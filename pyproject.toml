@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ha-spark"
+version = "0.0.1"
+description = "Local-first natural-language home automation agent for Home Assistant"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "ha-spark contributors" }]
+dependencies = [
+    "httpx>=0.27",
+    "websockets>=12.0",
+    "aiosqlite>=0.20",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+]
+
+[project.optional-dependencies]
+# Habit-learning (Phase 5). CPU-only by design; no torch/GPU dependency.
+habits = [
+    "scikit-learn>=1.5",
+    "river>=0.21",
+    "numpy>=1.26",
+]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+ha-spark = "ha_spark.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ha_spark"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "W"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# Optional habit-ML deps are not always installed in the base/dev env.
+module = ["sklearn.*", "river.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
