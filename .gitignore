@@ -29,3 +29,8 @@ data/
 .vscode/
 .idea/
 .DS_Store
+*Zone.Identifier
+
+# Handoff / transfer artifacts (git bundles & patches)
+*.bundle
+*.patch
