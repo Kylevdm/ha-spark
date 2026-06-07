@@ -6,9 +6,9 @@ the "sensor-aware" substrate the agent reads before acting.
 
 from __future__ import annotations
 
-from ha_agent.ha.models import EntityState, StateChangedEvent
-from ha_agent.ha.rest import HomeAssistantRest
-from ha_agent.logging import get_logger
+from ha_spark.ha.models import EntityState, StateChangedEvent
+from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
 

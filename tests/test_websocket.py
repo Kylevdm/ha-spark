@@ -7,8 +7,8 @@ import json
 
 from websockets.asyncio.server import ServerConnection, serve
 
-from ha_agent.ha.models import StateChangedEvent
-from ha_agent.ha.websocket import HomeAssistantWebSocket
+from ha_spark.ha.models import StateChangedEvent
+from ha_spark.ha.websocket import HomeAssistantWebSocket
 
 
 async def _fake_ha_handler(ws: ServerConnection) -> None:

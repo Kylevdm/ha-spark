@@ -1,4 +1,4 @@
-# ha-agent
+# ha-spark
 
 Local-first home automation agent for Home Assistant.
 
@@ -23,15 +23,15 @@ pip install -e ".[dev]"           # add ".[dev,habits]" for Phase 5 ML deps
 cp .env.example .env              # then set HA_URL and HA_TOKEN
 
 # Quality gates
-ruff check . && mypy ha_agent && pytest -q
+ruff check . && mypy ha_spark && pytest -q
 ```
 
 ### Try it (Phase 1: Home Assistant connectivity)
 
 ```bash
-python -m ha_agent states                 # list all entity states (via REST)
-python -m ha_agent states --domain light  # filter by domain
-python -m ha_agent states --watch         # stream live changes over WebSocket
+python -m ha_spark states                 # list all entity states (via REST)
+python -m ha_spark states --domain light  # filter by domain
+python -m ha_spark states --watch         # stream live changes over WebSocket
 ```
 
 Configuration is read from environment variables / `.env` (see `.env.example`).

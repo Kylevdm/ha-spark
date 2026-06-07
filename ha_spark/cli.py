@@ -1,16 +1,17 @@
-"""Command-line interface for ha-agent."""
+"""Command-line interface for ha-spark."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 
-from ha_agent.config import Settings, load_settings
-from ha_agent.ha.models import StateChangedEvent
-from ha_agent.ha.rest import HomeAssistantRest
-from ha_agent.ha.state_cache import StateCache
-from ha_agent.ha.websocket import HomeAssistantWebSocket
-from ha_agent.logging import get_logger, setup_logging
+from ha_spark.config import ConfigError, Settings, load_settings
+from ha_spark.ha.models import StateChangedEvent
+from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.ha.state_cache import StateCache
+from ha_spark.ha.websocket import HomeAssistantWebSocket
+from ha_spark.logging import get_logger, setup_logging
 
 log = get_logger(__name__)
 
@@ -19,7 +20,7 @@ async def _cmd_states(settings: Settings, *, domain: str | None, watch: bool) ->
     """Seed the state cache from HA and print it; optionally stream live updates."""
     cache = StateCache()
     async with HomeAssistantRest(
-        settings.ha_rest_url, settings.ha_token, timeout=settings.ha_timeout
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
         await cache.seed(rest)
 
@@ -31,7 +32,7 @@ async def _cmd_states(settings: Settings, *, domain: str | None, watch: bool) ->
     if not watch:
         return 0
 
-    ws = HomeAssistantWebSocket(settings.ha_websocket_url, settings.ha_token)
+    ws = HomeAssistantWebSocket(settings.ha_websocket_url, settings.auth_token)
     ws.add_listener(cache.on_state_changed)
 
     async def _print_change(event: StateChangedEvent) -> None:
@@ -53,7 +54,7 @@ async def _cmd_states(settings: Settings, *, domain: str | None, watch: bool) ->
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="ha-agent", description=__doc__)
+    parser = argparse.ArgumentParser(prog="ha-spark", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_states = sub.add_parser("states", help="List Home Assistant entity states")
@@ -68,7 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    settings = load_settings()
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
     setup_logging(settings.log_level)
 
     if args.command == "states":

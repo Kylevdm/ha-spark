@@ -1,5 +1,5 @@
-from ha_agent.ha.models import EntityState, StateChangedEvent
-from ha_agent.ha.state_cache import StateCache
+from ha_spark.ha.models import EntityState, StateChangedEvent
+from ha_spark.ha.state_cache import StateCache
 
 
 def _state(entity_id: str, state: str) -> EntityState:

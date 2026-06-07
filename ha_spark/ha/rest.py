@@ -7,8 +7,8 @@ from typing import Any
 
 import httpx
 
-from ha_agent.ha.models import EntityState
-from ha_agent.logging import get_logger
+from ha_spark.ha.models import EntityState
+from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
 

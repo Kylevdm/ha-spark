@@ -16,8 +16,8 @@ from typing import Any
 import websockets
 from websockets.asyncio.client import ClientConnection, connect
 
-from ha_agent.ha.models import StateChangedEvent
-from ha_agent.logging import get_logger
+from ha_spark.ha.models import StateChangedEvent
+from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
 

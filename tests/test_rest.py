@@ -1,7 +1,7 @@
 import httpx
 import respx
 
-from ha_agent.ha.rest import HomeAssistantRest
+from ha_spark.ha.rest import HomeAssistantRest
 
 BASE = "http://ha.test/api"
 
