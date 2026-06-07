@@ -7,6 +7,10 @@ import asyncio
 import sys
 
 from ha_spark.config import ConfigError, Settings, load_settings
+from ha_spark.energy.chargers import SolisCharger
+from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.report import format_plan
+from ha_spark.energy.sources import gather_inputs
 from ha_spark.ha.models import StateChangedEvent
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.state_cache import StateCache
@@ -61,6 +65,22 @@ async def _cmd_health(settings: Settings) -> int:
     return exit_code(results)
 
 
+async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
+    """Compute the battery charge plan, print it, optionally run the charger."""
+    async with HomeAssistantRest(
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+    ) as rest:
+        inputs, cfg, load_source = await gather_inputs(settings, rest)
+        plan = compute_plan(inputs, cfg)
+        print(format_plan(plan, load_source))
+        if apply:
+            lines = await SolisCharger(settings, rest).apply(plan)
+            print(f"\nActions (PROACTIVE_MODE={settings.proactive_mode}):")
+            for line in lines:
+                print(f"  {line}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ha-spark", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -72,6 +92,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("health", help="Probe HA, Ollama and storage; exit non-zero on failure")
+
+    p_plan = sub.add_parser("plan", help="Compute the battery charge plan")
+    p_plan.add_argument(
+        "--apply", action="store_true", help="Run the charger (simulate/on per PROACTIVE_MODE)"
+    )
 
     return parser
 
@@ -98,6 +123,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "states":
         return asyncio.run(_cmd_states(settings, domain=args.domain, watch=args.watch))
+
+    if args.command == "plan":
+        return asyncio.run(_cmd_plan(settings, apply=args.apply))
 
     parser.error(f"unknown command: {args.command}")
     return 2  # pragma: no cover - argparse exits first

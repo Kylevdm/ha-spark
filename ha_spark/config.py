@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -41,6 +41,17 @@ _OPTION_KEYS = frozenset(
         "ha_timeout",
         "db_path",
         "log_level",
+        # Energy planner knobs (entity IDs stay code-default unless overridden in env).
+        "proactive_mode",
+        "battery_capacity_kwh",
+        "min_soc",
+        "target_soc_cap",
+        "max_charge_current_a",
+        "solar_haircut_k",
+        "forecast_days",
+        "expected_load_kwh",
+        "charge_window_start",
+        "charge_window_end",
     }
 )
 
@@ -79,6 +90,44 @@ class Settings(BaseSettings):
 
     # --- Logging ---
     log_level: str = Field(default="INFO")
+
+    # --- Energy planner ---
+    # Proactivity: "off" (compute only), "simulate" (log intended writes, default),
+    # "on" (real control — not exercised in v1).
+    proactive_mode: Literal["off", "simulate", "on"] = Field(default="simulate")
+
+    # Battery / inverter model.
+    battery_capacity_kwh: float = Field(default=26.88)
+    battery_voltage_v: float = Field(default=51.0)  # fallback if the sensor is unavailable
+    min_soc: float = Field(default=20.0)
+    target_soc_cap: float = Field(default=90.0)
+    max_charge_current_a: float = Field(default=62.5)
+
+    # Forecast / model coefficients.
+    solar_haircut_k: float = Field(default=1.0)
+    forecast_days: int = Field(default=14)
+    expected_load_kwh: float = Field(default=24.0)  # fallback when statistics unavailable
+
+    # Fixed cheap charge window (local HH:MM).
+    charge_window_start: str = Field(default="23:30")
+    charge_window_end: str = Field(default="05:30")
+
+    # HA entity IDs (all overridable; defaults match the user's current setup).
+    soc_entity: str = Field(default="sensor.solisac_battery_soc")
+    battery_voltage_entity: str = Field(default="sensor.solisac_battery_voltage")
+    solar_tomorrow_entity: str = Field(default="sensor.solcast_pv_forecast_forecast_tomorrow")
+    octopus_rate_entity: str = Field(
+        default="sensor.octopus_energy_electricity_22l4386358_2200012282082_current_rate"
+    )
+    dispatch_entity: str = Field(
+        default="binary_sensor.octopus_energy_00000000_0009_4000_8020_000000068b29_intelligent_dispatching"  # noqa: E501
+    )
+    ev_plug_entity: str = Field(default="sensor.myenergi_zappi_22300254_plug_status")
+    ev_status_entity: str = Field(default="sensor.myenergi_zappi_22300254_status")
+    consumption_energy_entity: str = Field(default="sensor.house_consumption_energy")
+    charge_current_entity: str = Field(default="number.solisac_timed_charge_current")
+    inverter_power_switch_entity: str = Field(default="select.solisac_power_switch")
+    ha_template_charge_needed_entity: str = Field(default="sensor.charge_energy_needed")
 
     @property
     def is_standalone(self) -> bool:
