@@ -11,6 +11,7 @@ from ha_spark.ha.models import StateChangedEvent
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.state_cache import StateCache
 from ha_spark.ha.websocket import HomeAssistantWebSocket
+from ha_spark.health import exit_code, format_report, run_health
 from ha_spark.logging import get_logger, setup_logging
 
 log = get_logger(__name__)
@@ -53,6 +54,13 @@ async def _cmd_states(settings: Settings, *, domain: str | None, watch: bool) ->
     return 0
 
 
+async def _cmd_health(settings: Settings) -> int:
+    """Run the dependency checks, print the report, and return its exit code."""
+    results = await run_health(settings)
+    print(format_report(results))
+    return exit_code(results)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ha-spark", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -63,12 +71,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--watch", action="store_true", help="Stream live state changes over WebSocket"
     )
 
+    sub.add_parser("health", help="Probe HA, Ollama and storage; exit non-zero on failure")
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # `health` is the tool you reach for when config is broken, so it must run and
+    # diagnose rather than fail fast: build raw Settings (no credential validation)
+    # and let the checks themselves report what's wrong. Quiet logs keep the report
+    # clean — failure detail is carried in each check result.
+    if args.command == "health":
+        settings = Settings()
+        setup_logging("WARNING")
+        return asyncio.run(_cmd_health(settings))
+
     try:
         settings = load_settings()
     except ConfigError as exc:

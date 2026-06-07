@@ -65,6 +65,11 @@ class HomeAssistantRest:
         data = await self._get(f"/states/{entity_id}")
         return EntityState.model_validate(data)
 
+    async def get_config(self) -> dict[str, Any]:
+        """Return the Home Assistant configuration (version, location, etc.)."""
+        data = await self._get("/config")
+        return dict(data)
+
     async def get_services(self) -> list[dict[str, Any]]:
         """Return the catalog of available services, grouped by domain."""
         data = await self._get("/services")
