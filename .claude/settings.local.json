@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git config *)",
+      "Bash(git add *)",
+      "Bash(git commit -m 'Initial commit: project README and .gitignore *)",
+      "Bash(gh auth *)",
+      "Bash(git ls-remote *)",
+      "Bash(gh repo *)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" https://api.github.com/repos/Kylevdm/ha-spark)",
+      "Bash(gh pr *)",
+      "Bash(git remote *)",
+      "Bash(git push *)",
+      "Bash(gh api *)",
+      "Bash(git fetch *)",
+      "Bash(git merge *)"
+    ]
+  }
+}
