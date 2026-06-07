@@ -31,6 +31,21 @@ class HomeAssistantAuthError(RuntimeError):
     """Raised when the WebSocket auth handshake is rejected."""
 
 
+async def _authenticate(ws: ClientConnection, token: str) -> str:
+    """Perform the HA WebSocket auth handshake; return the HA version string.
+
+    Raises :class:`HomeAssistantAuthError` if the handshake is rejected.
+    """
+    msg = json.loads(await ws.recv())
+    if msg.get("type") != "auth_required":
+        raise HomeAssistantAuthError(f"unexpected first message: {msg.get('type')}")
+    await ws.send(json.dumps({"type": "auth", "access_token": token}))
+    result = json.loads(await ws.recv())
+    if result.get("type") != "auth_ok":
+        raise HomeAssistantAuthError(f"auth rejected: {result.get('type')}")
+    return str(result.get("ha_version", "?"))
+
+
 class HomeAssistantWebSocket:
     """Maintains a WebSocket connection to Home Assistant and streams events."""
 
@@ -69,7 +84,8 @@ class HomeAssistantWebSocket:
         while True:
             try:
                 async with connect(self._ws_url, max_size=None) as ws:
-                    await self._authenticate(ws)
+                    ha_version = await _authenticate(ws, self._token)
+                    log.info("WebSocket authenticated (HA %s)", ha_version)
                     await self._subscribe(ws)
                     attempt = 0  # reset backoff after a clean connect
                     self._connected.set()
@@ -86,15 +102,15 @@ class HomeAssistantWebSocket:
                 log.warning("WebSocket disconnected (%s); reconnecting in %ss", exc, delay)
                 await asyncio.sleep(delay)
 
-    async def _authenticate(self, ws: ClientConnection) -> None:
-        msg = json.loads(await ws.recv())
-        if msg.get("type") != "auth_required":
-            raise HomeAssistantAuthError(f"unexpected first message: {msg.get('type')}")
-        await ws.send(json.dumps({"type": "auth", "access_token": self._token}))
-        result = json.loads(await ws.recv())
-        if result.get("type") != "auth_ok":
-            raise HomeAssistantAuthError(f"auth rejected: {result.get('type')}")
-        log.info("WebSocket authenticated (HA %s)", result.get("ha_version", "?"))
+    @staticmethod
+    async def probe(ws_url: str, token: str, *, timeout: float = 10.0) -> str:  # noqa: ASYNC109
+        """One-shot connect + auth handshake (no reconnect loop); return HA version.
+
+        Used by the ``health`` command so a rejected auth surfaces as a clear
+        :class:`HomeAssistantAuthError` rather than a generic timeout.
+        """
+        async with asyncio.timeout(timeout), connect(ws_url, max_size=None) as ws:
+            return await _authenticate(ws, token)
 
     async def _subscribe(self, ws: ClientConnection) -> None:
         sub_id = next(self._ids)

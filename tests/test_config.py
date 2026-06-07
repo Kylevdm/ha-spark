@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from ha_spark.config import (
@@ -7,6 +9,14 @@ from ha_spark.config import (
     Settings,
     load_settings,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_dotenv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep these tests hermetic: ignore any developer .env and stray env vars."""
+    monkeypatch.chdir(tmp_path)
+    for var in ("HA_URL", "HA_TOKEN", "SUPERVISOR_TOKEN", "OLLAMA_URL", "OLLAMA_MODEL"):
+        monkeypatch.delenv(var, raising=False)
 
 
 def test_addon_mode_uses_supervisor_endpoints() -> None:
