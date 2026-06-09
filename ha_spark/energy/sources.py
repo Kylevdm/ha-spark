@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ha_spark.config import Settings
-from ha_spark.energy.forecast import predict_home_load_kwh
-from ha_spark.energy.models import DispatchSlot, PlannerConfig, PlannerInputs
+from ha_spark.energy.forecast import load_timezone, predict_home_load
+from ha_spark.energy.models import SLOTS_PER_DAY, DispatchSlot, PlannerConfig, PlannerInputs
+from ha_spark.energy.solar import distribute_solar
 from ha_spark.ha.models import EntityState
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
@@ -58,6 +60,39 @@ def _parse_dispatches(raw: Any) -> tuple[DispatchSlot, ...]:
     return tuple(slots)
 
 
+def _parse_detailed_forecast(raw: Any) -> list[tuple[datetime, float]] | None:
+    """Tolerantly parse Solcast's ``detailedForecast`` attribute (shape varies)."""
+    if not isinstance(raw, list):
+        return None
+    entries: list[tuple[datetime, float]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = datetime.fromisoformat(str(item["period_start"]))
+            entries.append((start, float(item["pv_estimate"])))
+        except (KeyError, ValueError, TypeError):
+            continue
+    return entries or None
+
+
+def _slot_horizon(
+    day_slots: tuple[float, ...], window_start: time, window_end: time, tz: ZoneInfo
+) -> tuple[tuple[float, ...], datetime]:
+    """Rotate slot-of-day values so index 0 is the charge-window start tonight.
+
+    The horizon spans two calendar days but uses one day's profile values
+    throughout — adjacent days share a day-type often enough that the error in
+    tonight's pre-midnight slots is negligible.
+    """
+    start_idx = window_start.hour * 2 + window_start.minute // 30
+    rotated = tuple(day_slots[(start_idx + i) % SLOTS_PER_DAY] for i in range(SLOTS_PER_DAY))
+    tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
+    origin_date = tomorrow - timedelta(days=1) if window_start >= window_end else tomorrow
+    horizon_start = datetime.combine(origin_date, window_start, tzinfo=tz)
+    return rotated, horizon_start
+
+
 def build_config(settings: Settings, voltage_v: float) -> PlannerConfig:
     return PlannerConfig(
         capacity_kwh=settings.battery_capacity_kwh,
@@ -68,6 +103,8 @@ def build_config(settings: Settings, voltage_v: float) -> PlannerConfig:
         solar_haircut_k=settings.solar_haircut_k,
         window_start=_parse_time(settings.charge_window_start),
         window_end=_parse_time(settings.charge_window_end),
+        rate_offpeak=settings.rate_offpeak_gbp_kwh,
+        rate_peak=settings.rate_peak_gbp_kwh,
     )
 
 
@@ -96,14 +133,33 @@ async def gather_inputs(
     )
     ev_charging = bool(ev_status and str(ev_status.state).lower() in _EV_ACTIVE)
 
-    load_kwh, load_source = await predict_home_load_kwh(settings)
+    forecast = await predict_home_load(settings)
+    solar_kwh = _to_float(solar.state if solar else None, 0.0)
+
+    load_slots: tuple[float, ...] | None = None
+    solar_slots: tuple[float, ...] | None = None
+    horizon_start: datetime | None = None
+    if forecast.slots is not None:
+        tz = load_timezone(settings.timezone)
+        window_start = _parse_time(settings.charge_window_start)
+        window_end = _parse_time(settings.charge_window_end)
+        load_slots, horizon_start = _slot_horizon(forecast.slots, window_start, window_end, tz)
+        tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
+        detailed = _parse_detailed_forecast(
+            solar.attributes.get("detailedForecast") if solar else None
+        )
+        solar_day = distribute_solar(solar_kwh, detailed, tz, tomorrow)
+        solar_slots, _ = _slot_horizon(solar_day, window_start, window_end, tz)
 
     inputs = PlannerInputs(
         soc_now=_to_float(soc.state if soc else None, 0.0),
-        solar_tomorrow_kwh=_to_float(solar.state if solar else None, 0.0),
-        predicted_home_load_kwh=load_kwh,
+        solar_tomorrow_kwh=solar_kwh,
+        predicted_home_load_kwh=forecast.total_kwh,
         dispatches=dispatches,
         ev_charging=ev_charging,
         ha_template_needed=_opt_float(ha_needed.state) if ha_needed else None,
+        load_slots=load_slots,
+        solar_slots=solar_slots,
+        horizon_start=horizon_start,
     )
-    return inputs, build_config(settings, voltage_v), load_source
+    return inputs, build_config(settings, voltage_v), forecast.source

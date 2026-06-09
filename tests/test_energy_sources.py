@@ -10,6 +10,7 @@ import respx
 
 from ha_spark.config import Settings
 from ha_spark.energy import sources
+from ha_spark.energy.models import LoadForecast
 from ha_spark.energy.sources import gather_inputs
 from ha_spark.ha.rest import HomeAssistantRest
 
@@ -37,10 +38,10 @@ def _settings() -> Settings:
 
 @respx.mock
 async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_load(_s: Settings) -> tuple[float, str]:
-        return 24.0, "test"
+    async def fake_load(_s: Settings) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
-    monkeypatch.setattr(sources, "predict_home_load_kwh", fake_load)
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
 
     respx.get(f"{BASE}/states/sensor.soc").mock(return_value=_state("sensor.soc", "30"))
     respx.get(f"{BASE}/states/sensor.volt").mock(return_value=_state("sensor.volt", "51"))
@@ -77,10 +78,10 @@ async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) 
 
 @respx.mock
 async def test_gather_inputs_tolerates_missing_entities(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_load(_s: Settings) -> tuple[float, str]:
-        return 24.0, "test"
+    async def fake_load(_s: Settings) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
-    monkeypatch.setattr(sources, "predict_home_load_kwh", fake_load)
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
     respx.route(method="GET").mock(return_value=httpx.Response(404))
 
     s = _settings()

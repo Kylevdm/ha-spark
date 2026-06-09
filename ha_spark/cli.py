@@ -5,12 +5,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from ha_spark.config import ConfigError, Settings, load_settings
 from ha_spark.energy.chargers import SolisCharger
+from ha_spark.energy.models import ConsumptionInterval
+from ha_spark.energy.octopus import OctopusApiError, fetch_consumption, parse_octopus_csv
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.sources import gather_inputs
+from ha_spark.energy.store import ConsumptionStore
 from ha_spark.ha.models import StateChangedEvent
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.state_cache import StateCache
@@ -81,6 +86,49 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
     return 0
 
 
+async def _store_and_report(
+    settings: Settings, intervals: list[ConsumptionInterval], source: str
+) -> int:
+    """Upsert intervals into the consumption store and print a summary."""
+    async with ConsumptionStore(settings.db_path) as store:
+        changed = await store.upsert(intervals, source)
+        count, first, last = await store.summary()
+    print(f"Imported {len(intervals)} intervals ({changed} new/updated).")
+    if first and last:
+        print(
+            f"Store now holds {count} intervals: "
+            f"{first:%Y-%m-%d %H:%M} .. {last:%Y-%m-%d %H:%M} UTC"
+        )
+    return 0
+
+
+def _cmd_import_csv(settings: Settings, paths: list[str]) -> int:
+    """Ingest Octopus dashboard CSV export(s) into the consumption store."""
+    intervals: list[ConsumptionInterval] = []
+    for path in paths:
+        try:
+            intervals.extend(parse_octopus_csv(Path(path).read_text(encoding="utf-8-sig")))
+        except (OSError, ValueError) as exc:
+            print(f"Could not import {path}: {exc}", file=sys.stderr)
+            return 2
+    return asyncio.run(_store_and_report(settings, intervals, "csv"))
+
+
+async def _cmd_pull_consumption(settings: Settings, *, days: int) -> int:
+    """Pull half-hourly consumption from the Octopus API (incremental)."""
+    period_from = datetime.now(UTC) - timedelta(days=days)
+    async with ConsumptionStore(settings.db_path) as store:
+        latest = await store.latest_interval_start()
+    if latest is not None and latest > period_from:
+        period_from = latest  # incremental: re-fetch the newest interval onward
+    try:
+        intervals = await fetch_consumption(settings, period_from=period_from)
+    except OctopusApiError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    return await _store_and_report(settings, intervals, "api")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ha-spark", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -96,6 +144,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan = sub.add_parser("plan", help="Compute the battery charge plan")
     p_plan.add_argument(
         "--apply", action="store_true", help="Run the charger (simulate/on per PROACTIVE_MODE)"
+    )
+
+    p_csv = sub.add_parser(
+        "import-csv", help="Import Octopus half-hourly consumption CSV export(s)"
+    )
+    p_csv.add_argument("paths", nargs="+", metavar="PATH", help="CSV file(s) to import")
+
+    p_pull = sub.add_parser(
+        "pull-consumption", help="Pull half-hourly consumption from the Octopus API"
+    )
+    p_pull.add_argument(
+        "--days", type=int, default=30, help="History window to fetch (default 30)"
     )
 
     return parser
@@ -126,6 +186,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "plan":
         return asyncio.run(_cmd_plan(settings, apply=args.apply))
+
+    if args.command == "import-csv":
+        return _cmd_import_csv(settings, args.paths)
+
+    if args.command == "pull-consumption":
+        return asyncio.run(_cmd_pull_consumption(settings, days=args.days))
 
     parser.error(f"unknown command: {args.command}")
     return 2  # pragma: no cover - argparse exits first
