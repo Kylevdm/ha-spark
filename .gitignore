@@ -24,6 +24,9 @@ env/
 *.sqlite
 *.sqlite3
 data/
+# Octopus consumption exports (personal meter data)
+usage*.csv
+consumption*.csv
 
 # Editor / OS
 .vscode/

@@ -52,6 +52,17 @@ _OPTION_KEYS = frozenset(
         "expected_load_kwh",
         "charge_window_start",
         "charge_window_end",
+        # Energy planner v2: tariff, slot profile, Octopus consumption pull.
+        # The API key is exposed here too — options.json is the only user config
+        # surface in add-on mode (the add-on schema will mark it `password`).
+        "rate_offpeak_gbp_kwh",
+        "rate_peak_gbp_kwh",
+        "profile_min_days",
+        "profile_history_days",
+        "timezone",
+        "octopus_api_key",
+        "octopus_mpan",
+        "octopus_meter_serial",
     }
 )
 
@@ -111,6 +122,21 @@ class Settings(BaseSettings):
     # Fixed cheap charge window (local HH:MM).
     charge_window_start: str = Field(default="23:30")
     charge_window_end: str = Field(default="05:30")
+
+    # Two-rate tariff (GBP/kWh): off-peak inside the window/dispatch slots, else peak.
+    rate_offpeak_gbp_kwh: float = Field(default=0.069)
+    rate_peak_gbp_kwh: float = Field(default=0.30)
+
+    # v2 slot-profile load model (from imported Octopus half-hourly consumption).
+    profile_min_days: int = Field(default=7)
+    profile_history_days: int = Field(default=60)
+    timezone: str = Field(default="Europe/London")
+
+    # Octopus REST API (for `pull-consumption`; CSV import needs none of these).
+    octopus_api_key: str = Field(default="")
+    octopus_mpan: str = Field(default="")
+    octopus_meter_serial: str = Field(default="")
+    octopus_api_url: str = Field(default="https://api.octopus.energy/v1")
 
     # HA entity IDs (all overridable; defaults match the user's current setup).
     soc_entity: str = Field(default="sensor.solisac_battery_soc")
