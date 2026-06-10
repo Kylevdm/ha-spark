@@ -47,6 +47,7 @@ _OPTION_KEYS = frozenset(
         "min_soc",
         "target_soc_cap",
         "max_charge_current_a",
+        "charge_buffer_pct",
         "solar_haircut_k",
         "forecast_days",
         "expected_load_kwh",
@@ -113,6 +114,8 @@ class Settings(BaseSettings):
     min_soc: float = Field(default=20.0)
     target_soc_cap: float = Field(default=90.0)
     max_charge_current_a: float = Field(default=62.5)
+    # Safety margin applied to the forecast deficit before sizing the charge.
+    charge_buffer_pct: float = Field(default=20.0)
 
     # Forecast / model coefficients.
     solar_haircut_k: float = Field(default=1.0)

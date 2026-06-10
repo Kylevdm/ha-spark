@@ -14,7 +14,8 @@ from ha_spark.ha.rest import HomeAssistantRest
 def _plan() -> ChargePlan:
     return ChargePlan(
         soc_now=30, capacity_kwh=26.88, solar_kwh=8.75, effective_solar_kwh=8.75,
-        load_kwh=24.2, cheap_covered_kwh=0.0, usable_now_kwh=2.69, required_kwh=12.8,
+        load_kwh=24.2, cheap_covered_kwh=0.0, usable_now_kwh=2.69,
+        deficit_kwh=12.8, buffer_pct=0.0, required_kwh=12.8,
         target_soc=77, overnight_current_a=42, window_hours=6.0, ev_charging=False,
         ha_template_needed=19.0,
         actions=(

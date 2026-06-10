@@ -21,6 +21,7 @@ def cfg(**kw: Any) -> PlannerConfig:
         solar_haircut_k=1.0,
         window_start=time(23, 30),
         window_end=time(5, 30),
+        buffer_pct=0.0,
     )
     base.update(kw)
     return PlannerConfig(**base)
@@ -47,6 +48,15 @@ def test_zero_need_when_full_and_sunny() -> None:
     plan = compute_plan(inp, cfg())
     assert plan.required_kwh == 0
     assert plan.overnight_current_a == 0
+
+
+def test_buffer_inflates_required_within_headroom() -> None:
+    inp = PlannerInputs(soc_now=20, solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
+    plan = compute_plan(inp, cfg(buffer_pct=20.0))
+    # deficit = 10 - 3 = 7; usable_now = 0 (soc at min); buffered = 7 * 1.2 = 8.4.
+    assert plan.deficit_kwh == pytest.approx(7.0)
+    assert plan.buffer_pct == pytest.approx(20.0)
+    assert plan.required_kwh == pytest.approx(8.4)
 
 
 def test_headroom_caps_required() -> None:

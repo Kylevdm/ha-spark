@@ -64,6 +64,7 @@ class PlannerConfig:
     window_end: time
     rate_offpeak: float = 0.069  # GBP/kWh inside the window / dispatch slots
     rate_peak: float = 0.30
+    buffer_pct: float = 20.0  # safety margin applied to the forecast deficit
 
     @property
     def window_hours(self) -> float:
@@ -112,6 +113,8 @@ class ChargePlan:
     load_kwh: float
     cheap_covered_kwh: float
     usable_now_kwh: float
+    deficit_kwh: float
+    buffer_pct: float
     required_kwh: float
     target_soc: float
     overnight_current_a: float
