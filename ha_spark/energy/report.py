@@ -23,8 +23,14 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
         lines.append(
             f"  Peak-slot load     {plan.expensive_load_kwh:.2f} kWh (after solar)"
         )
+    deficit = f"{plan.deficit_kwh:.2f} kWh"
+    if plan.buffer_pct > 0 and plan.deficit_kwh > 0:
+        buffered = plan.deficit_kwh * (1.0 + plan.buffer_pct / 100.0)
+        deficit += f"  (+{plan.buffer_pct:.0f}% buffer -> {buffered:.2f})"
+
     lines += [
         f"  Usable now         {plan.usable_now_kwh:.2f} kWh",
+        f"  Energy deficit     {deficit}",
         f"  Required charge    {plan.required_kwh:.2f} kWh  ->  target {plan.target_soc:.0f}%",
         f"  Charge current     {plan.overnight_current_a:.0f} A over {plan.window_hours:.1f} h",
         f"  EV                 {'charging' if plan.ev_charging else 'not charging'}",

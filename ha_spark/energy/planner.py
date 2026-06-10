@@ -6,7 +6,8 @@ v1 model (daily energy balance, used when no per-slot forecast is available):
     cheap_covered   = home-load energy during daytime dispatch slots (cheap grid)
     deficit         = max(0, home_load - effective_solar - cheap_covered)
     usable_now      = capacity * (soc_now - min_soc) / 100
-    required        = clamp(deficit - usable_now, 0, headroom_to_cap)
+    buffered        = deficit * (1 + buffer_pct / 100)
+    required        = clamp(buffered - usable_now, 0, headroom_to_cap)
     current_A       = clamp(required / (window_h * voltage/1000), 0, max_A)
 
 v2 model (per-slot horizon, when ``inputs.load_slots`` is set): the horizon is 48
@@ -16,8 +17,8 @@ needs to cover the *expensive* slots' net load (load - solar), so
 
     expensive_need  = sum_slots (1 - cheap_frac) * max(0, load - solar)
 
-replaces ``deficit`` and the same clamps apply. Both models also project a
-two-rate cost (off-peak/peak) with and without the battery.
+replaces ``deficit``, then the same buffer and clamps apply. Both models also
+project a two-rate cost (off-peak/peak) with and without the battery.
 
 Daytime dispatch slots each emit a ``stop_discharge`` action so the battery
 holds (doesn't feed the EV) while cheap grid covers the house.
@@ -131,8 +132,9 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
         cheap_net = min(net_total, cheap_covered + window_load)
         baseline_cost = cheap_net * cfg.rate_offpeak + (net_total - cheap_net) * cfg.rate_peak
 
-    required = _clamp(deficit - usable_now, 0.0, headroom)
-    uncovered = max(0.0, deficit - usable_now - required)
+    buffered_deficit = deficit * (1.0 + cfg.buffer_pct / 100.0)
+    required = _clamp(buffered_deficit - usable_now, 0.0, headroom)
+    uncovered = max(0.0, buffered_deficit - usable_now - required)
     planned_cost = (cheap_net + required) * cfg.rate_offpeak + uncovered * cfg.rate_peak
 
     target_soc = inputs.soc_now
@@ -174,6 +176,8 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
         load_kwh=inputs.predicted_home_load_kwh,
         cheap_covered_kwh=cheap_covered,
         usable_now_kwh=usable_now,
+        deficit_kwh=deficit,
+        buffer_pct=cfg.buffer_pct,
         required_kwh=required,
         target_soc=target_soc,
         overnight_current_a=current,
