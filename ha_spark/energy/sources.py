@@ -105,6 +105,7 @@ def build_config(settings: Settings, voltage_v: float) -> PlannerConfig:
         window_end=_parse_time(settings.charge_window_end),
         rate_offpeak=settings.rate_offpeak_gbp_kwh,
         rate_peak=settings.rate_peak_gbp_kwh,
+        buffer_pct=settings.charge_buffer_pct,
     )
 
 
