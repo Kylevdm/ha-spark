@@ -8,7 +8,8 @@ v1 model (daily energy balance, used when no per-slot forecast is available):
     usable_now      = capacity * (soc_now - min_soc) / 100
     buffered        = deficit * (1 + buffer_pct / 100)
     required        = clamp(buffered - usable_now, 0, headroom_to_cap)
-    current_A       = clamp(required / (window_h * voltage/1000), 0, max_A)
+    purchase        = required / charge_efficiency   (AC kWh bought)
+    current_A       = clamp(purchase / (window_h * voltage/1000), 0, max_A)
 
 v2 model (per-slot horizon, when ``inputs.load_slots`` is set): the horizon is 48
 half-hour slots starting at the charge-window start tonight. Slots inside the
@@ -120,6 +121,10 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
             for f, e in zip(fracs, net, strict=True)
         )
         cheap_net = sum(f * e for f, e in zip(fracs, net, strict=True))
+        export_kwh = sum(
+            max(0.0, solar * cfg.solar_haircut_k - load)
+            for load, solar in zip(inputs.load_slots, solar_slots, strict=False)
+        )
     else:
         # --- v1 daily balance ---
         model = "daily"
@@ -131,19 +136,32 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
         window_load = inputs.predicted_home_load_kwh * cfg.window_hours / 24.0
         cheap_net = min(net_total, cheap_covered + window_load)
         baseline_cost = cheap_net * cfg.rate_offpeak + (net_total - cheap_net) * cfg.rate_peak
+        export_kwh = max(0.0, effective_solar - inputs.predicted_home_load_kwh)
 
     buffered_deficit = deficit * (1.0 + cfg.buffer_pct / 100.0)
     required = _clamp(buffered_deficit - usable_now, 0.0, headroom)
     uncovered = max(0.0, buffered_deficit - usable_now - required)
-    planned_cost = (cheap_net + required) * cfg.rate_offpeak + uncovered * cfg.rate_peak
+    # The grid supplies required/efficiency AC kWh to store `required` kWh
+    # (round-trip: AC->DC charging now, DC->AC discharge to the load later).
+    efficiency = cfg.charge_efficiency if cfg.charge_efficiency > 0 else 1.0
+    purchase = required / efficiency
+    planned_cost = (cheap_net + purchase) * cfg.rate_offpeak + uncovered * cfg.rate_peak
+
+    # Export revenue is identical with or without the overnight charge, so it
+    # adjusts both projections (reporting honesty) without changing decisions.
+    export_revenue: float | None = None
+    if cfg.rate_export > 0:
+        export_revenue = export_kwh * cfg.rate_export
+        baseline_cost -= export_revenue
+        planned_cost -= export_revenue
 
     target_soc = inputs.soc_now
     if cfg.capacity_kwh > 0:
         target_soc = min(cfg.target_cap, inputs.soc_now + required / cfg.capacity_kwh * 100.0)
 
-    # required kWh over the fixed window -> charge current (A).
+    # purchased AC kWh over the fixed window -> charge current (A).
     kwh_per_amp = cfg.window_hours * cfg.voltage_v / 1000.0
-    current = _clamp(required / kwh_per_amp, 0.0, cfg.max_current_a) if kwh_per_amp > 0 else 0.0
+    current = _clamp(purchase / kwh_per_amp, 0.0, cfg.max_current_a) if kwh_per_amp > 0 else 0.0
 
     actions: list[ChargeAction] = [
         ChargeAction(
@@ -190,4 +208,6 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
         expensive_load_kwh=expensive_load_kwh,
         baseline_cost=baseline_cost,
         planned_cost=planned_cost,
+        charge_efficiency=efficiency,
+        export_revenue=export_revenue,
     )

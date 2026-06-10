@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 
 from ha_spark import cli
-from ha_spark.cli import _cmd_backfill_load, _cmd_import_csv, _cmd_onboard, _cmd_run
+from ha_spark.cli import (
+    _cmd_backfill_load,
+    _cmd_backtest,
+    _cmd_import_csv,
+    _cmd_onboard,
+    _cmd_run,
+    build_parser,
+)
 from ha_spark.config import Settings
 from ha_spark.health import CheckResult, Status
 
@@ -38,6 +45,51 @@ def test_import_csv_missing_file_errors(
     settings = Settings(db_path=str(tmp_path / "test.db"))
     assert _cmd_import_csv(settings, [str(tmp_path / "nope.csv")]) == 2
     assert "Could not import" in capsys.readouterr().err
+
+
+def test_help_mentions_every_command_and_flags() -> None:
+    parser = build_parser()
+    top = parser.format_help()
+    for command in (
+        "states", "health", "onboard", "plan", "run",
+        "backfill-load", "import-csv", "pull-consumption", "backtest",
+    ):
+        assert command in top
+    assert "examples:" in top
+
+    args = parser.parse_args(["backtest", "--days", "7"])
+    assert args.command == "backtest" and args.days == 7
+    args = parser.parse_args(["plan", "--apply"])
+    assert args.apply is True
+
+
+async def test_backtest_rates_seeded_store(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from ha_spark.energy.models import ConsumptionInterval
+    from ha_spark.energy.store import ConsumptionStore
+
+    settings = Settings(db_path=str(tmp_path / "test.db"), timezone="UTC")
+    start = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) - timedelta(days=1)
+    async with ConsumptionStore(settings.db_path) as store:
+        await store.upsert(
+            [ConsumptionInterval(start, start + timedelta(minutes=30), 2.0)], "test"
+        )
+
+    assert await _cmd_backtest(settings, days=7) == 0
+    out = capsys.readouterr().out
+    assert "Grid import backtest" in out
+    assert "2.00 kWh" in out
+
+
+async def test_backtest_empty_store_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = Settings(db_path=str(tmp_path / "empty.db"))
+    assert await _cmd_backtest(settings, days=7) == 2
+    assert "No stored consumption" in capsys.readouterr().err
 
 
 async def test_onboard_exit_code_tracks_status(monkeypatch: pytest.MonkeyPatch) -> None:
