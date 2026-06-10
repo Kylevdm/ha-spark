@@ -1,4 +1,9 @@
-"""SQLite store for half-hourly consumption history (aiosqlite)."""
+"""SQLite store for half-hourly Octopus meter history (aiosqlite).
+
+Octopus consumption is grid *import*, not house load — the battery/solar shape
+it, so it must not feed the load model (see forecast.py). It is retained for
+cost backtesting: what was actually bought from the grid, and when.
+"""
 
 from __future__ import annotations
 
