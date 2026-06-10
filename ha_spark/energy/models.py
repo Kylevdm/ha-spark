@@ -64,7 +64,9 @@ class PlannerConfig:
     window_end: time
     rate_offpeak: float = 0.069  # GBP/kWh inside the window / dispatch slots
     rate_peak: float = 0.30
+    rate_export: float = 0.0  # GBP/kWh feed-in; 0 disables export revenue
     buffer_pct: float = 20.0  # safety margin applied to the forecast deficit
+    charge_efficiency: float = 0.90  # round-trip AC->DC->AC; buy required/efficiency
 
     @property
     def window_hours(self) -> float:
@@ -130,3 +132,5 @@ class ChargePlan:
     expensive_load_kwh: float | None = None  # net load in peak-rate slots (slot model)
     baseline_cost: float | None = None  # projected GBP without battery
     planned_cost: float | None = None  # projected GBP with this plan
+    charge_efficiency: float = 1.0  # round-trip efficiency used for sizing
+    export_revenue: float | None = None  # projected GBP feed-in (None when disabled)

@@ -58,6 +58,9 @@ _OPTION_KEYS = frozenset(
         # surface in add-on mode (the add-on schema will mark it `password`).
         "rate_offpeak_gbp_kwh",
         "rate_peak_gbp_kwh",
+        "rate_export_gbp_kwh",
+        "charge_efficiency",
+        "solar_percentile",
         "profile_min_days",
         "profile_history_days",
         "timezone",
@@ -118,9 +121,13 @@ class Settings(BaseSettings):
     max_charge_current_a: float = Field(default=62.5)
     # Safety margin applied to the forecast deficit before sizing the charge.
     charge_buffer_pct: float = Field(default=20.0)
+    # Round-trip AC->DC->AC efficiency: the planner buys required/efficiency.
+    charge_efficiency: float = Field(default=0.90)
 
     # Forecast / model coefficients.
     solar_haircut_k: float = Field(default=1.0)
+    # Solcast percentile to plan on: 50 (median), 10 (conservative), 90 (optimistic).
+    solar_percentile: Literal[10, 50, 90] = Field(default=50)
     forecast_days: int = Field(default=14)
     expected_load_kwh: float = Field(default=24.0)  # fallback when statistics unavailable
 
@@ -131,6 +138,8 @@ class Settings(BaseSettings):
     # Two-rate tariff (GBP/kWh): off-peak inside the window/dispatch slots, else peak.
     rate_offpeak_gbp_kwh: float = Field(default=0.069)
     rate_peak_gbp_kwh: float = Field(default=0.30)
+    # Export/feed-in rate (GBP/kWh); 0 disables export revenue in cost projections.
+    rate_export_gbp_kwh: float = Field(default=0.0)
 
     # v2 slot-profile load model (from imported Octopus half-hourly consumption).
     profile_min_days: int = Field(default=7)

@@ -22,6 +22,7 @@ def cfg(**kw: Any) -> PlannerConfig:
         window_start=time(23, 30),
         window_end=time(5, 30),
         buffer_pct=0.0,
+        charge_efficiency=1.0,
     )
     base.update(kw)
     return PlannerConfig(**base)
@@ -179,3 +180,40 @@ def test_slot_model_respects_headroom_and_max_current() -> None:
     headroom = 26.88 * (90 - 85) / 100
     assert plan.required_kwh == pytest.approx(headroom)
     assert plan.overnight_current_a <= 62.5
+
+
+def test_charge_efficiency_inflates_purchase_and_current() -> None:
+    inp = PlannerInputs(soc_now=20, solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
+    lossless = compute_plan(inp, cfg())
+    lossy = compute_plan(inp, cfg(charge_efficiency=0.9))
+    # Stored energy target is unchanged; the AC purchase and current grow by 1/0.9.
+    assert lossy.required_kwh == pytest.approx(lossless.required_kwh)
+    assert lossy.overnight_current_a == pytest.approx(lossless.overnight_current_a / 0.9)
+    assert lossy.charge_efficiency == pytest.approx(0.9)
+    assert lossless.planned_cost is not None and lossy.planned_cost is not None
+    extra_buy = lossless.required_kwh / 0.9 - lossless.required_kwh
+    assert lossy.planned_cost == pytest.approx(lossless.planned_cost + extra_buy * 0.069)
+
+
+def test_export_revenue_adjusts_both_costs_equally() -> None:
+    # Daily model: 10 kWh solar vs 6 kWh load -> 4 kWh exported.
+    inp = PlannerInputs(soc_now=50, solar_tomorrow_kwh=10, predicted_home_load_kwh=6)
+    without = compute_plan(inp, cfg())
+    with_export = compute_plan(inp, cfg(rate_export=0.15))
+    assert without.export_revenue is None
+    assert with_export.export_revenue == pytest.approx(4 * 0.15)
+    assert without.baseline_cost is not None and with_export.baseline_cost is not None
+    assert without.planned_cost is not None and with_export.planned_cost is not None
+    assert with_export.baseline_cost == pytest.approx(without.baseline_cost - 0.6)
+    assert with_export.planned_cost == pytest.approx(without.planned_cost - 0.6)
+    # The decision (required charge) is unchanged.
+    assert with_export.required_kwh == pytest.approx(without.required_kwh)
+
+
+def test_slot_model_export_revenue_sums_per_slot_surplus() -> None:
+    solar = [0.0] * 48
+    solar[24] = 2.0  # 0.5 kWh load slots -> 1.5 kWh surplus in this slot
+    plan = compute_plan(
+        _slot_inputs(load=0.5, solar_slots=tuple(solar)), cfg(rate_export=0.10)
+    )
+    assert plan.export_revenue == pytest.approx(1.5 * 0.10)
