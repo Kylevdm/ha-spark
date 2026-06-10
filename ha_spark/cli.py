@@ -12,6 +12,12 @@ from ha_spark.config import ConfigError, Settings, load_settings
 from ha_spark.energy.chargers import SolisCharger
 from ha_spark.energy.models import ConsumptionInterval
 from ha_spark.energy.octopus import OctopusApiError, fetch_consumption, parse_octopus_csv
+from ha_spark.energy.onboarding import (
+    BACKFILL_STATISTIC_ID,
+    SUPPORTED_UNITS,
+    backfill_load,
+    statistic_unit,
+)
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever, run_once
@@ -20,8 +26,9 @@ from ha_spark.energy.store import ConsumptionStore
 from ha_spark.ha.models import StateChangedEvent
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.state_cache import StateCache
+from ha_spark.ha.statistics import list_statistic_ids
 from ha_spark.ha.websocket import HomeAssistantWebSocket
-from ha_spark.health import exit_code, format_report, run_health
+from ha_spark.health import Status, check_load_history, exit_code, format_report, run_health
 from ha_spark.logging import get_logger, setup_logging
 
 log = get_logger(__name__)
@@ -99,6 +106,46 @@ async def _cmd_run(settings: Settings, *, once: bool) -> int:
     return 0
 
 
+async def _cmd_onboard(settings: Settings) -> int:
+    """Report load-history readiness for the slot-profile forecast."""
+    result = await check_load_history(settings)
+    print(format_report([result]))
+    return 0 if result.status is Status.OK else 2
+
+
+async def _cmd_backfill_load(settings: Settings, *, source: str | None, list_only: bool) -> int:
+    """Backfill ha_spark:house_load from an existing statistic, or list candidates."""
+    if list_only:
+        metas = await list_statistic_ids(
+            settings.ha_websocket_url, settings.auth_token, timeout=settings.ha_timeout
+        )
+        candidates = [m for m in metas if statistic_unit(m) in SUPPORTED_UNITS]
+        for meta in sorted(candidates, key=lambda m: str(m.get("statistic_id"))):
+            kind = "mean power" if meta.get("has_mean") else "energy sum"
+            print(f"{meta['statistic_id']:<70} {statistic_unit(meta):<4} ({kind})")
+        print(f"\n{len(candidates)} backfill-capable statistics.")
+        return 0
+    entity = source or settings.backfill_source_entity
+    if not entity:
+        print(
+            "No source entity: pass --from <entity_id> or set BACKFILL_SOURCE_ENTITY "
+            "(use --list to see candidates).",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        count, span = await backfill_load(settings, entity)
+    except (ValueError, RuntimeError) as exc:
+        print(f"Backfill failed: {exc}", file=sys.stderr)
+        return 2
+    print(f"Imported {count} hourly stats ({span}) from {entity} into {BACKFILL_STATISTIC_ID}.")
+    print(
+        f"Set CONSUMPTION_ENERGY_ENTITY={BACKFILL_STATISTIC_ID} to use it for the load "
+        "forecast, then run `ha-spark onboard` to confirm readiness."
+    )
+    return 0
+
+
 async def _store_and_report(
     settings: Settings, intervals: list[ConsumptionInterval], source: str
 ) -> int:
@@ -166,6 +213,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--once", action="store_true", help="Run immediately and exit (skip the daily schedule)"
     )
 
+    sub.add_parser("onboard", help="Check load-history readiness for the slot-profile forecast")
+
+    p_bf = sub.add_parser(
+        "backfill-load",
+        help="Backfill house-load history (ha_spark:house_load) from an existing statistic",
+    )
+    p_bf.add_argument(
+        "--from",
+        dest="source",
+        metavar="ENTITY_ID",
+        help="Source statistic to build history from (default: BACKFILL_SOURCE_ENTITY)",
+    )
+    p_bf.add_argument(
+        "--list", dest="list_only", action="store_true", help="List backfill-capable statistics"
+    )
+
     p_csv = sub.add_parser(
         "import-csv", help="Import Octopus half-hourly grid-import CSV export(s) (cost data)"
     )
@@ -209,6 +272,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         return asyncio.run(_cmd_run(settings, once=args.once))
+
+    if args.command == "onboard":
+        return asyncio.run(_cmd_onboard(settings))
+
+    if args.command == "backfill-load":
+        return asyncio.run(
+            _cmd_backfill_load(settings, source=args.source, list_only=args.list_only)
+        )
 
     if args.command == "import-csv":
         return _cmd_import_csv(settings, args.paths)

@@ -41,7 +41,7 @@ def load_timezone(name: str) -> ZoneInfo:
         return ZoneInfo("UTC")
 
 
-def _intervals_from_hourly_stats(rows: list[dict[str, Any]]) -> list[ConsumptionInterval]:
+def intervals_from_hourly_stats(rows: list[dict[str, Any]]) -> list[ConsumptionInterval]:
     """Split hourly stats rows into half-hour intervals (kWh halved, assumed uniform)."""
     intervals: list[ConsumptionInterval] = []
     for row in rows:
@@ -74,7 +74,7 @@ async def predict_home_load(settings: Settings) -> LoadForecast:
             period="hour",
             timeout=settings.ha_timeout,
         )
-        intervals = _intervals_from_hourly_stats(rows)
+        intervals = intervals_from_hourly_stats(rows)
         profile = build_slot_profile(intervals, tz, min_days=settings.profile_min_days)
         if profile is not None:
             tomorrow = (datetime.now(tz) + timedelta(days=1)).date()

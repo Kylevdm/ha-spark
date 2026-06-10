@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 import respx
 from websockets.asyncio.server import ServerConnection, serve
 
+from ha_spark import health
 from ha_spark.config import Settings
 from ha_spark.ha.websocket import HomeAssistantAuthError, HomeAssistantWebSocket
 from ha_spark.health import (
@@ -17,6 +20,7 @@ from ha_spark.health import (
     Status,
     check_ha_rest,
     check_ha_websocket,
+    check_load_history,
     check_ollama,
     check_sqlite,
     exit_code,
@@ -118,6 +122,57 @@ async def test_check_sqlite_ok(tmp_path: Path) -> None:
     res = await check_sqlite(Settings(db_path=str(db)))
     assert res.status is Status.OK
     assert db.exists()
+
+
+# --- Load history check ---
+
+
+def _hourly_rows(days: int) -> list[dict[str, Any]]:
+    today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    return [
+        {"start": (today - timedelta(days=d, hours=-h)).timestamp() * 1000, "change": 1.0}
+        for d in range(days, 0, -1)
+        for h in range(24)
+    ]
+
+
+async def test_check_load_history_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_stats(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        return _hourly_rows(days=14)
+
+    monkeypatch.setattr(health, "statistics_during_period", fake_stats)
+    res = await check_load_history(Settings())
+    assert res.status is Status.OK
+    assert "slot profile ready" in res.detail
+
+
+async def test_check_load_history_warns_when_thin(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_stats(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        return _hourly_rows(days=3)
+
+    monkeypatch.setattr(health, "statistics_during_period", fake_stats)
+    res = await check_load_history(Settings())
+    assert res.status is Status.WARN
+    assert "backfill-load" in res.detail
+
+
+async def test_check_load_history_warns_when_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_stats(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(health, "statistics_during_period", fake_stats)
+    res = await check_load_history(Settings())
+    assert res.status is Status.WARN
+    assert "no hourly history" in res.detail
+
+
+async def test_check_load_history_warns_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def boom(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        raise RuntimeError("ws down")
+
+    monkeypatch.setattr(health, "statistics_during_period", boom)
+    res = await check_load_history(Settings())
+    assert res.status is Status.WARN
 
 
 # --- WebSocket probe + check ---
