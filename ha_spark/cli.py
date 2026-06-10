@@ -1,4 +1,9 @@
-"""Command-line interface for ha-spark."""
+"""ha-spark: a local-first energy planner and agent for Home Assistant.
+
+Reads live state over the HA REST/WebSocket APIs, plans the overnight battery
+charge deterministically, and (per PROACTIVE_MODE) applies it to the inverter.
+Configure via .env / add-on options; see .env.example for every setting.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +14,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ha_spark.config import ConfigError, Settings, load_settings
+from ha_spark.energy.backtest import backtest_cost, format_backtest
 from ha_spark.energy.chargers import SolisCharger
+from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.models import ConsumptionInterval
 from ha_spark.energy.octopus import OctopusApiError, fetch_consumption, parse_octopus_csv
 from ha_spark.energy.onboarding import (
@@ -21,7 +28,7 @@ from ha_spark.energy.onboarding import (
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever, run_once
-from ha_spark.energy.sources import gather_inputs
+from ha_spark.energy.sources import gather_inputs, parse_time
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.ha.models import StateChangedEvent
 from ha_spark.ha.rest import HomeAssistantRest
@@ -174,6 +181,30 @@ def _cmd_import_csv(settings: Settings, paths: list[str]) -> int:
     return asyncio.run(_store_and_report(settings, intervals, "csv"))
 
 
+async def _cmd_backtest(settings: Settings, *, days: int) -> int:
+    """Rate stored grid import under the two-rate tariff and print the summary."""
+    since = datetime.now(UTC) - timedelta(days=days)
+    async with ConsumptionStore(settings.db_path) as store:
+        intervals = await store.load_since(since)
+    summary = backtest_cost(
+        intervals,
+        window_start=parse_time(settings.charge_window_start),
+        window_end=parse_time(settings.charge_window_end),
+        rate_offpeak=settings.rate_offpeak_gbp_kwh,
+        rate_peak=settings.rate_peak_gbp_kwh,
+        tz=load_timezone(settings.timezone),
+    )
+    if summary is None:
+        print(
+            "No stored consumption in the window; run `import-csv` or "
+            "`pull-consumption` first.",
+            file=sys.stderr,
+        )
+        return 2
+    print(format_backtest(summary))
+    return 0
+
+
 async def _cmd_pull_consumption(settings: Settings, *, days: int) -> int:
     """Pull half-hourly consumption from the Octopus API (incremental)."""
     period_from = datetime.now(UTC) - timedelta(days=days)
@@ -189,35 +220,103 @@ async def _cmd_pull_consumption(settings: Settings, *, days: int) -> int:
     return await _store_and_report(settings, intervals, "api")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="ha-spark", description=__doc__)
-    sub = parser.add_subparsers(dest="command", required=True)
+_EPILOG = """\
+examples:
+  ha-spark states --domain sensor          list all sensor entities
+  ha-spark states --watch                  list entities, then stream live changes
+  ha-spark health                          probe HA / Ollama / SQLite / load history
+  ha-spark onboard                         check load-history readiness for the forecast
+  ha-spark plan                            compute tonight's charge plan
+  ha-spark plan --apply                    ...and run the charger (per PROACTIVE_MODE)
+  ha-spark run                             daemon: plan + apply daily at PLAN_RUN_TIME
+  ha-spark run --once                      plan + apply immediately, then exit
+  ha-spark backfill-load --list            show statistics usable as a load source
+  ha-spark backfill-load --from sensor.x   rebuild house-load history from sensor.x
+  ha-spark import-csv export.csv           import an Octopus dashboard CSV (cost data)
+  ha-spark pull-consumption --days 60      pull grid import from the Octopus API
+  ha-spark backtest --days 30              rate stored grid import under the tariff
+"""
 
-    p_states = sub.add_parser("states", help="List Home Assistant entity states")
-    p_states.add_argument("--domain", help="Filter by domain (e.g. light, sensor)")
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ha-spark",
+        description=__doc__,
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    p_states = sub.add_parser(
+        "states",
+        help="List Home Assistant entity states",
+        description="List every entity HA knows about (entity_id, state, friendly name), "
+        "seeded over REST. With --watch, keep streaming state changes over WebSocket "
+        "until Ctrl-C.",
+    )
     p_states.add_argument(
-        "--watch", action="store_true", help="Stream live state changes over WebSocket"
+        "--domain",
+        metavar="DOMAIN",
+        help="Only show entities of this domain (e.g. light, sensor, number)",
+    )
+    p_states.add_argument(
+        "--watch",
+        action="store_true",
+        help="After listing, stream live state changes over WebSocket (Ctrl-C to stop)",
     )
 
-    sub.add_parser("health", help="Probe HA, Ollama and storage; exit non-zero on failure")
+    sub.add_parser(
+        "health",
+        help="Probe HA, Ollama, storage and load history; exit non-zero on failure",
+        description="Doctor command: checks the HA REST API, the HA WebSocket auth "
+        "handshake, the Ollama endpoint, that the SQLite path is writable, and whether "
+        "the load forecast has enough history. Exit 0 = all green, 1 = a critical "
+        "dependency (HA/SQLite) failed, 2 = degraded (e.g. Ollama down, thin history).",
+    )
 
-    p_plan = sub.add_parser("plan", help="Compute the battery charge plan")
+    sub.add_parser(
+        "onboard",
+        help="Check load-history readiness for the slot-profile forecast",
+        description="Report whether CONSUMPTION_ENERGY_ENTITY has enough hourly history "
+        "for the slot-profile forecast (PROFILE_MIN_DAYS distinct days incl. 2+ weekend "
+        "days). Exit 0 when ready, 2 otherwise — fix gaps with `backfill-load`.",
+    )
+
+    p_plan = sub.add_parser(
+        "plan",
+        help="Compute the overnight battery charge plan",
+        description="Read live HA state (SoC, Solcast solar, Octopus dispatches, load "
+        "forecast), compute the overnight charge deterministically, and print the plan "
+        "with projected two-rate costs.",
+    )
     p_plan.add_argument(
-        "--apply", action="store_true", help="Run the charger (simulate/on per PROACTIVE_MODE)"
+        "--apply",
+        action="store_true",
+        help="Run the charger with the computed plan. PROACTIVE_MODE gates side effects: "
+        "off = compute only, simulate = log intended writes (default), on = real "
+        "service calls to the inverter",
     )
 
     p_run = sub.add_parser(
-        "run", help="Run the planner daemon: compute & apply the plan once per day"
+        "run",
+        help="Daemon: compute & apply the plan once per day",
+        description="Long-running loop that computes and applies the charge plan once "
+        "per local calendar day at PLAN_RUN_TIME (default 22:00), retrying on failure "
+        "until the day rolls over. Writes are still gated by PROACTIVE_MODE.",
     )
     p_run.add_argument(
-        "--once", action="store_true", help="Run immediately and exit (skip the daily schedule)"
+        "--once",
+        action="store_true",
+        help="Compute & apply immediately and exit (skip the daily schedule)",
     )
-
-    sub.add_parser("onboard", help="Check load-history readiness for the slot-profile forecast")
 
     p_bf = sub.add_parser(
         "backfill-load",
-        help="Backfill house-load history (ha_spark:house_load) from an existing statistic",
+        help="Rebuild house-load history from an existing HA statistic",
+        description="Read hourly long-term statistics from a source entity (mean-power "
+        "W/kW or energy Wh/kWh — unit auto-detected), convert to hourly kWh, and import "
+        "them as the external statistic ha_spark:house_load via the recorder WS API. "
+        "Afterwards set CONSUMPTION_ENERGY_ENTITY=ha_spark:house_load. Idempotent.",
     )
     p_bf.add_argument(
         "--from",
@@ -226,19 +325,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Source statistic to build history from (default: BACKFILL_SOURCE_ENTITY)",
     )
     p_bf.add_argument(
-        "--list", dest="list_only", action="store_true", help="List backfill-capable statistics"
+        "--list",
+        dest="list_only",
+        action="store_true",
+        help="List backfill-capable statistics (with units) instead of importing",
     )
 
     p_csv = sub.add_parser(
-        "import-csv", help="Import Octopus half-hourly grid-import CSV export(s) (cost data)"
+        "import-csv",
+        help="Import Octopus grid-import CSV export(s) into the cost store",
+        description="Parse half-hourly consumption CSV(s) exported from the Octopus "
+        "dashboard into the local store. This is grid *import* (cost/backtest data) — "
+        "it does not feed the load forecast.",
     )
     p_csv.add_argument("paths", nargs="+", metavar="PATH", help="CSV file(s) to import")
 
     p_pull = sub.add_parser(
-        "pull-consumption", help="Pull half-hourly grid import from the Octopus API (cost data)"
+        "pull-consumption",
+        help="Pull grid import from the Octopus API into the cost store",
+        description="Fetch half-hourly grid import from the Octopus REST API "
+        "(needs OCTOPUS_API_KEY, OCTOPUS_MPAN, OCTOPUS_METER_SERIAL). Incremental: "
+        "resumes from the newest stored interval.",
     )
     p_pull.add_argument(
-        "--days", type=int, default=30, help="History window to fetch (default 30)"
+        "--days",
+        type=int,
+        default=30,
+        metavar="N",
+        help="History window to fetch when the store is empty (default: 30)",
+    )
+
+    p_bt = sub.add_parser(
+        "backtest",
+        help="Rate stored grid import under the configured two-rate tariff",
+        description="Summarise what the stored half-hourly grid import cost under "
+        "RATE_OFFPEAK/RATE_PEAK, classifying each interval by the fixed charge window. "
+        "Populate the store with `import-csv` or `pull-consumption` first.",
+    )
+    p_bt.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        metavar="N",
+        help="How far back to rate stored intervals (default: 30)",
     )
 
     return parser
@@ -286,6 +415,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "pull-consumption":
         return asyncio.run(_cmd_pull_consumption(settings, days=args.days))
+
+    if args.command == "backtest":
+        return asyncio.run(_cmd_backtest(settings, days=args.days))
 
     parser.error(f"unknown command: {args.command}")
     return 2  # pragma: no cover - argparse exits first

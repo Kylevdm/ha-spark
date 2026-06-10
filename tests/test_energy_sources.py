@@ -96,6 +96,58 @@ async def test_gather_inputs_tolerates_missing_entities(monkeypatch: pytest.Monk
 
 
 @respx.mock
+async def test_solar_percentile_prefers_estimate_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_load(_s: Settings) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.get(f"{BASE}/states/sensor.solar").mock(
+        return_value=_state("sensor.solar", "8.75", {"estimate10": 5.5, "estimate90": 12.0})
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = Settings(**{**_settings().model_dump(), "solar_percentile": 10})
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, _, _ = await gather_inputs(s, rest)
+    assert inputs.solar_tomorrow_kwh == 5.5
+
+
+@respx.mock
+async def test_solar_percentile_falls_back_to_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_load(_s: Settings) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.get(f"{BASE}/states/sensor.solar").mock(
+        return_value=_state("sensor.solar", "8.75")  # no estimate10 attribute
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = Settings(**{**_settings().model_dump(), "solar_percentile": 10})
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, _, _ = await gather_inputs(s, rest)
+    assert inputs.solar_tomorrow_kwh == 8.75
+
+
+def test_parse_detailed_forecast_percentile_key() -> None:
+    raw = [
+        {"period_start": "2026-06-11T12:00:00+01:00", "pv_estimate": 2.0, "pv_estimate10": 1.0}
+    ]
+    assert sources._parse_detailed_forecast(raw, 50) == [
+        (sources.datetime.fromisoformat("2026-06-11T12:00:00+01:00"), 2.0)
+    ]
+    assert sources._parse_detailed_forecast(raw, 10) == [
+        (sources.datetime.fromisoformat("2026-06-11T12:00:00+01:00"), 1.0)
+    ]
+    # Missing percentile key falls back to the median estimate.
+    bare = [{"period_start": "2026-06-11T12:00:00+01:00", "pv_estimate": 2.0}]
+    parsed = sources._parse_detailed_forecast(bare, 10)
+    assert parsed is not None and parsed[0][1] == 2.0
+
+
+@respx.mock
 async def test_gather_inputs_flags_unavailable_soc(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_load(_s: Settings) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")

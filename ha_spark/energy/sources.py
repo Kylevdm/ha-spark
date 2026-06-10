@@ -60,17 +60,27 @@ def _parse_dispatches(raw: Any) -> tuple[DispatchSlot, ...]:
     return tuple(slots)
 
 
-def _parse_detailed_forecast(raw: Any) -> list[tuple[datetime, float]] | None:
-    """Tolerantly parse Solcast's ``detailedForecast`` attribute (shape varies)."""
+def _parse_detailed_forecast(
+    raw: Any, percentile: int = 50
+) -> list[tuple[datetime, float]] | None:
+    """Tolerantly parse Solcast's ``detailedForecast`` attribute (shape varies).
+
+    ``percentile`` selects ``pv_estimate10``/``pv_estimate90`` when present,
+    falling back to the median ``pv_estimate``.
+    """
     if not isinstance(raw, list):
         return None
+    key = "pv_estimate" if percentile == 50 else f"pv_estimate{percentile}"
     entries: list[tuple[datetime, float]] = []
     for item in raw:
         if not isinstance(item, dict):
             continue
         try:
             start = datetime.fromisoformat(str(item["period_start"]))
-            entries.append((start, float(item["pv_estimate"])))
+            value = item.get(key)
+            if value is None:
+                value = item["pv_estimate"]
+            entries.append((start, float(value)))
         except (KeyError, ValueError, TypeError):
             continue
     return entries or None
@@ -105,7 +115,9 @@ def build_config(settings: Settings, voltage_v: float) -> PlannerConfig:
         window_end=parse_time(settings.charge_window_end),
         rate_offpeak=settings.rate_offpeak_gbp_kwh,
         rate_peak=settings.rate_peak_gbp_kwh,
+        rate_export=settings.rate_export_gbp_kwh,
         buffer_pct=settings.charge_buffer_pct,
+        charge_efficiency=settings.charge_efficiency,
     )
 
 
@@ -136,6 +148,14 @@ async def gather_inputs(
 
     forecast = await predict_home_load(settings)
     solar_kwh = _to_float(solar.state if solar else None, 0.0)
+    # The sensor state is Solcast's median day total; estimate10/estimate90
+    # attributes carry the conservative/optimistic totals.
+    if settings.solar_percentile != 50 and solar is not None:
+        percentile_total = _opt_float(
+            solar.attributes.get(f"estimate{settings.solar_percentile}")
+        )
+        if percentile_total is not None:
+            solar_kwh = percentile_total
 
     load_slots: tuple[float, ...] | None = None
     solar_slots: tuple[float, ...] | None = None
@@ -147,7 +167,8 @@ async def gather_inputs(
         load_slots, horizon_start = _slot_horizon(forecast.slots, window_start, window_end, tz)
         tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
         detailed = _parse_detailed_forecast(
-            solar.attributes.get("detailedForecast") if solar else None
+            solar.attributes.get("detailedForecast") if solar else None,
+            settings.solar_percentile,
         )
         solar_day = distribute_solar(solar_kwh, detailed, tz, tomorrow)
         solar_slots, _ = _slot_horizon(solar_day, window_start, window_end, tz)
