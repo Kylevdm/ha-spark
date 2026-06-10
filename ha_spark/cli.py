@@ -147,12 +147,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p_csv = sub.add_parser(
-        "import-csv", help="Import Octopus half-hourly consumption CSV export(s)"
+        "import-csv", help="Import Octopus half-hourly grid-import CSV export(s) (cost data)"
     )
     p_csv.add_argument("paths", nargs="+", metavar="PATH", help="CSV file(s) to import")
 
     p_pull = sub.add_parser(
-        "pull-consumption", help="Pull half-hourly consumption from the Octopus API"
+        "pull-consumption", help="Pull half-hourly grid import from the Octopus API (cost data)"
     )
     p_pull.add_argument(
         "--days", type=int, default=30, help="History window to fetch (default 30)"
