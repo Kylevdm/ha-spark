@@ -182,6 +182,41 @@ def test_slot_model_respects_headroom_and_max_current() -> None:
     assert plan.overnight_current_a <= 62.5
 
 
+def test_fill_strategy_charges_to_cap() -> None:
+    inp = PlannerInputs(soc_now=69, solar_tomorrow_kwh=3.4, predicted_home_load_kwh=17.7)
+    plan = compute_plan(inp, cfg(strategy="fill"))
+    headroom = 26.88 * (90 - 69) / 100
+    assert plan.required_kwh == pytest.approx(headroom)
+    assert plan.target_soc == pytest.approx(90.0)
+    assert plan.strategy == "fill"
+    # Fill ignores need entirely: it buys more than the deficit strategy would.
+    assert plan.required_kwh > compute_plan(inp, cfg()).required_kwh
+
+
+def test_fill_strategy_zero_at_cap() -> None:
+    inp = PlannerInputs(soc_now=90, solar_tomorrow_kwh=3.4, predicted_home_load_kwh=17.7)
+    plan = compute_plan(inp, cfg(strategy="fill"))
+    assert plan.required_kwh == 0.0
+    assert plan.overnight_current_a == 0.0
+
+
+def test_pre_window_drain_reduces_usable() -> None:
+    base = PlannerInputs(soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
+    drained = PlannerInputs(
+        soc_now=30,
+        solar_tomorrow_kwh=8.75,
+        predicted_home_load_kwh=24.2,
+        pre_window_drain_kwh=1.0,
+    )
+    plan_base = compute_plan(base, cfg())
+    plan_drained = compute_plan(drained, cfg())
+    # The kWh drained before the window must be bought back on top.
+    assert plan_drained.required_kwh == pytest.approx(plan_base.required_kwh + 1.0)
+    assert plan_drained.pre_window_drain_kwh == 1.0
+    # Raw usable_now is reported unchanged; only sizing uses the window value.
+    assert plan_drained.usable_now_kwh == pytest.approx(plan_base.usable_now_kwh)
+
+
 def test_charge_efficiency_inflates_purchase_and_current() -> None:
     inp = PlannerInputs(soc_now=20, solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
     lossless = compute_plan(inp, cfg())

@@ -48,6 +48,7 @@ _OPTION_KEYS = frozenset(
         "target_soc_cap",
         "max_charge_current_a",
         "charge_buffer_pct",
+        "charge_strategy",
         "solar_haircut_k",
         "forecast_days",
         "expected_load_kwh",
@@ -123,6 +124,9 @@ class Settings(BaseSettings):
     charge_buffer_pct: float = Field(default=20.0)
     # Round-trip AC->DC->AC efficiency: the planner buys required/efficiency.
     charge_efficiency: float = Field(default=0.90)
+    # Overnight sizing: "deficit" buys only the forecast shortfall;
+    # "fill" charges to target_soc_cap every night (wins once export > off-peak).
+    charge_strategy: Literal["deficit", "fill"] = Field(default="deficit")
 
     # Forecast / model coefficients.
     solar_haircut_k: float = Field(default=1.0)

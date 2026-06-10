@@ -6,10 +6,16 @@ v1 model (daily energy balance, used when no per-slot forecast is available):
     cheap_covered   = home-load energy during daytime dispatch slots (cheap grid)
     deficit         = max(0, home_load - effective_solar - cheap_covered)
     usable_now      = capacity * (soc_now - min_soc) / 100
+    usable_at_window= usable_now - pre_window_drain   (load before the window opens)
     buffered        = deficit * (1 + buffer_pct / 100)
-    required        = clamp(buffered - usable_now, 0, headroom_to_cap)
+    required        = clamp(buffered - usable_at_window, 0, headroom_to_cap)
     purchase        = required / charge_efficiency   (AC kWh bought)
     current_A       = clamp(purchase / (window_h * voltage/1000), 0, max_A)
+
+With ``strategy="fill"`` the sizing instead charges to the target cap every
+night (``required = headroom``) — optimal once the export rate exceeds
+off-peak; the carried-over surplus is an asset the cost projection does not
+model.
 
 v2 model (per-slot horizon, when ``inputs.load_slots`` is set): the horizon is 48
 half-hour slots starting at the charge-window start tonight. Slots inside the
@@ -139,8 +145,16 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
         export_kwh = max(0.0, effective_solar - inputs.predicted_home_load_kwh)
 
     buffered_deficit = deficit * (1.0 + cfg.buffer_pct / 100.0)
-    required = _clamp(buffered_deficit - usable_now, 0.0, headroom)
-    uncovered = max(0.0, buffered_deficit - usable_now - required)
+    # The horizon starts at the window, so load between now and then drains
+    # the battery invisibly — size against the usable energy at window start.
+    usable_at_window = usable_now - inputs.pre_window_drain_kwh
+    if cfg.strategy == "fill":
+        # Fill to the cap regardless of need: optimal once export pays more
+        # than off-peak; surplus carries over to later days (not costed here).
+        required = headroom
+    else:
+        required = _clamp(buffered_deficit - usable_at_window, 0.0, headroom)
+    uncovered = max(0.0, buffered_deficit - usable_at_window - required)
     # The grid supplies required/efficiency AC kWh to store `required` kWh
     # (round-trip: AC->DC charging now, DC->AC discharge to the load later).
     efficiency = cfg.charge_efficiency if cfg.charge_efficiency > 0 else 1.0
@@ -210,4 +224,6 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
         planned_cost=planned_cost,
         charge_efficiency=efficiency,
         export_revenue=export_revenue,
+        strategy=cfg.strategy,
+        pre_window_drain_kwh=inputs.pre_window_drain_kwh,
     )
