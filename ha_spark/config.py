@@ -62,6 +62,7 @@ _OPTION_KEYS = frozenset(
         "profile_history_days",
         "timezone",
         "plan_run_time",
+        "backfill_source_entity",
         "octopus_api_key",
         "octopus_mpan",
         "octopus_meter_serial",
@@ -138,6 +139,10 @@ class Settings(BaseSettings):
 
     # Local time (HH:MM) at which `ha-spark run` computes/applies the daily plan.
     plan_run_time: str = Field(default="22:00")
+
+    # Statistic whose history seeds `ha-spark backfill-load` (a true-load power
+    # or energy sensor); the CLI's --from flag overrides it.
+    backfill_source_entity: str = Field(default="")
 
     # Octopus REST API (for `pull-consumption`; CSV import needs none of these).
     octopus_api_key: str = Field(default="")
