@@ -14,6 +14,7 @@ from ha_spark.energy.models import ConsumptionInterval
 from ha_spark.energy.octopus import OctopusApiError, fetch_consumption, parse_octopus_csv
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.report import format_plan
+from ha_spark.energy.scheduler import run_forever, run_once
 from ha_spark.energy.sources import gather_inputs
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.ha.models import StateChangedEvent
@@ -86,6 +87,18 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
     return 0
 
 
+async def _cmd_run(settings: Settings, *, once: bool) -> int:
+    """Run the planner daemon: compute & apply once, or loop daily."""
+    if once:
+        await run_once(settings)
+        return 0
+    try:
+        await run_forever(settings)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    return 0
+
+
 async def _store_and_report(
     settings: Settings, intervals: list[ConsumptionInterval], source: str
 ) -> int:
@@ -146,6 +159,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply", action="store_true", help="Run the charger (simulate/on per PROACTIVE_MODE)"
     )
 
+    p_run = sub.add_parser(
+        "run", help="Run the planner daemon: compute & apply the plan once per day"
+    )
+    p_run.add_argument(
+        "--once", action="store_true", help="Run immediately and exit (skip the daily schedule)"
+    )
+
     p_csv = sub.add_parser(
         "import-csv", help="Import Octopus half-hourly grid-import CSV export(s) (cost data)"
     )
@@ -186,6 +206,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "plan":
         return asyncio.run(_cmd_plan(settings, apply=args.apply))
+
+    if args.command == "run":
+        return asyncio.run(_cmd_run(settings, once=args.once))
 
     if args.command == "import-csv":
         return _cmd_import_csv(settings, args.paths)
