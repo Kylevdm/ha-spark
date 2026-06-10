@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from ha_spark.cli import _cmd_import_csv
+from ha_spark import cli
+from ha_spark.cli import _cmd_import_csv, _cmd_run
 from ha_spark.config import Settings
 
 _CSV = (
@@ -36,3 +37,26 @@ def test_import_csv_missing_file_errors(
     settings = Settings(db_path=str(tmp_path / "test.db"))
     assert _cmd_import_csv(settings, [str(tmp_path / "nope.csv")]) == 2
     assert "Could not import" in capsys.readouterr().err
+
+
+async def test_run_once_invokes_run_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[Settings] = []
+
+    async def fake_run_once(s: Settings) -> None:
+        calls.append(s)
+
+    monkeypatch.setattr(cli, "run_once", fake_run_once)
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+
+    assert await _cmd_run(settings, once=True) == 0
+    assert calls == [settings]
+
+
+async def test_run_forever_handles_keyboard_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_run_forever(_s: Settings) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "run_forever", fake_run_forever)
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+
+    assert await _cmd_run(settings, once=False) == 0

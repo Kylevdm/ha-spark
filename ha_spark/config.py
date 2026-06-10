@@ -61,6 +61,7 @@ _OPTION_KEYS = frozenset(
         "profile_min_days",
         "profile_history_days",
         "timezone",
+        "plan_run_time",
         "octopus_api_key",
         "octopus_mpan",
         "octopus_meter_serial",
@@ -134,6 +135,9 @@ class Settings(BaseSettings):
     profile_min_days: int = Field(default=7)
     profile_history_days: int = Field(default=60)
     timezone: str = Field(default="Europe/London")
+
+    # Local time (HH:MM) at which `ha-spark run` computes/applies the daily plan.
+    plan_run_time: str = Field(default="22:00")
 
     # Octopus REST API (for `pull-consumption`; CSV import needs none of these).
     octopus_api_key: str = Field(default="")
