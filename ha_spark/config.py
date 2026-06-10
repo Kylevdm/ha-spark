@@ -150,7 +150,9 @@ class Settings(BaseSettings):
     )
     ev_plug_entity: str = Field(default="sensor.myenergi_zappi_22300254_plug_status")
     ev_status_entity: str = Field(default="sensor.myenergi_zappi_22300254_status")
-    consumption_energy_entity: str = Field(default="sensor.house_consumption_energy")
+    # True house load excluding battery/EV; historic_household_usage backfills
+    # hourly stats to Dec 2025 (vs ~Jun 2026 for sensor.house_consumption_energy).
+    consumption_energy_entity: str = Field(default="sensor.historic_household_usage")
     charge_current_entity: str = Field(default="number.solisac_timed_charge_current")
     inverter_power_switch_entity: str = Field(default="select.solisac_power_switch")
     ha_template_charge_needed_entity: str = Field(default="sensor.charge_energy_needed")
