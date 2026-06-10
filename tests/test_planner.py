@@ -50,6 +50,15 @@ def test_zero_need_when_full_and_sunny() -> None:
     assert plan.overnight_current_a == 0
 
 
+def test_soc_validity_passes_through_to_plan() -> None:
+    inp = PlannerInputs(
+        soc_now=0, solar_tomorrow_kwh=3, predicted_home_load_kwh=10, soc_valid=False
+    )
+    assert compute_plan(inp, cfg()).soc_valid is False
+    valid = PlannerInputs(soc_now=30, solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
+    assert compute_plan(valid, cfg()).soc_valid is True
+
+
 def test_buffer_inflates_required_within_headroom() -> None:
     inp = PlannerInputs(soc_now=20, solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
     plan = compute_plan(inp, cfg(buffer_pct=20.0))

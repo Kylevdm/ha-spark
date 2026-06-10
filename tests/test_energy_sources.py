@@ -66,6 +66,7 @@ async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) 
         inputs, cfg, load_source = await gather_inputs(s, rest)
 
     assert inputs.soc_now == 30.0
+    assert inputs.soc_valid is True
     assert cfg.voltage_v == 51.0
     assert inputs.solar_tomorrow_kwh == 8.75
     assert inputs.predicted_home_load_kwh == 24.0
@@ -89,5 +90,25 @@ async def test_gather_inputs_tolerates_missing_entities(monkeypatch: pytest.Monk
         inputs, cfg, _ = await gather_inputs(s, rest)
 
     assert inputs.soc_now == 0.0
+    assert inputs.soc_valid is False
     assert cfg.voltage_v == s.battery_voltage_v  # fell back to config default
     assert inputs.dispatches == ()
+
+
+@respx.mock
+async def test_gather_inputs_flags_unavailable_soc(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_load(_s: Settings) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.get(f"{BASE}/states/sensor.soc").mock(
+        return_value=_state("sensor.soc", "unavailable")
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = _settings()
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, _, _ = await gather_inputs(s, rest)
+
+    assert inputs.soc_now == 0.0
+    assert inputs.soc_valid is False

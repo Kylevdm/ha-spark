@@ -81,6 +81,9 @@ class PlannerInputs:
     soc_now: float
     solar_tomorrow_kwh: float
     predicted_home_load_kwh: float
+    # False when the SoC sensor was unreadable (soc_now then defaults to 0);
+    # chargers must refuse real writes on an invalid SoC.
+    soc_valid: bool = True
     dispatches: tuple[DispatchSlot, ...] = ()
     ev_charging: bool = False
     ha_template_needed: float | None = None
@@ -122,6 +125,7 @@ class ChargePlan:
     ev_charging: bool
     ha_template_needed: float | None
     actions: tuple[ChargeAction, ...]
+    soc_valid: bool = True  # False -> SoC sensor unreadable; block real writes
     model: str = "daily"  # "slots" (per-slot horizon) | "daily" (v1 balance)
     expensive_load_kwh: float | None = None  # net load in peak-rate slots (slot model)
     baseline_cost: float | None = None  # projected GBP without battery
