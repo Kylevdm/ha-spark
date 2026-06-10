@@ -34,7 +34,7 @@ def _opt_float(value: Any) -> float | None:
         return None
 
 
-def _parse_time(hhmm: str) -> time:
+def parse_time(hhmm: str) -> time:
     h, m = hhmm.split(":")
     return time(int(h), int(m))
 
@@ -101,8 +101,8 @@ def build_config(settings: Settings, voltage_v: float) -> PlannerConfig:
         target_cap=settings.target_soc_cap,
         max_current_a=settings.max_charge_current_a,
         solar_haircut_k=settings.solar_haircut_k,
-        window_start=_parse_time(settings.charge_window_start),
-        window_end=_parse_time(settings.charge_window_end),
+        window_start=parse_time(settings.charge_window_start),
+        window_end=parse_time(settings.charge_window_end),
         rate_offpeak=settings.rate_offpeak_gbp_kwh,
         rate_peak=settings.rate_peak_gbp_kwh,
         buffer_pct=settings.charge_buffer_pct,
@@ -142,8 +142,8 @@ async def gather_inputs(
     horizon_start: datetime | None = None
     if forecast.slots is not None:
         tz = load_timezone(settings.timezone)
-        window_start = _parse_time(settings.charge_window_start)
-        window_end = _parse_time(settings.charge_window_end)
+        window_start = parse_time(settings.charge_window_start)
+        window_end = parse_time(settings.charge_window_end)
         load_slots, horizon_start = _slot_horizon(forecast.slots, window_start, window_end, tz)
         tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
         detailed = _parse_detailed_forecast(
