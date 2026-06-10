@@ -67,6 +67,7 @@ class PlannerConfig:
     rate_export: float = 0.0  # GBP/kWh feed-in; 0 disables export revenue
     buffer_pct: float = 20.0  # safety margin applied to the forecast deficit
     charge_efficiency: float = 0.90  # round-trip AC->DC->AC; buy required/efficiency
+    strategy: str = "deficit"  # "deficit" (buy the shortfall) | "fill" (to target cap)
 
     @property
     def window_hours(self) -> float:
@@ -86,6 +87,9 @@ class PlannerInputs:
     # False when the SoC sensor was unreadable (soc_now then defaults to 0);
     # chargers must refuse real writes on an invalid SoC.
     soc_valid: bool = True
+    # Forecast battery drain between plan time and the charge-window start
+    # (the horizon starts at the window, so this load is otherwise invisible).
+    pre_window_drain_kwh: float = 0.0
     dispatches: tuple[DispatchSlot, ...] = ()
     ev_charging: bool = False
     ha_template_needed: float | None = None
@@ -134,3 +138,5 @@ class ChargePlan:
     planned_cost: float | None = None  # projected GBP with this plan
     charge_efficiency: float = 1.0  # round-trip efficiency used for sizing
     export_revenue: float | None = None  # projected GBP feed-in (None when disabled)
+    strategy: str = "deficit"  # sizing strategy used ("deficit" | "fill")
+    pre_window_drain_kwh: float = 0.0  # forecast drain before the window opens
