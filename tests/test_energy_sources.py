@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, time
 from typing import Any
 
 import httpx
@@ -11,7 +12,7 @@ import respx
 from ha_spark.config import Settings
 from ha_spark.energy import sources
 from ha_spark.energy.models import LoadForecast
-from ha_spark.energy.sources import gather_inputs
+from ha_spark.energy.sources import gather_inputs, pre_window_drain
 from ha_spark.ha.rest import HomeAssistantRest
 
 BASE = "http://ha.test/api"
@@ -93,6 +94,28 @@ async def test_gather_inputs_tolerates_missing_entities(monkeypatch: pytest.Monk
     assert inputs.soc_valid is False
     assert cfg.voltage_v == s.battery_voltage_v  # fell back to config default
     assert inputs.dispatches == ()
+
+
+def test_pre_window_drain_daily_fallback() -> None:
+    fc = LoadForecast(total_kwh=24.0, slots=None, source="t")
+    now = datetime(2026, 6, 10, 22, 0)
+    # 1.5 h until 23:30 at 1 kW average.
+    assert pre_window_drain(fc, now, time(23, 30), time(5, 30)) == pytest.approx(1.5)
+
+
+def test_pre_window_drain_sums_slots_with_proration() -> None:
+    fc = LoadForecast(total_kwh=24.0, slots=(0.5,) * 48, source="t")
+    now = datetime(2026, 6, 10, 22, 45)
+    # Half of the 22:30 slot (0.25) plus the full 23:00 slot (0.5).
+    assert pre_window_drain(fc, now, time(23, 30), time(5, 30)) == pytest.approx(0.75)
+
+
+def test_pre_window_drain_zero_inside_window_or_far_away() -> None:
+    fc = LoadForecast(total_kwh=24.0, slots=None, source="t")
+    inside = datetime(2026, 6, 11, 0, 30)  # window wraps midnight
+    assert pre_window_drain(fc, inside, time(23, 30), time(5, 30)) == 0.0
+    far = datetime(2026, 6, 10, 9, 0)  # 14.5 h before the window opens
+    assert pre_window_drain(fc, far, time(23, 30), time(5, 30)) == 0.0
 
 
 @respx.mock

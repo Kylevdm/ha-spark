@@ -33,12 +33,21 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
         deficit += f"  (+{plan.buffer_pct:.0f}% buffer -> {buffered:.2f})"
 
     required = f"{plan.required_kwh:.2f} kWh"
+    if plan.strategy == "fill":
+        required += f"  (fill to {plan.target_soc:.0f}%)"
     if plan.charge_efficiency < 1 and plan.required_kwh > 0:
         buy = plan.required_kwh / plan.charge_efficiency
         required += f"  (buy {buy:.2f} @ {plan.charge_efficiency:.0%} eff)"
 
+    usable = f"{plan.usable_now_kwh:.2f} kWh"
+    if plan.pre_window_drain_kwh > 0:
+        at_window = plan.usable_now_kwh - plan.pre_window_drain_kwh
+        usable += (
+            f"  (-{plan.pre_window_drain_kwh:.2f} by window start -> {at_window:.2f})"
+        )
+
     lines += [
-        f"  Usable now         {plan.usable_now_kwh:.2f} kWh",
+        f"  Usable now         {usable}",
         f"  Energy deficit     {deficit}",
         f"  Required charge    {required}  ->  target {plan.target_soc:.0f}%",
         f"  Charge current     {plan.overnight_current_a:.0f} A over {plan.window_hours:.1f} h",

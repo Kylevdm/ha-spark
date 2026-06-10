@@ -8,7 +8,14 @@ from zoneinfo import ZoneInfo
 
 from ha_spark.config import Settings
 from ha_spark.energy.forecast import load_timezone, predict_home_load
-from ha_spark.energy.models import SLOTS_PER_DAY, DispatchSlot, PlannerConfig, PlannerInputs
+from ha_spark.energy.models import (
+    SLOTS_PER_DAY,
+    DispatchSlot,
+    LoadForecast,
+    PlannerConfig,
+    PlannerInputs,
+)
+from ha_spark.energy.planner import _in_overnight_window
 from ha_spark.energy.solar import distribute_solar
 from ha_spark.ha.models import EntityState
 from ha_spark.ha.rest import HomeAssistantRest
@@ -103,6 +110,40 @@ def _slot_horizon(
     return rotated, horizon_start
 
 
+def pre_window_drain(
+    forecast: LoadForecast, now: datetime, window_start: time, window_end: time
+) -> float:
+    """Forecast battery drain (kWh) from ``now`` until the charge window opens.
+
+    The planner horizon starts at the window, so this load is otherwise
+    invisible. 0 when already inside the window, or when the window is more
+    than 12 h away (a daytime manual run shouldn't dock half a day of load).
+    """
+    if _in_overnight_window(now.time(), window_start, window_end):
+        return 0.0
+    open_today = now.replace(
+        hour=window_start.hour, minute=window_start.minute, second=0, microsecond=0
+    )
+    opens = open_today if open_today > now else open_today + timedelta(days=1)
+    gap_hours = (opens - now).total_seconds() / 3600.0
+    if gap_hours > 12:
+        return 0.0
+    if forecast.slots is None:
+        return forecast.total_kwh / 24.0 * gap_hours
+    # Sum slot-of-day values between now and the window, prorating partials.
+    # (Uses tomorrow's day-type profile for tonight — same approximation as
+    # the slot horizon.)
+    total = 0.0
+    t = now
+    while t < opens:
+        slot_floor = t.replace(minute=0 if t.minute < 30 else 30, second=0, microsecond=0)
+        segment_end = min(slot_floor + timedelta(minutes=30), opens)
+        fraction = (segment_end - t).total_seconds() / 1800.0
+        total += forecast.slots[(t.hour * 2 + t.minute // 30) % SLOTS_PER_DAY] * fraction
+        t = segment_end
+    return total
+
+
 def build_config(settings: Settings, voltage_v: float) -> PlannerConfig:
     return PlannerConfig(
         capacity_kwh=settings.battery_capacity_kwh,
@@ -118,6 +159,7 @@ def build_config(settings: Settings, voltage_v: float) -> PlannerConfig:
         rate_export=settings.rate_export_gbp_kwh,
         buffer_pct=settings.charge_buffer_pct,
         charge_efficiency=settings.charge_efficiency,
+        strategy=settings.charge_strategy,
     )
 
 
@@ -157,13 +199,15 @@ async def gather_inputs(
         if percentile_total is not None:
             solar_kwh = percentile_total
 
+    tz = load_timezone(settings.timezone)
+    window_start = parse_time(settings.charge_window_start)
+    window_end = parse_time(settings.charge_window_end)
+    drain = pre_window_drain(forecast, datetime.now(tz), window_start, window_end)
+
     load_slots: tuple[float, ...] | None = None
     solar_slots: tuple[float, ...] | None = None
     horizon_start: datetime | None = None
     if forecast.slots is not None:
-        tz = load_timezone(settings.timezone)
-        window_start = parse_time(settings.charge_window_start)
-        window_end = parse_time(settings.charge_window_end)
         load_slots, horizon_start = _slot_horizon(forecast.slots, window_start, window_end, tz)
         tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
         detailed = _parse_detailed_forecast(
@@ -176,6 +220,7 @@ async def gather_inputs(
     inputs = PlannerInputs(
         soc_now=_to_float(soc.state if soc else None, 0.0),
         soc_valid=_opt_float(soc.state if soc else None) is not None,
+        pre_window_drain_kwh=drain,
         solar_tomorrow_kwh=solar_kwh,
         predicted_home_load_kwh=forecast.total_kwh,
         dispatches=dispatches,
