@@ -11,13 +11,17 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 
 import aiosqlite
 
 from ha_spark.config import Settings
+from ha_spark.energy.forecast import intervals_from_hourly_stats, load_timezone
+from ha_spark.energy.profile import history_coverage
 from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.ha.statistics import statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
 from ha_spark.ollama import OllamaClient
 
@@ -112,6 +116,43 @@ async def check_sqlite(settings: Settings) -> CheckResult:
         return CheckResult("SQLite", Status.FAIL, f"{settings.db_path}: {exc!r}")
 
 
+async def check_load_history(settings: Settings) -> CheckResult:
+    """Report whether the load forecast has enough history for a slot profile."""
+    entity = settings.consumption_energy_entity
+    try:
+        start = datetime.now(UTC) - timedelta(days=settings.profile_history_days)
+        rows = await statistics_during_period(
+            settings.ha_websocket_url,
+            settings.auth_token,
+            entity,
+            start,
+            period="hour",
+            timeout=settings.ha_timeout,
+        )
+        intervals = intervals_from_hourly_stats(rows)
+        if not intervals:
+            return CheckResult(
+                "Load history",
+                Status.WARN,
+                f"no hourly history for {entity}; see `ha-spark backfill-load`",
+            )
+        days, weekend_days = history_coverage(intervals, load_timezone(settings.timezone))
+        if days >= settings.profile_min_days and weekend_days >= 2:
+            return CheckResult(
+                "Load history",
+                Status.OK,
+                f"slot profile ready ({days}d incl. {weekend_days} weekend) from {entity}",
+            )
+        return CheckResult(
+            "Load history",
+            Status.WARN,
+            f"{days}/{settings.profile_min_days} days, {weekend_days}/2 weekend days "
+            f"for {entity} — daily-median fallback; see `ha-spark backfill-load`",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("Load history", Status.WARN, f"{entity}: {exc!r}")
+
+
 async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
     return list(
@@ -120,6 +161,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
             check_ha_websocket(settings),
             check_ollama(settings),
             check_sqlite(settings),
+            check_load_history(settings),
         )
     )
 

@@ -105,14 +105,14 @@ async def test_predict_home_load_falls_back_to_baseline(
     assert "baseline" in result.source
 
 
-def test_intervals_from_hourly_stats_splits_and_filters() -> None:
+def testintervals_from_hourly_stats_splits_and_filters() -> None:
     rows = [
         {"start": 1780304400000, "change": 1.0},
         {"start": 1780308000000, "change": None},
         {"start": 1780311600000, "change": -0.5},
         {"start": None, "change": 2.0},
     ]
-    intervals = forecast._intervals_from_hourly_stats(rows)
+    intervals = forecast.intervals_from_hourly_stats(rows)
     assert len(intervals) == 2
     assert all(i.kwh == 0.5 for i in intervals)
     assert intervals[0].start == datetime.fromtimestamp(1780304400, UTC)

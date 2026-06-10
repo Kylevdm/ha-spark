@@ -22,6 +22,14 @@ def _is_weekend(d: date) -> bool:
     return d.weekday() >= 5
 
 
+def history_coverage(
+    intervals: Sequence[ConsumptionInterval], tz: ZoneInfo
+) -> tuple[int, int]:
+    """(distinct local dates, weekend dates) covered by ``intervals``."""
+    dates = {interval.start.astimezone(tz).date() for interval in intervals}
+    return len(dates), sum(1 for d in dates if _is_weekend(d))
+
+
 def build_slot_profile(
     intervals: Sequence[ConsumptionInterval], tz: ZoneInfo, *, min_days: int
 ) -> SlotProfile | None:
