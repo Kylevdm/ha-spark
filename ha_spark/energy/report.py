@@ -11,9 +11,13 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
     if abs(plan.effective_solar_kwh - plan.solar_kwh) > 1e-9:
         solar += f" (haircut -> {plan.effective_solar_kwh:.2f})"
 
+    soc = f"{plan.soc_now:.0f}%"
+    if not plan.soc_valid:
+        soc += "  (SoC sensor unreadable!)"
+
     lines = [
         "Charge plan:",
-        f"  SoC now            {plan.soc_now:.0f}%",
+        f"  SoC now            {soc}",
         f"  Solar tomorrow     {solar}",
         f"  Home load forecast {plan.load_kwh:.2f} kWh  ({load_source})",
     ]

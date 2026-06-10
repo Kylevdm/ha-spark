@@ -154,6 +154,7 @@ async def gather_inputs(
 
     inputs = PlannerInputs(
         soc_now=_to_float(soc.state if soc else None, 0.0),
+        soc_valid=_opt_float(soc.state if soc else None) is not None,
         solar_tomorrow_kwh=solar_kwh,
         predicted_home_load_kwh=forecast.total_kwh,
         dispatches=dispatches,
