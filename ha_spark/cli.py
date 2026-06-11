@@ -378,11 +378,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     # `health` is the tool you reach for when config is broken, so it must run and
-    # diagnose rather than fail fast: build raw Settings (no credential validation)
-    # and let the checks themselves report what's wrong. Quiet logs keep the report
-    # clean — failure detail is carried in each check result.
+    # diagnose rather than fail fast: skip credential validation (but keep the
+    # add-on options overlay so the configured endpoints are probed) and let the
+    # checks themselves report what's wrong. Quiet logs keep the report clean —
+    # failure detail is carried in each check result.
     if args.command == "health":
-        settings = Settings()
+        settings = load_settings(validate=False)
         setup_logging("WARNING")
         return asyncio.run(_cmd_health(settings))
 

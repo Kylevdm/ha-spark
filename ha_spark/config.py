@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ha_spark.logging import get_logger
@@ -41,7 +41,7 @@ _OPTION_KEYS = frozenset(
         "ha_timeout",
         "db_path",
         "log_level",
-        # Energy planner knobs (entity IDs stay code-default unless overridden in env).
+        # Energy planner knobs.
         "proactive_mode",
         "battery_capacity_kwh",
         "min_soc",
@@ -70,6 +70,22 @@ _OPTION_KEYS = frozenset(
         "octopus_api_key",
         "octopus_mpan",
         "octopus_meter_serial",
+        "octopus_api_url",
+        # Battery model fallback.
+        "battery_voltage_v",
+        # Entity IDs: exposed so other installs can map their own sensors/controls
+        # (the code defaults match the author's setup).
+        "soc_entity",
+        "battery_voltage_entity",
+        "solar_tomorrow_entity",
+        "octopus_rate_entity",
+        "dispatch_entity",
+        "ev_plug_entity",
+        "ev_status_entity",
+        "consumption_energy_entity",
+        "charge_current_entity",
+        "inverter_power_switch_entity",
+        "ha_template_charge_needed_entity",
     }
 )
 
@@ -182,6 +198,15 @@ class Settings(BaseSettings):
     inverter_power_switch_entity: str = Field(default="select.solisac_power_switch")
     ha_template_charge_needed_entity: str = Field(default="sensor.charge_energy_needed")
 
+    @field_validator("solar_percentile", mode="before")
+    @classmethod
+    def _coerce_solar_percentile(cls, v: object) -> object:
+        # The add-on schema `list(10|50|90)` delivers the choice as a string in
+        # /data/options.json; the field is an int Literal.
+        if isinstance(v, str) and v.strip().isdigit():
+            return int(v.strip())
+        return v
+
     @property
     def is_standalone(self) -> bool:
         """True when an explicit HA URL + token override add-on mode (dev)."""
@@ -228,16 +253,20 @@ def _read_options_overlay(path: Path = _OPTIONS_PATH) -> dict[str, Any]:
     return {k: v for k, v in raw.items() if k in _OPTION_KEYS and v is not None}
 
 
-def load_settings() -> Settings:
+def load_settings(*, validate: bool = True) -> Settings:
     """Build :class:`Settings`, overlaying add-on options, and validate.
 
     Add-on options (``/data/options.json``) take precedence over environment
     variables. In add-on mode a ``SUPERVISOR_TOKEN`` is required; standalone/dev
     mode (``HA_URL`` + ``HA_TOKEN`` set) bypasses that requirement.
+
+    ``validate=False`` skips the credential check (but keeps the options
+    overlay) for diagnostic paths like ``ha-spark health`` that must run and
+    report rather than fail fast.
     """
     overlay = _read_options_overlay()
     settings = Settings(**overlay)
-    if not settings.is_standalone and not settings.supervisor_token:
+    if validate and not settings.is_standalone and not settings.supervisor_token:
         raise ConfigError(
             "No Home Assistant credentials. Running as an HA add-on provides "
             "SUPERVISOR_TOKEN automatically; for standalone/dev set HA_URL and "
