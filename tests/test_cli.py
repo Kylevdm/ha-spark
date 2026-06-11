@@ -8,6 +8,7 @@ import pytest
 
 from ha_spark import cli
 from ha_spark.cli import (
+    _cmd_ask,
     _cmd_backfill_load,
     _cmd_backtest,
     _cmd_import_csv,
@@ -17,6 +18,7 @@ from ha_spark.cli import (
 )
 from ha_spark.config import Settings
 from ha_spark.health import CheckResult, Status
+from ha_spark.router import RouterResult
 
 _CSV = (
     " Consumption (kwh), Start, End\n"
@@ -51,7 +53,7 @@ def test_help_mentions_every_command_and_flags() -> None:
     parser = build_parser()
     top = parser.format_help()
     for command in (
-        "states", "health", "onboard", "plan", "run",
+        "states", "health", "onboard", "plan", "ask", "run",
         "backfill-load", "import-csv", "pull-consumption", "backtest",
     ):
         assert command in top
@@ -61,6 +63,8 @@ def test_help_mentions_every_command_and_flags() -> None:
     assert args.command == "backtest" and args.days == 7
     args = parser.parse_args(["plan", "--apply"])
     assert args.apply is True
+    args = parser.parse_args(["ask", "what's", "the", "plan"])
+    assert args.command == "ask" and args.message == ["what's", "the", "plan"]
 
 
 async def test_backtest_rates_seeded_store(
@@ -104,6 +108,19 @@ async def test_onboard_exit_code_tracks_status(monkeypatch: pytest.MonkeyPatch) 
     assert await _cmd_onboard(settings) == 0
     monkeypatch.setattr(cli, "check_load_history", warn)
     assert await _cmd_onboard(settings) == 2
+
+
+async def test_ask_prints_routed_answer(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_route(message: str, _s: Settings, _rest: object) -> RouterResult:
+        assert message == "what's the plan"
+        return RouterResult(text="all good", source="offline")
+
+    monkeypatch.setattr(cli, "route_message", fake_route)
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+    assert await _cmd_ask(settings, "what's the plan") == 0
+    assert capsys.readouterr().out.strip() == "[offline] all good"
 
 
 async def test_backfill_load_requires_source(capsys: pytest.CaptureFixture[str]) -> None:

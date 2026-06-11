@@ -1,8 +1,8 @@
 """Minimal async client for a remote Ollama instance.
 
-Only the surface the ``health`` probe needs today: list the models available on
-the server via ``/api/tags``. The chat/generate surface is added when the LLM
-router lands (Phase 2 proper).
+Two surfaces: list the models available on the server via ``/api/tags`` (the
+``health`` probe and the router's availability check), and a non-streaming
+``/api/chat`` call (the router's primary tier).
 """
 
 from __future__ import annotations
@@ -49,3 +49,20 @@ class OllamaClient:
         resp.raise_for_status()
         data: dict[str, Any] = resp.json()
         return [str(m["name"]) for m in data.get("models", []) if "name" in m]
+
+    async def chat(
+        self, messages: list[dict[str, str]], *, model: str, num_ctx: int
+    ) -> str:
+        """Send a non-streaming ``/api/chat`` request and return the reply text."""
+        resp = await self._client.post(
+            "/api/chat",
+            json={
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "options": {"num_ctx": num_ctx},
+            },
+        )
+        resp.raise_for_status()
+        data: dict[str, Any] = resp.json()
+        return str(data["message"]["content"])
