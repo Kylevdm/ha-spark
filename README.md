@@ -12,6 +12,9 @@ add-on.
 > Status: early scaffolding. See the planning notes / implementation plan for the
 > architecture and phased build-out.
 
+See [`ROADMAP.md`](ROADMAP.md) for where the project is going and how it
+differs from EMHASS / Predbat.
+
 ## Development
 
 Requires Python 3.11+.
