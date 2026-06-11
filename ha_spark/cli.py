@@ -37,6 +37,7 @@ from ha_spark.ha.statistics import list_statistic_ids
 from ha_spark.ha.websocket import HomeAssistantWebSocket
 from ha_spark.health import Status, check_load_history, exit_code, format_report, run_health
 from ha_spark.logging import get_logger, setup_logging
+from ha_spark.router import route_message
 
 log = get_logger(__name__)
 
@@ -98,6 +99,16 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
             print(f"\nActions (PROACTIVE_MODE={settings.proactive_mode}):")
             for line in lines:
                 print(f"  {line}")
+    return 0
+
+
+async def _cmd_ask(settings: Settings, message: str) -> int:
+    """Route a natural-language message: Ollama if reachable, offline parser if not."""
+    async with HomeAssistantRest(
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+    ) as rest:
+        result = await route_message(message, settings, rest)
+    print(f"[{result.source}] {result.text}")
     return 0
 
 
@@ -228,6 +239,7 @@ examples:
   ha-spark onboard                         check load-history readiness for the forecast
   ha-spark plan                            compute tonight's charge plan
   ha-spark plan --apply                    ...and run the charger (per PROACTIVE_MODE)
+  ha-spark ask "what's tonight's plan"     answer via Ollama, or offline if unreachable
   ha-spark run                             daemon: plan + apply daily at PLAN_RUN_TIME
   ha-spark run --once                      plan + apply immediately, then exit
   ha-spark backfill-load --list            show statistics usable as a load source
@@ -295,6 +307,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the charger with the computed plan. PROACTIVE_MODE gates side effects: "
         "off = compute only, simulate = log intended writes (default), on = real "
         "service calls to the inverter",
+    )
+
+    p_ask = sub.add_parser(
+        "ask",
+        help="Ask a natural-language question (Ollama, with offline fallback)",
+        description="Route a message through the LLM router: a fast /api/tags probe "
+        "checks the remote Ollama endpoint; if reachable the message is answered by "
+        "OLLAMA_MODEL, otherwise the deterministic offline parser answers energy "
+        "queries (plan, soc, solar, strategy, mode, window). The output is prefixed "
+        "with [ollama] or [offline] to show which tier answered.",
+    )
+    p_ask.add_argument(
+        "message",
+        nargs="+",
+        metavar="MESSAGE",
+        help="The question to ask (multiple words are joined with spaces)",
     )
 
     p_run = sub.add_parser(
@@ -399,6 +427,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "plan":
         return asyncio.run(_cmd_plan(settings, apply=args.apply))
+
+    if args.command == "ask":
+        return asyncio.run(_cmd_ask(settings, " ".join(args.message)))
 
     if args.command == "run":
         return asyncio.run(_cmd_run(settings, once=args.once))
