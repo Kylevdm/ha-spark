@@ -1,0 +1,103 @@
+---
+name: ha-spark
+version: "0.1.0"
+slug: ha_spark_addon
+description: Local-first battery charge planner and automation agent for Home Assistant
+url: https://github.com/Kylevdm/ha-spark
+arch:
+  - aarch64
+  - amd64
+init: false
+homeassistant_api: true
+startup: services
+boot: auto
+options:
+  log_level: INFO
+  proactive_mode: simulate
+  db_path: /data/ha_spark.db
+  ha_timeout: 10.0
+  ollama_url: "http://127.0.0.1:11434"
+  ollama_model: "qwen3:14b"
+  ollama_num_ctx: 32768
+  ollama_timeout: 120.0
+  ollama_health_timeout: 2.0
+  battery_capacity_kwh: 26.88
+  battery_voltage_v: 51.0
+  min_soc: 20.0
+  target_soc_cap: 90.0
+  max_charge_current_a: 62.5
+  charge_buffer_pct: 20.0
+  charge_efficiency: 0.9
+  charge_strategy: deficit
+  solar_haircut_k: 1.0
+  solar_percentile: "50"
+  forecast_days: 14
+  expected_load_kwh: 24.0
+  charge_window_start: "23:30"
+  charge_window_end: "05:30"
+  rate_offpeak_gbp_kwh: 0.069
+  rate_peak_gbp_kwh: 0.30
+  rate_export_gbp_kwh: 0.0
+  profile_min_days: 7
+  profile_history_days: 60
+  timezone: Europe/London
+  plan_run_time: "22:00"
+  octopus_api_url: "https://api.octopus.energy/v1"
+  soc_entity: sensor.solisac_battery_soc
+  battery_voltage_entity: sensor.solisac_battery_voltage
+  solar_tomorrow_entity: sensor.solcast_pv_forecast_forecast_tomorrow
+  octopus_rate_entity: sensor.octopus_energy_electricity_22l4386358_2200012282082_current_rate
+  dispatch_entity: binary_sensor.octopus_energy_00000000_0009_4000_8020_000000068b29_intelligent_dispatching
+  ev_plug_entity: sensor.myenergi_zappi_22300254_plug_status
+  ev_status_entity: sensor.myenergi_zappi_22300254_status
+  consumption_energy_entity: sensor.historic_household_usage
+  charge_current_entity: number.solisac_timed_charge_current
+  inverter_power_switch_entity: select.solisac_power_switch
+  ha_template_charge_needed_entity: sensor.charge_energy_needed
+schema:
+  log_level: list(DEBUG|INFO|WARNING|ERROR)
+  proactive_mode: list(off|simulate|on)
+  db_path: str
+  ha_timeout: float
+  ollama_url: url
+  ollama_model: str
+  ollama_num_ctx: int
+  ollama_timeout: float
+  ollama_health_timeout: float
+  battery_capacity_kwh: float
+  battery_voltage_v: float
+  min_soc: float(0,100)
+  target_soc_cap: float(0,100)
+  max_charge_current_a: float
+  charge_buffer_pct: float
+  charge_efficiency: float(0,1)
+  charge_strategy: list(deficit|fill)
+  solar_haircut_k: float
+  solar_percentile: list(10|50|90)
+  forecast_days: int(1,)
+  expected_load_kwh: float
+  charge_window_start: match(^\d{2}:\d{2}$)
+  charge_window_end: match(^\d{2}:\d{2}$)
+  rate_offpeak_gbp_kwh: float
+  rate_peak_gbp_kwh: float
+  rate_export_gbp_kwh: float
+  profile_min_days: int
+  profile_history_days: int
+  timezone: str
+  plan_run_time: match(^\d{2}:\d{2}$)
+  backfill_source_entity: str?
+  octopus_api_key: password?
+  octopus_mpan: str?
+  octopus_meter_serial: str?
+  octopus_api_url: url
+  soc_entity: str
+  battery_voltage_entity: str
+  solar_tomorrow_entity: str
+  octopus_rate_entity: str
+  dispatch_entity: str
+  ev_plug_entity: str
+  ev_status_entity: str
+  consumption_energy_entity: str
+  charge_current_entity: str
+  inverter_power_switch_entity: str
+  ha_template_charge_needed_entity: str
