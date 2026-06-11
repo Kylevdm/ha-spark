@@ -12,6 +12,9 @@ add-on.
 > Status: energy-planner MVP. See the planning notes / implementation plan for the
 > architecture and phased build-out.
 
+See [`ROADMAP.md`](ROADMAP.md) for where the project is going and how it
+differs from EMHASS / Predbat.
+
 ## Install as a Home Assistant add-on
 
 1. **Settings → Add-ons → Add-on Store → ⋮ → Repositories**, add
