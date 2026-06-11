@@ -9,11 +9,22 @@ acting, to learn household habits over time, and to be controlled in natural
 language — text first, voice (via HA Assist) later. Packaged as a Home Assistant
 add-on.
 
-> Status: early scaffolding. See the planning notes / implementation plan for the
+> Status: energy-planner MVP. See the planning notes / implementation plan for the
 > architecture and phased build-out.
 
 See [`ROADMAP.md`](ROADMAP.md) for where the project is going and how it
 differs from EMHASS / Predbat.
+
+## Install as a Home Assistant add-on
+
+1. **Settings → Add-ons → Add-on Store → ⋮ → Repositories**, add
+   `https://github.com/Kylevdm/ha-spark`.
+2. Install **ha-spark** (built locally; first install takes a few minutes),
+   configure your entity IDs and tariff on the Configuration tab, and start it.
+
+See [`ha_spark_addon/DOCS.md`](ha_spark_addon/DOCS.md) for the full option
+reference and onboarding flow (health check → load-history backfill → plan →
+enable real control).
 
 ## Development
 
