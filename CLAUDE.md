@@ -78,8 +78,9 @@ cache, decides via the Ollama router, and acts through `call_service`.
 
 - **Single remote Ollama tier**, reached over Tailscale (often a Tailnet IP like
   `http://100.x.y.z:11434`), plus a **deterministic offline intent parser**
-  fallback. There is no second local model tier. Phase 2 builds this router: a
-  fast `/api/tags` health probe; on failure/timeout, hand straight to the offline
+  fallback. There is no second local model tier. Shipped in Phase 2
+  (`ha_spark/router.py`, `ha_spark/intent_parser.py`, `ha-spark ask`): a fast
+  `/api/tags` health probe; on failure/timeout, hand straight to the offline
   parser. Config is the single `OLLAMA_URL` + `OLLAMA_MODEL`.
 - **Raw `entity_id` addressing.** All tools/HA operations use raw `entity_id`
   strings; no fuzzy name resolution. Schemas may return `friendly_name` as data
@@ -91,10 +92,10 @@ cache, decides via the Ollama router, and acts through `call_service`.
   predictions, then executes real service calls or logs them as "simulated" based
   on the flag — same decision path, side effects suppressed. (Config field
   deferred until the orchestrator phase has a consumer.)
-- **A `health`/doctor CLI command is wanted** (`python -m ha_spark health`): probe
-  HA REST via the Supervisor proxy, the HA WS auth handshake, Ollama `/api/tags`,
-  and that the SQLite path under `data/` is writable; human-readable, non-zero
-  exit on failure.
+- **`health`/doctor CLI command** (`python -m ha_spark health`, implemented in
+  `ha_spark/health.py`): probes HA REST, the HA WS auth handshake, Ollama
+  `/api/tags`, SQLite writability, and load-history readiness; human-readable,
+  exit 0/1/2 (green/critical/degraded).
 
 ## Conventions
 
@@ -105,8 +106,9 @@ cache, decides via the Ollama router, and acts through `call_service`.
   server / temp SQLite. pytest runs in `asyncio_mode = "auto"` (no
   `@pytest.mark.asyncio` needed). ruff lints `E,F,I,UP,B,ASYNC,W`, line length 100.
 - **Phase-per-branch/PR:** one phase per branch, each ending runnable and
-  verifiable. Phase 0-1 (scaffolding + HA connectivity) is done; next is Phase 2
-  (single remote Ollama client + router with deterministic offline fallback).
+  verifiable. Done: Phase 0-1 (scaffolding + HA connectivity), the energy
+  planner MVP (add-on v0.1.0), and Phase 2 (Ollama router + offline parser,
+  `ha-spark ask`). Next is Phase 3 (EV integration); see ROADMAP.md.
 - **No-push fallback:** if a session lacks git credentials, produce a `git bundle`
   + `git format-patch` and push from a credentialed clone. (`*.bundle` / `*.patch`
   are gitignored.)
