@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings — CRLF breaks the shebang in the
+# add-on container.
+*.sh text eol=lf
+Dockerfile text eol=lf

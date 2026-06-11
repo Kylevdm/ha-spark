@@ -1,14 +1,19 @@
+import json
 from pathlib import Path
 
 import pytest
 
 from ha_spark.config import (
+    _OPTION_KEYS,
     SUPERVISOR_REST_URL,
     SUPERVISOR_WS_URL,
     ConfigError,
     Settings,
+    _read_options_overlay,
     load_settings,
 )
+
+ADDON_CONFIG = Path(__file__).parent.parent / "ha_spark_addon" / "config.yaml"
 
 
 @pytest.fixture(autouse=True)
@@ -77,3 +82,59 @@ def test_load_settings_ok_in_addon_mode(monkeypatch: pytest.MonkeyPatch) -> None
     settings = load_settings()
     assert settings.is_standalone is False
     assert settings.auth_token == "sup-token"
+
+
+def test_load_settings_validate_false_skips_credential_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Diagnostic paths (`ha-spark health`) must build settings without creds
+    # while still honouring the options overlay.
+    monkeypatch.setattr(
+        "ha_spark.config._read_options_overlay",
+        lambda: {"ollama_url": "http://100.1.2.3:11434"},
+    )
+    settings = load_settings(validate=False)
+    assert settings.ollama_url == "http://100.1.2.3:11434"
+
+
+def test_options_overlay_accepts_entity_ids(tmp_path: Path) -> None:
+    options = tmp_path / "options.json"
+    options.write_text(
+        json.dumps(
+            {
+                "soc_entity": "sensor.my_soc",
+                "charge_current_entity": "number.my_charge_current",
+                "not_an_option": "ignored",
+            }
+        ),
+        encoding="utf-8",
+    )
+    overlay = _read_options_overlay(options)
+    assert overlay == {
+        "soc_entity": "sensor.my_soc",
+        "charge_current_entity": "number.my_charge_current",
+    }
+    s = Settings(**overlay)
+    assert s.soc_entity == "sensor.my_soc"
+    assert s.charge_current_entity == "number.my_charge_current"
+
+
+def test_solar_percentile_coerces_addon_string() -> None:
+    # The add-on schema `list(10|50|90)` delivers the choice as a string.
+    assert Settings(solar_percentile="10").solar_percentile == 10  # type: ignore[arg-type]
+    assert Settings(solar_percentile=90).solar_percentile == 90
+
+
+def test_addon_schema_covers_all_option_keys() -> None:
+    """Every honoured option key appears in the add-on schema, and vice versa."""
+    in_schema = False
+    schema_keys: set[str] = set()
+    for line in ADDON_CONFIG.read_text(encoding="utf-8").splitlines():
+        if line == "schema:":
+            in_schema = True
+            continue
+        if in_schema:
+            if not line.startswith("  "):
+                break
+            schema_keys.add(line.split(":", 1)[0].strip())
+    assert schema_keys == set(_OPTION_KEYS)
