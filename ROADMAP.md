@@ -70,10 +70,11 @@ weekend") — they never bypass the planner to actuate hardware directly.
 | Phase | What ships |
 |---|---|
 | ✅ MVP (done) | Deterministic planner (solar + load forecast → overnight charge current), Solis actuation with guard rails, dispatch-slot handling, simulate mode, cost backtest, scheduled daemon, HA add-on packaging |
-| 4 — EV integration | zappi-aware planning through the Charger Protocol: the first proof of coordinating two flexible loads against one tariff |
-| 5 — Onboarding wizard | Entity auto-discovery (integration / device class / unit matching), interactive `onboard` proposal, per-vendor presets (Solis first) |
-| 6 — NL copilot v1 | Read-only plan/state Q&A via local Ollama with deterministic fallback, scoped to the energy domain |
-| 7 — ML load forecasting | Upgrade the per-slot median load model with learned features (weekday/season/weather); actuation stays deterministic |
+| ✅ 2 — LLM router (done) | Two-tier router behind `ha-spark ask`: remote Ollama chat (`/api/tags` probe gates `/api/chat`) with a deterministic offline parser answering energy queries (plan, SoC, solar, strategy, mode, window) from the planner pipeline |
+| 3 — EV integration | zappi-aware planning through the Charger Protocol: the first proof of coordinating two flexible loads against one tariff |
+| 4 — Onboarding wizard | Entity auto-discovery (integration / device class / unit matching), interactive `onboard` proposal, per-vendor presets (Solis first) |
+| 5 — NL copilot v1 | Plan/state Q&A grounded in live planner output: feed the computed plan and state into the Ollama tier (Phase 2 router) so answers explain the actual decision, scoped to the energy domain |
+| 6 — ML load forecasting | Upgrade the per-slot median load model with learned features (weekday/season/weather); actuation stays deterministic |
 | Later (v3) | Heat pump + hot-water coordination, multi-inverter and rectifier support, more vendor presets via the Charger Protocol |
 
 ## Non-goals
