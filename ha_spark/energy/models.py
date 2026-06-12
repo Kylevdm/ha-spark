@@ -140,3 +140,6 @@ class ChargePlan:
     export_revenue: float | None = None  # projected GBP feed-in (None when disabled)
     strategy: str = "deficit"  # sizing strategy used ("deficit" | "fill")
     pre_window_drain_kwh: float = 0.0  # forecast drain before the window opens
+    # EV energy Octopus plans to deliver across the dispatches (None when there
+    # are no dispatches) — reported, not planned: Octopus controls the EV.
+    dispatch_ev_kwh: float | None = None

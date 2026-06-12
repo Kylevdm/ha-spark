@@ -32,3 +32,12 @@ def test_no_annotations_by_default() -> None:
     out = format_plan(_plan(), "test")
     assert "fill to" not in out
     assert "window start" not in out
+
+
+def test_dispatch_ev_kwh_renders_when_present() -> None:
+    out = format_plan(_plan(dispatch_ev_kwh=4.0), "test")
+    assert "EV dispatch energy 4.00 kWh planned by Octopus" in out
+
+
+def test_dispatch_ev_kwh_omitted_when_none() -> None:
+    assert "EV dispatch energy" not in format_plan(_plan(), "test")

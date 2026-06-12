@@ -40,16 +40,23 @@ class SolisCharger:
                 # command a max-size charge — never act on it.
                 line = f"[BLOCKED] SoC unreadable; not applying: {action.description}"
                 log.warning(line)
-            elif mode == "on":
-                line = await self._execute(action)
-            elif mode == "simulate":
-                line = f"[SIMULATE] would {action.description}"
-            else:  # "off"
-                line = f"[OFF] computed: {action.description}"
-            if mode != "off":
-                log.info(line)
+            else:
+                line = await self.apply_action(action)
             lines.append(line)
         return lines
+
+    async def apply_action(self, action: ChargeAction) -> str:
+        """Apply one action per PROACTIVE_MODE (no SoC gate — callers decide)."""
+        mode = self._settings.proactive_mode
+        if mode == "on":
+            line = await self._execute(action)
+        elif mode == "simulate":
+            line = f"[SIMULATE] would {action.description}"
+        else:  # "off"
+            line = f"[OFF] computed: {action.description}"
+        if mode != "off":
+            log.info(line)
+        return line
 
     async def _execute(self, action: ChargeAction) -> str:
         """One real HA write — only reached when PROACTIVE_MODE == 'on'.

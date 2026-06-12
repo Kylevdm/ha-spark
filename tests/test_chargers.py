@@ -134,3 +134,18 @@ async def test_off_mode_computes_without_calls() -> None:
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await SolisCharger(s, rest).apply(_plan())
     assert all("OFF" in line for line in lines)
+
+
+@respx.mock
+async def test_apply_action_executes_one_action_with_read_back() -> None:
+    set_value = respx.post("http://ha.test/api/services/number/set_value").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    s = Settings(ha_url="http://ha.test", ha_token="t", proactive_mode="on")
+    _mock_read_back(s, current="10.0", switch="Off")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        line = await SolisCharger(s, rest).apply_action(
+            ChargeAction("set_charge_current", "set current to 10 A", current_a=10)
+        )
+    assert set_value.called
+    assert line == "[APPLIED] set current to 10 A"
