@@ -1,6 +1,6 @@
 ---
 name: ha-spark
-version: "0.1.0"
+version: "0.2.0"
 slug: ha_spark_addon
 description: Local-first battery charge planner and automation agent for Home Assistant
 url: https://github.com/Kylevdm/ha-spark
@@ -51,6 +51,8 @@ options:
   ev_plug_entity: sensor.myenergi_zappi_22300254_plug_status
   ev_status_entity: sensor.myenergi_zappi_22300254_status
   consumption_energy_entity: sensor.historic_household_usage
+  supply_max_current_a: 75.0
+  supply_voltage_v: 240.0
   charge_current_entity: number.solisac_timed_charge_current
   inverter_power_switch_entity: select.solisac_power_switch
   ha_template_charge_needed_entity: sensor.charge_energy_needed
@@ -98,6 +100,9 @@ schema:
   ev_plug_entity: str
   ev_status_entity: str
   consumption_energy_entity: str
+  grid_power_entity: str?
+  supply_max_current_a: float
+  supply_voltage_v: float
   charge_current_entity: str
   inverter_power_switch_entity: str
   ha_template_charge_needed_entity: str

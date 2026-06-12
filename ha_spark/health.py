@@ -153,6 +153,32 @@ async def check_load_history(settings: Settings) -> CheckResult:
         return CheckResult("Load history", Status.WARN, f"{entity}: {exc!r}")
 
 
+async def check_supply_guard(settings: Settings) -> CheckResult:
+    """Confirm the supply-guard sensor reads as a number (or report it disabled)."""
+    entity = settings.grid_power_entity
+    if not entity:
+        return CheckResult(
+            "Supply guard", Status.OK, "disabled (grid_power_entity not set)"
+        )
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            state = await rest.get_state(entity)
+        watts = float(state.state)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(
+            "Supply guard",
+            Status.WARN,
+            f"{entity}: {exc!r} — guard will skip ticks until it reads",
+        )
+    return CheckResult(
+        "Supply guard",
+        Status.OK,
+        f"{watts:g} W from {entity} (limit {settings.supply_max_current_a:g} A)",
+    )
+
+
 async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
     return list(
@@ -162,6 +188,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
             check_ollama(settings),
             check_sqlite(settings),
             check_load_history(settings),
+            check_supply_guard(settings),
         )
     )
 
