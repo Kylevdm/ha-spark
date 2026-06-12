@@ -252,3 +252,17 @@ def test_slot_model_export_revenue_sums_per_slot_surplus() -> None:
         _slot_inputs(load=0.5, solar_slots=tuple(solar)), cfg(rate_export=0.10)
     )
     assert plan.export_revenue == pytest.approx(1.5 * 0.10)
+
+
+def test_dispatch_ev_kwh_sums_magnitudes() -> None:
+    inp = PlannerInputs(
+        soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2,
+        dispatches=(_slot(13, 0), _slot(2, 0)),
+    )
+    # each fixture dispatch plans -2.0 kWh into the car
+    assert compute_plan(inp, cfg()).dispatch_ev_kwh == pytest.approx(4.0)
+
+
+def test_dispatch_ev_kwh_none_without_dispatches() -> None:
+    inp = PlannerInputs(soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
+    assert compute_plan(inp, cfg()).dispatch_ev_kwh is None

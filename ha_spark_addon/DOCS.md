@@ -30,6 +30,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `dispatch_entity` | Octopus Intelligent dispatching binary sensor |
 | `ev_plug_entity` / `ev_status_entity` | EV charger plug/status sensors |
 | `consumption_energy_entity` | True household load energy statistic (excluding battery/EV charging) |
+| `grid_power_entity` | Optional whole-house supply power sensor (W); enables the supply guard |
 | `charge_current_entity` | Inverter timed-charge current `number` entity (the only control written) |
 | `inverter_power_switch_entity` | Inverter power switch `select` entity |
 | `ha_template_charge_needed_entity` | Optional HA template sensor for comparison logging |
@@ -49,6 +50,18 @@ Intelligent, myenergi zappi). Point these at your own entities:
   defaults are sensible.
 - `charge_window_start` / `charge_window_end` — your cheap-rate window.
 - `plan_run_time` — local HH:MM at which the daily plan runs.
+
+### Supply guard (optional)
+
+When the battery is timed-charging and an EV dispatch lands in the same
+window, total supply draw can climb past what the main fuse should carry. Set
+`grid_power_entity` to a whole-house grid/supply power sensor (W) and the
+daemon will, on every tick inside the charge window, throttle the
+timed-charge current so total draw stays under `supply_max_current_a`
+(default 75 A), restoring it toward the planned current as headroom returns.
+`supply_voltage_v` (default 240) converts the sensor's watts to amps. Writes
+respect `proactive_mode` exactly like the nightly plan. Leave
+`grid_power_entity` empty to disable the guard entirely.
 
 ### Tariff
 

@@ -83,6 +83,9 @@ _OPTION_KEYS = frozenset(
         "ev_plug_entity",
         "ev_status_entity",
         "consumption_energy_entity",
+        "grid_power_entity",
+        "supply_max_current_a",
+        "supply_voltage_v",
         "charge_current_entity",
         "inverter_power_switch_entity",
         "ha_template_charge_needed_entity",
@@ -194,6 +197,11 @@ class Settings(BaseSettings):
     # True house load excluding battery/EV; historic_household_usage backfills
     # hourly stats to Dec 2025 (vs ~Jun 2026 for sensor.house_consumption_energy).
     consumption_energy_entity: str = Field(default="sensor.historic_household_usage")
+    # Live supply guard: throttle battery charging while whole-house AC draw
+    # exceeds supply_max_current_a. Disabled while grid_power_entity is empty.
+    grid_power_entity: str = Field(default="")  # W; whole-house grid/supply draw
+    supply_max_current_a: float = Field(default=75.0)
+    supply_voltage_v: float = Field(default=240.0)  # AC volts, converts W -> A
     charge_current_entity: str = Field(default="number.solisac_timed_charge_current")
     inverter_power_switch_entity: str = Field(default="select.solisac_power_switch")
     ha_template_charge_needed_entity: str = Field(default="sensor.charge_energy_needed")

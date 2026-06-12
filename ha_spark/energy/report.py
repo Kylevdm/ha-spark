@@ -53,6 +53,10 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
         f"  Charge current     {plan.overnight_current_a:.0f} A over {plan.window_hours:.1f} h",
         f"  EV                 {'charging' if plan.ev_charging else 'not charging'}",
     ]
+    if plan.dispatch_ev_kwh is not None:
+        lines.append(
+            f"  EV dispatch energy {plan.dispatch_ev_kwh:.2f} kWh planned by Octopus"
+        )
     if plan.baseline_cost is not None and plan.planned_cost is not None:
         saving = plan.baseline_cost - plan.planned_cost
         cost = (

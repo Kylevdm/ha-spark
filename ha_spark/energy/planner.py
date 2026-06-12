@@ -226,4 +226,9 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
         export_revenue=export_revenue,
         strategy=cfg.strategy,
         pre_window_drain_kwh=inputs.pre_window_drain_kwh,
+        # Octopus reports planned charge_in_kwh as negative (energy into the
+        # car); report the magnitude.
+        dispatch_ev_kwh=(
+            sum(abs(d.charge_in_kwh) for d in inputs.dispatches) if inputs.dispatches else None
+        ),
     )
