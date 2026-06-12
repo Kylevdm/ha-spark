@@ -89,6 +89,10 @@ _OPTION_KEYS = frozenset(
         "charge_current_entity",
         "inverter_power_switch_entity",
         "ha_template_charge_needed_entity",
+        # Forecast ledger: signal sampling (Phase 6A).
+        "person_entities",
+        "heatpump_energy_entity",
+        "outdoor_weather_entity",
     }
 )
 
@@ -205,6 +209,15 @@ class Settings(BaseSettings):
     charge_current_entity: str = Field(default="number.solisac_timed_charge_current")
     inverter_power_switch_entity: str = Field(default="select.solisac_power_switch")
     ha_template_charge_needed_entity: str = Field(default="sensor.charge_energy_needed")
+
+    # Forecast ledger signal sampling (Phase 6A): recorded so training data
+    # accumulates ahead of the models (6B+) that will consume it.
+    # Comma-separated person/device_tracker entity ids; empty disables occupancy sampling.
+    person_entities: str = Field(default="")
+    # Dedicated heat-pump energy sensor (kWh); empty disables heatpump_kwh sampling.
+    heatpump_energy_entity: str = Field(default="")
+    # Weather entity with a `temperature` attribute (e.g. HA's built-in Met.no `weather.home`).
+    outdoor_weather_entity: str = Field(default="weather.home")
 
     @field_validator("solar_percentile", mode="before")
     @classmethod

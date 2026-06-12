@@ -16,12 +16,15 @@ inert (and there is nothing else ha-spark can shed), so the guard stays quiet.
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
+
+import httpx
 
 from ha_spark.config import Settings
 from ha_spark.energy.chargers import SolisCharger
 from ha_spark.energy.forecast import load_timezone
-from ha_spark.energy.models import ChargePlan
+from ha_spark.energy.ledger import ForecastLedger
+from ha_spark.energy.models import ChargePlan, PlannerInputs
 from ha_spark.energy.planner import _in_overnight_window as in_window
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.report import format_plan
@@ -32,10 +35,41 @@ from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
 
+# How often the signal sampler records occupancy/heat-pump/temperature signals.
+SIGNAL_SAMPLE_INTERVAL = timedelta(minutes=30)
+
 
 def should_run(now: datetime, run_time: time, last_run_date: date | None) -> bool:
     """True once per calendar day, at or after ``run_time`` local time."""
     return now.time() >= run_time and now.date() != last_run_date
+
+
+def _forecast_model_tag(source: str) -> str:
+    """Short model tag for the ledger, derived from ``LoadForecast.source``."""
+    if source.startswith("slot profile"):
+        return "slots"
+    if source.startswith("median of"):
+        return "median"
+    return "baseline"
+
+
+async def _record_forecast(settings: Settings, plan: ChargePlan, inputs: PlannerInputs,
+                            load_source: str) -> None:
+    """Log tonight's forecast for tomorrow so `forecast-eval` can score it later."""
+    tz = load_timezone(settings.timezone)
+    target_date = (datetime.now(tz) + timedelta(days=1)).date()
+    try:
+        async with ForecastLedger(settings.db_path) as ledger:
+            await ledger.record_forecast(
+                datetime.now(UTC),
+                target_date,
+                _forecast_model_tag(load_source),
+                plan.load_kwh,
+                inputs.load_slots,
+                load_source,
+            )
+    except Exception:
+        log.exception("Recording forecast failed")
 
 
 async def run_once(settings: Settings) -> ChargePlan:
@@ -49,7 +83,54 @@ async def run_once(settings: Settings) -> ChargePlan:
         lines = await SolisCharger(settings, rest).apply(plan)
         for line in lines:
             log.info(line)
+    await _record_forecast(settings, plan, inputs, load_source)
     return plan
+
+
+async def sample_signals(settings: Settings, now: datetime) -> None:
+    """Record occupancy/heat-pump/temperature signals for one sample tick.
+
+    Each signal is independently best-effort: an unreadable entity logs a
+    warning and is skipped, it never aborts the others or the daemon loop.
+    """
+    async with (
+        HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest,
+        ForecastLedger(settings.db_path) as ledger,
+    ):
+        person_entities = [e.strip() for e in settings.person_entities.split(",") if e.strip()]
+        if person_entities:
+            home = 0
+            for entity in person_entities:
+                try:
+                    state = await rest.get_state(entity)
+                except httpx.HTTPError as exc:
+                    log.warning("Signal sampler: %s unreadable (%s)", entity, exc)
+                    continue
+                if state.state == "home":
+                    home += 1
+            await ledger.record_signal(now, "occupancy_home_frac", home / len(person_entities))
+
+        if settings.heatpump_energy_entity:
+            try:
+                state = await rest.get_state(settings.heatpump_energy_entity)
+                await ledger.record_signal(now, "heatpump_kwh", float(state.state))
+            except (httpx.HTTPError, ValueError) as exc:
+                log.warning(
+                    "Signal sampler: %s unreadable (%s)", settings.heatpump_energy_entity, exc
+                )
+
+        if settings.outdoor_weather_entity:
+            try:
+                state = await rest.get_state(settings.outdoor_weather_entity)
+                temp = state.attributes.get("temperature")
+                if temp is not None:
+                    await ledger.record_signal(now, "temp_out_c", float(temp))
+            except (httpx.HTTPError, ValueError, TypeError) as exc:
+                log.warning(
+                    "Signal sampler: %s unreadable (%s)", settings.outdoor_weather_entity, exc
+                )
 
 
 async def guard_tick(settings: Settings, target_a: float | None) -> float:
@@ -83,6 +164,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
         )
     last_run_date: date | None = None
     target_a: float | None = None
+    last_signal_at: datetime | None = None
     while True:
         now = datetime.now(tz)
         if should_run(now, run_time, last_run_date):
@@ -97,4 +179,10 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                 target_a = await guard_tick(settings, target_a)
             except Exception:
                 log.exception("Supply guard tick failed; will retry next tick")
+        if last_signal_at is None or now - last_signal_at >= SIGNAL_SAMPLE_INTERVAL:
+            try:
+                await sample_signals(settings, now)
+                last_signal_at = now
+            except Exception:
+                log.exception("Signal sampling failed; will retry next tick")
         await asyncio.sleep(poll_seconds)

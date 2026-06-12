@@ -11,6 +11,7 @@ from ha_spark.cli import (
     _cmd_ask,
     _cmd_backfill_load,
     _cmd_backtest,
+    _cmd_forecast_eval,
     _cmd_import_csv,
     _cmd_onboard,
     _cmd_run,
@@ -54,13 +55,15 @@ def test_help_mentions_every_command_and_flags() -> None:
     top = parser.format_help()
     for command in (
         "states", "health", "onboard", "plan", "ask", "run",
-        "backfill-load", "import-csv", "pull-consumption", "backtest",
+        "backfill-load", "import-csv", "pull-consumption", "backtest", "forecast-eval",
     ):
         assert command in top
     assert "examples:" in top
 
     args = parser.parse_args(["backtest", "--days", "7"])
     assert args.command == "backtest" and args.days == 7
+    args = parser.parse_args(["forecast-eval", "--days", "5"])
+    assert args.command == "forecast-eval" and args.days == 5
     args = parser.parse_args(["plan", "--apply"])
     assert args.apply is True
     args = parser.parse_args(["ask", "what's", "the", "plan"])
@@ -94,6 +97,37 @@ async def test_backtest_empty_store_errors(
     settings = Settings(db_path=str(tmp_path / "empty.db"))
     assert await _cmd_backtest(settings, days=7) == 2
     assert "No stored consumption" in capsys.readouterr().err
+
+
+async def test_forecast_eval_no_recorded_forecasts_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = Settings(ha_url="http://ha.test", ha_token="t", db_path=str(tmp_path / "empty.db"))
+    assert await _cmd_forecast_eval(settings, days=14) == 2
+    assert "No recorded forecasts" in capsys.readouterr().err
+
+
+async def test_forecast_eval_reports_accuracy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from datetime import UTC, date, datetime
+
+    from ha_spark.energy.ledger import ForecastLedger
+
+    settings = Settings(ha_url="http://ha.test", ha_token="t", db_path=str(tmp_path / "test.db"))
+    async with ForecastLedger(settings.db_path) as ledger:
+        await ledger.record_forecast(
+            datetime(2026, 6, 1, tzinfo=UTC), date(2026, 6, 2), "median", 20.0, None, "median of 7d"
+        )
+
+    async def fake_stats(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        return [{"start": 1780358400000, "change": 22.0}]  # 2026-06-02 00:00 UTC
+
+    monkeypatch.setattr(cli, "statistics_during_period", fake_stats)
+    assert await _cmd_forecast_eval(settings, days=14) == 0
+    out = capsys.readouterr().out
+    assert "median" in out
+    assert "MAE" in out
 
 
 async def test_onboard_exit_code_tracks_status(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0
+
+- Forecast ledger (Phase 6A): the daemon now records each night's load
+  forecast (model, total kWh, per-slot breakdown) alongside the date it
+  predicted, so accuracy can be scored later.
+- `ha-spark forecast-eval [--days N]` joins recorded forecasts against actual
+  consumption and reports MAE/MAPE per model — the baseline a future ML model
+  (Phase 6B) must beat before it can drive plans.
+- New signal sampler records `occupancy_home_frac` (from `person_entities`),
+  `heatpump_kwh` (from `heatpump_energy_entity`), and `temp_out_c` (from
+  `outdoor_weather_entity`) every 30 minutes, building training data for later
+  phases. All three are optional and degrade silently if unconfigured or
+  unreadable.
+
 ## 0.2.0
 
 - Live supply guard (Phase 3, EV-aware): when `grid_power_entity` is set, the

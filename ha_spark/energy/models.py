@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import date, datetime, time
 
 # Half-hour slots in a (non-DST-transition) day; the planner horizon is always 48.
 SLOTS_PER_DAY = 48
@@ -16,6 +16,18 @@ class ConsumptionInterval:
     start: datetime
     end: datetime
     kwh: float
+
+
+@dataclass(frozen=True)
+class ForecastRecord:
+    """One recorded load forecast, for later joining against actuals (ledger)."""
+
+    made_at: datetime
+    target_date: date
+    model: str  # short tag: "slots" | "median" | "baseline" | (future ML models)
+    total_kwh: float
+    slots: tuple[float, ...] | None
+    source: str
 
 
 @dataclass(frozen=True)
