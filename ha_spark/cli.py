@@ -16,7 +16,9 @@ from pathlib import Path
 from ha_spark.config import ConfigError, Settings, load_settings
 from ha_spark.energy.backtest import backtest_cost, format_backtest
 from ha_spark.energy.chargers import SolisCharger
+from ha_spark.energy.eval import actual_kwh_by_date, evaluate, format_eval
 from ha_spark.energy.forecast import load_timezone
+from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ConsumptionInterval
 from ha_spark.energy.octopus import OctopusApiError, fetch_consumption, parse_octopus_csv
 from ha_spark.energy.onboarding import (
@@ -33,7 +35,7 @@ from ha_spark.energy.store import ConsumptionStore
 from ha_spark.ha.models import StateChangedEvent
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.state_cache import StateCache
-from ha_spark.ha.statistics import list_statistic_ids
+from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
 from ha_spark.health import Status, check_load_history, exit_code, format_report, run_health
 from ha_spark.logging import get_logger, setup_logging
@@ -216,6 +218,30 @@ async def _cmd_backtest(settings: Settings, *, days: int) -> int:
     return 0
 
 
+async def _cmd_forecast_eval(settings: Settings, *, days: int) -> int:
+    """Score recorded load forecasts against actual consumption (MAE/MAPE per model)."""
+    since = (datetime.now(UTC) - timedelta(days=days)).date()
+    async with ForecastLedger(settings.db_path) as ledger:
+        forecasts = await ledger.forecasts_since(since)
+    if not forecasts:
+        print(
+            "No recorded forecasts yet; the daemon writes one nightly (`ha-spark run`).",
+            file=sys.stderr,
+        )
+        return 2
+    rows = await statistics_during_period(
+        settings.ha_websocket_url,
+        settings.auth_token,
+        settings.consumption_energy_entity,
+        datetime.combine(since, datetime.min.time(), tzinfo=UTC),
+        period="day",
+        timeout=settings.ha_timeout,
+    )
+    results = evaluate(forecasts, actual_kwh_by_date(rows))
+    print(format_eval(results, days))
+    return 0
+
+
 async def _cmd_pull_consumption(settings: Settings, *, days: int) -> int:
     """Pull half-hourly consumption from the Octopus API (incremental)."""
     period_from = datetime.now(UTC) - timedelta(days=days)
@@ -247,6 +273,7 @@ examples:
   ha-spark import-csv export.csv           import an Octopus dashboard CSV (cost data)
   ha-spark pull-consumption --days 60      pull grid import from the Octopus API
   ha-spark backtest --days 30              rate stored grid import under the tariff
+  ha-spark forecast-eval --days 14         score recorded forecasts vs actual load
 """
 
 
@@ -383,6 +410,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="History window to fetch when the store is empty (default: 30)",
     )
 
+    p_fe = sub.add_parser(
+        "forecast-eval",
+        help="Score recorded load forecasts against actual consumption",
+        description="Join forecasts recorded nightly by the daemon (`ha-spark run`) "
+        "against actual daily consumption from HA statistics, and report MAE/MAPE "
+        "per model. A model must beat the `median` baseline here before "
+        "LOAD_MODEL=auto can use it.",
+    )
+    p_fe.add_argument(
+        "--days",
+        type=int,
+        default=14,
+        metavar="N",
+        help="How many days of recorded forecasts to score (default: 14)",
+    )
+
     p_bt = sub.add_parser(
         "backtest",
         help="Rate stored grid import under the configured two-rate tariff",
@@ -450,6 +493,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "backtest":
         return asyncio.run(_cmd_backtest(settings, days=args.days))
+
+    if args.command == "forecast-eval":
+        return asyncio.run(_cmd_forecast_eval(settings, days=args.days))
 
     parser.error(f"unknown command: {args.command}")
     return 2  # pragma: no cover - argparse exits first

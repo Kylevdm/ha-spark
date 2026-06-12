@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
@@ -10,8 +11,17 @@ import respx
 
 from ha_spark.config import Settings
 from ha_spark.energy import scheduler, sources
+from ha_spark.energy.forecast import load_timezone
+from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargePlan, LoadForecast
-from ha_spark.energy.scheduler import guard_tick, run_forever, run_once, should_run
+from ha_spark.energy.scheduler import (
+    SIGNAL_SAMPLE_INTERVAL,
+    guard_tick,
+    run_forever,
+    run_once,
+    sample_signals,
+    should_run,
+)
 
 
 def _plan(current_a: float = 42) -> ChargePlan:
@@ -49,7 +59,7 @@ def test_should_run_true_again_next_day() -> None:
 
 @respx.mock
 async def test_run_once_computes_and_applies_plan(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     async def fake_load(_s: Settings) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
@@ -57,7 +67,10 @@ async def test_run_once_computes_and_applies_plan(
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
     respx.route(method="GET").mock(return_value=httpx.Response(404))
 
-    s = Settings(ha_url="http://ha.test", ha_token="t", proactive_mode="off")
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="off",
+        db_path=str(tmp_path / "ledger.db"),
+    )
 
     with caplog.at_level("INFO"):
         plan = await run_once(s)
@@ -65,6 +78,15 @@ async def test_run_once_computes_and_applies_plan(
     assert plan.overnight_current_a >= 0
     assert any("Charge plan" in r.message for r in caplog.records)
     assert any("OFF" in r.message for r in caplog.records)
+
+    tomorrow = (datetime.now(load_timezone(s.timezone)) + timedelta(days=1)).date()
+    async with ForecastLedger(s.db_path) as ledger:
+        rows = await ledger.forecasts_since(tomorrow)
+    assert len(rows) == 1
+    assert rows[0].target_date == tomorrow
+    assert rows[0].model == "baseline"
+    assert rows[0].total_kwh == plan.load_kwh
+    assert rows[0].source == "test"
 
 
 async def test_run_forever_runs_once_per_day_and_retries_on_error(
@@ -103,8 +125,12 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
     async def fake_sleep(_seconds: float) -> None:
         return None
 
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
     monkeypatch.setattr(scheduler, "datetime", _FakeDatetime)
     monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
     monkeypatch.setattr(scheduler.asyncio, "sleep", fake_sleep)
 
     s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
@@ -154,8 +180,12 @@ async def test_run_forever_guard_ticks_only_inside_window(
         assert target_a is not None
         return target_a
 
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
     monkeypatch.setattr(scheduler, "run_once", fake_run_once)
     monkeypatch.setattr(scheduler, "guard_tick", fake_guard_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
     stop = _patch_loop(
         monkeypatch,
         [
@@ -184,8 +214,12 @@ async def test_run_forever_no_guard_when_entity_unset(
     async def fail_guard_tick(_s: Settings, target_a: float | None) -> float:
         raise AssertionError("guard must not run when grid_power_entity is empty")
 
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
     monkeypatch.setattr(scheduler, "run_once", fake_run_once)
     monkeypatch.setattr(scheduler, "guard_tick", fail_guard_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
     stop = _patch_loop(monkeypatch, [datetime(2026, 6, 10, 23, 45)])
 
     s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
@@ -202,7 +236,11 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
         attempts.append(datetime.now())
         raise RuntimeError("HA unreachable")
 
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
     monkeypatch.setattr(scheduler, "guard_tick", boom_guard_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
     stop = _patch_loop(
         monkeypatch,
         [datetime(2026, 6, 11, 0, 0), datetime(2026, 6, 11, 0, 1)],
@@ -232,3 +270,122 @@ async def test_guard_tick_adopts_setpoint_as_target_on_restart() -> None:
         )
     # Mid-window restart: no plan target yet -> adopt the live 30 A setpoint.
     assert await guard_tick(s, None) == 30.0
+
+
+@respx.mock
+async def test_sample_signals_records_occupancy_heatpump_and_temperature(
+    tmp_path: Path,
+) -> None:
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t",
+        db_path=str(tmp_path / "ledger.db"),
+        person_entities="person.alice, person.bob",
+        heatpump_energy_entity="sensor.heatpump_energy",
+        outdoor_weather_entity="weather.home",
+    )
+    respx.get("http://ha.test/api/states/person.alice").mock(
+        return_value=httpx.Response(
+            200, json={"entity_id": "person.alice", "state": "home", "attributes": {}}
+        )
+    )
+    respx.get("http://ha.test/api/states/person.bob").mock(
+        return_value=httpx.Response(
+            200, json={"entity_id": "person.bob", "state": "not_home", "attributes": {}}
+        )
+    )
+    respx.get("http://ha.test/api/states/sensor.heatpump_energy").mock(
+        return_value=httpx.Response(
+            200, json={"entity_id": "sensor.heatpump_energy", "state": "1.5", "attributes": {}}
+        )
+    )
+    respx.get("http://ha.test/api/states/weather.home").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "entity_id": "weather.home",
+                "state": "cloudy",
+                "attributes": {"temperature": 12.5},
+            },
+        )
+    )
+
+    now = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    await sample_signals(s, now)
+
+    async with ForecastLedger(s.db_path) as ledger:
+        since = datetime(2026, 1, 1, tzinfo=UTC)
+        assert await ledger.signal_history("occupancy_home_frac", since) == [(now, 0.5)]
+        assert await ledger.signal_history("heatpump_kwh", since) == [(now, 1.5)]
+        assert await ledger.signal_history("temp_out_c", since) == [(now, 12.5)]
+
+
+@respx.mock
+async def test_sample_signals_skips_disabled_signals(tmp_path: Path) -> None:
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t",
+        db_path=str(tmp_path / "ledger.db"),
+        person_entities="",
+        heatpump_energy_entity="",
+        outdoor_weather_entity="",
+    )
+    now = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    await sample_signals(s, now)
+
+    async with ForecastLedger(s.db_path) as ledger:
+        since = datetime(2026, 1, 1, tzinfo=UTC)
+        assert await ledger.signal_history("occupancy_home_frac", since) == []
+        assert await ledger.signal_history("heatpump_kwh", since) == []
+        assert await ledger.signal_history("temp_out_c", since) == []
+
+
+@respx.mock
+async def test_sample_signals_tolerates_unreadable_entity(tmp_path: Path) -> None:
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t",
+        db_path=str(tmp_path / "ledger.db"),
+        person_entities="person.alice",
+        heatpump_energy_entity="",
+        outdoor_weather_entity="",
+    )
+    respx.get("http://ha.test/api/states/person.alice").mock(return_value=httpx.Response(500))
+
+    now = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    await sample_signals(s, now)  # must not raise
+
+    async with ForecastLedger(s.db_path) as ledger:
+        since = datetime(2026, 1, 1, tzinfo=UTC)
+        assert await ledger.signal_history("occupancy_home_frac", since) == [(now, 0.0)]
+
+
+async def test_run_forever_samples_signals_every_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sampled: list[datetime] = []
+
+    async def fake_run_once(_s: Settings) -> ChargePlan:
+        return _plan()
+
+    async def fake_sample_signals(_s: Settings, now: datetime) -> None:
+        sampled.append(now)
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "sample_signals", fake_sample_signals)
+    stop = _patch_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 22, 0),
+            datetime(2026, 6, 10, 22, 0) + SIGNAL_SAMPLE_INTERVAL - timedelta(minutes=1),
+            datetime(2026, 6, 10, 22, 0) + SIGNAL_SAMPLE_INTERVAL,
+        ],
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", db_path=str(tmp_path / "ledger.db"))
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    # First tick samples immediately; the next sample is skipped until the
+    # interval elapses, then samples again on the third tick.
+    assert sampled == [
+        datetime(2026, 6, 10, 22, 0),
+        datetime(2026, 6, 10, 22, 0) + SIGNAL_SAMPLE_INTERVAL,
+    ]
