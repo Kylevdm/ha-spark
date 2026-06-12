@@ -34,6 +34,9 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `charge_current_entity` | Inverter timed-charge current `number` entity (the only control written) |
 | `inverter_power_switch_entity` | Inverter power switch `select` entity |
 | `ha_template_charge_needed_entity` | Optional HA template sensor for comparison logging |
+| `person_entities` | Optional comma-separated `person`/`device_tracker` entity ids for occupancy signal recording |
+| `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
+| `outdoor_weather_entity` | Weather entity with a `temperature` attribute (default `weather.home`) for signal recording |
 
 ### Planner
 
@@ -62,6 +65,21 @@ timed-charge current so total draw stays under `supply_max_current_a`
 `supply_voltage_v` (default 240) converts the sensor's watts to amps. Writes
 respect `proactive_mode` exactly like the nightly plan. Leave
 `grid_power_entity` empty to disable the guard entirely.
+
+### Forecast ledger
+
+Every nightly run records the forecast it used (model, total kWh, per-slot
+breakdown) for the date it predicted. `ha-spark forecast-eval [--days N]`
+joins those recorded forecasts against actual consumption and reports
+MAE/MAPE per model — the baseline a future ML model must beat before it can
+drive plans (`load_model: auto`).
+
+A signal sampler also runs every 30 minutes, recording household signals used
+by later phases: `occupancy_home_frac` (from `person_entities`),
+`heatpump_kwh` (from `heatpump_energy_entity`), and `temp_out_c` (from
+`outdoor_weather_entity`). All three are optional — leave them unset to skip
+that signal; an unreadable entity logs a warning and is skipped without
+affecting the others.
 
 ### Tariff
 
