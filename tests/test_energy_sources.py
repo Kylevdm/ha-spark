@@ -39,7 +39,7 @@ def _settings() -> Settings:
 
 @respx.mock
 async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_load(_s: Settings) -> LoadForecast:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
@@ -80,7 +80,7 @@ async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) 
 
 @respx.mock
 async def test_gather_inputs_tolerates_missing_entities(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_load(_s: Settings) -> LoadForecast:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
@@ -122,7 +122,7 @@ def test_pre_window_drain_zero_inside_window_or_far_away() -> None:
 async def test_solar_percentile_prefers_estimate_attributes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_load(_s: Settings) -> LoadForecast:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
@@ -139,7 +139,7 @@ async def test_solar_percentile_prefers_estimate_attributes(
 
 @respx.mock
 async def test_solar_percentile_falls_back_to_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_load(_s: Settings) -> LoadForecast:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
@@ -172,7 +172,7 @@ def test_parse_detailed_forecast_percentile_key() -> None:
 
 @respx.mock
 async def test_gather_inputs_flags_unavailable_soc(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_load(_s: Settings) -> LoadForecast:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
@@ -187,3 +187,78 @@ async def test_gather_inputs_flags_unavailable_soc(monkeypatch: pytest.MonkeyPat
 
     assert inputs.soc_now == 0.0
     assert inputs.soc_valid is False
+
+
+@respx.mock
+async def test_quantile_buffer_derived_from_ml_p90(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(
+            total_kwh=20.0, slots=None, source="ml quantile gbr", p90_total_kwh=23.0
+        )
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", buffer_mode="quantile")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        _, cfg, _ = await gather_inputs(s, rest)
+    assert cfg.buffer_pct == pytest.approx(15.0)  # (23/20 - 1) * 100
+
+
+@respx.mock
+async def test_fixed_buffer_ignores_p90(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(
+            total_kwh=20.0, slots=None, source="ml quantile gbr", p90_total_kwh=23.0
+        )
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", charge_buffer_pct=20.0)
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        _, cfg, _ = await gather_inputs(s, rest)
+    assert cfg.buffer_pct == 20.0
+
+
+@respx.mock
+async def test_gather_inputs_reads_location_from_ha_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    async def fake_load(_s: Settings, **kw: object) -> LoadForecast:
+        seen.update(kw)
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.get(f"{BASE}/config").mock(
+        return_value=httpx.Response(200, json={"latitude": 51.5, "longitude": -0.1})
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = Settings(ha_url="http://ha.test", ha_token="t")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        await gather_inputs(s, rest)
+    assert seen == {"lat": 51.5, "lon": -0.1}
+
+
+@respx.mock
+async def test_explicit_coordinates_override_ha_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    async def fake_load(_s: Settings, **kw: object) -> LoadForecast:
+        seen.update(kw)
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", latitude=55.9, longitude=-3.2)
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        await gather_inputs(s, rest)
+    assert seen == {"lat": 55.9, "lon": -3.2}

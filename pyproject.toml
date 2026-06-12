@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Habit-learning (Phase 5). CPU-only by design; no torch/GPU dependency.
+# ML load model + habit-learning (Phase 6). CPU-only by design; no torch/GPU.
 habits = [
     "scikit-learn>=1.5",
     "river>=0.21",

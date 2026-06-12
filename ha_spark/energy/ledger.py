@@ -113,6 +113,13 @@ class ForecastLedger:
         await self._conn.execute(_UPSERT_SIGNAL, (_iso(ts), name, value))
         await self._conn.commit()
 
+    async def record_signals(self, samples: Iterable[tuple[datetime, str, float]]) -> None:
+        """Bulk-upsert ``(ts, name, value)`` samples in one transaction."""
+        await self._conn.executemany(
+            _UPSERT_SIGNAL, [(_iso(ts), name, value) for ts, name, value in samples]
+        )
+        await self._conn.commit()
+
     async def forecasts_since(self, since: date) -> list[ForecastRecord]:
         """Recorded forecasts with ``target_date >= since``, oldest first."""
         cursor = await self._conn.execute(

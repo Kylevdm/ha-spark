@@ -144,7 +144,11 @@ def pre_window_drain(
     return total
 
 
-def build_config(settings: Settings, voltage_v: float) -> PlannerConfig:
+def build_config(
+    settings: Settings, voltage_v: float, *, buffer_pct: float | None = None
+) -> PlannerConfig:
+    if buffer_pct is None:
+        buffer_pct = settings.charge_buffer_pct
     return PlannerConfig(
         capacity_kwh=settings.battery_capacity_kwh,
         voltage_v=voltage_v,
@@ -157,7 +161,7 @@ def build_config(settings: Settings, voltage_v: float) -> PlannerConfig:
         rate_offpeak=settings.rate_offpeak_gbp_kwh,
         rate_peak=settings.rate_peak_gbp_kwh,
         rate_export=settings.rate_export_gbp_kwh,
-        buffer_pct=settings.charge_buffer_pct,
+        buffer_pct=buffer_pct,
         charge_efficiency=settings.charge_efficiency,
         strategy=settings.charge_strategy,
     )
@@ -188,7 +192,17 @@ async def gather_inputs(
     )
     ev_charging = bool(ev_status and str(ev_status.state).lower() in _EV_ACTIVE)
 
-    forecast = await predict_home_load(settings)
+    lat, lon = settings.latitude, settings.longitude
+    if lat is None or lon is None:
+        # HA knows the site location; the explicit config fields override it.
+        try:
+            ha_cfg = await rest.get_config()
+            lat = lat if lat is not None else _opt_float(ha_cfg.get("latitude"))
+            lon = lon if lon is not None else _opt_float(ha_cfg.get("longitude"))
+        except Exception as exc:  # noqa: BLE001 - location only gates the ML model
+            log.warning("Could not read HA config for site location (%s)", exc)
+
+    forecast = await predict_home_load(settings, lat=lat, lon=lon)
     solar_kwh = _to_float(solar.state if solar else None, 0.0)
     # The sensor state is Solcast's median day total; estimate10/estimate90
     # attributes carry the conservative/optimistic totals.
@@ -230,4 +244,15 @@ async def gather_inputs(
         solar_slots=solar_slots,
         horizon_start=horizon_start,
     )
-    return inputs, build_config(settings, voltage_v), forecast.source
+    # Dynamic buffer: when the quantile ML forecast drives the plan, replace the
+    # fixed margin with the model's own uncertainty, (P90 - P50) / P50.
+    buffer_override: float | None = None
+    if (
+        settings.buffer_mode == "quantile"
+        and forecast.p90_total_kwh is not None
+        and forecast.total_kwh > 0
+    ):
+        buffer_override = max(
+            0.0, (forecast.p90_total_kwh / forecast.total_kwh - 1.0) * 100.0
+        )
+    return inputs, build_config(settings, voltage_v, buffer_pct=buffer_override), forecast.source

@@ -61,7 +61,7 @@ def test_should_run_true_again_next_day() -> None:
 async def test_run_once_computes_and_applies_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    async def fake_load(_s: Settings) -> LoadForecast:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
