@@ -71,11 +71,18 @@ weekend") — they never bypass the planner to actuate hardware directly.
 |---|---|
 | ✅ MVP (done) | Deterministic planner (solar + load forecast → overnight charge current), Solis actuation with guard rails, dispatch-slot handling, simulate mode, cost backtest, scheduled daemon, HA add-on packaging |
 | ✅ 2 — LLM router (done) | Two-tier router behind `ha-spark ask`: remote Ollama chat (`/api/tags` probe gates `/api/chat`) with a deterministic offline parser answering energy queries (plan, SoC, solar, strategy, mode, window) from the planner pipeline |
-| 3 — EV integration | zappi-aware planning through the Charger Protocol: the first proof of coordinating two flexible loads against one tariff |
-| 4 — Onboarding wizard | Entity auto-discovery (integration / device class / unit matching), interactive `onboard` proposal, per-vendor presets (Solis first) |
-| 5 — NL copilot v1 | Plan/state Q&A grounded in live planner output: feed the computed plan and state into the Ollama tier (Phase 2 router) so answers explain the actual decision, scoped to the energy domain |
-| 6 — ML load forecasting | Upgrade the per-slot median load model with learned features (weekday/season/weather); actuation stays deterministic |
+| ✅ 3 — EV integration (done) | Live supply guard (throttle battery charging when whole-house draw nears the main-fuse limit, e.g. during an EV dispatch) plus EV dispatch energy in the plan report |
+| ✅ 6A — Forecast ledger (done) | Forecast-vs-actual accuracy ledger (`ha-spark forecast-eval`) and a 30-min signal sampler (occupancy, heat-pump energy, outdoor temp) so training data accumulates |
+| 6B — Weather-aware ML model | Gradient-boosted quantile slot model (Open-Meteo temps, HDD, day-type, lags, occupancy); `load_model: auto` gated by the ledger; quantile buffer mode |
+| 6C — Context store | Date-ranged facts (away/guests) via `ha-spark context`; deterministic load scaling, visible in the plan report |
+| 6D — LLM context extraction | "I'm on holiday for two weeks" in chat → structured fact in the context store (Ollama JSON extraction + offline fallback); facts only, never setpoints |
+| 6E — Occupancy habits | Predict occupancy from recorded patterns; learn the away-load factor; seed of the `predict_actions` habit API |
+| 4 — Onboarding wizard (deferred) | Entity auto-discovery (integration / device class / unit matching), interactive `onboard` proposal, per-vendor presets (Solis first) |
+| 5 — NL copilot v1 (deferred; partly delivered by 6C/6D) | Plan/state Q&A grounded in live planner output: feed the computed plan and state into the Ollama tier (Phase 2 router) so answers explain the actual decision, scoped to the energy domain |
 | Later (v3) | Heat pump + hot-water coordination, multi-inverter and rectifier support, more vendor presets via the Charger Protocol |
+
+Phase 6 (ML load intelligence, split 6A–6E) is prioritised ahead of 4/5: every
+later learning phase needs 6A's data and referee, and 6D delivers part of 5.
 
 ## Non-goals
 

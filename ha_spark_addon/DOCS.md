@@ -66,6 +66,30 @@ timed-charge current so total draw stays under `supply_max_current_a`
 respect `proactive_mode` exactly like the nightly plan. Leave
 `grid_power_entity` empty to disable the guard entirely.
 
+### ML load model (optional)
+
+When scikit-learn is available (it is in the add-on image), a weather-aware
+gradient-boosted quantile model can forecast tomorrow's load instead of the
+slot-profile median, using Open-Meteo temperatures (heating degree hours →
+heat-pump demand), day-of-week/season, recent-load lags, recorded occupancy,
+and UK bank holidays.
+
+- `load_model` — `median` (profile only), `ml` (always prefer the model when
+  it can run), or `auto` (default): use ML only once `ha-spark forecast-eval`
+  shows it beating the median over the trailing 14 days. Both forecasts are
+  shadow-recorded nightly, so `auto` switches by itself once the model earns
+  it — and switches back if it stops winning.
+- `buffer_mode` — `fixed` keeps `charge_buffer_pct`; `quantile` replaces it
+  with the model's own uncertainty, (P90 − P50)/P50, whenever the ML forecast
+  drives the plan (confident days buy less margin).
+- `latitude` / `longitude` — site coordinates for Open-Meteo; leave unset to
+  use HA's own configured location. Fetched past temperatures are cached into
+  the signal ledger, so the model still runs from recorded data when
+  Open-Meteo is unreachable.
+
+The deterministic planner is unchanged — the model only supplies the load
+numbers fed into it, and falls back to the median chain on any failure.
+
 ### Forecast ledger
 
 Every nightly run records the forecast it used (model, total kWh, per-slot

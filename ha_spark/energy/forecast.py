@@ -1,35 +1,59 @@
 """ha-spark's own home-load forecast — owns the pipeline, retiring HA templates.
 
-`predict_home_load` is the seam consumed by the planner. Fallback chain:
+`predict_home_load` is the seam consumed by the planner. Forecast chain:
 
+0. Weather-aware ML quantile model (Phase 6B, optional): gradient boosting
+   over the same hourly history plus Open-Meteo temperatures and recorded
+   signals. Gated by `load_model` — "auto" uses it only once the forecast
+   ledger shows it beating the median over the trailing 14 days.
 1. v2 slot profile — medians per local half-hour slot, built from hourly HA
    long-term statistics of the house-consumption sensor (true load: excludes
    battery charging and EV). Gives a 48-slot forecast.
 2. v1 daily median of recent house-consumption totals from HA long-term statistics.
 3. The configured baseline (`expected_load_kwh`).
 
+Whenever the ML model runs, both its forecast and the median forecast are
+shadow-recorded in the ledger regardless of which one drives the plan, so
+`forecast-eval` accumulates a fair comparison from day one.
+
 The Octopus consumption store deliberately does NOT feed this model: Octopus
 meter data is grid *import*, which the battery/solar have shaped for the whole
 history — training on it teaches the planner "what the battery already did".
 The store is kept for cost backtesting instead.
-
-Phase 5's trained model is expected to slot in behind the same interface.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from statistics import median
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from ha_spark.config import Settings
+from ha_spark.energy import ml, weather
+from ha_spark.energy.eval import evaluate
+from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ConsumptionInterval, LoadForecast
 from ha_spark.energy.profile import build_slot_profile, predict_day_slots
 from ha_spark.ha.statistics import statistics_during_period
 from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
+
+# `auto` needs at least this many scored ML days before trusting the model.
+_AUTO_MIN_DAYS = 7
+_AUTO_EVAL_DAYS = 14
+
+
+def forecast_model_tag(source: str) -> str:
+    """Short ledger model tag derived from ``LoadForecast.source``."""
+    if source.startswith("ml"):
+        return "ml"
+    if source.startswith("slot profile"):
+        return "slots"
+    if source.startswith("median of"):
+        return "median"
+    return "baseline"
 
 
 def load_timezone(name: str) -> ZoneInfo:
@@ -61,9 +85,17 @@ def intervals_from_hourly_stats(rows: list[dict[str, Any]]) -> list[ConsumptionI
     return intervals
 
 
-async def predict_home_load(settings: Settings) -> LoadForecast:
-    """Predict tomorrow's home load, per-slot when enough local history exists."""
+async def predict_home_load(
+    settings: Settings, *, lat: float | None = None, lon: float | None = None
+) -> LoadForecast:
+    """Predict tomorrow's home load, per-slot when enough local history exists.
+
+    ``lat``/``lon`` enable the weather-aware ML model (Phase 6B); when None the
+    chain starts at the median slot profile as before.
+    """
     tz = load_timezone(settings.timezone)
+    intervals: list[ConsumptionInterval] = []
+    median_forecast: LoadForecast | None = None
     try:
         start = datetime.now(UTC) - timedelta(days=settings.profile_history_days)
         rows = await statistics_during_period(
@@ -79,15 +111,140 @@ async def predict_home_load(settings: Settings) -> LoadForecast:
         if profile is not None:
             tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
             slots = predict_day_slots(profile, tomorrow)
-            return LoadForecast(
+            median_forecast = LoadForecast(
                 total_kwh=sum(slots),
                 slots=slots,
                 source=f"slot profile ({profile.days_used}d hourly house stats)",
             )
     except Exception as exc:  # noqa: BLE001 - the forecast must never crash the plan
         log.warning("Slot-profile forecast unavailable (%s); falling back", exc)
-    total, source = await predict_home_load_kwh(settings)
-    return LoadForecast(total_kwh=total, slots=None, source=source)
+    if median_forecast is None:
+        total, source = await predict_home_load_kwh(settings)
+        median_forecast = LoadForecast(total_kwh=total, slots=None, source=source)
+
+    if settings.load_model == "median":
+        return median_forecast
+    try:
+        ml_forecast = await _ml_forecast(settings, intervals, tz, lat, lon)
+    except Exception:  # noqa: BLE001 - the ML path must never crash the plan
+        log.exception("ML forecast failed; using %s", median_forecast.source)
+        return median_forecast
+    if ml_forecast is None:
+        return median_forecast
+    await _record_shadow_forecasts(settings, tz, median_forecast, ml_forecast)
+    if settings.load_model == "ml":
+        return ml_forecast
+    if await _ml_beats_median(settings, intervals, tz):
+        return ml_forecast
+    log.info(
+        "load_model=auto: ML not yet beating the median over the trailing "
+        "%dd; using %s", _AUTO_EVAL_DAYS, median_forecast.source,
+    )
+    return median_forecast
+
+
+async def _ml_forecast(
+    settings: Settings,
+    intervals: list[ConsumptionInterval],
+    tz: ZoneInfo,
+    lat: float | None,
+    lon: float | None,
+) -> LoadForecast | None:
+    """Run the quantile ML model; None whenever it cannot responsibly run."""
+    if lat is None or lon is None or not intervals or not ml.ml_available():
+        return None
+    now = datetime.now(UTC)
+    since = now - timedelta(days=settings.profile_history_days)
+    temps: dict[datetime, float] = {}
+    try:
+        temps = await weather.hourly_temps(
+            lat, lon, past_days=settings.profile_history_days
+        )
+    except Exception as exc:  # noqa: BLE001 - degrade to recorded signal temps
+        log.warning("Open-Meteo unavailable (%s); using recorded temperatures", exc)
+    occupancy: dict[date, float] = {}
+    try:
+        async with ForecastLedger(settings.db_path) as ledger:
+            if temps:
+                await ledger.record_signals(
+                    (ts, "temp_out_c", v) for ts, v in temps.items() if ts <= now
+                )
+            else:
+                temps = dict(await ledger.signal_history("temp_out_c", since))
+            occupancy = _mean_by_local_date(
+                await ledger.signal_history("occupancy_home_frac", since), tz
+            )
+    except Exception as exc:  # noqa: BLE001 - the ledger is an optional enrichment here
+        log.warning("Signal ledger unavailable for ML features (%s)", exc)
+    tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
+    prediction = ml.train_and_predict(
+        intervals, temps, occupancy, tomorrow, tz,
+        min_days=max(14, settings.profile_min_days),
+    )
+    if prediction is None:
+        return None
+    return LoadForecast(
+        total_kwh=sum(prediction.p50),
+        slots=prediction.p50,
+        source=f"ml quantile gbr ({prediction.days_used}d, weather-aware)",
+        p90_total_kwh=sum(prediction.p90),
+    )
+
+
+def _mean_by_local_date(
+    samples: list[tuple[datetime, float]], tz: ZoneInfo
+) -> dict[date, float]:
+    sums: dict[date, list[float]] = {}
+    for ts, value in samples:
+        sums.setdefault(ts.astimezone(tz).date(), []).append(value)
+    return {d: sum(vs) / len(vs) for d, vs in sums.items()}
+
+
+def _daily_actuals(intervals: list[ConsumptionInterval], tz: ZoneInfo) -> dict[date, float]:
+    """Actual kWh per complete local day (today and sparse days excluded)."""
+    by_day: dict[date, list[float]] = {}
+    for iv in intervals:
+        by_day.setdefault(iv.start.astimezone(tz).date(), []).append(iv.kwh)
+    today = datetime.now(tz).date()
+    return {d: sum(vs) for d, vs in by_day.items() if d < today and len(vs) >= 40}
+
+
+async def _record_shadow_forecasts(
+    settings: Settings, tz: ZoneInfo, *forecasts: LoadForecast
+) -> None:
+    """Record every candidate forecast so `forecast-eval` compares them fairly."""
+    target = (datetime.now(tz) + timedelta(days=1)).date()
+    try:
+        async with ForecastLedger(settings.db_path) as ledger:
+            for f in forecasts:
+                await ledger.record_forecast(
+                    datetime.now(UTC), target, forecast_model_tag(f.source),
+                    f.total_kwh, f.slots, f.source,
+                )
+    except Exception:  # noqa: BLE001 - recording must never block the plan
+        log.exception("Shadow forecast recording failed")
+
+
+async def _ml_beats_median(
+    settings: Settings, intervals: list[ConsumptionInterval], tz: ZoneInfo
+) -> bool:
+    """True when ledger history shows ML beating the median baseline on MAE."""
+    try:
+        since = (datetime.now(tz) - timedelta(days=_AUTO_EVAL_DAYS)).date()
+        async with ForecastLedger(settings.db_path) as ledger:
+            records = await ledger.forecasts_since(since)
+        results = {r.model: r for r in evaluate(records, _daily_actuals(intervals, tz))}
+        ml_eval = results.get("ml")
+        baseline = results.get("slots") or results.get("median") or results.get("baseline")
+        return (
+            ml_eval is not None
+            and baseline is not None
+            and ml_eval.n >= _AUTO_MIN_DAYS
+            and ml_eval.mae_kwh < baseline.mae_kwh
+        )
+    except Exception:  # noqa: BLE001 - gating must never crash the plan
+        log.exception("ML-vs-median gate failed; staying on the median")
+        return False
 
 
 def _daily_totals(rows: list[dict[str, Any]]) -> list[float]:

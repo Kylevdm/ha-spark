@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0
+
+- Weather-aware ML load model (Phase 6B, optional): gradient-boosted quantile
+  regression (P50/P90) over the hourly load history plus Open-Meteo
+  temperatures, occupancy signals, and UK bank holidays. Needs the `[habits]`
+  Python extra; without it everything falls back to the median profile.
+- `load_model` option: `median` (previous behaviour), `ml` (always prefer the
+  model), or `auto` (default — use ML only once `forecast-eval` shows it
+  beating the median over the trailing 14 days; both forecasts are
+  shadow-recorded nightly so the comparison accumulates automatically).
+- `buffer_mode: quantile` replaces the fixed `charge_buffer_pct` with the
+  model's own uncertainty, (P90 − P50)/P50, whenever the ML forecast drives
+  the plan.
+- `latitude`/`longitude` options for Open-Meteo (default: read from HA's own
+  configured location). Fetched past temperatures are cached into the signal
+  ledger so the model still runs from recorded data when Open-Meteo is down.
+
 ## 0.3.0
 
 - Forecast ledger (Phase 6A): the daemon now records each night's load

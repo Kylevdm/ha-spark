@@ -107,8 +107,10 @@ cache, decides via the Ollama router, and acts through `call_service`.
   `@pytest.mark.asyncio` needed). ruff lints `E,F,I,UP,B,ASYNC,W`, line length 100.
 - **Phase-per-branch/PR:** one phase per branch, each ending runnable and
   verifiable. Done: Phase 0-1 (scaffolding + HA connectivity), the energy
-  planner MVP (add-on v0.1.0), and Phase 2 (Ollama router + offline parser,
-  `ha-spark ask`). Next is Phase 3 (EV integration); see ROADMAP.md.
+  planner MVP (add-on v0.1.0), Phase 2 (Ollama router + offline parser,
+  `ha-spark ask`), Phase 3 (EV supply guard, add-on 0.2.0), Phase 6A
+  (forecast ledger + signal sampler, 0.3.0), and Phase 6B (weather-aware ML
+  quantile model, 0.4.0). Next is Phase 6C (context store); see ROADMAP.md.
 - **No-push fallback:** if a session lacks git credentials, produce a `git bundle`
   + `git format-patch` and push from a credentialed clone. (`*.bundle` / `*.patch`
   are gitignored.)
