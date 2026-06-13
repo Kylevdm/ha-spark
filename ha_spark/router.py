@@ -19,6 +19,7 @@ from ha_spark.context_intent import (
     parse_llm_extraction,
     record_context,
 )
+from ha_spark.copilot import build_grounding, grounded_system_prompt
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.intent_parser import (
@@ -42,21 +43,39 @@ class RouterResult:
     source: Literal["ollama", "offline"]
 
 
-async def _try_ollama(message: str, settings: Settings) -> str | None:
-    """Probe then chat; return the reply, or None if Ollama can't answer."""
+async def _ollama_reachable(settings: Settings) -> bool:
+    """Fast ``/api/tags`` probe: is the remote Ollama instance answering?"""
     try:
         async with OllamaClient(
             settings.ollama_url, timeout=settings.ollama_health_timeout
         ) as probe:
             await probe.list_models()
+        return True
     except Exception as exc:  # noqa: BLE001 - any probe failure means fall back
         log.info("Ollama unreachable @ %s (%r); using offline parser", settings.ollama_url, exc)
-        return None
+        return False
 
+
+async def _grounded_chat(
+    message: str, settings: Settings, rest: HomeAssistantRest
+) -> str | None:
+    """Probe, then answer via Ollama grounded in the live plan; None to fall back.
+
+    The probe runs first so the grounding plan isn't computed when Ollama is
+    unreachable. Grounding is best-effort: if it can't be built the model still
+    answers (told the plan is unavailable) rather than failing the chat.
+    """
+    if not await _ollama_reachable(settings):
+        return None
+    grounding = await build_grounding(settings, rest)
+    system = grounded_system_prompt(grounding)
     try:
         async with OllamaClient(settings.ollama_url, timeout=settings.ollama_timeout) as client:
             return await client.chat(
-                [{"role": "user", "content": message}],
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": message},
+                ],
                 model=settings.ollama_model,
                 num_ctx=settings.ollama_num_ctx,
             )
@@ -133,7 +152,7 @@ async def route_message(
     if context is not None:
         return context
 
-    reply = await _try_ollama(message, settings)
+    reply = await _grounded_chat(message, settings, rest)
     if reply is not None:
         log.info("Message answered by Ollama (%s)", settings.ollama_model)
         return RouterResult(text=reply, source="ollama")

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.0
+
+- NL copilot (Phase 5): `ha-spark ask` now grounds the Ollama tier in the live
+  computed plan. Before answering, it feeds the model the same plan the `plan`
+  command prints (SoC, solar, load forecast + source, deficit, charge current,
+  projected cost/saving, active context), so chat explains the actual decision
+  — "why 42 A", "what does tonight cost" — instead of guessing. Scoped to the
+  home-energy domain; the model explains and reports only, never claims to have
+  changed a setting (the deterministic planner still decides and acts).
+- Grounding is best-effort and the probe runs first: if Ollama is down the
+  offline parser answers as before, and if the plan can't be computed the model
+  is told so rather than inventing figures.
+
 ## 0.7.0
 
 - Occupancy habits + learned factors (Phase 6E):

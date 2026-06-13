@@ -173,6 +173,19 @@ it is **not** used as the load forecast).
 Tailscale) for the natural-language agent features. The planner runs fine
 without it; health reports it as a warning.
 
+When Ollama is reachable, `ha-spark ask` grounds it in the live computed plan,
+so chat explains the actual decision rather than guessing:
+
+```
+ha-spark ask "why is it charging at 42 A tonight?"
+ha-spark ask "what does tonight cost vs no battery?"
+```
+
+The model is given the same plan the `plan` command prints and is scoped to
+home energy — it explains and reports only, and never controls hardware. If
+Ollama is down, the deterministic offline parser answers the energy queries it
+recognises instead.
+
 ## Onboarding
 
 1. **Check the Log tab** after the first start: the add-on runs

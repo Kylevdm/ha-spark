@@ -145,3 +145,49 @@ async def test_non_context_message_unaffected(tmp_path: Any) -> None:
     result = await route_message("what's the battery soc", s, REST)  # type: ignore[arg-type]
     assert result.source == "ollama"
     assert result.text == "42% charged"
+
+
+# --- Phase 5: grounded chat ---
+
+import json  # noqa: E402
+
+
+@respx.mock
+async def test_chat_is_grounded_in_the_live_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_grounding(settings: Settings, rest: Any) -> str:
+        return "Charge plan:\n  Charge current 42 A over 6.0 h"
+
+    monkeypatch.setattr(router, "build_grounding", fake_grounding)
+    respx.get(f"{OLLAMA}/api/tags").mock(return_value=_TAGS_OK)
+    chat = respx.post(f"{OLLAMA}/api/chat").mock(
+        return_value=httpx.Response(
+            200, json={"message": {"content": "It charges at 42 A to cover the deficit."}}
+        )
+    )
+
+    result = await route_message("why 42 amps?", _settings(), REST)  # type: ignore[arg-type]
+    assert result.source == "ollama"
+    assert "42 A" in result.text
+
+    # The plan facts and the copilot system prompt reached the model.
+    body = json.loads(chat.calls.last.request.content)
+    system = body["messages"][0]
+    assert system["role"] == "system"
+    assert "Charge current 42 A" in system["content"]
+    assert "only cover home energy" in system["content"]
+    assert body["messages"][1] == {"role": "user", "content": "why 42 amps?"}
+
+
+@respx.mock
+async def test_grounding_failure_still_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def no_grounding(settings: Settings, rest: Any) -> str | None:
+        return None
+
+    monkeypatch.setattr(router, "build_grounding", no_grounding)
+    respx.get(f"{OLLAMA}/api/tags").mock(return_value=_TAGS_OK)
+    respx.post(f"{OLLAMA}/api/chat").mock(
+        return_value=httpx.Response(200, json={"message": {"content": "plan unavailable"}})
+    )
+    result = await route_message("what's the plan?", _settings(), REST)  # type: ignore[arg-type]
+    assert result.source == "ollama"
+    assert result.text == "plan unavailable"
