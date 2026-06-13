@@ -90,6 +90,26 @@ and UK bank holidays.
 The deterministic planner is unchanged — the model only supplies the load
 numbers fed into it, and falls back to the median chain on any failure.
 
+### Context facts (away / guests)
+
+Tell the planner about days that won't look like a normal week, and it scales
+the load forecast accordingly:
+
+```
+ha-spark context add away   --from 2026-07-01 --to 2026-07-14 --note Italy
+ha-spark context add guests --from 2026-12-24 --to 2026-12-27
+ha-spark context add high_usage --from 2026-08-10 --to 2026-08-10 --factor 1.5
+ha-spark context list
+ha-spark context remove 3
+```
+
+`away` multiplies the forecast by `away_load_factor` (default 0.4), `guests`
+by `guests_load_factor` (default 1.3), and `high_usage`/`low_usage` by the
+`--factor` you give. Overlapping facts multiply. Every active fact is printed
+in the plan report's forecast line, so each adjustment is visible and can be
+removed by id. Facts are data only — they never actuate hardware. (Phase 6D
+will let you set these from natural language via `ha-spark ask`.)
+
 ### Forecast ledger
 
 Every nightly run records the forecast it used (model, total kWh, per-slot
