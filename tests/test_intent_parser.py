@@ -102,3 +102,97 @@ async def test_plan_failure_is_reported_not_raised(monkeypatch: pytest.MonkeyPat
     result = await parse_offline("plan?", Settings(), REST)  # type: ignore[arg-type]
     assert result.matched
     assert "Could not compute the charge plan" in result.text
+
+
+# --- Phase 6D: offline context extraction + query ---
+
+from datetime import date, timedelta  # noqa: E402
+
+from ha_spark.energy.context import ContextStore  # noqa: E402
+from ha_spark.intent_parser import (  # noqa: E402
+    answer_context_query,
+    extract_context_offline,
+    is_context_query,
+    mentions_context,
+)
+
+_TODAY = date(2026, 6, 13)  # a Saturday
+
+
+def test_extract_iso_range_away() -> None:
+    e = extract_context_offline("i'm away from 2026-07-01 to 2026-07-14", _TODAY)
+    assert e is not None
+    assert e.kind == "away"
+    assert e.start == date(2026, 7, 1)
+    assert e.end == date(2026, 7, 14)
+
+
+def test_extract_next_two_weeks() -> None:
+    e = extract_context_offline("on holiday for the next two weeks", _TODAY)
+    assert e is not None
+    assert e.kind == "away"
+    assert e.start == _TODAY
+    assert e.end == _TODAY + timedelta(days=13)
+
+
+def test_extract_fortnight() -> None:
+    e = extract_context_offline("away for a fortnight", _TODAY)
+    assert e is not None
+    assert (e.end - e.start) == timedelta(days=13)
+
+
+def test_extract_guests_this_weekend() -> None:
+    e = extract_context_offline("we have guests this weekend", _TODAY)
+    assert e is not None
+    assert e.kind == "guests"
+    # 2026-06-13 is Saturday; "this weekend" is that Sat + Sun.
+    assert e.start == date(2026, 6, 13)
+    assert e.end == date(2026, 6, 14)
+
+
+def test_extract_next_week() -> None:
+    e = extract_context_offline("i'm on holiday next week", _TODAY)
+    assert e is not None
+    assert e.start == date(2026, 6, 15)  # Monday after the 13th
+    assert e.end == date(2026, 6, 21)
+
+
+def test_extract_tomorrow_single_day() -> None:
+    e = extract_context_offline("away tomorrow", _TODAY)
+    assert e is not None
+    assert e.start == e.end == _TODAY + timedelta(days=1)
+
+
+def test_extract_returns_none_without_kind() -> None:
+    assert extract_context_offline("what's the plan for next week", _TODAY) is None
+
+
+def test_extract_returns_none_without_dates() -> None:
+    assert extract_context_offline("i am going on holiday", _TODAY) is None
+
+
+def test_is_context_query_matches_questions_about_context() -> None:
+    assert is_context_query("what do you know about my holidays?")
+    assert is_context_query("show upcoming context")
+    assert not is_context_query("what's tonight's charge plan?")
+    assert not is_context_query("i'm away next week")  # a statement, not a query
+
+
+def test_mentions_context_prefilter() -> None:
+    assert mentions_context("i'm away next week")
+    assert mentions_context("guests staying 2026-07-01")
+    assert not mentions_context("what's the battery soc")
+
+
+async def test_answer_context_query_lists_facts(tmp_path: Any) -> None:
+    settings = Settings(db_path=str(tmp_path / "test.db"))
+    async with ContextStore(settings.db_path) as store:
+        await store.add("away", date(2026, 7, 1), date(2026, 7, 14), note="Italy")
+    out = await answer_context_query(settings, _TODAY)
+    assert "away" in out and "Italy" in out and "upcoming" in out
+
+
+async def test_answer_context_query_empty(tmp_path: Any) -> None:
+    settings = Settings(db_path=str(tmp_path / "test.db"))
+    out = await answer_context_query(settings, _TODAY)
+    assert "No context facts" in out
