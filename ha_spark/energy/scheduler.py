@@ -22,7 +22,7 @@ import httpx
 
 from ha_spark.config import Settings
 from ha_spark.energy.chargers import SolisCharger
-from ha_spark.energy.forecast import load_timezone
+from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargePlan, PlannerInputs
 from ha_spark.energy.planner import _in_overnight_window as in_window
@@ -44,15 +44,6 @@ def should_run(now: datetime, run_time: time, last_run_date: date | None) -> boo
     return now.time() >= run_time and now.date() != last_run_date
 
 
-def _forecast_model_tag(source: str) -> str:
-    """Short model tag for the ledger, derived from ``LoadForecast.source``."""
-    if source.startswith("slot profile"):
-        return "slots"
-    if source.startswith("median of"):
-        return "median"
-    return "baseline"
-
-
 async def _record_forecast(settings: Settings, plan: ChargePlan, inputs: PlannerInputs,
                             load_source: str) -> None:
     """Log tonight's forecast for tomorrow so `forecast-eval` can score it later."""
@@ -63,7 +54,7 @@ async def _record_forecast(settings: Settings, plan: ChargePlan, inputs: Planner
             await ledger.record_forecast(
                 datetime.now(UTC),
                 target_date,
-                _forecast_model_tag(load_source),
+                forecast_model_tag(load_source),
                 plan.load_kwh,
                 inputs.load_slots,
                 load_source,

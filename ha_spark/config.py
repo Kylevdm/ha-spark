@@ -93,6 +93,11 @@ _OPTION_KEYS = frozenset(
         "person_entities",
         "heatpump_energy_entity",
         "outdoor_weather_entity",
+        # Weather-aware ML load model (Phase 6B).
+        "load_model",
+        "buffer_mode",
+        "latitude",
+        "longitude",
     }
 )
 
@@ -218,6 +223,18 @@ class Settings(BaseSettings):
     heatpump_energy_entity: str = Field(default="")
     # Weather entity with a `temperature` attribute (e.g. HA's built-in Met.no `weather.home`).
     outdoor_weather_entity: str = Field(default="weather.home")
+
+    # Weather-aware ML load model (Phase 6B; needs the [habits] extra).
+    # "median" = slot-profile only; "ml" = always prefer the ML model when it can
+    # run; "auto" = use ML only once forecast-eval shows it beating the median
+    # over the trailing 14 days (safe default: degrades to median until then).
+    load_model: Literal["median", "ml", "auto"] = Field(default="auto")
+    # "quantile" replaces the fixed charge_buffer_pct with (P90-P50)/P50 from the
+    # ML model whenever an ML forecast drives the plan.
+    buffer_mode: Literal["fixed", "quantile"] = Field(default="fixed")
+    # Site coordinates for Open-Meteo; unset -> read from HA /api/config.
+    latitude: float | None = Field(default=None)
+    longitude: float | None = Field(default=None)
 
     @field_validator("solar_percentile", mode="before")
     @classmethod

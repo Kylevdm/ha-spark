@@ -1,6 +1,6 @@
 ---
 name: ha-spark
-version: "0.3.0"
+version: "0.4.0"
 slug: ha_spark_addon
 description: Local-first battery charge planner and automation agent for Home Assistant
 url: https://github.com/Kylevdm/ha-spark
@@ -57,6 +57,8 @@ options:
   inverter_power_switch_entity: select.solisac_power_switch
   ha_template_charge_needed_entity: sensor.charge_energy_needed
   outdoor_weather_entity: weather.home
+  load_model: auto
+  buffer_mode: fixed
 schema:
   log_level: list(DEBUG|INFO|WARNING|ERROR)
   proactive_mode: list(off|simulate|on)
@@ -110,3 +112,7 @@ schema:
   person_entities: str?
   heatpump_energy_entity: str?
   outdoor_weather_entity: str?
+  load_model: list(median|ml|auto)
+  buffer_mode: list(fixed|quantile)
+  latitude: float?
+  longitude: float?

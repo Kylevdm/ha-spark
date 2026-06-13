@@ -46,6 +46,9 @@ class LoadForecast:
     total_kwh: float
     slots: tuple[float, ...] | None  # 48 local half-hour slot kWh (slot-of-day order)
     source: str
+    # P90 day total from the quantile ML model (None elsewhere); feeds the
+    # dynamic buffer when buffer_mode is "quantile".
+    p90_total_kwh: float | None = None
 
 
 @dataclass(frozen=True)
