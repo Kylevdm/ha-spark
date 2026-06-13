@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from ha_spark.cli import (
     _cmd_ask,
     _cmd_backfill_load,
     _cmd_backtest,
+    _cmd_context,
     _cmd_forecast_eval,
     _cmd_import_csv,
     _cmd_onboard,
@@ -56,6 +58,7 @@ def test_help_mentions_every_command_and_flags() -> None:
     for command in (
         "states", "health", "onboard", "plan", "ask", "run",
         "backfill-load", "import-csv", "pull-consumption", "backtest", "forecast-eval",
+        "context",
     ):
         assert command in top
     assert "examples:" in top
@@ -64,6 +67,13 @@ def test_help_mentions_every_command_and_flags() -> None:
     assert args.command == "backtest" and args.days == 7
     args = parser.parse_args(["forecast-eval", "--days", "5"])
     assert args.command == "forecast-eval" and args.days == 5
+    args = parser.parse_args(
+        ["context", "add", "away", "--from", "2026-07-01", "--to", "2026-07-14"]
+    )
+    assert args.command == "context" and args.context_command == "add"
+    assert args.kind == "away" and args.start == "2026-07-01" and args.end == "2026-07-14"
+    args = parser.parse_args(["context", "remove", "3"])
+    assert args.context_command == "remove" and args.id == 3
     args = parser.parse_args(["plan", "--apply"])
     assert args.apply is True
     args = parser.parse_args(["ask", "what's", "the", "plan"])
@@ -128,6 +138,62 @@ async def test_forecast_eval_reports_accuracy(
     out = capsys.readouterr().out
     assert "median" in out
     assert "MAE" in out
+
+
+def _ctx_args(**kw: object) -> argparse.Namespace:
+    return argparse.Namespace(**kw)
+
+
+async def test_context_add_list_remove_cli(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = Settings(db_path=str(tmp_path / "test.db"), timezone="UTC")
+
+    add = _ctx_args(
+        context_command="add", kind="away", start="2026-07-01", end="2026-07-14",
+        note="Italy", factor=None,
+    )
+    assert await _cmd_context(settings, add) == 0
+    assert "Added context" in capsys.readouterr().out
+
+    lst = _ctx_args(context_command="list")
+    assert await _cmd_context(settings, lst) == 0
+    out = capsys.readouterr().out
+    assert "away" in out and "Italy" in out and "×0.40" in out
+
+    rm = _ctx_args(context_command="remove", id=1)
+    assert await _cmd_context(settings, rm) == 0
+    assert "Removed context [1]" in capsys.readouterr().out
+
+
+async def test_context_add_bad_date_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = Settings(db_path=str(tmp_path / "test.db"))
+    add = _ctx_args(
+        context_command="add", kind="away", start="not-a-date", end=None,
+        note=None, factor=None,
+    )
+    assert await _cmd_context(settings, add) == 2
+    assert "Bad date" in capsys.readouterr().err
+
+
+async def test_context_remove_missing_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = Settings(db_path=str(tmp_path / "test.db"))
+    rm = _ctx_args(context_command="remove", id=99)
+    assert await _cmd_context(settings, rm) == 2
+    assert "No context with id 99" in capsys.readouterr().err
+
+
+async def test_context_list_empty(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = Settings(db_path=str(tmp_path / "test.db"))
+    lst = _ctx_args(context_command="list")
+    assert await _cmd_context(settings, lst) == 0
+    assert "No context facts stored" in capsys.readouterr().out
 
 
 async def test_onboard_exit_code_tracks_status(monkeypatch: pytest.MonkeyPatch) -> None:

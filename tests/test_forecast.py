@@ -268,3 +268,46 @@ async def test_no_location_skips_ml(
     settings = _ml_settings(tmp_path, load_model="ml")
     result = await predict_home_load(settings)  # no lat/lon
     assert "slot profile" in result.source
+
+
+# --- Phase 6C: context scaling of the forecast ---
+
+
+async def test_context_away_scales_forecast_down(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
+
+    from ha_spark.energy.context import ContextStore
+    from ha_spark.energy.forecast import load_timezone
+
+    async def fake_stats(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        return _hourly_rows(days=14, kwh_per_hour=1.0)  # 24 kWh/day unscaled
+
+    monkeypatch.setattr(forecast, "statistics_during_period", fake_stats)
+    settings = Settings(db_path=str(tmp_path / "ctx.db"), load_model="median",
+                        away_load_factor=0.4)
+    tz = load_timezone(settings.timezone)
+    tomorrow = (_dt.now(tz) + _td(days=1)).date()
+    async with ContextStore(settings.db_path) as store:
+        await store.add("away", tomorrow, tomorrow, note="holiday")
+
+    result = await predict_home_load(settings)
+    assert result.total_kwh == pytest.approx(24.0 * 0.4)
+    assert "context" in result.source and "away" in result.source
+    assert result.slots is not None
+    assert all(s == pytest.approx(0.5 * 0.4) for s in result.slots)
+
+
+async def test_no_active_context_leaves_forecast_unscaled(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_stats(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        return _hourly_rows(days=14, kwh_per_hour=1.0)
+
+    monkeypatch.setattr(forecast, "statistics_during_period", fake_stats)
+    settings = Settings(db_path=str(tmp_path / "ctx.db"), load_model="median")
+    result = await predict_home_load(settings)
+    assert result.total_kwh == pytest.approx(24.0)
+    assert "context" not in result.source

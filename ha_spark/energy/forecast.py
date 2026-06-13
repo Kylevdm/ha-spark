@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 
 from ha_spark.config import Settings
 from ha_spark.energy import ml, weather
+from ha_spark.energy.context import ContextStore, combined_factor
 from ha_spark.energy.eval import evaluate
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ConsumptionInterval, LoadForecast
@@ -94,6 +95,10 @@ async def predict_home_load(
     chain starts at the median slot profile as before.
     """
     tz = load_timezone(settings.timezone)
+    # A dated context fact (away/guests/...) scales both candidate forecasts by
+    # the same factor, so the ledger comparison and the P90/P50 buffer ratio are
+    # unaffected; the report surfaces it via the forecast source.
+    ctx_scale, ctx_lines = await _context_scale(settings, tz)
     intervals: list[ConsumptionInterval] = []
     median_forecast: LoadForecast | None = None
     try:
@@ -122,6 +127,7 @@ async def predict_home_load(
         total, source = await predict_home_load_kwh(settings)
         median_forecast = LoadForecast(total_kwh=total, slots=None, source=source)
 
+    median_forecast = _apply_context(median_forecast, ctx_scale, ctx_lines)
     if settings.load_model == "median":
         return median_forecast
     try:
@@ -131,6 +137,7 @@ async def predict_home_load(
         return median_forecast
     if ml_forecast is None:
         return median_forecast
+    ml_forecast = _apply_context(ml_forecast, ctx_scale, ctx_lines)
     await _record_shadow_forecasts(settings, tz, median_forecast, ml_forecast)
     if settings.load_model == "ml":
         return ml_forecast
@@ -141,6 +148,35 @@ async def predict_home_load(
         "%dd; using %s", _AUTO_EVAL_DAYS, median_forecast.source,
     )
     return median_forecast
+
+
+async def _context_scale(settings: Settings, tz: ZoneInfo) -> tuple[float, list[str]]:
+    """Combined load multiplier (and report lines) for context active tomorrow."""
+    target = (datetime.now(tz) + timedelta(days=1)).date()
+    try:
+        async with ContextStore(settings.db_path) as store:
+            active = await store.active_on(target)
+        return combined_factor(active, settings)
+    except Exception as exc:  # noqa: BLE001 - context is an optional adjustment
+        log.warning("Context store unavailable (%s); ignoring context", exc)
+        return 1.0, []
+
+
+def _apply_context(
+    forecast: LoadForecast, scale: float, lines: list[str]
+) -> LoadForecast:
+    """Scale a forecast by an active-context factor, noting it in the source."""
+    if scale == 1.0 or not lines:
+        return forecast
+    note = "; ".join(lines)
+    return LoadForecast(
+        total_kwh=forecast.total_kwh * scale,
+        slots=tuple(s * scale for s in forecast.slots) if forecast.slots else None,
+        source=f"{forecast.source} ×{scale:.2f} [context: {note}]",
+        p90_total_kwh=(
+            forecast.p90_total_kwh * scale if forecast.p90_total_kwh is not None else None
+        ),
+    )
 
 
 async def _ml_forecast(

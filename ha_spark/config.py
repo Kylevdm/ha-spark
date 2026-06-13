@@ -98,6 +98,9 @@ _OPTION_KEYS = frozenset(
         "buffer_mode",
         "latitude",
         "longitude",
+        # Context store (Phase 6C).
+        "away_load_factor",
+        "guests_load_factor",
     }
 )
 
@@ -235,6 +238,12 @@ class Settings(BaseSettings):
     # Site coordinates for Open-Meteo; unset -> read from HA /api/config.
     latitude: float | None = Field(default=None)
     longitude: float | None = Field(default=None)
+
+    # Context store (Phase 6C): load multipliers for an active dated fact.
+    # away (holiday) lightens the forecast; guests heightens it. high_usage/
+    # low_usage facts carry their own factor instead.
+    away_load_factor: float = Field(default=0.4)
+    guests_load_factor: float = Field(default=1.3)
 
     @field_validator("solar_percentile", mode="before")
     @classmethod

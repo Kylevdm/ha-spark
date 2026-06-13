@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0
+
+- Context store (Phase 6C): record date-ranged household facts the planner
+  consumes as a deterministic load multiplier. `ha-spark context add away
+  --from 2026-07-01 --to 2026-07-14` lightens the overnight charge for a
+  holiday; `guests` heightens it; `high_usage`/`low_usage --factor X` apply a
+  custom multiplier. `context list` / `context remove <id>` round-trip.
+- Active facts scale tomorrow's load forecast (both the median and ML
+  candidates by the same factor, so accuracy scoring and the quantile buffer
+  are unaffected) and are named in the plan report's forecast line.
+- `away_load_factor` (default 0.4) and `guests_load_factor` (default 1.3)
+  options set the multipliers; Phase 6E will learn them from history.
+
 ## 0.4.0
 
 - Weather-aware ML load model (Phase 6B, optional): gradient-boosted quantile
