@@ -10,12 +10,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from ha_spark.config import ConfigError, Settings, load_settings
 from ha_spark.energy.backtest import backtest_cost, format_backtest
 from ha_spark.energy.chargers import SolisCharger
+from ha_spark.energy.context import KINDS, ContextStore
 from ha_spark.energy.eval import actual_kwh_by_date, evaluate, format_eval
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
@@ -242,6 +243,55 @@ async def _cmd_forecast_eval(settings: Settings, *, days: int) -> int:
     return 0
 
 
+async def _cmd_context(settings: Settings, args: argparse.Namespace) -> int:
+    """Add, list, or remove date-ranged context facts the planner consumes."""
+    async with ContextStore(settings.db_path) as store:
+        if args.context_command == "add":
+            try:
+                start = date.fromisoformat(args.start)
+                end = date.fromisoformat(args.end) if args.end else start
+            except ValueError as exc:
+                print(f"Bad date (expected YYYY-MM-DD): {exc}", file=sys.stderr)
+                return 2
+            try:
+                entry_id = await store.add(
+                    args.kind, start, end, note=args.note or "", factor=args.factor
+                )
+            except ValueError as exc:
+                print(f"Could not add context: {exc}", file=sys.stderr)
+                return 2
+            print(f"Added context [{entry_id}] {args.kind} {start} .. {end}.")
+            return 0
+
+        if args.context_command == "remove":
+            removed = await store.remove(args.id)
+            if not removed:
+                print(f"No context with id {args.id}.", file=sys.stderr)
+                return 2
+            print(f"Removed context [{args.id}].")
+            return 0
+
+        entries = await store.list_all()
+
+    if not entries:
+        print("No context facts stored. Add one with `ha-spark context add`.")
+        return 0
+    today = datetime.now(load_timezone(settings.timezone)).date()
+    print(f"{len(entries)} context fact(s):")
+    for e in entries:
+        active = e.start_date <= today <= e.end_date
+        factor = e.factor(settings)
+        span = (
+            f"{e.start_date}"
+            if e.start_date == e.end_date
+            else f"{e.start_date} .. {e.end_date}"
+        )
+        note = f"  — {e.note}" if e.note else ""
+        flag = "active" if active else "      "
+        print(f"  [{e.id}] {flag} {e.kind:<10} {span}  ×{factor:.2f}{note}")
+    return 0
+
+
 async def _cmd_pull_consumption(settings: Settings, *, days: int) -> int:
     """Pull half-hourly consumption from the Octopus API (incremental)."""
     period_from = datetime.now(UTC) - timedelta(days=days)
@@ -274,6 +324,9 @@ examples:
   ha-spark pull-consumption --days 60      pull grid import from the Octopus API
   ha-spark backtest --days 30              rate stored grid import under the tariff
   ha-spark forecast-eval --days 14         score recorded forecasts vs actual load
+  ha-spark context add away --from 2026-07-01 --to 2026-07-14   record a holiday
+  ha-spark context list                    show stored context facts
+  ha-spark context remove 3                delete a context fact by id
 """
 
 
@@ -426,6 +479,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="How many days of recorded forecasts to score (default: 14)",
     )
 
+    p_ctx = sub.add_parser(
+        "context",
+        help="Manage date-ranged context facts (away/guests) the planner uses",
+        description="Record household context the deterministic planner consumes as a "
+        "load multiplier: an `away` holiday lightens the forecast, `guests` heightens "
+        "it, and `high_usage`/`low_usage` apply a custom --factor. Active facts are "
+        "printed with each plan.",
+    )
+    ctx_sub = p_ctx.add_subparsers(dest="context_command", required=True, metavar="ACTION")
+    p_ctx_add = ctx_sub.add_parser("add", help="Add a context fact")
+    p_ctx_add.add_argument("kind", choices=KINDS, help="The kind of fact")
+    p_ctx_add.add_argument(
+        "--from", dest="start", required=True, metavar="YYYY-MM-DD", help="First day (inclusive)"
+    )
+    p_ctx_add.add_argument(
+        "--to", dest="end", metavar="YYYY-MM-DD", help="Last day (inclusive; default: same day)"
+    )
+    p_ctx_add.add_argument("--note", metavar="TEXT", help="Optional free-text note")
+    p_ctx_add.add_argument(
+        "--factor",
+        type=float,
+        metavar="X",
+        help="Load multiplier for high_usage/low_usage facts (away/guests use config)",
+    )
+    ctx_sub.add_parser("list", help="List all stored context facts")
+    p_ctx_rm = ctx_sub.add_parser("remove", help="Remove a context fact by id")
+    p_ctx_rm.add_argument("id", type=int, metavar="ID", help="The fact id (see `context list`)")
+
     p_bt = sub.add_parser(
         "backtest",
         help="Rate stored grid import under the configured two-rate tariff",
@@ -496,6 +577,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "forecast-eval":
         return asyncio.run(_cmd_forecast_eval(settings, days=args.days))
+
+    if args.command == "context":
+        return asyncio.run(_cmd_context(settings, args))
 
     parser.error(f"unknown command: {args.command}")
     return 2  # pragma: no cover - argparse exits first
