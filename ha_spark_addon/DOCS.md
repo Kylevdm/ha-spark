@@ -125,6 +125,22 @@ handles ISO dates and phrases like "next week", "this weekend", and "for a
 fortnight". Either way the fact is echoed back with an undo command, and the
 language model never controls hardware — it only records reviewable facts.
 
+### Learned habits
+
+As occupancy and away history accumulate, ha-spark learns from it:
+
+- Tomorrow's **occupancy** is predicted from the weekday/weekend pattern of
+  recorded `occupancy_home_frac` and fed to the ML model.
+- The **away load factor** is learned from how much less you actually used on
+  past `away` days versus normal days of the same type, and applied
+  automatically once there's enough history (the plan report marks it
+  `(learned)`); until then the configured `away_load_factor` is used.
+
+`ha-spark learn-factors` shows the current learned away factor, tomorrow's
+predicted occupancy, and any advisory habit predictions. The daemon logs those
+predictions each run, labelled with `proactive_mode` — they are advisory only
+and never actuate hardware.
+
 ### Forecast ledger
 
 Every nightly run records the forecast it used (model, total kWh, per-slot
