@@ -110,8 +110,9 @@ cache, decides via the Ollama router, and acts through `call_service`.
   planner MVP (add-on v0.1.0), Phase 2 (Ollama router + offline parser,
   `ha-spark ask`), Phase 3 (EV supply guard, add-on 0.2.0), Phase 6A
   (forecast ledger + signal sampler, 0.3.0), Phase 6B (weather-aware ML
-  quantile model, 0.4.0), and Phase 6C (context store + `ha-spark context`,
-  0.5.0). Next is Phase 6D (LLM context extraction); see ROADMAP.md.
+  quantile model, 0.4.0), Phase 6C (context store + `ha-spark context`,
+  0.5.0), and Phase 6D (LLM context extraction in `ha-spark ask`, 0.6.0).
+  Next is Phase 6E (occupancy habits + learned factors); see ROADMAP.md.
 - **No-push fallback:** if a session lacks git credentials, produce a `git bundle`
   + `git format-patch` and push from a credentialed clone. (`*.bundle` / `*.patch`
   are gitignored.)

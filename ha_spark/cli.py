@@ -395,8 +395,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Route a message through the LLM router: a fast /api/tags probe "
         "checks the remote Ollama endpoint; if reachable the message is answered by "
         "OLLAMA_MODEL, otherwise the deterministic offline parser answers energy "
-        "queries (plan, soc, solar, strategy, mode, window). The output is prefixed "
-        "with [ollama] or [offline] to show which tier answered.",
+        "queries (plan, soc, solar, strategy, mode, window). A context statement "
+        "(\"I'm away next week\") is extracted into a context fact, and a context "
+        "question lists stored facts — both before plain chat. The output is "
+        "prefixed with [ollama] or [offline] to show which tier answered.",
     )
     p_ask.add_argument(
         "message",

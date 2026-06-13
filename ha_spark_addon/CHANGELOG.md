@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.0
+
+- Natural-language context (Phase 6D): `ha-spark ask "I'm on holiday for the
+  next two weeks"` now records a context fact and replies with its planner
+  effect and an undo command. When the Ollama tier is reachable it extracts
+  the dates as strict JSON (validated before anything is stored); offline, a
+  deterministic parser handles ISO dates and phrases like "next week", "this
+  weekend", and "for a fortnight".
+- `ha-spark ask "what do you know about my holidays?"` lists stored facts,
+  answered directly from the context store.
+- The router runs this extraction/query pass before plain chat. The language
+  model only ever records reviewable facts — it never actuates hardware, and
+  every recorded fact is echoed back and removable via `ha-spark context`.
+
 ## 0.5.0
 
 - Context store (Phase 6C): record date-ranged household facts the planner

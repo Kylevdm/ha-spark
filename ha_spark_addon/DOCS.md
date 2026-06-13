@@ -107,8 +107,23 @@ ha-spark context remove 3
 by `guests_load_factor` (default 1.3), and `high_usage`/`low_usage` by the
 `--factor` you give. Overlapping facts multiply. Every active fact is printed
 in the plan report's forecast line, so each adjustment is visible and can be
-removed by id. Facts are data only — they never actuate hardware. (Phase 6D
-will let you set these from natural language via `ha-spark ask`.)
+removed by id. Facts are data only — they never actuate hardware.
+
+You can also set them in plain language through `ha-spark ask` (and so any
+chat surface wired to it):
+
+```
+ha-spark ask "I'm on holiday for the next two weeks"
+  -> Noted — away Sat 13 Jun – Fri 26 Jun. The planner will assume ~40% of
+     normal load on those days. Undo with `ha-spark context remove 4`.
+ha-spark ask "what do you know about my holidays?"   # lists stored facts
+```
+
+When the Ollama tier is reachable it extracts the dates (returning strict
+JSON, validated before anything is stored); offline, a deterministic parser
+handles ISO dates and phrases like "next week", "this weekend", and "for a
+fortnight". Either way the fact is echoed back with an undo command, and the
+language model never controls hardware — it only records reviewable facts.
 
 ### Forecast ledger
 
