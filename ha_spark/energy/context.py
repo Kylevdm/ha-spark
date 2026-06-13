@@ -73,13 +73,22 @@ class ContextEntry:
 
 
 def combined_factor(
-    entries: Sequence[ContextEntry], settings: Settings
+    entries: Sequence[ContextEntry],
+    settings: Settings,
+    *,
+    away_factor_override: float | None = None,
 ) -> tuple[float, list[str]]:
-    """Multiply the factors of all active facts; return (factor, report lines)."""
+    """Multiply the factors of all active facts; return (factor, report lines).
+
+    ``away_factor_override`` (Phase 6E) replaces the configured factor for
+    ``away`` facts with one learned from past away periods.
+    """
     factor = 1.0
     lines: list[str] = []
     for e in entries:
-        f = e.factor(settings)
+        learned = away_factor_override is not None and e.kind == "away"
+        f = away_factor_override if learned else e.factor(settings)
+        assert f is not None  # narrow for mypy: learned implies override is set
         factor *= f
         span = (
             f"{e.start_date:%Y-%m-%d}"
@@ -87,7 +96,8 @@ def combined_factor(
             else f"{e.start_date:%Y-%m-%d}..{e.end_date:%Y-%m-%d}"
         )
         note = f" — {e.note}" if e.note else ""
-        lines.append(f"[{e.id}] {e.kind} {span} ×{f:.2f}{note}")
+        suffix = " (learned)" if learned else ""
+        lines.append(f"[{e.id}] {e.kind} {span} ×{f:.2f}{suffix}{note}")
     return factor, lines
 
 

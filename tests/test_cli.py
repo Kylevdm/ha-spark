@@ -15,6 +15,7 @@ from ha_spark.cli import (
     _cmd_context,
     _cmd_forecast_eval,
     _cmd_import_csv,
+    _cmd_learn_factors,
     _cmd_onboard,
     _cmd_run,
     build_parser,
@@ -58,7 +59,7 @@ def test_help_mentions_every_command_and_flags() -> None:
     for command in (
         "states", "health", "onboard", "plan", "ask", "run",
         "backfill-load", "import-csv", "pull-consumption", "backtest", "forecast-eval",
-        "context",
+        "context", "learn-factors",
     ):
         assert command in top
     assert "examples:" in top
@@ -142,6 +143,57 @@ async def test_forecast_eval_reports_accuracy(
 
 def _ctx_args(**kw: object) -> argparse.Namespace:
     return argparse.Namespace(**kw)
+
+
+async def test_learn_factors_reports_learned_away_and_occupancy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from ha_spark.energy.context import ContextStore
+    from ha_spark.energy.ledger import ForecastLedger
+
+    settings = Settings(db_path=str(tmp_path / "test.db"), timezone="UTC")
+    today = datetime.now(UTC).date()
+    # Daily actuals: normal 20 kWh, three away days at 8 kWh -> learned ~0.4.
+    rows = []
+    away = [today - timedelta(days=d) for d in (10, 9, 8)]
+    for d in range(20, 0, -1):
+        day = today - timedelta(days=d)
+        start_ms = datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp() * 1000
+        rows.append({"start": start_ms, "change": 8.0 if day in away else 20.0})
+
+    async def fake_stats(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        return rows
+
+    monkeypatch.setattr(cli, "statistics_during_period", fake_stats)
+    async with ContextStore(settings.db_path) as store:
+        await store.add("away", away[0], away[-1])
+    async with ForecastLedger(settings.db_path) as ledger:
+        for d in range(14, 0, -1):
+            day = today - timedelta(days=d)
+            ts = datetime(day.year, day.month, day.day, 12, tzinfo=UTC)
+            await ledger.record_signal(ts, "occupancy_home_frac", 0.5)
+
+    assert await _cmd_learn_factors(settings) == 0
+    out = capsys.readouterr().out
+    assert "Away load factor" in out
+    assert "0.4" in out
+    assert "Occupancy tomorrow" in out
+
+
+async def test_learn_factors_reports_insufficient_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = Settings(db_path=str(tmp_path / "test.db"), timezone="UTC")
+
+    async def fake_stats(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        return []
+
+    monkeypatch.setattr(cli, "statistics_during_period", fake_stats)
+    assert await _cmd_learn_factors(settings) == 0
+    out = capsys.readouterr().out
+    assert "not enough away history" in out
 
 
 async def test_context_add_list_remove_cli(
