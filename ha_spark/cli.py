@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -41,6 +42,8 @@ from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
 from ha_spark.health import Status, check_load_history, exit_code, format_report, run_health
 from ha_spark.logging import get_logger, setup_logging
+from ha_spark.onboarding_discover import FieldProposal, propose
+from ha_spark.presets import get_preset, preset_names
 from ha_spark.router import route_message
 
 log = get_logger(__name__)
@@ -128,8 +131,80 @@ async def _cmd_run(settings: Settings, *, once: bool) -> int:
     return 0
 
 
-async def _cmd_onboard(settings: Settings) -> int:
-    """Report load-history readiness for the slot-profile forecast."""
+_STATUS_GLYPH = {"match": "✓", "differs": "≠", "missing": "·"}
+
+
+def _resolve_field(prop: FieldProposal, preset: dict[str, str]) -> tuple[str, str] | None:
+    """The entity to propose for a field and where it came from, or None."""
+    if prop.best is not None:
+        return prop.best.entity_id, "discovered"
+    if prop.config_field in preset:
+        return preset[prop.config_field], "preset"
+    return None
+
+
+async def _cmd_onboard(
+    settings: Settings, *, as_json: bool, write: bool, preset_name: str | None
+) -> int:
+    """Propose entity mappings from a live state dump, then check load readiness."""
+    preset: dict[str, str] = {}
+    if preset_name:
+        try:
+            preset = get_preset(preset_name)
+        except KeyError:
+            print(
+                f"Unknown preset {preset_name!r}; available: {', '.join(preset_names())}",
+                file=sys.stderr,
+            )
+            return 2
+
+    async with HomeAssistantRest(
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+    ) as rest:
+        states = await rest.get_states()
+    proposals = propose(states, settings)
+
+    if as_json:
+        payload = {
+            p.config_field: {
+                "current": p.current,
+                "status": p.status,
+                "optional": p.optional,
+                "candidates": [
+                    {"entity_id": c.entity_id, "score": c.score, "reasons": list(c.reasons)}
+                    for c in p.candidates
+                ],
+            }
+            for p in proposals
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print(f"Entity discovery ({len(states)} entities scanned):")
+    for p in proposals:
+        glyph = _STATUS_GLYPH[p.status]
+        opt = " (optional)" if p.optional else ""
+        print(f"  {glyph} {p.config_field}{opt}")
+        print(f"      configured: {p.current or '<unset>'}")
+        if p.best is not None:
+            print(f"      proposed:   {p.best.entity_id}  [{', '.join(p.best.reasons)}]")
+            for alt in p.candidates[1:]:
+                print(f"      alt:        {alt.entity_id}")
+        elif p.config_field in preset:
+            print(f"      preset:     {preset[p.config_field]}  [{preset_name}]")
+        else:
+            print("      no candidate found")
+
+    if write:
+        print("\n# Proposed options (paste into the add-on Configuration / .env):")
+        for p in proposals:
+            resolved = _resolve_field(p, preset)
+            if resolved is None:
+                continue
+            entity_id, origin = resolved
+            print(f"{p.config_field}: {entity_id}    # {origin}")
+
+    print()
     result = await check_load_history(settings)
     print(format_report([result]))
     return 0 if result.status is Status.OK else 2
@@ -427,12 +502,27 @@ def build_parser() -> argparse.ArgumentParser:
         "dependency (HA/SQLite) failed, 2 = degraded (e.g. Ollama down, thin history).",
     )
 
-    sub.add_parser(
+    p_onboard = sub.add_parser(
         "onboard",
-        help="Check load-history readiness for the slot-profile forecast",
-        description="Report whether CONSUMPTION_ENERGY_ENTITY has enough hourly history "
-        "for the slot-profile forecast (PROFILE_MIN_DAYS distinct days incl. 2+ weekend "
-        "days). Exit 0 when ready, 2 otherwise — fix gaps with `backfill-load`.",
+        help="Propose entity mappings from live HA state, then check load readiness",
+        description="Scan Home Assistant's entities and propose which one maps to each "
+        "ha-spark config field (battery SoC, solar forecast, dispatch sensor, charge "
+        "current control, ...), ranked by device class / unit / name. Then report "
+        "whether CONSUMPTION_ENERGY_ENTITY has enough hourly history for the slot-profile "
+        "forecast. Exit 0 when ready, 2 otherwise — fix gaps with `backfill-load`. "
+        "Proposals are advisory: review and set the options yourself.",
+    )
+    p_onboard.add_argument(
+        "--json", dest="as_json", action="store_true",
+        help="Emit the discovery proposals as JSON (skips the readiness check output)",
+    )
+    p_onboard.add_argument(
+        "--write", action="store_true",
+        help="Also print a ready-to-paste options fragment for the proposed mapping",
+    )
+    p_onboard.add_argument(
+        "--preset", dest="preset", metavar="NAME", choices=preset_names(),
+        help=f"Fill unmatched fields from a vendor preset ({', '.join(preset_names())})",
     )
 
     p_plan = sub.add_parser(
@@ -631,7 +721,11 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_cmd_run(settings, once=args.once))
 
     if args.command == "onboard":
-        return asyncio.run(_cmd_onboard(settings))
+        return asyncio.run(
+            _cmd_onboard(
+                settings, as_json=args.as_json, write=args.write, preset_name=args.preset
+            )
+        )
 
     if args.command == "backfill-load":
         return asyncio.run(
