@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.0
+
+- Occupancy habits + learned factors (Phase 6E):
+  - Tomorrow's occupancy is predicted from the day-type pattern of recorded
+    `occupancy_home_frac` samples and fed to the ML model as a real feature
+    for the target day (previously the history mean).
+  - The `away` load factor is learned from past away periods (actual load on
+    those days vs same-day-type normal days) and applied automatically once
+    enough away history exists, falling back to `away_load_factor` otherwise.
+    The plan report marks a learned factor with `(learned)`.
+  - `ha-spark learn-factors` reports the learned away factor, tomorrow's
+    predicted occupancy, and the advisory habit predictions.
+  - The daemon logs `predict_actions` advisories each run (gated by, and
+    labelled with, `PROACTIVE_MODE`) — the seam later proactivity builds on.
+    Nothing is executed yet; the model still only ever records reviewable
+    facts and the deterministic planner still decides.
+
 ## 0.6.0
 
 - Natural-language context (Phase 6D): `ha-spark ask "I'm on holiday for the

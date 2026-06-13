@@ -311,3 +311,50 @@ async def test_no_active_context_leaves_forecast_unscaled(
     result = await predict_home_load(settings)
     assert result.total_kwh == pytest.approx(24.0)
     assert "context" not in result.source
+
+
+# --- Phase 6E: learned away factor overrides the configured default ---
+
+
+async def test_learned_away_factor_overrides_config(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import datetime as _dt
+
+    from ha_spark.energy.context import ContextStore
+    from ha_spark.energy.forecast import load_timezone
+
+    tz = load_timezone("UTC")
+    today = _dt.now(tz).date()
+    tomorrow = today + timedelta(days=1)
+    # Three past away days (well before today) drew 40% of a normal 24 kWh day.
+    away_past = [today - timedelta(days=d) for d in (10, 9, 8)]
+
+    def rows_for(_days: int, _kwh: float) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        today_mid = _dt.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        for d in range(21, 0, -1):
+            day = today_mid - timedelta(days=d)
+            per_hour = 0.4 if day.date() in away_past else 1.0
+            out.extend(
+                {"start": (day + timedelta(hours=h)).timestamp() * 1000, "change": per_hour}
+                for h in range(24)
+            )
+        return out
+
+    async def fake_stats(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        return rows_for(21, 1.0)
+
+    monkeypatch.setattr(forecast, "statistics_during_period", fake_stats)
+    settings = Settings(
+        db_path=str(tmp_path / "ctx.db"), load_model="median", away_load_factor=0.7
+    )
+    async with ContextStore(settings.db_path) as store:
+        # Record the past away block (for learning) and tomorrow (active).
+        await store.add("away", away_past[0], away_past[-1])
+        await store.add("away", tomorrow, tomorrow, note="holiday")
+
+    result = await predict_home_load(settings)
+    # Learned factor ~0.4 (away/normal), not the configured 0.7.
+    assert result.total_kwh == pytest.approx(24.0 * 0.4, abs=0.5)
+    assert "learned" in result.source

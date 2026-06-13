@@ -30,7 +30,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ha_spark.config import Settings
-from ha_spark.energy import ml, weather
+from ha_spark.energy import habits, ml, weather
 from ha_spark.energy.context import ContextStore, combined_factor
 from ha_spark.energy.eval import evaluate
 from ha_spark.energy.ledger import ForecastLedger
@@ -95,10 +95,6 @@ async def predict_home_load(
     chain starts at the median slot profile as before.
     """
     tz = load_timezone(settings.timezone)
-    # A dated context fact (away/guests/...) scales both candidate forecasts by
-    # the same factor, so the ledger comparison and the P90/P50 buffer ratio are
-    # unaffected; the report surfaces it via the forecast source.
-    ctx_scale, ctx_lines = await _context_scale(settings, tz)
     intervals: list[ConsumptionInterval] = []
     median_forecast: LoadForecast | None = None
     try:
@@ -127,6 +123,11 @@ async def predict_home_load(
         total, source = await predict_home_load_kwh(settings)
         median_forecast = LoadForecast(total_kwh=total, slots=None, source=source)
 
+    # A dated context fact (away/guests/...) scales both candidate forecasts by
+    # the same factor, so the ledger comparison and the P90/P50 buffer ratio are
+    # unaffected; the report surfaces it via the forecast source. The away
+    # factor is learned from past away periods (6E) when enough history exists.
+    ctx_scale, ctx_lines = await _context_scale(settings, tz, intervals)
     median_forecast = _apply_context(median_forecast, ctx_scale, ctx_lines)
     if settings.load_model == "median":
         return median_forecast
@@ -150,16 +151,41 @@ async def predict_home_load(
     return median_forecast
 
 
-async def _context_scale(settings: Settings, tz: ZoneInfo) -> tuple[float, list[str]]:
+async def _context_scale(
+    settings: Settings, tz: ZoneInfo, intervals: list[ConsumptionInterval]
+) -> tuple[float, list[str]]:
     """Combined load multiplier (and report lines) for context active tomorrow."""
     target = (datetime.now(tz) + timedelta(days=1)).date()
     try:
         async with ContextStore(settings.db_path) as store:
             active = await store.active_on(target)
-        return combined_factor(active, settings)
+            override = None
+            if any(e.kind == "away" for e in active):
+                override = await _learned_away_factor(store, intervals, tz)
+        return combined_factor(active, settings, away_factor_override=override)
     except Exception as exc:  # noqa: BLE001 - context is an optional adjustment
         log.warning("Context store unavailable (%s); ignoring context", exc)
         return 1.0, []
+
+
+async def _learned_away_factor(
+    store: ContextStore, intervals: list[ConsumptionInterval], tz: ZoneInfo
+) -> float | None:
+    """The away factor learned from past away periods, or None when too thin."""
+    if not intervals:
+        return None
+    away_dates: set[date] = set()
+    for e in await store.list_all():
+        if e.kind != "away":
+            continue
+        d = e.start_date
+        while d <= e.end_date:
+            away_dates.add(d)
+            d += timedelta(days=1)
+    factor, n = habits.learn_away_factor(_daily_actuals(intervals, tz), away_dates)
+    if factor is not None:
+        log.info("Using learned away factor %.2f from %d past away days", factor, n)
+    return factor
 
 
 def _apply_context(
@@ -198,6 +224,7 @@ async def _ml_forecast(
         )
     except Exception as exc:  # noqa: BLE001 - degrade to recorded signal temps
         log.warning("Open-Meteo unavailable (%s); using recorded temperatures", exc)
+    tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
     occupancy: dict[date, float] = {}
     try:
         async with ForecastLedger(settings.db_path) as ledger:
@@ -207,12 +234,15 @@ async def _ml_forecast(
                 )
             else:
                 temps = dict(await ledger.signal_history("temp_out_c", since))
-            occupancy = _mean_by_local_date(
-                await ledger.signal_history("occupancy_home_frac", since), tz
-            )
+            occ_samples = await ledger.signal_history("occupancy_home_frac", since)
+        occupancy = _mean_by_local_date(occ_samples, tz)
+        # Predict tomorrow's occupancy from the day-type pattern so the model
+        # has a real value for the target day, not just the history mean (6E).
+        predicted = habits.predict_occupancy(occ_samples, tomorrow, tz)
+        if predicted is not None:
+            occupancy[tomorrow] = predicted
     except Exception as exc:  # noqa: BLE001 - the ledger is an optional enrichment here
         log.warning("Signal ledger unavailable for ML features (%s)", exc)
-    tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
     prediction = ml.train_and_predict(
         intervals, temps, occupancy, tomorrow, tz,
         min_days=max(14, settings.profile_min_days),

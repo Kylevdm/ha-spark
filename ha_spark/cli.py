@@ -14,6 +14,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from ha_spark.config import ConfigError, Settings, load_settings
+from ha_spark.energy import habits
 from ha_spark.energy.backtest import backtest_cost, format_backtest
 from ha_spark.energy.chargers import SolisCharger
 from ha_spark.energy.context import KINDS, ContextStore
@@ -243,6 +244,65 @@ async def _cmd_forecast_eval(settings: Settings, *, days: int) -> int:
     return 0
 
 
+async def _cmd_learn_factors(settings: Settings) -> int:
+    """Report what the habit learner derives from recorded history (6E)."""
+    tz = load_timezone(settings.timezone)
+    tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
+    since = datetime.now(UTC) - timedelta(days=settings.profile_history_days)
+
+    rows = await statistics_during_period(
+        settings.ha_websocket_url,
+        settings.auth_token,
+        settings.consumption_energy_entity,
+        since,
+        period="day",
+        timeout=settings.ha_timeout,
+    )
+    daily_actuals = actual_kwh_by_date(rows)
+
+    away_dates: set[date] = set()
+    async with ContextStore(settings.db_path) as store:
+        for e in await store.list_all():
+            if e.kind != "away":
+                continue
+            d = e.start_date
+            while d <= e.end_date:
+                away_dates.add(d)
+                d += timedelta(days=1)
+    async with ForecastLedger(settings.db_path) as ledger:
+        occ_samples = await ledger.signal_history("occupancy_home_frac", since)
+
+    factor, n = habits.learn_away_factor(daily_actuals, away_dates)
+    predicted_occ = habits.predict_occupancy(occ_samples, tomorrow, tz)
+
+    print("Learned habits:")
+    if factor is not None:
+        print(f"  Away load factor   {factor:.2f}  (from {n} past away days; auto-applied)")
+    else:
+        print(
+            f"  Away load factor   not enough away history ({n} usable day(s); "
+            f"need {habits.MIN_AWAY_SAMPLES}) — using configured "
+            f"{settings.away_load_factor:.2f}"
+        )
+    if predicted_occ is not None:
+        print(f"  Occupancy tomorrow ~{predicted_occ * 100:.0f}% home ({tomorrow:%a %d %b})")
+    else:
+        print("  Occupancy tomorrow not enough occupancy history yet")
+
+    ctx = habits.HabitContext(
+        target_date=tomorrow,
+        predicted_occupancy=predicted_occ,
+        away_active=any(d == tomorrow for d in away_dates),
+        learned_away_factor=factor,
+    )
+    actions = habits.predict_actions(ctx)
+    if actions:
+        print("Advisory predictions for tomorrow:")
+        for a in actions:
+            print(f"  - {a.action} ({a.confidence * 100:.0f}%): {a.reason}")
+    return 0
+
+
 async def _cmd_context(settings: Settings, args: argparse.Namespace) -> int:
     """Add, list, or remove date-ranged context facts the planner consumes."""
     async with ContextStore(settings.db_path) as store:
@@ -324,6 +384,7 @@ examples:
   ha-spark pull-consumption --days 60      pull grid import from the Octopus API
   ha-spark backtest --days 30              rate stored grid import under the tariff
   ha-spark forecast-eval --days 14         score recorded forecasts vs actual load
+  ha-spark learn-factors                   show learned away factor + occupancy
   ha-spark context add away --from 2026-07-01 --to 2026-07-14   record a holiday
   ha-spark context list                    show stored context facts
   ha-spark context remove 3                delete a context fact by id
@@ -481,6 +542,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="How many days of recorded forecasts to score (default: 14)",
     )
 
+    sub.add_parser(
+        "learn-factors",
+        help="Report habits learned from recorded history (away factor, occupancy)",
+        description="Show what the habit learner derives from the signal/forecast/context "
+        "history: the away load factor learned from past away periods (auto-applied to the "
+        "plan once enough away days exist), tomorrow's predicted occupancy fraction, and "
+        "the advisory habit predictions for tomorrow.",
+    )
+
     p_ctx = sub.add_parser(
         "context",
         help="Manage date-ranged context facts (away/guests) the planner uses",
@@ -579,6 +649,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "forecast-eval":
         return asyncio.run(_cmd_forecast_eval(settings, days=args.days))
+
+    if args.command == "learn-factors":
+        return asyncio.run(_cmd_learn_factors(settings))
 
     if args.command == "context":
         return asyncio.run(_cmd_context(settings, args))

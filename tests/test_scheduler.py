@@ -389,3 +389,32 @@ async def test_run_forever_samples_signals_every_interval(
         datetime(2026, 6, 10, 22, 0),
         datetime(2026, 6, 10, 22, 0) + SIGNAL_SAMPLE_INTERVAL,
     ]
+
+
+@respx.mock
+async def test_run_once_logs_habit_predictions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="simulate",
+        db_path=str(tmp_path / "ledger.db"), timezone="UTC",
+    )
+    # Seed low occupancy so a suggestion fires, and no away context.
+    async with ForecastLedger(s.db_path) as ledger:
+        for d in range(14, 0, -1):
+            day = datetime.now(UTC) - timedelta(days=d)
+            await ledger.record_signal(
+                day.replace(hour=12, minute=0, second=0, microsecond=0),
+                "occupancy_home_frac", 0.05,
+            )
+
+    with caplog.at_level("INFO"):
+        await run_once(s)
+
+    assert any("Habit prediction" in r.message for r in caplog.records)

@@ -111,8 +111,11 @@ cache, decides via the Ollama router, and acts through `call_service`.
   `ha-spark ask`), Phase 3 (EV supply guard, add-on 0.2.0), Phase 6A
   (forecast ledger + signal sampler, 0.3.0), Phase 6B (weather-aware ML
   quantile model, 0.4.0), Phase 6C (context store + `ha-spark context`,
-  0.5.0), and Phase 6D (LLM context extraction in `ha-spark ask`, 0.6.0).
-  Next is Phase 6E (occupancy habits + learned factors); see ROADMAP.md.
+  0.5.0), Phase 6D (LLM context extraction in `ha-spark ask`, 0.6.0), and
+  Phase 6E (occupancy habits + learned away factor + `predict_actions` seed,
+  0.7.0). The 6-series ML arc is complete; deferred phases 4 (onboarding
+  wizard) and 5 (NL copilot; partly delivered by 6C/6D) are next. See
+  ROADMAP.md.
 - **No-push fallback:** if a session lacks git credentials, produce a `git bundle`
   + `git format-patch` and push from a credentialed clone. (`*.bundle` / `*.patch`
   are gitignored.)
