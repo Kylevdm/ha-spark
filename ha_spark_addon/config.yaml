@@ -1,6 +1,6 @@
 ---
 name: ha-spark
-version: "0.8.0"
+version: "0.9.0"
 slug: ha_spark_addon
 description: Local-first battery charge planner and automation agent for Home Assistant
 url: https://github.com/Kylevdm/ha-spark
