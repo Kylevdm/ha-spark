@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.0
+
+- Onboarding wizard (Phase 4): `ha-spark onboard` now scans Home Assistant's
+  entities and proposes which one maps to each ha-spark config field (battery
+  SoC, battery voltage, Solcast forecast, Octopus rate/dispatch, EV sensors,
+  household consumption, grid power, charge-current control, inverter switch,
+  heat-pump energy, weather), ranked by device class, unit, attributes, and
+  name. Each proposal shows the configured value, the best match with why it
+  matched, and whether they agree.
+- `--json` emits the proposals for tooling; `--write` prints a ready-to-paste
+  options fragment; `--preset solis` fills fields discovery can't match from
+  the reference Solis/Solcast/Octopus/zappi setup. Proposals are advisory —
+  you review and set the options yourself; the wizard never rewrites config.
+- `onboard` still reports load-history readiness and keeps its exit code.
+
 ## 0.8.0
 
 - NL copilot (Phase 5): `ha-spark ask` now grounds the Ollama tier in the live

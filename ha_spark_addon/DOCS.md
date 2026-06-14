@@ -191,15 +191,25 @@ recognises instead.
 1. **Check the Log tab** after the first start: the add-on runs
    `ha-spark health` and prints a line per dependency (HA REST, HA WebSocket,
    Ollama, SQLite, load history).
-2. The load forecast needs hourly household-load history. From a shell in the
-   add-on container (e.g. the SSH add-on with
-   `docker exec -it addon_<slug> sh`, or the add-on's own terminal):
-   - `ha-spark onboard` — readiness check.
+2. **Map your entities.** From a shell in the add-on container (e.g. the SSH
+   add-on with `docker exec -it addon_<slug> sh`, or the add-on's own
+   terminal), run `ha-spark onboard`. It scans your HA entities and proposes
+   which one maps to each config field, with the reason it matched and whether
+   it agrees with the current setting:
+   - `ha-spark onboard --preset solis` fills anything it can't match from the
+     reference Solis/Solcast/Octopus/zappi setup.
+   - `ha-spark onboard --write` also prints a ready-to-paste options fragment.
+   - `ha-spark onboard --json` emits the proposals for tooling.
+
+   Proposals are advisory — review them and set the options in the
+   **Configuration** tab yourself; the wizard never rewrites your config.
+3. The load forecast needs hourly household-load history:
    - `ha-spark backfill-load --list` — list statistics usable as a backfill
      source, then `ha-spark backfill-load --from <entity_id>` to import one
-     as `ha_spark:house_load` history.
-3. `ha-spark plan` — print tonight's plan without applying it.
-4. Leave the add-on running; it executes the plan daily at `plan_run_time`.
+     as `ha_spark:house_load` history. `ha-spark onboard` reports when the
+     history is sufficient.
+4. `ha-spark plan` — print tonight's plan without applying it.
+5. Leave the add-on running; it executes the plan daily at `plan_run_time`.
    When the simulated decisions look right, set `proactive_mode: on`.
 
 ## Data

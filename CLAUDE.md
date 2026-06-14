@@ -113,8 +113,10 @@ cache, decides via the Ollama router, and acts through `call_service`.
   quantile model, 0.4.0), Phase 6C (context store + `ha-spark context`,
   0.5.0), Phase 6D (LLM context extraction in `ha-spark ask`, 0.6.0), and
   Phase 6E (occupancy habits + learned away factor + `predict_actions` seed,
-  0.7.0), and Phase 5 (NL copilot — `ha-spark ask` grounded in the live plan,
-  0.8.0). Next is the deferred Phase 4 (onboarding wizard). See ROADMAP.md.
+  0.7.0), Phase 5 (NL copilot — `ha-spark ask` grounded in the live plan,
+  0.8.0), and Phase 4 (onboarding wizard — entity auto-discovery + presets in
+  `ha-spark onboard`, 0.9.0). The full roadmap (phases 0–6) has shipped; see
+  ROADMAP.md for later (v3) ideas.
 - **No-push fallback:** if a session lacks git credentials, produce a `git bundle`
   + `git format-patch` and push from a credentialed clone. (`*.bundle` / `*.patch`
   are gitignored.)

@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import httpx
 import pytest
+import respx
 
 from ha_spark import cli
 from ha_spark.cli import (
@@ -248,6 +250,92 @@ async def test_context_list_empty(
     assert "No context facts stored" in capsys.readouterr().out
 
 
+def _states_json() -> list[dict[str, object]]:
+    def s(eid: str, **attrs: object) -> dict[str, object]:
+        return {"entity_id": eid, "state": "1", "attributes": attrs}
+
+    return [
+        s("sensor.solisac_battery_soc", device_class="battery", unit_of_measurement="%"),
+        s("number.solisac_timed_charge_current", unit_of_measurement="A"),
+        s("sensor.historic_household_usage", device_class="energy", unit_of_measurement="kWh"),
+    ]
+
+
+@respx.mock
+async def test_onboard_discovery_table(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def ok(_s: Settings) -> CheckResult:
+        return CheckResult("Load history", Status.OK, "ready")
+
+    monkeypatch.setattr(cli, "check_load_history", ok)
+    respx.get("http://ha.test/api/states").mock(
+        return_value=httpx.Response(200, json=_states_json())
+    )
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+    rc = await _cmd_onboard(settings, as_json=False, write=False, preset_name=None)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Entity discovery" in out
+    assert "sensor.solisac_battery_soc" in out
+    assert "soc_entity" in out
+
+
+@respx.mock
+async def test_onboard_json_output(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json as _json
+
+    respx.get("http://ha.test/api/states").mock(
+        return_value=httpx.Response(200, json=_states_json())
+    )
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+    rc = await _cmd_onboard(settings, as_json=True, write=False, preset_name=None)
+    assert rc == 0
+    payload = _json.loads(capsys.readouterr().out)
+    assert payload["soc_entity"]["candidates"][0]["entity_id"] == "sensor.solisac_battery_soc"
+    assert payload["soc_entity"]["status"] == "match"
+
+
+@respx.mock
+async def test_onboard_write_fragment_uses_preset_for_gaps(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def ok(_s: Settings) -> CheckResult:
+        return CheckResult("Load history", Status.OK, "ready")
+
+    monkeypatch.setattr(cli, "check_load_history", ok)
+    # Only the SoC entity is discoverable; the dispatch sensor must come from the preset.
+    respx.get("http://ha.test/api/states").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "entity_id": "sensor.solisac_battery_soc",
+                    "state": "1",
+                    "attributes": {"device_class": "battery", "unit_of_measurement": "%"},
+                }
+            ],
+        )
+    )
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+    rc = await _cmd_onboard(settings, as_json=False, write=True, preset_name="solis")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "soc_entity: sensor.solisac_battery_soc    # discovered" in out
+    assert "dispatch_entity:" in out and "# preset" in out
+
+
+@respx.mock
+async def test_onboard_unknown_preset_errors(capsys: pytest.CaptureFixture[str]) -> None:
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+    rc = await _cmd_onboard(settings, as_json=False, write=False, preset_name="nope")
+    assert rc == 2
+    assert "Unknown preset" in capsys.readouterr().err
+
+
+@respx.mock
 async def test_onboard_exit_code_tracks_status(monkeypatch: pytest.MonkeyPatch) -> None:
     async def ok(_s: Settings) -> CheckResult:
         return CheckResult("Load history", Status.OK, "ready")
@@ -255,11 +343,12 @@ async def test_onboard_exit_code_tracks_status(monkeypatch: pytest.MonkeyPatch) 
     async def warn(_s: Settings) -> CheckResult:
         return CheckResult("Load history", Status.WARN, "thin")
 
+    respx.get("http://ha.test/api/states").mock(return_value=httpx.Response(200, json=[]))
     settings = Settings(ha_url="http://ha.test", ha_token="t")
     monkeypatch.setattr(cli, "check_load_history", ok)
-    assert await _cmd_onboard(settings) == 0
+    assert await _cmd_onboard(settings, as_json=False, write=False, preset_name=None) == 0
     monkeypatch.setattr(cli, "check_load_history", warn)
-    assert await _cmd_onboard(settings) == 2
+    assert await _cmd_onboard(settings, as_json=False, write=False, preset_name=None) == 2
 
 
 async def test_ask_prints_routed_answer(
