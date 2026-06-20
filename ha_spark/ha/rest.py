@@ -75,6 +75,16 @@ class HomeAssistantRest:
         data = await self._get("/services")
         return list(data)
 
+    async def set_state(
+        self, entity_id: str, state: str, attributes: dict[str, Any] | None = None
+    ) -> None:
+        """Set an entity's state, creating it if it doesn't exist yet."""
+        resp = await self._client.post(
+            f"/states/{entity_id}",
+            json={"state": state, "attributes": attributes or {}},
+        )
+        resp.raise_for_status()
+
     async def call_service(
         self, domain: str, service: str, data: dict[str, Any] | None = None
     ) -> list[EntityState]:

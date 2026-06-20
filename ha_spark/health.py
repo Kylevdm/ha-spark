@@ -116,6 +116,33 @@ async def check_sqlite(settings: Settings) -> CheckResult:
         return CheckResult("SQLite", Status.FAIL, f"{settings.db_path}: {exc!r}")
 
 
+_REQUIRED_ENTITY_FIELDS = (
+    "soc_entity",
+    "battery_voltage_entity",
+    "solar_tomorrow_entity",
+    "octopus_rate_entity",
+    "dispatch_entity",
+    "ev_plug_entity",
+    "ev_status_entity",
+    "consumption_energy_entity",
+    "charge_current_entity",
+    "inverter_power_switch_entity",
+    "ha_template_charge_needed_entity",
+)
+
+
+def check_entity_config(settings: Settings) -> CheckResult:
+    """Flag required entity fields left blank (ships unconfigured by default)."""
+    unset = [f for f in _REQUIRED_ENTITY_FIELDS if not getattr(settings, f)]
+    if not unset:
+        return CheckResult("Entity config", Status.OK, "all required entities configured")
+    return CheckResult(
+        "Entity config",
+        Status.WARN,
+        f"unset: {', '.join(unset)} — run `ha-spark onboard` or set a preset",
+    )
+
+
 async def check_load_history(settings: Settings) -> CheckResult:
     """Report whether the load forecast has enough history for a slot profile."""
     entity = settings.consumption_energy_entity
@@ -181,16 +208,15 @@ async def check_supply_guard(settings: Settings) -> CheckResult:
 
 async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
-    return list(
-        await asyncio.gather(
-            check_ha_rest(settings),
-            check_ha_websocket(settings),
-            check_ollama(settings),
-            check_sqlite(settings),
-            check_load_history(settings),
-            check_supply_guard(settings),
-        )
+    results = await asyncio.gather(
+        check_ha_rest(settings),
+        check_ha_websocket(settings),
+        check_ollama(settings),
+        check_sqlite(settings),
+        check_load_history(settings),
+        check_supply_guard(settings),
     )
+    return [*results, check_entity_config(settings)]
 
 
 def format_report(results: list[CheckResult]) -> str:

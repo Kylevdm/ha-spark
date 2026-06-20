@@ -290,7 +290,9 @@ async def test_onboard_json_output(
     respx.get("http://ha.test/api/states").mock(
         return_value=httpx.Response(200, json=_states_json())
     )
-    settings = Settings(ha_url="http://ha.test", ha_token="t")
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", soc_entity="sensor.solisac_battery_soc"
+    )
     rc = await _cmd_onboard(settings, as_json=True, write=False, preset_name=None)
     assert rc == 0
     payload = _json.loads(capsys.readouterr().out)

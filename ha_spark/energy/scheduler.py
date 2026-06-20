@@ -29,6 +29,7 @@ from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargePlan, PlannerInputs
 from ha_spark.energy.planner import _in_overnight_window as in_window
 from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.publish import publish_plan, republish_last
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.sources import gather_inputs, parse_time
 from ha_spark.energy.supply_guard import SupplyGuard
@@ -76,6 +77,7 @@ async def run_once(settings: Settings) -> ChargePlan:
         lines = await SolisCharger(settings, rest).apply(plan)
         for line in lines:
             log.info(line)
+        await publish_plan(rest, plan, settings)
     await _record_forecast(settings, plan, inputs, load_source)
     await _log_habit_predictions(settings)
     return plan
@@ -186,6 +188,13 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             settings.grid_power_entity,
             settings.supply_max_current_a,
         )
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            await republish_last(rest, settings)
+    except Exception:
+        log.exception("Republishing last known states failed")
     last_run_date: date | None = None
     target_a: float | None = None
     last_signal_at: datetime | None = None

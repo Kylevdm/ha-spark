@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import respx
 
@@ -46,3 +48,20 @@ async def test_call_service_sends_bearer_and_returns_changed() -> None:
     assert changed[0].entity_id == "light.kitchen"
     sent = route.calls.last.request
     assert sent.headers["Authorization"] == "Bearer secret"
+
+
+@respx.mock
+async def test_set_state_posts_state_and_attributes() -> None:
+    route = respx.post(f"{BASE}/states/sensor.ha_spark_target_soc").mock(
+        return_value=httpx.Response(200, json={"entity_id": "sensor.ha_spark_target_soc"})
+    )
+    async with HomeAssistantRest(BASE, "secret") as rest:
+        await rest.set_state(
+            "sensor.ha_spark_target_soc", "90", attributes={"unit_of_measurement": "%"}
+        )
+
+    sent = route.calls.last.request
+    assert json.loads(sent.content) == {
+        "state": "90",
+        "attributes": {"unit_of_measurement": "%"},
+    }

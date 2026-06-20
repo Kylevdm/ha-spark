@@ -18,6 +18,7 @@ from ha_spark.ha.websocket import HomeAssistantAuthError, HomeAssistantWebSocket
 from ha_spark.health import (
     CheckResult,
     Status,
+    check_entity_config,
     check_ha_rest,
     check_ha_websocket,
     check_load_history,
@@ -173,6 +174,34 @@ async def test_check_load_history_warns_on_error(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(health, "statistics_during_period", boom)
     res = await check_load_history(Settings())
     assert res.status is Status.WARN
+
+
+# --- Entity config check ---
+
+
+def test_check_entity_config_warns_when_unset() -> None:
+    res = check_entity_config(Settings())
+    assert res.status is Status.WARN
+    assert "soc_entity" in res.detail
+
+
+def test_check_entity_config_ok_when_set() -> None:
+    res = check_entity_config(
+        Settings(
+            soc_entity="sensor.a",
+            battery_voltage_entity="sensor.b",
+            solar_tomorrow_entity="sensor.c",
+            octopus_rate_entity="sensor.d",
+            dispatch_entity="binary_sensor.e",
+            ev_plug_entity="sensor.f",
+            ev_status_entity="sensor.g",
+            consumption_energy_entity="sensor.h",
+            charge_current_entity="number.i",
+            inverter_power_switch_entity="select.j",
+            ha_template_charge_needed_entity="sensor.k",
+        )
+    )
+    assert res.status is Status.OK
 
 
 # --- WebSocket probe + check ---
