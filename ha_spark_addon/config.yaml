@@ -1,6 +1,6 @@
 ---
 name: ha-spark
-version: "0.9.1"
+version: "0.10.0"
 slug: ha_spark_addon
 description: Local-first battery charge planner and automation agent for Home Assistant
 url: https://github.com/Kylevdm/ha-spark
@@ -43,19 +43,19 @@ options:
   timezone: Europe/London
   plan_run_time: "22:00"
   octopus_api_url: "https://api.octopus.energy/v1"
-  soc_entity: sensor.solisac_battery_soc
-  battery_voltage_entity: sensor.solisac_battery_voltage
-  solar_tomorrow_entity: sensor.solcast_pv_forecast_forecast_tomorrow
-  octopus_rate_entity: sensor.octopus_energy_electricity_22l4386358_2200012282082_current_rate
-  dispatch_entity: binary_sensor.octopus_energy_00000000_0009_4000_8020_000000068b29_intelligent_dispatching
-  ev_plug_entity: sensor.myenergi_zappi_22300254_plug_status
-  ev_status_entity: sensor.myenergi_zappi_22300254_status
-  consumption_energy_entity: sensor.historic_household_usage
+  soc_entity: ""
+  battery_voltage_entity: ""
+  solar_tomorrow_entity: ""
+  octopus_rate_entity: ""
+  dispatch_entity: ""
+  ev_plug_entity: ""
+  ev_status_entity: ""
+  consumption_energy_entity: ""
   supply_max_current_a: 75.0
   supply_voltage_v: 240.0
-  charge_current_entity: number.solisac_timed_charge_current
-  inverter_power_switch_entity: select.solisac_power_switch
-  ha_template_charge_needed_entity: sensor.charge_energy_needed
+  charge_current_entity: ""
+  inverter_power_switch_entity: ""
+  ha_template_charge_needed_entity: ""
   outdoor_weather_entity: weather.home
   load_model: auto
   buffer_mode: fixed
@@ -97,20 +97,20 @@ schema:
   octopus_mpan: str?
   octopus_meter_serial: str?
   octopus_api_url: url
-  soc_entity: str
-  battery_voltage_entity: str
-  solar_tomorrow_entity: str
-  octopus_rate_entity: str
-  dispatch_entity: str
-  ev_plug_entity: str
-  ev_status_entity: str
-  consumption_energy_entity: str
+  soc_entity: str?
+  battery_voltage_entity: str?
+  solar_tomorrow_entity: str?
+  octopus_rate_entity: str?
+  dispatch_entity: str?
+  ev_plug_entity: str?
+  ev_status_entity: str?
+  consumption_energy_entity: str?
   grid_power_entity: str?
   supply_max_current_a: float
   supply_voltage_v: float
-  charge_current_entity: str
-  inverter_power_switch_entity: str
-  ha_template_charge_needed_entity: str
+  charge_current_entity: str?
+  inverter_power_switch_entity: str?
+  ha_template_charge_needed_entity: str?
   person_entities: str?
   heatpump_energy_entity: str?
   outdoor_weather_entity: str?

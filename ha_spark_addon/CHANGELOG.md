@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.10.0
+
+- ha-spark now publishes its computed charge plan back to Home Assistant as
+  `sensor.ha_spark_*` entities (charge needed, target/current SoC, overnight
+  current, forecast load/solar, deficit, planned/baseline cost, plan status,
+  last run) after every run, so the numbers are visible in HA instead of only
+  in logs/SQLite. The last-published values are cached to `/data` and
+  re-pushed on daemon startup so a restarted add-on doesn't show `unknown`
+  until the next scheduled run.
+- The add-on's entity config options (`soc_entity`, `charge_current_entity`,
+  etc.) now ship blank instead of defaulting to the original author's Solis
+  setup; use `ha-spark onboard` (entity auto-discovery) or
+  `ha-spark onboard --preset solis` to fill them in. `ha-spark health` now
+  flags any required entity left unset.
+
 ## 0.9.1
 
 - Fix add-on build failure on the Python 3.13 / Alpine (musllinux) base image:

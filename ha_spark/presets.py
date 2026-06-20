@@ -3,14 +3,15 @@
 A preset is a baseline ``config_field -> entity_id`` map for a known hardware
 combination. The wizard uses it to fill fields auto-discovery couldn't match,
 so a user on a supported setup gets a complete proposal even for entities whose
-names don't carry an obvious keyword. ``solis`` is the reference setup
-(Solis inverter + Solcast + Octopus Intelligent + myenergi zappi) the code
-defaults already target; more can be added without touching the discovery code.
+names don't carry an obvious keyword. ``solis`` is the original reference setup
+(Solis inverter + Solcast + Octopus Intelligent + myenergi zappi); more can be
+added without touching the discovery code. Settings ships with blank entity
+defaults — use ``ha-spark onboard`` or a preset to fill them in.
 """
 
 from __future__ import annotations
 
-# Reference setup: matches the built-in Settings defaults.
+# Original reference setup the author built ha-spark against.
 SOLIS: dict[str, str] = {
     "soc_entity": "sensor.solisac_battery_soc",
     "battery_voltage_entity": "sensor.solisac_battery_voltage",

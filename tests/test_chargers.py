@@ -60,7 +60,13 @@ async def test_on_executes_service_calls_and_verifies_read_back() -> None:
     select_option = respx.post("http://ha.test/api/services/select/select_option").mock(
         return_value=httpx.Response(200, json=[])
     )
-    s = Settings(ha_url="http://ha.test", ha_token="t", proactive_mode="on")
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        proactive_mode="on",
+        charge_current_entity="number.solisac_timed_charge_current",
+        inverter_power_switch_entity="select.solisac_power_switch",
+    )
     _mock_read_back(s, current="42.0", switch="Off")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await SolisCharger(s, rest).apply(_plan())
@@ -72,7 +78,13 @@ async def test_on_executes_service_calls_and_verifies_read_back() -> None:
 @respx.mock
 async def test_on_warns_when_read_back_mismatches() -> None:
     respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = Settings(ha_url="http://ha.test", ha_token="t", proactive_mode="on")
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        proactive_mode="on",
+        charge_current_entity="number.solisac_timed_charge_current",
+        inverter_power_switch_entity="select.solisac_power_switch",
+    )
     _mock_read_back(s, current="0.0", switch="On")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await SolisCharger(s, rest).apply(_plan())
@@ -85,7 +97,13 @@ async def test_on_warns_when_read_back_mismatches() -> None:
 async def test_on_warns_when_read_back_read_fails() -> None:
     respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     respx.route(method="GET").mock(return_value=httpx.Response(500))
-    s = Settings(ha_url="http://ha.test", ha_token="t", proactive_mode="on")
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        proactive_mode="on",
+        charge_current_entity="number.solisac_timed_charge_current",
+        inverter_power_switch_entity="select.solisac_power_switch",
+    )
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await SolisCharger(s, rest).apply(_plan())
     assert all(line.startswith("[WARNING]") for line in lines)
@@ -100,7 +118,13 @@ async def test_on_isolates_action_failures() -> None:
     select_option = respx.post("http://ha.test/api/services/select/select_option").mock(
         return_value=httpx.Response(200, json=[])
     )
-    s = Settings(ha_url="http://ha.test", ha_token="t", proactive_mode="on")
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        proactive_mode="on",
+        charge_current_entity="number.solisac_timed_charge_current",
+        inverter_power_switch_entity="select.solisac_power_switch",
+    )
     _mock_read_back(s, current="42.0", switch="Off")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await SolisCharger(s, rest).apply(_plan())
@@ -112,7 +136,13 @@ async def test_on_isolates_action_failures() -> None:
 @respx.mock
 async def test_on_blocks_all_writes_when_soc_invalid() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = Settings(ha_url="http://ha.test", ha_token="t", proactive_mode="on")
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        proactive_mode="on",
+        charge_current_entity="number.solisac_timed_charge_current",
+        inverter_power_switch_entity="select.solisac_power_switch",
+    )
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await SolisCharger(s, rest).apply(_plan(soc_valid=False))
     assert posts.call_count == 0
@@ -141,7 +171,13 @@ async def test_apply_action_executes_one_action_with_read_back() -> None:
     set_value = respx.post("http://ha.test/api/services/number/set_value").mock(
         return_value=httpx.Response(200, json=[])
     )
-    s = Settings(ha_url="http://ha.test", ha_token="t", proactive_mode="on")
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        proactive_mode="on",
+        charge_current_entity="number.solisac_timed_charge_current",
+        inverter_power_switch_entity="select.solisac_power_switch",
+    )
     _mock_read_back(s, current="10.0", switch="Off")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         line = await SolisCharger(s, rest).apply_action(

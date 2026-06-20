@@ -194,29 +194,26 @@ class Settings(BaseSettings):
     octopus_meter_serial: str = Field(default="")
     octopus_api_url: str = Field(default="https://api.octopus.energy/v1")
 
-    # HA entity IDs (all overridable; defaults match the user's current setup).
-    soc_entity: str = Field(default="sensor.solisac_battery_soc")
-    battery_voltage_entity: str = Field(default="sensor.solisac_battery_voltage")
-    solar_tomorrow_entity: str = Field(default="sensor.solcast_pv_forecast_forecast_tomorrow")
-    octopus_rate_entity: str = Field(
-        default="sensor.octopus_energy_electricity_22l4386358_2200012282082_current_rate"
-    )
-    dispatch_entity: str = Field(
-        default="binary_sensor.octopus_energy_00000000_0009_4000_8020_000000068b29_intelligent_dispatching"  # noqa: E501
-    )
-    ev_plug_entity: str = Field(default="sensor.myenergi_zappi_22300254_plug_status")
-    ev_status_entity: str = Field(default="sensor.myenergi_zappi_22300254_status")
-    # True house load excluding battery/EV; historic_household_usage backfills
-    # hourly stats to Dec 2025 (vs ~Jun 2026 for sensor.house_consumption_energy).
-    consumption_energy_entity: str = Field(default="sensor.historic_household_usage")
+    # HA entity IDs (all overridable). Blank by default; set via `ha-spark
+    # onboard` (entity auto-discovery) or the `solis` preset (ha_spark/presets.py),
+    # which holds the values for the original Solis/Solcast/Octopus/zappi setup.
+    soc_entity: str = Field(default="")
+    battery_voltage_entity: str = Field(default="")
+    solar_tomorrow_entity: str = Field(default="")
+    octopus_rate_entity: str = Field(default="")
+    dispatch_entity: str = Field(default="")
+    ev_plug_entity: str = Field(default="")
+    ev_status_entity: str = Field(default="")
+    # True house load excluding battery/EV.
+    consumption_energy_entity: str = Field(default="")
     # Live supply guard: throttle battery charging while whole-house AC draw
     # exceeds supply_max_current_a. Disabled while grid_power_entity is empty.
     grid_power_entity: str = Field(default="")  # W; whole-house grid/supply draw
     supply_max_current_a: float = Field(default=75.0)
     supply_voltage_v: float = Field(default=240.0)  # AC volts, converts W -> A
-    charge_current_entity: str = Field(default="number.solisac_timed_charge_current")
-    inverter_power_switch_entity: str = Field(default="select.solisac_power_switch")
-    ha_template_charge_needed_entity: str = Field(default="sensor.charge_energy_needed")
+    charge_current_entity: str = Field(default="")
+    inverter_power_switch_entity: str = Field(default="")
+    ha_template_charge_needed_entity: str = Field(default="")
 
     # Forecast ledger signal sampling (Phase 6A): recorded so training data
     # accumulates ahead of the models (6B+) that will consume it.

@@ -83,11 +83,11 @@ def test_no_match_yields_empty() -> None:
 
 
 def test_propose_marks_status_against_current_config() -> None:
-    settings = Settings()  # defaults match the solis reference entity ids
+    settings = Settings(soc_entity="sensor.solisac_battery_soc")
     proposals = {p.config_field: p for p in propose(_realistic_dump(), settings)}
 
     soc = proposals["soc_entity"]
-    assert soc.status == "match"  # default soc_entity == discovered
+    assert soc.status == "match"  # configured soc_entity == discovered
 
     # A field whose configured value differs from the discovered best.
     settings2 = Settings(soc_entity="sensor.something_else")
