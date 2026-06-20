@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.1
+
+- Fix add-on build failure on the Python 3.13 / Alpine (musllinux) base image:
+  drop the explicit `scikit-learn`/`numpy` install. scikit-learn ships no
+  musllinux wheel, so pip was source-compiling it and failing for lack of a C
+  compiler. The optional ML load model (`load_model: ml|auto`) is import-guarded;
+  the forecast degrades to the slot-profile median. No CLI/option changes.
+
 ## 0.9.0
 
 - Onboarding wizard (Phase 4): `ha-spark onboard` now scans Home Assistant's
