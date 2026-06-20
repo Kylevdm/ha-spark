@@ -68,9 +68,14 @@ respect `proactive_mode` exactly like the nightly plan. Leave
 
 ### ML load model (optional)
 
-When scikit-learn is available (it is in the add-on image), a weather-aware
-gradient-boosted quantile model can forecast tomorrow's load instead of the
-slot-profile median, using Open-Meteo temperatures (heating degree hours →
+> Not bundled in the add-on image: scikit-learn has no musllinux wheel, so it is
+> left out to keep the build compiler-free. `load_model: ml|auto` therefore falls
+> back to the slot-profile median until scikit-learn is installed in the
+> environment (e.g. standalone with the `[habits]` extra).
+
+When scikit-learn is available, a weather-aware gradient-boosted quantile model
+can forecast tomorrow's load instead of the slot-profile median, using
+Open-Meteo temperatures (heating degree hours →
 heat-pump demand), day-of-week/season, recent-load lags, recorded occupancy,
 and UK bank holidays.
 
