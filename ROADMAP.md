@@ -73,7 +73,7 @@ weekend") — they never bypass the planner to actuate hardware directly.
 | ✅ 2 — LLM router (done) | Two-tier router behind `ha-spark ask`: remote Ollama chat (`/api/tags` probe gates `/api/chat`) with a deterministic offline parser answering energy queries (plan, SoC, solar, strategy, mode, window) from the planner pipeline |
 | ✅ 3 — EV integration (done) | Live supply guard (throttle battery charging when whole-house draw nears the main-fuse limit, e.g. during an EV dispatch) plus EV dispatch energy in the plan report |
 | ✅ 6A — Forecast ledger (done) | Forecast-vs-actual accuracy ledger (`ha-spark forecast-eval`) and a 30-min signal sampler (occupancy, heat-pump energy, outdoor temp) so training data accumulates |
-| 6B — Weather-aware ML model | Gradient-boosted quantile slot model (Open-Meteo temps, HDD, day-type, lags, occupancy); `load_model: auto` gated by the ledger; quantile buffer mode |
+| ✅ 6B — Weather-aware ML model | Gradient-boosted quantile slot model (Open-Meteo temps, HDD, day-type, lags, occupancy); `load_model: auto` gated by the ledger; quantile buffer mode |
 | ✅ 6C — Context store (done) | Date-ranged facts (away/guests) via `ha-spark context`; deterministic load scaling, visible in the plan report |
 | ✅ 6D — LLM context extraction (done) | "I'm on holiday for two weeks" in `ha-spark ask` → structured fact in the context store (Ollama JSON extraction + offline fallback); facts only, never setpoints |
 | ✅ 6E — Occupancy habits (done) | Predict occupancy from recorded patterns; learn the away-load factor (auto-applied); seed of the `predict_actions` habit API (advisory, gated by `PROACTIVE_MODE`) |
@@ -86,12 +86,11 @@ later learning phase needs 6A's data and referee, and 6D delivers part of 5.
 
 ## Backlog
 
-- **Re-bundle the ML load model in the add-on image.** Dropped in 0.9.1 because
-  scikit-learn ships no musllinux wheel and was source-compiling (no compiler in
-  the base image → build failure). `load_model: ml|auto` currently degrades to
-  the slot-profile median on the add-on. Re-add `scikit-learn`/`numpy` to
-  `ha_spark_addon/Dockerfile` once a musllinux wheel is published, or compile it
-  in (build-base + openblas — heavier image, slow on Pi hosts).
+- ✅ **Re-bundle the ML load model in the add-on image** (0.10.1). The add-on now
+  builds on a glibc `python:slim` base, so pip installs prebuilt
+  scikit-learn/numpy wheels with no musl source-compile. `load_model: ml|auto`
+  runs on the add-on; `auto` self-promotes ML only once the ledger shows it
+  beating the median.
 
 ## Non-goals
 

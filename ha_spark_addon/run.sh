@@ -1,13 +1,15 @@
-#!/usr/bin/with-contenv bashio
+#!/usr/bin/env bash
 # Startup: log a health report (never fatal), then hand over to the daemon.
+# Plain shell — the glibc python:slim base has no bashio/s6 (Supervisor runs
+# tini as PID 1 via `init: true`, so signals reach the daemon directly).
 set +e
 
-bashio::log.info "ha-spark starting; running health check..."
+echo "[ha-spark] starting; running health check..."
 ha-spark health
 rc=$?
 if [ "${rc}" -ne 0 ]; then
-    bashio::log.warning "health check reported issues (exit ${rc}); continuing"
+    echo "[ha-spark] health check reported issues (exit ${rc}); continuing"
 fi
 
-bashio::log.info "Starting ha-spark run daemon"
+echo "[ha-spark] starting run daemon"
 exec ha-spark run
