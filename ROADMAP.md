@@ -84,6 +84,15 @@ weekend") — they never bypass the planner to actuate hardware directly.
 Phase 6 (ML load intelligence, split 6A–6E) is prioritised ahead of 4/5: every
 later learning phase needs 6A's data and referee, and 6D delivers part of 5.
 
+## Backlog
+
+- **Re-bundle the ML load model in the add-on image.** Dropped in 0.9.1 because
+  scikit-learn ships no musllinux wheel and was source-compiling (no compiler in
+  the base image → build failure). `load_model: ml|auto` currently degrades to
+  the slot-profile median on the add-on. Re-add `scikit-learn`/`numpy` to
+  `ha_spark_addon/Dockerfile` once a musllinux wheel is published, or compile it
+  in (build-base + openblas — heavier image, slow on Pi hosts).
+
 ## Non-goals
 
 - **No cloud service.** Local-first is a feature, not a phase.
