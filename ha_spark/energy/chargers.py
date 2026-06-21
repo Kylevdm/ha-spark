@@ -94,9 +94,12 @@ class SolisCharger:
         return await self._set_current(amps, f"set charge current to {amps} A ({watts:.0f} W)")
 
     async def read_charge_rate(self) -> float:
+        """Does not catch: callers isolate read failures (the supply guard skips the tick)."""
         state = await self._rest.get_state(self._settings.charge_current_entity)
         return float(state.state) * self._settings.battery_voltage_v
 
+    # TODO(Task 4): remove apply_action + the ChargeAction import once supply_guard
+    # is rewritten in watts.
     async def apply_action(self, action: ChargeAction) -> str:
         """Transitional: supply_guard still builds ChargeActions (removed in Task 4)."""
         if action.kind == "set_charge_current" and action.current_a is not None:
@@ -175,7 +178,7 @@ class SolisCharger:
             got = float((await self._rest.get_state(entity)).state)
         except Exception as exc:  # noqa: BLE001
             return f"read-back failed: {exc!r}"
-        return None if abs(got - wanted) <= 0.5 else f"read back {got:g} (wanted {wanted:g})"
+        return None if abs(got - wanted) <= 0.5 else f"read back {got:g} A (wanted {wanted:g} A)"
 
     async def _read_back_option(self, entity: str, wanted: str) -> str | None:
         try:

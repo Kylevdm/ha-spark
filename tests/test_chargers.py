@@ -130,7 +130,8 @@ async def test_on_warns_when_read_back_mismatches() -> None:
         lines = await SolisCharger(s, rest).apply(intent)
     current_line = next(line for line in lines if "set timed charge current" in line)
     assert current_line.startswith("[WARNING]")
-    assert "read back 0" in current_line
+    expected_a = round(solis_current_a(intent, s))
+    assert current_line.endswith(f"read back 0 A (wanted {expected_a:g} A)")
 
 
 @respx.mock
@@ -200,3 +201,53 @@ async def test_apply_action_executes_one_action_with_read_back() -> None:
         )
     assert set_value.called
     assert line == "[APPLIED] set current to 10 A"
+
+
+def test_planned_rate_w_matches_current_times_voltage() -> None:
+    s = _settings(
+        battery_capacity_kwh=26.88,
+        charge_efficiency=0.90,
+        battery_voltage_v=51.0,
+        max_charge_current_a=62.5,
+    )
+    intent = _intent()
+    rest = HomeAssistantRest(s.ha_rest_url, s.auth_token)
+    expected = solis_current_a(intent, s) * s.battery_voltage_v
+    assert SolisCharger(s, rest).planned_rate_w(intent) == pytest.approx(expected)
+
+
+@respx.mock
+async def test_set_charge_rate_posts_amps_and_applies() -> None:
+    set_value = respx.post("http://ha.test/api/services/number/set_value").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    s = _settings(proactive_mode="on", battery_voltage_v=51.0)
+    _mock_read_back(s, current="40.0", switch="Off")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        line = await SolisCharger(s, rest).set_charge_rate(2040.0)
+    assert set_value.called
+    posted = set_value.calls.last.request.content
+    assert b'"value":40' in posted or b'"value": 40' in posted
+    assert line.startswith("[APPLIED]")
+
+
+@respx.mock
+async def test_read_charge_rate_converts_amps_to_watts() -> None:
+    s = _settings(battery_voltage_v=51.0)
+    respx.get(f"http://ha.test/api/states/{s.charge_current_entity}").mock(
+        return_value=httpx.Response(200, json=_state(s.charge_current_entity, "30"))
+    )
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        watts = await SolisCharger(s, rest).read_charge_rate()
+    assert watts == pytest.approx(30 * 51.0)
+
+
+@respx.mock
+async def test_read_charge_rate_raises_on_unreadable_sensor() -> None:
+    s = _settings()
+    respx.get(f"http://ha.test/api/states/{s.charge_current_entity}").mock(
+        return_value=httpx.Response(500)
+    )
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        with pytest.raises(httpx.HTTPStatusError):
+            await SolisCharger(s, rest).read_charge_rate()
