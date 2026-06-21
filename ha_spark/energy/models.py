@@ -121,17 +121,6 @@ class PlannerInputs:
 
 
 @dataclass(frozen=True)
-class ChargeAction:
-    """One control the planner would apply (kind interpreted by a Charger)."""
-
-    kind: str  # "set_charge_current" | "stop_discharge"
-    description: str
-    current_a: float | None = None
-    slot_start: datetime | None = None
-    slot_end: datetime | None = None
-
-
-@dataclass(frozen=True)
 class ChargeIntent:
     """Inverter-agnostic charge command: reach ``target_soc_pct`` by ``window_end``.
 
@@ -162,12 +151,10 @@ class ChargePlan:
     buffer_pct: float
     required_kwh: float
     target_soc: float
-    overnight_current_a: float
     window_hours: float
     ev_charging: bool
     ha_template_needed: float | None
-    actions: tuple[ChargeAction, ...]
-    charge_intent: ChargeIntent | None = None  # control contract (Task 5 makes it required)
+    charge_intent: ChargeIntent  # control contract: the sole charge-control surface
     soc_valid: bool = True  # False -> SoC sensor unreadable; block real writes
     model: str = "daily"  # "slots" (per-slot horizon) | "daily" (v1 balance)
     expensive_load_kwh: float | None = None  # net load in peak-rate slots (slot model)

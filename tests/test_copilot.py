@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import time
 from typing import Any
 
 import pytest
@@ -9,7 +10,7 @@ import pytest
 from ha_spark import copilot
 from ha_spark.config import Settings
 from ha_spark.copilot import COPILOT_SYSTEM, build_grounding, grounded_system_prompt
-from ha_spark.energy.models import ChargePlan
+from ha_spark.energy.models import ChargeIntent, ChargePlan
 
 REST = object()  # only forwarded to gather_inputs (mocked)
 
@@ -19,8 +20,11 @@ def _plan() -> ChargePlan:
         soc_now=42, capacity_kwh=26.88, solar_kwh=8.75, effective_solar_kwh=8.75,
         load_kwh=24.2, cheap_covered_kwh=0.0, usable_now_kwh=5.9,
         deficit_kwh=12.8, buffer_pct=20.0, required_kwh=12.8,
-        target_soc=77, overnight_current_a=42, window_hours=6.0,
-        ev_charging=False, ha_template_needed=None, actions=(),
+        target_soc=77, window_hours=6.0,
+        ev_charging=False, ha_template_needed=None,
+        charge_intent=ChargeIntent(
+            target_soc_pct=77, soc_now=42, window_start=time(23, 30), window_end=time(5, 30)
+        ),
     )
 
 

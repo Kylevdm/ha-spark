@@ -31,13 +31,13 @@ _INTENT = ChargeIntent(
 )
 
 
-def _plan(current_a: float = 42, intent: ChargeIntent | None = _INTENT) -> ChargePlan:
+def _plan(intent: ChargeIntent = _INTENT) -> ChargePlan:
     return ChargePlan(
         soc_now=30, capacity_kwh=26.88, solar_kwh=8.75, effective_solar_kwh=8.75,
         load_kwh=24.2, cheap_covered_kwh=0.0, usable_now_kwh=2.69,
         deficit_kwh=12.8, buffer_pct=0.0, required_kwh=12.8,
-        target_soc=77, overnight_current_a=current_a, window_hours=6.0,
-        ev_charging=False, ha_template_needed=None, actions=(),
+        target_soc=77, window_hours=6.0,
+        ev_charging=False, ha_template_needed=None,
         charge_intent=intent,
     )
 
@@ -89,7 +89,7 @@ async def test_run_once_computes_and_applies_plan(
     with caplog.at_level("INFO"):
         plan = await run_once(s)
 
-    assert plan.overnight_current_a >= 0
+    assert plan.charge_intent.target_soc_pct >= 0
     assert any("Charge plan" in r.message for r in caplog.records)
     assert any("OFF" in r.message for r in caplog.records)
 
@@ -187,7 +187,7 @@ async def test_run_forever_guard_ticks_only_inside_window(
     guard_targets: list[float | None] = []
 
     async def fake_run_once(_s: Settings) -> ChargePlan:
-        return _plan(42)
+        return _plan()
 
     async def fake_guard_tick(_s: Settings, target_w: float | None) -> float:
         guard_targets.append(target_w)

@@ -38,17 +38,16 @@ def test_basic_required_and_current() -> None:
     # deficit 15.45 - usable 2.688 = 12.76 kWh; target 30 + 12.76/26.88*100 ~ 77%
     assert round(plan.required_kwh, 2) == 12.76
     assert 77 <= plan.target_soc <= 78
-    # 12.76 / (6h * 51V/1000) ~ 41.7 A
-    assert 41 <= plan.overnight_current_a <= 42
-    assert plan.actions[0].kind == "set_charge_current"
-    assert plan.actions[0].current_a == 42
+    # 12.76 / (6h * 51V/1000) ~ 41.7 A -> charge_intent carries the SOC target,
+    # not amps; rate is derived per-inverter from target_soc_pct.
+    assert plan.charge_intent.target_soc_pct == pytest.approx(plan.target_soc)
 
 
 def test_zero_need_when_full_and_sunny() -> None:
     inp = PlannerInputs(soc_now=90, solar_tomorrow_kwh=30, predicted_home_load_kwh=10)
     plan = compute_plan(inp, cfg())
     assert plan.required_kwh == 0
-    assert plan.overnight_current_a == 0
+    assert plan.charge_intent.target_soc_pct == pytest.approx(plan.soc_now)
 
 
 def test_soc_validity_passes_through_to_plan() -> None:
@@ -88,7 +87,7 @@ def test_daytime_dispatch_emits_stop_discharge() -> None:
         dispatches=(_slot(13, 0),),
     )
     plan = compute_plan(inp, cfg())
-    assert any(a.kind == "stop_discharge" for a in plan.actions)
+    assert len(plan.charge_intent.holds) == 1
     assert plan.cheap_covered_kwh > 0
 
 
@@ -98,7 +97,7 @@ def test_overnight_dispatch_does_not_stop_discharge() -> None:
         dispatches=(_slot(2, 0),),
     )
     plan = compute_plan(inp, cfg())
-    assert not any(a.kind == "stop_discharge" for a in plan.actions)
+    assert len(plan.charge_intent.holds) == 0
     assert plan.cheap_covered_kwh == 0
 
 
@@ -175,7 +174,7 @@ def test_slot_model_dispatch_overlap_is_fractional() -> None:
     dispatch = DispatchSlot(d_start, d_start + timedelta(minutes=30), -2.0, "SMART")
     plan = compute_plan(_slot_inputs(load=0.5, dispatches=(dispatch,)), cfg())
     assert plan.expensive_load_kwh == pytest.approx(17.5)
-    assert any(a.kind == "stop_discharge" for a in plan.actions)
+    assert len(plan.charge_intent.holds) == 1
     assert plan.cheap_covered_kwh == pytest.approx(0.5)
 
 
@@ -201,7 +200,7 @@ def test_slot_model_respects_headroom_and_max_current() -> None:
     plan = compute_plan(_slot_inputs(load=2.0, soc_now=85.0), cfg())
     headroom = 26.88 * (90 - 85) / 100
     assert plan.required_kwh == pytest.approx(headroom)
-    assert plan.overnight_current_a <= 62.5
+    assert plan.charge_intent.target_soc_pct <= 90.0 + 1e-9
 
 
 def test_fill_strategy_charges_to_cap() -> None:
@@ -219,7 +218,7 @@ def test_fill_strategy_zero_at_cap() -> None:
     inp = PlannerInputs(soc_now=90, solar_tomorrow_kwh=3.4, predicted_home_load_kwh=17.7)
     plan = compute_plan(inp, cfg(strategy="fill"))
     assert plan.required_kwh == 0.0
-    assert plan.overnight_current_a == 0.0
+    assert plan.charge_intent.target_soc_pct == pytest.approx(plan.soc_now)
 
 
 def test_pre_window_drain_reduces_usable() -> None:
@@ -245,7 +244,9 @@ def test_charge_efficiency_inflates_purchase_and_current() -> None:
     lossy = compute_plan(inp, cfg(charge_efficiency=0.9))
     # Stored energy target is unchanged; the AC purchase and current grow by 1/0.9.
     assert lossy.required_kwh == pytest.approx(lossless.required_kwh)
-    assert lossy.overnight_current_a == pytest.approx(lossless.overnight_current_a / 0.9)
+    assert lossy.charge_intent.target_soc_pct == pytest.approx(
+        lossless.charge_intent.target_soc_pct
+    )
     assert lossy.charge_efficiency == pytest.approx(0.9)
     assert lossless.planned_cost is not None and lossy.planned_cost is not None
     extra_buy = lossless.required_kwh / 0.9 - lossless.required_kwh
