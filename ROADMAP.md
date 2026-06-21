@@ -86,8 +86,9 @@ later learning phase needs 6A's data and referee, and 6D delivers part of 5.
 
 ## Backlog
 
-- ✅ **Re-bundle the ML load model in the add-on image** (0.10.1). The add-on now
-  builds on a glibc `python:slim` base, so pip installs prebuilt
+- ✅ **Re-bundle the ML load model in the add-on image** (0.10.2). The add-on now
+  builds on a glibc `python:slim` base (set directly via `FROM`, since Supervisor
+  2026.04.0+ no longer reads `build.yaml`), so pip installs prebuilt
   scikit-learn/numpy wheels with no musl source-compile. `load_model: ml|auto`
   runs on the add-on; `auto` self-promotes ML only once the ledger shows it
   beating the median.
