@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import time
 from pathlib import Path
 
 import httpx
 import respx
 
 from ha_spark.config import Settings
-from ha_spark.energy.models import ChargePlan
+from ha_spark.energy.models import ChargeIntent, ChargePlan
 from ha_spark.energy.publish import publish_plan, republish_last
 from ha_spark.ha.rest import HomeAssistantRest
 
@@ -28,11 +29,12 @@ def _plan(**overrides: object) -> ChargePlan:
         buffer_pct=20.0,
         required_kwh=9.6,
         target_soc=90.0,
-        overnight_current_a=50.0,
         window_hours=6.0,
         ev_charging=False,
         ha_template_needed=None,
-        actions=(),
+        charge_intent=ChargeIntent(
+            target_soc_pct=90.0, soc_now=40.0, window_start=time(23, 30), window_end=time(5, 30)
+        ),
     )
     defaults.update(overrides)
     return ChargePlan(**defaults)  # type: ignore[arg-type]
@@ -44,7 +46,6 @@ async def test_publish_plan_pushes_required_entities(tmp_path: Path) -> None:
         "sensor.ha_spark_charge_needed_kwh",
         "sensor.ha_spark_target_soc",
         "sensor.ha_spark_soc_now",
-        "sensor.ha_spark_overnight_current",
         "sensor.ha_spark_forecast_load_kwh",
         "sensor.ha_spark_solar_forecast_kwh",
         "sensor.ha_spark_deficit_kwh",
@@ -64,7 +65,6 @@ async def test_publish_plan_skips_none_cost_fields(tmp_path: Path) -> None:
         "sensor.ha_spark_charge_needed_kwh",
         "sensor.ha_spark_target_soc",
         "sensor.ha_spark_soc_now",
-        "sensor.ha_spark_overnight_current",
         "sensor.ha_spark_forecast_load_kwh",
         "sensor.ha_spark_solar_forecast_kwh",
         "sensor.ha_spark_deficit_kwh",
@@ -89,7 +89,6 @@ async def test_republish_last_replays_cached_payload(tmp_path: Path) -> None:
         "sensor.ha_spark_charge_needed_kwh",
         "sensor.ha_spark_target_soc",
         "sensor.ha_spark_soc_now",
-        "sensor.ha_spark_overnight_current",
         "sensor.ha_spark_forecast_load_kwh",
         "sensor.ha_spark_solar_forecast_kwh",
         "sensor.ha_spark_deficit_kwh",
@@ -106,7 +105,7 @@ async def test_republish_last_replays_cached_payload(tmp_path: Path) -> None:
     async with HomeAssistantRest(BASE, "tok") as rest:
         await republish_last(rest, settings)
 
-    assert len(respx.calls) - calls_before == 9
+    assert len(respx.calls) - calls_before == 8
 
 
 @respx.mock

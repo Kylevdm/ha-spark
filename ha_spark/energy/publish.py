@@ -61,15 +61,6 @@ def _entities(plan: ChargePlan, settings: Settings) -> list[Entity]:
             },
         ),
         (
-            "sensor.ha_spark_overnight_current",
-            f"{plan.overnight_current_a:.1f}",
-            {
-                "friendly_name": "ha-spark overnight charge current",
-                "unit_of_measurement": "A",
-                "device_class": "current",
-            },
-        ),
-        (
             "sensor.ha_spark_forecast_load_kwh",
             f"{plan.load_kwh:.2f}",
             {

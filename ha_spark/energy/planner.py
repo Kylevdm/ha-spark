@@ -36,7 +36,6 @@ from __future__ import annotations
 from datetime import datetime, time
 
 from ha_spark.energy.models import (
-    ChargeAction,
     ChargeIntent,
     ChargePlan,
     DispatchSlot,
@@ -174,33 +173,6 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
     if cfg.capacity_kwh > 0:
         target_soc = min(cfg.target_cap, inputs.soc_now + required / cfg.capacity_kwh * 100.0)
 
-    # purchased AC kWh over the fixed window -> charge current (A).
-    kwh_per_amp = cfg.window_hours * cfg.voltage_v / 1000.0
-    current = _clamp(purchase / kwh_per_amp, 0.0, cfg.max_current_a) if kwh_per_amp > 0 else 0.0
-
-    actions: list[ChargeAction] = [
-        ChargeAction(
-            kind="set_charge_current",
-            description=(
-                f"set timed charge current to {current:.0f} A "
-                f"for the {cfg.window_hours:.1f} h window"
-            ),
-            current_a=round(current),
-        )
-    ]
-    for d in daytime:
-        actions.append(
-            ChargeAction(
-                kind="stop_discharge",
-                description=(
-                    "turn inverter off (stop discharge) during dispatch "
-                    f"{d.start:%H:%M}-{d.end:%H:%M}"
-                ),
-                slot_start=d.start,
-                slot_end=d.end,
-            )
-        )
-
     holds = tuple((d.start, d.end) for d in daytime)
     intent = ChargeIntent(
         target_soc_pct=target_soc,
@@ -223,11 +195,9 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
         buffer_pct=cfg.buffer_pct,
         required_kwh=required,
         target_soc=target_soc,
-        overnight_current_a=current,
         window_hours=cfg.window_hours,
         ev_charging=inputs.ev_charging,
         ha_template_needed=inputs.ha_template_needed,
-        actions=tuple(actions),
         charge_intent=intent,
         model=model,
         expensive_load_kwh=expensive_load_kwh,

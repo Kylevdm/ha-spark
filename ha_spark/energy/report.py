@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import time
+
 from ha_spark.energy.models import ChargePlan
+
+
+def _fmt(t: time) -> str:
+    return f"{t.hour:02d}:{t.minute:02d}"
 
 
 def format_plan(plan: ChargePlan, load_source: str) -> str:
@@ -50,7 +56,8 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
         f"  Usable now         {usable}",
         f"  Energy deficit     {deficit}",
         f"  Required charge    {required}  ->  target {plan.target_soc:.0f}%",
-        f"  Charge current     {plan.overnight_current_a:.0f} A over {plan.window_hours:.1f} h",
+        f"  Charge to          {plan.target_soc:.0f}%  over the {plan.window_hours:.1f} h window "
+        f"({_fmt(plan.charge_intent.window_start)}-{_fmt(plan.charge_intent.window_end)})",
         f"  EV                 {'charging' if plan.ev_charging else 'not charging'}",
     ]
     if plan.dispatch_ev_kwh is not None:
