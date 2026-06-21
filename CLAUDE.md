@@ -72,6 +72,10 @@ Data flow: REST seeds the `StateCache`; the WebSocket stream feeds incremental
 `state_changed` updates into the same cache; the agent (future phases) reads the
 cache, decides via the Ollama router, and acts through `call_service`.
 
+Charging is per-inverter: `ha_spark/energy/chargers.py` defines a `Charger`
+protocol and `charger_for(settings, rest)` selects the adapter for
+`settings.inverter` (see `docs/adding-an-inverter.md`).
+
 ## Design direction (`usernotes.md` is authoritative)
 
 `usernotes.md` records the user's design decisions; honor it over older notes:
