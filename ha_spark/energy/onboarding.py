@@ -15,9 +15,6 @@ from typing import Any
 
 from ha_spark.config import Settings
 from ha_spark.ha.statistics import import_statistics, list_statistic_ids, statistics_during_period
-from ha_spark.logging import get_logger
-
-log = get_logger(__name__)
 
 BACKFILL_STATISTIC_ID = "ha_spark:house_load"
 BACKFILL_NAME = "ha-spark house load (backfilled)"

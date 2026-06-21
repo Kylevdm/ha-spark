@@ -15,9 +15,6 @@ from typing import Any
 from websockets.asyncio.client import connect
 
 from ha_spark.ha.websocket import _authenticate
-from ha_spark.logging import get_logger
-
-log = get_logger(__name__)
 
 
 async def _command(

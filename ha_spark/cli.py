@@ -41,12 +41,10 @@ from ha_spark.ha.state_cache import StateCache
 from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
 from ha_spark.health import Status, check_load_history, exit_code, format_report, run_health
-from ha_spark.logging import get_logger, setup_logging
+from ha_spark.logging import setup_logging
 from ha_spark.onboarding_discover import FieldProposal, propose
 from ha_spark.presets import get_preset, preset_names
 from ha_spark.router import route_message
-
-log = get_logger(__name__)
 
 
 async def _cmd_states(settings: Settings, *, domain: str | None, watch: bool) -> int:

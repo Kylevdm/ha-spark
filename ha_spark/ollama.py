@@ -12,10 +12,6 @@ from typing import Any
 
 import httpx
 
-from ha_spark.logging import get_logger
-
-log = get_logger(__name__)
-
 
 class OllamaClient:
     """Thin async wrapper over a remote Ollama HTTP API.
