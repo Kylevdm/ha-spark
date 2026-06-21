@@ -37,6 +37,7 @@ from datetime import datetime, time
 
 from ha_spark.energy.models import (
     ChargeAction,
+    ChargeIntent,
     ChargePlan,
     DispatchSlot,
     PlannerConfig,
@@ -200,6 +201,15 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
             )
         )
 
+    holds = tuple((d.start, d.end) for d in daytime)
+    intent = ChargeIntent(
+        target_soc_pct=target_soc,
+        soc_now=inputs.soc_now,
+        window_start=cfg.window_start,
+        window_end=cfg.window_end,
+        holds=holds,
+    )
+
     return ChargePlan(
         soc_now=inputs.soc_now,
         soc_valid=inputs.soc_valid,
@@ -218,6 +228,7 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
         ev_charging=inputs.ev_charging,
         ha_template_needed=inputs.ha_template_needed,
         actions=tuple(actions),
+        charge_intent=intent,
         model=model,
         expensive_load_kwh=expensive_load_kwh,
         baseline_cost=baseline_cost,
