@@ -123,18 +123,25 @@ async def test_forecast_eval_no_recorded_forecasts_errors(
 async def test_forecast_eval_reports_accuracy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from datetime import UTC, date, datetime
+    from datetime import UTC, datetime, timedelta
 
     from ha_spark.energy.ledger import ForecastLedger
+
+    # Anchor to a recent date so the forecast stays inside the --days window
+    # regardless of when the test runs (otherwise it ages out of range).
+    target = (datetime.now(UTC) - timedelta(days=2)).date()
+    target_midnight = datetime.combine(target, datetime.min.time(), tzinfo=UTC)
 
     settings = Settings(ha_url="http://ha.test", ha_token="t", db_path=str(tmp_path / "test.db"))
     async with ForecastLedger(settings.db_path) as ledger:
         await ledger.record_forecast(
-            datetime(2026, 6, 1, tzinfo=UTC), date(2026, 6, 2), "median", 20.0, None, "median of 7d"
+            target_midnight - timedelta(days=1), target, "median", 20.0, None, "median of 7d"
         )
 
+    target_start_ms = int(target_midnight.timestamp() * 1000)
+
     async def fake_stats(*args: object, **kwargs: object) -> list[dict[str, object]]:
-        return [{"start": 1780358400000, "change": 22.0}]  # 2026-06-02 00:00 UTC
+        return [{"start": target_start_ms, "change": 22.0}]
 
     monkeypatch.setattr(cli, "statistics_during_period", fake_stats)
     assert await _cmd_forecast_eval(settings, days=14) == 0
