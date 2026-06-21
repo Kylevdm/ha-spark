@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.11.0
+
+- Add the proactive orchestrator: a single decision/audit path that, after each
+  daily run, computes the habit API's predictions for tomorrow, honors the
+  `proactive_mode` flag (`off`/`simulate`/`on`), logs each as a `Proactive
+  decision`, and publishes them to Home Assistant as a new
+  `sensor.ha_spark_predictions` (count + per-prediction action/confidence/
+  reason/outcome). Predictions stay advisory for now — nothing is actuated yet;
+  this builds the seam future proactivity hangs off. The away-period prediction
+  now uses the learned away load factor when enough history exists (best-effort,
+  so a history-fetch hiccup never suppresses predictions).
+
 ## 0.10.0
 
 - ha-spark now publishes its computed charge plan back to Home Assistant as
