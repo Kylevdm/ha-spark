@@ -17,7 +17,7 @@ from pathlib import Path
 from ha_spark.config import ConfigError, Settings, load_settings
 from ha_spark.energy import habits
 from ha_spark.energy.backtest import backtest_cost, format_backtest
-from ha_spark.energy.chargers import SolisCharger
+from ha_spark.energy.chargers import charger_for
 from ha_spark.energy.context import KINDS, ContextStore
 from ha_spark.energy.eval import actual_kwh_by_date, evaluate, format_eval
 from ha_spark.energy.forecast import load_timezone
@@ -102,7 +102,7 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
         if apply:
             intent = plan.charge_intent
             assert intent is not None  # planner always sets it
-            lines = await SolisCharger(settings, rest).apply(intent)
+            lines = await charger_for(settings, rest).apply(intent)
             print(f"\nActions (PROACTIVE_MODE={settings.proactive_mode}):")
             for line in lines:
                 print(f"  {line}")

@@ -11,9 +11,10 @@ import respx
 
 from ha_spark.config import Settings
 from ha_spark.energy import scheduler, sources
+from ha_spark.energy.chargers import charger_for
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
-from ha_spark.energy.models import ChargePlan, LoadForecast
+from ha_spark.energy.models import ChargeIntent, ChargePlan, LoadForecast
 from ha_spark.energy.scheduler import (
     SIGNAL_SAMPLE_INTERVAL,
     guard_tick,
@@ -22,16 +23,29 @@ from ha_spark.energy.scheduler import (
     sample_signals,
     should_run,
 )
+from ha_spark.ha.rest import HomeAssistantRest
+
+# A concrete intent so plan.charge_intent drives a real planned charge rate (W).
+_INTENT = ChargeIntent(
+    target_soc_pct=77.0, soc_now=30.0, window_start=time(23, 30), window_end=time(5, 30)
+)
 
 
-def _plan(current_a: float = 42) -> ChargePlan:
+def _plan(current_a: float = 42, intent: ChargeIntent | None = _INTENT) -> ChargePlan:
     return ChargePlan(
         soc_now=30, capacity_kwh=26.88, solar_kwh=8.75, effective_solar_kwh=8.75,
         load_kwh=24.2, cheap_covered_kwh=0.0, usable_now_kwh=2.69,
         deficit_kwh=12.8, buffer_pct=0.0, required_kwh=12.8,
         target_soc=77, overnight_current_a=current_a, window_hours=6.0,
         ev_charging=False, ha_template_needed=None, actions=(),
+        charge_intent=intent,
     )
+
+
+def _planned_w(settings: Settings, intent: ChargeIntent) -> float:
+    """The watts the active charger plans for ``intent`` (pure)."""
+    rest = HomeAssistantRest(settings.ha_rest_url, settings.auth_token)
+    return charger_for(settings, rest).planned_rate_w(intent)
 
 
 def test_should_run_at_or_after_run_time_once_per_day() -> None:
@@ -175,10 +189,10 @@ async def test_run_forever_guard_ticks_only_inside_window(
     async def fake_run_once(_s: Settings) -> ChargePlan:
         return _plan(42)
 
-    async def fake_guard_tick(_s: Settings, target_a: float | None) -> float:
-        guard_targets.append(target_a)
-        assert target_a is not None
-        return target_a
+    async def fake_guard_tick(_s: Settings, target_w: float | None) -> float:
+        guard_targets.append(target_w)
+        assert target_w is not None
+        return target_w
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
         return None
@@ -202,7 +216,9 @@ async def test_run_forever_guard_ticks_only_inside_window(
     )
     with pytest.raises(stop):
         await run_forever(s, poll_seconds=0)
-    assert guard_targets == [42, 42]
+    # Restore target is the plan's planned charge rate in watts, not amps.
+    planned = _planned_w(s, _INTENT)
+    assert guard_targets == [planned, planned]
 
 
 async def test_run_forever_no_guard_when_entity_unset(
@@ -211,7 +227,7 @@ async def test_run_forever_no_guard_when_entity_unset(
     async def fake_run_once(_s: Settings) -> ChargePlan:
         return _plan()
 
-    async def fail_guard_tick(_s: Settings, target_a: float | None) -> float:
+    async def fail_guard_tick(_s: Settings, target_w: float | None) -> float:
         raise AssertionError("guard must not run when grid_power_entity is empty")
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
@@ -227,12 +243,40 @@ async def test_run_forever_no_guard_when_entity_unset(
         await run_forever(s, poll_seconds=0)
 
 
+async def test_run_forever_no_guard_when_charger_has_no_live_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AlphaESS has no settable rate -> the guard branch never fires, even with
+    grid_power_entity set."""
+
+    async def fake_run_once(_s: Settings) -> ChargePlan:
+        return _plan()
+
+    async def fail_guard_tick(_s: Settings, target_w: float | None) -> float:
+        raise AssertionError("guard must not run for an inverter without a live rate")
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "guard_tick", fail_guard_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    stop = _patch_loop(monkeypatch, [datetime(2026, 6, 10, 23, 45)])
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        inverter="alphaess", grid_power_entity="sensor.house_supply_power",
+    )
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+
 async def test_run_forever_guard_failure_does_not_kill_loop(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     attempts: list[datetime] = []
 
-    async def boom_guard_tick(_s: Settings, target_a: float | None) -> float:
+    async def boom_guard_tick(_s: Settings, target_w: float | None) -> float:
         attempts.append(datetime.now())
         raise RuntimeError("HA unreachable")
 
@@ -260,7 +304,7 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
 async def test_guard_tick_adopts_setpoint_as_target_on_restart() -> None:
     s = Settings(
         ha_url="http://ha.test", ha_token="t", proactive_mode="simulate",
-        grid_power_entity="sensor.house_supply_power",
+        grid_power_entity="sensor.house_supply_power", battery_voltage_v=51.0,
     )
     for entity, state in ((s.grid_power_entity, "2000"), (s.charge_current_entity, "30")):
         respx.get(f"http://ha.test/api/states/{entity}").mock(
@@ -268,8 +312,9 @@ async def test_guard_tick_adopts_setpoint_as_target_on_restart() -> None:
                 200, json={"entity_id": entity, "state": state, "attributes": {}}
             )
         )
-    # Mid-window restart: no plan target yet -> adopt the live 30 A setpoint.
-    assert await guard_tick(s, None) == 30.0
+    # Mid-window restart: no plan target yet -> adopt the live setpoint in watts
+    # (30 A * 51 V = 1530 W) via the charger's read_charge_rate.
+    assert await guard_tick(s, None) == 30.0 * 51.0
 
 
 @respx.mock

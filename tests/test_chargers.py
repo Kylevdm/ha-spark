@@ -11,7 +11,7 @@ import respx
 
 from ha_spark.config import Settings
 from ha_spark.energy.chargers import AlphaESSCharger, SolisCharger, charger_for, solis_current_a
-from ha_spark.energy.models import ChargeAction, ChargeIntent
+from ha_spark.energy.models import ChargeIntent
 from ha_spark.ha.rest import HomeAssistantRest
 
 
@@ -187,21 +187,6 @@ async def test_off_mode_computes_without_calls() -> None:
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await SolisCharger(s, rest).apply(_intent())
     assert all("OFF" in line or "SKIP" in line for line in lines)
-
-
-@respx.mock
-async def test_apply_action_executes_one_action_with_read_back() -> None:
-    set_value = respx.post("http://ha.test/api/services/number/set_value").mock(
-        return_value=httpx.Response(200, json=[])
-    )
-    s = _settings(proactive_mode="on")
-    _mock_read_back(s, current="10.0", switch="Off")
-    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        line = await SolisCharger(s, rest).apply_action(
-            ChargeAction("set_charge_current", "set current to 10 A", current_a=10)
-        )
-    assert set_value.called
-    assert line == "[APPLIED] set current to 10 A"
 
 
 def test_planned_rate_w_matches_current_times_voltage() -> None:

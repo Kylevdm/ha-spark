@@ -11,7 +11,7 @@ from datetime import time
 from typing import Protocol
 
 from ha_spark.config import Settings
-from ha_spark.energy.models import ChargeAction, ChargeIntent, window_hours
+from ha_spark.energy.models import ChargeIntent, window_hours
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -98,16 +98,6 @@ class SolisCharger:
         """Does not catch: callers isolate read failures (the supply guard skips the tick)."""
         state = await self._rest.get_state(self._settings.charge_current_entity)
         return float(state.state) * self._settings.battery_voltage_v
-
-    # TODO(Task 4): remove apply_action + the ChargeAction import once supply_guard
-    # is rewritten in watts.
-    async def apply_action(self, action: ChargeAction) -> str:
-        """Transitional: supply_guard still builds ChargeActions (removed in Task 4)."""
-        if action.kind == "set_charge_current" and action.current_a is not None:
-            return await self._set_current(action.current_a, action.description)
-        if action.kind == "stop_discharge":
-            return await self._stop_discharge(action.description)
-        return f"[SKIPPED] unknown action kind {action.kind!r}: {action.description}"
 
     # --- internal writes (PROACTIVE_MODE-gated, failure-isolated, read-back verified) ---
 

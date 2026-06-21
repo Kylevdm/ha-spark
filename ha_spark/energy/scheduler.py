@@ -21,7 +21,7 @@ from datetime import UTC, date, datetime, time, timedelta
 import httpx
 
 from ha_spark.config import Settings
-from ha_spark.energy.chargers import SolisCharger
+from ha_spark.energy.chargers import charger_for
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargePlan, PlannerInputs
@@ -75,7 +75,7 @@ async def run_once(settings: Settings) -> ChargePlan:
         log.info("Charge plan:\n%s", format_plan(plan, load_source))
         intent = plan.charge_intent
         assert intent is not None  # planner always sets it
-        lines = await SolisCharger(settings, rest).apply(intent)
+        lines = await charger_for(settings, rest).apply(intent)
         for line in lines:
             log.info(line)
         await publish_plan(rest, plan, settings)
@@ -146,21 +146,46 @@ async def sample_signals(settings: Settings, now: datetime) -> None:
                 )
 
 
-async def guard_tick(settings: Settings, target_a: float | None) -> float:
-    """One supply-guard pass; returns the target current used (adopted if None).
+async def guard_tick(settings: Settings, target_w: float | None) -> float:
+    """One supply-guard pass; returns the target charge power (W) used.
 
-    A daemon (re)started mid-window has no plan yet; adopt the current
-    charge-current setpoint as the restore target rather than guessing.
+    No-op for inverters without a settable charge rate (the guard has nothing
+    to throttle). A daemon (re)started mid-window has no plan yet; adopt the
+    current charge-rate setpoint (W) as the restore target rather than guessing.
     """
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        if target_a is None:
-            state = await rest.get_state(settings.charge_current_entity)
-            target_a = float(state.state)
-            log.info("Supply guard: adopted current setpoint %g A as target", target_a)
-        await SupplyGuard(settings, rest).tick(target_a)
-    return target_a
+        charger = charger_for(settings, rest)
+        if not charger.supports_live_rate:
+            return target_w or 0.0
+        if target_w is None:
+            target_w = await charger.read_charge_rate()
+            log.info("Supply guard: adopted current setpoint %.0f W as target", target_w)
+        await SupplyGuard(settings, rest).tick(target_w)
+    return target_w
+
+
+async def _planned_rate_w(settings: Settings, plan: ChargePlan) -> float | None:
+    """The plan's charge rate (W) for the active charger, or None if unset.
+
+    ``charger_for``/``planned_rate_w`` perform no I/O; the rest client just
+    satisfies the constructor and is closed straight away.
+    """
+    if plan.charge_intent is None:
+        return None
+    async with HomeAssistantRest(
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+    ) as rest:
+        return charger_for(settings, rest).planned_rate_w(plan.charge_intent)
+
+
+async def _charger_supports_live_rate(settings: Settings) -> bool:
+    """Whether the configured inverter exposes a settable charge rate (no I/O)."""
+    async with HomeAssistantRest(
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+    ) as rest:
+        return charger_for(settings, rest).supports_live_rate
 
 
 async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
@@ -169,7 +194,9 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     run_time = parse_time(settings.plan_run_time)
     window_start = parse_time(settings.charge_window_start)
     window_end = parse_time(settings.charge_window_end)
-    if settings.grid_power_entity:
+    # Guard only inverters with a live charge rate (AlphaESS self-regulates).
+    guard_enabled = bool(settings.grid_power_entity) and await _charger_supports_live_rate(settings)
+    if guard_enabled:
         log.info(
             "Supply guard enabled: watching %s (limit %g A)",
             settings.grid_power_entity,
@@ -183,7 +210,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     except Exception:
         log.exception("Republishing last known states failed")
     last_run_date: date | None = None
-    target_a: float | None = None
+    target_w: float | None = None
     last_signal_at: datetime | None = None
     while True:
         now = datetime.now(tz)
@@ -191,12 +218,12 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             try:
                 plan = await run_once(settings)
                 last_run_date = now.date()
-                target_a = plan.overnight_current_a
+                target_w = await _planned_rate_w(settings, plan)
             except Exception:
                 log.exception("Scheduled plan run failed; will retry next tick")
-        if settings.grid_power_entity and in_window(now.time(), window_start, window_end):
+        if guard_enabled and in_window(now.time(), window_start, window_end):
             try:
-                target_a = await guard_tick(settings, target_a)
+                target_w = await guard_tick(settings, target_w)
             except Exception:
                 log.exception("Supply guard tick failed; will retry next tick")
         if last_signal_at is None or now - last_signal_at >= SIGNAL_SAMPLE_INTERVAL:
