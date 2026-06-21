@@ -28,9 +28,14 @@ def _settings(**overrides: object) -> Settings:
 
 
 def _intent(
-    target_soc: float = 77.0, soc_now: float = 50.0, holds: tuple[tuple, ...] = ()
+    target_soc: float = 77.0,
+    soc_now: float = 50.0,
+    holds: tuple[tuple, ...] = (),
+    soc_valid: bool = True,
 ) -> ChargeIntent:
-    return ChargeIntent(target_soc, soc_now, time(23, 30), time(5, 30), holds=holds)
+    return ChargeIntent(
+        target_soc, soc_now, time(23, 30), time(5, 30), holds=holds, soc_valid=soc_valid
+    )
 
 
 def _state(entity_id: str, state: str) -> dict[str, object]:
@@ -164,7 +169,7 @@ async def test_on_isolates_action_failures() -> None:
 async def test_on_blocks_all_writes_when_soc_invalid() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _settings(proactive_mode="on")
-    intent = _intent(soc_now=0)
+    intent = _intent(soc_valid=False)
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await SolisCharger(s, rest).apply(intent)
     assert posts.call_count == 0
@@ -172,10 +177,23 @@ async def test_on_blocks_all_writes_when_soc_invalid() -> None:
 
 
 @respx.mock
+async def test_on_does_not_block_genuine_zero_soc() -> None:
+    """A real 0% reading (soc_valid=True) must NOT be blocked -- that's exactly
+    the moment a real charge is most needed."""
+    s = _settings(proactive_mode="on")
+    intent = _intent(soc_now=0, soc_valid=True)
+    _mock_read_back(s, "0", "Off")
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        lines = await SolisCharger(s, rest).apply(intent)
+    assert not any(line.startswith("[BLOCKED]") for line in lines)
+
+
+@respx.mock
 async def test_simulate_unaffected_by_invalid_soc() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _settings(proactive_mode="simulate")
-    intent = _intent(soc_now=0)
+    intent = _intent(soc_valid=False)
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await SolisCharger(s, rest).apply(intent)
     assert posts.call_count == 0
@@ -292,9 +310,18 @@ async def test_alphaess_apply_blocks_when_soc_invalid() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _settings(inverter="alphaess", proactive_mode="on")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await AlphaESSCharger(s, rest).apply(_intent(soc_now=0))
+        lines = await AlphaESSCharger(s, rest).apply(_intent(soc_valid=False))
     assert posts.call_count == 0
     assert "[BLOCKED]" in lines[0]
+
+
+@respx.mock
+async def test_alphaess_apply_does_not_block_genuine_zero_soc() -> None:
+    s = _settings(inverter="alphaess", proactive_mode="on", alphaess_serial="SN123")
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        lines = await AlphaESSCharger(s, rest).apply(_intent(soc_now=0, soc_valid=True))
+    assert not any(line.startswith("[BLOCKED]") for line in lines)
 
 
 @respx.mock

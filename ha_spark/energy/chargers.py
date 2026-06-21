@@ -65,7 +65,7 @@ class SolisCharger:
         lines: list[str] = []
         current = round(solis_current_a(intent, self._settings))
         # SoC-unreadable guard: soc_now==0 from a dead sensor would size a max charge.
-        if mode == "on" and intent.soc_now <= 0:
+        if mode == "on" and not intent.soc_valid:
             line = f"[BLOCKED] SoC unreadable; not charging to {intent.target_soc_pct:.0f}%"
             log.warning(line)
             return [line]
@@ -207,7 +207,7 @@ class AlphaESSCharger:
             f"{_fmt_hhmm(intent.window_start)}-{_fmt_hhmm(intent.window_end)}"
         )
         mode = self._settings.proactive_mode
-        if mode == "on" and intent.soc_now <= 0:
+        if mode == "on" and not intent.soc_valid:
             return [f"[BLOCKED] SoC unreadable; not {desc}"]
         if mode == "simulate":
             return [f"[SIMULATE] would {desc}"]

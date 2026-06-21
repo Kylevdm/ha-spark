@@ -134,6 +134,7 @@ class ChargeIntent:
     window_start: time
     window_end: time
     holds: tuple[tuple[datetime, datetime], ...] = ()
+    soc_valid: bool = True  # False -> SoC sensor unreadable; chargers must refuse real writes
 
 
 @dataclass(frozen=True)
