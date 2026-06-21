@@ -138,7 +138,7 @@ class ChargeIntent:
 
 @dataclass(frozen=True)
 class ChargePlan:
-    """The computed plan: the numbers, plus the actions a Charger would take."""
+    """The computed plan: the numbers, plus the ChargeIntent a Charger realizes."""
 
     soc_now: float
     capacity_kwh: float

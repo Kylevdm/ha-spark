@@ -55,7 +55,7 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
     lines += [
         f"  Usable now         {usable}",
         f"  Energy deficit     {deficit}",
-        f"  Required charge    {required}  ->  target {plan.target_soc:.0f}%",
+        f"  Required charge    {required}",
         f"  Charge to          {plan.target_soc:.0f}%  over the {plan.window_hours:.1f} h window "
         f"({_fmt(plan.charge_intent.window_start)}-{_fmt(plan.charge_intent.window_end)})",
         f"  EV                 {'charging' if plan.ev_charging else 'not charging'}",
