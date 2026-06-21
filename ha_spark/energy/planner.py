@@ -183,6 +183,7 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
         window_start=cfg.window_start,
         window_end=cfg.window_end,
         holds=holds,
+        soc_valid=inputs.soc_valid,
     )
 
     return ChargePlan(
