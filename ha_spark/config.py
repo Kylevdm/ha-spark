@@ -89,6 +89,11 @@ _OPTION_KEYS = frozenset(
         "charge_current_entity",
         "inverter_power_switch_entity",
         "ha_template_charge_needed_entity",
+        # Inverter selector + AlphaESS control (Task 3).
+        "inverter",
+        "charge_window_start_entity",
+        "charge_window_end_entity",
+        "alphaess_serial",
         # Forecast ledger: signal sampling (Phase 6A).
         "person_entities",
         "heatpump_energy_entity",
@@ -214,6 +219,14 @@ class Settings(BaseSettings):
     charge_current_entity: str = Field(default="")
     inverter_power_switch_entity: str = Field(default="")
     ha_template_charge_needed_entity: str = Field(default="")
+
+    # Inverter selector: picks the Charger adapter (ha_spark/energy/chargers.py).
+    inverter: Literal["solis", "alphaess"] = Field(default="solis")
+    # Charge window time entities (Solis); blank skips the window write.
+    charge_window_start_entity: str = Field(default="")
+    charge_window_end_entity: str = Field(default="")
+    # AlphaESS system serial for the alphaess.setbatterycharge service call.
+    alphaess_serial: str = Field(default="")
 
     # Forecast ledger signal sampling (Phase 6A): recorded so training data
     # accumulates ahead of the models (6B+) that will consume it.
