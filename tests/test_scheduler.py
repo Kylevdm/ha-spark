@@ -392,7 +392,7 @@ async def test_run_forever_samples_signals_every_interval(
 
 
 @respx.mock
-async def test_run_once_logs_habit_predictions(
+async def test_run_once_logs_proactive_decisions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
@@ -400,6 +400,7 @@ async def test_run_once_logs_habit_predictions(
 
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
     respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
 
     s = Settings(
         ha_url="http://ha.test", ha_token="t", proactive_mode="simulate",
@@ -417,4 +418,4 @@ async def test_run_once_logs_habit_predictions(
     with caplog.at_level("INFO"):
         await run_once(s)
 
-    assert any("Habit prediction" in r.message for r in caplog.records)
+    assert any("Proactive decision" in r.message for r in caplog.records)
