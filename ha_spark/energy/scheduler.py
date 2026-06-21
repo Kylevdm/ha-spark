@@ -21,15 +21,14 @@ from datetime import UTC, date, datetime, time, timedelta
 import httpx
 
 from ha_spark.config import Settings
-from ha_spark.energy import habits
 from ha_spark.energy.chargers import SolisCharger
-from ha_spark.energy.context import ContextStore
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargePlan, PlannerInputs
+from ha_spark.energy.orchestrator import orchestrate
 from ha_spark.energy.planner import _in_overnight_window as in_window
 from ha_spark.energy.planner import compute_plan
-from ha_spark.energy.publish import publish_plan, republish_last
+from ha_spark.energy.publish import publish_plan, publish_predictions, republish_last
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.sources import gather_inputs, parse_time
 from ha_spark.energy.supply_guard import SupplyGuard
@@ -79,38 +78,24 @@ async def run_once(settings: Settings) -> ChargePlan:
             log.info(line)
         await publish_plan(rest, plan, settings)
     await _record_forecast(settings, plan, inputs, load_source)
-    await _log_habit_predictions(settings)
+    await _run_orchestrator(settings)
     return plan
 
 
-async def _log_habit_predictions(settings: Settings) -> None:
-    """Request and log the habit API's advisory predictions for tomorrow (6E).
+async def _run_orchestrator(settings: Settings) -> None:
+    """Compute proactive decisions for tomorrow and publish them (best-effort).
 
-    Always logged; the ``PROACTIVE_MODE`` it would honour is shown. Nothing is
-    executed yet — this is the orchestrator seam later proactivity hangs off.
+    Isolated so a failure here never aborts the daily run. Nothing is executed
+    yet — decisions are advisory; this is the seam later proactivity hangs off.
     """
-    tz = load_timezone(settings.timezone)
-    tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
     try:
-        since = datetime.now(UTC) - timedelta(days=settings.profile_history_days)
-        async with ForecastLedger(settings.db_path) as ledger:
-            occ_samples = await ledger.signal_history("occupancy_home_frac", since)
-        async with ContextStore(settings.db_path) as store:
-            active = await store.active_on(tomorrow)
-        ctx = habits.HabitContext(
-            target_date=tomorrow,
-            predicted_occupancy=habits.predict_occupancy(occ_samples, tomorrow, tz),
-            away_active=any(e.kind == "away" for e in active),
-            learned_away_factor=None,
-        )
-        for action in habits.predict_actions(ctx):
-            log.info(
-                "Habit prediction [mode=%s] %s (%.0f%% confidence): %s",
-                settings.proactive_mode, action.action,
-                action.confidence * 100, action.reason,
-            )
+        decisions = await orchestrate(settings)
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            await publish_predictions(rest, decisions, settings)
     except Exception:
-        log.exception("Habit prediction logging failed")
+        log.exception("Proactive orchestrator failed")
 
 
 async def sample_signals(settings: Settings, now: datetime) -> None:

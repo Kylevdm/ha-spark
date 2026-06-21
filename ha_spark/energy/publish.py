@@ -17,6 +17,7 @@ from typing import Any
 
 from ha_spark.config import Settings
 from ha_spark.energy.models import ChargePlan
+from ha_spark.energy.orchestrator import Decision
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -159,6 +160,26 @@ async def publish_plan(rest: HomeAssistantRest, plan: ChargePlan, settings: Sett
         path.write_text(json.dumps(entities), encoding="utf-8")
     except OSError:
         log.warning("Caching published states failed", exc_info=True)
+
+
+async def publish_predictions(
+    rest: HomeAssistantRest, decisions: list[Decision], settings: Settings
+) -> None:
+    """Surface the orchestrator's decisions as sensor.ha_spark_predictions (best-effort)."""
+    attrs: dict[str, Any] = {
+        "friendly_name": "ha-spark predictions",
+        "proactive_mode": settings.proactive_mode,
+        "predictions": [
+            {
+                "action": d.action,
+                "confidence": round(d.confidence, 2),
+                "reason": d.reason,
+                "outcome": d.outcome,
+            }
+            for d in decisions
+        ],
+    }
+    await _push(rest, [("sensor.ha_spark_predictions", str(len(decisions)), attrs)])
 
 
 async def republish_last(rest: HomeAssistantRest, settings: Settings) -> None:
