@@ -1,7 +1,0 @@
----
-# glibc base so pip installs prebuilt scikit-learn/numpy wheels for the ML load
-# model (the HA Alpine/musl base-python images have no sklearn wheel). Official
-# python:slim is multi-arch (amd64 + arm64/aarch64).
-build_from:
-  aarch64: python:3.13-slim-bookworm
-  amd64: python:3.13-slim-bookworm
