@@ -10,7 +10,10 @@ v1 model (daily energy balance, used when no per-slot forecast is available):
     buffered        = deficit * (1 + buffer_pct / 100)
     required        = clamp(buffered - usable_at_window, 0, headroom_to_cap)
     purchase        = required / charge_efficiency   (AC kWh bought)
-    current_A       = clamp(purchase / (window_h * voltage/1000), 0, max_A)
+
+``compute_plan`` turns ``required``/``purchase`` into a ``target_soc`` and emits
+a ``ChargeIntent``; per-inverter charge mechanics (e.g. amps sizing for Solis)
+are the adapter's job, not the planner's.
 
 With ``strategy="fill"`` the sizing instead charges to the target cap every
 night (``required = headroom``) — optimal once the export rate exceeds
@@ -27,8 +30,8 @@ needs to cover the *expensive* slots' net load (load - solar), so
 replaces ``deficit``, then the same buffer and clamps apply. Both models also
 project a two-rate cost (off-peak/peak) with and without the battery.
 
-Daytime dispatch slots each emit a ``stop_discharge`` action so the battery
-holds (doesn't feed the EV) while cheap grid covers the house.
+Daytime dispatch slots are expressed as ``holds`` on the ``ChargeIntent``, so
+the battery holds (doesn't discharge) while cheap grid covers the house.
 """
 
 from __future__ import annotations

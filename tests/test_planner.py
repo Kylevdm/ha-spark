@@ -105,7 +105,6 @@ def test_plan_emits_charge_intent() -> None:
     inp = PlannerInputs(soc_now=50.0, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=20.0)
     plan = compute_plan(inp, cfg())
     intent = plan.charge_intent
-    assert intent is not None
     assert intent.target_soc_pct == plan.target_soc
     assert intent.soc_now == plan.soc_now
     # default window is 23:30 -> 05:30
@@ -119,7 +118,6 @@ def test_daytime_dispatch_becomes_a_hold() -> None:
         dispatches=(_slot(13, 0),),
     )
     plan = compute_plan(inp, cfg())
-    assert plan.charge_intent is not None
     assert len(plan.charge_intent.holds) == 1
 
 
