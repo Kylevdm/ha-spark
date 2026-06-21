@@ -18,7 +18,17 @@
       "Bash(xargs git checkout --)",
       "Bash(git check-ignore *)",
       "Bash(git checkout *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(git pull *)",
+      "Bash(git commit -q -m ' *)",
+      "Bash(git symbolic-ref *)",
+      "Bash(grep '\\\\.py$')",
+      "Bash(pytest -q)",
+      "Bash(pytest -q tests/test_rest.py)",
+      "Bash(echo \"---EXIT $?---\")",
+      "Bash(ls -la /install_error.txt)",
+      "Bash(awk '/def cmd_onboard|onboard/{print NR\": \"$0}' ha_spark/cli.py)",
+      "Bash(timeout 60 python3 -m ha_spark states)"
     ]
   },
   "remote": {

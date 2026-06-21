@@ -86,13 +86,7 @@ async def _grounded_chat(
 
 async def _ollama_extract(message: str, settings: Settings, today: datetime) -> str | None:
     """Run the extraction pass on Ollama; None when it can't give a usable reply."""
-    try:
-        async with OllamaClient(
-            settings.ollama_url, timeout=settings.ollama_health_timeout
-        ) as probe:
-            await probe.list_models()
-    except Exception as exc:  # noqa: BLE001 - unreachable -> offline extraction
-        log.info("Ollama unreachable for extraction (%r); using offline parser", exc)
+    if not await _ollama_reachable(settings):
         return None
     try:
         async with OllamaClient(settings.ollama_url, timeout=settings.ollama_timeout) as client:

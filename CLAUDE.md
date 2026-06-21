@@ -120,3 +120,20 @@ cache, decides via the Ollama router, and acts through `call_service`.
 - **No-push fallback:** if a session lacks git credentials, produce a `git bundle`
   + `git format-patch` and push from a credentialed clone. (`*.bundle` / `*.patch`
   are gitignored.)
+- **Add-on release procedure (two things must agree):** the Supervisor build
+  clones the package via `pip install "...@v${BUILD_VERSION}"`, where
+  `BUILD_VERSION` = `ha_spark_addon/config.yaml` `version`. So a release needs
+  BOTH (1) the `version` bumped in `config.yaml` **on `master`** — the add-on
+  store advertises the version from the default branch, so a tag alone won't
+  surface an update — and (2) a matching `vX.Y.Z` git **tag pushed** to GitHub,
+  or the build fails with `pathspec 'vX.Y.Z' did not match`. Sequence: commit the
+  bump → tag `vX.Y.Z` → push branch + tag → merge to `master`.
+- **Add-on base image (Supervisor 2026.04.0+):** `build.yaml` is no longer read
+  and `BUILD_FROM` is no longer injected — set the base directly with `FROM` in
+  `ha_spark_addon/Dockerfile`. The ML model (`[habits]` extra: scikit-learn/numpy)
+  has no musllinux wheel, so the add-on builds on a **glibc** base
+  (`python:3.13-slim-bookworm`) to install prebuilt wheels instead of
+  source-compiling. That base has no s6/bashio, so `run.sh` is plain shell and
+  `config.yaml` sets `init: true` (Supervisor runs tini as PID 1). The ML
+  weather path gets lat/lon from `config.yaml` or falls back to HA's home
+  location (`sources.py` via `rest.get_config()`).
