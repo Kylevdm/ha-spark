@@ -100,7 +100,9 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
         plan = compute_plan(inputs, cfg)
         print(format_plan(plan, load_source))
         if apply:
-            lines = await SolisCharger(settings, rest).apply(plan)
+            intent = plan.charge_intent
+            assert intent is not None  # planner always sets it
+            lines = await SolisCharger(settings, rest).apply(intent)
             print(f"\nActions (PROACTIVE_MODE={settings.proactive_mode}):")
             for line in lines:
                 print(f"  {line}")

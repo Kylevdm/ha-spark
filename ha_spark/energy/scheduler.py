@@ -73,7 +73,9 @@ async def run_once(settings: Settings) -> ChargePlan:
         inputs, cfg, load_source = await gather_inputs(settings, rest)
         plan = compute_plan(inputs, cfg)
         log.info("Charge plan:\n%s", format_plan(plan, load_source))
-        lines = await SolisCharger(settings, rest).apply(plan)
+        intent = plan.charge_intent
+        assert intent is not None  # planner always sets it
+        lines = await SolisCharger(settings, rest).apply(intent)
         for line in lines:
             log.info(line)
         await publish_plan(rest, plan, settings)
