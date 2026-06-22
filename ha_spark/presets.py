@@ -30,7 +30,16 @@ SOLIS: dict[str, str] = {
     "inverter_power_switch_entity": "select.solisac_power_switch",
 }
 
-PRESETS: dict[str, dict[str, str]] = {"solis": SOLIS}
+# AlphaESS: control is the alphaess.setbatterycharge service (window + stop-SOC),
+# not entities. Sensors below come from the CharlesGillanders integration
+# (cloud or local).
+ALPHAESS: dict[str, str] = {
+    "soc_entity": "sensor.alphaess_battery_soc",
+    "battery_voltage_entity": "sensor.alphaess_battery_voltage",
+    "grid_power_entity": "sensor.alphaess_total_load",  # used only if a rate tier appears
+}
+
+PRESETS: dict[str, dict[str, str]] = {"solis": SOLIS, "alphaess": ALPHAESS}
 
 
 def preset_names() -> list[str]:

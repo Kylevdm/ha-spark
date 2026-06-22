@@ -56,6 +56,10 @@ options:
   charge_current_entity: ""
   inverter_power_switch_entity: ""
   ha_template_charge_needed_entity: ""
+  inverter: solis
+  charge_window_start_entity: ""
+  charge_window_end_entity: ""
+  alphaess_serial: ""
   outdoor_weather_entity: weather.home
   load_model: auto
   buffer_mode: fixed
@@ -111,6 +115,10 @@ schema:
   charge_current_entity: str?
   inverter_power_switch_entity: str?
   ha_template_charge_needed_entity: str?
+  inverter: list(solis|alphaess)
+  charge_window_start_entity: str?
+  charge_window_end_entity: str?
+  alphaess_serial: str?
   person_entities: str?
   heatpump_energy_entity: str?
   outdoor_weather_entity: str?

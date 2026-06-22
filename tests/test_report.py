@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from ha_spark.energy.models import ChargePlan
+from datetime import time
+
+from ha_spark.energy.models import ChargeIntent, ChargePlan
 from ha_spark.energy.report import format_plan
 
 
@@ -11,8 +13,11 @@ def _plan(**kw: object) -> ChargePlan:
         soc_now=69, capacity_kwh=26.88, solar_kwh=3.4, effective_solar_kwh=3.4,
         load_kwh=17.7, cheap_covered_kwh=0.0, usable_now_kwh=13.17,
         deficit_kwh=9.23, buffer_pct=20.0, required_kwh=0.0,
-        target_soc=69, overnight_current_a=0, window_hours=6.0, ev_charging=False,
-        ha_template_needed=None, actions=(),
+        target_soc=69, window_hours=6.0, ev_charging=False,
+        ha_template_needed=None,
+        charge_intent=ChargeIntent(
+            target_soc_pct=69, soc_now=69, window_start=time(23, 30), window_end=time(5, 30)
+        ),
     )
     base.update(kw)
     return ChargePlan(**base)  # type: ignore[arg-type]
@@ -41,3 +46,9 @@ def test_dispatch_ev_kwh_renders_when_present() -> None:
 
 def test_dispatch_ev_kwh_omitted_when_none() -> None:
     assert "EV dispatch energy" not in format_plan(_plan(), "test")
+
+
+def test_report_shows_target_and_window() -> None:
+    out = format_plan(_plan(), "median")
+    assert "Charge to" in out and "%" in out
+    assert "Charge current" not in out

@@ -34,6 +34,9 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `charge_current_entity` | Inverter timed-charge current `number` entity (the only control written) |
 | `inverter_power_switch_entity` | Inverter power switch `select` entity |
 | `ha_template_charge_needed_entity` | Optional HA template sensor for comparison logging |
+| `inverter` | Which inverter ha-spark controls: `solis` (default) or `alphaess` |
+| `charge_window_start_entity` / `charge_window_end_entity` | Optional HA entities ha-spark writes the timed-charge window to (blank = leave the inverter's window as-is) |
+| `alphaess_serial` | AlphaESS system serial (only needed when `inverter: alphaess`) |
 | `person_entities` | Optional comma-separated `person`/`device_tracker` entity ids for occupancy signal recording |
 | `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
 | `outdoor_weather_entity` | Weather entity with a `temperature` attribute (default `weather.home`) for signal recording |
