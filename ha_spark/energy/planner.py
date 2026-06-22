@@ -10,7 +10,10 @@ v1 model (daily energy balance, used when no per-slot forecast is available):
     buffered        = deficit * (1 + buffer_pct / 100)
     required        = clamp(buffered - usable_at_window, 0, headroom_to_cap)
     purchase        = required / charge_efficiency   (AC kWh bought)
-    current_A       = clamp(purchase / (window_h * voltage/1000), 0, max_A)
+
+``compute_plan`` turns ``required``/``purchase`` into a ``target_soc`` and emits
+a ``ChargeIntent``; per-inverter charge mechanics (e.g. amps sizing for Solis)
+are the adapter's job, not the planner's.
 
 With ``strategy="fill"`` the sizing instead charges to the target cap every
 night (``required = headroom``) — optimal once the export rate exceeds
@@ -27,8 +30,8 @@ needs to cover the *expensive* slots' net load (load - solar), so
 replaces ``deficit``, then the same buffer and clamps apply. Both models also
 project a two-rate cost (off-peak/peak) with and without the battery.
 
-Daytime dispatch slots each emit a ``stop_discharge`` action so the battery
-holds (doesn't feed the EV) while cheap grid covers the house.
+Daytime dispatch slots are expressed as ``holds`` on the ``ChargeIntent``, so
+the battery holds (doesn't discharge) while cheap grid covers the house.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ from __future__ import annotations
 from datetime import datetime, time
 
 from ha_spark.energy.models import (
-    ChargeAction,
+    ChargeIntent,
     ChargePlan,
     DispatchSlot,
     PlannerConfig,
@@ -173,32 +176,15 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
     if cfg.capacity_kwh > 0:
         target_soc = min(cfg.target_cap, inputs.soc_now + required / cfg.capacity_kwh * 100.0)
 
-    # purchased AC kWh over the fixed window -> charge current (A).
-    kwh_per_amp = cfg.window_hours * cfg.voltage_v / 1000.0
-    current = _clamp(purchase / kwh_per_amp, 0.0, cfg.max_current_a) if kwh_per_amp > 0 else 0.0
-
-    actions: list[ChargeAction] = [
-        ChargeAction(
-            kind="set_charge_current",
-            description=(
-                f"set timed charge current to {current:.0f} A "
-                f"for the {cfg.window_hours:.1f} h window"
-            ),
-            current_a=round(current),
-        )
-    ]
-    for d in daytime:
-        actions.append(
-            ChargeAction(
-                kind="stop_discharge",
-                description=(
-                    "turn inverter off (stop discharge) during dispatch "
-                    f"{d.start:%H:%M}-{d.end:%H:%M}"
-                ),
-                slot_start=d.start,
-                slot_end=d.end,
-            )
-        )
+    holds = tuple((d.start, d.end) for d in daytime)
+    intent = ChargeIntent(
+        target_soc_pct=target_soc,
+        soc_now=inputs.soc_now,
+        window_start=cfg.window_start,
+        window_end=cfg.window_end,
+        holds=holds,
+        soc_valid=inputs.soc_valid,
+    )
 
     return ChargePlan(
         soc_now=inputs.soc_now,
@@ -213,11 +199,10 @@ def compute_plan(inputs: PlannerInputs, cfg: PlannerConfig) -> ChargePlan:
         buffer_pct=cfg.buffer_pct,
         required_kwh=required,
         target_soc=target_soc,
-        overnight_current_a=current,
         window_hours=cfg.window_hours,
         ev_charging=inputs.ev_charging,
         ha_template_needed=inputs.ha_template_needed,
-        actions=tuple(actions),
+        charge_intent=intent,
         model=model,
         expensive_load_kwh=expensive_load_kwh,
         baseline_cost=baseline_cost,

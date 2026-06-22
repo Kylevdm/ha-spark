@@ -26,6 +26,11 @@ See [`ha_spark_addon/DOCS.md`](ha_spark_addon/DOCS.md) for the full option
 reference and onboarding flow (health check → load-history backfill → plan →
 enable real control).
 
+Charging is driven through a per-inverter adapter; set the `inverter` option
+to `solis` (default) or `alphaess` to match your hardware. See
+[`docs/adding-an-inverter.md`](docs/adding-an-inverter.md) for the adapter
+contract and how to add support for another inverter.
+
 ## Development
 
 Requires Python 3.11+.

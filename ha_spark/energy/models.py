@@ -9,6 +9,13 @@ from datetime import date, datetime, time
 SLOTS_PER_DAY = 48
 
 
+def window_hours(start: time, end: time) -> float:
+    """Length of the (possibly midnight-wrapping) charge window, in hours."""
+    s = start.hour + start.minute / 60
+    e = end.hour + end.minute / 60
+    return (e - s) % 24 or 24.0
+
+
 @dataclass(frozen=True)
 class ConsumptionInterval:
     """One half-hourly meter reading (timestamps tz-aware UTC)."""
@@ -87,9 +94,7 @@ class PlannerConfig:
     @property
     def window_hours(self) -> float:
         """Length of the (possibly midnight-wrapping) charge window, in hours."""
-        s = self.window_start.hour + self.window_start.minute / 60
-        e = self.window_end.hour + self.window_end.minute / 60
-        return (e - s) % 24 or 24.0
+        return window_hours(self.window_start, self.window_end)
 
 
 @dataclass(frozen=True)
@@ -116,19 +121,25 @@ class PlannerInputs:
 
 
 @dataclass(frozen=True)
-class ChargeAction:
-    """One control the planner would apply (kind interpreted by a Charger)."""
+class ChargeIntent:
+    """Inverter-agnostic charge command: reach ``target_soc_pct`` by ``window_end``.
 
-    kind: str  # "set_charge_current" | "stop_discharge"
-    description: str
-    current_a: float | None = None
-    slot_start: datetime | None = None
-    slot_end: datetime | None = None
+    ``soc_now`` is carried so a rate-based adapter (Solis) can re-derive the kWh
+    to add without re-reading the sensor. ``holds`` are daytime dispatch windows
+    during which the battery must stop discharging (hold for cheap grid).
+    """
+
+    target_soc_pct: float
+    soc_now: float
+    window_start: time
+    window_end: time
+    holds: tuple[tuple[datetime, datetime], ...] = ()
+    soc_valid: bool = True  # False -> SoC sensor unreadable; chargers must refuse real writes
 
 
 @dataclass(frozen=True)
 class ChargePlan:
-    """The computed plan: the numbers, plus the actions a Charger would take."""
+    """The computed plan: the numbers, plus the ChargeIntent a Charger realizes."""
 
     soc_now: float
     capacity_kwh: float
@@ -141,11 +152,10 @@ class ChargePlan:
     buffer_pct: float
     required_kwh: float
     target_soc: float
-    overnight_current_a: float
     window_hours: float
     ev_charging: bool
     ha_template_needed: float | None
-    actions: tuple[ChargeAction, ...]
+    charge_intent: ChargeIntent  # control contract: the sole charge-control surface
     soc_valid: bool = True  # False -> SoC sensor unreadable; block real writes
     model: str = "daily"  # "slots" (per-slot horizon) | "daily" (v1 balance)
     expensive_load_kwh: float | None = None  # net load in peak-rate slots (slot model)
