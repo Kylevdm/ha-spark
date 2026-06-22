@@ -73,16 +73,39 @@ weekend") — they never bypass the planner to actuate hardware directly.
 | ✅ 2 — LLM router (done) | Two-tier router behind `ha-spark ask`: remote Ollama chat (`/api/tags` probe gates `/api/chat`) with a deterministic offline parser answering energy queries (plan, SoC, solar, strategy, mode, window) from the planner pipeline |
 | ✅ 3 — EV integration (done) | Live supply guard (throttle battery charging when whole-house draw nears the main-fuse limit, e.g. during an EV dispatch) plus EV dispatch energy in the plan report |
 | ✅ 6A — Forecast ledger (done) | Forecast-vs-actual accuracy ledger (`ha-spark forecast-eval`) and a 30-min signal sampler (occupancy, heat-pump energy, outdoor temp) so training data accumulates |
-| ✅ 6B — Weather-aware ML model | Gradient-boosted quantile slot model (Open-Meteo temps, HDD, day-type, lags, occupancy); `load_model: auto` gated by the ledger; quantile buffer mode |
+| ✅ 6B — Weather-aware ML model (done) | Gradient-boosted quantile slot model (Open-Meteo temps, HDD, day-type, lags, occupancy); `load_model: auto` gated by the ledger; quantile buffer mode |
 | ✅ 6C — Context store (done) | Date-ranged facts (away/guests) via `ha-spark context`; deterministic load scaling, visible in the plan report |
 | ✅ 6D — LLM context extraction (done) | "I'm on holiday for two weeks" in `ha-spark ask` → structured fact in the context store (Ollama JSON extraction + offline fallback); facts only, never setpoints |
 | ✅ 6E — Occupancy habits (done) | Predict occupancy from recorded patterns; learn the away-load factor (auto-applied); seed of the `predict_actions` habit API (advisory, gated by `PROACTIVE_MODE`) |
 | ✅ 4 — Onboarding wizard (done) | Entity auto-discovery (domain / device class / unit / attribute / name matching) and `ha-spark onboard` proposal with `--json`/`--write`/`--preset`; Solis reference preset |
 | ✅ 5 — NL copilot v1 (done) | Plan/state Q&A grounded in live planner output: `ha-spark ask` feeds the computed plan and state into the Ollama tier so answers explain the actual decision, scoped to the energy domain; context set/queried in chat via 6C/6D |
-| Later (v3) | Heat pump + hot-water coordination, multi-inverter and rectifier support, more vendor presets via the Charger Protocol |
+All of the above shipped through add-on **v0.9.0** (tagged `v0.9.0`).
 
-Phase 6 (ML load intelligence, split 6A–6E) is prioritised ahead of 4/5: every
-later learning phase needs 6A's data and referee, and 6D delivers part of 5.
+## v1.0 — Modular ecosystem + agent surface
+
+Open ha-spark beyond the one Solis/Solcast/Octopus/zappi setup, and make it
+something a future Home Assistant agent ("Jarvis") can orchestrate. Detailed
+plan: see the active plan file. Cross-cutting throughout: the deterministic
+planner still decides; **security is a top priority** (see `CLAUDE.md`); every
+controllable device carries a `control: observe | ha_spark | supplier`
+authority, and real writes need `control == ha_spark` **and**
+`PROACTIVE_MODE == on`.
+
+| Phase | What ships | Add-on |
+|---|---|---|
+| 7 — Device-driver core | `devices/` driver layer (inverter drivers + registry), `Capability`/`ControlAuthority`, structured per-device config + migration shim off the flat 0.9.0 config; planner actuation routed through drivers + the authority gate. Zero behaviour change for the current setup. | 1.0.0 |
+| 8 — Multi-supplier tariffs | `TariffProvider` ecosystem yielding a normalised per-slot import/export price schedule + controlled windows (`fixed`, `time_of_use`, `dynamic`/half-hourly price sensors, `export`, `octopus_intelligent`); planner costed against the schedule, not a fixed window. | 1.1.0 |
+| 9 — EV drivers + supplier authority | EV charger drivers; EV defaults to `supplier` (observe & plan around), with an optional `ha_spark` control path; reads V2L availability. | 1.2.0 |
+| 10 — Multi-source charging + notifications | R48 rectifier drivers (grid-wired for charging outside the night slot; V2L-fed from the car); planner chooses among charge sources by cost/availability; a `NOTIFY` action ("plug in the car") via HA `notify`. | 1.3.0 |
+| 11 — Heat pump (observe + model) | First-class heat-pump device fed explicitly into the load model; control deferred. | 1.4.0 |
+| 12 — Driver-aware onboarding | `onboard` proposes driver + provider + entity map + capability coverage; per-driver/supplier presets; multi-device. | 1.5.0 |
+| 13 — MCP agent surface ("Jarvis") | An authenticated, ingress-bound MCP server exposing read tools (plan/state/eval/predictions/health) and gated act tools (context, run-plan, notify) for an external HA agent. | 1.6.0 |
+
+## Later (v3, post-1.0)
+
+Heat-pump *active* coordination + hot-water tank, multi-inverter sites,
+Solcast bias correction, EV-dispatch propensity prediction, more vendor
+presets/drivers as the ecosystem grows.
 
 ## Backlog
 
