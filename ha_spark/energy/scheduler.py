@@ -19,7 +19,15 @@ import asyncio
 from datetime import UTC, date, datetime, time, timedelta
 
 import httpx
+from aiohttp import web
 
+from ha_spark.api.server import (
+    INGRESS_PORT,
+    OPTIONS_PATH,
+    AppState,
+    start_server,
+    stop_server,
+)
 from ha_spark.config import Settings
 from ha_spark.energy.chargers import charger_for
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
@@ -189,12 +197,23 @@ async def _charger_supports_live_rate(settings: Settings) -> bool:
 
 
 async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
-    """Loop: run the plan once per day at ``settings.plan_run_time``."""
-    tz = load_timezone(settings.timezone)
-    run_time = parse_time(settings.plan_run_time)
-    window_start = parse_time(settings.charge_window_start)
-    window_end = parse_time(settings.charge_window_end)
-    # Guard only inverters with a live charge rate (AlphaESS self-regulates).
+    """Loop: run the plan once per day at ``settings.plan_run_time``.
+
+    Serves the add-on HTTP API (behind ingress) sharing an :class:`AppState`
+    with this loop: ``POST /api/config`` rewrites the options and the loop picks
+    up the reloaded settings on its next tick (hot reload, no restart).
+    """
+    state = AppState(settings=settings, options_path=OPTIONS_PATH)
+    runner: web.AppRunner | None = None
+    try:
+        runner = await start_server(state)
+        log.info("HTTP API listening on :%d (ingress)", INGRESS_PORT)
+    except Exception:
+        log.exception("HTTP API failed to start; continuing without it")
+
+    # Guard only inverters with a live charge rate (AlphaESS self-regulates);
+    # re-checked only when the inverter or grid entity changes (it needs a client).
+    guard_cfg = (settings.grid_power_entity, settings.inverter)
     guard_enabled = bool(settings.grid_power_entity) and await _charger_supports_live_rate(settings)
     if guard_enabled:
         log.info(
@@ -212,24 +231,39 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     last_run_date: date | None = None
     target_w: float | None = None
     last_signal_at: datetime | None = None
-    while True:
-        now = datetime.now(tz)
-        if should_run(now, run_time, last_run_date):
-            try:
-                plan = await run_once(settings)
-                last_run_date = now.date()
-                target_w = await _planned_rate_w(settings, plan)
-            except Exception:
-                log.exception("Scheduled plan run failed; will retry next tick")
-        if guard_enabled and in_window(now.time(), window_start, window_end):
-            try:
-                target_w = await guard_tick(settings, target_w)
-            except Exception:
-                log.exception("Supply guard tick failed; will retry next tick")
-        if last_signal_at is None or now - last_signal_at >= SIGNAL_SAMPLE_INTERVAL:
-            try:
-                await sample_signals(settings, now)
-                last_signal_at = now
-            except Exception:
-                log.exception("Signal sampling failed; will retry next tick")
-        await asyncio.sleep(poll_seconds)
+    try:
+        while True:
+            settings = state.settings  # hot-reloaded by POST /api/config
+            tz = load_timezone(settings.timezone)
+            run_time = parse_time(settings.plan_run_time)
+            window_start = parse_time(settings.charge_window_start)
+            window_end = parse_time(settings.charge_window_end)
+            if (settings.grid_power_entity, settings.inverter) != guard_cfg:
+                guard_cfg = (settings.grid_power_entity, settings.inverter)
+                guard_enabled = bool(settings.grid_power_entity) and (
+                    await _charger_supports_live_rate(settings)
+                )
+            now = datetime.now(tz)
+            if should_run(now, run_time, last_run_date):
+                try:
+                    plan = await run_once(settings)
+                    state.set_plan(plan)
+                    last_run_date = now.date()
+                    target_w = await _planned_rate_w(settings, plan)
+                except Exception:
+                    log.exception("Scheduled plan run failed; will retry next tick")
+            if guard_enabled and in_window(now.time(), window_start, window_end):
+                try:
+                    target_w = await guard_tick(settings, target_w)
+                except Exception:
+                    log.exception("Supply guard tick failed; will retry next tick")
+            if last_signal_at is None or now - last_signal_at >= SIGNAL_SAMPLE_INTERVAL:
+                try:
+                    await sample_signals(settings, now)
+                    last_signal_at = now
+                except Exception:
+                    log.exception("Signal sampling failed; will retry next tick")
+            await asyncio.sleep(poll_seconds)
+    finally:
+        if runner is not None:
+            await stop_server(runner)
