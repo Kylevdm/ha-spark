@@ -14,7 +14,10 @@ import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import yaml
+
 from ha_spark.config import ConfigError, Settings, load_settings
+from ha_spark.dashboard import build_dashboard
 from ha_spark.energy import habits
 from ha_spark.energy.backtest import backtest_cost, format_backtest
 from ha_spark.energy.chargers import charger_for
@@ -208,6 +211,19 @@ async def _cmd_onboard(
     result = await check_load_history(settings)
     print(format_report([result]))
     return 0 if result.status is Status.OK else 2
+
+
+async def _cmd_generate_dashboard(settings: Settings, *, output: str) -> int:
+    """Render a Lovelace dashboard from configured entity fields and write it to disk."""
+    async with HomeAssistantRest(
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+    ) as rest:
+        dashboard = await build_dashboard(settings, rest)
+    Path(output).write_text(  # noqa: ASYNC240 (one-shot CLI write, not a server loop)
+        yaml.safe_dump(dashboard, sort_keys=False), encoding="utf-8"
+    )
+    print(f"Wrote dashboard to {output}")
+    return 0
 
 
 async def _cmd_backfill_load(settings: Settings, *, source: str | None, list_only: bool) -> int:
@@ -525,6 +541,21 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Fill unmatched fields from a vendor preset ({', '.join(preset_names())})",
     )
 
+    p_dash = sub.add_parser(
+        "generate-dashboard",
+        help="Render a Lovelace dashboard YAML file from configured entity fields",
+        description="Build a Lovelace dashboard from whichever entity-id fields are "
+        "already set in config (battery SoC, solar, EV/charger, grid/tariff, ...), "
+        "labelling each with its live HA friendly_name where reachable. Re-run any "
+        "time config changes — no onboarding re-run needed.",
+    )
+    p_dash.add_argument(
+        "--output",
+        required=True,
+        metavar="PATH",
+        help="File path to write the Lovelace YAML to",
+    )
+
     p_plan = sub.add_parser(
         "plan",
         help="Compute the overnight battery charge plan",
@@ -726,6 +757,9 @@ def main(argv: list[str] | None = None) -> int:
                 settings, as_json=args.as_json, write=args.write, preset_name=args.preset
             )
         )
+
+    if args.command == "generate-dashboard":
+        return asyncio.run(_cmd_generate_dashboard(settings, output=args.output))
 
     if args.command == "backfill-load":
         return asyncio.run(
