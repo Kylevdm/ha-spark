@@ -30,8 +30,12 @@ def _cache_path(settings: Settings) -> Path:
     return Path(settings.db_path).parent / "ha_spark_published.json"
 
 
-def _entities(plan: ChargePlan, settings: Settings) -> list[Entity]:
-    """Map a computed plan to the (entity_id, state, attributes) to publish."""
+def plan_to_payload(plan: ChargePlan, settings: Settings) -> list[Entity]:
+    """Map a computed plan to the (entity_id, state, attributes) sensors.
+
+    Shared source of truth: the daemon pushes these via REST, and the add-on
+    HTTP API serves the same list so the companion integration mirrors them.
+    """
     entities: list[Entity] = [
         (
             "sensor.ha_spark_charge_needed_kwh",
@@ -143,7 +147,7 @@ async def _push(rest: HomeAssistantRest, entities: list[Entity]) -> None:
 
 async def publish_plan(rest: HomeAssistantRest, plan: ChargePlan, settings: Settings) -> None:
     """Push the plan's computed numbers as sensor.ha_spark_* states (best-effort)."""
-    entities = _entities(plan, settings)
+    entities = plan_to_payload(plan, settings)
     await _push(rest, entities)
     try:
         path = _cache_path(settings)

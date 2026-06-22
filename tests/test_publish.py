@@ -10,7 +10,7 @@ import respx
 
 from ha_spark.config import Settings
 from ha_spark.energy.models import ChargeIntent, ChargePlan
-from ha_spark.energy.publish import publish_plan, republish_last
+from ha_spark.energy.publish import plan_to_payload, publish_plan, republish_last
 from ha_spark.ha.rest import HomeAssistantRest
 
 BASE = "http://ha.test/api"
@@ -38,6 +38,14 @@ def _plan(**overrides: object) -> ChargePlan:
     )
     defaults.update(overrides)
     return ChargePlan(**defaults)  # type: ignore[arg-type]
+
+
+def test_plan_to_payload_maps_core_sensors() -> None:
+    by_id = {eid: (state, attrs) for eid, state, attrs in plan_to_payload(_plan(), Settings())}
+    assert by_id["sensor.ha_spark_target_soc"][0] == "90"
+    assert by_id["sensor.ha_spark_target_soc"][1]["device_class"] == "battery"
+    # optional cost sensors are omitted when the plan didn't cost itself
+    assert "sensor.ha_spark_planned_cost" not in by_id
 
 
 @respx.mock
