@@ -9,6 +9,7 @@ import httpx
 import pytest
 import respx
 
+from ha_spark.api.server import AppState
 from ha_spark.config import Settings
 from ha_spark.energy import scheduler, sources
 from ha_spark.energy.chargers import charger_for
@@ -176,9 +177,42 @@ def _patch_loop(
     async def fake_sleep(_seconds: float) -> None:
         return None
 
+    async def fake_start_server(_state: object) -> None:
+        return None  # don't bind a real ingress port in tests
+
     monkeypatch.setattr(scheduler, "datetime", _FakeDatetime)
     monkeypatch.setattr(scheduler.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(scheduler, "start_server", fake_start_server)
     return _StopLoop
+
+
+async def test_run_forever_publishes_plan_to_api_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each computed plan is pushed into the AppState the HTTP API serves."""
+    captured: dict[str, object] = {}
+
+    async def capture_start(state: object) -> None:
+        captured["state"] = state
+        return None
+
+    async def fake_run_once(_s: Settings) -> ChargePlan:
+        return _plan()
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    stop = _patch_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0)])
+    monkeypatch.setattr(scheduler, "start_server", capture_start)  # override the noop
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+    state = captured["state"]
+    assert isinstance(state, AppState)
+    assert state.plan is not None
 
 
 async def test_run_forever_guard_ticks_only_inside_window(
