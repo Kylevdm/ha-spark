@@ -17,6 +17,7 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "aiohttp>=3.9",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +33,7 @@ dev = [
     "respx>=0.21",
     "ruff>=0.5",
     "mypy>=1.10",
+    "types-PyYAML>=6.0",
 ]
 
 [project.scripts]
