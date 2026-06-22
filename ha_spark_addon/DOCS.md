@@ -194,6 +194,17 @@ home energy — it explains and reports only, and never controls hardware. If
 Ollama is down, the deterministic offline parser answers the energy queries it
 recognises instead.
 
+### HTTP API (for companion integrations)
+
+The daemon serves a read-only REST API through add-on ingress (authenticated
+via Home Assistant, not exposed to the host network). Reach it at
+`http://localhost:8099` from within the add-on's network, or through the
+companion integration proxy once wired up. Endpoints:
+
+- `GET /api/plan` — current computed charge plan (same data as `ha-spark plan`)
+- Config hot-reload: edit `/data/options.json` and the daemon detects the change
+  and reloads within seconds — no restart needed.
+
 ## Onboarding
 
 1. **Check the Log tab** after the first start: the add-on runs
