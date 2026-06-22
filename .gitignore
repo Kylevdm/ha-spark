@@ -37,3 +37,5 @@ consumption*.csv
 # Handoff / transfer artifacts (git bundles & patches)
 *.bundle
 *.patch
+
+.superpowers/
