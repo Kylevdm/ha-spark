@@ -29,6 +29,12 @@ from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
 
+# Add-on ingress serves on this fixed internal port (must match config.yaml
+# `ingress_port`). Not mapped to the host network, so it isn't externally reachable.
+INGRESS_PORT = 8099
+# Where the add-on persists user options (HA add-on convention).
+OPTIONS_PATH = Path("/data/options.json")
+
 
 @dataclass
 class AppState:
@@ -128,3 +134,16 @@ def create_app(state: AppState) -> web.Application:
         ]
     )
     return app
+
+
+async def start_server(state: AppState) -> web.AppRunner:
+    """Bind the API on the ingress port; returns the runner for later cleanup."""
+    runner = web.AppRunner(create_app(state))
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", INGRESS_PORT).start()  # noqa: S104 - ingress only
+    return runner
+
+
+async def stop_server(runner: web.AppRunner) -> None:
+    """Tear down the API server."""
+    await runner.cleanup()

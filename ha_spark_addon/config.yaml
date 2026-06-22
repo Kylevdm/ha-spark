@@ -11,6 +11,10 @@ init: true
 homeassistant_api: true
 startup: services
 boot: auto
+# HTTP API for the companion integration, reached through HA's authenticated
+# ingress proxy (not mapped to the host network). Must match api.server.INGRESS_PORT.
+ingress: true
+ingress_port: 8099
 options:
   log_level: INFO
   proactive_mode: simulate
