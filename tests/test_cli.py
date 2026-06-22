@@ -127,18 +127,15 @@ async def test_forecast_eval_reports_accuracy(
 
     from ha_spark.energy.ledger import ForecastLedger
 
-    # Anchor to a recent date so the forecast stays inside the --days window
-    # regardless of when the test runs (otherwise it ages out of range).
+    # Relative to now so the forecast stays inside the rolling --days window.
     target = (datetime.now(UTC) - timedelta(days=2)).date()
-    target_midnight = datetime.combine(target, datetime.min.time(), tzinfo=UTC)
+    run_at = datetime.now(UTC) - timedelta(days=3)
+    target_midnight = datetime(target.year, target.month, target.day, tzinfo=UTC)
+    target_start_ms = int(target_midnight.timestamp() * 1000)
 
     settings = Settings(ha_url="http://ha.test", ha_token="t", db_path=str(tmp_path / "test.db"))
     async with ForecastLedger(settings.db_path) as ledger:
-        await ledger.record_forecast(
-            target_midnight - timedelta(days=1), target, "median", 20.0, None, "median of 7d"
-        )
-
-    target_start_ms = int(target_midnight.timestamp() * 1000)
+        await ledger.record_forecast(run_at, target, "median", 20.0, None, "median of 7d")
 
     async def fake_stats(*args: object, **kwargs: object) -> list[dict[str, object]]:
         return [{"start": target_start_ms, "change": 22.0}]
