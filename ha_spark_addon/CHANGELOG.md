@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.0
+
+- Daemon HTTP API serving: the daemon now exposes a read-only REST API through
+  add-on ingress (no open port, authenticated via HA's ingress proxy) for the
+  future companion integration. Hot config reload when `/data/options.json`
+  changes — the daemon detects the change and reloads without restart. API
+  endpoint: `GET /api/plan` (returns the current computed plan).
+
 ## 0.11.0
 
 - Add the proactive orchestrator: a single decision/audit path that, after each
