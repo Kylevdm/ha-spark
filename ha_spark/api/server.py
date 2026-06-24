@@ -13,6 +13,7 @@ mutation and is reachable only through that authenticated proxy.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -131,3 +133,20 @@ def build_app(state: AppState) -> FastAPI:
         return JSONResponse(_state_of(request).current_options())
 
     return app
+
+
+def make_server(app: FastAPI, host: str, port: int) -> uvicorn.Server:
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False)
+    return uvicorn.Server(config)
+
+
+async def serve_in_background(server: uvicorn.Server) -> asyncio.Task[None]:
+    task = asyncio.ensure_future(server.serve())
+    while not server.started:  # noqa: ASYNC110 - uvicorn flips this once the socket is bound
+        await asyncio.sleep(0.01)
+    return task
+
+
+async def stop_server(server: uvicorn.Server, task: asyncio.Task[None]) -> None:
+    server.should_exit = True
+    await task
