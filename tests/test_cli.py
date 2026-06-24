@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 import respx
+import yaml
 
 from ha_spark import cli
 from ha_spark.cli import (
@@ -16,6 +17,7 @@ from ha_spark.cli import (
     _cmd_backtest,
     _cmd_context,
     _cmd_forecast_eval,
+    _cmd_generate_dashboard,
     _cmd_import_csv,
     _cmd_learn_factors,
     _cmd_onboard,
@@ -55,13 +57,44 @@ def test_import_csv_missing_file_errors(
     assert "Could not import" in capsys.readouterr().err
 
 
+@respx.mock
+async def test_generate_dashboard_writes_yaml_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    respx.get("http://ha.test/api/states").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "entity_id": "sensor.soc",
+                    "state": "80",
+                    "attributes": {"friendly_name": "Battery SoC (Live)"},
+                }
+            ],
+        )
+    )
+    settings = Settings(ha_url="http://ha.test", ha_token="t", soc_entity="sensor.soc")
+    out_path = tmp_path / "dash.yaml"
+
+    rc = await _cmd_generate_dashboard(settings, output=str(out_path))
+
+    assert rc == 0
+    assert f"Wrote dashboard to {out_path}" in capsys.readouterr().out
+    written = yaml.safe_load(out_path.read_text(encoding="utf-8"))
+    cards = written["views"][0]["cards"]
+    battery = next(c for c in cards if c["title"] == "Battery")
+    assert battery["entities"] == [
+        {"entity": "sensor.soc", "name": "Battery SoC (Live)"}
+    ]
+
+
 def test_help_mentions_every_command_and_flags() -> None:
     parser = build_parser()
     top = parser.format_help()
     for command in (
         "states", "health", "onboard", "plan", "ask", "run",
         "backfill-load", "import-csv", "pull-consumption", "backtest", "forecast-eval",
-        "context", "learn-factors",
+        "context", "learn-factors", "generate-dashboard",
     ):
         assert command in top
     assert "examples:" in top
