@@ -142,7 +142,7 @@ def _agent_router(state: AppState) -> APIRouter:
         # handler here Starlette would answer POST /agent/context with 405
         # (path matches, method doesn't) instead of 404. Register one that
         # 404s, so "absent below this tier" reads the same for every route.
-        @router.post("/context", status_code=404, include_in_schema=False)
+        @router.post("/context", include_in_schema=False)
         async def add_context_unavailable(body: dict[str, object] | None = None) -> None:
             raise HTTPException(status_code=404)
 
