@@ -140,9 +140,33 @@ def make_server(app: FastAPI, host: str, port: int) -> uvicorn.Server:
     return uvicorn.Server(config)
 
 
+async def _serve_or_raise(server: uvicorn.Server) -> None:
+    """Run ``server.serve()``, converting a failed-bind ``SystemExit`` to a normal error.
+
+    Uvicorn calls ``sys.exit(1)`` internally when the socket bind fails (e.g. the
+    port is already in use). ``SystemExit`` is a ``BaseException``: if it escapes
+    this task uncaught, asyncio re-raises it straight out of the event loop the
+    moment the task is stepped -- before any poll loop watching ``task.done()``
+    gets a chance to observe it -- which would crash the daemon instead of letting
+    it degrade gracefully. Catching it here lets the task store a normal
+    ``Exception`` that callers' ``except Exception`` can handle as usual.
+    """
+    try:
+        await server.serve()
+    except SystemExit as exc:
+        raise RuntimeError(f"HTTP server exited before startup: {exc!r}") from exc
+
+
 async def serve_in_background(server: uvicorn.Server) -> asyncio.Task[None]:
-    task = asyncio.ensure_future(server.serve())
+    task = asyncio.ensure_future(_serve_or_raise(server))
     while not server.started:  # noqa: ASYNC110 - uvicorn flips this once the socket is bound
+        if task.done():
+            # The serve task finished before binding -- raise its stored
+            # exception now instead of polling forever.
+            exc = task.exception()
+            if exc is not None:
+                raise exc
+            return task
         await asyncio.sleep(0.01)
     return task
 
