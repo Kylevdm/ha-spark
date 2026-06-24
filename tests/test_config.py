@@ -138,3 +138,16 @@ def test_addon_schema_covers_all_option_keys() -> None:
                 break
             schema_keys.add(line.split(":", 1)[0].strip())
     assert schema_keys == set(_OPTION_KEYS)
+
+
+def test_agent_defaults() -> None:
+    s = Settings(ha_url="http://ha.test", ha_token="x")  # type: ignore[call-arg]
+    assert s.agent_surface == "off"
+    assert s.agent_exposure == "read_act"
+    assert s.agent_expose_port is False
+    assert s.agent_api_token == ""
+
+
+def test_agent_options_in_whitelist() -> None:
+    for key in ("agent_surface", "agent_exposure", "agent_api_token", "agent_expose_port"):
+        assert key in _OPTION_KEYS
