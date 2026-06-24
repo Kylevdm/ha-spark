@@ -17,14 +17,15 @@ import asyncio
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from ha_spark.agent import auth, tools
 from ha_spark.config import _OPTION_KEYS, Settings, load_settings
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.publish import plan_to_payload
@@ -88,10 +89,93 @@ def _state_of(request: Request) -> AppState:
     return state
 
 
-def build_app(state: AppState) -> FastAPI:
-    """Build the FastAPI app with the API routes bound to ``state``."""
+def _agent_router(state: AppState) -> APIRouter:
+    """Build the ``/agent/*`` router, gated by ``state.settings.agent_exposure``."""
+    router = APIRouter(prefix="/agent")
+    exposure = state.settings.agent_exposure
+
+    @router.get("/plan")
+    async def plan() -> tools.PlanResult:
+        return await tools.get_plan(state.settings)
+
+    @router.get("/state")
+    async def state_() -> tools.StateResult:
+        return await tools.get_state(state.settings)
+
+    @router.get("/forecast")
+    async def forecast() -> tools.ForecastResult:
+        return await tools.get_forecast(state.settings)
+
+    @router.get("/predictions")
+    async def predictions() -> tools.PredictionsResult:
+        return await tools.get_predictions(state.settings)
+
+    @router.get("/health")
+    async def health_() -> tools.HealthResult:
+        return await tools.get_health(state.settings)
+
+    @router.get("/context")
+    async def context() -> tools.ContextResult:
+        return await tools.get_context(state.settings)
+
+    if exposure in ("read_act", "read_write"):
+
+        @router.post("/context")
+        async def add_context(body: dict[str, object]) -> tools.ContextResult:
+            try:
+                return await tools.add_context(
+                    state.settings,
+                    str(body["kind"]),
+                    date.fromisoformat(str(body["start_date"])),
+                    date.fromisoformat(str(body["end_date"])),
+                    note=str(body.get("note", "")),
+                )
+            except (KeyError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        @router.post("/run")
+        async def run() -> tools.PlanResult:
+            return await tools.run_plan(state.settings)
+
+    else:
+        # GET /context is always registered, so without an explicit POST
+        # handler here Starlette would answer POST /agent/context with 405
+        # (path matches, method doesn't) instead of 404. Register one that
+        # 404s, so "absent below this tier" reads the same for every route.
+        @router.post("/context", status_code=404, include_in_schema=False)
+        async def add_context_unavailable(body: dict[str, object] | None = None) -> None:
+            raise HTTPException(status_code=404)
+
+    if exposure == "read_write":
+
+        @router.post("/config")
+        async def config(body: dict[str, object]) -> dict[str, Any]:
+            try:
+                state.apply_options(body)
+            except Exception as exc:  # noqa: BLE001 - validation failure -> 400
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return state.current_options()
+
+    return router
+
+
+def build_app(state: AppState, *, require_token: bool = False, token: str = "") -> FastAPI:
+    """Build the FastAPI app with the API routes bound to ``state``.
+
+    ``require_token``/``token`` gate every route (including ``/api/*``) behind
+    bearer auth -- used by the published port (Task 9). The ingress app omits
+    it, since ingress already authenticates the caller.
+    """
     app = FastAPI(title="ha-spark", docs_url=None, redoc_url=None)
     setattr(app.state, STATE_ATTR, state)
+
+    if require_token:
+
+        async def _auth(authorization: str | None = Header(default=None)) -> None:
+            if not auth.verify(authorization, token):
+                raise HTTPException(status_code=401, detail="invalid or missing token")
+
+        app.router.dependencies.append(Depends(_auth))
 
     @app.get("/api/health")
     async def health(request: Request) -> dict[str, Any]:
@@ -132,6 +216,7 @@ def build_app(state: AppState) -> FastAPI:
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(_state_of(request).current_options())
 
+    app.include_router(_agent_router(state))
     return app
 
 
