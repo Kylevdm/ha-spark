@@ -205,6 +205,46 @@ companion integration proxy once wired up. Endpoints:
 - Config hot-reload: edit `/data/options.json` and the daemon detects the change
   and reloads within seconds — no restart needed.
 
+### Agent surface
+
+Off by default. Set `agent_surface: on` to let an external model (e.g. Claude,
+or any OpenAPI-compatible tool client) read ha-spark's data and, optionally,
+trigger a few gated actions.
+
+- `agent_surface` (`off` | `on`) — master switch, off by default.
+- `agent_exposure` (`read` | `read_act` | `read_write`, default `read_act`) —
+  how much is exposed. `read` is data-only (states, plan, forecast,
+  predictions, health). `read_act` additionally exposes `add_context` and
+  `run_plan`. `read_write` additionally exposes `set_config`.
+- `agent_api_token` — bearer token for the published port. Leave blank and the
+  add-on generates one on first start and prints it **once** to the add-on
+  log; it's a `password` field, so it's never shown back in the UI.
+- `agent_expose_port` (`bool`, default `false`) — publish the agent surface on
+  the host network for clients that can't reach add-on ingress.
+
+The agent surface is always served over HA's authenticated ingress proxy —
+no token needed there, since ingress already authenticates the user. For
+external clients (Claude Desktop, open-webui on your LAN/Tailnet) that can't
+go through ingress, set `agent_expose_port: true` and map host port **8098**
+(the `ports:` entry in this add-on's configuration). Requests on that
+published port require the bearer token.
+
+- **open-webui**: add a new tool server pointing at
+  `http://<host>:8098/openapi.json`, with header `Authorization: Bearer
+  <token>`.
+- **Claude (Desktop, or via your own reverse proxy)**: point an MCP
+  (Streamable HTTP) connector at `http://<host>:8098/mcp`, with the same
+  bearer token. The server 307-redirects `/mcp` → `/mcp/`, which MCP clients
+  follow automatically.
+- **claude.ai (web)** additionally needs a public HTTPS endpoint in front of
+  the published port — a reverse proxy or Nabu Casa — since claude.ai cannot
+  reach a bare LAN/Tailnet address. That's a deployment step you manage
+  yourself, not something the add-on sets up.
+
+Act and write tools still pass the existing `proactive_mode` gate, and the
+model never reaches `call_service` directly — the deterministic planner
+remains the sole decider. Nothing here changes that.
+
 ## Onboarding
 
 1. **Check the Log tab** after the first start: the add-on runs
