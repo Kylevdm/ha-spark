@@ -68,6 +68,7 @@ options:
   charge_window_start_entity: ""
   charge_window_end_entity: ""
   alphaess_serial: ""
+  devices: []
   outdoor_weather_entity: weather.home
   load_model: auto
   buffer_mode: fixed
@@ -130,6 +131,16 @@ schema:
   charge_window_start_entity: str?
   charge_window_end_entity: str?
   alphaess_serial: str?
+  devices:
+    - id: str
+      type: list(inverter)
+      driver: list(solis|alphaess)
+      control: list(observe|ha_spark|supplier)?
+      entities:
+        charge_current: str?
+        window_start: str?
+        window_end: str?
+        power_switch: str?
   person_entities: str?
   heatpump_energy_entity: str?
   outdoor_weather_entity: str?
