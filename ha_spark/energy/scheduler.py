@@ -19,8 +19,11 @@ import asyncio
 from datetime import UTC, date, datetime, time, timedelta
 
 import httpx
+import uvicorn
 
+from ha_spark.agent.auth import resolve_token
 from ha_spark.api.server import (
+    AGENT_PORT,
     INGRESS_PORT,
     OPTIONS_PATH,
     AppState,
@@ -213,6 +216,19 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     except Exception:
         log.exception("HTTP API failed to start; continuing without it")
 
+    port_server: uvicorn.Server | None = None
+    port_task: asyncio.Task[None] | None = None
+    if settings.agent_surface == "on" and settings.agent_expose_port:
+        token = resolve_token(settings)
+        port_server = make_server(
+            build_app(state, require_token=True, token=token), "0.0.0.0", AGENT_PORT  # noqa: S104
+        )
+        try:
+            port_task = await serve_in_background(port_server)
+            log.info("Agent surface listening on :%d (token-protected)", AGENT_PORT)
+        except Exception:
+            log.exception("Agent port failed to start; continuing")
+
     # Guard only inverters with a live charge rate (AlphaESS self-regulates);
     # re-checked only when the inverter or grid entity changes (it needs a client).
     guard_cfg = (settings.grid_power_entity, settings.inverter)
@@ -269,3 +285,5 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     finally:
         if serve_task is not None:
             await stop_server(server, serve_task)
+        if port_server is not None and port_task is not None:
+            await stop_server(port_server, port_task)

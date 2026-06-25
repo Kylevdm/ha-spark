@@ -36,6 +36,9 @@ log = get_logger(__name__)
 # Add-on ingress serves on this fixed internal port (must match config.yaml
 # `ingress_port`). Not mapped to the host network, so it isn't externally reachable.
 INGRESS_PORT = 8099
+# Optional published port (Task 9): bound only when the user opts in via
+# `agent_surface == "on"` and `agent_expose_port`. Mapped to the host in config.yaml.
+AGENT_PORT = 8098
 # Where the add-on persists user options (HA add-on convention).
 OPTIONS_PATH = Path("/data/options.json")
 STATE_ATTR = "ha_spark_state"
