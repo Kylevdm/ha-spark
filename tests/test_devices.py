@@ -13,6 +13,9 @@ def test_effective_mode_non_ha_spark_never_writes():
     assert effective_mode(ControlAuthority.OBSERVE, "on") == "observe"
     assert effective_mode(ControlAuthority.SUPPLIER, "on") == "observe"
     assert effective_mode(ControlAuthority.OBSERVE, "simulate") == "observe"
+    assert effective_mode(ControlAuthority.SUPPLIER, "simulate") == "observe"
+    assert effective_mode(ControlAuthority.SUPPLIER, "off") == "observe"
+    assert effective_mode(ControlAuthority.OBSERVE, "off") == "observe"
 
 
 def test_capability_and_authority_values():
