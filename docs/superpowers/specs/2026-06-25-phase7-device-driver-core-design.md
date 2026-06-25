@@ -112,8 +112,8 @@ class Capability(StrEnum):
 - Solis advertises `{CHARGE_WINDOW, CHARGE_RATE, STOP_DISCHARGE}`; AlphaESS
   advertises `{CHARGE_WINDOW}`.
 - `supply_guard.py` checks `Capability.CHARGE_RATE in device.capabilities`
-  instead of `device.supports_live_rate` (`supports_live_rate` becomes a derived
-  convenience or is dropped).
+  instead of `device.supports_live_rate`; `supports_live_rate` is **dropped**
+  from the Protocol (capability membership is the single source of truth).
 - The set is general enough that Phase 9/11 device types (EV charger, heat pump)
   declare their own capabilities without touching the inverter drivers.
 
@@ -169,8 +169,12 @@ class DeviceConfig(BaseModel):
   `[DeviceConfig(id="main_inverter", type="inverter", driver=settings.inverter,
   control="ha_spark", entities={"charge_current": charge_current_entity,
   "window_start": charge_window_start_entity, "window_end":
-  charge_window_end_entity, "power_switch": inverter_power_switch_entity,
-  "alphaess_serial": alphaess_serial})]`.
+  charge_window_end_entity, "power_switch": inverter_power_switch_entity})]`.
+
+`entities` holds **entity IDs only**. Driver-specific scalars that are not
+entities — e.g. `alphaess_serial` — **stay top-level on `Settings`** and are
+read by the driver directly (the same treatment as the battery/site params
+below). This keeps `entities: dict[str, str]` a clean entity-ID map.
 
 The flat keys remain in `_OPTION_KEYS` (legacy, still honoured); `devices` is
 **added** to `_OPTION_KEYS` and to a `devices:` block in `config.yaml`
@@ -187,8 +191,9 @@ not per-inverter and the planner reads them directly. Only the inverter's
 - `charger_for(settings, rest)` → `get_device(device_config, settings, rest)`,
   resolved through the registry (`registry.lookup(device_config.driver)`).
 - `scheduler.py` (`run_once`, `guard_tick`) and `supply_guard.py` resolve the
-  inverter device from `settings.devices[0]` instead of hardcoding
-  `SolisCharger`/`charger_for`.
+  inverter device by selecting the first `type == "inverter"` entry in
+  `settings.devices` (robust as EV/heat-pump device types are added later),
+  instead of hardcoding `SolisCharger`/`charger_for`.
 - `planner.py` / `sources.py` are unchanged — the planner still emits
   `ChargeIntent`; it has no knowledge of drivers or authority.
 
