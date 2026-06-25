@@ -18,9 +18,10 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from ha_spark.devices.base import ControlAuthority
 from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
@@ -94,6 +95,8 @@ _OPTION_KEYS = frozenset(
         "charge_window_start_entity",
         "charge_window_end_entity",
         "alphaess_serial",
+        # Structured device config (Phase 7): list of controllable devices.
+        "devices",
         # Forecast ledger: signal sampling (Phase 6A).
         "person_entities",
         "heatpump_energy_entity",
@@ -122,6 +125,16 @@ _SECRET_OPTION_KEYS = frozenset({"octopus_api_key", "agent_api_token"})
 
 class ConfigError(RuntimeError):
     """Raised when the runtime configuration is invalid or incomplete."""
+
+
+class DeviceConfig(BaseModel):
+    """One controllable device. Phase 7 ships type == "inverter" only."""
+
+    id: str
+    type: Literal["inverter"] = "inverter"
+    driver: str
+    control: ControlAuthority = ControlAuthority.HA_SPARK
+    entities: dict[str, str] = Field(default_factory=dict)
 
 
 class Settings(BaseSettings):
@@ -238,6 +251,11 @@ class Settings(BaseSettings):
     # AlphaESS system serial for the alphaess.setbatterycharge service call.
     alphaess_serial: str = Field(default="")
 
+    # Structured device config (Phase 7): a list of controllable devices. Left
+    # empty in flat-config installs; the after-validator synthesizes one inverter
+    # device from the flat entity keys below so existing setups need no change.
+    devices: list[DeviceConfig] = Field(default_factory=list)
+
     # Forecast ledger signal sampling (Phase 6A): recorded so training data
     # accumulates ahead of the models (6B+) that will consume it.
     # Comma-separated person/device_tracker entity ids; empty disables occupancy sampling.
@@ -283,6 +301,27 @@ class Settings(BaseSettings):
         if isinstance(v, str) and v.strip().isdigit():
             return int(v.strip())
         return v
+
+    @model_validator(mode="after")
+    def _synthesize_devices(self) -> Settings:
+        """Dual-read shim: if no structured ``devices``, build one inverter device
+        from the flat entity keys in memory. Idempotent; never rewrites options.json."""
+        if not self.devices:
+            self.devices = [
+                DeviceConfig(
+                    id="main_inverter",
+                    type="inverter",
+                    driver=self.inverter,
+                    control=ControlAuthority.HA_SPARK,
+                    entities={
+                        "charge_current": self.charge_current_entity,
+                        "window_start": self.charge_window_start_entity,
+                        "window_end": self.charge_window_end_entity,
+                        "power_switch": self.inverter_power_switch_entity,
+                    },
+                )
+            ]
+        return self
 
     @property
     def is_standalone(self) -> bool:

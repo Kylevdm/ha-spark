@@ -81,6 +81,11 @@ class AppState:
             value = getattr(self.settings, key)
             if key in _SECRET_OPTION_KEYS and value:
                 out[key] = _REDACTED
+            elif key == "devices":
+                # `devices` holds pydantic DeviceConfig models (synthesized from
+                # the flat keys when unset); dump to JSON-safe primitives so the
+                # config response/persistence stays serializable.
+                out[key] = [d.model_dump(mode="json") for d in value]
             else:
                 out[key] = value
         return out
