@@ -26,7 +26,7 @@ from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from ha_spark.agent import auth, tools
-from ha_spark.config import _OPTION_KEYS, Settings, load_settings
+from ha_spark.config import _OPTION_KEYS, _SECRET_OPTION_KEYS, Settings, load_settings
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.logging import get_logger
@@ -42,6 +42,10 @@ AGENT_PORT = 8098
 # Where the add-on persists user options (HA add-on convention).
 OPTIONS_PATH = Path("/data/options.json")
 STATE_ATTR = "ha_spark_state"
+# Placeholder returned in place of a set secret so it never leaves the process
+# in cleartext. A client that posts this value back is treated as "unchanged"
+# (see apply_options), so a GET-then-POST round-trip can't clobber the secret.
+_REDACTED = "***"
 
 
 @dataclass
@@ -64,19 +68,43 @@ class AppState:
         self.plan_at = datetime.now(UTC)
 
     def current_options(self) -> dict[str, Any]:
-        """The user-facing options subset of the current settings."""
-        return {key: getattr(self.settings, key) for key in _OPTION_KEYS}
+        """The user-facing options subset of the current settings.
+
+        Secret keys (``_SECRET_OPTION_KEYS``) are masked with ``_REDACTED`` when
+        set so they never leave the process in cleartext (this is the single
+        chokepoint for ``/api/config``, ``/agent/config`` and the ``set_config``
+        MCP tool). An unset secret keeps its empty value so clients can still
+        tell it isn't configured.
+        """
+        out: dict[str, Any] = {}
+        for key in _OPTION_KEYS:
+            value = getattr(self.settings, key)
+            if key in _SECRET_OPTION_KEYS and value:
+                out[key] = _REDACTED
+            else:
+                out[key] = value
+        return out
 
     def apply_options(self, updates: dict[str, Any]) -> Settings:
         """Merge ``updates`` into the persisted options, then reload settings.
 
-        Only keys in ``_OPTION_KEYS`` are accepted; unknown keys are ignored.
-        Raises if the merged config fails validation (the caller maps that to 400).
+        Only keys in ``_OPTION_KEYS`` are accepted; unknown keys are ignored. An
+        incoming secret value equal to ``_REDACTED`` is dropped (treated as
+        "unchanged"), so a GET-then-POST round-trip of the masked options can't
+        clobber the real secret with the mask. Raises if the merged config fails
+        validation (the caller maps that to 400).
         """
         current: dict[str, Any] = {}
         if self.options_path.exists():
             current = json.loads(self.options_path.read_text(encoding="utf-8"))
-        current.update({k: v for k, v in updates.items() if k in _OPTION_KEYS})
+        current.update(
+            {
+                k: v
+                for k, v in updates.items()
+                if k in _OPTION_KEYS
+                and not (k in _SECRET_OPTION_KEYS and v == _REDACTED)
+            }
+        )
         self.options_path.parent.mkdir(parents=True, exist_ok=True)
         self.options_path.write_text(json.dumps(current), encoding="utf-8")
         self.settings = self.reload()

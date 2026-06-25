@@ -9,11 +9,12 @@ from ha_spark.api.server import AppState, build_app
 from ha_spark.config import Settings
 
 
-def _state(tmp_path: Path, exposure: str = "read_act") -> AppState:
+def _state(tmp_path: Path, exposure: str = "read_act", **extra: object) -> AppState:
     options_path = tmp_path / "options.json"
     settings_kw: dict[str, object] = dict(
         ha_url="http://ha.test", ha_token="x",
         db_path=str(tmp_path / "t.db"), agent_exposure=exposure,
+        **extra,
     )
     return AppState(  # type: ignore[call-arg]
         settings=Settings(**settings_kw),  # type: ignore[arg-type]
@@ -83,6 +84,24 @@ def test_read_act_post_context_invalid_body_hits_real_handler_not_404_stub(
     with TestClient(build_app(_state(tmp_path, exposure="read_act"))) as client:
         resp = client.post("/agent/context", json={})
     assert resp.status_code == 400
+
+
+def test_agent_config_redacts_secrets_in_read_write(tmp_path: Path) -> None:
+    """The read_write /agent/config response must not leak secrets in cleartext."""
+    state = _state(
+        tmp_path,
+        exposure="read_write",
+        octopus_api_key="SECRET_OCTO",
+        agent_api_token="SECRET_AGENT",
+    )
+    with TestClient(build_app(state)) as client:
+        resp = client.post("/agent/config", json={"min_soc": 30.0})
+    assert resp.status_code == 200
+    assert "SECRET_OCTO" not in resp.text
+    assert "SECRET_AGENT" not in resp.text
+    body = resp.json()
+    assert body["octopus_api_key"] == "***"
+    assert body["agent_api_token"] == "***"
 
 
 @respx.mock

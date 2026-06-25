@@ -104,3 +104,63 @@ def test_post_config_rejects_non_object(tmp_path: Path) -> None:
     with _client(_state(tmp_path)) as client:
         resp = client.post("/api/config", json=[1, 2, 3])
     assert resp.status_code == 400
+
+
+def test_get_config_redacts_secrets(tmp_path: Path) -> None:
+    """Set secrets must never leave the process in cleartext (CLAUDE.md top rule)."""
+    state = _state(tmp_path, octopus_api_key="SECRET_OCTO", agent_api_token="SECRET_AGENT")
+    with _client(state) as client:
+        resp = client.get("/api/config")
+    assert resp.status_code == 200
+    # Raw response text carries neither secret.
+    assert "SECRET_OCTO" not in resp.text
+    assert "SECRET_AGENT" not in resp.text
+    body = resp.json()
+    # Keys are still present (response shape preserved) but redacted.
+    assert body["octopus_api_key"] == "***"
+    assert body["agent_api_token"] == "***"
+
+
+def test_unset_secret_not_rendered_as_redacted(tmp_path: Path) -> None:
+    """An empty secret stays empty so clients can tell it's not configured."""
+    with _client(_state(tmp_path)) as client:
+        body = client.get("/api/config").json()
+    assert body["octopus_api_key"] == ""
+    assert body["agent_api_token"] == ""
+
+
+def test_post_redacted_secret_does_not_clobber_stored_value(tmp_path: Path) -> None:
+    """GET-then-POST round-trip of the masked options must not overwrite the secret."""
+    # The secrets live in the persisted options file (as in add-on mode), so the
+    # reload after apply_options reconstructs them rather than losing them.
+    (tmp_path / "options.json").write_text(
+        json.dumps({"octopus_api_key": "REAL_OCTO", "agent_api_token": "REAL_AGENT"}),
+        encoding="utf-8",
+    )
+    state = _state(tmp_path, octopus_api_key="REAL_OCTO", agent_api_token="REAL_AGENT")
+    with _client(state) as client:
+        # Posting the sentinel back (as a client echoing GET /api/config would) is a no-op.
+        resp = client.post(
+            "/api/config",
+            json={"octopus_api_key": "***", "agent_api_token": "***", "min_soc": 25.0},
+        )
+    assert resp.status_code == 200
+    # Stored secrets are unchanged; the non-secret update still applied.
+    assert state.settings.octopus_api_key == "REAL_OCTO"
+    assert state.settings.agent_api_token == "REAL_AGENT"
+    assert state.settings.min_soc == 25.0
+    persisted = json.loads((tmp_path / "options.json").read_text(encoding="utf-8"))
+    # The sentinel was dropped, so the persisted secrets keep their real values.
+    assert persisted["octopus_api_key"] == "REAL_OCTO"
+    assert persisted["agent_api_token"] == "REAL_AGENT"
+    assert persisted["min_soc"] == 25.0
+
+
+def test_post_genuine_secret_value_is_stored(tmp_path: Path) -> None:
+    """A real (non-sentinel) secret value still updates normally."""
+    state = _state(tmp_path)
+    with _client(state) as client:
+        client.post("/api/config", json={"octopus_api_key": "NEW_OCTO"})
+    assert state.settings.octopus_api_key == "NEW_OCTO"
+    persisted = json.loads((tmp_path / "options.json").read_text(encoding="utf-8"))
+    assert persisted["octopus_api_key"] == "NEW_OCTO"

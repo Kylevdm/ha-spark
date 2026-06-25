@@ -114,6 +114,11 @@ _OPTION_KEYS = frozenset(
     }
 )
 
+# Subset of _OPTION_KEYS that hold secrets. These must never appear in cleartext
+# in any response (CLAUDE.md top-priority rule): the API masks them before
+# returning options. Kept here next to _OPTION_KEYS so the two stay in sync.
+_SECRET_OPTION_KEYS = frozenset({"octopus_api_key", "agent_api_token"})
+
 
 class ConfigError(RuntimeError):
     """Raised when the runtime configuration is invalid or incomplete."""
