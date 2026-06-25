@@ -166,7 +166,21 @@ def build_app(state: AppState, *, require_token: bool = False, token: str = "") 
     bearer auth -- used by the published port (Task 9). The ingress app omits
     it, since ingress already authenticates the caller.
     """
-    app = FastAPI(title="ha-spark", docs_url=None, redoc_url=None)
+    # Local import: mcp_server does ``from ha_spark.api.server import AppState``,
+    # so a module-top import would cycle.
+    from ha_spark.agent.mcp_server import build_mcp
+
+    # FastMCP's streamable-HTTP app owns its own lifespan (a StreamableHTTP
+    # session manager); FastAPI does NOT auto-run a mounted sub-app's lifespan,
+    # so we adopt it as the app's lifespan or /mcp 500s with "Task group is not
+    # initialized". Build the app and read its lifespan BEFORE creating FastAPI.
+    mcp_app = build_mcp(state).streamable_http_app()
+    app = FastAPI(
+        title="ha-spark",
+        docs_url=None,
+        redoc_url=None,
+        lifespan=mcp_app.router.lifespan_context,
+    )
     setattr(app.state, STATE_ATTR, state)
 
     if require_token:
@@ -217,7 +231,36 @@ def build_app(state: AppState, *, require_token: bool = False, token: str = "") 
         return JSONResponse(_state_of(request).current_options())
 
     app.include_router(_agent_router(state))
+    # FastAPI router dependencies (the ``_auth`` gate above) do NOT propagate to a
+    # mounted ASGI sub-app, so on the published port /mcp would otherwise be
+    # reachable without the bearer token while /api/* and /agent/* require it.
+    # Wrap the mount in the same check so every inbound surface is gated alike.
+    app.mount("/mcp", _token_gated(mcp_app, token) if require_token else mcp_app)
     return app
+
+
+def _token_gated(asgi_app: Any, token: str) -> Any:
+    """Wrap an ASGI app so HTTP requests must carry a valid bearer token.
+
+    FastAPI route dependencies don't reach mounted sub-apps, so the published
+    port gates ``/mcp`` here instead, reusing :func:`auth.verify`. Non-HTTP
+    scopes (lifespan) pass through untouched.
+    """
+
+    async def gated(scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            header = next(
+                (v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"authorization"),
+                None,
+            )
+            if not auth.verify(header, token):
+                await JSONResponse({"error": "invalid or missing token"}, status_code=401)(
+                    scope, receive, send
+                )
+                return
+        await asgi_app(scope, receive, send)
+
+    return gated
 
 
 def make_server(app: FastAPI, host: str, port: int) -> uvicorn.Server:
