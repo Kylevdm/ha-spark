@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -165,7 +166,20 @@ def build_app(state: AppState, *, require_token: bool = False, token: str = "") 
     ``Authorization: Bearer <token>``; the ingress app leaves it unset and trusts
     HA's authenticated proxy.
     """
-    app = FastAPI(title="ha-spark", docs_url=None, redoc_url=None)
+    # Local import: mcp_server imports AppState from this module.
+    from ha_spark.agent.mcp_server import build_mcp
+
+    mcp = build_mcp(state)
+    mcp_app = mcp.streamable_http_app()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # The streamable-HTTP transport needs its session manager running for the
+        # life of the app; mounting alone would not start the sub-app's lifespan.
+        async with mcp.session_manager.run():
+            yield
+
+    app = FastAPI(title="ha-spark", docs_url=None, redoc_url=None, lifespan=lifespan)
     setattr(app.state, STATE_ATTR, state)
 
     if require_token:
@@ -216,6 +230,9 @@ def build_app(state: AppState, *, require_token: bool = False, token: str = "") 
         return JSONResponse(_state_of(request).current_options())
 
     app.include_router(_agent_router(state))
+    # The MCP app already serves at /mcp internally; mount at root (last, so the
+    # /api and /agent routes match first) to avoid a /mcp/mcp double-prefix.
+    app.mount("/", mcp_app)
     return app
 
 
