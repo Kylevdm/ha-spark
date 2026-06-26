@@ -143,10 +143,14 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
         return None
 
+    async def fake_serve(_server: object) -> None:
+        return None  # don't bind a real ingress port in tests
+
     monkeypatch.setattr(scheduler, "datetime", _FakeDatetime)
     monkeypatch.setattr(scheduler, "run_once", fake_run_once)
     monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
     monkeypatch.setattr(scheduler.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(scheduler, "serve_in_background", fake_serve)
 
     s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
     with pytest.raises(_StopLoop):
@@ -158,9 +162,16 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
 
 
 def _patch_loop(
-    monkeypatch: pytest.MonkeyPatch, ticks: list[datetime]
+    monkeypatch: pytest.MonkeyPatch,
+    ticks: list[datetime],
+    captured: dict[str, object] | None = None,
 ) -> type[Exception]:
-    """Drive run_forever through ``ticks``, then raise to stop the loop."""
+    """Drive run_forever through ``ticks``, then raise to stop the loop.
+
+    Patches the uvicorn serve seam so no real ingress port is bound. When
+    ``captured`` is given, the AppState built for the HTTP API is stored under
+    ``captured["state"]``.
+    """
     it = iter(ticks)
 
     class _StopLoop(Exception):
@@ -177,12 +188,20 @@ def _patch_loop(
     async def fake_sleep(_seconds: float) -> None:
         return None
 
-    async def fake_start_server(_state: object) -> None:
+    real_build_app = scheduler.build_app
+
+    def fake_build_app(state: AppState) -> object:
+        if captured is not None:
+            captured["state"] = state
+        return real_build_app(state)
+
+    async def fake_serve(_server: object) -> None:
         return None  # don't bind a real ingress port in tests
 
     monkeypatch.setattr(scheduler, "datetime", _FakeDatetime)
     monkeypatch.setattr(scheduler.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(scheduler, "start_server", fake_start_server)
+    monkeypatch.setattr(scheduler, "build_app", fake_build_app)
+    monkeypatch.setattr(scheduler, "serve_in_background", fake_serve)
     return _StopLoop
 
 
@@ -192,10 +211,6 @@ async def test_run_forever_publishes_plan_to_api_state(
     """Each computed plan is pushed into the AppState the HTTP API serves."""
     captured: dict[str, object] = {}
 
-    async def capture_start(state: object) -> None:
-        captured["state"] = state
-        return None
-
     async def fake_run_once(_s: Settings) -> ChargePlan:
         return _plan()
 
@@ -204,8 +219,7 @@ async def test_run_forever_publishes_plan_to_api_state(
 
     monkeypatch.setattr(scheduler, "run_once", fake_run_once)
     monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
-    stop = _patch_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0)])
-    monkeypatch.setattr(scheduler, "start_server", capture_start)  # override the noop
+    stop = _patch_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0)], captured)
 
     s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
     with pytest.raises(stop):

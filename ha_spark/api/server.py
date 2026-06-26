@@ -13,6 +13,7 @@ mutation and is reachable only through that authenticated proxy.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
+import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -131,3 +133,30 @@ def build_app(state: AppState) -> FastAPI:
         return JSONResponse(_state_of(request).current_options())
 
     return app
+
+
+def make_server(app: FastAPI, host: str, port: int) -> uvicorn.Server:
+    """Wrap ``app`` in a uvicorn server bound to ``host:port`` (not yet running)."""
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False)
+    return uvicorn.Server(config)
+
+
+async def serve_in_background(server: uvicorn.Server) -> asyncio.Task[None]:
+    """Start ``server.serve()`` as a task and return once the socket is bound.
+
+    If ``serve()`` exits before binding (e.g. the port is already taken),
+    re-raise its error to the caller instead of waiting forever.
+    """
+    task = asyncio.ensure_future(server.serve())
+    # ponytail: poll uvicorn's `started` flag; it exposes no awaitable for readiness.
+    while not server.started and not task.done():  # noqa: ASYNC110
+        await asyncio.sleep(0.01)
+    if task.done():  # serve() returned/raised before binding -> surface it
+        await task
+    return task
+
+
+async def stop_server(server: uvicorn.Server, task: asyncio.Task[None]) -> None:
+    """Ask the server to exit and await the serve task."""
+    server.should_exit = True
+    await task
