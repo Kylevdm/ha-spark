@@ -6,9 +6,9 @@ import json
 from datetime import time
 from pathlib import Path
 
-from aiohttp.test_utils import TestClient, TestServer
+from fastapi.testclient import TestClient
 
-from ha_spark.api.server import AppState, create_app
+from ha_spark.api.server import AppState, build_app
 from ha_spark.config import Settings
 from ha_spark.energy.models import ChargeIntent, ChargePlan
 
@@ -47,40 +47,44 @@ def _state(tmp_path: Path, **settings_kw: object) -> AppState:
     )
 
 
-async def test_health_ok(tmp_path: Path) -> None:
-    async with TestClient(TestServer(create_app(_state(tmp_path)))) as client:
-        resp = await client.get("/api/health")
-        body = await resp.json()
-    assert resp.status == 200
+def _client(state: AppState) -> TestClient:
+    return TestClient(build_app(state))
+
+
+def test_health_ok(tmp_path: Path) -> None:
+    with _client(_state(tmp_path)) as client:
+        resp = client.get("/api/health")
+    body = resp.json()
+    assert resp.status_code == 200
     assert body["status"] == "ok"
     assert body["plan_at"] is None  # no plan computed yet
 
 
-async def test_get_plan_null_without_a_plan(tmp_path: Path) -> None:
-    async with TestClient(TestServer(create_app(_state(tmp_path)))) as client:
-        body = await (await client.get("/api/plan")).json()
+def test_get_plan_null_without_a_plan(tmp_path: Path) -> None:
+    with _client(_state(tmp_path)) as client:
+        body = client.get("/api/plan").json()
     assert body["plan"] is None
 
 
-async def test_get_plan_returns_sensor_entities(tmp_path: Path) -> None:
+def test_get_plan_returns_sensor_entities(tmp_path: Path) -> None:
     state = _state(tmp_path)
     state.set_plan(_plan())
-    async with TestClient(TestServer(create_app(state))) as client:
-        body = await (await client.get("/api/plan")).json()
+    with _client(state) as client:
+        body = client.get("/api/plan").json()
     by_id = {e["entity_id"]: e for e in body["plan"]}
     assert by_id["sensor.ha_spark_target_soc"]["state"] == "90"
     assert by_id["sensor.ha_spark_target_soc"]["attributes"]["device_class"] == "battery"
     assert body["generated_at"] is not None
 
 
-async def test_config_roundtrip_persists_and_reloads(tmp_path: Path) -> None:
+def test_config_roundtrip_persists_and_reloads(tmp_path: Path) -> None:
     state = _state(tmp_path, min_soc=20.0)
-    async with TestClient(TestServer(create_app(state))) as client:
-        before = await (await client.get("/api/config")).json()
+    with _client(state) as client:
+        before = client.get("/api/config").json()
         assert before["min_soc"] == 20.0
-        resp = await client.post("/api/config", json={"min_soc": 25.0, "not_a_key": "x"})
-        after = await resp.json()
-    assert resp.status == 200
+        resp = client.post("/api/config", json={"min_soc": 25.0, "not_a_key": "x"})
+        after = resp.json()
+    assert resp.status_code == 200
     assert after["min_soc"] == 25.0
     # persisted to the options file, and the unknown key was dropped
     persisted = json.loads((tmp_path / "options.json").read_text(encoding="utf-8"))
@@ -88,7 +92,7 @@ async def test_config_roundtrip_persists_and_reloads(tmp_path: Path) -> None:
     assert state.settings.min_soc == 25.0
 
 
-async def test_post_config_rejects_non_object(tmp_path: Path) -> None:
-    async with TestClient(TestServer(create_app(_state(tmp_path)))) as client:
-        resp = await client.post("/api/config", json=[1, 2, 3])
-    assert resp.status == 400
+def test_post_config_rejects_non_object(tmp_path: Path) -> None:
+    with _client(_state(tmp_path)) as client:
+        resp = client.post("/api/config", json=[1, 2, 3])
+    assert resp.status_code == 400

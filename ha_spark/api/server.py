@@ -18,9 +18,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from aiohttp import web
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from ha_spark.config import _OPTION_KEYS, Settings, load_settings
 from ha_spark.energy.models import ChargePlan
@@ -34,6 +35,8 @@ log = get_logger(__name__)
 INGRESS_PORT = 8099
 # Where the add-on persists user options (HA add-on convention).
 OPTIONS_PATH = Path("/data/options.json")
+# Attribute under which the shared AppState is stashed on the FastAPI app.
+STATE_ATTR = "ha_spark_state"
 
 
 @dataclass
@@ -75,75 +78,56 @@ class AppState:
         return self.settings
 
 
-STATE_KEY = web.AppKey("ha_spark_state", AppState)
-
-
 def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt is not None else None
 
 
-async def _health(request: web.Request) -> web.Response:
-    """Liveness + whether a plan has been computed yet (full doctor stays in the CLI)."""
-    state = request.app[STATE_KEY]
-    return web.json_response({"status": "ok", "plan_at": _iso(state.plan_at)})
+def _state_of(request: Request) -> AppState:
+    return cast(AppState, getattr(request.app.state, STATE_ATTR))
 
 
-async def _get_plan(request: web.Request) -> web.Response:
-    """The latest plan as the same sensor payload the daemon would push."""
-    state = request.app[STATE_KEY]
-    if state.plan is None:
-        return web.json_response({"plan": None, "generated_at": None})
-    entities = [
-        {"entity_id": entity_id, "state": value, "attributes": attrs}
-        for entity_id, value, attrs in plan_to_payload(state.plan, state.settings)
-    ]
-    return web.json_response({"plan": entities, "generated_at": _iso(state.plan_at)})
+def build_app(state: AppState) -> FastAPI:
+    """Build the FastAPI app with the API routes bound to ``state``."""
+    app = FastAPI(title="ha-spark", docs_url=None, redoc_url=None)
+    setattr(app.state, STATE_ATTR, state)
 
+    @app.get("/api/health")
+    async def health(request: Request) -> dict[str, Any]:
+        """Liveness + whether a plan has been computed yet (full doctor stays in the CLI)."""
+        st = _state_of(request)
+        return {"status": "ok", "plan_at": _iso(st.plan_at)}
 
-async def _get_config(request: web.Request) -> web.Response:
-    """Current user options."""
-    return web.json_response(request.app[STATE_KEY].current_options())
-
-
-async def _post_config(request: web.Request) -> web.Response:
-    """Merge posted options, persist, and hot-reload the daemon's settings."""
-    try:
-        updates = await request.json()
-    except Exception:  # noqa: BLE001 - any malformed body is a client error
-        return web.json_response({"error": "invalid JSON body"}, status=400)
-    if not isinstance(updates, dict):
-        return web.json_response({"error": "expected a JSON object"}, status=400)
-    try:
-        request.app[STATE_KEY].apply_options(updates)
-    except Exception as exc:  # noqa: BLE001 - validation/reload failure -> client error
-        log.warning("Rejecting config update: %r", exc)
-        return web.json_response({"error": str(exc)}, status=400)
-    return web.json_response(request.app[STATE_KEY].current_options())
-
-
-def create_app(state: AppState) -> web.Application:
-    """Build the aiohttp app with the API routes bound to ``state``."""
-    app = web.Application()
-    app[STATE_KEY] = state
-    app.add_routes(
-        [
-            web.get("/api/health", _health),
-            web.get("/api/plan", _get_plan),
-            web.get("/api/config", _get_config),
-            web.post("/api/config", _post_config),
+    @app.get("/api/plan")
+    async def get_plan(request: Request) -> dict[str, Any]:
+        """The latest plan as the same sensor payload the daemon would push."""
+        st = _state_of(request)
+        if st.plan is None:
+            return {"plan": None, "generated_at": None}
+        entities = [
+            {"entity_id": eid, "state": value, "attributes": attrs}
+            for eid, value, attrs in plan_to_payload(st.plan, st.settings)
         ]
-    )
+        return {"plan": entities, "generated_at": _iso(st.plan_at)}
+
+    @app.get("/api/config")
+    async def get_config(request: Request) -> dict[str, Any]:
+        """Current user options."""
+        return _state_of(request).current_options()
+
+    @app.post("/api/config")
+    async def post_config(request: Request) -> JSONResponse:
+        """Merge posted options, persist, and hot-reload the daemon's settings."""
+        try:
+            updates = await request.json()
+        except Exception:  # noqa: BLE001 - any malformed body is a client error
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        if not isinstance(updates, dict):
+            return JSONResponse({"error": "expected a JSON object"}, status_code=400)
+        try:
+            _state_of(request).apply_options(updates)
+        except Exception as exc:  # noqa: BLE001 - validation/reload failure -> client error
+            log.warning("Rejecting config update: %r", exc)
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse(_state_of(request).current_options())
+
     return app
-
-
-async def start_server(state: AppState) -> web.AppRunner:
-    """Bind the API on the ingress port; returns the runner for later cleanup."""
-    runner = web.AppRunner(create_app(state))
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", INGRESS_PORT).start()  # noqa: S104 - ingress only
-    return runner
-
-
-async def stop_server(runner: web.AppRunner) -> None:
-    """Tear down the API server."""
-    await runner.cleanup()
