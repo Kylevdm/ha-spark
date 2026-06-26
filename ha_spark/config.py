@@ -106,6 +106,11 @@ _OPTION_KEYS = frozenset(
         # Context store (Phase 6C).
         "away_load_factor",
         "guests_load_factor",
+        # Agent surface (MCP + OpenAPI tool server).
+        "agent_surface",
+        "agent_exposure",
+        "agent_api_token",
+        "agent_expose_port",
     }
 )
 
@@ -254,6 +259,15 @@ class Settings(BaseSettings):
     # low_usage facts carry their own factor instead.
     away_load_factor: float = Field(default=0.4)
     guests_load_factor: float = Field(default=1.3)
+
+    # Agent surface (MCP + OpenAPI tool server). "off" disables the published
+    # port; the ingress tool routes are always mounted. agent_exposure gates how
+    # much is reachable (read-only -> read+act -> read+write). agent_api_token
+    # protects the optional published port (auto-generated when blank).
+    agent_surface: Literal["off", "on"] = Field(default="off")
+    agent_exposure: Literal["read", "read_act", "read_write"] = Field(default="read_act")
+    agent_api_token: str = Field(default="")
+    agent_expose_port: bool = Field(default=False)
 
     @field_validator("solar_percentile", mode="before")
     @classmethod
