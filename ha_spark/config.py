@@ -106,8 +106,18 @@ _OPTION_KEYS = frozenset(
         # Context store (Phase 6C).
         "away_load_factor",
         "guests_load_factor",
+        # Agent surface (MCP + OpenAPI).
+        "agent_surface",
+        "agent_exposure",
+        "agent_api_token",
+        "agent_expose_port",
     }
 )
+
+# Subset of _OPTION_KEYS that hold secrets. These must never appear in cleartext
+# in any response (CLAUDE.md top-priority rule): the API masks them before
+# returning options. Kept here next to _OPTION_KEYS so the two stay in sync.
+_SECRET_OPTION_KEYS = frozenset({"octopus_api_key", "agent_api_token"})
 
 
 class ConfigError(RuntimeError):
@@ -254,6 +264,16 @@ class Settings(BaseSettings):
     # low_usage facts carry their own factor instead.
     away_load_factor: float = Field(default=0.4)
     guests_load_factor: float = Field(default=1.3)
+
+    # Agent surface (MCP + OpenAPI): "off" disables the surface entirely.
+    agent_surface: Literal["off", "on"] = Field(default="off")
+    # Exposure level gates which tools are registered: read-only, read + act
+    # (reviewable proposals), or read + write (direct actuation).
+    agent_exposure: Literal["read", "read_act", "read_write"] = Field(default="read_act")
+    # Bearer token for the agent surface; blank means auto-generate at runtime.
+    agent_api_token: str = Field(default="")
+    # Expose the agent surface port directly (bypassing ingress); off by default.
+    agent_expose_port: bool = Field(default=False)
 
     @field_validator("solar_percentile", mode="before")
     @classmethod
