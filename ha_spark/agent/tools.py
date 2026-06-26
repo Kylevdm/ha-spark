@@ -8,7 +8,7 @@ would too. No HTTP/transport code lives here.
 from __future__ import annotations
 
 import dataclasses
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
@@ -99,3 +99,24 @@ async def get_context(settings: Settings) -> ContextResult:
     async with ContextStore(settings.db_path) as store:
         facts = await store.list_all()
     return ContextResult(facts=[jsonable_encoder(dataclasses.asdict(f)) for f in facts])
+
+
+async def add_context(
+    settings: Settings, kind: str, start_date: date, end_date: date, note: str = ""
+) -> ContextResult:
+    async with ContextStore(settings.db_path) as store:
+        await store.add(kind, start_date, end_date, note=note, source="agent")
+    return await get_context(settings)
+
+
+async def run_plan(settings: Settings) -> PlanResult:
+    # Local import: scheduler imports api.server, which imports this module
+    # (Task 7) — importing run_once at top level would close that cycle.
+    from ha_spark.energy.scheduler import run_once
+
+    plan = await run_once(settings)
+    entities = [
+        {"entity_id": eid, "state": value, "attributes": attrs}
+        for eid, value, attrs in plan_to_payload(plan, settings)
+    ]
+    return PlanResult(plan=entities, generated_at=datetime.now(UTC).isoformat())
