@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.13.0
+
+- Agent surface: ha-spark now exposes its data and a few gated actions to an
+  external model. The add-on HTTP API moved to FastAPI; in addition to the
+  existing ingress API it serves OpenAPI tool routes under `/agent/*` (for
+  open-webui / curl) and an MCP server at `/mcp` (for Claude). A new
+  `agent_exposure` option (`read` | `read_act` | `read_write`, default
+  `read_act`) controls how much is exposed; act/write still pass the existing
+  PROACTIVE_MODE gate, and the LLM never reaches `call_service`. Enable with
+  `agent_surface: on`; for external (non-ingress) clients set
+  `agent_expose_port: true` and map port 8098 — requests then require the
+  bearer token (`agent_api_token`, auto-generated and logged once if blank).
+
 ## 0.12.0
 
 - Daemon HTTP API serving: the daemon now exposes a read-only REST API through
