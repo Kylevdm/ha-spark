@@ -23,8 +23,9 @@ from pathlib import Path
 from typing import Any, cast
 
 import uvicorn
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ha_spark.agent import auth, tools
 from ha_spark.config import _OPTION_KEYS, Settings, load_settings
@@ -37,6 +38,8 @@ log = get_logger(__name__)
 # Add-on ingress serves on this fixed internal port (must match config.yaml
 # `ingress_port`). Not mapped to the host network, so it isn't externally reachable.
 INGRESS_PORT = 8099
+# Optional published (host-mapped) port for the agent surface; token-protected.
+AGENT_PORT = 8098
 # Where the add-on persists user options (HA add-on convention).
 OPTIONS_PATH = Path("/data/options.json")
 # Attribute under which the shared AppState is stashed on the FastAPI app.
@@ -88,6 +91,41 @@ def _iso(dt: datetime | None) -> str | None:
 
 def _state_of(request: Request) -> AppState:
     return cast(AppState, getattr(request.app.state, STATE_ATTR))
+
+
+class _TokenGate:
+    """Pure-ASGI bearer-token gate for the published port.
+
+    A raw ASGI wrapper (vs. a FastAPI route dependency) so the token requirement
+    also covers the mounted ``/mcp`` app; BaseHTTPMiddleware is avoided because it
+    would buffer the streamable-HTTP responses. Non-HTTP scopes (lifespan) pass
+    straight through.
+    """
+
+    def __init__(self, app: ASGIApp, token: str) -> None:
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        raw = dict(scope.get("headers") or {}).get(b"authorization")
+        if not auth.verify(raw.decode("latin-1") if raw else None, self.token):
+            body = b'{"detail":"invalid or missing token"}'
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self.app(scope, receive, send)
 
 
 def _agent_router(state: AppState) -> APIRouter:
@@ -183,12 +221,7 @@ def build_app(state: AppState, *, require_token: bool = False, token: str = "") 
     setattr(app.state, STATE_ATTR, state)
 
     if require_token:
-
-        async def _auth(authorization: str | None = Header(default=None)) -> None:
-            if not auth.verify(authorization, token):
-                raise HTTPException(status_code=401, detail="invalid or missing token")
-
-        app.router.dependencies.append(Depends(_auth))
+        app.add_middleware(_TokenGate, token=token)
 
     @app.get("/api/health")
     async def health(request: Request) -> dict[str, Any]:
