@@ -205,6 +205,41 @@ companion integration proxy once wired up. Endpoints:
 - Config hot-reload: edit `/data/options.json` and the daemon detects the change
   and reloads within seconds — no restart needed.
 
+### Agent surface (MCP + OpenAPI, for external models)
+
+Expose ha-spark's data and a few gated actions to an external LLM — Claude over
+**MCP**, or open-webui / any OpenAPI tool client. Useful if you don't run Ollama
+locally and want a hosted model to read your plan and add context facts.
+
+Options:
+
+- `agent_surface` (`off` | `on`, default `off`) — master switch for the
+  published port. The tool routes are always mounted behind ingress; this only
+  controls the optional host-mapped port.
+- `agent_exposure` (`read` | `read_act` | `read_write`, default `read_act`) —
+  how much is reachable. `read` = data only; `read_act` adds `add_context` and
+  `run_plan` (apply still obeys `proactive_mode`); `read_write` also allows
+  changing options. The LLM never calls Home Assistant services directly.
+- `agent_expose_port` (default `false`) — when `true` (and `agent_surface: on`),
+  bind the surface on host port **8098** (map it in the add-on **Network** tab).
+- `agent_api_token` (password) — bearer token for the published port. Leave blank
+  and one is generated on first start and saved to `/data/agent_token` (the value
+  is never logged).
+
+Access:
+
+- **Through ingress** (no token needed — Home Assistant authenticates the proxy):
+  `http://localhost:8099/agent/*`, `/openapi.json`, and `/mcp` from within the
+  add-on network.
+- **Through the published port** (token required on every request):
+  - open-webui: add a tool server with URL `http://<host>:8098/openapi.json` and
+    the bearer token (`Authorization: Bearer <agent_api_token>`).
+  - Claude (Desktop / API): point the MCP client at `http://<host>:8098/mcp`
+    with the same bearer token.
+
+> claude.ai in the browser additionally needs the endpoint reachable over public
+> HTTPS — put it behind a reverse proxy or Nabu Casa; a bare LAN address won't work.
+
 ## Onboarding
 
 1. **Check the Log tab** after the first start: the add-on runs
