@@ -36,8 +36,9 @@ from ha_spark.energy.onboarding import (
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever, run_once
-from ha_spark.energy.sources import gather_inputs, parse_time
+from ha_spark.energy.sources import _to_float, gather_inputs, parse_time
 from ha_spark.energy.store import ConsumptionStore
+from ha_spark.energy.v2l import load_session, savings
 from ha_spark.ha.models import StateChangedEvent
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.state_cache import StateCache
@@ -48,6 +49,34 @@ from ha_spark.logging import setup_logging
 from ha_spark.onboarding_discover import FieldProposal, propose
 from ha_spark.presets import get_preset, preset_names
 from ha_spark.router import route_message
+
+
+async def _cmd_v2l(settings: Settings) -> int:
+    """Print the live V2L tally: current power, session energy, and savings."""
+    if not settings.v2l_power_entity:
+        print("V2L not configured (set v2l_power_entity).", file=sys.stderr)
+        return 2
+    session = load_session(settings)
+    async with HomeAssistantRest(
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+    ) as rest:
+        try:
+            power_w = _to_float((await rest.get_state(settings.v2l_power_entity)).state, 0.0)
+        except Exception as exc:  # noqa: BLE001 - report and exit non-zero
+            print(f"Could not read {settings.v2l_power_entity}: {exc}", file=sys.stderr)
+            return 1
+    avoided, refill, net = savings(
+        session.kwh_delivered,
+        settings.v2l_peak_rate_gbp,
+        settings.v2l_offpeak_rate_gbp,
+        settings.v2l_round_trip_efficiency,
+    )
+    print(f"V2L power now:  {power_w:.0f} W")
+    print(f"Session energy: {session.kwh_delivered:.2f} kWh (peak {session.peak_power_w:.0f} W)")
+    print(f"Avoided import: GBP {avoided:.2f}")
+    print(f"Refill cost:    GBP {refill:.2f}")
+    print(f"Net benefit:    GBP {net:.2f}")
+    return 0
 
 
 async def _cmd_states(settings: Settings, *, domain: str | None, watch: bool) -> int:
@@ -510,6 +539,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser(
+        "v2l",
+        help="Show the live V2L tally (power, session energy, savings)",
+        description="Read the V2L discharge-power sensor and print the current "
+        "session's energy delivered and efficiency-discounted net saving.",
+    )
+
+    sub.add_parser(
         "health",
         help="Probe HA, Ollama, storage and load history; exit non-zero on failure",
         description="Doctor command: checks the HA REST API, the HA WebSocket auth "
@@ -741,6 +777,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "states":
         return asyncio.run(_cmd_states(settings, domain=args.domain, watch=args.watch))
+
+    if args.command == "v2l":
+        return asyncio.run(_cmd_v2l(settings))
 
     if args.command == "plan":
         return asyncio.run(_cmd_plan(settings, apply=args.apply))
