@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
+
+import httpx
+import respx
 
 from ha_spark.config import Settings
 from ha_spark.energy.v2l import (
@@ -10,10 +14,16 @@ from ha_spark.energy.v2l import (
     V2LSession,
     apply_sample,
     integrate,
+    load_session,
     notifications,
+    notify,
     payload,
+    save_session,
     savings,
 )
+from ha_spark.ha.rest import HomeAssistantRest
+
+BASE = "http://ha.test/api"
 
 
 def test_integrate_rectangle() -> None:
@@ -185,3 +195,32 @@ def test_notice_carries_flag_title_message() -> None:
     sess = V2LSession(day="2026-06-28", kwh_delivered=2.0, active=True)
     notices = notifications(sess, datetime(2026, 6, 28, 1, 5), s)
     assert all(isinstance(n, Notice) and n.flag and n.title and n.message for n in notices)
+
+
+def test_session_round_trip(tmp_path: Path) -> None:
+    s = Settings(db_path=str(tmp_path / "ha_spark.db"))
+    assert load_session(s).day == ""  # no file yet
+    sess = V2LSession(day="2026-06-28", kwh_delivered=2.5, notified_unplug=True)
+    save_session(s, sess)
+    back = load_session(s)
+    assert back.day == "2026-06-28"
+    assert back.kwh_delivered == 2.5
+    assert back.notified_unplug is True
+
+
+def test_load_session_tolerates_garbage(tmp_path: Path) -> None:
+    s = Settings(db_path=str(tmp_path / "ha_spark.db"))
+    (tmp_path / "ha_spark_v2l_session.json").write_text("{not json", encoding="utf-8")
+    assert load_session(s).day == ""
+
+
+@respx.mock
+async def test_notify_calls_notify_service() -> None:
+    route = respx.post(f"{BASE}/services/notify/mobile_app_x").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    async with HomeAssistantRest(BASE, "token") as rest:
+        await notify(rest, "mobile_app_x", "Title", "Body")
+    assert route.called
+    sent = route.calls.last.request
+    assert b"Body" in sent.content

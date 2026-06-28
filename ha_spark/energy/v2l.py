@@ -9,12 +9,18 @@ read/observe + notify only. The planner and chargers are untouched.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from datetime import datetime, time
+from pathlib import Path
 from typing import Any
 
 from ha_spark.config import Settings
 from ha_spark.energy.sources import parse_time
+from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.logging import get_logger
+
+log = get_logger(__name__)
 
 # ponytail: rectangle integration + dt clamp; upgrade to trapezoid only if the
 # 60 s tick proves too coarse (it won't for kWh-scale tallies).
@@ -205,3 +211,35 @@ def payload(session: V2LSession, settings: Settings) -> list[Entity]:
             },
         ),
     ]
+
+
+def _session_path(settings: Settings) -> Path:
+    return Path(settings.db_path).parent / "ha_spark_v2l_session.json"
+
+
+def load_session(settings: Settings) -> V2LSession:
+    """Load the persisted session, or a fresh one if absent/corrupt."""
+    path = _session_path(settings)
+    if not path.is_file():
+        return V2LSession(day="")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return V2LSession(**data)
+    except (OSError, ValueError, TypeError):
+        log.warning("Reading V2L session failed; starting fresh", exc_info=True)
+        return V2LSession(day="")
+
+
+def save_session(settings: Settings, session: V2LSession) -> None:
+    """Persist the session to /data (best-effort)."""
+    path = _session_path(settings)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(asdict(session)), encoding="utf-8")
+    except OSError:
+        log.warning("Caching V2L session failed", exc_info=True)
+
+
+async def notify(rest: HomeAssistantRest, service: str, title: str, message: str) -> None:
+    """Fire an HA notification via notify.<service>."""
+    await rest.call_service("notify", service, {"title": title, "message": message})
