@@ -6,9 +6,11 @@ from datetime import datetime
 
 from ha_spark.config import Settings
 from ha_spark.energy.v2l import (
+    Notice,
     V2LSession,
     apply_sample,
     integrate,
+    notifications,
     payload,
     savings,
 )
@@ -102,3 +104,84 @@ def test_apply_sample_does_not_reset_mid_session_across_midnight() -> None:
     s = apply_sample(s, 2000.0, datetime(2026, 6, 28, 1, 0, 0))
     assert s.day == "2026-06-27"
     assert s.kwh_delivered > 5.0
+
+
+def _nsettings(**kw: object) -> Settings:
+    base: dict[str, object] = dict(
+        v2l_notify_service="mobile_app_x",
+        v2l_cutoff_time="01:00",
+        v2l_budget_kwh=0.0,
+        v2l_peak_rate_gbp=0.30,
+        v2l_offpeak_rate_gbp=0.07,
+        v2l_round_trip_efficiency=0.85,
+    )
+    base.update(kw)
+    return Settings(**base)
+
+
+def test_no_notifications_without_service() -> None:
+    s = _nsettings(v2l_notify_service="")
+    sess = V2LSession(day="2026-06-28", kwh_delivered=2.0, active=True)
+    assert notifications(sess, datetime(2026, 6, 28, 1, 5), s) == []
+
+
+def test_n1_unplug_fires_within_cutoff_window_when_active() -> None:
+    s = _nsettings()
+    sess = V2LSession(day="2026-06-28", kwh_delivered=2.0, active=True)
+    flags = {n.flag for n in notifications(sess, datetime(2026, 6, 28, 1, 5), s)}
+    assert "notified_unplug" in flags
+
+
+def test_n1_does_not_fire_in_afternoon() -> None:
+    s = _nsettings()
+    sess = V2LSession(day="2026-06-28", kwh_delivered=2.0, active=True)
+    flags = {n.flag for n in notifications(sess, datetime(2026, 6, 28, 14, 0), s)}
+    assert "notified_unplug" not in flags
+
+
+def test_n1_fire_once() -> None:
+    s = _nsettings()
+    sess = V2LSession(day="2026-06-28", kwh_delivered=2.0, active=True, notified_unplug=True)
+    flags = {n.flag for n in notifications(sess, datetime(2026, 6, 28, 1, 5), s)}
+    assert "notified_unplug" not in flags
+
+
+def test_n2_plug_in_fires_when_idle_after_delivering() -> None:
+    s = _nsettings()
+    sess = V2LSession(day="2026-06-28", kwh_delivered=3.0, active=False)
+    flags = {n.flag for n in notifications(sess, datetime(2026, 6, 28, 22, 0), s)}
+    assert "notified_plug_in" in flags
+
+
+def test_n2_no_fire_while_active_or_zero() -> None:
+    s = _nsettings()
+    active = V2LSession(day="2026-06-28", kwh_delivered=3.0, active=True)
+    empty = V2LSession(day="2026-06-28", kwh_delivered=0.0, active=False)
+    assert "notified_plug_in" not in {
+        n.flag for n in notifications(active, datetime(2026, 6, 28, 22, 0), s)
+    }
+    assert "notified_plug_in" not in {
+        n.flag for n in notifications(empty, datetime(2026, 6, 28, 22, 0), s)
+    }
+
+
+def test_n3_predictive_fires_near_budget() -> None:
+    s = _nsettings(v2l_budget_kwh=5.0)
+    # 4.9 kWh delivered, 2000 W -> 0.1 kWh to go = 0.05 h = 3 min <= lead(20)
+    sess = V2LSession(day="2026-06-28", kwh_delivered=4.9, last_power_w=2000.0, active=True)
+    flags = {n.flag for n in notifications(sess, datetime(2026, 6, 28, 22, 0), s)}
+    assert "notified_budget" in flags
+
+
+def test_n3_disabled_without_budget() -> None:
+    s = _nsettings(v2l_budget_kwh=0.0)
+    sess = V2LSession(day="2026-06-28", kwh_delivered=4.9, last_power_w=2000.0, active=True)
+    flags = {n.flag for n in notifications(sess, datetime(2026, 6, 28, 22, 0), s)}
+    assert "notified_budget" not in flags
+
+
+def test_notice_carries_flag_title_message() -> None:
+    s = _nsettings()
+    sess = V2LSession(day="2026-06-28", kwh_delivered=2.0, active=True)
+    notices = notifications(sess, datetime(2026, 6, 28, 1, 5), s)
+    assert all(isinstance(n, Notice) and n.flag and n.title and n.message for n in notices)
