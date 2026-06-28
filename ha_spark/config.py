@@ -111,6 +111,14 @@ _OPTION_KEYS = frozenset(
         "agent_exposure",
         "agent_api_token",
         "agent_expose_port",
+        # V2L observe + tally + notify.
+        "v2l_power_entity",
+        "v2l_round_trip_efficiency",
+        "v2l_peak_rate_gbp",
+        "v2l_offpeak_rate_gbp",
+        "v2l_cutoff_time",
+        "v2l_notify_service",
+        "v2l_budget_kwh",
     }
 )
 
@@ -274,6 +282,23 @@ class Settings(BaseSettings):
     agent_api_token: str = Field(default="")
     # Expose the agent surface port directly (bypassing ingress); off by default.
     agent_expose_port: bool = Field(default=False)
+
+    # --- V2L (Vehicle-to-Load) observe + tally + notify ---
+    # The car's V2L discharge-power sensor (W). Empty disables the feature.
+    v2l_power_entity: str = Field(default="")
+    # Round-trip AC->DC->AC->DC efficiency, used to discount the cost of
+    # refilling the car later. One calibration knob folding both DC<->AC stages.
+    v2l_round_trip_efficiency: float = Field(default=0.85)
+    # GBP/kWh import rate being offset now (peak) vs the cheap rate to refill.
+    v2l_peak_rate_gbp: float = Field(default=0.30)
+    v2l_offpeak_rate_gbp: float = Field(default=0.07)
+    # Local time (HH:MM) the cheap window starts; the unplug nudge fires here.
+    v2l_cutoff_time: str = Field(default="01:00")
+    # HA notify.<service> target (e.g. mobile_app_x). Empty disables notifications.
+    v2l_notify_service: str = Field(default="")
+    # Optional V2L budget (kWh) standing in for car SoC; 0 disables the
+    # predictive plug-in warning.
+    v2l_budget_kwh: float = Field(default=0.0)
 
     @field_validator("solar_percentile", mode="before")
     @classmethod
