@@ -275,3 +275,36 @@ async def test_run_v2l_tick_skips_on_unreadable_sensor(tmp_path: Path) -> None:
     respx.get(f"{BASE}/states/sensor.car_v2l_power").mock(return_value=httpx.Response(500))
     # must not raise
     await run_v2l_tick(s, datetime(2026, 6, 28, 19, 0, 0))
+
+
+@respx.mock
+async def test_cmd_v2l_prints_tally(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    from ha_spark.cli import _cmd_v2l
+
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="token",
+        db_path=str(tmp_path / "ha_spark.db"),
+        v2l_power_entity="sensor.car_v2l_power",
+        v2l_peak_rate_gbp=0.30,
+        v2l_offpeak_rate_gbp=0.07,
+        v2l_round_trip_efficiency=0.85,
+    )
+    save_session(s, V2LSession(day="2026-06-28", kwh_delivered=2.0, peak_power_w=1500.0))
+    respx.get(f"{BASE}/states/sensor.car_v2l_power").mock(
+        return_value=httpx.Response(
+            200, json={"entity_id": "sensor.car_v2l_power", "state": "1400", "attributes": {}}
+        )
+    )
+    rc = await _cmd_v2l(s)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "1400 W" in out
+    assert "2.00 kWh" in out
+
+
+async def test_cmd_v2l_unconfigured_returns_2(tmp_path: Path) -> None:
+    from ha_spark.cli import _cmd_v2l
+
+    s = Settings(db_path=str(tmp_path / "ha_spark.db"))
+    assert await _cmd_v2l(s) == 2
