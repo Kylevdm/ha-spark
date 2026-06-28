@@ -18,6 +18,7 @@ from ha_spark.energy.v2l import (
     notifications,
     notify,
     payload,
+    run_v2l_tick,
     save_session,
     savings,
 )
@@ -224,3 +225,53 @@ async def test_notify_calls_notify_service() -> None:
     assert route.called
     sent = route.calls.last.request
     assert b"Body" in sent.content
+
+
+@respx.mock
+async def test_run_v2l_tick_integrates_publishes_and_notifies(tmp_path: Path) -> None:
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="token",
+        db_path=str(tmp_path / "ha_spark.db"),
+        v2l_power_entity="sensor.car_v2l_power",
+        v2l_notify_service="mobile_app_x",
+        v2l_cutoff_time="01:00",
+    )
+    respx.get(f"{BASE}/states/sensor.car_v2l_power").mock(
+        return_value=httpx.Response(
+            200, json={"entity_id": "sensor.car_v2l_power", "state": "2000", "attributes": {}}
+        )
+    )
+    posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+
+    # Seed a prior sample 4 min earlier so this tick integrates ~0.13 kWh, and an
+    # active session past cutoff so N1 fires.
+    prior = V2LSession(
+        day="2026-06-28",
+        kwh_delivered=0.0,
+        active=True,
+        last_sample_ts="2026-06-28T01:01:00",
+    )
+    save_session(s, prior)
+
+    await run_v2l_tick(s, datetime(2026, 6, 28, 1, 5, 0))
+
+    back = load_session(s)
+    assert back.kwh_delivered > 0.0  # integrated the interval
+    assert back.notified_unplug is True  # N1 fired and was flagged
+    paths = [c.request.url.path for c in posts.calls]
+    assert any(p.endswith("/services/notify/mobile_app_x") for p in paths)
+    assert any("sensor.ha_spark_v2l_energy_kwh" in p for p in paths)
+
+
+@respx.mock
+async def test_run_v2l_tick_skips_on_unreadable_sensor(tmp_path: Path) -> None:
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="token",
+        db_path=str(tmp_path / "ha_spark.db"),
+        v2l_power_entity="sensor.car_v2l_power",
+    )
+    respx.get(f"{BASE}/states/sensor.car_v2l_power").mock(return_value=httpx.Response(500))
+    # must not raise
+    await run_v2l_tick(s, datetime(2026, 6, 28, 19, 0, 0))
