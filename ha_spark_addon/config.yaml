@@ -76,6 +76,13 @@ options:
   agent_surface: off
   agent_exposure: read_act
   agent_expose_port: false
+  v2l_power_entity: ""
+  v2l_round_trip_efficiency: 0.85
+  v2l_peak_rate_gbp: 0.30
+  v2l_offpeak_rate_gbp: 0.07
+  v2l_cutoff_time: "01:00"
+  v2l_notify_service: ""
+  v2l_budget_kwh: 0.0
 schema:
   log_level: list(DEBUG|INFO|WARNING|ERROR)
   proactive_mode: list(off|simulate|on)
@@ -143,3 +150,10 @@ schema:
   agent_exposure: list(read|read_act|read_write)
   agent_api_token: password?
   agent_expose_port: bool
+  v2l_power_entity: str?
+  v2l_round_trip_efficiency: float
+  v2l_peak_rate_gbp: float
+  v2l_offpeak_rate_gbp: float
+  v2l_cutoff_time: match(^\d{2}:\d{2}$)
+  v2l_notify_service: str?
+  v2l_budget_kwh: float

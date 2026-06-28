@@ -151,3 +151,22 @@ def test_agent_defaults() -> None:
 def test_agent_options_in_whitelist() -> None:
     for key in ("agent_surface", "agent_exposure", "agent_api_token", "agent_expose_port"):
         assert key in _OPTION_KEYS
+
+
+def test_v2l_options_load_from_overlay() -> None:
+    s = Settings(
+        v2l_power_entity="sensor.car_v2l_power",
+        v2l_round_trip_efficiency=0.8,
+        v2l_peak_rate_gbp=0.32,
+        v2l_offpeak_rate_gbp=0.07,
+        v2l_cutoff_time="01:00",
+        v2l_notify_service="mobile_app_phone",
+        v2l_budget_kwh=5.0,
+    )
+    assert s.v2l_power_entity == "sensor.car_v2l_power"
+    assert s.v2l_round_trip_efficiency == 0.8
+    assert s.v2l_budget_kwh == 5.0
+    # defaults
+    assert Settings().v2l_power_entity == ""
+    assert Settings().v2l_round_trip_efficiency == 0.85
+    assert Settings().v2l_cutoff_time == "01:00"
