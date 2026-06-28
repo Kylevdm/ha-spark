@@ -10,10 +10,11 @@ read/observe + notify only. The planner and chargers are untouched.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time
 from typing import Any
 
 from ha_spark.config import Settings
+from ha_spark.energy.sources import parse_time
 
 # ponytail: rectangle integration + dt clamp; upgrade to trapezoid only if the
 # 60 s tick proves too coarse (it won't for kWh-scale tallies).
@@ -87,6 +88,81 @@ def savings(kwh: float, peak: float, offpeak: float, eff: float) -> tuple[float,
     avoided = kwh * peak
     refill = (kwh / eff) * offpeak if eff > 0 else 0.0
     return avoided, refill, avoided - refill
+
+
+@dataclass
+class Notice:
+    """One pending HA notification; ``flag`` is the session attr set once fired."""
+
+    flag: str
+    title: str
+    message: str
+
+
+def _minutes_after(now: time, cutoff: time) -> float:
+    """Minutes from ``cutoff`` to ``now`` within a day, wrapping at midnight."""
+    now_m = now.hour * 60 + now.minute
+    cut_m = cutoff.hour * 60 + cutoff.minute
+    return float((now_m - cut_m) % (24 * 60))
+
+
+def notifications(session: V2LSession, now: datetime, settings: Settings) -> list[Notice]:
+    """Return the fire-once notices whose trigger holds (empty if notify off)."""
+    if not settings.v2l_notify_service:
+        return []
+
+    out: list[Notice] = []
+    _, _, net = savings(
+        session.kwh_delivered,
+        settings.v2l_peak_rate_gbp,
+        settings.v2l_offpeak_rate_gbp,
+        settings.v2l_round_trip_efficiency,
+    )
+
+    # N1 - unplug at cutoff: still discharging within the post-cutoff window.
+    cutoff = parse_time(settings.v2l_cutoff_time)
+    if (
+        not session.notified_unplug
+        and session.active
+        and _minutes_after(now.time(), cutoff) <= _CUTOFF_WINDOW_MIN
+    ):
+        out.append(
+            Notice(
+                "notified_unplug",
+                "Unplug V2L",
+                f"Cheap window starting - unplug V2L. Tonight: "
+                f"{session.kwh_delivered:.1f} kWh, net GBP {net:.2f}.",
+            )
+        )
+
+    # N2 - plug in to recharge: delivered something and V2L has now stopped.
+    if not session.notified_plug_in and not session.active and session.kwh_delivered > 0:
+        out.append(
+            Notice(
+                "notified_plug_in",
+                "Plug in to recharge",
+                f"V2L done - {session.kwh_delivered:.1f} kWh pulled. "
+                f"Plug the car in to recharge on the cheap rate.",
+            )
+        )
+
+    # N3 - predictive plug-in: projected to hit the V2L budget within the lead.
+    if not session.notified_budget and settings.v2l_budget_kwh > 0:
+        remaining = settings.v2l_budget_kwh - session.kwh_delivered
+        hit = remaining <= 0
+        if not hit and session.last_power_w > 0:
+            mins = (remaining / (session.last_power_w / 1000.0)) * 60.0
+            hit = mins <= _PLUG_IN_LEAD_MIN
+        if hit:
+            out.append(
+                Notice(
+                    "notified_budget",
+                    "Car nearing V2L budget",
+                    f"Car will reach your V2L budget "
+                    f"({settings.v2l_budget_kwh:.0f} kWh) soon - plan to plug in.",
+                )
+            )
+    return out
 
 
 def payload(session: V2LSession, settings: Settings) -> list[Entity]:
