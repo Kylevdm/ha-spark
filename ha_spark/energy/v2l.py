@@ -10,6 +10,7 @@ read/observe + notify only. The planner and chargers are untouched.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from ha_spark.config import Settings
@@ -46,6 +47,34 @@ def integrate(prev_kwh: float, power_w: float, dt_s: float) -> float:
     ``_DT_CLAMP_S`` first, so a long downtime gap can't inflate the tally.
     """
     return prev_kwh + (power_w / 1000.0) * (dt_s / 3600.0)
+
+
+def apply_sample(session: V2LSession, power_w: float, now: datetime) -> V2LSession:
+    """Fold one power reading into the session and return it (mutates in place).
+
+    Resets to a fresh session only when the calendar day has rolled over AND
+    V2L is idle, so a session running across midnight is never cut mid-discharge.
+    The sample interval is clamped to ``_DT_CLAMP_S`` so a restart gap can't
+    inflate the tally.
+    """
+    today = now.date().isoformat()
+    if session.day and session.day != today and power_w < _IDLE_W:
+        session = V2LSession(day=today)
+    if not session.day:
+        session.day = today
+
+    if session.last_sample_ts is not None:
+        prev = datetime.fromisoformat(session.last_sample_ts)
+        dt_s = min(_DT_CLAMP_S, max(0.0, (now - prev).total_seconds()))
+    else:
+        dt_s = 0.0  # first sample: no interval to integrate
+
+    session.kwh_delivered = integrate(session.kwh_delivered, power_w, dt_s)
+    session.last_power_w = power_w
+    session.peak_power_w = max(session.peak_power_w, power_w)
+    session.active = power_w >= _IDLE_W
+    session.last_sample_ts = now.isoformat()
+    return session
 
 
 def savings(kwh: float, peak: float, offpeak: float, eff: float) -> tuple[float, float, float]:
