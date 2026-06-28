@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from ha_spark.config import Settings
-from ha_spark.energy.sources import parse_time
+from ha_spark.energy.sources import _to_float, parse_time
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -243,3 +243,38 @@ def save_session(settings: Settings, session: V2LSession) -> None:
 async def notify(rest: HomeAssistantRest, service: str, title: str, message: str) -> None:
     """Fire an HA notification via notify.<service>."""
     await rest.call_service("notify", service, {"title": title, "message": message})
+
+
+async def run_v2l_tick(settings: Settings, now: datetime) -> None:
+    """One V2L pass: read, integrate, publish sensors, notify, persist.
+
+    Best-effort and self-contained (opens its own REST client), mirroring
+    ``scheduler.sample_signals``. An unreadable sensor logs and returns; it
+    never raises into the daemon loop.
+    """
+    session = load_session(settings)
+    async with HomeAssistantRest(
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+    ) as rest:
+        try:
+            state = await rest.get_state(settings.v2l_power_entity)
+        except Exception as exc:  # noqa: BLE001 - never break the loop on bad data
+            log.warning("V2L: %s unreadable (%s); skipping", settings.v2l_power_entity, exc)
+            return
+        power_w = _to_float(state.state, 0.0)
+        session = apply_sample(session, power_w, now)
+
+        for entity_id, value, attrs in payload(session, settings):
+            try:
+                await rest.set_state(entity_id, value, attrs)
+            except Exception:  # noqa: BLE001 - publishing is best-effort
+                log.warning("Publishing %s failed", entity_id, exc_info=True)
+
+        for notice in notifications(session, now, settings):
+            try:
+                await notify(rest, settings.v2l_notify_service, notice.title, notice.message)
+                setattr(session, notice.flag, True)  # flag only on success
+            except Exception:  # noqa: BLE001 - a failed send retries next tick
+                log.warning("V2L notify (%s) failed", notice.flag, exc_info=True)
+
+    save_session(settings, session)
