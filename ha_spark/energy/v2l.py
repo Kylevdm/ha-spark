@@ -75,7 +75,7 @@ def apply_sample(session: V2LSession, power_w: float, now: datetime) -> V2LSessi
     if session.last_sample_ts is not None:
         try:
             prev = datetime.fromisoformat(session.last_sample_ts)
-        except ValueError:
+        except (ValueError, TypeError):
             prev = None
         # ponytail: skip-one-interval on tz mismatch; can't recover a naive value's
         # true offset, and losing one 60 s tick of kWh is negligible.
