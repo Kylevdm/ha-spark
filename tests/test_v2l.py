@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import respx
@@ -60,8 +61,11 @@ def test_payload_maps_three_sensors() -> None:
     by_id = {eid: (state, attrs) for eid, state, attrs in payload(sess, s)}
     assert by_id["sensor.ha_spark_v2l_power_w"][0] == "1400"
     assert by_id["sensor.ha_spark_v2l_power_w"][1]["device_class"] == "power"
+    assert by_id["sensor.ha_spark_v2l_power_w"][1]["state_class"] == "measurement"
     assert by_id["sensor.ha_spark_v2l_energy_kwh"][0] == "2.00"
+    assert by_id["sensor.ha_spark_v2l_energy_kwh"][1]["state_class"] == "total_increasing"
     assert by_id["sensor.ha_spark_v2l_net_saving_gbp"][1]["device_class"] == "monetary"
+    assert by_id["sensor.ha_spark_v2l_net_saving_gbp"][1]["state_class"] == "measurement"
     assert "avoided_gbp" in by_id["sensor.ha_spark_v2l_net_saving_gbp"][1]
 
 
@@ -115,6 +119,40 @@ def test_apply_sample_does_not_reset_mid_session_across_midnight() -> None:
     s = apply_sample(s, 2000.0, datetime(2026, 6, 28, 1, 0, 0))
     assert s.day == "2026-06-27"
     assert s.kwh_delivered > 5.0
+
+
+def test_apply_sample_aware_timestamps_integrate_normally() -> None:
+    t0 = datetime(2026, 6, 28, 19, 0, 0, tzinfo=UTC)
+    s = apply_sample(V2LSession(day=""), 2000.0, t0)
+    t1 = datetime(2026, 6, 28, 19, 3, 0, tzinfo=UTC)
+    s = apply_sample(s, 2000.0, t1)
+    assert abs(s.kwh_delivered - 0.1) < 1e-9
+
+
+def test_apply_sample_mixed_tz_skips_interval_without_raising() -> None:
+    # naive stored timestamp, tz-aware now -> degrade to no integration this tick
+    s = V2LSession(day="2026-06-28", last_sample_ts="2026-06-28T19:00:00")
+    now = datetime(2026, 6, 28, 19, 3, 0, tzinfo=UTC)
+    s = apply_sample(s, 2000.0, now)
+    assert s.kwh_delivered == 0.0
+    assert s.last_sample_ts == now.isoformat()
+
+
+def test_apply_sample_garbage_timestamp_skips_interval_without_raising() -> None:
+    s = V2LSession(day="2026-06-28", last_sample_ts="not-a-date")
+    now = datetime(2026, 6, 28, 19, 3, 0)
+    s = apply_sample(s, 2000.0, now)
+    assert s.kwh_delivered == 0.0
+    assert s.last_sample_ts == now.isoformat()
+
+
+def test_apply_sample_self_heals_after_mixed_tz_tick() -> None:
+    s = V2LSession(day="2026-06-28", last_sample_ts="2026-06-28T19:00:00")
+    now = datetime(2026, 6, 28, 19, 3, 0, tzinfo=UTC)
+    s = apply_sample(s, 2000.0, now)  # mixed-tz tick: skipped
+    now2 = datetime(2026, 6, 28, 19, 6, 0, tzinfo=UTC)
+    s = apply_sample(s, 2000.0, now2)  # both aware now: integrates
+    assert abs(s.kwh_delivered - 0.1) < 1e-9
 
 
 def _nsettings(**kw: object) -> Settings:
@@ -207,6 +245,27 @@ def test_session_round_trip(tmp_path: Path) -> None:
     assert back.day == "2026-06-28"
     assert back.kwh_delivered == 2.5
     assert back.notified_unplug is True
+
+
+def test_save_session_leaves_no_stray_tmp_file(tmp_path: Path) -> None:
+    s = Settings(db_path=str(tmp_path / "ha_spark.db"))
+    save_session(s, V2LSession(day="2026-06-28", kwh_delivered=1.0))
+    files = {p.name for p in tmp_path.iterdir()}
+    assert "ha_spark_v2l_session.json" in files
+    assert "ha_spark_v2l_session.json.tmp" not in files
+
+
+def test_save_session_failed_replace_preserves_prior_file(tmp_path: Path) -> None:
+    s = Settings(db_path=str(tmp_path / "ha_spark.db"))
+    good = V2LSession(day="2026-06-28", kwh_delivered=2.5, notified_unplug=True)
+    save_session(s, good)
+
+    with patch("ha_spark.energy.v2l.os.replace", side_effect=OSError("disk full")):
+        save_session(s, V2LSession(day="2026-06-29", kwh_delivered=9.0))  # does not raise
+
+    back = load_session(s)
+    assert back.day == "2026-06-28"
+    assert back.kwh_delivered == 2.5
 
 
 def test_load_session_tolerates_garbage(tmp_path: Path) -> None:
