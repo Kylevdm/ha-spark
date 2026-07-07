@@ -146,6 +146,16 @@ def test_apply_sample_garbage_timestamp_skips_interval_without_raising() -> None
     assert s.last_sample_ts == now.isoformat()
 
 
+def test_apply_sample_non_string_timestamp_skips_interval_without_raising() -> None:
+    # a hand-edited/corrupt session file could carry a non-string JSON value;
+    # fromisoformat raises TypeError (not ValueError) for that shape
+    s = V2LSession(day="2026-06-28", last_sample_ts=12345)  # type: ignore[arg-type]
+    now = datetime(2026, 6, 28, 19, 3, 0)
+    s = apply_sample(s, 2000.0, now)
+    assert s.kwh_delivered == 0.0
+    assert s.last_sample_ts == now.isoformat()
+
+
 def test_apply_sample_self_heals_after_mixed_tz_tick() -> None:
     s = V2LSession(day="2026-06-28", last_sample_ts="2026-06-28T19:00:00")
     now = datetime(2026, 6, 28, 19, 3, 0, tzinfo=UTC)
