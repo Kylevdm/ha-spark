@@ -10,6 +10,7 @@ read/observe + notify only. The planner and chargers are untouched.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, time
 from pathlib import Path
@@ -70,11 +71,16 @@ def apply_sample(session: V2LSession, power_w: float, now: datetime) -> V2LSessi
     if not session.day:
         session.day = today
 
+    dt_s = 0.0  # first sample, or a malformed/mixed-tz stored timestamp: no interval
     if session.last_sample_ts is not None:
-        prev = datetime.fromisoformat(session.last_sample_ts)
-        dt_s = min(_DT_CLAMP_S, max(0.0, (now - prev).total_seconds()))
-    else:
-        dt_s = 0.0  # first sample: no interval to integrate
+        try:
+            prev = datetime.fromisoformat(session.last_sample_ts)
+        except ValueError:
+            prev = None
+        # ponytail: skip-one-interval on tz mismatch; can't recover a naive value's
+        # true offset, and losing one 60 s tick of kWh is negligible.
+        if prev is not None and (prev.tzinfo is None) == (now.tzinfo is None):
+            dt_s = min(_DT_CLAMP_S, max(0.0, (now - prev).total_seconds()))
 
     session.kwh_delivered = integrate(session.kwh_delivered, power_w, dt_s)
     session.last_power_w = power_w
@@ -187,6 +193,7 @@ def payload(session: V2LSession, settings: Settings) -> list[Entity]:
                 "friendly_name": "ha-spark V2L power",
                 "unit_of_measurement": "W",
                 "device_class": "power",
+                "state_class": "measurement",
             },
         ),
         (
@@ -196,6 +203,7 @@ def payload(session: V2LSession, settings: Settings) -> list[Entity]:
                 "friendly_name": "ha-spark V2L energy",
                 "unit_of_measurement": "kWh",
                 "device_class": "energy",
+                "state_class": "total_increasing",
             },
         ),
         (
@@ -205,6 +213,7 @@ def payload(session: V2LSession, settings: Settings) -> list[Entity]:
                 "friendly_name": "ha-spark V2L net saving",
                 "unit_of_measurement": "GBP",
                 "device_class": "monetary",
+                "state_class": "measurement",
                 "avoided_gbp": round(avoided, 2),
                 "refill_cost_gbp": round(refill, 2),
                 "peak_power_w": round(session.peak_power_w, 0),
@@ -231,13 +240,16 @@ def load_session(settings: Settings) -> V2LSession:
 
 
 def save_session(settings: Settings, session: V2LSession) -> None:
-    """Persist the session to /data (best-effort)."""
+    """Persist the session to /data (best-effort, atomic via tmp-file + rename)."""
     path = _session_path(settings)
+    tmp_path = path.with_suffix(".json.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(session)), encoding="utf-8")
+        tmp_path.write_text(json.dumps(asdict(session)), encoding="utf-8")
+        os.replace(tmp_path, path)  # ponytail: stdlib atomic rename, no WAL needed
     except OSError:
         log.warning("Caching V2L session failed", exc_info=True)
+        tmp_path.unlink(missing_ok=True)
 
 
 async def notify(rest: HomeAssistantRest, service: str, title: str, message: str) -> None:
