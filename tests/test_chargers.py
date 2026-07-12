@@ -11,8 +11,9 @@ import respx
 
 from ha_spark.config import Settings
 from ha_spark.devices.base import Capability, ControlAuthority
+from ha_spark.devices.inverters.alphaess import AlphaESSDevice
 from ha_spark.devices.inverters.solis import SolisDevice, solis_current_a
-from ha_spark.energy.chargers import AlphaESSCharger, charger_for
+from ha_spark.energy.chargers import charger_for
 from ha_spark.energy.models import ChargeIntent
 from ha_spark.ha.rest import HomeAssistantRest
 
@@ -39,6 +40,15 @@ def _solis_device(
     if control != "ha_spark":
         config = config.model_copy(update={"control": ControlAuthority(control)})
     return SolisDevice(config, s, rest)
+
+
+def _alpha_device(
+    s: Settings, rest: HomeAssistantRest, *, control: str = "ha_spark"
+) -> AlphaESSDevice:
+    config = s.devices[0]
+    if control != "ha_spark":
+        config = config.model_copy(update={"control": ControlAuthority(control)})
+    return AlphaESSDevice(config, s, rest)
 
 
 def _intent(
@@ -284,13 +294,13 @@ async def test_read_charge_rate_raises_on_unreadable_sensor() -> None:
 def test_charger_for_selects_by_inverter() -> None:
     rest = HomeAssistantRest(_settings().ha_rest_url, _settings().auth_token)
     assert isinstance(charger_for(_settings(inverter="solis"), rest), SolisDevice)
-    assert isinstance(charger_for(_settings(inverter="alphaess"), rest), AlphaESSCharger)
+    assert isinstance(charger_for(_settings(inverter="alphaess"), rest), AlphaESSDevice)
 
 
-def test_alphaess_does_not_support_live_rate() -> None:
+def test_alphaess_capabilities_exclude_rate() -> None:
     s = _settings(inverter="alphaess")
     rest = HomeAssistantRest(s.ha_rest_url, s.auth_token)
-    assert AlphaESSCharger(s, rest).supports_live_rate is False
+    assert Capability.CHARGE_RATE not in _alpha_device(s, rest).capabilities
 
 
 @respx.mock
@@ -301,7 +311,7 @@ async def test_alphaess_apply_writes_window_and_stop_soc() -> None:
     )
     s = _settings(inverter="alphaess", proactive_mode="on", alphaess_serial="ABC123")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await AlphaESSCharger(s, rest).apply(_intent(target_soc=80.0))
+        lines = await _alpha_device(s, rest).apply(_intent(target_soc=80.0))
     assert route.called
     body = json.loads(route.calls.last.request.content)
     assert body["serial"] == "ABC123"
@@ -317,7 +327,7 @@ async def test_alphaess_apply_simulate_makes_no_call() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _settings(inverter="alphaess", proactive_mode="simulate")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await AlphaESSCharger(s, rest).apply(_intent())
+        lines = await _alpha_device(s, rest).apply(_intent())
     assert posts.call_count == 0
     assert "[SIMULATE]" in lines[0]
 
@@ -325,7 +335,7 @@ async def test_alphaess_apply_simulate_makes_no_call() -> None:
 async def test_alphaess_apply_off_mode_computes_without_calls() -> None:
     s = _settings(inverter="alphaess", proactive_mode="off")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await AlphaESSCharger(s, rest).apply(_intent())
+        lines = await _alpha_device(s, rest).apply(_intent())
     assert "[OFF]" in lines[0]
 
 
@@ -334,7 +344,7 @@ async def test_alphaess_apply_blocks_when_soc_invalid() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _settings(inverter="alphaess", proactive_mode="on")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await AlphaESSCharger(s, rest).apply(_intent(soc_valid=False))
+        lines = await _alpha_device(s, rest).apply(_intent(soc_valid=False))
     assert posts.call_count == 0
     assert "[BLOCKED]" in lines[0]
 
@@ -344,7 +354,7 @@ async def test_alphaess_apply_does_not_block_genuine_zero_soc() -> None:
     s = _settings(inverter="alphaess", proactive_mode="on", alphaess_serial="SN123")
     respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await AlphaESSCharger(s, rest).apply(_intent(soc_now=0, soc_valid=True))
+        lines = await _alpha_device(s, rest).apply(_intent(soc_now=0, soc_valid=True))
     assert not any(line.startswith("[BLOCKED]") for line in lines)
 
 
@@ -355,14 +365,14 @@ async def test_alphaess_apply_isolates_failure() -> None:
     )
     s = _settings(inverter="alphaess", proactive_mode="on", alphaess_serial="ABC123")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await AlphaESSCharger(s, rest).apply(_intent())
+        lines = await _alpha_device(s, rest).apply(_intent())
     assert "[FAILED]" in lines[0]
 
 
 async def test_alphaess_set_charge_rate_and_read_charge_rate_are_noops() -> None:
     s = _settings(inverter="alphaess")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        charger = AlphaESSCharger(s, rest)
+        charger = _alpha_device(s, rest)
         assert "[SKIP]" in await charger.set_charge_rate(1000.0)
         assert await charger.read_charge_rate() == 0.0
         assert charger.planned_rate_w(_intent()) == 0.0
