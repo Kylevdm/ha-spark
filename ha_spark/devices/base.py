@@ -1,11 +1,16 @@
 """Device-driver core: capabilities, control authority, and the actuation gate."""
 from __future__ import annotations
 
+from datetime import time
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:  # avoid an import cycle: models never imports config/devices at runtime
     from ha_spark.energy.models import ChargeIntent
+
+
+def fmt_hhmm(t: time) -> str:
+    return f"{t.hour:02d}:{t.minute:02d}"
 
 
 class Capability(StrEnum):

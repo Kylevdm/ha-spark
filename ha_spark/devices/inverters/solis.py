@@ -8,10 +8,8 @@ and reads back to confirm the device took it.
 """
 from __future__ import annotations
 
-from datetime import time
-
 from ha_spark.config import DeviceConfig, Settings
-from ha_spark.devices.base import Capability, effective_mode
+from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
 from ha_spark.devices.registry import register
 from ha_spark.energy.models import ChargeIntent, window_hours
 from ha_spark.ha.rest import HomeAssistantRest
@@ -33,10 +31,6 @@ def solis_current_a(intent: ChargeIntent, settings: Settings) -> float:
     if kwh_per_amp <= 0:
         return 0.0
     return min(settings.max_charge_current_a, purchase / kwh_per_amp)
-
-
-def _fmt_hhmm(t: time) -> str:
-    return f"{t.hour:02d}:{t.minute:02d}"
 
 
 @register("solis")
@@ -141,7 +135,7 @@ class SolisDevice:
         end_e = self._config.entities.get("window_end", "")
         if not (start_e and end_e):
             return "[SKIP] no window entities configured; window left as-is"
-        desc = f"set charge window {_fmt_hhmm(intent.window_start)}-{_fmt_hhmm(intent.window_end)}"
+        desc = f"set charge window {fmt_hhmm(intent.window_start)}-{fmt_hhmm(intent.window_end)}"
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         if mode == "simulate":
             return f"[SIMULATE] would {desc}"
@@ -151,12 +145,12 @@ class SolisDevice:
             await self._rest.call_service(
                 "time",
                 "set_value",
-                {"entity_id": start_e, "time": _fmt_hhmm(intent.window_start) + ":00"},
+                {"entity_id": start_e, "time": fmt_hhmm(intent.window_start) + ":00"},
             )
             await self._rest.call_service(
                 "time",
                 "set_value",
-                {"entity_id": end_e, "time": _fmt_hhmm(intent.window_end) + ":00"},
+                {"entity_id": end_e, "time": fmt_hhmm(intent.window_end) + ":00"},
             )
         except Exception as exc:  # noqa: BLE001
             return f"[FAILED] {desc}: {exc!r}"
