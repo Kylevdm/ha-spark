@@ -14,7 +14,7 @@ from __future__ import annotations
 from ha_spark.config import Settings
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.report import format_plan
-from ha_spark.energy.sources import gather_inputs
+from ha_spark.energy.sources import build_schedule, gather_inputs
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -40,7 +40,7 @@ async def build_grounding(settings: Settings, rest: HomeAssistantRest) -> str | 
     """
     try:
         inputs, cfg, load_source = await gather_inputs(settings, rest)
-        plan = compute_plan(inputs, cfg)
+        plan = compute_plan(inputs, cfg, build_schedule(settings, inputs, cfg))
         return format_plan(plan, load_source)
     except Exception as exc:  # noqa: BLE001 - grounding is best-effort
         log.warning("Could not build copilot grounding (%s); answering ungrounded", exc)

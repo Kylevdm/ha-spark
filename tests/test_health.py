@@ -24,6 +24,7 @@ from ha_spark.health import (
     check_load_history,
     check_ollama,
     check_sqlite,
+    check_tariff_provider,
     exit_code,
     format_report,
 )
@@ -83,6 +84,72 @@ async def test_check_ha_rest_fail() -> None:
     respx.get(f"{HA}/api/config").mock(side_effect=httpx.ConnectError("boom"))
     res = await check_ha_rest(Settings(ha_url=HA, ha_token="tok"))
     assert res.status is Status.FAIL
+
+
+# --- Tariff provider check ---
+
+
+async def test_check_tariff_provider_fixed_needs_no_live_read() -> None:
+    res = await check_tariff_provider(Settings(ha_url=HA, ha_token="tok"))
+    assert res.status is Status.OK
+    assert "fixed" in res.detail
+
+
+async def test_check_tariff_provider_dynamic_unset_warns() -> None:
+    res = await check_tariff_provider(
+        Settings(ha_url=HA, ha_token="tok", tariff_provider="dynamic")
+    )
+    assert res.status is Status.WARN
+
+
+@respx.mock
+async def test_check_tariff_provider_dynamic_ok() -> None:
+    respx.get(f"{HA}/api/states/event.rates").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "entity_id": "event.rates",
+                "state": "2026-07-12T00:00:00+00:00",
+                "attributes": {"rates": [{"start": "x", "end": "y", "value_inc_vat": 0.1}] * 48},
+            },
+        )
+    )
+    res = await check_tariff_provider(
+        Settings(
+            ha_url=HA, ha_token="tok", tariff_provider="dynamic",
+            dynamic_rates_entity="event.rates",
+        )
+    )
+    assert res.status is Status.OK
+    assert "48" in res.detail
+
+
+@respx.mock
+async def test_check_tariff_provider_dynamic_missing_rates_warns() -> None:
+    respx.get(f"{HA}/api/states/event.rates").mock(
+        return_value=httpx.Response(
+            200, json={"entity_id": "event.rates", "state": "x", "attributes": {}}
+        )
+    )
+    res = await check_tariff_provider(
+        Settings(
+            ha_url=HA, ha_token="tok", tariff_provider="dynamic",
+            dynamic_rates_entity="event.rates",
+        )
+    )
+    assert res.status is Status.WARN
+
+
+@respx.mock
+async def test_check_tariff_provider_dynamic_unreachable_warns() -> None:
+    respx.get(f"{HA}/api/states/event.rates").mock(side_effect=httpx.ConnectError("down"))
+    res = await check_tariff_provider(
+        Settings(
+            ha_url=HA, ha_token="tok", tariff_provider="dynamic",
+            dynamic_rates_entity="event.rates",
+        )
+    )
+    assert res.status is Status.WARN
 
 
 # --- Ollama check ---

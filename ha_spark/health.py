@@ -206,6 +206,35 @@ async def check_supply_guard(settings: Settings) -> CheckResult:
     )
 
 
+async def check_tariff_provider(settings: Settings) -> CheckResult:
+    """Confirm the configured tariff provider reads end-to-end (`fixed` needs no live read)."""
+    if settings.tariff_provider != "dynamic":
+        return CheckResult("Tariff provider", Status.OK, "fixed (no live source)")
+    entity = settings.dynamic_rates_entity
+    if not entity:
+        return CheckResult("Tariff provider", Status.WARN, "dynamic_rates_entity not set")
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            state = await rest.get_state(entity)
+        rates = state.attributes.get("rates")
+        n = len(rates) if isinstance(rates, list) else 0
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(
+            "Tariff provider",
+            Status.WARN,
+            f"{entity}: {exc!r} — plans fall back to the fixed rate/window",
+        )
+    if not n:
+        return CheckResult(
+            "Tariff provider",
+            Status.WARN,
+            f"{entity}: no `rates` attribute — plans fall back to the fixed rate/window",
+        )
+    return CheckResult("Tariff provider", Status.OK, f"{n} rate slots from {entity}")
+
+
 async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
     results = await asyncio.gather(
@@ -215,6 +244,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_sqlite(settings),
         check_load_history(settings),
         check_supply_guard(settings),
+        check_tariff_provider(settings),
     )
     return [*results, check_entity_config(settings)]
 

@@ -59,6 +59,15 @@ class LoadForecast:
 
 
 @dataclass(frozen=True)
+class PricePoint:
+    """One half-hourly import price read from a dynamic-tariff price sensor."""
+
+    start: datetime
+    end: datetime
+    price: float  # GBP/kWh, inc. VAT
+
+
+@dataclass(frozen=True)
 class DispatchSlot:
     """A planned Octopus dispatch (cheap import) window."""
 
@@ -118,6 +127,9 @@ class PlannerInputs:
     load_slots: tuple[float, ...] | None = None
     solar_slots: tuple[float, ...] | None = None
     horizon_start: datetime | None = None
+    # Live per-slot import prices from a `dynamic` tariff price sensor, sorted
+    # by start; empty when the dynamic provider isn't in use or the read failed.
+    dynamic_prices: tuple[PricePoint, ...] = ()
 
 
 @dataclass(frozen=True)
