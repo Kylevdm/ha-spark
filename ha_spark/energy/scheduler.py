@@ -33,7 +33,7 @@ from ha_spark.api.server import (
     stop_server,
 )
 from ha_spark.config import Settings
-from ha_spark.energy.chargers import charger_for
+from ha_spark.devices import Capability, inverter_device
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargePlan, PlannerInputs
@@ -87,7 +87,7 @@ async def run_once(settings: Settings) -> ChargePlan:
         log.info("Charge plan:\n%s", format_plan(plan, load_source))
         intent = plan.charge_intent
         assert intent is not None  # planner always sets it
-        lines = await charger_for(settings, rest).apply(intent)
+        lines = await inverter_device(settings, rest).apply(intent)
         for line in lines:
             log.info(line)
         await publish_plan(rest, plan, settings)
@@ -168,8 +168,8 @@ async def guard_tick(settings: Settings, target_w: float | None) -> float:
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        charger = charger_for(settings, rest)
-        if not charger.supports_live_rate:
+        charger = inverter_device(settings, rest)
+        if Capability.CHARGE_RATE not in charger.capabilities:
             return target_w or 0.0
         if target_w is None:
             target_w = await charger.read_charge_rate()
@@ -181,7 +181,7 @@ async def guard_tick(settings: Settings, target_w: float | None) -> float:
 async def _planned_rate_w(settings: Settings, plan: ChargePlan) -> float | None:
     """The plan's charge rate (W) for the active charger, or None if unset.
 
-    ``charger_for``/``planned_rate_w`` perform no I/O; the rest client just
+    ``inverter_device``/``planned_rate_w`` perform no I/O; the rest client just
     satisfies the constructor and is closed straight away.
     """
     if plan.charge_intent is None:
@@ -189,7 +189,7 @@ async def _planned_rate_w(settings: Settings, plan: ChargePlan) -> float | None:
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        return charger_for(settings, rest).planned_rate_w(plan.charge_intent)
+        return inverter_device(settings, rest).planned_rate_w(plan.charge_intent)
 
 
 async def _charger_supports_live_rate(settings: Settings) -> bool:
@@ -197,7 +197,7 @@ async def _charger_supports_live_rate(settings: Settings) -> bool:
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        return charger_for(settings, rest).supports_live_rate
+        return Capability.CHARGE_RATE in inverter_device(settings, rest).capabilities
 
 
 async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
