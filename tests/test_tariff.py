@@ -12,12 +12,19 @@ from datetime import UTC, datetime, time, timedelta
 
 import pytest
 
-from ha_spark.config import ConfigError, Settings, validate_dynamic_tariff, validate_fixed_tariff
+from ha_spark.config import (
+    ConfigError,
+    Settings,
+    validate_dynamic_tariff,
+    validate_fixed_tariff,
+    validate_octopus_intelligent_tariff,
+)
 from ha_spark.energy.models import DispatchSlot, PlannerConfig, PlannerInputs, PricePoint
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.tariff import (
     DynamicTariffProvider,
     FixedTariffProvider,
+    OctopusIntelligentProvider,
     TariffSchedule,
     fixed_schedule,
 )
@@ -283,4 +290,94 @@ def test_validate_dynamic_rejects_missing_entity() -> None:
 def test_validate_dynamic_accepts_configured_entity() -> None:
     validate_dynamic_tariff(
         _settings(tariff_provider="dynamic", dynamic_rates_entity="event.rates")
+    )  # no raise
+
+
+# --- octopus_intelligent provider boundary (P8.5, #39) ---
+
+
+def _octopus() -> OctopusIntelligentProvider:
+    return OctopusIntelligentProvider(fallback=FixedTariffProvider(0.069, 0.30, 0.0))
+
+
+def test_octopus_intelligent_matches_fixed_dispatch_handling_without_live_prices() -> None:
+    """No live API prices (e.g. an unconfigured/failed fetch) -> byte-identical
+    to fixed, including dispatch-overlap cheap coverage and controlled windows
+    — the P8.1 golden dispatch scenarios' guarantee."""
+    dispatch = DispatchSlot(
+        start=datetime(2026, 1, 16, 13, 30, tzinfo=UTC),
+        end=datetime(2026, 1, 16, 15, 0, tzinfo=UTC),
+        charge_in_kwh=-5.2,
+        source="octopus",
+    )
+    inputs = PlannerInputs(
+        soc_now=55, solar_tomorrow_kwh=8.0, predicted_home_load_kwh=24.0,
+        load_slots=tuple(0.5 for _ in range(48)), horizon_start=HORIZON,
+        dispatches=(dispatch,),
+    )
+    a = compute_plan(inputs, cfg())
+    b = compute_plan(inputs, cfg(), _octopus().schedule(inputs, cfg()))
+    assert a == b
+
+
+def test_octopus_intelligent_overlays_live_prices_without_changing_dispatch_handling() -> None:
+    """Live API prices replace `prices`, but cheap_fracs/controlled_windows
+    (the dispatch-overlap math) stay identical to the fixed schedule."""
+    dispatch = DispatchSlot(
+        start=datetime(2026, 1, 16, 13, 30, tzinfo=UTC),
+        end=datetime(2026, 1, 16, 15, 0, tzinfo=UTC),
+    )
+    inputs = PlannerInputs(
+        soc_now=55, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+        load_slots=tuple(0.5 for _ in range(48)), horizon_start=HORIZON,
+        dispatches=(dispatch,), dynamic_prices=_points([0.08] * 48),
+    )
+    base = fixed_schedule(inputs, cfg())
+    sched = _octopus().schedule(inputs, cfg())
+    assert sched.cheap_fracs == base.cheap_fracs
+    assert sched.controlled_windows == base.controlled_windows
+    assert sched.prices == (0.08,) * 48  # live prices, not the fixed frac*rate blend
+
+
+def test_octopus_intelligent_falls_back_without_load_slots() -> None:
+    inputs = PlannerInputs(
+        soc_now=55, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+        dynamic_prices=_points([0.08] * 48),
+    )
+    assert _octopus().schedule(inputs, cfg()) == fixed_schedule(inputs, cfg())
+
+
+def test_octopus_intelligent_uncovered_slot_costs_standard_rate() -> None:
+    inputs = PlannerInputs(
+        soc_now=55, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+        load_slots=tuple(0.5 for _ in range(48)), horizon_start=HORIZON,
+        dynamic_prices=_points([0.05] * 10),
+    )
+    sched = _octopus().schedule(inputs, cfg())
+    assert sched.prices[0] == pytest.approx(0.05, abs=APPROX)
+    assert sched.prices[10] == pytest.approx(0.30, abs=APPROX)
+
+
+# --- octopus_intelligent startup validation (P8.5, #39) ---
+
+
+def test_validate_octopus_intelligent_noop_for_fixed_provider() -> None:
+    validate_octopus_intelligent_tariff(_settings())  # no raise
+
+
+def test_validate_octopus_intelligent_rejects_missing_config() -> None:
+    with pytest.raises(ConfigError) as exc:
+        validate_octopus_intelligent_tariff(_settings(tariff_provider="octopus_intelligent"))
+    assert "octopus_" in str(exc.value)
+
+
+def test_validate_octopus_intelligent_accepts_full_config() -> None:
+    validate_octopus_intelligent_tariff(
+        _settings(
+            tariff_provider="octopus_intelligent",
+            octopus_api_key="sk_test",
+            octopus_account_number="A-1234ABCD",
+            octopus_product_code="INTELLI-VAR-22-10-14",
+            octopus_tariff_code="E-1R-INTELLI-VAR-22-10-14-A",
+        )
     )  # no raise

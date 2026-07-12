@@ -75,6 +75,9 @@ _OPTION_KEYS = frozenset(
         "octopus_mpan",
         "octopus_meter_serial",
         "octopus_api_url",
+        "octopus_account_number",
+        "octopus_product_code",
+        "octopus_tariff_code",
         # Battery model fallback.
         "battery_voltage_v",
         # Entity IDs: exposed so other installs can map their own sensors/controls
@@ -185,6 +188,30 @@ def validate_dynamic_tariff(settings: Settings) -> None:
         raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
 
 
+class OctopusIntelligentTariffConfig(BaseModel):
+    """The ``octopus_intelligent`` tariff provider's settings, validated at startup."""
+
+    octopus_api_key: str = Field(min_length=1)
+    octopus_account_number: str = Field(min_length=1)
+    octopus_product_code: str = Field(min_length=1)
+    octopus_tariff_code: str = Field(min_length=1)
+
+
+def validate_octopus_intelligent_tariff(settings: Settings) -> None:
+    """When `tariff_provider` is "octopus_intelligent", require API config; else no-op."""
+    if settings.tariff_provider != "octopus_intelligent":
+        return
+    try:
+        OctopusIntelligentTariffConfig(
+            octopus_api_key=settings.octopus_api_key,
+            octopus_account_number=settings.octopus_account_number,
+            octopus_product_code=settings.octopus_product_code,
+            octopus_tariff_code=settings.octopus_tariff_code,
+        )
+    except ValidationError as exc:
+        raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
+
+
 class Settings(BaseSettings):
     """Top-level configuration for ha-spark."""
 
@@ -255,7 +282,7 @@ class Settings(BaseSettings):
     # Tariff provider: "fixed" costs against rate_offpeak/rate_peak + the charge
     # window above; "dynamic" costs each slot at its live price from an HA
     # half-hourly price sensor (falls back to fixed on a missing/bad read).
-    tariff_provider: Literal["fixed", "dynamic"] = Field(default="fixed")
+    tariff_provider: Literal["fixed", "dynamic", "octopus_intelligent"] = Field(default="fixed")
     dynamic_rates_entity: str = Field(default="")
     # Optional: a second entity for tomorrow's rates (many integrations publish
     # today/tomorrow as separate entities). Blank is fine — slots past today's
@@ -275,10 +302,18 @@ class Settings(BaseSettings):
     backfill_source_entity: str = Field(default="")
 
     # Octopus REST API (for `pull-consumption`; CSV import needs none of these).
+    # `octopus_api_key` also drives the `octopus_intelligent` tariff provider
+    # below (Kraken GraphQL auth + REST standard-unit-rates).
     octopus_api_key: str = Field(default="")
     octopus_mpan: str = Field(default="")
     octopus_meter_serial: str = Field(default="")
     octopus_api_url: str = Field(default="https://api.octopus.energy/v1")
+    # Octopus Intelligent tariff provider: account number for the GraphQL
+    # plannedDispatches query, product/tariff code for the standard-unit-rates
+    # REST endpoint (e.g. "INTELLI-VAR-22-10-14" / "E-1R-INTELLI-VAR-22-10-14-A").
+    octopus_account_number: str = Field(default="")
+    octopus_product_code: str = Field(default="")
+    octopus_tariff_code: str = Field(default="")
 
     # HA entity IDs (all overridable). Blank by default; set via `ha-spark
     # onboard` (entity auto-discovery) or the `solis` preset (ha_spark/presets.py),
@@ -423,4 +458,5 @@ def load_settings(*, validate: bool = True) -> Settings:
     if validate:
         validate_fixed_tariff(settings)
         validate_dynamic_tariff(settings)
+        validate_octopus_intelligent_tariff(settings)
     return settings

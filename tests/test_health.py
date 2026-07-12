@@ -152,6 +152,38 @@ async def test_check_tariff_provider_dynamic_unreachable_warns() -> None:
     assert res.status is Status.WARN
 
 
+def _octopus_settings() -> Settings:
+    return Settings(
+        ha_url=HA, ha_token="tok", tariff_provider="octopus_intelligent",
+        octopus_api_url="http://octo.test/v1", octopus_api_key="sk_test",
+        octopus_account_number="A-1234ABCD", octopus_product_code="INTELLI-VAR-22-10-14",
+        octopus_tariff_code="E-1R-INTELLI-VAR-22-10-14-A",
+    )
+
+
+@respx.mock
+async def test_check_tariff_provider_octopus_intelligent_ok() -> None:
+    respx.post("http://octo.test/v1/graphql/").mock(
+        side_effect=[
+            httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": "jwt-abc"}}}),
+            httpx.Response(200, json={"data": {"plannedDispatches": []}}),
+        ]
+    )
+    respx.get(url__startswith="http://octo.test/v1/products/").mock(
+        return_value=httpx.Response(200, json={"next": None, "results": []})
+    )
+    res = await check_tariff_provider(_octopus_settings())
+    assert res.status is Status.OK
+
+
+@respx.mock
+async def test_check_tariff_provider_octopus_intelligent_auth_failure_warns() -> None:
+    respx.route(url__startswith="http://octo.test").mock(return_value=httpx.Response(401))
+    res = await check_tariff_provider(_octopus_settings())
+    assert res.status is Status.WARN
+    assert "sk_test" not in res.detail
+
+
 # --- Ollama check ---
 
 
