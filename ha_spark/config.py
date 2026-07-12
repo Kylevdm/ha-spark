@@ -61,6 +61,9 @@ _OPTION_KEYS = frozenset(
         "rate_offpeak_gbp_kwh",
         "rate_peak_gbp_kwh",
         "rate_export_gbp_kwh",
+        "tariff_provider",
+        "dynamic_rates_entity",
+        "dynamic_rates_entity_tomorrow",
         "charge_efficiency",
         "solar_percentile",
         "profile_min_days",
@@ -166,6 +169,22 @@ def validate_fixed_tariff(settings: Settings) -> None:
         raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
 
 
+class DynamicTariffConfig(BaseModel):
+    """The ``dynamic`` tariff provider's settings, validated at startup."""
+
+    dynamic_rates_entity: str = Field(min_length=1)
+
+
+def validate_dynamic_tariff(settings: Settings) -> None:
+    """When `tariff_provider` is "dynamic", require a rates entity; else no-op."""
+    if settings.tariff_provider != "dynamic":
+        return
+    try:
+        DynamicTariffConfig(dynamic_rates_entity=settings.dynamic_rates_entity)
+    except ValidationError as exc:
+        raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
+
+
 class Settings(BaseSettings):
     """Top-level configuration for ha-spark."""
 
@@ -232,6 +251,16 @@ class Settings(BaseSettings):
     rate_peak_gbp_kwh: float = Field(default=0.30)
     # Export/feed-in rate (GBP/kWh); 0 disables export revenue in cost projections.
     rate_export_gbp_kwh: float = Field(default=0.0)
+
+    # Tariff provider: "fixed" costs against rate_offpeak/rate_peak + the charge
+    # window above; "dynamic" costs each slot at its live price from an HA
+    # half-hourly price sensor (falls back to fixed on a missing/bad read).
+    tariff_provider: Literal["fixed", "dynamic"] = Field(default="fixed")
+    dynamic_rates_entity: str = Field(default="")
+    # Optional: a second entity for tomorrow's rates (many integrations publish
+    # today/tomorrow as separate entities). Blank is fine — slots past today's
+    # coverage just fall back to the fixed rate.
+    dynamic_rates_entity_tomorrow: str = Field(default="")
 
     # v2 slot-profile load model (from imported Octopus half-hourly consumption).
     profile_min_days: int = Field(default=7)
@@ -393,4 +422,5 @@ def load_settings(*, validate: bool = True) -> Settings:
         )
     if validate:
         validate_fixed_tariff(settings)
+        validate_dynamic_tariff(settings)
     return settings

@@ -169,6 +169,16 @@ affecting the others.
 `rate_offpeak_gbp_kwh`, `rate_peak_gbp_kwh`, `rate_export_gbp_kwh` — used for
 the cost projection printed with each plan and by `ha-spark backtest`.
 
+`tariff_provider` selects how plans are costed: `fixed` (default) uses the
+rates above plus the charge window; `dynamic` costs each half-hour slot at its
+live price from an HA price sensor, choosing the cheapest slots as "cheap" for
+costing (the charge window itself is unchanged). Set `dynamic_rates_entity` to
+an entity whose `rates` attribute is a list of `{start, end, value_inc_vat}`
+(e.g. the BottlecapDave Octopus Energy integration's
+`event....current_day_rates`); `dynamic_rates_entity_tomorrow` is optional and
+covers tomorrow's slots the same way. A missing/bad read falls back to the
+fixed rates — `ha-spark health` reports the live provider status.
+
 ### Octopus API (optional)
 
 `octopus_api_key`, `octopus_mpan`, `octopus_meter_serial` enable

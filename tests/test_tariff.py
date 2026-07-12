@@ -1,4 +1,4 @@
-"""Tariff schedule contract tests (P8.2, #36).
+"""Tariff schedule contract tests (P8.2 #36, P8.4 #38).
 
 Two seams: the provider boundary (config in, schedule out) and the planner
 boundary (inputs + a synthetic schedule in, plan choice + costs out). The
@@ -8,14 +8,19 @@ test_golden_baseline.py.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 
 import pytest
 
-from ha_spark.config import ConfigError, Settings, validate_fixed_tariff
-from ha_spark.energy.models import DispatchSlot, PlannerConfig, PlannerInputs
+from ha_spark.config import ConfigError, Settings, validate_dynamic_tariff, validate_fixed_tariff
+from ha_spark.energy.models import DispatchSlot, PlannerConfig, PlannerInputs, PricePoint
 from ha_spark.energy.planner import compute_plan
-from ha_spark.energy.tariff import FixedTariffProvider, TariffSchedule, fixed_schedule
+from ha_spark.energy.tariff import (
+    DynamicTariffProvider,
+    FixedTariffProvider,
+    TariffSchedule,
+    fixed_schedule,
+)
 
 APPROX = 1e-9
 HORIZON = datetime(2026, 1, 15, 23, 30, tzinfo=UTC)
@@ -158,3 +163,124 @@ def test_validate_rejects_bad_window_naming_field() -> None:
 
 def test_validate_accepts_defaults() -> None:
     validate_fixed_tariff(_settings())  # no raise
+
+
+# --- dynamic provider boundary (P8.4, #38) ---
+
+
+def _points(prices: list[float]) -> tuple[PricePoint, ...]:
+    """One PricePoint per half-hour slot from ``HORIZON``, in order."""
+    return tuple(
+        PricePoint(
+            start=HORIZON + timedelta(minutes=30 * i),
+            end=HORIZON + timedelta(minutes=30 * (i + 1)),
+            price=p,
+        )
+        for i, p in enumerate(prices)
+    )
+
+
+def _dynamic_inputs(prices: list[float], *, load_slots: bool = True) -> PlannerInputs:
+    return PlannerInputs(
+        soc_now=55, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+        load_slots=tuple(0.5 for _ in range(48)) if load_slots else None,
+        horizon_start=HORIZON,
+        dynamic_prices=_points(prices),
+    )
+
+
+def _dynamic() -> DynamicTariffProvider:
+    return DynamicTariffProvider(fallback=FixedTariffProvider(0.069, 0.30, 0.0))
+
+
+def test_dynamic_provider_falls_back_without_load_slots() -> None:
+    """No v2 slot horizon -> identical to the fixed schedule (daily model)."""
+    inputs = _dynamic_inputs([0.1] * 48, load_slots=False)
+    assert _dynamic().schedule(inputs, cfg()) == fixed_schedule(inputs, cfg())
+
+
+def test_dynamic_provider_still_honours_daytime_dispatches() -> None:
+    """A daytime Octopus dispatch becomes a controlled window under `dynamic` too."""
+    day = DispatchSlot(
+        start=datetime(2026, 1, 16, 13, 0, tzinfo=UTC),
+        end=datetime(2026, 1, 16, 14, 30, tzinfo=UTC),
+    )
+    inputs = PlannerInputs(
+        soc_now=55, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+        load_slots=tuple(0.5 for _ in range(48)), horizon_start=HORIZON,
+        dynamic_prices=_points([0.1] * 48), dispatches=(day,),
+    )
+    sched = _dynamic().schedule(inputs, cfg())
+    assert sched.controlled_windows == ((day.start, day.end),)
+
+
+def test_dynamic_provider_falls_back_without_prices() -> None:
+    """No live prices at all (unread/empty sensor) -> falls back to fixed."""
+    inputs = PlannerInputs(
+        soc_now=55, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+        load_slots=tuple(0.5 for _ in range(48)), horizon_start=HORIZON,
+    )
+    assert _dynamic().schedule(inputs, cfg()) == fixed_schedule(inputs, cfg())
+
+
+def test_dynamic_provider_marks_cheapest_slots_as_cheap() -> None:
+    """The window_hours-worth of cheapest live-priced slots become cheap_frac=1.0,
+    wherever they fall — not just the first 12 slots (the old fixed window)."""
+    prices = [0.30] * 48
+    cheap_indices = range(20, 32)  # 12 slots (6h window) away from slot 0
+    for i in cheap_indices:
+        prices[i] = 0.05
+    sched = _dynamic().schedule(_dynamic_inputs(prices), cfg())
+    assert sched.prices == tuple(prices)
+    for i in range(48):
+        expected = 1.0 if i in cheap_indices else 0.0
+        assert sched.cheap_fracs[i] == expected, i
+    # The old fixed-window slots (0-11) are no longer flagged cheap.
+    assert sched.cheap_fracs[:12] == (0.0,) * 12
+
+
+def test_dynamic_provider_uncovered_slot_costs_standard_rate() -> None:
+    """A slot with no live price (partial sensor read) costs at the standard rate."""
+    inputs = PlannerInputs(
+        soc_now=55, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+        load_slots=tuple(0.5 for _ in range(48)), horizon_start=HORIZON,
+        dynamic_prices=_points([0.05] * 10),  # only the first 10 slots are covered
+    )
+    sched = _dynamic().schedule(inputs, cfg())
+    assert sched.prices[10] == pytest.approx(0.30, abs=APPROX)
+    assert sched.prices[0] == pytest.approx(0.05, abs=APPROX)
+
+
+def test_dynamic_schedule_places_charge_in_the_cheapest_slots() -> None:
+    """Planner integration: load sitting on the genuinely cheapest slots is
+    cheap-covered, even though those slots aren't the (old) fixed window."""
+    prices = [0.30] * 48
+    cheap_indices = range(20, 32)
+    for i in cheap_indices:
+        prices[i] = 0.05
+    inputs = _dynamic_inputs(prices)
+    sched = _dynamic().schedule(inputs, cfg())
+    plan = compute_plan(inputs, cfg(), sched)
+    # Net load in the 12 genuinely-cheapest slots (0.5 kWh * 12) is cheap-covered;
+    # the rest (36 slots) is expensive.
+    assert plan.expensive_load_kwh == pytest.approx(0.5 * 36, abs=APPROX)
+    assert plan.baseline_cost == pytest.approx(0.5 * 12 * 0.05 + 0.5 * 36 * 0.30, abs=APPROX)
+
+
+# --- dynamic startup validation (P8.4, #38) ---
+
+
+def test_validate_dynamic_noop_for_fixed_provider() -> None:
+    validate_dynamic_tariff(_settings())  # tariff_provider defaults to "fixed"; no raise
+
+
+def test_validate_dynamic_rejects_missing_entity() -> None:
+    with pytest.raises(ConfigError) as exc:
+        validate_dynamic_tariff(_settings(tariff_provider="dynamic"))
+    assert "dynamic_rates_entity" in str(exc.value)
+
+
+def test_validate_dynamic_accepts_configured_entity() -> None:
+    validate_dynamic_tariff(
+        _settings(tariff_provider="dynamic", dynamic_rates_entity="event.rates")
+    )  # no raise

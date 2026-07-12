@@ -14,9 +14,15 @@ from ha_spark.energy.models import (
     LoadForecast,
     PlannerConfig,
     PlannerInputs,
+    PricePoint,
 )
 from ha_spark.energy.solar import distribute_solar
-from ha_spark.energy.tariff import _in_overnight_window
+from ha_spark.energy.tariff import (
+    DynamicTariffProvider,
+    FixedTariffProvider,
+    TariffSchedule,
+    _in_overnight_window,
+)
 from ha_spark.ha.models import EntityState
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
@@ -65,6 +71,24 @@ def _parse_dispatches(raw: Any) -> tuple[DispatchSlot, ...]:
             )
         )
     return tuple(slots)
+
+
+def _parse_price_points(raw: Any) -> tuple[PricePoint, ...]:
+    """Tolerantly parse a rates-array attribute: [{start, end, value_inc_vat|value}, ...]."""
+    points: list[PricePoint] = []
+    for r in raw or []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            start = datetime.fromisoformat(str(r["start"]))
+            end = datetime.fromisoformat(str(r["end"]))
+        except (KeyError, ValueError, TypeError):
+            continue
+        price = _opt_float(r.get("value_inc_vat", r.get("value")))
+        if price is None:
+            continue
+        points.append(PricePoint(start, end, price))
+    return tuple(points)
 
 
 def _parse_detailed_forecast(
@@ -167,6 +191,18 @@ def build_config(
     )
 
 
+def build_schedule(
+    settings: Settings, inputs: PlannerInputs, cfg: PlannerConfig
+) -> TariffSchedule:
+    """Build the configured tariff provider's schedule for this plan."""
+    fixed = FixedTariffProvider(
+        cheap_rate=cfg.rate_offpeak, standard_rate=cfg.rate_peak, export_rate=cfg.rate_export
+    )
+    if settings.tariff_provider == "dynamic":
+        return DynamicTariffProvider(fallback=fixed).schedule(inputs, cfg)
+    return fixed.schedule(inputs, cfg)
+
+
 async def gather_inputs(
     settings: Settings, rest: HomeAssistantRest
 ) -> tuple[PlannerInputs, PlannerConfig, str]:
@@ -191,6 +227,19 @@ async def gather_inputs(
         dispatch.attributes.get("planned_dispatches") if dispatch else None
     )
     ev_charging = bool(ev_status and str(ev_status.state).lower() in _EV_ACTIVE)
+
+    dynamic_prices: tuple[PricePoint, ...] = ()
+    if settings.tariff_provider == "dynamic" and settings.dynamic_rates_entity:
+        today = await state(settings.dynamic_rates_entity)
+        points = list(_parse_price_points(today.attributes.get("rates") if today else None))
+        if settings.dynamic_rates_entity_tomorrow:
+            rates_tomorrow = await state(settings.dynamic_rates_entity_tomorrow)
+            points.extend(
+                _parse_price_points(
+                    rates_tomorrow.attributes.get("rates") if rates_tomorrow else None
+                )
+            )
+        dynamic_prices = tuple(sorted(points, key=lambda p: p.start))
 
     lat, lon = settings.latitude, settings.longitude
     if lat is None or lon is None:
@@ -243,6 +292,7 @@ async def gather_inputs(
         load_slots=load_slots,
         solar_slots=solar_slots,
         horizon_start=horizon_start,
+        dynamic_prices=dynamic_prices,
     )
     # Dynamic buffer: when the quantile ML forecast drives the plan, replace the
     # fixed margin with the model's own uncertainty, (P90 - P50) / P50.

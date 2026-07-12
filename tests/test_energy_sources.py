@@ -12,7 +12,8 @@ import respx
 from ha_spark.config import Settings
 from ha_spark.energy import sources
 from ha_spark.energy.models import LoadForecast
-from ha_spark.energy.sources import gather_inputs, pre_window_drain
+from ha_spark.energy.sources import build_schedule, gather_inputs, pre_window_drain
+from ha_spark.energy.tariff import fixed_schedule
 from ha_spark.ha.rest import HomeAssistantRest
 
 BASE = "http://ha.test/api"
@@ -262,3 +263,135 @@ async def test_explicit_coordinates_override_ha_config(
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         await gather_inputs(s, rest)
     assert seen == {"lat": 55.9, "lon": -3.2}
+
+
+# --- dynamic-tariff price sensor reads (P8.4, #38) ---
+
+
+def _dynamic_settings(**kw: Any) -> Settings:
+    base: dict[str, Any] = dict(
+        ha_url="http://ha.test", ha_token="t",
+        tariff_provider="dynamic", dynamic_rates_entity="event.rates_today",
+    )
+    base.update(kw)
+    return Settings(**base)
+
+
+@respx.mock
+async def test_gather_inputs_parses_dynamic_rates(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.get(f"{BASE}/states/event.rates_today").mock(
+        return_value=_state(
+            "event.rates_today",
+            "2026-06-08T00:00:00+00:00",
+            {
+                "rates": [
+                    {"start": "2026-06-08T00:00:00+00:00", "end": "2026-06-08T00:30:00+00:00",
+                     "value_inc_vat": 0.12},
+                    {"start": "2026-06-08T00:30:00+00:00", "end": "2026-06-08T01:00:00+00:00",
+                     "value_inc_vat": 0.09},
+                ]
+            },
+        )
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = _dynamic_settings()
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, _cfg, _src = await gather_inputs(s, rest)
+    assert [p.price for p in inputs.dynamic_prices] == [0.12, 0.09]
+
+
+@respx.mock
+async def test_gather_inputs_merges_today_and_tomorrow_rates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.get(f"{BASE}/states/event.rates_today").mock(
+        return_value=_state(
+            "event.rates_today", "x",
+            {"rates": [{"start": "2026-06-08T00:00:00+00:00", "end": "2026-06-08T00:30:00+00:00",
+                        "value_inc_vat": 0.20}]},
+        )
+    )
+    respx.get(f"{BASE}/states/event.rates_tomorrow").mock(
+        return_value=_state(
+            "event.rates_tomorrow", "x",
+            {"rates": [{"start": "2026-06-09T00:00:00+00:00", "end": "2026-06-09T00:30:00+00:00",
+                        "value_inc_vat": 0.05}]},
+        )
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = _dynamic_settings(dynamic_rates_entity_tomorrow="event.rates_tomorrow")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, _cfg, _src = await gather_inputs(s, rest)
+    # Sorted by start: today's slot, then tomorrow's.
+    assert [p.price for p in inputs.dynamic_prices] == [0.20, 0.05]
+
+
+@respx.mock
+async def test_gather_inputs_tolerates_malformed_rates(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.get(f"{BASE}/states/event.rates_today").mock(
+        return_value=_state(
+            "event.rates_today", "x",
+            {"rates": [
+                "not-a-dict",
+                {"start": "bad-timestamp", "end": "also-bad", "value_inc_vat": 0.1},
+                {"start": "2026-06-08T00:00:00+00:00", "end": "2026-06-08T00:30:00+00:00"},
+            ]},
+        )
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = _dynamic_settings()
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, _cfg, _src = await gather_inputs(s, rest)
+    assert inputs.dynamic_prices == ()
+
+
+@respx.mock
+async def test_gather_inputs_dynamic_unavailable_sensor_degrades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = _dynamic_settings()
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, cfg, _src = await gather_inputs(s, rest)
+    assert inputs.dynamic_prices == ()
+    # Never blocks a plan: the schedule falls back to fixed.
+    assert build_schedule(s, inputs, cfg) == fixed_schedule(inputs, cfg)
+
+
+async def test_gather_inputs_skips_dynamic_fetch_when_fixed_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No dynamic_rates_entity fetch at all when tariff_provider isn't "dynamic"."""
+
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    with respx.mock:
+        respx.route(method="GET").mock(return_value=httpx.Response(404))
+        s = Settings(
+            ha_url="http://ha.test", ha_token="t", dynamic_rates_entity="event.rates_today"
+        )
+        async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+            inputs, _cfg, _src = await gather_inputs(s, rest)
+        assert inputs.dynamic_prices == ()

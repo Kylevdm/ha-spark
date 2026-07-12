@@ -5,9 +5,10 @@ planner: per-slot import prices and supplier-controlled cheap fractions over the
 horizon, plus the daytime controlled windows the battery holds through, plus the
 representative rates the daily-balance model and charge-purchase costing use.
 
-Only the ``fixed`` provider ships in this slice; it reproduces the legacy
-fixed-window two-rate behaviour exactly (the golden baseline pins this). Later
-slices add ``dynamic`` (HA price sensor) and ``octopus_intelligent`` providers
+The ``fixed`` provider reproduces the legacy fixed-window two-rate behaviour
+exactly (the golden baseline pins this). ``dynamic`` costs each slot at its
+live price from an HA half-hourly price sensor, falling back to ``fixed``
+whenever there's no usable live read. A later slice adds ``octopus_intelligent``
 behind the same protocol.
 """
 
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, time
 from typing import Protocol
 
-from ha_spark.energy.models import DispatchSlot, PlannerConfig, PlannerInputs
+from ha_spark.energy.models import DispatchSlot, PlannerConfig, PlannerInputs, PricePoint
 
 
 def _in_overnight_window(t: time, start: time, end: time) -> bool:
@@ -86,6 +87,18 @@ class TariffProvider(Protocol):
     def schedule(self, inputs: PlannerInputs, cfg: PlannerConfig) -> TariffSchedule: ...
 
 
+def _controlled_windows(
+    dispatches: tuple[DispatchSlot, ...], window_start: time, window_end: time
+) -> tuple[tuple[datetime, datetime], ...]:
+    """Daytime dispatches (outside the overnight window) become controlled windows
+    the battery holds through; night dispatches fold into cheap coverage instead."""
+    return tuple(
+        (d.start, d.end)
+        for d in dispatches
+        if not _in_overnight_window(d.start.time(), window_start, window_end)
+    )
+
+
 @dataclass(frozen=True)
 class FixedTariffProvider:
     """Legacy fixed-window two-rate tariff: off-peak inside the window/dispatches."""
@@ -95,14 +108,7 @@ class FixedTariffProvider:
     export_rate: float
 
     def schedule(self, inputs: PlannerInputs, cfg: PlannerConfig) -> TariffSchedule:
-        # Daytime dispatches (outside the overnight window) become controlled
-        # windows the battery holds through; night dispatches fold into the
-        # window's cheap coverage via the per-slot fractions below.
-        controlled = tuple(
-            (d.start, d.end)
-            for d in inputs.dispatches
-            if not _in_overnight_window(d.start.time(), cfg.window_start, cfg.window_end)
-        )
+        controlled = _controlled_windows(inputs.dispatches, cfg.window_start, cfg.window_end)
         prices: tuple[float, ...] = ()
         cheap_fracs: tuple[float, ...] = ()
         if inputs.load_slots is not None:
@@ -131,3 +137,60 @@ def fixed_schedule(inputs: PlannerInputs, cfg: PlannerConfig) -> TariffSchedule:
         standard_rate=cfg.rate_peak,
         export_rate=cfg.rate_export,
     ).schedule(inputs, cfg)
+
+
+def _slot_prices_from_points(
+    n_slots: int, horizon_start: datetime | None, points: tuple[PricePoint, ...]
+) -> list[float | None]:
+    """Per-slot live price via time overlap with ``points``; ``None`` where uncovered."""
+    prices: list[float | None] = [None] * n_slots
+    if horizon_start is None:
+        return prices
+    for pt in points:
+        a = _hours_since(horizon_start, pt.start)
+        b = _hours_since(horizon_start, pt.end)
+        for i in range(n_slots):
+            slot_start, slot_end = i * 0.5, (i + 1) * 0.5
+            if max(a, slot_start) < min(b, slot_end):
+                prices[i] = pt.price
+    return prices
+
+
+@dataclass(frozen=True)
+class DynamicTariffProvider:
+    """Half-hourly HA price-sensor tariff: costs each slot at its live price.
+
+    The physical charge window stays ``cfg.window_start``/``window_end`` (a
+    later ticket may change that); this provider only re-derives which slots
+    count as "cheap" for costing — the ``window_hours``-worth of slots with the
+    lowest live price, instead of a fixed clock window. Falls back to
+    ``fallback`` (the fixed schedule) whenever there's no v2 slot horizon or no
+    usable live price for any slot — a sensor hiccup degrades a plan, it never
+    blocks one.
+    """
+
+    fallback: FixedTariffProvider
+
+    def schedule(self, inputs: PlannerInputs, cfg: PlannerConfig) -> TariffSchedule:
+        if inputs.load_slots is None or not inputs.dynamic_prices:
+            return self.fallback.schedule(inputs, cfg)
+        n = len(inputs.load_slots)
+        raw_prices = _slot_prices_from_points(n, inputs.horizon_start, inputs.dynamic_prices)
+        if not any(p is not None for p in raw_prices):
+            return self.fallback.schedule(inputs, cfg)
+        # ponytail: an uncovered slot (partial sensor read) costs at the
+        # standard rate rather than being guessed at.
+        prices = [p if p is not None else self.fallback.standard_rate for p in raw_prices]
+        n_window = int(cfg.window_hours * 2)
+        cheapest = set(sorted(range(n), key=lambda i: prices[i])[:n_window])
+        cheap_fracs = tuple(1.0 if i in cheapest else 0.0 for i in range(n))
+        controlled = _controlled_windows(inputs.dispatches, cfg.window_start, cfg.window_end)
+        return TariffSchedule(
+            cheap_rate=self.fallback.cheap_rate,
+            standard_rate=self.fallback.standard_rate,
+            export_rate=self.fallback.export_rate,
+            window_hours=cfg.window_hours,
+            prices=tuple(prices),
+            cheap_fracs=cheap_fracs,
+            controlled_windows=controlled,
+        )
