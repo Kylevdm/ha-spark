@@ -12,8 +12,8 @@ import respx
 
 from ha_spark.api.server import AppState
 from ha_spark.config import Settings
+from ha_spark.devices import inverter_device
 from ha_spark.energy import scheduler, sources
-from ha_spark.energy.chargers import charger_for
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, LoadForecast
@@ -47,7 +47,7 @@ def _plan(intent: ChargeIntent = _INTENT) -> ChargePlan:
 def _planned_w(settings: Settings, intent: ChargeIntent) -> float:
     """The watts the active charger plans for ``intent`` (pure)."""
     rest = HomeAssistantRest(settings.ha_rest_url, settings.auth_token)
-    return charger_for(settings, rest).planned_rate_w(intent)
+    return inverter_device(settings, rest).planned_rate_w(intent)
 
 
 def test_should_run_at_or_after_run_time_once_per_day() -> None:

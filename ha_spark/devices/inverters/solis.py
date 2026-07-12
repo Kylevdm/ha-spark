@@ -8,12 +8,16 @@ and reads back to confirm the device took it.
 """
 from __future__ import annotations
 
-from ha_spark.config import DeviceConfig, Settings
+from typing import TYPE_CHECKING
+
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
 from ha_spark.devices.registry import register
 from ha_spark.energy.models import ChargeIntent, window_hours
-from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
+
+if TYPE_CHECKING:  # avoid an import cycle: config imports devices.base at runtime
+    from ha_spark.config import DeviceConfig, Settings
+    from ha_spark.ha.rest import HomeAssistantRest
 
 log = get_logger(__name__)
 

@@ -6,6 +6,8 @@ import httpx
 import respx
 
 from ha_spark.config import Settings
+from ha_spark.devices import inverter_device
+from ha_spark.devices.base import Capability
 from ha_spark.energy.scheduler import guard_tick
 from ha_spark.energy.supply_guard import SupplyGuard, throttled_rate_w
 from ha_spark.ha.rest import HomeAssistantRest
@@ -168,3 +170,9 @@ async def test_guard_dormant_when_no_live_rate() -> None:
     assert out == 5000.0
     assert posts.call_count == 0
     assert gets.call_count == 0
+
+
+def test_guard_dormant_for_inverter_without_rate() -> None:
+    s = _guard_settings(inverter="alphaess")
+    rest = HomeAssistantRest("http://ha.test", "tok")
+    assert Capability.CHARGE_RATE not in inverter_device(s, rest).capabilities
