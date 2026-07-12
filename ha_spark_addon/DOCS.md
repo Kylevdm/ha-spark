@@ -170,7 +170,8 @@ affecting the others.
 the cost projection printed with each plan and by `ha-spark backtest`.
 
 `tariff_provider` selects how plans are costed: `fixed` (default) uses the
-rates above plus the charge window; `dynamic` costs each half-hour slot at its
+rates above plus the charge window — this is the provider every existing
+install is already on, so upgrading needs no config changes; `dynamic` costs each half-hour slot at its
 live price from an HA price sensor, choosing the cheapest slots as "cheap" for
 costing (the charge window itself is unchanged). Set `dynamic_rates_entity` to
 an entity whose `rates` attribute is a list of `{start, end, value_inc_vat}`
