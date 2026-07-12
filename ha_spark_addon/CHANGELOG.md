@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.0
+
+- Device-driver core (Phase 7): inverter adapters now live in a `devices/`
+  driver package behind a registry, each advertising a `Capability` set, and
+  every controllable device carries a `control` authority
+  (`observe | ha_spark | supplier`). A real write now requires BOTH
+  `control: ha_spark` and `proactive_mode: on` — `observe`/`supplier` compute
+  and log (`[OBSERVE]`) but never actuate. Config gains a structured `devices:`
+  list; existing flat setups are migrated in memory automatically (no config
+  change needed, options.json is never rewritten). The agent surface's
+  `get_state` now reports each device's control authority. No behaviour change
+  for the existing Solis install.
+- (Back-note) The multi-inverter charge contract (`ChargeIntent`, the
+  inverter selector, the AlphaESS adapter) landed in an earlier build without a
+  changelog entry; it is the foundation this phase formalises.
+
 ## 0.13.0
 
 - Agent surface: ha-spark now exposes its data and a few gated actions to an
