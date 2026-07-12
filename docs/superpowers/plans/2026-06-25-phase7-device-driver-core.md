@@ -24,7 +24,7 @@ Most tasks are mechanical and run on **Sonnet**. **Task 3 is judgment-heavy (con
 - **Quality gates (all green before each commit):** `ruff check .`, `mypy ha_spark`, `pytest -q`.
 - **Import discipline (avoid cycles):** `config.py` imports **only** `ha_spark.devices.base` (for `ControlAuthority`), never `ha_spark.devices` (the package `__init__`). `devices/base.py` imports `ChargeIntent` under `TYPE_CHECKING` only. `energy/models.py` must not import `config`.
 - **Zero behaviour change** for the existing flat-config Solis install: the relocated adapters must produce byte-identical actuation; the existing `test_chargers.py` assertion *values* are preserved (only import paths / constructor calls / capability checks change).
-- Next shipped add-on version is **0.14.0**; every shipped `config.yaml` version needs a matching annotated `vX.Y.Z` tag.
+- Next shipped add-on version is **1.0.0**; every shipped `config.yaml` version needs a matching annotated `vX.Y.Z` tag.
 
 ## File Structure
 
@@ -39,7 +39,7 @@ Most tasks are mechanical and run on **Sonnet**. **Task 3 is judgment-heavy (con
 - Modify `ha_spark/energy/scheduler.py` — resolve the inverter via `inverter_device()`; capability check replaces `supports_live_rate`.
 - Modify `ha_spark/energy/supply_guard.py` — resolve via `inverter_device()`.
 - Modify `ha_spark/agent/tools.py` — `get_state` reports each device's `control` (read-only).
-- Modify `ha_spark_addon/config.yaml` — `version: 0.14.0`, `devices` option + schema.
+- Modify `ha_spark_addon/config.yaml` — `version: 1.0.0`, `devices` option + schema.
 - Modify `ha_spark_addon/CHANGELOG.md`, `ha_spark_addon/DOCS.md`.
 - Tests: `tests/test_devices.py` (new), `tests/test_chargers.py` (update imports/ctors), `tests/test_config.py` (sync-parser fix + shim tests), `tests/test_supply_guard.py` (capability gating), `tests/test_agent_routes.py` (control reported).
 
@@ -838,7 +838,7 @@ git commit -m "feat(agent): get_state reports each device's control authority (r
 **Model:** Sonnet.
 
 **Files:**
-- Modify: `ha_spark_addon/config.yaml` (`version: "0.14.0"`)
+- Modify: `ha_spark_addon/config.yaml` (`version: "1.0.0"`)
 - Modify: `ha_spark_addon/CHANGELOG.md`
 - Modify: `ha_spark_addon/DOCS.md`
 
@@ -846,12 +846,12 @@ git commit -m "feat(agent): get_state reports each device's control authority (r
 
 - [ ] **Step 1: Bump the version**
 
-In `ha_spark_addon/config.yaml`: `version: "0.14.0"`.
+In `ha_spark_addon/config.yaml`: `version: "1.0.0"`.
 
 - [ ] **Step 2: Add the CHANGELOG entry (top of file)**
 
 ```markdown
-## 0.14.0
+## 1.0.0
 
 - Device-driver core (Phase 7): inverter adapters now live in a `devices/`
   driver package behind a registry, each advertising a `Capability` set, and
@@ -884,10 +884,10 @@ Expected: all PASS (notably `test_addon_schema_covers_all_option_keys`).
 
 ```bash
 git add ha_spark_addon/config.yaml ha_spark_addon/CHANGELOG.md ha_spark_addon/DOCS.md
-git commit -m "chore(addon): ship device-driver core in 0.14.0 (changelog, docs, version)"
+git commit -m "chore(addon): ship device-driver core in 1.0.0 (changelog, docs, version)"
 ```
 
-> **Release (do NOT do automatically — confirm with the user):** per CLAUDE.md, after merge to `master` the add-on needs an annotated `v0.14.0` tag pushed (`git tag -a v0.14.0 -m ... && git push origin v0.14.0`) and a GitHub release, or the image won't build. Sequence: bump on master → tag → push branch + tag.
+> **Release (do NOT do automatically — confirm with the user):** per CLAUDE.md, after merge to `master` the add-on needs an annotated `v1.0.0` tag pushed (`git tag -a v1.0.0 -m ... && git push origin v1.0.0`) and a GitHub release, or the image won't build. Sequence: bump on master → tag → push branch + tag.
 
 ---
 
@@ -905,7 +905,7 @@ git commit -m "chore(addon): ship device-driver core in 0.14.0 (changelog, docs,
 - chargers.py re-export shim for one release → Tasks 4–6. ✓
 - Agent reports `control` read-only, no write tool → Task 7. ✓
 - Characterization preserved / zero behaviour change → Task 4 (existing assertions kept). ✓
-- Packaging 0.14.0 + contract back-note → Task 8. ✓
+- Packaging 1.0.0 + contract back-note → Task 8. ✓
 
 **Placeholder scan:** Test bodies in Tasks 4/6/7 say "adapt to the file's existing fixtures" rather than reprinting unseen respx/fixture scaffolding — intentional, because those helpers already exist in the target test files; the *assertions* are concrete. No TBD/TODO in implementation code.
 
