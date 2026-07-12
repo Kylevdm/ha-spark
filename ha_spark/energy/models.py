@@ -159,6 +159,8 @@ class ChargePlan:
     soc_valid: bool = True  # False -> SoC sensor unreadable; block real writes
     model: str = "daily"  # "slots" (per-slot horizon) | "daily" (v1 balance)
     expensive_load_kwh: float | None = None  # net load in peak-rate slots (slot model)
+    # Per-slot import price (£/kWh) the planner costed against (slot model only).
+    slot_prices: tuple[float, ...] | None = None
     baseline_cost: float | None = None  # projected GBP without battery
     planned_cost: float | None = None  # projected GBP with this plan
     charge_efficiency: float = 1.0  # round-trip efficiency used for sizing

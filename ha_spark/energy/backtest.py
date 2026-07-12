@@ -13,7 +13,7 @@ from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from ha_spark.energy.models import ConsumptionInterval
-from ha_spark.energy.planner import _in_overnight_window
+from ha_spark.energy.tariff import _in_overnight_window
 
 
 @dataclass(frozen=True)

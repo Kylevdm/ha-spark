@@ -15,8 +15,8 @@ from ha_spark.energy.models import (
     PlannerConfig,
     PlannerInputs,
 )
-from ha_spark.energy.planner import _in_overnight_window
 from ha_spark.energy.solar import distribute_solar
+from ha_spark.energy.tariff import _in_overnight_window
 from ha_spark.ha.models import EntityState
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
