@@ -9,10 +9,15 @@ import pytest
 
 from ha_spark.energy.backtest import backtest_cost, format_backtest
 from ha_spark.energy.models import ConsumptionInterval
+from ha_spark.energy.tariff import TariffSchedule
 
 UTC_TZ = ZoneInfo("UTC")
 WINDOW = {"window_start": time(23, 30), "window_end": time(5, 30)}
-RATES = {"rate_offpeak": 0.10, "rate_peak": 0.30}
+SCHEDULE = {
+    "schedule": TariffSchedule(
+        cheap_rate=0.10, standard_rate=0.30, export_rate=0.0, window_hours=6.0
+    )
+}
 
 
 def _iv(start: datetime, kwh: float) -> ConsumptionInterval:
@@ -25,7 +30,7 @@ def test_backtest_classifies_window_with_midnight_wrap() -> None:
         _iv(datetime(2026, 6, 2, 3, 0, tzinfo=UTC), 2.0),  # in window (after midnight)
         _iv(datetime(2026, 6, 2, 12, 0, tzinfo=UTC), 4.0),  # peak
     ]
-    s = backtest_cost(intervals, tz=UTC_TZ, **WINDOW, **RATES)
+    s = backtest_cost(intervals, tz=UTC_TZ, **WINDOW, **SCHEDULE)
     assert s is not None
     assert s.offpeak_kwh == pytest.approx(3.0)
     assert s.peak_kwh == pytest.approx(4.0)
@@ -41,19 +46,19 @@ def test_backtest_classifies_window_with_midnight_wrap() -> None:
 def test_backtest_uses_local_time_for_classification() -> None:
     # 22:45 UTC is 23:45 in London (BST) — inside the window locally.
     interval = _iv(datetime(2026, 6, 1, 22, 45, tzinfo=UTC), 1.0)
-    s = backtest_cost([interval], tz=ZoneInfo("Europe/London"), **WINDOW, **RATES)
+    s = backtest_cost([interval], tz=ZoneInfo("Europe/London"), **WINDOW, **SCHEDULE)
     assert s is not None
     assert s.offpeak_kwh == pytest.approx(1.0)
     assert s.peak_kwh == 0.0
 
 
 def test_backtest_empty_returns_none() -> None:
-    assert backtest_cost([], tz=UTC_TZ, **WINDOW, **RATES) is None
+    assert backtest_cost([], tz=UTC_TZ, **WINDOW, **SCHEDULE) is None
 
 
 def test_format_backtest_renders_totals() -> None:
     s = backtest_cost(
-        [_iv(datetime(2026, 6, 2, 12, 0, tzinfo=UTC), 4.0)], tz=UTC_TZ, **WINDOW, **RATES
+        [_iv(datetime(2026, 6, 2, 12, 0, tzinfo=UTC), 4.0)], tz=UTC_TZ, **WINDOW, **SCHEDULE
     )
     assert s is not None
     out = format_backtest(s)

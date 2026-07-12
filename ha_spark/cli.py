@@ -25,7 +25,7 @@ from ha_spark.energy.context import KINDS, ContextStore
 from ha_spark.energy.eval import actual_kwh_by_date, evaluate, format_eval
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
-from ha_spark.energy.models import ConsumptionInterval
+from ha_spark.energy.models import ConsumptionInterval, window_hours
 from ha_spark.energy.octopus import OctopusApiError, fetch_consumption, parse_octopus_csv
 from ha_spark.energy.onboarding import (
     BACKFILL_STATISTIC_ID,
@@ -38,6 +38,7 @@ from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever, run_once
 from ha_spark.energy.sources import gather_inputs, parse_time
 from ha_spark.energy.store import ConsumptionStore
+from ha_spark.energy.tariff import TariffSchedule
 from ha_spark.ha.models import StateChangedEvent
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.state_cache import StateCache
@@ -292,12 +293,19 @@ async def _cmd_backtest(settings: Settings, *, days: int) -> int:
     since = datetime.now(UTC) - timedelta(days=days)
     async with ConsumptionStore(settings.db_path) as store:
         intervals = await store.load_since(since)
+    window_start = parse_time(settings.charge_window_start)
+    window_end = parse_time(settings.charge_window_end)
+    schedule = TariffSchedule(
+        cheap_rate=settings.rate_offpeak_gbp_kwh,
+        standard_rate=settings.rate_peak_gbp_kwh,
+        export_rate=settings.rate_export_gbp_kwh,
+        window_hours=window_hours(window_start, window_end),
+    )
     summary = backtest_cost(
         intervals,
-        window_start=parse_time(settings.charge_window_start),
-        window_end=parse_time(settings.charge_window_end),
-        rate_offpeak=settings.rate_offpeak_gbp_kwh,
-        rate_peak=settings.rate_peak_gbp_kwh,
+        window_start=window_start,
+        window_end=window_end,
+        schedule=schedule,
         tz=load_timezone(settings.timezone),
     )
     if summary is None:
