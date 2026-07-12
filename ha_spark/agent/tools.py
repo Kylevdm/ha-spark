@@ -11,7 +11,7 @@ import dataclasses
 from datetime import UTC, date, datetime
 
 from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ha_spark.config import Settings
 from ha_spark.energy.context import ContextStore
@@ -30,6 +30,8 @@ class PlanResult(BaseModel):
 
 class StateResult(BaseModel):
     inputs: dict[str, object]
+    # {id, type, driver, control} per configured device — no entity IDs/secrets.
+    devices: list[dict[str, str]] = Field(default_factory=list)
 
 
 class ForecastResult(BaseModel):
@@ -70,7 +72,11 @@ async def get_state(settings: Settings) -> StateResult:
         inputs, _cfg, _src = await gather_inputs(settings, rest)
     data = jsonable_encoder(dataclasses.asdict(inputs))
     data.pop("load_slots", None)  # large; available via get_forecast
-    return StateResult(inputs=data)
+    devices = [
+        {"id": d.id, "type": d.type, "driver": d.driver, "control": d.control.value}
+        for d in settings.devices
+    ]
+    return StateResult(inputs=data, devices=devices)
 
 
 async def get_forecast(settings: Settings) -> ForecastResult:
