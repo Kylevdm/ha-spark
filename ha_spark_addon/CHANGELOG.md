@@ -1,6 +1,8 @@
 # Changelog
 
-## 1.0.0
+## 1.0.0-rc1
+
+Release candidate for 1.0.0 — pre-release for testing before promotion.
 
 - Device-driver core (Phase 7): inverter adapters now live in a `devices/`
   driver package behind a registry, each advertising a `Capability` set, and
