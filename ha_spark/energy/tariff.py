@@ -8,13 +8,15 @@ representative rates the daily-balance model and charge-purchase costing use.
 The ``fixed`` provider reproduces the legacy fixed-window two-rate behaviour
 exactly (the golden baseline pins this). ``dynamic`` costs each slot at its
 live price from an HA half-hourly price sensor, falling back to ``fixed``
-whenever there's no usable live read. A later slice adds ``octopus_intelligent``
-behind the same protocol.
+whenever there's no usable live read. ``octopus_intelligent`` keeps the fixed
+provider's dispatch/window folding exactly (dispatches sourced from the
+Octopus API instead of an HA sensor) and overlays live per-slot prices from
+the Octopus standard-unit-rates API.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time
 from typing import Protocol
 
@@ -194,3 +196,35 @@ class DynamicTariffProvider:
             cheap_fracs=cheap_fracs,
             controlled_windows=controlled,
         )
+
+
+@dataclass(frozen=True)
+class OctopusIntelligentProvider:
+    """Octopus Intelligent: dispatch windows + per-slot prices from the Octopus API.
+
+    Dispatch/cheap-window costing is identical to ``fallback`` (the same
+    ``_cheap_fractions``/``_controlled_windows`` folding as the fixed
+    provider) — dispatches are supplier-controlled cheap windows exactly as
+    they are today, per spec. The only thing this provider adds is live
+    per-slot import prices (``inputs.dynamic_prices``, sourced from the
+    Octopus standard-unit-rates API rather than a generic HA sensor) laid
+    over that same schedule, for accurate cost reporting. Falls back to
+    ``fallback`` verbatim whenever there's no v2 slot horizon or no usable
+    live price — an API hiccup degrades a plan, it never blocks one.
+    """
+
+    fallback: FixedTariffProvider
+
+    def schedule(self, inputs: PlannerInputs, cfg: PlannerConfig) -> TariffSchedule:
+        base = self.fallback.schedule(inputs, cfg)
+        if inputs.load_slots is None or not inputs.dynamic_prices:
+            return base
+        raw_prices = _slot_prices_from_points(
+            len(inputs.load_slots), inputs.horizon_start, inputs.dynamic_prices
+        )
+        if not any(p is not None for p in raw_prices):
+            return base
+        prices = tuple(
+            p if p is not None else self.fallback.standard_rate for p in raw_prices
+        )
+        return replace(base, prices=prices)

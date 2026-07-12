@@ -395,3 +395,113 @@ async def test_gather_inputs_skips_dynamic_fetch_when_fixed_provider(
         async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
             inputs, _cfg, _src = await gather_inputs(s, rest)
         assert inputs.dynamic_prices == ()
+
+
+# --- octopus_intelligent: dispatches + prices from the Octopus API (P8.5, #39) ---
+
+
+def _octopus_settings(**kw: Any) -> Settings:
+    base: dict[str, Any] = dict(
+        ha_url="http://ha.test", ha_token="t",
+        tariff_provider="octopus_intelligent",
+        octopus_api_url="http://octo.test/v1",
+        octopus_api_key="sk_test",
+        octopus_account_number="A-1234ABCD",
+        octopus_product_code="INTELLI-VAR-22-10-14",
+        octopus_tariff_code="E-1R-INTELLI-VAR-22-10-14-A",
+    )
+    base.update(kw)
+    return Settings(**base)
+
+
+@respx.mock
+async def test_gather_inputs_octopus_intelligent_fetches_dispatches_and_prices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET", url__startswith="http://ha.test").mock(
+        return_value=httpx.Response(404)
+    )
+    respx.post("http://octo.test/v1/graphql/").mock(
+        side_effect=[
+            httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": "jwt-abc"}}}),
+            httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "plannedDispatches": [
+                            {"startDt": "2026-06-01T13:00:00Z", "endDt": "2026-06-01T13:30:00Z",
+                             "delta": -2.0, "meta": {"source": "smart-charge"}}
+                        ]
+                    }
+                },
+            ),
+        ]
+    )
+    respx.get(url__startswith="http://octo.test/v1/products/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "next": None,
+                "results": [
+                    {"valid_from": "2026-06-01T00:00:00Z", "valid_to": "2026-06-01T00:30:00Z",
+                     "value_inc_vat": 0.12}
+                ],
+            },
+        )
+    )
+
+    s = _octopus_settings()
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, _cfg, _src = await gather_inputs(s, rest)
+    assert len(inputs.dispatches) == 1
+    assert inputs.dispatches[0].source == "smart-charge"
+    assert [p.price for p in inputs.dynamic_prices] == [0.12]
+
+
+@respx.mock
+async def test_gather_inputs_octopus_intelligent_degrades_on_api_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET", url__startswith="http://ha.test").mock(
+        return_value=httpx.Response(404)
+    )
+    respx.route(url__startswith="http://octo.test").mock(return_value=httpx.Response(401))
+
+    s = _octopus_settings()
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, cfg, _src = await gather_inputs(s, rest)
+    # Never crashes or blocks the plan: dispatches/prices degrade to empty,
+    # and the schedule falls back to fixed.
+    assert inputs.dispatches == ()
+    assert inputs.dynamic_prices == ()
+    assert build_schedule(s, inputs, cfg) == fixed_schedule(inputs, cfg)
+
+
+async def test_gather_inputs_skips_ha_dispatch_sensor_for_octopus_intelligent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No `dispatch_entity` HA-sensor fetch at all — dispatches come from the API."""
+
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    with respx.mock:
+        respx.route(method="GET", url__startswith="http://ha.test").mock(
+            return_value=httpx.Response(404)
+        )
+        respx.route(url__startswith="http://octo.test").mock(return_value=httpx.Response(401))
+        s = _octopus_settings(dispatch_entity="binary_sensor.dispatch")
+        async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+            await gather_inputs(s, rest)
+        assert "states/binary_sensor.dispatch" not in {
+            str(c.request.url) for c in respx.calls
+        }

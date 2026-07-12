@@ -19,6 +19,11 @@ import aiosqlite
 
 from ha_spark.config import Settings
 from ha_spark.energy.forecast import intervals_from_hourly_stats, load_timezone
+from ha_spark.energy.octopus import (
+    OctopusApiError,
+    fetch_planned_dispatches,
+    fetch_standard_unit_rates,
+)
 from ha_spark.energy.profile import history_coverage
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.statistics import statistics_during_period
@@ -206,10 +211,7 @@ async def check_supply_guard(settings: Settings) -> CheckResult:
     )
 
 
-async def check_tariff_provider(settings: Settings) -> CheckResult:
-    """Confirm the configured tariff provider reads end-to-end (`fixed` needs no live read)."""
-    if settings.tariff_provider != "dynamic":
-        return CheckResult("Tariff provider", Status.OK, "fixed (no live source)")
+async def _check_dynamic_tariff(settings: Settings) -> CheckResult:
     entity = settings.dynamic_rates_entity
     if not entity:
         return CheckResult("Tariff provider", Status.WARN, "dynamic_rates_entity not set")
@@ -233,6 +235,35 @@ async def check_tariff_provider(settings: Settings) -> CheckResult:
             f"{entity}: no `rates` attribute — plans fall back to the fixed rate/window",
         )
     return CheckResult("Tariff provider", Status.OK, f"{n} rate slots from {entity}")
+
+
+async def _check_octopus_intelligent_tariff(settings: Settings) -> CheckResult:
+    """Confirm both API calls this provider needs succeed; never logs the API key."""
+    try:
+        dispatches = await fetch_planned_dispatches(settings)
+        rates = await fetch_standard_unit_rates(
+            settings,
+            period_from=datetime.now(UTC),
+            period_to=datetime.now(UTC) + timedelta(hours=48),
+        )
+    except OctopusApiError as exc:
+        return CheckResult(
+            "Tariff provider", Status.WARN, f"{exc} — plans fall back to the fixed rate/window"
+        )
+    return CheckResult(
+        "Tariff provider",
+        Status.OK,
+        f"{len(rates)} rate slots, {len(dispatches)} planned dispatch(es)",
+    )
+
+
+async def check_tariff_provider(settings: Settings) -> CheckResult:
+    """Confirm the configured tariff provider reads end-to-end (`fixed` needs no live read)."""
+    if settings.tariff_provider == "dynamic":
+        return await _check_dynamic_tariff(settings)
+    if settings.tariff_provider == "octopus_intelligent":
+        return await _check_octopus_intelligent_tariff(settings)
+    return CheckResult("Tariff provider", Status.OK, "fixed (no live source)")
 
 
 async def run_health(settings: Settings) -> list[CheckResult]:

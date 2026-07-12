@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -16,10 +16,16 @@ from ha_spark.energy.models import (
     PlannerInputs,
     PricePoint,
 )
+from ha_spark.energy.octopus import (
+    OctopusApiError,
+    fetch_planned_dispatches,
+    fetch_standard_unit_rates,
+)
 from ha_spark.energy.solar import distribute_solar
 from ha_spark.energy.tariff import (
     DynamicTariffProvider,
     FixedTariffProvider,
+    OctopusIntelligentProvider,
     TariffSchedule,
     _in_overnight_window,
 )
@@ -200,6 +206,8 @@ def build_schedule(
     )
     if settings.tariff_provider == "dynamic":
         return DynamicTariffProvider(fallback=fixed).schedule(inputs, cfg)
+    if settings.tariff_provider == "octopus_intelligent":
+        return OctopusIntelligentProvider(fallback=fixed).schedule(inputs, cfg)
     return fixed.schedule(inputs, cfg)
 
 
@@ -218,14 +226,26 @@ async def gather_inputs(
     soc = await state(settings.soc_entity)
     voltage = await state(settings.battery_voltage_entity)
     solar = await state(settings.solar_tomorrow_entity)
-    dispatch = await state(settings.dispatch_entity)
     ev_status = await state(settings.ev_status_entity)
     ha_needed = await state(settings.ha_template_charge_needed_entity)
 
     voltage_v = _to_float(voltage.state if voltage else None, settings.battery_voltage_v)
-    dispatches = _parse_dispatches(
-        dispatch.attributes.get("planned_dispatches") if dispatch else None
-    )
+
+    dispatches: tuple[DispatchSlot, ...]
+    if settings.tariff_provider == "octopus_intelligent":
+        # Octopus Intelligent dispatches come straight from the Octopus API —
+        # no HA sensor read (avoids a pointless call + the sensor-shaped
+        # bolt-on this provider replaces).
+        try:
+            dispatches = await fetch_planned_dispatches(settings)
+        except OctopusApiError as exc:
+            log.warning("Could not read Octopus planned dispatches (%s)", exc)
+            dispatches = ()
+    else:
+        dispatch = await state(settings.dispatch_entity)
+        dispatches = _parse_dispatches(
+            dispatch.attributes.get("planned_dispatches") if dispatch else None
+        )
     ev_charging = bool(ev_status and str(ev_status.state).lower() in _EV_ACTIVE)
 
     dynamic_prices: tuple[PricePoint, ...] = ()
@@ -240,6 +260,15 @@ async def gather_inputs(
                 )
             )
         dynamic_prices = tuple(sorted(points, key=lambda p: p.start))
+    elif settings.tariff_provider == "octopus_intelligent":
+        try:
+            dynamic_prices = await fetch_standard_unit_rates(
+                settings,
+                period_from=datetime.now(UTC),
+                period_to=datetime.now(UTC) + timedelta(hours=48),
+            )
+        except OctopusApiError as exc:
+            log.warning("Could not read Octopus standard unit rates (%s)", exc)
 
     lat, lon = settings.latitude, settings.longitude
     if lat is None or lon is None:

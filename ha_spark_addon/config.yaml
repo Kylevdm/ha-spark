@@ -106,7 +106,7 @@ schema:
   rate_offpeak_gbp_kwh: float
   rate_peak_gbp_kwh: float
   rate_export_gbp_kwh: float
-  tariff_provider: list(fixed|dynamic)
+  tariff_provider: list(fixed|dynamic|octopus_intelligent)
   dynamic_rates_entity: str
   dynamic_rates_entity_tomorrow: str
   profile_min_days: int
@@ -118,6 +118,9 @@ schema:
   octopus_mpan: str?
   octopus_meter_serial: str?
   octopus_api_url: url
+  octopus_account_number: str?
+  octopus_product_code: str?
+  octopus_tariff_code: str?
   soc_entity: str?
   battery_voltage_entity: str?
   solar_tomorrow_entity: str?
