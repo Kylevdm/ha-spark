@@ -24,6 +24,7 @@ from ha_spark.energy.models import (
     PlannerInputs,
 )
 from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.tariff import TariffSchedule
 
 APPROX = 1e-6  # golden values recorded to 6 dp
 
@@ -200,8 +201,9 @@ def test_golden_backtest_two_rate_wrapping_window() -> None:
         _backtest_intervals(tz),
         window_start=time(23, 30),
         window_end=time(5, 30),
-        rate_offpeak=0.069,
-        rate_peak=0.30,
+        schedule=TariffSchedule(
+            cheap_rate=0.069, standard_rate=0.30, export_rate=0.0, window_hours=6.0
+        ),
         tz=tz,
     )
     assert summary is not None
@@ -221,8 +223,9 @@ def test_golden_backtest_two_rate_non_wrapping_window() -> None:
         _backtest_intervals(tz),
         window_start=time(1, 0),
         window_end=time(6, 0),
-        rate_offpeak=0.069,
-        rate_peak=0.30,
+        schedule=TariffSchedule(
+            cheap_rate=0.069, standard_rate=0.30, export_rate=0.0, window_hours=5.0
+        ),
         tz=tz,
     )
     assert summary is not None

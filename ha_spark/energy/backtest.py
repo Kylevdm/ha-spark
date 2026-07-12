@@ -13,7 +13,7 @@ from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from ha_spark.energy.models import ConsumptionInterval
-from ha_spark.energy.tariff import _in_overnight_window
+from ha_spark.energy.tariff import TariffSchedule, _in_overnight_window
 
 
 @dataclass(frozen=True)
@@ -50,15 +50,15 @@ def backtest_cost(
     *,
     window_start: time,
     window_end: time,
-    rate_offpeak: float,
-    rate_peak: float,
+    schedule: TariffSchedule,
     tz: ZoneInfo,
 ) -> BacktestSummary | None:
     """Rate each interval off-peak/peak by its local start time; None if empty.
 
-    Off-peak is the fixed (possibly midnight-wrapping) charge window. Historic
-    Octopus dispatch slots are not stored, so dispatch-time import rates as
-    peak — the summary slightly overstates the true cost.
+    Off-peak is the fixed (possibly midnight-wrapping) charge window, rated at
+    the schedule's cheap/standard rates — the same schedule the planner costs
+    against. Historic Octopus dispatch slots are not stored, so dispatch-time
+    import rates as peak — the summary slightly overstates the true cost.
     """
     if not intervals:
         return None
@@ -76,8 +76,8 @@ def backtest_cost(
         days=len(dates),
         offpeak_kwh=offpeak_kwh,
         peak_kwh=peak_kwh,
-        rate_offpeak=rate_offpeak,
-        rate_peak=rate_peak,
+        rate_offpeak=schedule.cheap_rate,
+        rate_peak=schedule.standard_rate,
         first=min(starts),
         last=max(starts),
     )
