@@ -10,10 +10,10 @@ import pytest
 import respx
 
 from ha_spark.config import Settings
+from ha_spark.devices import get_device, inverter_device
 from ha_spark.devices.base import Capability, ControlAuthority
 from ha_spark.devices.inverters.alphaess import AlphaESSDevice
 from ha_spark.devices.inverters.solis import SolisDevice, solis_current_a
-from ha_spark.energy.chargers import charger_for
 from ha_spark.energy.models import ChargeIntent
 from ha_spark.ha.rest import HomeAssistantRest
 
@@ -291,10 +291,18 @@ async def test_read_charge_rate_raises_on_unreadable_sensor() -> None:
             await _solis_device(s, rest).read_charge_rate()
 
 
-def test_charger_for_selects_by_inverter() -> None:
+def test_get_device_selects_by_driver() -> None:
     rest = HomeAssistantRest(_settings().ha_rest_url, _settings().auth_token)
-    assert isinstance(charger_for(_settings(inverter="solis"), rest), SolisDevice)
-    assert isinstance(charger_for(_settings(inverter="alphaess"), rest), AlphaESSDevice)
+    s = _settings()
+    assert isinstance(get_device(s.devices[0], s, rest), SolisDevice)
+    alpha_s = _settings(inverter="alphaess")
+    assert isinstance(get_device(alpha_s.devices[0], alpha_s, rest), AlphaESSDevice)
+
+
+def test_inverter_device_picks_inverter_type() -> None:
+    rest = HomeAssistantRest(_settings().ha_rest_url, _settings().auth_token)
+    s = _settings(inverter="solis")  # synthesizes a main_inverter device
+    assert isinstance(inverter_device(s, rest), SolisDevice)
 
 
 def test_alphaess_capabilities_exclude_rate() -> None:

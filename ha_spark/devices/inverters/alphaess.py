@@ -5,11 +5,15 @@ No settable rate -> the supply guard stays dormant for this inverter.
 """
 from __future__ import annotations
 
-from ha_spark.config import DeviceConfig, Settings
+from typing import TYPE_CHECKING
+
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
 from ha_spark.devices.registry import register
 from ha_spark.energy.models import ChargeIntent
-from ha_spark.ha.rest import HomeAssistantRest
+
+if TYPE_CHECKING:  # avoid an import cycle: config imports devices.base at runtime
+    from ha_spark.config import DeviceConfig, Settings
+    from ha_spark.ha.rest import HomeAssistantRest
 
 
 @register("alphaess")
