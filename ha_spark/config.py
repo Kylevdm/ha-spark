@@ -15,10 +15,11 @@ environment variables, a local ``.env`` file, and built-in defaults.
 from __future__ import annotations
 
 import json
+from datetime import time
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ha_spark.logging import get_logger
@@ -122,6 +123,47 @@ _SECRET_OPTION_KEYS = frozenset({"octopus_api_key", "agent_api_token"})
 
 class ConfigError(RuntimeError):
     """Raised when the runtime configuration is invalid or incomplete."""
+
+
+class FixedTariffConfig(BaseModel):
+    """The ``fixed`` tariff provider's settings, validated at startup.
+
+    Slice 1 keeps the existing flat rate/window config keys as the fixed
+    provider's sole config source (no keys renamed, so no config break); this
+    validates them up front so a bad tariff value is caught with a message
+    naming the offending field rather than degrading a plan later. A later
+    slice adds the provider selector these settings become nested under.
+    """
+
+    rate_offpeak: float = Field(ge=0)
+    rate_peak: float = Field(ge=0)
+    rate_export: float = Field(ge=0)
+    window_start: str
+    window_end: str
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _hhmm(cls, v: str) -> str:
+        try:
+            h, m = v.split(":")
+            time(int(h), int(m))
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"must be HH:MM (got {v!r})") from exc
+        return v
+
+
+def validate_fixed_tariff(settings: Settings) -> None:
+    """Validate the fixed provider's tariff settings; raise ConfigError on a bad field."""
+    try:
+        FixedTariffConfig(
+            rate_offpeak=settings.rate_offpeak_gbp_kwh,
+            rate_peak=settings.rate_peak_gbp_kwh,
+            rate_export=settings.rate_export_gbp_kwh,
+            window_start=settings.charge_window_start,
+            window_end=settings.charge_window_end,
+        )
+    except ValidationError as exc:
+        raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
 
 
 class Settings(BaseSettings):
@@ -349,4 +391,6 @@ def load_settings(*, validate: bool = True) -> Settings:
             "SUPERVISOR_TOKEN automatically; for standalone/dev set HA_URL and "
             "HA_TOKEN (see .env.example)."
         )
+    if validate:
+        validate_fixed_tariff(settings)
     return settings
