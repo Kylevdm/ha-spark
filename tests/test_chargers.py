@@ -10,7 +10,9 @@ import pytest
 import respx
 
 from ha_spark.config import Settings
-from ha_spark.energy.chargers import AlphaESSCharger, SolisCharger, charger_for, solis_current_a
+from ha_spark.devices.base import Capability, ControlAuthority
+from ha_spark.devices.inverters.solis import SolisDevice, solis_current_a
+from ha_spark.energy.chargers import AlphaESSCharger, charger_for
 from ha_spark.energy.models import ChargeIntent
 from ha_spark.ha.rest import HomeAssistantRest
 
@@ -25,6 +27,18 @@ def _settings(**overrides: object) -> Settings:
     }
     defaults.update(overrides)
     return Settings(**defaults)  # type: ignore[arg-type]
+
+
+def _solis_device(
+    s: Settings, rest: HomeAssistantRest, *, control: str = "ha_spark"
+) -> SolisDevice:
+    """SolisDevice over the DeviceConfig Settings synthesizes from its own flat
+    entity fields, so respx mocks built against s.charge_current_entity etc.
+    line up with the entities SolisDevice actually reads/writes."""
+    config = s.devices[0]
+    if control != "ha_spark":
+        config = config.model_copy(update={"control": ControlAuthority(control)})
+    return SolisDevice(config, s, rest)
 
 
 def _intent(
@@ -78,10 +92,20 @@ def test_solis_current_clamps_to_max() -> None:
     assert solis_current_a(_intent(target_soc=90.0), s) == 10.0
 
 
-def test_supports_live_rate_true() -> None:
+def test_solis_capabilities_include_rate() -> None:
     s = _settings()
     rest = HomeAssistantRest(s.ha_rest_url, s.auth_token)
-    assert SolisCharger(s, rest).supports_live_rate is True
+    assert Capability.CHARGE_RATE in _solis_device(s, rest).capabilities
+
+
+@respx.mock
+async def test_solis_observe_authority_never_writes_even_when_on() -> None:
+    posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    s = _settings(proactive_mode="on")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        lines = await _solis_device(s, rest, control="observe").apply(_intent())
+    assert posts.call_count == 0  # observe authority suppresses the write despite "on"
+    assert any("[OBSERVE]" in line for line in lines)
 
 
 @respx.mock
@@ -94,7 +118,7 @@ async def test_apply_writes_charge_current() -> None:
     expected_a = round(solis_current_a(intent, s))
     _mock_read_back(s, current=f"{expected_a}.0", switch="Off")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await SolisCharger(s, rest).apply(intent)
+        lines = await _solis_device(s, rest).apply(intent)
     assert set_value.called
     posted = set_value.calls.last.request.content
     assert f'"value":{expected_a}'.encode() in posted or f'"value": {expected_a}'.encode() in posted
@@ -106,7 +130,7 @@ async def test_simulate_makes_no_service_calls() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _settings(proactive_mode="simulate")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await SolisCharger(s, rest).apply(_intent())
+        lines = await _solis_device(s, rest).apply(_intent())
     assert posts.call_count == 0
     assert any("SIMULATE" in line for line in lines)
 
@@ -121,7 +145,7 @@ async def test_on_executes_service_calls_and_verifies_read_back() -> None:
     expected_a = round(solis_current_a(intent, s))
     _mock_read_back(s, current=f"{expected_a}.0", switch="Off")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await SolisCharger(s, rest).apply(intent)
+        lines = await _solis_device(s, rest).apply(intent)
     assert set_value.called
     assert all(line.startswith("[APPLIED]") or line.startswith("[SKIP]") for line in lines)
 
@@ -133,7 +157,7 @@ async def test_on_warns_when_read_back_mismatches() -> None:
     intent = _intent()
     _mock_read_back(s, current="0.0", switch="On")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await SolisCharger(s, rest).apply(intent)
+        lines = await _solis_device(s, rest).apply(intent)
     current_line = next(line for line in lines if "set timed charge current" in line)
     assert current_line.startswith("[WARNING]")
     expected_a = round(solis_current_a(intent, s))
@@ -146,7 +170,7 @@ async def test_on_warns_when_read_back_read_fails() -> None:
     respx.route(method="GET").mock(return_value=httpx.Response(500))
     s = _settings(proactive_mode="on")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await SolisCharger(s, rest).apply(_intent())
+        lines = await _solis_device(s, rest).apply(_intent())
     current_line = next(line for line in lines if "set timed charge current" in line)
     assert current_line.startswith("[WARNING]")
     assert "read-back failed" in current_line
@@ -160,7 +184,7 @@ async def test_on_isolates_action_failures() -> None:
     s = _settings(proactive_mode="on")
     intent = _intent(holds=(), target_soc=77.0, soc_now=50.0)
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await SolisCharger(s, rest).apply(intent)
+        lines = await _solis_device(s, rest).apply(intent)
     current_line = next(line for line in lines if "set timed charge current" in line)
     assert current_line.startswith("[FAILED]")
 
@@ -171,7 +195,7 @@ async def test_on_blocks_all_writes_when_soc_invalid() -> None:
     s = _settings(proactive_mode="on")
     intent = _intent(soc_valid=False)
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await SolisCharger(s, rest).apply(intent)
+        lines = await _solis_device(s, rest).apply(intent)
     assert posts.call_count == 0
     assert all(line.startswith("[BLOCKED] SoC unreadable") for line in lines)
 
@@ -185,7 +209,7 @@ async def test_on_does_not_block_genuine_zero_soc() -> None:
     _mock_read_back(s, "0", "Off")
     respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await SolisCharger(s, rest).apply(intent)
+        lines = await _solis_device(s, rest).apply(intent)
     assert not any(line.startswith("[BLOCKED]") for line in lines)
 
 
@@ -195,7 +219,7 @@ async def test_simulate_unaffected_by_invalid_soc() -> None:
     s = _settings(proactive_mode="simulate")
     intent = _intent(soc_valid=False)
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await SolisCharger(s, rest).apply(intent)
+        lines = await _solis_device(s, rest).apply(intent)
     assert posts.call_count == 0
     assert all(line.startswith("[SIMULATE]") or line.startswith("[SKIP]") for line in lines)
 
@@ -203,7 +227,7 @@ async def test_simulate_unaffected_by_invalid_soc() -> None:
 async def test_off_mode_computes_without_calls() -> None:
     s = _settings(proactive_mode="off")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await SolisCharger(s, rest).apply(_intent())
+        lines = await _solis_device(s, rest).apply(_intent())
     assert all("OFF" in line or "SKIP" in line for line in lines)
 
 
@@ -217,7 +241,7 @@ def test_planned_rate_w_matches_current_times_voltage() -> None:
     intent = _intent()
     rest = HomeAssistantRest(s.ha_rest_url, s.auth_token)
     expected = solis_current_a(intent, s) * s.battery_voltage_v
-    assert SolisCharger(s, rest).planned_rate_w(intent) == pytest.approx(expected)
+    assert _solis_device(s, rest).planned_rate_w(intent) == pytest.approx(expected)
 
 
 @respx.mock
@@ -228,7 +252,7 @@ async def test_set_charge_rate_posts_amps_and_applies() -> None:
     s = _settings(proactive_mode="on", battery_voltage_v=51.0)
     _mock_read_back(s, current="40.0", switch="Off")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        line = await SolisCharger(s, rest).set_charge_rate(2040.0)
+        line = await _solis_device(s, rest).set_charge_rate(2040.0)
     assert set_value.called
     posted = set_value.calls.last.request.content
     assert b'"value":40' in posted or b'"value": 40' in posted
@@ -242,7 +266,7 @@ async def test_read_charge_rate_converts_amps_to_watts() -> None:
         return_value=httpx.Response(200, json=_state(s.charge_current_entity, "30"))
     )
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        watts = await SolisCharger(s, rest).read_charge_rate()
+        watts = await _solis_device(s, rest).read_charge_rate()
     assert watts == pytest.approx(30 * 51.0)
 
 
@@ -254,12 +278,12 @@ async def test_read_charge_rate_raises_on_unreadable_sensor() -> None:
     )
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         with pytest.raises(httpx.HTTPStatusError):
-            await SolisCharger(s, rest).read_charge_rate()
+            await _solis_device(s, rest).read_charge_rate()
 
 
 def test_charger_for_selects_by_inverter() -> None:
     rest = HomeAssistantRest(_settings().ha_rest_url, _settings().auth_token)
-    assert isinstance(charger_for(_settings(inverter="solis"), rest), SolisCharger)
+    assert isinstance(charger_for(_settings(inverter="solis"), rest), SolisDevice)
     assert isinstance(charger_for(_settings(inverter="alphaess"), rest), AlphaESSCharger)
 
 
