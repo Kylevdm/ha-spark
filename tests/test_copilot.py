@@ -33,7 +33,8 @@ async def test_build_grounding_renders_plan(monkeypatch: pytest.MonkeyPatch) -> 
         return object(), object(), "slot profile (14d hourly house stats)"
 
     monkeypatch.setattr(copilot, "gather_inputs", fake_gather)
-    monkeypatch.setattr(copilot, "compute_plan", lambda inputs, cfg: _plan())
+    monkeypatch.setattr(copilot, "build_schedule", lambda settings, inputs, cfg: object())
+    monkeypatch.setattr(copilot, "compute_plan", lambda inputs, cfg, schedule: _plan())
 
     grounding = await build_grounding(Settings(), REST)  # type: ignore[arg-type]
     assert grounding is not None

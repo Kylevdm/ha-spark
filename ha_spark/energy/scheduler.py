@@ -38,12 +38,12 @@ from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargePlan, PlannerInputs
 from ha_spark.energy.orchestrator import orchestrate
-from ha_spark.energy.planner import _in_overnight_window as in_window
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.publish import publish_plan, publish_predictions, republish_last
 from ha_spark.energy.report import format_plan
-from ha_spark.energy.sources import gather_inputs, parse_time
+from ha_spark.energy.sources import build_schedule, gather_inputs, parse_time
 from ha_spark.energy.supply_guard import SupplyGuard
+from ha_spark.energy.tariff import _in_overnight_window as in_window
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -83,7 +83,7 @@ async def run_once(settings: Settings) -> ChargePlan:
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
         inputs, cfg, load_source = await gather_inputs(settings, rest)
-        plan = compute_plan(inputs, cfg)
+        plan = compute_plan(inputs, cfg, build_schedule(settings, inputs, cfg))
         log.info("Charge plan:\n%s", format_plan(plan, load_source))
         intent = plan.charge_intent
         assert intent is not None  # planner always sets it

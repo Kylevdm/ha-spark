@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.0-rc2
+
+- Multi-supplier tariffs: the planner and `ha-spark backtest` now cost every
+  plan against a normalised per-slot price schedule instead of a fixed
+  two-rate window. Three providers, selected with `tariff_provider`: `fixed`
+  (default, reproduces the previous behaviour exactly — existing configs need
+  no changes), `dynamic` (half-hourly prices from an HA price sensor via
+  `dynamic_rates_entity`), and `octopus_intelligent` (Octopus API prices +
+  planned dispatch windows via `octopus_api_key`/`octopus_account_number`/
+  `octopus_product_code`/`octopus_tariff_code`). A misconfigured provider is
+  rejected at startup with a message naming the bad field; a live price
+  read that fails at runtime falls back to `fixed` rather than blocking a
+  plan. See DOCS.md "Tariff" for the full option reference.
 ## 1.0.0-rc1
 
 Release candidate for 1.0.0 — pre-release for testing before promotion.
