@@ -143,8 +143,7 @@ live over the WebSocket stream. `ha-spark ask` routes through the Ollama tier
 milestone per phase/add-on version, issues under them (`gh` CLI; see
 `docs/agents/issue-tracker.md`). ROADMAP.md keeps only the durable positioning,
 design rules, and non-goals; shipped work is recorded in
-`ha_spark_addon/CHANGELOG.md`; design decisions in `docs/adr/`. `usernotes.md`
-records older design rationale — honor it only where the above are silent. The
+`ha_spark_addon/CHANGELOG.md`; design decisions in `docs/adr/`. The
 next stage (see the milestones) moves to a modular `devices/` **driver layer**,
 a multi-supplier **`TariffProvider`** (normalised per-slot price schedule, not
 Octopus-shaped), per-device **control authority** (`observe|ha_spark|supplier`),
