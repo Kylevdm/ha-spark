@@ -1,7 +1,7 @@
 """The proactive orchestrator: the single chokepoint between the habit API and
 acting on its predictions.
 
-usernotes.md asks for one decision path that always computes
+The standing design decision is one decision path that always computes
 ``predict_actions(context)``, logs the predictions, and — gated by the single
 ``PROACTIVE_MODE`` flag — either executes them as real HA service calls or logs
 them as "simulated", with the same code either way.
