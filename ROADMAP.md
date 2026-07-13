@@ -2,6 +2,13 @@
 
 *The home energy autopilot that explains itself — and sets up in 15 minutes.*
 
+> **Phases and status live in the GitHub tracker, not this file:**
+> [milestones](https://github.com/Kylevdm/ha-spark/milestones) (one per
+> phase/add-on version) and their [issues](https://github.com/Kylevdm/ha-spark/issues).
+> This file keeps only the durable content: positioning, design rules,
+> comparison, core bets, and non-goals. Vocabulary: `CONTEXT.md`.
+> Design decisions: [`docs/adr/`](docs/adr/).
+
 ## Positioning
 
 ha-spark plans your home's energy day for you: it forecasts tomorrow's solar and
@@ -36,7 +43,7 @@ framework to configure.
 
 | | EMHASS | Predbat | ha-spark |
 |---|---|---|---|
-| Optimizes a plan | ✅ LP solver | ✅ | ✅ energy-balance planner |
+| Optimizes a plan | ✅ LP solver | ✅ | ✅ energy-balance planner ([why not LP](docs/adr/0002-auditable-over-optimal-planning.md)) |
 | Actuates hardware itself | ❌ user wires automations | ✅ | ✅ with guard rails (SoC validity, read-back, failure isolation) |
 | Setup effort | YAML + sensor templates + REST commands | YAML; docs assume HA/file-editing fluency | add-on options UI; onboarding wizard planned |
 | Explains decisions in plain language | ❌ | ❌ | ✅ planned (local LLM over the deterministic plan) |
@@ -65,72 +72,25 @@ the plan is, why it chose what it chose, and what it saved you. Later, NL
 requests adjust *planner configuration* ("keep the battery above 30% this
 weekend") — they never bypass the planner to actuate hardware directly.
 
-## Phases
+## Where the plan lives
 
-| Phase | What ships |
-|---|---|
-| ✅ MVP (done) | Deterministic planner (solar + load forecast → overnight charge current), Solis actuation with guard rails, dispatch-slot handling, simulate mode, cost backtest, scheduled daemon, HA add-on packaging |
-| ✅ 2 — LLM router (done) | Two-tier router behind `ha-spark ask`: remote Ollama chat (`/api/tags` probe gates `/api/chat`) with a deterministic offline parser answering energy queries (plan, SoC, solar, strategy, mode, window) from the planner pipeline |
-| ✅ 3 — EV integration (done) | Live supply guard (throttle battery charging when whole-house draw nears the main-fuse limit, e.g. during an EV dispatch) plus EV dispatch energy in the plan report |
-| ✅ 6A — Forecast ledger (done) | Forecast-vs-actual accuracy ledger (`ha-spark forecast-eval`) and a 30-min signal sampler (occupancy, heat-pump energy, outdoor temp) so training data accumulates |
-| ✅ 6B — Weather-aware ML model (done) | Gradient-boosted quantile slot model (Open-Meteo temps, HDD, day-type, lags, occupancy); `load_model: auto` gated by the ledger; quantile buffer mode |
-| ✅ 6C — Context store (done) | Date-ranged facts (away/guests) via `ha-spark context`; deterministic load scaling, visible in the plan report |
-| ✅ 6D — LLM context extraction (done) | "I'm on holiday for two weeks" in `ha-spark ask` → structured fact in the context store (Ollama JSON extraction + offline fallback); facts only, never setpoints |
-| ✅ 6E — Occupancy habits (done) | Predict occupancy from recorded patterns; learn the away-load factor (auto-applied); seed of the `predict_actions` habit API (advisory, gated by `PROACTIVE_MODE`) |
-| ✅ 4 — Onboarding wizard (done) | Entity auto-discovery (domain / device class / unit / attribute / name matching) and `ha-spark onboard` proposal with `--json`/`--write`/`--preset`; Solis reference preset |
-| ✅ 5 — NL copilot v1 (done) | Plan/state Q&A grounded in live planner output: `ha-spark ask` feeds the computed plan and state into the Ollama tier so answers explain the actual decision, scoped to the energy domain; context set/queried in chat via 6C/6D |
-All of the above shipped through add-on **v0.9.0** (tagged `v0.9.0`).
+- **Shipped:** everything through add-on v0.9.0 (deterministic planner, Solis
+  actuation with guard rails, simulate mode + backtest, onboarding wizard, NL
+  copilot, forecast ledger + weather-aware ML, context store, occupancy
+  habits), then Phase 7 (device-driver core, 1.0.0) —
+  `ha_spark_addon/CHANGELOG.md` is the shipped record.
+- **In flight and next:** the [milestones](https://github.com/Kylevdm/ha-spark/milestones),
+  currently Phase 8 (multi-supplier tariffs) then the competitive-MVP
+  sub-phases 10.1–10.4 (epic [#43](https://github.com/Kylevdm/ha-spark/issues/43)).
+  Phase 9 (EV charger drivers) is formally deferred
+  ([#61](https://github.com/Kylevdm/ha-spark/issues/61)).
+- **Someday:** the post-1.0 bucket
+  ([#62](https://github.com/Kylevdm/ha-spark/issues/62)).
 
-## v1.0 — Modular ecosystem + agent surface
-
-Open ha-spark beyond the one Solis/Solcast/Octopus/zappi setup, and make it
-something a future Home Assistant agent ("Jarvis") can orchestrate. Detailed
-plan: see the active plan file. Cross-cutting throughout: the deterministic
-planner still decides; **security is a top priority** (see `CLAUDE.md`); every
-controllable device carries a `control: observe | ha_spark | supplier`
-authority, and real writes need `control == ha_spark` **and**
-`PROACTIVE_MODE == on`.
-
-**Sequencing (competitive MVP, epic #43).** Phase 9 (EV charger drivers) is
-**formally deferred** — the EV stays supplier-authority via the shipped
-`octopus_intelligent` tariff provider (Phase 8); ha-spark never actuates the
-EV charger. In its place, Phase 10 lands as four competitive-MVP sub-phases,
-in order: derived base load → half-hourly cadence + phone digest →
-reservations + Axle provider → V2L chunk. Heat pump stays inside derived
-base load (Phase 10.1, via the existing weather-aware ML) and is not
-promoted to a first-class device until Phase 11. See
-[ADR-0001](docs/adr/0001-derived-base-load-by-energy-balance.md) (derived
-base load) and [ADR-0002](docs/adr/0002-auditable-over-optimal-planning.md)
-(auditable-over-optimal planning) for the design decisions behind this
-sequence; CONTEXT.md is the vocabulary for the terms below.
-
-| Phase | What ships | Add-on |
-|---|---|---|
-| 7 — Device-driver core | `devices/` driver layer (inverter drivers + registry), `Capability`/`ControlAuthority`, structured per-device config + migration shim off the flat 0.9.0 config; planner actuation routed through drivers + the authority gate. Zero behaviour change for the current setup. | 1.0.0 |
-| 8 — Multi-supplier tariffs | `TariffProvider` ecosystem yielding a normalised per-slot import/export price schedule + controlled windows (`fixed`, `time_of_use`, `dynamic`/half-hourly price sensors, `export`, `octopus_intelligent`); planner costed against the schedule, not a fixed window. | 1.1.0 |
-| 9 — EV drivers + supplier authority | **Deferred.** EV charger drivers are not built; the EV stays `supplier`-authority (observe & plan around) via the Phase 8 `octopus_intelligent` provider. Revisit once the competitive-MVP sub-phases below ship. | — |
-| 10.1 — Derived base load | Pure energy-balance derivation (`grid import − grid export + solar + battery discharge − battery charge − EV charge`) from HA long-term component statistics, replacing the trusted consumption sensor; explicit per-component sign-convention config surfaced by onboarding; history backfill so past load statistics stop being judged on corrupted data. See ADR-0001. | 1.2.0 |
-| 10.2 — Half-hourly cadence + phone digest | Scheduler recomputes the plan every half-hourly tariff slot instead of daily (the pure planner stays cheap to re-run); drivers write only when a recomputation changes a setpoint; the live supply guard keeps running between replans; morning plan digest pushed via Home Assistant's Telegram bot (outbound `notify` service call only — ha-spark holds no Telegram credentials). | 1.3.0 |
-| 10.3 — Reservations + Axle provider | Merit-order dispatch gains named, backward-computed reservations (a flexibility event; reaching the next cheap slot) with sentence-shaped reasons; a new Axle `TariffProvider` polls grid-services flexibility events and overlays event-rate import/export price slots on the Phase 8 schedule — a schedule overlay, not a new control authority. See ADR-0002. | 1.4.0 |
-| 10.4 — V2L refill source | Car battery modelled as a refill source for the house battery only (car → rectifier → house battery, never direct to house loads or grid), actuated by a rectifier driver over ESPHome; configurable V2L budget (car SoC is unread) and rate ceiling; a "plug in the car" notification when the plan needs it. | 1.5.0 |
-| 11 — Heat pump (observe + model) | First-class heat-pump device fed explicitly into the load model; control deferred. Until this phase ships, heat-pump load lives inside derived base load (Phase 10.1) via the existing weather-aware ML — not a first-class device. | 1.6.0 |
-| 12 — Driver-aware onboarding | `onboard` proposes driver + provider + entity map + capability coverage; per-driver/supplier presets; multi-device. | 1.7.0 |
-| 13 — MCP agent surface ("Jarvis") | An authenticated, ingress-bound MCP server exposing read tools (plan/state/eval/predictions/health) and gated act tools (context, run-plan, notify) for an external HA agent. | 1.8.0 |
-
-## Later (v3, post-1.0)
-
-Heat-pump *active* coordination + hot-water tank, multi-inverter sites,
-Solcast bias correction, EV-dispatch propensity prediction, more vendor
-presets/drivers as the ecosystem grows.
-
-## Backlog
-
-- ✅ **Re-bundle the ML load model in the add-on image** (0.10.2). The add-on now
-  builds on a glibc `python:slim` base (set directly via `FROM`, since Supervisor
-  2026.04.0+ no longer reads `build.yaml`), so pip installs prebuilt
-  scikit-learn/numpy wheels with no musl source-compile. `load_model: ml|auto`
-  runs on the add-on; `auto` self-promotes ML only once the ledger shows it
-  beating the median.
+Cross-cutting throughout: the deterministic planner decides; **security is a
+top priority** (see `CLAUDE.md`); every controllable device carries a
+`control: observe | ha_spark | supplier` authority, and real writes need
+`control == ha_spark` **and** `PROACTIVE_MODE == on`.
 
 ## Non-goals
 
