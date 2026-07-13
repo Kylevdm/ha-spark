@@ -41,6 +41,34 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
 | `outdoor_weather_entity` | Weather entity with a `temperature` attribute (default `weather.home`) for signal recording |
 
+### Multiple inverters / device control (optional)
+
+Single-inverter installs need no change here — the flat `inverter` +
+entity-ID options above are still read directly (in memory, `options.json` is
+never rewritten). `devices` is the structured alternative for installs that
+want explicit per-device authority:
+
+```yaml
+devices:
+  - id: main_inverter
+    type: inverter
+    driver: solis          # solis | alphaess
+    control: ha_spark       # observe | ha_spark | supplier
+    entities:
+      charge_current: number.solisac_timed_charge_current
+      window_start: time.solisac_charge_start
+      window_end: time.solisac_charge_end
+      power_switch: select.solisac_power_switch
+```
+
+`control` is the authority gate: a real write requires **both**
+`control: ha_spark` **and** `proactive_mode: on`. `observe` (ha-spark reads and
+plans around the device but never writes it) and `supplier` (reserved — a
+third party is expected to control it) both compute and log a `[OBSERVE]`
+action line instead of writing, regardless of `proactive_mode`. Leave
+`control` unset for `ha_spark` (the default, and what the flat-key migration
+always produces).
+
 ### Planner
 
 - `proactive_mode` — `off` (compute only), `simulate` (log the writes it

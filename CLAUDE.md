@@ -137,12 +137,14 @@ Data flow: `gather_inputs` (REST) → `compute_plan` (pure) → `Charger.apply`
 live over the WebSocket stream. `ha-spark ask` routes through the Ollama tier
 (grounded in the computed plan) or the deterministic offline parser.
 
-## Design direction (ROADMAP.md is authoritative)
+## Design direction
 
-**ROADMAP.md is the source of truth** for direction and status, followed by the
-active plan file and `ha_spark_addon/CHANGELOG.md`. `usernotes.md` records older
-design rationale — honor it only where the roadmap is silent. The next stage
-(see the plan / ROADMAP "v1.0") moves to a modular `devices/` **driver layer**,
+**The GitHub tracker is the source of truth for phases and status** — one
+milestone per phase/add-on version, issues under them (`gh` CLI; see
+`docs/agents/issue-tracker.md`). ROADMAP.md keeps only the durable positioning,
+design rules, and non-goals; shipped work is recorded in
+`ha_spark_addon/CHANGELOG.md`; design decisions in `docs/adr/`. The
+next stage (see the milestones) moves to a modular `devices/` **driver layer**,
 a multi-supplier **`TariffProvider`** (normalised per-slot price schedule, not
 Octopus-shaped), per-device **control authority** (`observe|ha_spark|supplier`),
 multi-source charging (R48 rectifiers + V2L), and an **MCP** agent surface — do
@@ -180,10 +182,9 @@ Standing decisions:
   server / temp SQLite. pytest runs in `asyncio_mode = "auto"` (no
   `@pytest.mark.asyncio` needed). ruff lints `E,F,I,UP,B,ASYNC,W`, line length 100.
 - **Phase-per-branch/PR:** one phase per branch, each ending runnable and
-  verifiable. All roadmap phases (0–6, plus onboarding & NL copilot) have
-  shipped through add-on **v0.9.0**; **ROADMAP.md and
-  `ha_spark_addon/CHANGELOG.md` are the source of truth for status** — don't
-  duplicate the phase list here.
+  verifiable. **The GitHub milestones/issues and `ha_spark_addon/CHANGELOG.md`
+  are the source of truth for status** — don't duplicate the phase list here
+  or in ROADMAP.md.
 - **Add-on packaging per phase:** a phase that adds options/behaviour bumps
   `ha_spark_addon/config.yaml` `version`, adds a `CHANGELOG.md` entry, and
   updates `DOCS.md` + the options schema. Keep `config.yaml` `options`/`schema`
