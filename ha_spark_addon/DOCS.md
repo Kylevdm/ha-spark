@@ -197,11 +197,33 @@ affecting the others.
 `rate_offpeak_gbp_kwh`, `rate_peak_gbp_kwh`, `rate_export_gbp_kwh` — used for
 the cost projection printed with each plan and by `ha-spark backtest`.
 
+`tariff_provider` selects how plans are costed: `fixed` (default) uses the
+rates above plus the charge window — this is the provider every existing
+install is already on, so upgrading needs no config changes; `dynamic` costs each half-hour slot at its
+live price from an HA price sensor, choosing the cheapest slots as "cheap" for
+costing (the charge window itself is unchanged). Set `dynamic_rates_entity` to
+an entity whose `rates` attribute is a list of `{start, end, value_inc_vat}`
+(e.g. the BottlecapDave Octopus Energy integration's
+`event....current_day_rates`); `dynamic_rates_entity_tomorrow` is optional and
+covers tomorrow's slots the same way. A missing/bad read falls back to the
+fixed rates — `ha-spark health` reports the live provider status.
+
+`octopus_intelligent` is a first-class Octopus Intelligent tariff: prices come
+from the Octopus standard-unit-rates REST API and planned dispatch windows
+come straight from the Octopus API (Kraken GraphQL) instead of an HA sensor —
+dispatch/cheap-window handling is otherwise identical to `fixed`. Requires
+`octopus_api_key`, `octopus_account_number` (for the dispatches query), and
+`octopus_product_code`/`octopus_tariff_code` (for the rates endpoint, e.g.
+`INTELLI-VAR-22-10-14` / `E-1R-INTELLI-VAR-22-10-14-A`). An auth or API
+failure falls back to the fixed rates/dispatches — `ha-spark health` reports
+the live provider status; the API key is never logged or echoed.
+
 ### Octopus API (optional)
 
 `octopus_api_key`, `octopus_mpan`, `octopus_meter_serial` enable
 `ha-spark pull-consumption` (grid-import history for cost backtesting only —
-it is **not** used as the load forecast).
+it is **not** used as the load forecast). The same `octopus_api_key` also
+drives the `octopus_intelligent` tariff provider above.
 
 ### Ollama (optional)
 
