@@ -34,6 +34,10 @@ consumption*.csv
 .DS_Store
 *Zone.Identifier
 
+# Machine-local Claude Code config (permission grants, environment ids).
+# Shared settings belong in .claude/settings.json, curated deliberately.
+.claude/settings.local.json
+
 # Handoff / transfer artifacts (git bundles & patches)
 *.bundle
 *.patch
