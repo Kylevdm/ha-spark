@@ -100,3 +100,22 @@ write — same decision path, side effects suppressed.
   `run.sh` is plain shell and `config.yaml` sets `init: true`.
 - **No-push fallback:** without git credentials, produce a `git bundle` +
   `format-patch` (both gitignored) and push from a credentialed clone.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on `Kylevdm/ha-spark`, via the `gh` CLI. External PRs **are** a
+triage surface — `/triage` runs them through the same labels and states as
+issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical roles, unremapped: `needs-triage`, `needs-info`,
+`ready-for-agent`, `ready-for-human`, `wontfix`. See
+`docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context — `CONTEXT.md` (the domain glossary) + `docs/adr/` at the repo
+root. See `docs/agents/domain.md`.
