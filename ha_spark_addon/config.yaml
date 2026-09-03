@@ -54,6 +54,9 @@ options:
   timezone: Europe/London
   plan_run_time: "22:00"
   octopus_api_url: "https://api.octopus.energy/v1"
+  octopus_account_number: ""
+  octopus_product_code: ""
+  octopus_tariff_code: ""
   soc_entity: ""
   battery_voltage_entity: ""
   solar_tomorrow_entity: ""
