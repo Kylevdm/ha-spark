@@ -96,3 +96,6 @@ Wanted work outside every current map's destination and owned by nobody. An idea
 
 - **[P2] Report the selected dynamic slot indices and prices.** The report counts only slots equal to the absolute minimum and renders a min–max range, which can misstate how many varying-price slots were selected and hides the actual choice (`ha_spark/energy/report.py:36`, `ha_spark/energy/report.py:38`; follow-up to [#36](https://github.com/Kylevdm/ha-spark/issues/36) and [#38](https://github.com/Kylevdm/ha-spark/issues/38)).
   Trigger: none yet.
+
+- **[P2] Auto-discover Octopus product/tariff codes from the account API.** `octopus_product_code` and `octopus_tariff_code` are manually configured but can be fetched from `/v1/accounts/{account_number}/` using the API key — the active agreement contains both. Would reduce Octopus config to just API key + account number (`ha_spark/energy/octopus.py:161`, `ha_spark/config.py:199`).
+  Trigger: none yet.
