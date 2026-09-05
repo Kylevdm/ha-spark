@@ -93,17 +93,6 @@ def test_fixed_provider_daytime_dispatch_becomes_controlled_window() -> None:
     assert sched.controlled_windows == ((day.start, day.end),)
 
 
-def test_fixed_schedule_equals_default_costing() -> None:
-    """compute_plan with an explicit fixed schedule matches the None default."""
-    inputs = PlannerInputs(
-        soc_now=55, solar_tomorrow_kwh=8.0, predicted_home_load_kwh=24.0,
-        load_slots=tuple(0.5 for _ in range(48)), horizon_start=HORIZON,
-    )
-    a = compute_plan(inputs, cfg())
-    b = compute_plan(inputs, cfg(), fixed_schedule(inputs, cfg()))
-    assert a == b
-
-
 # --- planner boundary: synthetic schedules drive plan choice + costs ---
 
 
@@ -315,7 +304,7 @@ def test_octopus_intelligent_matches_fixed_dispatch_handling_without_live_prices
         load_slots=tuple(0.5 for _ in range(48)), horizon_start=HORIZON,
         dispatches=(dispatch,),
     )
-    a = compute_plan(inputs, cfg())
+    a = compute_plan(inputs, cfg(), fixed_schedule(inputs, cfg()))
     b = compute_plan(inputs, cfg(), _octopus().schedule(inputs, cfg()))
     assert a == b
 
