@@ -42,7 +42,7 @@ from ha_spark.energy.models import (
     PlannerConfig,
     PlannerInputs,
 )
-from ha_spark.energy.tariff import TariffSchedule, fixed_schedule
+from ha_spark.energy.tariff import TariffSchedule
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -50,17 +50,16 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def compute_plan(
-    inputs: PlannerInputs, cfg: PlannerConfig, schedule: TariffSchedule | None = None
+    inputs: PlannerInputs, cfg: PlannerConfig, schedule: TariffSchedule
 ) -> ChargePlan:
     """Compute the charge plan from live inputs, config, and a tariff schedule.
 
     ``schedule`` is the sole tariff contract: per-slot import prices/cheap
-    fractions plus the controlled (held) windows and representative rates.
-    When ``None`` it defaults to the ``fixed`` provider derived from ``cfg``,
-    which reproduces the legacy fixed-window two-rate behaviour byte-for-byte.
+    fractions plus the controlled (held) windows and representative rates. It is
+    required — a missing schedule was a silent revert to the ``fixed`` provider
+    that let callers describe a different plan than the daemon applied (#91).
+    For the legacy fixed-window two-rate behaviour, pass ``fixed_schedule``.
     """
-    if schedule is None:
-        schedule = fixed_schedule(inputs, cfg)
     effective_solar = inputs.solar_tomorrow_kwh * cfg.solar_haircut_k
 
     # Daytime dispatch slots (the schedule's controlled windows) run the house

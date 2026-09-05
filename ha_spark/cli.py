@@ -33,10 +33,10 @@ from ha_spark.energy.onboarding import (
     backfill_load,
     statistic_unit,
 )
-from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever, run_once
-from ha_spark.energy.sources import build_schedule, gather_inputs, parse_time
+from ha_spark.energy.sources import parse_time
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.energy.tariff import TariffSchedule
 from ha_spark.ha.models import StateChangedEvent
@@ -100,8 +100,8 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        inputs, cfg, load_source = await gather_inputs(settings, rest)
-        plan = compute_plan(inputs, cfg, build_schedule(settings, inputs, cfg))
+        run = await current_plan(settings, rest)
+        plan, load_source = run.plan, run.load_source
         print(format_plan(plan, load_source))
         if apply:
             intent = plan.charge_intent

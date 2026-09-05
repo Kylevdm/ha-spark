@@ -105,6 +105,67 @@ async def test_run_once_computes_and_applies_plan(
     assert rows[0].source == "test"
 
 
+@respx.mock
+async def test_dynamic_plan_parity_between_scheduler_and_agent_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#91: under ``tariff_provider="dynamic"`` the daily scheduler and the agent
+    ``get_plan`` surface must cost against the *same* live prices. Before the fix
+    ``get_plan`` silently used the fixed fallback, so its cost differed from the
+    plan the daemon applied.
+
+    The issue frames this as identical ``slot_prices``, but the agent payload
+    never exposes ``slot_prices`` (see ``plan_to_payload``); ``baseline_cost``
+    sums each slot at its live import price, so it is the faithful price-derived
+    observable that stands in for the raw prices here."""
+    from ha_spark.agent import tools
+
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        # 48 slot-of-day kWh -> triggers the v2 slot horizon (and slot_prices).
+        return LoadForecast(total_kwh=24.0, slots=tuple(0.5 for _ in range(48)), source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+
+    # One wide live-rate point spanning the whole horizon at a distinctive price,
+    # so every slot is priced 0.99 regardless of today's date — nothing like the
+    # fixed 0.069/0.30, so a fixed-fallback bug would show up in the cost.
+    now = datetime.now(UTC)
+    rates = [{
+        "start": (now - timedelta(days=1)).isoformat(),
+        "end": (now + timedelta(days=3)).isoformat(),
+        "value_inc_vat": 0.99,
+    }]
+    respx.get("http://ha.test/api/states/sensor.dynamic_rates").mock(
+        return_value=httpx.Response(
+            200, json={"entity_id": "sensor.dynamic_rates", "state": "0.99",
+                       "attributes": {"rates": rates}},
+        )
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="off",
+        db_path=str(tmp_path / "ledger.db"),
+        tariff_provider="dynamic", dynamic_rates_entity="sensor.dynamic_rates",
+    )
+
+    plan = await run_once(s)
+    # The dynamic schedule actually flowed through the daemon's plan.
+    assert plan.model == "slots"
+    assert plan.slot_prices == tuple(0.99 for _ in range(48))
+
+    # baseline_cost tallies each slot at its live import price, so it reflects the
+    # 0.99 dynamic prices (unlike planned_cost, which costs at the representative
+    # cheap/standard rates). Under the old bug get_plan would report the fixed
+    # fallback's baseline here, diverging from the daemon's.
+    result = await tools.get_plan(s)
+    baseline_cost = next(
+        e["state"] for e in result.plan if e["entity_id"] == "sensor.ha_spark_baseline_cost"
+    )
+    assert baseline_cost == f"{plan.baseline_cost:.2f}"
+
+
 async def test_run_forever_runs_once_per_day_and_retries_on_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
