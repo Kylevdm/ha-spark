@@ -132,7 +132,6 @@ _REQUIRED_ENTITY_FIELDS = (
     "consumption_energy_entity",
     "charge_current_entity",
     "inverter_power_switch_entity",
-    "ha_template_charge_needed_entity",
 )
 
 

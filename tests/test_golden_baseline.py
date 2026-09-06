@@ -24,7 +24,7 @@ from ha_spark.energy.models import (
     PlannerInputs,
 )
 from ha_spark.energy.planner import compute_plan
-from ha_spark.energy.tariff import TariffSchedule
+from ha_spark.energy.tariff import TariffSchedule, fixed_schedule
 
 APPROX = 1e-6  # golden values recorded to 6 dp
 
@@ -57,10 +57,9 @@ SOLAR_SLOTS = tuple(1.0 if 20 <= i < 28 else 0.0 for i in range(48))
 
 def test_golden_daily_zero_solar() -> None:
     """v1 daily balance, zero-solar day: full deficit, headroom-capped charge."""
-    plan = compute_plan(
-        PlannerInputs(soc_now=40, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0),
-        cfg(),
-    )
+    inputs = PlannerInputs(soc_now=40, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0)
+    config = cfg()
+    plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
     assert plan.model == "daily"
     assert plan.deficit_kwh == pytest.approx(24.0, abs=APPROX)
     assert plan.required_kwh == pytest.approx(13.44, abs=APPROX)
@@ -73,17 +72,16 @@ def test_golden_daily_zero_solar() -> None:
 
 def test_golden_slots_no_dispatch() -> None:
     """v2 slot horizon, no-dispatch night: expensive-slot need drives sizing."""
-    plan = compute_plan(
-        PlannerInputs(
-            soc_now=55,
-            solar_tomorrow_kwh=8.0,
-            predicted_home_load_kwh=sum(LOAD_SLOTS),
-            load_slots=LOAD_SLOTS,
-            solar_slots=SOLAR_SLOTS,
-            horizon_start=HORIZON,
-        ),
-        cfg(),
+    inputs = PlannerInputs(
+        soc_now=55,
+        solar_tomorrow_kwh=8.0,
+        predicted_home_load_kwh=sum(LOAD_SLOTS),
+        load_slots=LOAD_SLOTS,
+        solar_slots=SOLAR_SLOTS,
+        horizon_start=HORIZON,
     )
+    config = cfg()
+    plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
     assert plan.model == "slots"
     assert plan.deficit_kwh == pytest.approx(14.0, abs=APPROX)
     assert plan.expensive_load_kwh == pytest.approx(14.0, abs=APPROX)
@@ -104,18 +102,17 @@ def test_golden_slots_dispatch_overlap() -> None:
         charge_in_kwh=-5.2,
         source="octopus",
     )
-    plan = compute_plan(
-        PlannerInputs(
-            soc_now=55,
-            solar_tomorrow_kwh=8.0,
-            predicted_home_load_kwh=sum(LOAD_SLOTS),
-            load_slots=LOAD_SLOTS,
-            solar_slots=SOLAR_SLOTS,
-            horizon_start=HORIZON,
-            dispatches=(dispatch,),
-        ),
-        cfg(),
+    inputs = PlannerInputs(
+        soc_now=55,
+        solar_tomorrow_kwh=8.0,
+        predicted_home_load_kwh=sum(LOAD_SLOTS),
+        load_slots=LOAD_SLOTS,
+        solar_slots=SOLAR_SLOTS,
+        horizon_start=HORIZON,
+        dispatches=(dispatch,),
     )
+    config = cfg()
+    plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
     assert plan.model == "slots"
     assert plan.deficit_kwh == pytest.approx(12.5, abs=APPROX)
     assert plan.required_kwh == pytest.approx(5.592, abs=APPROX)
@@ -140,15 +137,14 @@ def test_golden_daily_midnight_wrap_dispatch_classification() -> None:
         end=datetime(2026, 1, 16, 14, 30, tzinfo=UTC),
         charge_in_kwh=-2.4,
     )
-    plan = compute_plan(
-        PlannerInputs(
-            soc_now=35,
-            solar_tomorrow_kwh=6.0,
-            predicted_home_load_kwh=22.0,
-            dispatches=(night, day),
-        ),
-        cfg(),
+    inputs = PlannerInputs(
+        soc_now=35,
+        solar_tomorrow_kwh=6.0,
+        predicted_home_load_kwh=22.0,
+        dispatches=(night, day),
     )
+    config = cfg()
+    plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
     assert plan.model == "daily"
     assert plan.cheap_covered_kwh == pytest.approx(1.375, abs=APPROX)
     assert plan.deficit_kwh == pytest.approx(15.525, abs=APPROX)
@@ -163,10 +159,9 @@ def test_golden_daily_midnight_wrap_dispatch_classification() -> None:
 def test_golden_fill_strategy_with_export_revenue() -> None:
     """Fill-to-cap on a sunny day with export: revenue offsets both projections
     identically (reporting honesty, no decision change)."""
-    plan = compute_plan(
-        PlannerInputs(soc_now=60, solar_tomorrow_kwh=30.0, predicted_home_load_kwh=12.0),
-        cfg(rate_export=0.15, strategy="fill"),
-    )
+    inputs = PlannerInputs(soc_now=60, solar_tomorrow_kwh=30.0, predicted_home_load_kwh=12.0)
+    config = cfg(rate_export=0.15, strategy="fill")
+    plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
     assert plan.model == "daily"
     assert plan.deficit_kwh == pytest.approx(0.0, abs=APPROX)
     assert plan.required_kwh == pytest.approx(8.064, abs=APPROX)  # headroom to cap
@@ -199,10 +194,12 @@ def test_golden_backtest_two_rate_wrapping_window() -> None:
     tz = ZoneInfo("Europe/London")
     summary = backtest_cost(
         _backtest_intervals(tz),
-        window_start=time(23, 30),
-        window_end=time(5, 30),
         schedule=TariffSchedule(
-            cheap_rate=0.069, standard_rate=0.30, export_rate=0.0, window_hours=6.0
+            cheap_rate=0.069,
+            standard_rate=0.30,
+            export_rate=0.0,
+            window_hours=6.0,
+            window_start=time(23, 30),
         ),
         tz=tz,
     )
@@ -221,10 +218,12 @@ def test_golden_backtest_two_rate_non_wrapping_window() -> None:
     tz = ZoneInfo("Europe/London")
     summary = backtest_cost(
         _backtest_intervals(tz),
-        window_start=time(1, 0),
-        window_end=time(6, 0),
         schedule=TariffSchedule(
-            cheap_rate=0.069, standard_rate=0.30, export_rate=0.0, window_hours=5.0
+            cheap_rate=0.069,
+            standard_rate=0.30,
+            export_rate=0.0,
+            window_hours=5.0,
+            window_start=time(1, 0),
         ),
         tz=tz,
     )
