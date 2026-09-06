@@ -72,12 +72,16 @@ class TariffSchedule:
     ``controlled_windows`` are the daytime dispatch windows the battery holds
     through. ``cheap_rate``/``standard_rate``/``export_rate`` and
     ``window_hours`` feed the daily-balance model and charge-purchase costing.
+    ``window_start`` is the charge window's local start clock time — slot 0 of
+    ``cheap_fracs``/``prices`` — so the schedule anchors its per-slot pattern to
+    the clock on its own (the cost backtest classifies stored import against it).
     """
 
     cheap_rate: float
     standard_rate: float
     export_rate: float
     window_hours: float
+    window_start: time | None = None
     prices: tuple[float, ...] = ()
     cheap_fracs: tuple[float, ...] = ()
     controlled_windows: tuple[tuple[datetime, datetime], ...] = ()
@@ -126,6 +130,7 @@ class FixedTariffProvider:
             standard_rate=self.standard_rate,
             export_rate=self.export_rate,
             window_hours=cfg.window_hours,
+            window_start=cfg.window_start,
             prices=prices,
             cheap_fracs=cheap_fracs,
             controlled_windows=controlled,
@@ -192,6 +197,7 @@ class DynamicTariffProvider:
             standard_rate=self.fallback.standard_rate,
             export_rate=self.fallback.export_rate,
             window_hours=cfg.window_hours,
+            window_start=cfg.window_start,
             prices=tuple(prices),
             cheap_fracs=cheap_fracs,
             controlled_windows=controlled,
