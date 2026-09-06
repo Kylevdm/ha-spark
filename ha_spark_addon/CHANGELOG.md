@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.9.1
+
+Version re-baseline. The `1.0.0-rc1`–`rc4` line is retired: after live use,
+v1.0.0 is redefined as the full competitive MVP (see #94), so the pre-1.0 line
+returns to the `0.x` series — the competitive-MVP phases ship as `0.10.0`
+(derived base load) through `0.13.0` (V2L), then `1.0.0` once the MVP is
+complete and validated on real hardware. This release is the hardened
+foundation those phases build on — deterministic planner, device drivers,
+multi-supplier tariffs — and carries the `rc3`/`rc4` fixes, which never reached
+the store (the store stayed on `rc2`); they remain documented in their sections
+below. Upgrading from `rc2` is a version *decrease*, so the store won't auto-
+offer it — reinstall the add-on once to move onto the `0.x` line.
+
+## 1.0.0-rc4
+
+- Backtest costing fix: `ha-spark backtest` now rates stored grid import against
+  the current tariff schedule — its per-slot cheap pattern — instead of the two
+  flat fixed rates, so on a `dynamic`/`octopus_intelligent` install the
+  readiness signal is measured on the tariff the site is actually on (a `fixed`
+  install is unchanged). The command reads the live schedule from Home
+  Assistant to do this; an empty consumption store still reports offline. (#92)
+- Plan consistency: every surface that describes "the plan" — the scheduler,
+  CLI, agent tools, copilot, and the offline parser — now runs through one
+  plan-pipeline seam, so on a `dynamic`/`octopus_intelligent` install they all
+  report the same plan the daemon applies instead of silently reverting to the
+  `fixed` two-rate provider. (#91)
+
+## 1.0.0-rc3
+
+- Fix add-on startup: pin `mcp<2` (v2 renamed `FastMCP` to `MCPServer`).
+- Octopus options: add the missing `octopus_*` option defaults so the fields
+  render in the add-on config UI.
+- Health check: drop the optional `ha_template_charge_needed_entity` from the
+  required-entity list, so `ha-spark health` no longer fails when it is unset.
+
 ## 1.0.0-rc2
 
 - Multi-supplier tariffs: the planner and `ha-spark backtest` now cost every

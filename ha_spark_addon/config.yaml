@@ -1,6 +1,6 @@
 ---
 name: ha-spark
-version: "1.0.0-rc2"
+version: "0.9.1"
 slug: ha_spark_addon
 description: Local-first battery charge planner and automation agent for Home Assistant
 url: https://github.com/Kylevdm/ha-spark
@@ -53,7 +53,13 @@ options:
   profile_history_days: 60
   timezone: Europe/London
   plan_run_time: "22:00"
+  octopus_api_key: ""
+  octopus_mpan: ""
+  octopus_meter_serial: ""
   octopus_api_url: "https://api.octopus.energy/v1"
+  octopus_account_number: ""
+  octopus_product_code: ""
+  octopus_tariff_code: ""
   soc_entity: ""
   battery_voltage_entity: ""
   solar_tomorrow_entity: ""

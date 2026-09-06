@@ -1,8 +1,8 @@
 """Deterministic offline intent parser — the router's no-LLM fallback.
 
 Handles energy/planner queries only: the message is matched against keyword
-groups and answered from the same ``gather_inputs``/``compute_plan`` pipeline
-the ``plan`` command uses. Anything unrecognised returns help text listing the
+groups and answered from the same ``current_plan`` pipeline the ``plan``
+command uses. Anything unrecognised returns help text listing the
 supported queries; this path must never raise.
 """
 
@@ -16,9 +16,8 @@ from ha_spark.config import Settings
 from ha_spark.context_intent import ExtractedContext
 from ha_spark.energy.context import ContextEntry, ContextStore
 from ha_spark.energy.models import ChargePlan
-from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.report import format_plan
-from ha_spark.energy.sources import gather_inputs
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -88,8 +87,8 @@ async def parse_offline(
 
     # Everything else needs the computed plan.
     try:
-        inputs, cfg, load_source = await gather_inputs(settings, rest)
-        plan = compute_plan(inputs, cfg)
+        run = await current_plan(settings, rest)
+        plan, load_source = run.plan, run.load_source
     except Exception as exc:  # noqa: BLE001 - the fallback path must never crash
         log.warning("Offline parser could not compute the plan: %r", exc)
         return IntentResult(f"Could not compute the charge plan: {exc}", matched=True)

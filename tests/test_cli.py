@@ -117,12 +117,14 @@ def test_help_mentions_every_command_and_flags() -> None:
 
 
 async def test_backtest_rates_seeded_store(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from datetime import UTC, datetime, timedelta
+    from datetime import UTC, datetime, time, timedelta
+    from types import SimpleNamespace
 
     from ha_spark.energy.models import ConsumptionInterval
     from ha_spark.energy.store import ConsumptionStore
+    from ha_spark.energy.tariff import TariffSchedule
 
     settings = Settings(db_path=str(tmp_path / "test.db"), timezone="UTC")
     start = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) - timedelta(days=1)
@@ -130,6 +132,21 @@ async def test_backtest_rates_seeded_store(
         await store.upsert(
             [ConsumptionInterval(start, start + timedelta(minutes=30), 2.0)], "test"
         )
+
+    # The backtest costs stored import against the *live* plan schedule (the
+    # dynamic cheap pattern can't be reconstructed from stored kWh alone).
+    schedule = TariffSchedule(
+        cheap_rate=0.10,
+        standard_rate=0.30,
+        export_rate=0.0,
+        window_hours=6.0,
+        window_start=time(23, 30),
+    )
+
+    async def fake_current_plan(_settings: Settings, _rest: object) -> object:
+        return SimpleNamespace(schedule=schedule)
+
+    monkeypatch.setattr(cli, "current_plan", fake_current_plan)
 
     assert await _cmd_backtest(settings, days=7) == 0
     out = capsys.readouterr().out
@@ -140,6 +157,7 @@ async def test_backtest_rates_seeded_store(
 async def test_backtest_empty_store_errors(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # An empty store short-circuits before any live HA read.
     settings = Settings(db_path=str(tmp_path / "empty.db"))
     assert await _cmd_backtest(settings, days=7) == 2
     assert "No stored consumption" in capsys.readouterr().err

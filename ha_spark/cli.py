@@ -25,7 +25,7 @@ from ha_spark.energy.context import KINDS, ContextStore
 from ha_spark.energy.eval import actual_kwh_by_date, evaluate, format_eval
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
-from ha_spark.energy.models import ConsumptionInterval, window_hours
+from ha_spark.energy.models import ConsumptionInterval
 from ha_spark.energy.octopus import OctopusApiError, fetch_consumption, parse_octopus_csv
 from ha_spark.energy.onboarding import (
     BACKFILL_STATISTIC_ID,
@@ -33,12 +33,10 @@ from ha_spark.energy.onboarding import (
     backfill_load,
     statistic_unit,
 )
-from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever, run_once
-from ha_spark.energy.sources import build_schedule, gather_inputs, parse_time
 from ha_spark.energy.store import ConsumptionStore
-from ha_spark.energy.tariff import TariffSchedule
 from ha_spark.ha.models import StateChangedEvent
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.state_cache import StateCache
@@ -100,8 +98,8 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        inputs, cfg, load_source = await gather_inputs(settings, rest)
-        plan = compute_plan(inputs, cfg, build_schedule(settings, inputs, cfg))
+        run = await current_plan(settings, rest)
+        plan, load_source = run.plan, run.load_source
         print(format_plan(plan, load_source))
         if apply:
             intent = plan.charge_intent
@@ -289,32 +287,28 @@ def _cmd_import_csv(settings: Settings, paths: list[str]) -> int:
 
 
 async def _cmd_backtest(settings: Settings, *, days: int) -> int:
-    """Rate stored grid import under the two-rate tariff and print the summary."""
+    """Rate stored grid import under the current tariff schedule and print the summary."""
     since = datetime.now(UTC) - timedelta(days=days)
     async with ConsumptionStore(settings.db_path) as store:
         intervals = await store.load_since(since)
-    window_start = parse_time(settings.charge_window_start)
-    window_end = parse_time(settings.charge_window_end)
-    schedule = TariffSchedule(
-        cheap_rate=settings.rate_offpeak_gbp_kwh,
-        standard_rate=settings.rate_peak_gbp_kwh,
-        export_rate=settings.rate_export_gbp_kwh,
-        window_hours=window_hours(window_start, window_end),
-    )
-    summary = backtest_cost(
-        intervals,
-        window_start=window_start,
-        window_end=window_end,
-        schedule=schedule,
-        tz=load_timezone(settings.timezone),
-    )
-    if summary is None:
+    if not intervals:
         print(
             "No stored consumption in the window; run `import-csv` or "
             "`pull-consumption` first.",
             file=sys.stderr,
         )
         return 2
+    # Cost against the same schedule the planner runs on (the dynamic/intelligent
+    # cheap pattern isn't in the stored kWh) — a fixed install degrades to the
+    # two flat rates, exactly as before.
+    async with HomeAssistantRest(
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+    ) as rest:
+        run = await current_plan(settings, rest)
+    summary = backtest_cost(
+        intervals, schedule=run.schedule, tz=load_timezone(settings.timezone)
+    )
+    assert summary is not None  # intervals is non-empty
     print(format_backtest(summary))
     return 0
 

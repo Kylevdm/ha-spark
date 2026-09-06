@@ -9,6 +9,16 @@ import pytest
 
 from ha_spark.energy.models import DispatchSlot, PlannerConfig, PlannerInputs
 from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.tariff import fixed_schedule
+
+
+def _plan(inp: PlannerInputs, cfg: PlannerConfig) -> Any:
+    """compute_plan under the fixed two-rate schedule — the planner-math default.
+
+    These tests exercise sizing/cost math, not tariff selection, so they pin the
+    fixed schedule explicitly now that ``compute_plan`` requires one (#91).
+    """
+    return compute_plan(inp, cfg, fixed_schedule(inp, cfg))
 
 
 def cfg(**kw: Any) -> PlannerConfig:
@@ -34,7 +44,7 @@ def test_window_hours_wraps_midnight() -> None:
 
 def test_basic_required_and_current() -> None:
     inp = PlannerInputs(soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
-    plan = compute_plan(inp, cfg())
+    plan = _plan(inp, cfg())
     # deficit 15.45 - usable 2.688 = 12.76 kWh; target 30 + 12.76/26.88*100 ~ 77%
     assert round(plan.required_kwh, 2) == 12.76
     assert 77 <= plan.target_soc <= 78
@@ -45,7 +55,7 @@ def test_basic_required_and_current() -> None:
 
 def test_zero_need_when_full_and_sunny() -> None:
     inp = PlannerInputs(soc_now=90, solar_tomorrow_kwh=30, predicted_home_load_kwh=10)
-    plan = compute_plan(inp, cfg())
+    plan = _plan(inp, cfg())
     assert plan.required_kwh == 0
     assert plan.charge_intent.target_soc_pct == pytest.approx(plan.soc_now)
 
@@ -54,14 +64,14 @@ def test_soc_validity_passes_through_to_plan() -> None:
     inp = PlannerInputs(
         soc_now=0, solar_tomorrow_kwh=3, predicted_home_load_kwh=10, soc_valid=False
     )
-    assert compute_plan(inp, cfg()).soc_valid is False
+    assert _plan(inp, cfg()).soc_valid is False
     valid = PlannerInputs(soc_now=30, solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
-    assert compute_plan(valid, cfg()).soc_valid is True
+    assert _plan(valid, cfg()).soc_valid is True
 
 
 def test_buffer_inflates_required_within_headroom() -> None:
     inp = PlannerInputs(soc_now=20, solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
-    plan = compute_plan(inp, cfg(buffer_pct=20.0))
+    plan = _plan(inp, cfg(buffer_pct=20.0))
     # deficit = 10 - 3 = 7; usable_now = 0 (soc at min); buffered = 7 * 1.2 = 8.4.
     assert plan.deficit_kwh == pytest.approx(7.0)
     assert plan.buffer_pct == pytest.approx(20.0)
@@ -70,7 +80,7 @@ def test_buffer_inflates_required_within_headroom() -> None:
 
 def test_headroom_caps_required() -> None:
     inp = PlannerInputs(soc_now=85, solar_tomorrow_kwh=0, predicted_home_load_kwh=50)
-    plan = compute_plan(inp, cfg())
+    plan = _plan(inp, cfg())
     headroom = 26.88 * (90 - 85) / 100  # 1.344
     assert round(plan.required_kwh, 3) == round(headroom, 3)
     assert plan.target_soc <= 90 + 1e-9
@@ -86,7 +96,7 @@ def test_daytime_dispatch_emits_stop_discharge() -> None:
         soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2,
         dispatches=(_slot(13, 0),),
     )
-    plan = compute_plan(inp, cfg())
+    plan = _plan(inp, cfg())
     assert len(plan.charge_intent.holds) == 1
     assert plan.cheap_covered_kwh > 0
 
@@ -96,14 +106,14 @@ def test_overnight_dispatch_does_not_stop_discharge() -> None:
         soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2,
         dispatches=(_slot(2, 0),),
     )
-    plan = compute_plan(inp, cfg())
+    plan = _plan(inp, cfg())
     assert len(plan.charge_intent.holds) == 0
     assert plan.cheap_covered_kwh == 0
 
 
 def test_plan_emits_charge_intent() -> None:
     inp = PlannerInputs(soc_now=50.0, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=20.0)
-    plan = compute_plan(inp, cfg())
+    plan = _plan(inp, cfg())
     intent = plan.charge_intent
     assert intent.target_soc_pct == plan.target_soc
     assert intent.soc_now == plan.soc_now
@@ -117,7 +127,7 @@ def test_daytime_dispatch_becomes_a_hold() -> None:
         soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2,
         dispatches=(_slot(13, 0),),
     )
-    plan = compute_plan(inp, cfg())
+    plan = _plan(inp, cfg())
     assert len(plan.charge_intent.holds) == 1
 
 
@@ -147,7 +157,7 @@ def _slot_inputs(
 
 def test_slot_model_charges_for_expensive_slots_only() -> None:
     # 0.5 kWh per slot; 12 window slots are cheap -> 36 expensive slots = 18 kWh.
-    plan = compute_plan(_slot_inputs(load=0.5, soc_now=20.0), cfg())
+    plan = _plan(_slot_inputs(load=0.5, soc_now=20.0), cfg())
     assert plan.model == "slots"
     assert plan.expensive_load_kwh == pytest.approx(18.0)
     # SoC at min -> usable 0; required = 18 kWh within headroom (18.816).
@@ -160,7 +170,7 @@ def test_slot_model_subtracts_solar_per_slot() -> None:
     solar = [0.0] * 48
     solar[24] = 2.0  # 11:30 next day
     solar[26] = 2.0
-    plan = compute_plan(_slot_inputs(load=0.5, solar_slots=tuple(solar)), cfg())
+    plan = _plan(_slot_inputs(load=0.5, solar_slots=tuple(solar)), cfg())
     assert plan.expensive_load_kwh == pytest.approx(17.0)  # 18 - 2 * 0.5
     assert plan.required_kwh == pytest.approx(17.0)
 
@@ -170,14 +180,14 @@ def test_slot_model_dispatch_overlap_is_fractional() -> None:
     # and still emits stop_discharge.
     d_start = _HORIZON_START + timedelta(hours=14)  # 13:30 next day
     dispatch = DispatchSlot(d_start, d_start + timedelta(minutes=30), -2.0, "SMART")
-    plan = compute_plan(_slot_inputs(load=0.5, dispatches=(dispatch,)), cfg())
+    plan = _plan(_slot_inputs(load=0.5, dispatches=(dispatch,)), cfg())
     assert plan.expensive_load_kwh == pytest.approx(17.5)
     assert len(plan.charge_intent.holds) == 1
     assert plan.cheap_covered_kwh == pytest.approx(0.5)
 
 
 def test_slot_model_costs() -> None:
-    plan = compute_plan(_slot_inputs(load=0.5, soc_now=20.0), cfg())
+    plan = _plan(_slot_inputs(load=0.5, soc_now=20.0), cfg())
     # Baseline: 6 cheap kWh at 0.069 + 18 expensive kWh at 0.30.
     assert plan.baseline_cost == pytest.approx(6 * 0.069 + 18 * 0.30)
     # Planned: cheap load + the 18 kWh charge all at off-peak, nothing uncovered.
@@ -187,7 +197,7 @@ def test_slot_model_costs() -> None:
 
 def test_daily_model_also_reports_costs() -> None:
     inp = PlannerInputs(soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
-    plan = compute_plan(inp, cfg())
+    plan = _plan(inp, cfg())
     assert plan.model == "daily"
     assert plan.expensive_load_kwh is None
     assert plan.baseline_cost is not None and plan.planned_cost is not None
@@ -195,7 +205,7 @@ def test_daily_model_also_reports_costs() -> None:
 
 
 def test_slot_model_respects_headroom_and_max_current() -> None:
-    plan = compute_plan(_slot_inputs(load=2.0, soc_now=85.0), cfg())
+    plan = _plan(_slot_inputs(load=2.0, soc_now=85.0), cfg())
     headroom = 26.88 * (90 - 85) / 100
     assert plan.required_kwh == pytest.approx(headroom)
     assert plan.charge_intent.target_soc_pct <= 90.0 + 1e-9
@@ -203,18 +213,18 @@ def test_slot_model_respects_headroom_and_max_current() -> None:
 
 def test_fill_strategy_charges_to_cap() -> None:
     inp = PlannerInputs(soc_now=69, solar_tomorrow_kwh=3.4, predicted_home_load_kwh=17.7)
-    plan = compute_plan(inp, cfg(strategy="fill"))
+    plan = _plan(inp, cfg(strategy="fill"))
     headroom = 26.88 * (90 - 69) / 100
     assert plan.required_kwh == pytest.approx(headroom)
     assert plan.target_soc == pytest.approx(90.0)
     assert plan.strategy == "fill"
     # Fill ignores need entirely: it buys more than the deficit strategy would.
-    assert plan.required_kwh > compute_plan(inp, cfg()).required_kwh
+    assert plan.required_kwh > _plan(inp, cfg()).required_kwh
 
 
 def test_fill_strategy_zero_at_cap() -> None:
     inp = PlannerInputs(soc_now=90, solar_tomorrow_kwh=3.4, predicted_home_load_kwh=17.7)
-    plan = compute_plan(inp, cfg(strategy="fill"))
+    plan = _plan(inp, cfg(strategy="fill"))
     assert plan.required_kwh == 0.0
     assert plan.charge_intent.target_soc_pct == pytest.approx(plan.soc_now)
 
@@ -227,8 +237,8 @@ def test_pre_window_drain_reduces_usable() -> None:
         predicted_home_load_kwh=24.2,
         pre_window_drain_kwh=1.0,
     )
-    plan_base = compute_plan(base, cfg())
-    plan_drained = compute_plan(drained, cfg())
+    plan_base = _plan(base, cfg())
+    plan_drained = _plan(drained, cfg())
     # The kWh drained before the window must be bought back on top.
     assert plan_drained.required_kwh == pytest.approx(plan_base.required_kwh + 1.0)
     assert plan_drained.pre_window_drain_kwh == 1.0
@@ -238,8 +248,8 @@ def test_pre_window_drain_reduces_usable() -> None:
 
 def test_charge_efficiency_inflates_purchase_and_current() -> None:
     inp = PlannerInputs(soc_now=20, solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
-    lossless = compute_plan(inp, cfg())
-    lossy = compute_plan(inp, cfg(charge_efficiency=0.9))
+    lossless = _plan(inp, cfg())
+    lossy = _plan(inp, cfg(charge_efficiency=0.9))
     # Stored energy target is unchanged; the AC purchase and current grow by 1/0.9.
     assert lossy.required_kwh == pytest.approx(lossless.required_kwh)
     assert lossy.charge_intent.target_soc_pct == pytest.approx(
@@ -254,8 +264,8 @@ def test_charge_efficiency_inflates_purchase_and_current() -> None:
 def test_export_revenue_adjusts_both_costs_equally() -> None:
     # Daily model: 10 kWh solar vs 6 kWh load -> 4 kWh exported.
     inp = PlannerInputs(soc_now=50, solar_tomorrow_kwh=10, predicted_home_load_kwh=6)
-    without = compute_plan(inp, cfg())
-    with_export = compute_plan(inp, cfg(rate_export=0.15))
+    without = _plan(inp, cfg())
+    with_export = _plan(inp, cfg(rate_export=0.15))
     assert without.export_revenue is None
     assert with_export.export_revenue == pytest.approx(4 * 0.15)
     assert without.baseline_cost is not None and with_export.baseline_cost is not None
@@ -269,7 +279,7 @@ def test_export_revenue_adjusts_both_costs_equally() -> None:
 def test_slot_model_export_revenue_sums_per_slot_surplus() -> None:
     solar = [0.0] * 48
     solar[24] = 2.0  # 0.5 kWh load slots -> 1.5 kWh surplus in this slot
-    plan = compute_plan(
+    plan = _plan(
         _slot_inputs(load=0.5, solar_slots=tuple(solar)), cfg(rate_export=0.10)
     )
     assert plan.export_revenue == pytest.approx(1.5 * 0.10)
@@ -281,9 +291,9 @@ def test_dispatch_ev_kwh_sums_magnitudes() -> None:
         dispatches=(_slot(13, 0), _slot(2, 0)),
     )
     # each fixture dispatch plans -2.0 kWh into the car
-    assert compute_plan(inp, cfg()).dispatch_ev_kwh == pytest.approx(4.0)
+    assert _plan(inp, cfg()).dispatch_ev_kwh == pytest.approx(4.0)
 
 
 def test_dispatch_ev_kwh_none_without_dispatches() -> None:
     inp = PlannerInputs(soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
-    assert compute_plan(inp, cfg()).dispatch_ev_kwh is None
+    assert _plan(inp, cfg()).dispatch_ev_kwh is None
