@@ -1,12 +1,12 @@
 # Changelog
 
-## 0.13.0
+## 0.14.0
 
 Version re-baseline. The `1.0.0-rc1`–`rc4` line is retired: after live use,
 v1.0.0 is redefined as the full competitive MVP (see #94), so the pre-1.0 line
-**continues the `0.x` series from its last real release, `0.12.0`** (the rc jump
-was premature). The competitive-MVP phases ship as `0.14.0` (derived base load)
-through `0.17.0` (V2L), then `1.0.0` once the MVP is complete and validated on
+**continues the `0.x` series from its last real release, `0.13.0`** (the rc jump
+was premature). The competitive-MVP phases ship as `0.15.0` (derived base load)
+through `0.18.0` (V2L), then `1.0.0` once the MVP is complete and validated on
 real hardware. This release is the hardened foundation those phases build on —
 deterministic planner, device drivers, multi-supplier tariffs, plus the P8.1
 tariff-schedule pipeline — and carries the `rc3`/`rc4` fixes, which never
