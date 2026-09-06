@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.0.0-rc4
+
+- Backtest costing fix: `ha-spark backtest` now rates stored grid import against
+  the current tariff schedule — its per-slot cheap pattern — instead of the two
+  flat fixed rates, so on a `dynamic`/`octopus_intelligent` install the
+  readiness signal is measured on the tariff the site is actually on (a `fixed`
+  install is unchanged). The command reads the live schedule from Home
+  Assistant to do this; an empty consumption store still reports offline. (#92)
+- Plan consistency: every surface that describes "the plan" — the scheduler,
+  CLI, agent tools, copilot, and the offline parser — now runs through one
+  plan-pipeline seam, so on a `dynamic`/`octopus_intelligent` install they all
+  report the same plan the daemon applies instead of silently reverting to the
+  `fixed` two-rate provider. (#91)
+
+## 1.0.0-rc3
+
+- Fix add-on startup: pin `mcp<2` (v2 renamed `FastMCP` to `MCPServer`).
+- Octopus options: add the missing `octopus_*` option defaults so the fields
+  render in the add-on config UI.
+- Health check: drop the optional `ha_template_charge_needed_entity` from the
+  required-entity list, so `ha-spark health` no longer fails when it is unset.
+
 ## 1.0.0-rc2
 
 - Multi-supplier tariffs: the planner and `ha-spark backtest` now cost every
