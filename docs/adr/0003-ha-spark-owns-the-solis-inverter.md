@@ -1,6 +1,7 @@
 # ADR-0003: ha-spark is the sole owner of the Solis inverter
 
-Status: Accepted (2026-09-06)
+Status: Accepted (2026-09-06); premise corrected 2026-09-07 (see "The
+overnight charge is inverter-resident")
 
 ## Context
 
@@ -35,6 +36,27 @@ The founding purpose of ha-spark is to take control of the home's energy away
 from these coarse and sometimes-broken automations. That frames the decision:
 ha-spark takes over, rather than coexisting with a boundary.
 
+### The overnight charge is inverter-resident (established 2026-09-07)
+
+The inventory above described the automations correctly but mis-attributed the
+overnight charge to them. Register reads and recorder history (under #90/#100)
+show the inverter runs **its own timed charge schedule**, held in inverter
+registers, independent of Home Assistant:
+
+- Slot 1 is configured **23:30 → 05:30 at 60.0 A** (registers 43143-43146,
+  43141) and armed — bit 1 of the work-mode bitfield (33132) is set.
+- On the night of 2026-09-06, charging began at **23:29:44**, sixteen seconds
+  *before* `automation.turn_solis_on` fired at 23:30:00, and
+  `select.solisac_power_switch` did not change state across the boundary.
+- Charge current clamped at **59.2-60.5 A** — the timed-charge setpoint
+  (60.0 A), not the `battery_charge_current_limit` (62.5 A). No automation
+  sets a charge current; only the timed window does.
+
+The automations therefore **mirror** the inverter's schedule at the same
+boundaries rather than causing it. This does not change the decision — ha-spark
+still takes over — but it changes what taking over requires: disabling the
+automations alone leaves the 23:30 charge running.
+
 ## Decision
 
 **ha-spark becomes the sole owner of the Solis inverter** — of both control
@@ -56,7 +78,7 @@ incumbent's behaviour is decomposed and each rule assigned a disposition:
 
 | # | Incumbent rule | Disposition |
 |---|---|---|
-| 1 | Fixed overnight grid-charge, `On` 23:30 → 05:30 | **Replace** with planner-chosen dynamic charging (#84 force-charge + #46 replan cadence). Same outcome — cheap overnight charge — with the amount and timing chosen by the planner rather than a blunt fixed window. |
+| 1 | Fixed overnight grid-charge, 23:30 → 05:30 at 60 A — **inverter-resident, not automation-driven** (see above) | **Replace** with planner-chosen dynamic charging (#84 force-charge + #46 replan cadence). Same outcome — cheap overnight charge — with the amount and timing chosen by the planner rather than a blunt fixed window. **Replacing it requires disarming the inverter's own timed window** (#100); disabling the mirror automations does not stop it. |
 | 2 | Discharge-off during Octopus dispatch slots | **Keep** — already implemented: the planner emits dispatch `holds`. |
 | 3 | Discharge-off while the car charges | **Keep as a safety floor.** Raise a stop-discharge hold whenever `ev_charging` is active (the Zappi input is already ingested via `ev_status_entity`). This covers ad-hoc boosts *outside* a formal dispatch slot, which today's dispatch-only `holds` miss. **Hard precondition of cutover.** The richer "charge the battery based on what the car is doing, weighing grid carbon" ambition is explicitly *not* this floor — it is a separate feature (#98). |
 | 4 | 05:30 "if dispatch still active, stay Off" boundary | **Drop** — an artefact of the fixed-window design that dissolves under dynamic planning plus rule 2. |
@@ -74,12 +96,20 @@ scope and stays with the operator.
    power-switch / force-charge actions against the live incumbent until the
    behaviour ledger above checks out (rules 1–3 satisfied, rule 4 confirmed
    irrelevant).
-2. In **one coordinated step**: *disable* (not delete) the four incumbent
+2. **Disarm the inverter's own timed charge window** (#100) — slot 1,
+   23:30 → 05:30 at 60 A. This is a *separate controller from the automations*
+   and survives disabling them; leaving it armed means the inverter grid-charges
+   at 60 A every night regardless of what the planner decides. The mechanism
+   (clear the slot registers, clear the timed bit, or change the storage-control
+   mode) and its reversibility are decided in #100. Record the pre-change values
+   first — they are the rollback.
+3. In **one coordinated step**: *disable* (not delete) the four incumbent
    automations **and** set `proactive_mode = on`. Disabling rather than
    deleting keeps them as an instant rollback if ha-spark misbehaves live.
-3. **Invariant:** ha-spark is never in `proactive_mode = on` while the
-   incumbent automations are enabled. The two controllers never write the
-   switch at the same time.
+4. **Invariant:** ha-spark is never in `proactive_mode = on` while the
+   incumbent automations are enabled **or while the inverter's timed window is
+   armed**. Only one controller drives the battery at a time — and there are
+   three candidate controllers here, not two.
 
 The four incumbent automations, for the rollback record:
 `Solis on - grid charge slot starts (23:30)`,
@@ -119,6 +149,15 @@ The four incumbent automations, for the rollback record:
   #84, and must stay compatible with ADR-0002 (auditable-over-optimal): any
   carbon lookahead expressed as a named reservation with a sentence-shaped
   reason, not an opaque multi-objective score.
+- **Disarming the timed window is a hard cutover precondition**, alongside the
+  rule-3 car-charging discharge floor. Both are tracked outside this ADR (#100
+  and #84 respectively). Until the window is disarmed, `proactive_mode = on` is
+  unsafe in a way `simulate` validation cannot reveal: simulate compares
+  ha-spark's intentions against the incumbent, and the incumbent it is being
+  compared against is partly the inverter itself.
+- The rollback surface is larger than "re-enable four automations". A full
+  rollback also restores the timed-window registers, so their pre-change values
+  must be recorded before step 2.
 - #86 is resolved: the map's "nothing ships until ownership is reconciled"
   blocker is cleared for #84, with the cutover gated on `simulate` validation
   rather than on further debate.
