@@ -34,17 +34,40 @@ Re-verify both polarities against the baseline in step 0 before trusting them.
 | # | precondition | why | status 2026-09-07 15:35 BST |
 |---|---|---|---|
 | 1 | Run **well outside 23:30–05:30** | The inverter's own timed charge is armed at 60 A. A run inside the window cannot distinguish our write from its schedule ([#100](https://github.com/Kylevdm/ha-spark/issues/100)). | ✅ any time before ~23:00 |
-| 2 | **SoC ≤ ~60%** | At high SoC the BMS tapers, and "write rejected" is indistinguishable from "battery declined the current" — the exact ambiguity behind this map's history. | ❌ **84%** — not yet |
-| 3 | **Low or no solar** | Grid import must be unambiguously caused by the force. | ❌ daylight — wait for dusk |
+| 2 | **SoC ≤ ~95%** | Only a genuinely near-full pack confounds a negative result. Taper is *not* a factor below that — see the measured taper table below. | ✅ **84%**, ~4.3 kWh headroom |
+| 3 | Low solar *(preferred, not required)* | Makes grid import unambiguous. In daylight the force is still readable as a step change against a steady baseline; just record the pre-force baseline carefully. | ⚠️ daylight — dusk is cleaner |
 | 4 | **No Octopus dispatch slot during the run** | `automation.solis_off_dispatch_slot_starts_daytime` writes `select.solisac_power_switch` → `Off` mid-run, which would stop the test and confound it. Check `binary_sensor.octopus_energy_..._intelligent_dispatching` is `off` and no slot is imminent. | ⚠️ `off` now, but smart charge is `on` (target 08:00) — recheck at start |
-| 5 | **SoC reading is trustworthy** | The `12%` misreport of 2026-07-30 was the BMS lying plausibly. A false low SoC makes any negative result inconclusive. | ✅ 84% consistent with the overnight charge to 99% |
+| 5 | **SoC reading is trustworthy** | The `12%` misreport of 2026-07-30 was the BMS lying plausibly. A false low SoC makes any negative result inconclusive. | ✅ 84% consistent with the overnight charge to 100% |
 | 6 | Overlay healthy | The instrument. | ✅ 43135=0, 43136=0 W, 33132=35, 43282=0 |
 | 7 | Person present, ready to abort | Forced grid charge is the most expensive thing this project can get wrong. | — |
 
-**Practical slot:** SoC falls through the day from the 99% overnight peak and the timed window
-re-arms at 23:30, so the natural window is **after dusk and before ~23:00**, on a day with enough
-house load to pull SoC down. Do not trade SoC headroom away to save money — 1.5 kW for 10 minutes
-is ~0.25 kWh, pennies even at the current peak rate of ~30 p/kWh.
+**Practical slot:** any time before ~23:00; dusk is cleanest for solar attribution. There is no need
+to wait for a low SoC — see below.
+
+### Measured: this pack does not taper below full
+
+Charge current by SoC band, from the overnight window of 2026-09-06 → 09-07 (read-only history):
+
+| SoC | 50% | 70% | **84%** | 92% | 98% | 100% |
+|---|---|---|---|---|---|---|
+| charge current | 59.1 A | 58.0 A | **57.4 A** | 57.0 A | 57.3 A | 0 A |
+
+Flat to within 3% from 50% all the way to 98%, then a cliff at full — an LFP plateau, not a ramp.
+SoC also climbed at a constant 2% per ~11.3 min throughout, independently confirming a constant rate.
+
+**Consequence for this run:** at 84% there is ~4.3 kWh of headroom and the pack will accept full
+current, so a few minutes at the 1.5 kW test setpoint (~0.1 kWh) is untroubled. The old `≤60%`
+precondition was over-conservative and is retired.
+
+**What SoC still affects:** only the reading of a *negative* result. If the force does nothing at
+high SoC, "the write was rejected" and "the inverter declined because it is near full" are two
+explanations rather than one — though the 57.3 A observed at 98% makes the second unlikely below
+~95%. A **positive** result is fully conclusive at any SoC. Note also that the taper table above
+comes from the **timed-window** path; it proves the pack and the inverter will charge at 84%, not
+that the RC path is free of an SoC gate of its own. No register known to this map gates it —
+`battery_minimum_soc` (20) is a discharge floor and `force_charge_soc` (10) is a charge-below
+threshold, neither a ceiling — but that is absence of evidence, and a refusal at high SoC would
+itself be a finding worth recording.
 
 ## Instrumentation
 
