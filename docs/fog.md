@@ -91,3 +91,23 @@ dropped tariff schedule), #92 (backtest tariff contract), and #93
   manager and a `tick(state, now)` function. Pairs with the device-seam
   entry's no-REST `capabilities` fix. Trigger: the next scheduler feature that
   needs loop tests.
+
+### Solis control provisioning (from #84, 2026-09-08)
+
+- **Zero-touch install of the `solis_control` modbus overlay — up to a
+  supporting companion integration.** #84 ships native Solis forced charge
+  driving the `solis_control` overlay hub
+  (`ha_spark/devices/inverters/solis.py`), but the overlay itself
+  (`docs/solis-control-modbus-overlay.yaml`) is a one-time **manual** HA-config
+  step: an HA add-on cannot inject a `modbus:` block into a user's
+  `configuration.yaml`. Want: make it as easy as possible to install/use so
+  users don't hand-edit YAML. Two shapes weighed in-session: (a) the add-on
+  writes a package file into the HA config dir and the user enables a
+  `packages:` include (still one manual enable + restart); (b) a **companion
+  custom-integration** doing native `pymodbus`, limited to only the registers
+  ha-spark needs — with the map's standing constraint that it **must not**
+  rebuild solax/solis_modbus. Beyond map #78's destination (deliver forced
+  charge), which #84 met with the manual overlay; adjacent to #59 (driver-aware
+  onboarding) but distinct — onboarding maps existing entities, this provisions
+  a control surface. Trigger: none yet (a user hitting the manual-install
+  friction, or a decision to invest in the companion integration).
