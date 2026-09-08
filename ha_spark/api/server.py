@@ -24,6 +24,7 @@ from typing import Any
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 
 from ha_spark.agent import auth, tools
 from ha_spark.agent.exposure import OPERATION_TIERS, allowed, surface_on
@@ -138,28 +139,41 @@ class _Gate:
 
     def __init__(self, state: AppState, operation: str) -> None:
         self._state = state
-        self._operation = operation
+        # Public: the schema filter reads the operation back off the registered
+        # route's own gate rather than restating the binding (see
+        # :func:`_gate_bindings`).
+        self.operation = operation
 
     async def __call__(self) -> None:
-        if not allowed(self._state, OPERATION_TIERS[self._operation]):
+        if not allowed(self._state, OPERATION_TIERS[self.operation]):
             raise HTTPException(status_code=404)
 
 
-# (/agent/<path>, method) -> operation name, for filtering /openapi.json against
-# the live gate. Values are keys of ``OPERATION_TIERS``; a route's operation is
-# the same name its ``_Gate`` resolves (see ``_agent_router``), so the tier
-# lives in exactly one place. Method keys are lowercase, as in the schema.
-_AGENT_ROUTE_OPS: dict[tuple[str, str], str] = {
-    ("/agent/plan", "get"): "get_plan",
-    ("/agent/state", "get"): "get_state",
-    ("/agent/forecast", "get"): "get_forecast",
-    ("/agent/predictions", "get"): "get_predictions",
-    ("/agent/health", "get"): "get_health",
-    ("/agent/context", "get"): "get_context",
-    ("/agent/context", "post"): "add_context",
-    ("/agent/run", "post"): "run_plan",
-    ("/agent/config", "post"): "set_config",
-}
+# (path, lowercase method, operation) per gated route -- lowercase to match the
+# schema's method keys.
+_GateBindings = tuple[tuple[str, str, str], ...]
+
+
+def _gate_bindings(router: APIRouter) -> _GateBindings:
+    """The route -> operation binding, read back off each route's own :class:`_Gate`.
+
+    The gate the request path evaluates is the only place a route's operation is
+    named, so the schema filter cannot drift from what is enforced and adding a
+    route needs no second edit (#93 flagged this matrix being written twice).
+    Only the *binding* is static here; the exposure decision it feeds is still
+    taken per request against the live settings.
+    """
+    bindings: list[tuple[str, str, str]] = []
+    for route in router.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        for dependency in route.dependencies:
+            gate = dependency.dependency
+            if isinstance(gate, _Gate):
+                bindings.extend(
+                    (route.path, method.lower(), gate.operation) for method in route.methods or ()
+                )
+    return tuple(bindings)
 
 
 class _SparkAPI(FastAPI):
@@ -171,12 +185,16 @@ class _SparkAPI(FastAPI):
     true for discovery as well as execution.
     """
 
+    def __init__(self, *args: Any, gate_bindings: _GateBindings, **kwargs: Any) -> None:
+        self._gate_bindings = gate_bindings
+        super().__init__(*args, **kwargs)
+
     def openapi(self) -> dict[str, Any]:
         self.openapi_schema = None  # settings may have changed since the last call
         schema = super().openapi()
         state: AppState = getattr(self.state, STATE_ATTR)
         paths: dict[str, Any] = schema.get("paths", {})
-        for (path, method), operation in _AGENT_ROUTE_OPS.items():
+        for path, method, operation in self._gate_bindings:
             if allowed(state, OPERATION_TIERS[operation]):
                 continue
             ops: dict[str, Any] | None = paths.get(path)
@@ -265,11 +283,15 @@ def build_app(state: AppState, *, require_token: bool = False, token: str = "") 
     # so we adopt it as the app's lifespan or /mcp 500s with "Task group is not
     # initialized". Build the app and read its lifespan BEFORE creating FastAPI.
     mcp_app = build_mcp(state).streamable_http_app()
+    # Built before the app so the schema filter is handed the bindings of the
+    # very router that gets included below -- one object, no restated table.
+    agent_router = _agent_router(state)
     app = _SparkAPI(
         title="ha-spark",
         docs_url=None,
         redoc_url=None,
         lifespan=mcp_app.router.lifespan_context,
+        gate_bindings=_gate_bindings(agent_router),
     )
     setattr(app.state, STATE_ATTR, state)
 
@@ -320,7 +342,7 @@ def build_app(state: AppState, *, require_token: bool = False, token: str = "") 
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(_state_of(request).current_options())
 
-    app.include_router(_agent_router(state))
+    app.include_router(agent_router)
     # FastAPI router dependencies (the ``_auth`` gate above) do NOT propagate to a
     # mounted ASGI sub-app, so on the published port /mcp would otherwise be
     # reachable without the bearer token while /api/* and /agent/* require it.
