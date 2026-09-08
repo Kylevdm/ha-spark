@@ -23,10 +23,9 @@ from ha_spark.energy import habits
 from ha_spark.energy.backtest import backtest_cost, format_backtest
 from ha_spark.energy.context import KINDS, ContextStore
 from ha_spark.energy.derived_base_load import (
-    BACKFILL_DERIVED_NAME,
-    BACKFILL_DERIVED_STATISTIC_ID,
-    ComponentSpec,
+    BACKFILL_NAME,
     backfill_derived_load,
+    derive_specs_from_settings,
 )
 from ha_spark.energy.eval import actual_kwh_by_date, evaluate, format_eval
 from ha_spark.energy.forecast import load_timezone
@@ -232,56 +231,25 @@ async def _cmd_generate_dashboard(settings: Settings, *, output: str) -> int:
     return 0
 
 
-def _derive_specs(settings: Settings) -> dict[str, ComponentSpec]:
-    """Map the flat ``derive_*_entity`` / ``derive_invert_*`` Settings to ComponentSpecs.
-
-    Optional components with a blank entity id are omitted (the pure
-    function degrades those with a "not configured" note); grid import
-    with a blank entity id is kept so the call site reports the clearer
-    "required component missing" error.
-    """
-    pairs: tuple[tuple[str, str, str], ...] = (
-        ("grid_import", "derive_grid_import_entity", "derive_invert_grid_import"),
-        ("grid_export", "derive_grid_export_entity", "derive_invert_grid_export"),
-        (
-            "solar_generation",
-            "derive_solar_generation_entity",
-            "derive_invert_solar_generation",
-        ),
-        (
-            "battery_charge",
-            "derive_battery_charge_entity",
-            "derive_invert_battery_charge",
-        ),
-        (
-            "battery_discharge",
-            "derive_battery_discharge_entity",
-            "derive_invert_battery_discharge",
-        ),
-        ("ev_charge", "derive_ev_charge_entity", "derive_invert_ev_charge"),
-    )
-    specs: dict[str, ComponentSpec] = {}
-    for name, ent_field, inv_field in pairs:
-        entity_id = str(getattr(settings, ent_field) or "")
-        invert = bool(getattr(settings, inv_field))
-        if entity_id or name == "grid_import":
-            specs[name] = ComponentSpec(entity_id=entity_id, invert=invert)
-    return specs
-
-
 async def _cmd_backfill_load(
     settings: Settings, *, source: str | None, list_only: bool, derive: bool
 ) -> int:
     """Backfill ha_spark:house_load from an existing statistic, or list candidates.
 
-    Two paths: the legacy source-entity path (``--from`` /
-    ``BACKFILL_SOURCE_ENTITY``) copies a single power/energy sensor's
-    hourly rows into ``ha_spark:house_load``. The derived path (``--derive``,
-    enabled by setting any ``derive_*_entity`` option) computes base load
-    by energy balance over per-component statistic IDs and writes
-    ``ha_spark:derived_house_load`` (a separate external id so switching
-    between paths doesn't collide). ``--list`` always shows backfill-capable
-    source candidates regardless of which path is in use.
+    Two paths write the same external id (``ha_spark:house_load``) so the
+    forecast chain (``consumption_energy_entity``) consumes the result
+    unchanged — no need to repoint between paths:
+
+    - The source-entity path (``--from`` / ``BACKFILL_SOURCE_ENTITY``)
+      copies a single power/energy sensor's hourly rows into the target.
+    - The derived path (``--derive``, enabled by setting any
+      ``derive_*_entity`` option) computes base load by energy balance
+      over per-component statistic IDs and writes the result to the same
+      target.
+
+    The two paths are mutually exclusive at dispatch so they never run
+    in the same session. ``--list`` shows backfill-capable source
+    candidates regardless of which path is in use.
     """
     if list_only:
         metas = await list_statistic_ids(
@@ -294,7 +262,7 @@ async def _cmd_backfill_load(
         print(f"\n{len(candidates)} backfill-capable statistics.")
         return 0
     if derive:
-        specs = _derive_specs(settings)
+        specs = derive_specs_from_settings(settings)
         if not specs.get("grid_import") or not specs["grid_import"].entity_id:
             print(
                 "Derived backfill requires DERIVE_GRID_IMPORT_ENTITY; "
@@ -309,8 +277,8 @@ async def _cmd_backfill_load(
             result = await backfill_derived_load(
                 settings,
                 specs,
-                statistic_id=BACKFILL_DERIVED_STATISTIC_ID,
-                statistic_name=BACKFILL_DERIVED_NAME,
+                statistic_id=BACKFILL_STATISTIC_ID,
+                statistic_name=BACKFILL_NAME,
                 start=start,
             )
         except (ValueError, RuntimeError) as exc:
@@ -318,7 +286,7 @@ async def _cmd_backfill_load(
             return 2
         print(
             f"Imported {result.rows_imported} hourly stats ({result.span}) "
-            f"into {BACKFILL_DERIVED_STATISTIC_ID}."
+            f"into {BACKFILL_STATISTIC_ID}."
         )
         if result.negative_clamped:
             print(
@@ -330,9 +298,9 @@ async def _cmd_backfill_load(
             for note in result.degradation:
                 print(f"  {note}")
         print(
-            f"Set CONSUMPTION_ENERGY_ENTITY={BACKFILL_DERIVED_STATISTIC_ID} to "
-            "use the derived series for the load forecast, then run "
-            "`ha-spark onboard` to confirm readiness."
+            f"{BACKFILL_STATISTIC_ID} now holds the derived base-load series; "
+            "point CONSUMPTION_ENERGY_ENTITY at it (or run `ha-spark onboard` "
+            "to confirm readiness)."
         )
         return 0
     entity = source or settings.backfill_source_entity
@@ -706,15 +674,16 @@ def build_parser() -> argparse.ArgumentParser:
         "backfill-load",
         help="Rebuild house-load history from an existing HA statistic",
         description="Rebuild ha_spark:house_load history for the load forecast. Two "
-        "paths: the source-entity path (``--from`` / ``BACKFILL_SOURCE_ENTITY``) "
-        "copies a single power/energy sensor's hourly rows into "
-        "``ha_spark:house_load``. The derived path (``--derive``) computes base "
-        "load by energy balance over per-component statistic IDs "
-        "(``derive_grid_import_entity`` etc., with explicit invert flags) and "
-        "writes ``ha_spark:derived_house_load`` (a separate external id so "
-        "switching between paths does not collide). ``--list`` shows "
-        "backfill-capable source candidates regardless of path. Both paths are "
-        "idempotent (recorder upserts by statistic_id+start).",
+        "paths write the same external id (the forecast chain consumes it "
+        "unchanged, no need to repoint ``consumption_energy_entity``): the "
+        "source-entity path (``--from`` / ``BACKFILL_SOURCE_ENTITY``) copies a "
+        "single power/energy sensor's hourly rows into ``ha_spark:house_load``, "
+        "and the derived path (``--derive``) computes base load by energy "
+        "balance over per-component statistic IDs (``derive_grid_import_entity`` "
+        "etc., with explicit invert flags) and writes the result to the same id. "
+        "Both paths are idempotent (recorder upserts by statistic_id+start); "
+        "they are mutually exclusive at dispatch. ``--list`` shows "
+        "backfill-capable source candidates regardless of path.",
     )
     p_bf.add_argument(
         "--from",
@@ -734,7 +703,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="derive",
         action="store_true",
         help="Derive base load from per-component statistic IDs (DERIVE_*_ENTITY "
-        "options). Writes ha_spark:derived_house_load.",
+        "options). Writes the derived series into ha_spark:house_load.",
     )
 
     p_csv = sub.add_parser(

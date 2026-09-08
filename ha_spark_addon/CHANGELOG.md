@@ -6,29 +6,40 @@
   from base load **derived by energy balance** over the HA long-term
   component statistics (`grid_import - grid_export + solar_generation +
   battery_discharge - battery_charge - ev_charge`) instead of a single
-  user-supplied consumption sensor. The derived series is written as
-  the external statistic `ha_spark:derived_house_load`; the forecast
-  chain is unchanged — point `consumption_energy_entity` at the new id
-  after a one-time `ha-spark backfill-load --derive` run.
+  user-supplied consumption sensor. Both the derived path and the
+  source-entity path write the same external statistic
+  (`ha_spark:house_load`), so the forecast chain is unchanged — no
+  need to repoint `consumption_energy_entity` between paths. A
+  one-time `ha-spark backfill-load --derive` (re)builds the history
+  from the configured components.
 - New `derive_*_entity` options for each of the six components (grid
   import is required; the others are optional and contribute zero with
   a degradation note when unset) plus per-component `derive_invert_*`
   flags for the explicit sign convention. The same unit handling as
   the source-entity backfill (`W`/`kW` mean-power or `kWh`/`Wh`
   energy change) — an unsupported unit disables that component with a
-  clear reason, preserving old behaviour on a partial setup.
+  clear reason, preserving old behaviour on a partial setup. The
+  per-component conversion preserves sign through to the formula so
+  the explicit `invert` flag actually changes the contribution (a
+  positive source with `invert=true` reaches the formula as a
+  non-zero negative, not silently zeroed).
 - New CLI flag `ha-spark backfill-load --derive` runs the energy-balance
   backfill. `--from` (source-entity path) and `--derive` are mutually
-  exclusive; the two paths write to different external ids so switching
-  never collides. The backfill report names rows written, date range,
-  per-component coverage, sign-convention warnings, and omitted-component
-  notes. The wizard (`ha-spark onboard`) now surfaces candidates for
-  every `derive_*_entity` field.
+  exclusive at dispatch; the two paths write to the same external id,
+  so switching between them cannot collide on stale rows. The backfill
+  report names rows written, date range, every component's coverage
+  range (with omitted components stated as such), sign-convention
+  warnings, and omitted-component notes. The wizard (`ha-spark onboard`)
+  now surfaces candidates for every `derive_*_entity` field.
 - Scheduled rolling re-derivation: after every daily plan run the daemon
-  re-derives the trailing 48 h from component statistics and continues
-  the cumulative sum from the last imported row, so
-  `ha_spark:derived_house_load` stays current without a manual rerun.
-  Failures are logged/reported and never block planning.
+  re-derives the trailing 48 h from component statistics and **upserts**
+  every derivable hour in that window (late-arriving or corrected
+  component rows overwrite their previous target values), with the
+  cumulative `sum` anchored on the latest target row strictly *before*
+  the recompute window so the running total never drops. Failures are
+  logged/reported and never block planning. The shared `derive_specs_from_settings`
+  helper feeds both the CLI and the scheduler so the per-component
+  entity-id / invert-flag mapping cannot drift.
 
 ## 0.14.2
 
