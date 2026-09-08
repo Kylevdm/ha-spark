@@ -24,7 +24,8 @@ inverter's work mode (bit 5); the live rate-tier throttle is not so gated.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, TypeVar
 
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
 from ha_spark.devices.registry import register
@@ -67,6 +68,7 @@ _READ_BACK_DELAY_SECONDS = 0.1
 # Work-mode bitfield: bit 5 (mask 32) == grid charging permitted. A forced grid
 # charge is refused by firmware when this is unset, so assert it, never write it.
 _GRID_CHARGE_BIT = 1 << 5
+T = TypeVar("T")
 
 
 @register("solis")
@@ -106,11 +108,19 @@ class SolisDevice:
         # mode once. A real write is refused when bit 5 is unset (firmware would
         # ignore the force anyway). Non-"on" modes don't read/gate.
         blocked = await self._assert_grid_charge_allowed() if mode == "on" else None
-        # Current is the safety prerequisite for slot 1. A new or existing
-        # window must never be exposed at an unconfirmed, potentially higher
-        # current. If current fails, leave any existing window untouched and
-        # do not write the window block.
-        current_ok, current_line = await self._write_charge_current_result(intent, blocked)
+        # Current is the safety prerequisite for slot 1. If an existing window
+        # is active at another current, deactivate it and confirm zero before
+        # attempting the current transition. This leaves a failed transition
+        # safe at zero rather than continuing an old, higher-rate window.
+        deactivation_line: str | None = None
+        if mode == "on" and blocked is None:
+            current_ok, current_line, deactivation_line = await self._prepare_slot_one_current(
+                intent
+            )
+        else:
+            current_ok, current_line = await self._write_charge_current_result(intent, blocked)
+        if deactivation_line is not None:
+            lines.append(deactivation_line)
         lines.append(current_line)
         if current_ok:
             lines.append(await self._write_charge_window(intent, None))
@@ -192,11 +202,6 @@ class SolisDevice:
             return f"[WARNING] {desc}, but {mismatch}"
         return f"[APPLIED] {desc}" if wrote else f"[SKIP] {desc} (already set)"
 
-    async def _write_charge_current(self, intent: ChargeIntent, blocked: str | None) -> str:
-        """Program slot 1's charge current (43141), a standalone single register."""
-        _ok, line = await self._write_charge_current_result(intent, blocked)
-        return line
-
     async def _write_charge_current_result(
         self, intent: ChargeIntent, blocked: str | None
     ) -> tuple[bool, str]:
@@ -214,26 +219,72 @@ class SolisDevice:
             return False, f"[BLOCKED] {desc}: {blocked}"
         return await self._set_current_result(amps, desc)
 
+    async def _prepare_slot_one_current(
+        self, intent: ChargeIntent
+    ) -> tuple[bool, str, str | None]:
+        """Make slot 1 safe before changing its planned charge current."""
+        amps = round(solis_current_a(intent, self._settings))
+        current_desc = (
+            f"set timed charge current to {amps} A for the "
+            f"{window_hours(intent.window_start, intent.window_end):.1f} h window"
+        )
+        zeros = [0] * len(_WINDOW_FIELDS)
+        try:
+            active = await self._read_slot_block(1) != zeros
+        except Exception as exc:  # noqa: BLE001 - do not guess at an active window
+            line = f"[FAILED] {current_desc}: slot 1 state unreadable: {exc!r}"
+            log.error(line)
+            return False, line, None
+        if not active:
+            ok, line = await self._set_current_result(amps, current_desc)
+            return ok, line, None
+
+        try:
+            current = await self._read_current_a()
+            needs_deactivation = abs(current - amps) > 0.5
+        except Exception:
+            needs_deactivation = True
+        if needs_deactivation:
+            deactivated, deactivation_line = await self._zero_slot(
+                1, "deactivate timed slot 1 window"
+            )
+            if not deactivated:
+                line = f"[BLOCKED] {current_desc}: slot 1 was not safely deactivated"
+                log.warning(line)
+                return False, line, deactivation_line
+            ok, line = await self._set_current_result(amps, current_desc)
+            return ok, line, deactivation_line
+
+        ok, line = await self._set_current_result(amps, current_desc)
+        return ok, line, None
+
     async def _zero_guard_slot(self, slot: int) -> str:
         """Zero a non-driven slot's window block, but only if it is non-zero
         (register endurance: steady state costs zero writes)."""
         desc = f"zero timed slot {slot} window"
+        _ok, line = await self._zero_slot(slot, desc)
+        return line
+
+    async def _zero_slot(self, slot: int, desc: str) -> tuple[bool, str]:
+        """Zero a slot and confirm it, returning whether zero was confirmed."""
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         if mode == "simulate":
-            return f"[SIMULATE] would {desc} (if non-zero)"
+            return True, f"[SIMULATE] would {desc} (if non-zero)"
         if mode in ("off", "observe"):
-            return f"[{mode.upper()}] computed: {desc} (if non-zero)"
+            return True, f"[{mode.upper()}] computed: {desc} (if non-zero)"
         zeros = [0] * len(_WINDOW_FIELDS)
         try:
             current = await self._read_slot_block(slot)
             if current == zeros:
-                return f"[SKIP] slot {slot} already zeroed"
+                return True, f"[SKIP] slot {slot} already zeroed"
             await self._write_register(_SLOT_BLOCK_REG[slot], zeros)
             mismatch = await self._verify_slot_block(slot, zeros, refresh=True)
         except Exception as exc:  # noqa: BLE001
             log.error("[FAILED] %s: %r", desc, exc)
-            return f"[FAILED] {desc}: {exc!r}"
-        return f"[WARNING] {desc}, but {mismatch}" if mismatch else f"[APPLIED] {desc}"
+            return False, f"[FAILED] {desc}: {exc!r}"
+        if mismatch:
+            return False, f"[WARNING] {desc}, but {mismatch}"
+        return True, f"[APPLIED] {desc}"
 
     async def _set_current(self, amps: float, desc: str) -> str:
         """Live charge-rate write (rate tier / supply guard). Single register,
@@ -322,49 +373,48 @@ class SolisDevice:
     async def _verify_slot_block(
         self, slot: int, want: list[int], *, refresh: bool = False
     ) -> str | None:
-        if refresh:
-            try:
-                await self._refresh_slot(slot)
-            except Exception as exc:  # noqa: BLE001 - verification must degrade safely
-                return f"read-back refresh failed: {exc!r}"
-        mismatch: str | None = None
-        last_exc: Exception | None = None
-        for attempt in range(_READ_BACK_ATTEMPTS):
-            try:
-                got = await self._read_slot_block(slot)
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-            else:
-                last_exc = None
-                mismatch = None if got == want else f"read back slot {slot} {got} (wanted {want})"
-                if mismatch is None:
-                    return None
-            if attempt + 1 < _READ_BACK_ATTEMPTS:
-                await asyncio.sleep(_READ_BACK_DELAY_SECONDS)
-        if last_exc is not None:
-            return f"read-back failed: {last_exc!r}"
-        return mismatch or "read-back failed"
+        entities = tuple(
+            self._sensor(field + _SLOT_SUFFIX[slot]) for field in _WINDOW_FIELDS
+        )
+        return await self._verify_read_back(
+            lambda: self._read_slot_block(slot),
+            lambda got: got == want,
+            lambda got: f"read back slot {slot} {got} (wanted {want})",
+            refresh_entities=entities if refresh else None,
+        )
 
     async def _verify_current(self, amps: float, *, refresh: bool = False) -> str | None:
-        if refresh:
+        return await self._verify_read_back(
+            self._read_current_a,
+            lambda got: abs(got - amps) <= 0.5,
+            lambda got: f"read back {got:g} A (wanted {amps:g} A)",
+            refresh_entities=(self._sensor("timed_charge_current"),) if refresh else None,
+        )
+
+    async def _verify_read_back(
+        self,
+        read: Callable[[], Awaitable[T]],
+        matches: Callable[[T], bool],
+        describe_mismatch: Callable[[T], str],
+        *,
+        refresh_entities: tuple[str, ...] | None = None,
+    ) -> str | None:
+        """Refresh once, then perform a small bounded read-back observation."""
+        if refresh_entities is not None:
             try:
-                await self._refresh_entities((self._sensor("timed_charge_current"),))
+                await self._refresh_entities(refresh_entities)
             except Exception as exc:  # noqa: BLE001 - verification must degrade safely
                 return f"read-back refresh failed: {exc!r}"
         mismatch: str | None = None
         last_exc: Exception | None = None
         for attempt in range(_READ_BACK_ATTEMPTS):
             try:
-                got = await self._read_current_a()
+                got = await read()
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
             else:
                 last_exc = None
-                mismatch = (
-                    None
-                    if abs(got - amps) <= 0.5
-                    else f"read back {got:g} A (wanted {amps:g} A)"
-                )
+                mismatch = None if matches(got) else describe_mismatch(got)
                 if mismatch is None:
                     return None
             if attempt + 1 < _READ_BACK_ATTEMPTS:
@@ -372,12 +422,6 @@ class SolisDevice:
         if last_exc is not None:
             return f"read-back failed: {last_exc!r}"
         return mismatch or "read-back failed"
-
-    async def _refresh_slot(self, slot: int) -> None:
-        suffix = _SLOT_SUFFIX[slot]
-        await self._refresh_entities(
-            tuple(self._sensor(field + suffix) for field in _WINDOW_FIELDS)
-        )
 
     async def _refresh_entities(self, entity_ids: tuple[str, ...]) -> None:
         await self._rest.call_service(
