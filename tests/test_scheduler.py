@@ -422,7 +422,10 @@ async def test_guard_tick_adopts_setpoint_as_target_on_restart() -> None:
         ha_url="http://ha.test", ha_token="t", proactive_mode="simulate",
         grid_power_entity="sensor.house_supply_power", battery_voltage_v=51.0,
     )
-    for entity, state in ((s.grid_power_entity, "2000"), (s.charge_current_entity, "30")):
+    for entity, state in (
+        (s.grid_power_entity, "2000"),
+        ("sensor.solis_control_timed_charge_current", "30"),
+    ):
         respx.get(f"http://ha.test/api/states/{entity}").mock(
             return_value=httpx.Response(
                 200, json={"entity_id": entity, "state": state, "attributes": {}}

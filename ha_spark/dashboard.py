@@ -27,8 +27,6 @@ _CATEGORIES: list[tuple[str, list[tuple[str, str]]]] = [
         ("ev_plug_entity", "EV Plug"),
         ("ev_status_entity", "EV Status"),
         ("charge_current_entity", "Charge Current"),
-        ("charge_window_start_entity", "Charge Window Start"),
-        ("charge_window_end_entity", "Charge Window End"),
         ("ha_template_charge_needed_entity", "Charge Needed"),
     ]),
     ("Grid & Tariff", [

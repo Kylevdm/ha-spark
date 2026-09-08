@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.14.2
+
+- Solis forced charge is implemented as a **native** timed-slot control path
+  (#84). ha-spark writes the charge window and current directly to the inverter
+  holding registers via the `modbus.write_register` service on the thin
+  `solis_control` overlay hub, and reads them back through that hub's
+  `sensor.solis_control_*` entities — no dependency on the solax integration's
+  `number`/`button` entities for control. The window is a single 8-register
+  block write at 43143 (which *is* the commit — there is no separate commit
+  step); the charge current (43141) is written as DC amps ×10. Non-driven slots
+  (charge 2/3, all discharge) are zero-guarded (written to zero only when a
+  stale window is present, to spare register endurance). Forced charge is
+  refused unless the work-mode bitfield permits grid charging (bit 5).
+- All writes stay behind the existing actuation invariants — real writes only
+  under `proactive_mode: on` + `control: ha_spark`, refusal on an invalid SoC,
+  per-write read-back verification, per-action failure isolation, write-if-
+  changed. No live behaviour changes until the manual cutover (ADR-0003).
+- **Config:** added `solis_control_hub` (default `solis_control`) and
+  `solis_modbus_slave` (default `1`); **removed** the never-wired
+  `charge_window_start_entity` / `charge_window_end_entity` options (they wrote
+  the wrong HA domain and only ever ran in `simulate`). The `solis_control`
+  overlay is a one-time manual HA-config step — see
+  `docs/solis-control-modbus-overlay.yaml`.
+
 ## 0.14.1
 
 - Agent surface gating is now evaluated per request instead of being frozen at

@@ -99,8 +99,8 @@ _OPTION_KEYS = frozenset(
         "ha_template_charge_needed_entity",
         # Inverter selector + AlphaESS control (Task 3).
         "inverter",
-        "charge_window_start_entity",
-        "charge_window_end_entity",
+        "solis_control_hub",
+        "solis_modbus_slave",
         "alphaess_serial",
         # Structured device config (Phase 7): list of controllable devices.
         "devices",
@@ -350,9 +350,12 @@ class Settings(BaseSettings):
 
     # Inverter selector: picks the Charger adapter (ha_spark/energy/chargers.py).
     inverter: Literal["solis", "alphaess"] = Field(default="solis")
-    # Charge window time entities (Solis); blank skips the window write.
-    charge_window_start_entity: str = Field(default="")
-    charge_window_end_entity: str = Field(default="")
+    # Solis native control: the thin HA `modbus:` overlay hub (#90) ha-spark
+    # writes the timed-slot registers through (`modbus.write_register`) and reads
+    # back via its `sensor.<hub>_*` entities. The window/current/work-mode
+    # registers are fixed in the driver (docs/solis-control-modbus-overlay.yaml).
+    solis_control_hub: str = Field(default="solis_control")
+    solis_modbus_slave: int = Field(default=1)
     # AlphaESS system serial for the alphaess.setbatterycharge service call.
     alphaess_serial: str = Field(default="")
 
@@ -419,9 +422,10 @@ class Settings(BaseSettings):
                     driver=self.inverter,
                     control=ControlAuthority.HA_SPARK,
                     entities={
+                        # charge_current is telemetry/dashboard only for Solis
+                        # (control is native modbus via solis_control_hub); kept
+                        # generic here for the dashboard row and other drivers.
                         "charge_current": self.charge_current_entity,
-                        "window_start": self.charge_window_start_entity,
-                        "window_end": self.charge_window_end_entity,
                         "power_switch": self.inverter_power_switch_entity,
                     },
                 )

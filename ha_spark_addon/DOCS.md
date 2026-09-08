@@ -31,12 +31,21 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `ev_plug_entity` / `ev_status_entity` | EV charger plug/status sensors |
 | `consumption_energy_entity` | True household load energy statistic (excluding battery/EV charging) |
 | `grid_power_entity` | Optional whole-house supply power sensor (W); enables the supply guard |
-| `charge_current_entity` | Inverter timed-charge current `number` entity (the only control written) |
-| `inverter_power_switch_entity` | Inverter power switch `select` entity |
+| `charge_current_entity` | Optional inverter timed-charge current `number` entity for dashboard/telemetry (Solis control itself is native — see below) |
+| `inverter_power_switch_entity` | Inverter power switch `select` entity (used for the dispatch stop-discharge hold) |
 | `ha_template_charge_needed_entity` | Optional HA template sensor for comparison logging |
 | `inverter` | Which inverter ha-spark controls: `solis` (default) or `alphaess` |
-| `charge_window_start_entity` / `charge_window_end_entity` | Optional HA entities ha-spark writes the timed-charge window to (blank = leave the inverter's window as-is) |
+| `solis_control_hub` | Name of the thin HA `modbus:` overlay hub ha-spark drives the Solis timed-slot registers through (default `solis_control`; see `docs/solis-control-modbus-overlay.yaml`) |
+| `solis_modbus_slave` | Modbus slave/unit id on that hub (default `1`) |
 | `alphaess_serial` | AlphaESS system serial (only needed when `inverter: alphaess`) |
+
+**Solis control is native.** ha-spark writes the Solis timed-slot charge
+registers directly via the `modbus.write_register` service on the
+`solis_control` overlay hub and reads them back through that hub's
+`sensor.solis_control_*` entities — it does not depend on the solax integration
+for control. The overlay is a one-time manual HA-config step
+(`docs/solis-control-modbus-overlay.yaml`); an add-on cannot inject `modbus:`
+config into your `configuration.yaml`.
 | `person_entities` | Optional comma-separated `person`/`device_tracker` entity ids for occupancy signal recording |
 | `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
 | `outdoor_weather_entity` | Weather entity with a `temperature` attribute (default `weather.home`) for signal recording |
