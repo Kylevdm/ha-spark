@@ -470,3 +470,93 @@ LFP plateau from the history analysis. No overshoot, no hunting.
 **Verdict on the timed-slot surface:** precise, steady, self-terminating, boundary-accurate to the
 inverter's own clock, and fully observable over local modbus. On this evidence it is a far better
 control surface for ha-spark than the RC path.
+
+## Overnight, 23:30–05:30 BST — timed **charge**, the mode/SoC gate settled (#83 observation)
+
+Housekeeping first: the 19:00–20:00 BST timed-discharge slot from above was event-specific
+(2026-09-07 Axle event), so at 19:34:04 UTC `timed_discharge_start_hours`/`_end_hours` were zeroed
+by hand and `button.solisac_update_charge_discharge_times` pressed to commit. Confirmed at rest —
+it will not export again at 19:00 daily.
+
+Runbook: `docs/runbooks/OVERNIGHT-83-observation.md`. Read-only throughout — no writes, by anyone,
+during the window. Recorders: `live_fire_recorder.py` → `run-83-overnight.csv` (2,595 rows) and
+`axle_observer.py` → `axle-83-overnight.csv` (2,596 rows), both stopped cleanly afterwards.
+
+**The question this settled:** the live-fire found a forced **charge** refused via the RC register
+(43135) at 79% SoC, against a forced **discharge** that actuated fine at the same SoC — leaving a
+mode gate (`Self-Use`, whose option list names grid-charging permission explicitly) and an SoC gate
+(`battery_minimum_soc` = 20, an emergency-recharge floor) indistinguishable. The inverter's own
+**pre-existing** 23:30–05:30 timed-charge slot (60 A, no PV available at night) discriminates them
+for free: any charge in that window is necessarily from the grid.
+
+### 23:30 BST — charge start
+
+| time (UTC) | batt W | batt A | SoC | grid W | 43135 | mode |
+|---|---|---|---|---|---|---|
+| 22:29:30 | +1082 | 20.7 | 53 | +11 | off | 35 |
+| **22:29:44** | **−3075** | **57.7** | 53 | **−3893** | off | 35 | ← charge begins |
+| 22:29:59 | −3139 | 58.8 | 53 | −4061 | off | 35 | ← full rate |
+
+**Charging started at 53% SoC** — well above the 20% `battery_minimum_soc`/`force_charge_soc`
+floor, on the plain `Self-Use` mode (not one of the `- No Grid Charging` or `- No Timed
+Charge/Discharge` variants). `meter_active_power` swung to **≈ −4,000 W**, confirming the polarity
+predicted from the earlier export reading (+2182 W during the 19:00 discharge slot): **negative =
+import**.
+
+### Findings
+
+1. **Grid charging is not blocked by mode or by SoC in the timed-slot path.** This is the
+   runbook's predicted "most decisive result available without writing anything," and it held:
+   mode stayed `Self-Use` / bitfield `35`, 43135 stayed `off`, for the entire ~7-hour window — no
+   writer ever touched either. **The refusal found in the live-fire is specific to the RC path**,
+   not a property of mode or SoC. Both gate hypotheses from the earlier section are demoted to
+   RC-path quirks; the timed slot is confirmed as the control surface of interest for
+   [#82](https://github.com/Kylevdm/ha-spark/issues/82)/[#84](https://github.com/Kylevdm/ha-spark/issues/84).
+2. **A third independent clock-offset measurement, same result.** Charge began 22:29:44 UTC — 1 s
+   off the 22:29:45 predicted from the ~15 s RTC lead measured on both edges of the 19:00 discharge
+   slot. Three edges now agree (19:59:45, 18:59:45, 22:29:44): the inverter's RTC runs ~15 s ahead
+   of HA's clock on every boundary tested so far.
+3. **Achieved current sits a little under commanded, not clamped to the ceiling.** Clean stats over
+   the full charge (22:29:44–03:03:46 UTC, n=1079, excludes ramp and post-full-SoC samples):
+   current **mean 58.0 A, range 52.8–58.8 A** against a commanded 60.0 A and a 62.5 A hardware
+   ceiling. Unlike the 90 A discharge command that clamped hard to 61.3 A, the slot current field
+   *does* control rate below the ceiling — but doesn't deliver the full commanded value either
+   (~97%, consistently, not noise: the range never touches 60 A across 1,079 samples). Battery
+   power held **−3155 W mean** (−3195 to −2888 W); grid import **−4051 W mean** (−6584 to −3133 W,
+   the one −6584 W sample a single-poll house-load transient unrelated to the charge, self-resolved
+   next poll).
+4. **SoC reached 100%, and the taper is a hard cliff, not a ramp** — matching the live-fire's
+   discharge taper table. Last full-rate sample: 03:03:46 UTC, 57.3 A / −3151 W / 99%. Next poll,
+   15 s later: 03:04:01 UTC, **0.0 A / 0 W / 100%** — current and power both hit zero in one step,
+   no ramp-down. The pack then sat flat at 100%/0 A/0 W for **~1h26m** until the slot's own end.
+5. **Clean, boundary-exact termination, same as the discharge slot.** `power_switch` blipped
+   `On → Off → On` over 04:30:00–04:30:12 UTC — the slot's own close, at the same ~15 s-early
+   offset as the other edges — then self-use discharge resumed normally (~610–625 W / 11.3–11.7 A,
+   in line with baseline house load). No overrun, no residual charge current.
+6. **The RC path was untouched for the entire night** — 43135 `off`, mode `35` — confirming (5) from
+   the 19:00–20:00 section generalises to a 7-hour window, not just one hour.
+
+### Noise, disregarded
+
+- `communication_health` flipped to `Degraded` intermittently (323 of ~2,595 rows) with no effect
+  on entity availability — consistent with the live-fire's standing note that `Degraded` alone is
+  not a problem.
+- Two isolated rows (19:38:38–42 and 20:48:09–13 UTC, both **before** the charge window opened) read
+  a spurious `SoC = 100` alongside stale-looking battery-power values, both flagged `Degraded`.
+  Cache-staleness in the integration during a `Degraded` blip, not real inverter state — the real,
+  sustained 100% (0 A / 0 W, `Healthy`) only begins at 03:04:01 UTC as in finding 4.
+- One `sensor.solisac_battery_current` read `unavailable` for a single poll at 01:24:21 UTC,
+  self-recovered next poll. No guard (health/mode/43135/power switch) was affected.
+- `select.solisac_power_switch` read `unknown` for one poll at 22:59:45 UTC, mid-charge, unrelated
+  to any programmed boundary — reverted to `On` immediately. Treated as sensor noise, not a real
+  dispatch-off event.
+
+### Summary against the observation's questions
+
+| question | answer |
+|---|---|
+| Grid import through the window, charging above 20% SoC? | **Yes** — charge began at 53% SoC, held ~3.15 kW from the grid for 4h34m. Confirms neither mode nor SoC gates the timed-slot path; demotes both gate hypotheses to RC-path quirks. |
+| Achieved current vs. commanded 60 A? | **58.0 A mean, never reaching 60 A** — the field controls rate below the 62.5 A ceiling (unlike the 90 A discharge test) but under-delivers by ~2 A throughout, consistently. |
+| `meter_active_power` sign under a real ~3 kW import? | **Negative = import**, confirmed (~−4,000 W mean), completing the polarity read the live-fire couldn't settle from a near-zero grid baseline. |
+| Does SoC reach 100%, and what happens at the top? | **Yes** — hard cliff to 0 A/0 W in one 15 s poll step at 99%→100%, no ramp, then flat until slot end. Matches the discharge taper table. |
+| 43135 and the work-mode bitfield throughout? | **Unmoved** — `off` / `35` for the entire night. |
