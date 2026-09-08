@@ -72,6 +72,21 @@ _OPTION_KEYS = frozenset(
         "timezone",
         "plan_run_time",
         "backfill_source_entity",
+        # Derived base-load (ADR-0001): per-component statistic IDs + invert flags.
+        # Grid import is required when any of these are set; the others are
+        # optional and contribute zero with a degradation note when unset.
+        "derive_grid_import_entity",
+        "derive_grid_export_entity",
+        "derive_solar_generation_entity",
+        "derive_battery_charge_entity",
+        "derive_battery_discharge_entity",
+        "derive_ev_charge_entity",
+        "derive_invert_grid_import",
+        "derive_invert_grid_export",
+        "derive_invert_solar_generation",
+        "derive_invert_battery_charge",
+        "derive_invert_battery_discharge",
+        "derive_invert_ev_charge",
         "octopus_api_key",
         "octopus_mpan",
         "octopus_meter_serial",
@@ -312,6 +327,25 @@ class Settings(BaseSettings):
     # Statistic whose history seeds `ha-spark backfill-load` (a true-load power
     # or energy sensor); the CLI's --from flag overrides it.
     backfill_source_entity: str = Field(default="")
+
+    # Derived base load (ADR-0001): per-component HA statistic IDs.
+    # `derive_grid_import_entity` is required when any are set; the others
+    # contribute zero with a degradation note when unset. The invert flags
+    # are explicit (never inferred): true flips the canonical sign after the
+    # usual unit conversion, so a mis-signed sensor never silently corrupts
+    # the balance.
+    derive_grid_import_entity: str = Field(default="")
+    derive_grid_export_entity: str = Field(default="")
+    derive_solar_generation_entity: str = Field(default="")
+    derive_battery_charge_entity: str = Field(default="")
+    derive_battery_discharge_entity: str = Field(default="")
+    derive_ev_charge_entity: str = Field(default="")
+    derive_invert_grid_import: bool = Field(default=False)
+    derive_invert_grid_export: bool = Field(default=False)
+    derive_invert_solar_generation: bool = Field(default=False)
+    derive_invert_battery_charge: bool = Field(default=False)
+    derive_invert_battery_discharge: bool = Field(default=False)
+    derive_invert_ev_charge: bool = Field(default=False)
 
     # Octopus REST API (for `pull-consumption`; CSV import needs none of these).
     # `octopus_api_key` also drives the `octopus_intelligent` tariff provider

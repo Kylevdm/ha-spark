@@ -34,6 +34,12 @@ from ha_spark.api.server import (
 )
 from ha_spark.config import Settings
 from ha_spark.devices import Capability, inverter_device
+from ha_spark.energy.derived_base_load import (
+    BACKFILL_NAME,
+    BACKFILL_STATISTIC_ID,
+    derive_specs_from_settings,
+    rerive_trailing_window,
+)
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargePlan, PlannerInputs
@@ -93,6 +99,7 @@ async def run_once(settings: Settings) -> ChargePlan:
         await publish_plan(rest, plan, settings)
     await _record_forecast(settings, plan, inputs, load_source)
     await _run_orchestrator(settings)
+    await _run_derived_rerive(settings)
     return plan
 
 
@@ -110,6 +117,44 @@ async def _run_orchestrator(settings: Settings) -> None:
             await publish_predictions(rest, decisions, settings)
     except Exception:
         log.exception("Proactive orchestrator failed")
+
+
+async def _run_derived_rerive(settings: Settings) -> None:
+    """Re-derive the trailing 48h of base-load history (best-effort).
+
+    No-op when grid import is unconfigured (the source-entity backfill path
+    is still available via ``backfill-load --from``). A failure here must
+    never block the daily plan run; it logs + reports so the operator can
+    inspect the daemon log.
+    """
+    specs = derive_specs_from_settings(settings)
+    if not specs.get("grid_import") or not specs["grid_import"].entity_id:
+        return
+    try:
+        result = await rerive_trailing_window(
+            settings,
+            specs,
+            statistic_id=BACKFILL_STATISTIC_ID,
+            statistic_name=BACKFILL_NAME,
+        )
+    except Exception:
+        log.exception("Derived base-load rerive failed; will retry next tick")
+        return
+    if result is None:
+        return
+    if result.rows_imported:
+        log.info(
+            "Derived base-load rerive: %d rows upserted (%s)",
+            result.rows_imported,
+            result.span,
+        )
+    if result.negative_clamped:
+        log.warning(
+            "Derived base-load rerive: %d hour(s) clamped to 0 — check invert flags",
+            result.negative_clamped,
+        )
+    for note in result.degradation:
+        log.info("Derived base-load rerive: %s", note)
 
 
 async def sample_signals(settings: Settings, now: datetime) -> None:

@@ -35,6 +35,47 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `inverter_power_switch_entity` | Inverter power switch `select` entity (used for the dispatch stop-discharge hold) |
 | `ha_template_charge_needed_entity` | Optional HA template sensor for comparison logging |
 | `inverter` | Which inverter ha-spark controls: `solis` (default) or `alphaess` |
+
+### Derived base load (ADR-0001, optional)
+
+ha-spark's load forecast normally trusts a single user-supplied consumption
+sensor. That sensor is polluted on most installs (it includes battery
+charging), so the forecast chases setpoints ha-spark itself created the
+previous night and the historical statistics carry the same pollution. The
+derived path rebuilds base load by **energy balance** from your HA
+long-term component statistics and overwrites the same external id
+(`ha_spark:house_load`) the source-entity backfill below writes to. The
+forecast chain keeps consuming `consumption_energy_entity` unchanged — no
+need to repoint it between the two paths.
+
+Per hour: `base = grid_import - grid_export + solar_generation + battery_discharge - battery_charge - ev_charge`.
+
+| Option | What it must be |
+|---|---|
+| `derive_grid_import_entity` | **Required** when any of these are set: a long-term statistic id for grid import (kWh or compatible). Without it, the derived path refuses to run. |
+| `derive_grid_export_entity` | Optional grid-export statistic id; treated as zero with a degradation note when unset. |
+| `derive_solar_generation_entity` | Optional solar-production statistic id. |
+| `derive_battery_charge_entity` | Optional battery-charge statistic id. |
+| `derive_battery_discharge_entity` | Optional battery-discharge statistic id. |
+| `derive_ev_charge_entity` | Optional EV-charge statistic id. |
+| `derive_invert_*` | Explicit sign-convention flag per component (`true` flips the canonical direction after unit conversion). Never inferred — a mis-signed export or battery-charge sensor would silently break the balance otherwise. |
+
+Run `ha-spark backfill-load --derive` to write the full history
+(lookback `BACKFILL_LOOKBACK_DAYS`, default 730). After every scheduled
+plan run the daemon also re-derives the trailing 48 h from the component
+statistics — every derivable hour in that window is recomputed and
+upserted (late-arriving or corrected component rows overwrite their
+previous target values so the consumer never trains on stale base
+load), with the cumulative `sum` anchored on the latest target row
+*before* the window. A failed re-derivation is logged and never blocks
+planning. Use `--from` for the source-entity path or `--derive` for
+this one; the two are mutually exclusive at dispatch and write to the
+same external id.
+
+Each hourly component must use a supported unit (`W`/`kW` mean-power or
+`kWh`/`Wh` energy change). An unsupported unit disables that component
+with a clear reason in the run report — old behaviour on a partial
+setup.
 | `solis_control_hub` | Name of the thin HA `modbus:` overlay hub ha-spark drives the Solis timed-slot registers through (default `solis_control`; see `docs/solis-control-modbus-overlay.yaml`) |
 | `solis_modbus_slave` | Modbus slave/unit id on that hub (default `1`) |
 | `alphaess_serial` | AlphaESS system serial (only needed when `inverter: alphaess`) |
@@ -326,6 +367,16 @@ remains the sole decider. Nothing here changes that.
      source, then `ha-spark backfill-load --from <entity_id>` to import one
      as `ha_spark:house_load` history. `ha-spark onboard` reports when the
      history is sufficient.
+   - Or `ha-spark backfill-load --derive` — once you've configured any
+     `derive_*_entity` option (grid import is required; the others are
+     optional and degrade with a note). The derived path rebuilds base
+     load by energy balance and overwrites the same `ha_spark:house_load`
+     target, so the forecast chain stays unchanged and
+     `consumption_energy_entity` does not need to be repointed. The
+     scheduled plan run also recomputes the trailing 48 h every cycle
+     (upserting every derivable hour in that window so late-arriving
+     component stats repair history), so a manual rerun is only needed
+     once.
 4. `ha-spark plan` — print tonight's plan without applying it.
 5. Leave the add-on running; it executes the plan daily at `plan_run_time`.
    When the simulated decisions look right, set `proactive_mode: on`.

@@ -1,6 +1,6 @@
 ---
 name: ha-spark
-version: "0.14.2"
+version: "0.15.0"
 slug: ha_spark_addon
 description: Local-first battery charge planner and automation agent for Home Assistant
 url: https://github.com/Kylevdm/ha-spark
@@ -53,6 +53,21 @@ options:
   profile_history_days: 60
   timezone: Europe/London
   plan_run_time: "22:00"
+  # Derived base-load (ADR-0001): per-component statistic IDs. Grid import is
+  # required when any are set; the others contribute zero with a degradation
+  # note when unset. The invert flags are explicit — never inferred.
+  derive_grid_import_entity: ""
+  derive_grid_export_entity: ""
+  derive_solar_generation_entity: ""
+  derive_battery_charge_entity: ""
+  derive_battery_discharge_entity: ""
+  derive_ev_charge_entity: ""
+  derive_invert_grid_import: false
+  derive_invert_grid_export: false
+  derive_invert_solar_generation: false
+  derive_invert_battery_charge: false
+  derive_invert_battery_discharge: false
+  derive_invert_ev_charge: false
   octopus_api_key: ""
   octopus_mpan: ""
   octopus_meter_serial: ""
@@ -121,6 +136,18 @@ schema:
   timezone: str
   plan_run_time: match(^\d{2}:\d{2}$)
   backfill_source_entity: str?
+  derive_grid_import_entity: str?
+  derive_grid_export_entity: str?
+  derive_solar_generation_entity: str?
+  derive_battery_charge_entity: str?
+  derive_battery_discharge_entity: str?
+  derive_ev_charge_entity: str?
+  derive_invert_grid_import: bool
+  derive_invert_grid_export: bool
+  derive_invert_solar_generation: bool
+  derive_invert_battery_charge: bool
+  derive_invert_battery_discharge: bool
+  derive_invert_ev_charge: bool
   octopus_api_key: password?
   octopus_mpan: str?
   octopus_meter_serial: str?

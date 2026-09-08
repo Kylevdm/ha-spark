@@ -58,9 +58,17 @@ def hourly_kwh_from_stats(
     return hourly
 
 
-def to_import_stats(hourly: list[tuple[datetime, float]]) -> list[dict[str, Any]]:
-    """Rows for ``recorder/import_statistics``: running cumulative sum, time order."""
-    cumulative = 0.0
+def to_import_stats(
+    hourly: list[tuple[datetime, float]], *, start_sum: float = 0.0
+) -> list[dict[str, Any]]:
+    """Rows for ``recorder/import_statistics``: running cumulative sum, time order.
+
+    ``start_sum`` anchors the cumulative ``sum`` column for callers that want
+    the sequence to continue from a prior value (the rolling re-derivation
+    uses the last imported row's sum so the consumer-visible series never
+    drops). A ``start_sum`` of 0.0 reproduces the original backfill semantics.
+    """
+    cumulative = start_sum
     stats: list[dict[str, Any]] = []
     for start, kwh in sorted(hourly):
         cumulative += kwh
