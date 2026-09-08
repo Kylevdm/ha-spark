@@ -21,6 +21,12 @@ sign-convention warning (per-component invert flags live in Settings, they
 must be explicit). The output is monotonically cumulative, ready for
 ``recorder/import_statistics``; re-imports are idempotent (the recorder
 upserts by (statistic_id, start)).
+
+Both the source-entity path (``ha-spark backfill-load --from``) and this
+derived path write the same external id (``ha_spark:house_load``) so the
+forecast chain consumes the result unchanged — no need to repoint
+``consumption_energy_entity`` between paths. The two paths remain
+mutually exclusive at the CLI level: choose one or the other, never both.
 """
 
 from __future__ import annotations
@@ -30,7 +36,11 @@ from datetime import UTC, datetime, timedelta
 
 from ha_spark.config import Settings
 from ha_spark.energy.onboarding import (
-    hourly_kwh_from_stats,
+    _ENERGY_FACTORS,
+    _POWER_FACTORS,
+    BACKFILL_NAME,
+    BACKFILL_STATISTIC_ID,
+    SUPPORTED_UNITS,
     statistic_unit,
     to_import_stats,
 )
@@ -39,6 +49,29 @@ from ha_spark.ha.statistics import (
     list_statistic_ids,
     statistics_during_period,
 )
+
+# Re-export so the derived path can talk about its target without re-declaring
+# the same constant. Both paths write to ``ha_spark:house_load``; the user
+# never has to repoint ``consumption_energy_entity``.
+__all__ = [
+    "BACKFILL_STATISTIC_ID",
+    "BACKFILL_NAME",
+    "COMPONENTS",
+    "REQUIRED_COMPONENTS",
+    "ROLLING_WINDOW_HOURS",
+    "ComponentSpec",
+    "ComponentSeries",
+    "DeriveResult",
+    "DerivedBackfillResult",
+    "derive_base_load",
+    "derive_specs_from_settings",
+    "build_component_series",
+    "import_rows_for",
+    "last_imported_sum",
+    "latest_target_before",
+    "backfill_derived_load",
+    "rerive_trailing_window",
+]
 
 # Component canonical-direction names. Used as keys in derive_base_load and
 # surfaced in the per-component coverage report.
@@ -54,14 +87,6 @@ REQUIRED_COMPONENTS: frozenset[str] = frozenset({"grid_import"})
 
 # Trailing window the scheduled run re-derives each cycle.
 ROLLING_WINDOW_HOURS = 48
-
-# Distinct external statistic id for the derived series (different from the
-# source-entity path's ``ha_spark:house_load`` so a setup that already used
-# the source-entity backfill can switch without colliding with stale rows;
-# the two paths write to the same recorder upsert key, so this also keeps
-# things clean if both ever run).
-BACKFILL_DERIVED_STATISTIC_ID = "ha_spark:derived_house_load"
-BACKFILL_DERIVED_NAME = "ha-spark house load (derived)"
 
 
 @dataclass(frozen=True)
@@ -107,27 +132,36 @@ def derive_base_load(
     ``grid_import`` are skipped, preserving any prior cumulative sum.
     Hours present in ``grid_import`` but missing from an optional component
     contribute zero (important for pre-device history).
+
+    The returned :attr:`DeriveResult.coverage` map reports a real
+    ``(earliest, latest)`` hour range for *every* configured component
+    (even one with no rows — its range is ``(None, None)`` and the report
+    states it as "none") so the operator can see which components
+    contributed data to the derivation and which are absent or short.
     """
     if not grid_import.hourly:
         raise ValueError(
             "Grid import component has no hourly rows; cannot derive base load"
         )
     degradation: list[str] = []
-    coverage: dict[str, tuple[datetime | None, datetime | None]] = {
-        "grid_import": grid_import.coverage()
-    }
 
-    components: dict[str, ComponentSeries | None] = {
+    all_components: dict[str, ComponentSeries | None] = {
+        "grid_import": grid_import,
         "grid_export": grid_export,
         "solar_generation": solar_generation,
         "battery_discharge": battery_discharge,
         "battery_charge": battery_charge,
         "ev_charge": ev_charge,
     }
-    for name, comp in components.items():
+    coverage: dict[str, tuple[datetime | None, datetime | None]] = {
+        name: comp.coverage() if comp is not None else (None, None)
+        for name, comp in all_components.items()
+    }
+    for name, comp in all_components.items():
         if comp is None:
-            degradation.append(f"component '{name}' not configured — treated as zero")
-            coverage[name] = (None, None)
+            degradation.append(
+                f"component '{name}' not configured — omitted, treated as zero"
+            )
 
     negative_clamped = 0
     sorted_starts = sorted(grid_import.hourly)
@@ -185,6 +219,73 @@ def last_imported_sum(rows: list[dict[str, object]]) -> tuple[datetime, float] |
     return datetime.fromtimestamp(float(raw_start) / 1000, UTC), float(raw_sum)  # type: ignore[arg-type]
 
 
+def latest_target_before(
+    rows: list[dict[str, object]], before: datetime
+) -> tuple[datetime, float] | None:
+    """Latest target row strictly before ``before``, used as the rerive anchor.
+
+    A row inside the recompute window cannot anchor the cumulative sum,
+    because the rerive will overwrite it (the recorder upserts by start);
+    only a row *before* the window lets the running total continue forward
+    without double-counting or losing prior history. Returns ``None`` when
+    no row in ``rows`` precedes ``before``.
+    """
+    candidates: list[tuple[datetime, float]] = []
+    for row in rows:
+        raw_start: object = row.get("start")
+        raw_sum: object = row.get("sum")
+        if raw_start is None or raw_sum is None:
+            continue
+        start = datetime.fromtimestamp(float(raw_start) / 1000, UTC)  # type: ignore[arg-type]
+        if start < before:
+            candidates.append((start, float(raw_sum)))  # type: ignore[arg-type]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda pair: pair[0])
+
+
+def derive_specs_from_settings(settings: Settings) -> dict[str, ComponentSpec]:
+    """Map the flat ``derive_*_entity`` / ``derive_invert_*`` Settings to ComponentSpecs.
+
+    Single source of truth for the per-component entity-id / invert-flag
+    pair: both the ``backfill-load --derive`` CLI path and the scheduler's
+    rolling rerive read from here so they cannot drift.
+
+    Grid import is always included (even with a blank entity id) so the
+    call site can report the clearer "required component missing" error
+    rather than a generic "no grid import in specs". Optional components
+    with a blank entity id are omitted; ``derive_base_load`` degrades
+    those with an "omitted" note in the report.
+    """
+    pairs: tuple[tuple[str, str, str], ...] = (
+        ("grid_import", "derive_grid_import_entity", "derive_invert_grid_import"),
+        ("grid_export", "derive_grid_export_entity", "derive_invert_grid_export"),
+        (
+            "solar_generation",
+            "derive_solar_generation_entity",
+            "derive_invert_solar_generation",
+        ),
+        (
+            "battery_charge",
+            "derive_battery_charge_entity",
+            "derive_invert_battery_charge",
+        ),
+        (
+            "battery_discharge",
+            "derive_battery_discharge_entity",
+            "derive_invert_battery_discharge",
+        ),
+        ("ev_charge", "derive_ev_charge_entity", "derive_invert_ev_charge"),
+    )
+    specs: dict[str, ComponentSpec] = {}
+    for name, ent_field, inv_field in pairs:
+        entity_id = str(getattr(settings, ent_field) or "")
+        invert = bool(getattr(settings, inv_field))
+        if entity_id or name == "grid_import":
+            specs[name] = ComponentSpec(entity_id=entity_id, invert=invert)
+    return specs
+
+
 # --- integration with HA long-term statistics ---
 
 
@@ -203,17 +304,40 @@ def build_component_series(
 ) -> ComponentSeries:
     """Convert one component's raw hourly rows to a canonical-direction series.
 
-    Uses the same ``hourly_kwh_from_stats`` helper as the source-entity
-    backfill so unit handling stays in one place. The invert flag flips the
-    sign after conversion, so the resulting ``hourly`` map always carries
-    canonical-direction positive values for the formula.
+    Unit handling stays in one place (``_POWER_FACTORS`` / ``_ENERGY_FACTORS``
+    in ``energy/onboarding.py``) — the same constants the source-entity
+    backfill uses — but here we deliberately *do not* clamp negatives to
+    zero before applying the invert flag. The legacy
+    ``hourly_kwh_from_stats`` clamps for the source-entity path (where a
+    negative reading is genuinely a sensor error and should be erased);
+    for the derived path a signed / net sensor (e.g. "net_battery"
+    reporting +kWh during charge and −kWh during discharge) needs its
+    sign preserved so an explicit ``invert=True`` flips it to a positive
+    canonical contribution. Clamping before invert was silently zeroing
+    every positive source once invert was set; the formula's
+    ``negative_clamped`` counter now reports any sign-convention warning
+    it actually produces, instead of always-zero contributions hiding it.
     """
-    hourly_pairs = hourly_kwh_from_stats(raw_rows, unit, spec.entity_id)
+    if unit in _POWER_FACTORS:
+        factor, key = _POWER_FACTORS[unit], "mean"
+    elif unit in _ENERGY_FACTORS:
+        factor, key = _ENERGY_FACTORS[unit], "change"
+    else:
+        raise ValueError(
+            f"Unsupported unit {unit!r} for {spec.entity_id}; "
+            f"need one of {sorted(SUPPORTED_UNITS)}"
+        )
     sign = -1.0 if spec.invert else 1.0
-    return ComponentSeries(
-        entity_id=spec.entity_id,
-        hourly={start: max(0.0, round(kwh * sign, 4)) for start, kwh in hourly_pairs},
-    )
+    hourly: dict[datetime, float] = {}
+    for row in raw_rows:
+        raw_start: object = row.get("start")
+        value: object = row.get(key)
+        if raw_start is None or value is None:
+            continue
+        start = datetime.fromtimestamp(float(raw_start) / 1000, UTC)  # type: ignore[arg-type]
+        # Preserve the sign of the raw reading through the conversion.
+        hourly[start] = round(float(value) * factor * sign, 4)  # type: ignore[arg-type]
+    return ComponentSeries(entity_id=spec.entity_id, hourly=hourly)
 
 
 async def _fetch_component(
@@ -393,31 +517,45 @@ async def rerive_trailing_window(
     statistic_name: str,
     window_hours: int = ROLLING_WINDOW_HOURS,
 ) -> DerivedBackfillResult | None:
-    """Re-derive the trailing window and continue the cumulative sum.
+    """Recompute the trailing window from current component statistics.
 
-    Pulls the last imported row of ``statistic_id`` for the anchor point,
-    fetches ``window_hours`` of each component, derives base load, and
-    imports only the rows past the anchor so the cumulative ``sum`` never
-    drops. Returns ``None`` when grid import is unconfigured (caller logs
-    and continues). On any failure the caller catches and logs; this is
-    best-effort and must never block the daily plan.
+    Late-arriving or corrected component rows inside the window must
+    overwrite the existing target rows in that window so the consumer
+    never trains on a stale base load (component stats settle over
+    hours, not instantly). The cumulative ``sum`` therefore anchors on
+    the latest target row strictly *before* the recompute window — a row
+    inside the window cannot anchor because this rerive will overwrite
+    it — and every derivable hour in the window is recomputed and upserted
+    (recorder upserts by ``(statistic_id, start)`` so re-imports are
+    idempotent).
+
+    Returns ``None`` when grid import is unconfigured (caller logs and
+    continues — the no-grid-import skip path stays intact). When the
+    component fetch or derivation fails, the caller catches and logs;
+    this helper is best-effort and must never block the daily plan.
     """
     grid_spec = specs.get("grid_import")
     if grid_spec is None or not grid_spec.entity_id:
         return None
 
-    start = datetime.now(UTC) - timedelta(hours=window_hours + 1)
-    prior_rows = await statistics_during_period(
+    now = datetime.now(UTC)
+    window_start = now - timedelta(hours=window_hours)
+
+    # Anchor query: a narrow window just before the recompute window is
+    # usually enough; widen to a few days so a small history gap (e.g. a
+    # restart that missed a cycle) does not silently drop the cumulative
+    # sum baseline.
+    anchor_rows = await statistics_during_period(
         settings.ha_websocket_url,
         settings.auth_token,
         statistic_id,
-        start,
+        window_start - timedelta(days=7),
         period="hour",
         timeout=settings.ha_timeout,
     )
-    anchor = last_imported_sum(prior_rows)
+    anchor = latest_target_before(anchor_rows, window_start)
 
-    series, notes = await _gather_components(settings, specs, start)
+    series, notes = await _gather_components(settings, specs, window_start)
     grid_import = series.get("grid_import")
     if grid_import is None:
         return DerivedBackfillResult(
@@ -439,13 +577,9 @@ async def rerive_trailing_window(
         ev_charge=series.get("ev_charge"),
     )
     hourly = derived.hourly
-    start_sum = 0.0
-    if anchor is not None:
-        anchor_start, anchor_sum = anchor
-        # Filter to strictly-after rows so the cumulative sum continues forward
-        # from the anchor rather than double-counting it.
-        hourly = [(s, k) for s, k in hourly if s > anchor_start]
-        start_sum = anchor_sum
+    # No filter on hourly: every derivable hour in the window is recomputed
+    # and upserted (the recorder replaces by (statistic_id, start)).
+    start_sum = anchor[1] if anchor is not None else 0.0
     rows = import_rows_for(hourly, start_sum=start_sum) if hourly else []
     if rows:
         await import_statistics(

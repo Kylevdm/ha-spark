@@ -35,9 +35,9 @@ from ha_spark.api.server import (
 from ha_spark.config import Settings
 from ha_spark.devices import Capability, inverter_device
 from ha_spark.energy.derived_base_load import (
-    BACKFILL_DERIVED_NAME,
-    BACKFILL_DERIVED_STATISTIC_ID,
-    ComponentSpec,
+    BACKFILL_NAME,
+    BACKFILL_STATISTIC_ID,
+    derive_specs_from_settings,
     rerive_trailing_window,
 )
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
@@ -119,37 +119,6 @@ async def _run_orchestrator(settings: Settings) -> None:
         log.exception("Proactive orchestrator failed")
 
 
-def _derive_specs(settings: Settings) -> dict[str, ComponentSpec]:
-    """Map the flat ``derive_*_entity`` Settings to the rerive spec map."""
-    pairs: tuple[tuple[str, str, str], ...] = (
-        ("grid_import", "derive_grid_import_entity", "derive_invert_grid_import"),
-        ("grid_export", "derive_grid_export_entity", "derive_invert_grid_export"),
-        (
-            "solar_generation",
-            "derive_solar_generation_entity",
-            "derive_invert_solar_generation",
-        ),
-        (
-            "battery_charge",
-            "derive_battery_charge_entity",
-            "derive_invert_battery_charge",
-        ),
-        (
-            "battery_discharge",
-            "derive_battery_discharge_entity",
-            "derive_invert_battery_discharge",
-        ),
-        ("ev_charge", "derive_ev_charge_entity", "derive_invert_ev_charge"),
-    )
-    specs: dict[str, ComponentSpec] = {}
-    for name, ent_field, inv_field in pairs:
-        entity_id = str(getattr(settings, ent_field) or "")
-        invert = bool(getattr(settings, inv_field))
-        if entity_id or name == "grid_import":
-            specs[name] = ComponentSpec(entity_id=entity_id, invert=invert)
-    return specs
-
-
 async def _run_derived_rerive(settings: Settings) -> None:
     """Re-derive the trailing 48h of base-load history (best-effort).
 
@@ -158,15 +127,15 @@ async def _run_derived_rerive(settings: Settings) -> None:
     never block the daily plan run; it logs + reports so the operator can
     inspect the daemon log.
     """
-    specs = _derive_specs(settings)
+    specs = derive_specs_from_settings(settings)
     if not specs.get("grid_import") or not specs["grid_import"].entity_id:
         return
     try:
         result = await rerive_trailing_window(
             settings,
             specs,
-            statistic_id=BACKFILL_DERIVED_STATISTIC_ID,
-            statistic_name=BACKFILL_DERIVED_NAME,
+            statistic_id=BACKFILL_STATISTIC_ID,
+            statistic_name=BACKFILL_NAME,
         )
     except Exception:
         log.exception("Derived base-load rerive failed; will retry next tick")
@@ -175,7 +144,7 @@ async def _run_derived_rerive(settings: Settings) -> None:
         return
     if result.rows_imported:
         log.info(
-            "Derived base-load rerive: %d new rows (%s)",
+            "Derived base-load rerive: %d rows upserted (%s)",
             result.rows_imported,
             result.span,
         )

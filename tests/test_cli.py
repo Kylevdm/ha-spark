@@ -550,10 +550,13 @@ async def test_backfill_load_derive_happy_path(
     ) == 0
     out = capsys.readouterr().out
     assert "Imported 1234 hourly stats" in out
-    assert "ha_spark:derived_house_load" in out
+    # Derived path writes the same target as the source-entity path; the
+    # forecast chain consumes it unchanged.
+    assert "ha_spark:house_load" in out
+    assert "ha_spark:derived_house_load" not in out
     assert "2 hour(s) had a negative derived base" in out
     assert "component 'grid_export' not configured" in out
-    assert "Set CONSUMPTION_ENERGY_ENTITY=ha_spark:derived_house_load" in out
+    assert "ha_spark:house_load now holds the derived base-load series" in out
 
 
 async def test_backfill_load_derive_reports_failure(
@@ -574,7 +577,8 @@ async def test_backfill_load_derive_reports_failure(
 
 
 def test_derive_specs_map_blanks_to_missing() -> None:
-    from ha_spark.cli import _derive_specs
+    """The CLI uses the shared derive_specs_from_settings helper."""
+    from ha_spark.energy.derived_base_load import derive_specs_from_settings
 
     settings = Settings(
         ha_url="http://ha.test", ha_token="t",
@@ -582,7 +586,7 @@ def test_derive_specs_map_blanks_to_missing() -> None:
         # grid_export left blank on purpose
         derive_solar_generation_entity="sensor.sol",
     )
-    specs = _derive_specs(settings)
+    specs = derive_specs_from_settings(settings)
     # grid_import is always included (required component).
     assert specs["grid_import"].entity_id == "sensor.gi"
     # Blanked optional components are absent from the map.
@@ -597,7 +601,7 @@ def test_derive_specs_map_blanks_to_missing() -> None:
         derive_battery_charge_entity="sensor.bc",
         derive_invert_battery_charge=True,
     )
-    specs_inv = _derive_specs(settings_inv)
+    specs_inv = derive_specs_from_settings(settings_inv)
     assert specs_inv["battery_charge"].invert is True
     assert specs_inv["battery_charge"].entity_id == "sensor.bc"
 

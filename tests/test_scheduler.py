@@ -632,7 +632,7 @@ async def test_run_once_triggers_derived_rerive_when_configured(
     with caplog.at_level("INFO"):
         await run_once(s)
     assert len(rerive_calls) == 1
-    assert "10 new rows" in caplog.text
+    assert "10 rows upserted" in caplog.text
 
 
 @respx.mock
@@ -695,9 +695,15 @@ async def test_run_once_rerive_failure_does_not_block_plan(
     assert any("Charge plan" in r.message for r in caplog.records)
 
 
-def test_derive_specs_for_scheduler_match_settings() -> None:
-    """The scheduler's spec map mirrors the CLI helper."""
-    from ha_spark.energy.scheduler import _derive_specs
+def test_derive_specs_for_scheduler_uses_shared_helper() -> None:
+    """The scheduler reads the shared derive_specs_from_settings helper.
+
+    A duplicate helper here would let the CLI and scheduler drift apart
+    (different defaults for the same Settings options); the test pins
+    that both code paths read from the same module-level mapper.
+    """
+    from ha_spark.energy import scheduler
+    from ha_spark.energy.derived_base_load import derive_specs_from_settings
 
     s = Settings(
         ha_url="http://ha.test", ha_token="t",
@@ -705,7 +711,9 @@ def test_derive_specs_for_scheduler_match_settings() -> None:
         derive_solar_generation_entity="sensor.sol",
         derive_invert_grid_export=True,
     )
-    specs = _derive_specs(s)
+    # The scheduler module exposes the same helper, not its own copy.
+    assert scheduler.derive_specs_from_settings is derive_specs_from_settings
+    specs = derive_specs_from_settings(s)
     assert specs["grid_import"].entity_id == "sensor.gi"
     assert specs["solar_generation"].entity_id == "sensor.sol"
     # Grid export is not configured (no entity) but the invert flag is set;
