@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.15.0
+
+- Derived base load (ADR-0001, #45): the load forecast can now be sourced
+  from base load **derived by energy balance** over the HA long-term
+  component statistics (`grid_import - grid_export + solar_generation +
+  battery_discharge - battery_charge - ev_charge`) instead of a single
+  user-supplied consumption sensor. The derived series is written as
+  the external statistic `ha_spark:derived_house_load`; the forecast
+  chain is unchanged — point `consumption_energy_entity` at the new id
+  after a one-time `ha-spark backfill-load --derive` run.
+- New `derive_*_entity` options for each of the six components (grid
+  import is required; the others are optional and contribute zero with
+  a degradation note when unset) plus per-component `derive_invert_*`
+  flags for the explicit sign convention. The same unit handling as
+  the source-entity backfill (`W`/`kW` mean-power or `kWh`/`Wh`
+  energy change) — an unsupported unit disables that component with a
+  clear reason, preserving old behaviour on a partial setup.
+- New CLI flag `ha-spark backfill-load --derive` runs the energy-balance
+  backfill. `--from` (source-entity path) and `--derive` are mutually
+  exclusive; the two paths write to different external ids so switching
+  never collides. The backfill report names rows written, date range,
+  per-component coverage, sign-convention warnings, and omitted-component
+  notes. The wizard (`ha-spark onboard`) now surfaces candidates for
+  every `derive_*_entity` field.
+- Scheduled rolling re-derivation: after every daily plan run the daemon
+  re-derives the trailing 48 h from component statistics and continues
+  the cumulative sum from the last imported row, so
+  `ha_spark:derived_house_load` stays current without a manual rerun.
+  Failures are logged/reported and never block planning.
+
 ## 0.14.2
 
 - Solis forced charge is implemented as a **native** timed-slot control path

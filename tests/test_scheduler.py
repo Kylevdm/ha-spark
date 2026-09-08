@@ -583,3 +583,131 @@ async def test_run_once_logs_proactive_decisions(
         await run_once(s)
 
     assert any("Proactive decision" in r.message for r in caplog.records)
+
+
+@respx.mock
+async def test_run_once_triggers_derived_rerive_when_configured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Scheduled plan run also re-derives trailing base-load history when configured."""
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+
+    rerive_calls: list[object] = []
+
+    async def fake_rerive(
+        settings: Settings,
+        specs: dict[str, object],
+        *,
+        statistic_id: str,
+        statistic_name: str,
+        window_hours: int = 48,
+    ) -> object:
+        rerive_calls.append(specs)
+        from datetime import UTC, datetime
+
+        from ha_spark.energy.derived_base_load import DerivedBackfillResult
+        return DerivedBackfillResult(
+            rows_imported=10,
+            span="2026-06-11 00:00 .. 2026-06-11 09:00 UTC",
+            degradation=[],
+            negative_clamped=0,
+            coverage={"grid_import": (datetime(2026, 6, 10, tzinfo=UTC),
+                                      datetime(2026, 6, 11, tzinfo=UTC))},
+        )
+
+    monkeypatch.setattr(scheduler, "rerive_trailing_window", fake_rerive)
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="off",
+        db_path=str(tmp_path / "ledger.db"),
+        derive_grid_import_entity="sensor.grid_import",
+    )
+    with caplog.at_level("INFO"):
+        await run_once(s)
+    assert len(rerive_calls) == 1
+    assert "10 new rows" in caplog.text
+
+
+@respx.mock
+async def test_run_once_skips_derived_rerive_without_grid_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No grid import configured -> rerive is a no-op (source-entity path still works)."""
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+
+    rerive_calls: list[object] = []
+
+    async def fake_rerive(*args: object, **kwargs: object) -> object:
+        rerive_calls.append(args)
+        raise AssertionError("should not be called without grid import")
+
+    monkeypatch.setattr(scheduler, "rerive_trailing_window", fake_rerive)
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="off",
+        db_path=str(tmp_path / "ledger.db"),
+    )
+    await run_once(s)
+    assert rerive_calls == []
+
+
+@respx.mock
+async def test_run_once_rerive_failure_does_not_block_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rerive failure is logged but never aborts the plan run."""
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+
+    async def boom_rerive(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("ws down")
+
+    monkeypatch.setattr(scheduler, "rerive_trailing_window", boom_rerive)
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="off",
+        db_path=str(tmp_path / "ledger.db"),
+        derive_grid_import_entity="sensor.grid_import",
+    )
+    with caplog.at_level("INFO"):
+        await run_once(s)
+    assert any("Derived base-load rerive failed" in r.message for r in caplog.records)
+    # The plan still ran successfully.
+    assert any("Charge plan" in r.message for r in caplog.records)
+
+
+def test_derive_specs_for_scheduler_match_settings() -> None:
+    """The scheduler's spec map mirrors the CLI helper."""
+    from ha_spark.energy.scheduler import _derive_specs
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t",
+        derive_grid_import_entity="sensor.gi",
+        derive_solar_generation_entity="sensor.sol",
+        derive_invert_grid_export=True,
+    )
+    specs = _derive_specs(s)
+    assert specs["grid_import"].entity_id == "sensor.gi"
+    assert specs["solar_generation"].entity_id == "sensor.sol"
+    # Grid export is not configured (no entity) but the invert flag is set;
+    # the helper must not include it when no entity id is present.
+    assert "grid_export" not in specs

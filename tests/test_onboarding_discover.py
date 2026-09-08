@@ -6,7 +6,7 @@ from typing import Any
 
 from ha_spark.config import Settings
 from ha_spark.ha.models import EntityState
-from ha_spark.onboarding_discover import discover, propose
+from ha_spark.onboarding_discover import RULES, discover, propose
 
 
 def _state(entity_id: str, **attrs: Any) -> EntityState:
@@ -80,6 +80,52 @@ def test_solar_requires_no_device_class_but_uses_attribute() -> None:
 def test_no_match_yields_empty() -> None:
     ranked = discover([_state("light.kitchen")])
     assert ranked["soc_entity"] == []
+
+
+def test_derive_components_are_optional_rules() -> None:
+    """Every derive_*_entity rule is marked optional and ranked conservatively."""
+    rules = {r.config_field: r for r in RULES}
+    for field in (
+        "derive_grid_import_entity",
+        "derive_grid_export_entity",
+        "derive_solar_generation_entity",
+        "derive_battery_charge_entity",
+        "derive_battery_discharge_entity",
+        "derive_ev_charge_entity",
+    ):
+        assert field in rules
+        assert rules[field].optional is True
+
+
+def test_derive_components_surface_relevant_candidates() -> None:
+    """Discovery surfaces per-component candidates the wizard can pick from."""
+    states = [
+        # Grid import: energy sensor with `import` in its id.
+        _state("sensor.grid_import_kwh", device_class="energy", unit_of_measurement="kWh"),
+        # Grid export: energy sensor with `export` in its id.
+        _state("sensor.grid_export_kwh", device_class="energy", unit_of_measurement="kWh"),
+        # Solar: production sensor.
+        _state("sensor.solar_production_kwh", device_class="energy", unit_of_measurement="kWh"),
+        # Battery charge: sensor with `charge` in its id.
+        _state("sensor.battery_charge_kwh", device_class="energy", unit_of_measurement="kWh"),
+        # Battery discharge: sensor with `discharge` in its id.
+        _state("sensor.battery_discharge_kwh", device_class="energy", unit_of_measurement="kWh"),
+        # EV charge.
+        _state("sensor.ev_charge_kwh", device_class="energy", unit_of_measurement="kWh"),
+        # Distractor: a random temperature sensor must not win.
+        _state("sensor.indoor_temp", device_class="temperature", unit_of_measurement="°C"),
+    ]
+    ranked = discover(states)
+    assert ranked["derive_grid_import_entity"][0].entity_id == "sensor.grid_import_kwh"
+    assert ranked["derive_grid_export_entity"][0].entity_id == "sensor.grid_export_kwh"
+    assert ranked["derive_solar_generation_entity"][0].entity_id == "sensor.solar_production_kwh"
+    assert ranked["derive_battery_charge_entity"][0].entity_id == "sensor.battery_charge_kwh"
+    assert ranked["derive_battery_discharge_entity"][0].entity_id == "sensor.battery_discharge_kwh"
+    assert ranked["derive_ev_charge_entity"][0].entity_id == "sensor.ev_charge_kwh"
+    # Distractor (temperature) never wins any derive_* rule.
+    for key, cands in ranked.items():
+        if key.startswith("derive_"):
+            assert all(c.entity_id != "sensor.indoor_temp" for c in cands)
 
 
 def test_propose_marks_status_against_current_config() -> None:

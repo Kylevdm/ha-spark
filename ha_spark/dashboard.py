@@ -41,6 +41,14 @@ _CATEGORIES: list[tuple[str, list[tuple[str, str]]]] = [
         ("outdoor_weather_entity", "Outdoor Weather"),
         ("backfill_source_entity", "Backfill Source"),
     ]),
+    ("Derived base load", [
+        ("derive_grid_import_entity", "Grid Import"),
+        ("derive_grid_export_entity", "Grid Export"),
+        ("derive_solar_generation_entity", "Solar Generation"),
+        ("derive_battery_charge_entity", "Battery Charge"),
+        ("derive_battery_discharge_entity", "Battery Discharge"),
+        ("derive_ev_charge_entity", "EV Charge"),
+    ]),
 ]
 
 
