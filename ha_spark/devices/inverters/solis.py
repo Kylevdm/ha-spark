@@ -23,6 +23,7 @@ inverter's work mode (bit 5); the live rate-tier throttle is not so gated.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
@@ -58,6 +59,11 @@ _WINDOW_FIELDS = (
 _SLOT_SUFFIX = {1: "", 2: "_2", 3: "_3"}
 # Current register scale: the overlay sensor decodes raw/10 to amps; encode x10.
 _CURRENT_SCALE = 10.0
+# HA's update_entity service is asynchronous with respect to the Modbus
+# overlay sensors. Retry a small, fixed number of times after each write; the
+# bound is deliberately finite so a stale overlay can never hold the caller.
+_READ_BACK_ATTEMPTS = 3
+_READ_BACK_DELAY_SECONDS = 0.1
 # Work-mode bitfield: bit 5 (mask 32) == grid charging permitted. A forced grid
 # charge is refused by firmware when this is unset, so assert it, never write it.
 _GRID_CHARGE_BIT = 1 << 5
@@ -100,10 +106,25 @@ class SolisDevice:
         # mode once. A real write is refused when bit 5 is unset (firmware would
         # ignore the force anyway). Non-"on" modes don't read/gate.
         blocked = await self._assert_grid_charge_allowed() if mode == "on" else None
-        # Window and current are separate register writes, each isolated so a
-        # failure on one is reported distinctly and never masks the other.
-        lines.append(await self._write_charge_window(intent, blocked))
-        lines.append(await self._write_charge_current(intent, blocked))
+        # Current is the safety prerequisite for slot 1. A new or existing
+        # window must never be exposed at an unconfirmed, potentially higher
+        # current. If current fails, leave any existing window untouched and
+        # do not write the window block.
+        current_ok, current_line = await self._write_charge_current_result(intent, blocked)
+        lines.append(current_line)
+        if current_ok:
+            lines.append(await self._write_charge_window(intent, None))
+        else:
+            desc = (
+                f"set charge window {fmt_hhmm(intent.window_start)}-"
+                f"{fmt_hhmm(intent.window_end)} for the "
+                f"{window_hours(intent.window_start, intent.window_end):.1f} h window"
+            )
+            reason = blocked or "planned current was not confirmed"
+            suffix = "" if blocked else "; window unchanged"
+            line = f"[BLOCKED] {desc}: {reason}{suffix}"
+            log.warning(line)
+            lines.append(line)
         # Zero-guard the slots the planner does not drive so a stale manual
         # window (charge 2/3, any discharge) can't actuate behind the plan.
         for slot in (2, 3):
@@ -162,7 +183,7 @@ class SolisDevice:
         ]
         try:
             wrote = await self._apply_slot_block(1, want_block)
-            mismatch = await self._verify_slot_block(1, want_block)
+            mismatch = await self._verify_slot_block(1, want_block, refresh=wrote)
         except Exception as exc:  # noqa: BLE001 - isolate per action
             log.error("[FAILED] %s: %r", desc, exc)
             return f"[FAILED] {desc}: {exc!r}"
@@ -173,6 +194,13 @@ class SolisDevice:
 
     async def _write_charge_current(self, intent: ChargeIntent, blocked: str | None) -> str:
         """Program slot 1's charge current (43141), a standalone single register."""
+        _ok, line = await self._write_charge_current_result(intent, blocked)
+        return line
+
+    async def _write_charge_current_result(
+        self, intent: ChargeIntent, blocked: str | None
+    ) -> tuple[bool, str]:
+        """Write and freshly verify the planned current, returning success separately."""
         # solis_current_a already clamps to max_charge_current_a (<= the 62.5 A
         # DC hardware ceiling); round to the integer register value.
         amps = round(solis_current_a(intent, self._settings))
@@ -183,8 +211,8 @@ class SolisDevice:
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         if mode == "on" and blocked:
             log.warning("[BLOCKED] %s: %s", desc, blocked)
-            return f"[BLOCKED] {desc}: {blocked}"
-        return await self._set_current(amps, desc)
+            return False, f"[BLOCKED] {desc}: {blocked}"
+        return await self._set_current_result(amps, desc)
 
     async def _zero_guard_slot(self, slot: int) -> str:
         """Zero a non-driven slot's window block, but only if it is non-zero
@@ -201,7 +229,7 @@ class SolisDevice:
             if current == zeros:
                 return f"[SKIP] slot {slot} already zeroed"
             await self._write_register(_SLOT_BLOCK_REG[slot], zeros)
-            mismatch = await self._verify_slot_block(slot, zeros)
+            mismatch = await self._verify_slot_block(slot, zeros, refresh=True)
         except Exception as exc:  # noqa: BLE001
             log.error("[FAILED] %s: %r", desc, exc)
             return f"[FAILED] {desc}: {exc!r}"
@@ -210,22 +238,27 @@ class SolisDevice:
     async def _set_current(self, amps: float, desc: str) -> str:
         """Live charge-rate write (rate tier / supply guard). Single register,
         no commit block needed."""
+        _ok, line = await self._set_current_result(amps, desc)
+        return line
+
+    async def _set_current_result(self, amps: float, desc: str) -> tuple[bool, str]:
+        """Set current and return whether its post-write value was confirmed."""
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         if mode == "simulate":
             log.info("[SIMULATE] would %s", desc)
-            return f"[SIMULATE] would {desc}"
+            return True, f"[SIMULATE] would {desc}"
         if mode in ("off", "observe"):
-            return f"[{mode.upper()}] computed: {desc}"
+            return True, f"[{mode.upper()}] computed: {desc}"
         try:
-            await self._apply_current(round(amps * _CURRENT_SCALE), amps)
-            mismatch = await self._verify_current(amps)
+            wrote = await self._apply_current(round(amps * _CURRENT_SCALE), amps)
+            mismatch = await self._verify_current(amps, refresh=wrote)
         except Exception as exc:  # noqa: BLE001 - isolate per write
             log.error("[FAILED] %s: %r", desc, exc)
-            return f"[FAILED] {desc}: {exc!r}"
+            return False, f"[FAILED] {desc}: {exc!r}"
         if mismatch:
             log.warning("[WARNING] %s, but %s", desc, mismatch)
-            return f"[WARNING] {desc}, but {mismatch}"
-        return f"[APPLIED] {desc}"
+            return False, f"[WARNING] {desc}, but {mismatch}"
+        return True, f"[APPLIED] {desc}"
 
     async def _stop_discharge(self, desc: str) -> str:
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
@@ -286,19 +319,70 @@ class SolisDevice:
         state = await self._rest.get_state(self._sensor("timed_charge_current"))
         return float(state.state)
 
-    async def _verify_slot_block(self, slot: int, want: list[int]) -> str | None:
-        try:
-            got = await self._read_slot_block(slot)
-        except Exception as exc:  # noqa: BLE001
-            return f"read-back failed: {exc!r}"
-        return None if got == want else f"read back slot {slot} {got} (wanted {want})"
+    async def _verify_slot_block(
+        self, slot: int, want: list[int], *, refresh: bool = False
+    ) -> str | None:
+        if refresh:
+            try:
+                await self._refresh_slot(slot)
+            except Exception as exc:  # noqa: BLE001 - verification must degrade safely
+                return f"read-back refresh failed: {exc!r}"
+        mismatch: str | None = None
+        last_exc: Exception | None = None
+        for attempt in range(_READ_BACK_ATTEMPTS):
+            try:
+                got = await self._read_slot_block(slot)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+            else:
+                last_exc = None
+                mismatch = None if got == want else f"read back slot {slot} {got} (wanted {want})"
+                if mismatch is None:
+                    return None
+            if attempt + 1 < _READ_BACK_ATTEMPTS:
+                await asyncio.sleep(_READ_BACK_DELAY_SECONDS)
+        if last_exc is not None:
+            return f"read-back failed: {last_exc!r}"
+        return mismatch or "read-back failed"
 
-    async def _verify_current(self, amps: float) -> str | None:
-        try:
-            got = await self._read_current_a()
-        except Exception as exc:  # noqa: BLE001
-            return f"read-back failed: {exc!r}"
-        return None if abs(got - amps) <= 0.5 else f"read back {got:g} A (wanted {amps:g} A)"
+    async def _verify_current(self, amps: float, *, refresh: bool = False) -> str | None:
+        if refresh:
+            try:
+                await self._refresh_entities((self._sensor("timed_charge_current"),))
+            except Exception as exc:  # noqa: BLE001 - verification must degrade safely
+                return f"read-back refresh failed: {exc!r}"
+        mismatch: str | None = None
+        last_exc: Exception | None = None
+        for attempt in range(_READ_BACK_ATTEMPTS):
+            try:
+                got = await self._read_current_a()
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+            else:
+                last_exc = None
+                mismatch = (
+                    None
+                    if abs(got - amps) <= 0.5
+                    else f"read back {got:g} A (wanted {amps:g} A)"
+                )
+                if mismatch is None:
+                    return None
+            if attempt + 1 < _READ_BACK_ATTEMPTS:
+                await asyncio.sleep(_READ_BACK_DELAY_SECONDS)
+        if last_exc is not None:
+            return f"read-back failed: {last_exc!r}"
+        return mismatch or "read-back failed"
+
+    async def _refresh_slot(self, slot: int) -> None:
+        suffix = _SLOT_SUFFIX[slot]
+        await self._refresh_entities(
+            tuple(self._sensor(field + suffix) for field in _WINDOW_FIELDS)
+        )
+
+    async def _refresh_entities(self, entity_ids: tuple[str, ...]) -> None:
+        await self._rest.call_service(
+            "homeassistant", "update_entity", {"entity_id": list(entity_ids)}
+        )
 
     async def _assert_grid_charge_allowed(self) -> str | None:
         """None when grid charging is permitted; else a reason string (refuse)."""

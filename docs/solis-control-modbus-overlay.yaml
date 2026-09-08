@@ -27,7 +27,7 @@
 
 modbus:
   - name: solis_control            # == ha-spark `solis_control_hub`
-    type: rtuovertcp               # RS485-over-TCP forwarder (not plain `tcp`)
+    type: tcp                       # RS485-over-TCP gateway
     host: 192.0.2.10               # <-- your gateway IP
     port: 502                      # <-- your gateway Modbus port
     # A short scan_interval keeps read-back fresh: ha-spark reads a sensor right
@@ -35,11 +35,12 @@ modbus:
     # verify can transiently read the pre-write value (a benign [WARNING], not a
     # failed write). 5 s is a reasonable balance against bus load.
     sensors:
-      # --- Work mode: read-only. Bit 5 (mask 32) == grid charging permitted.
-      # ha-spark asserts this before a forced charge and NEVER writes 43110.
+      # --- Work mode: read-only input register. Bit 5 (mask 32) == grid
+      # charging permitted. ha-spark asserts this before a forced charge and
+      # NEVER writes 33132.
       - name: Solis Control Work Mode Bitfield
-        address: 43110
-        input_type: holding
+        address: 33132
+        input_type: input
         data_type: uint16
         scan_interval: 5
 
