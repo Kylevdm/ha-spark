@@ -135,6 +135,22 @@ The four incumbent automations, for the rollback record:
 
 ## Consequences
 
+- **Control surface is native modbus, not the solax entities (#84, 2026-09-08).**
+  #82's provisional write-list reached for the solax `number.solisac_timed_*`
+  entities plus the `update_charge_discharge_times` commit button. #84 instead
+  carries the #87/#90 principle through to the surface live-fire chose: ha-spark
+  writes the timed-slot holding registers *natively* via `modbus.write_register`
+  on the thin `solis_control` overlay hub and verifies through that hub's own
+  `sensor.solis_control_*` entities, so the control path does not depend on the
+  solax integration. The solax `update_charge_discharge_times` button is itself
+  a `WRITE_MULTI` block write starting at 43143 (source: `plugin_solis.py`), so
+  writing that 8-register window block *is* the commit — there is no separate
+  commit step, and #57/#84's "shrink-before-grow" ordering rule is moot for a
+  single atomic block write and was dropped. Register semantics are now
+  ha-spark's to own (no tier-A source); the map covers the flash-endurance and
+  RTC-drift caveats. The overlay YAML is a one-time manual HA-config step
+  (`docs/solis-control-modbus-overlay.yaml`); auto-provisioning it from the
+  add-on is an open follow-up, not part of #84.
 - The current `solis.py` `power_switch = Off` write during `holds` is harmless
   while `simulate` holds, but it is **not** the full lifecycle takeover
   requires (it never writes `On`, and its stop-discharge is dispatch-only).
