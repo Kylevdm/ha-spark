@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.14.1
+
+- Agent surface gating is now evaluated per request instead of being frozen at
+  startup: lowering `agent_exposure` (in the add-on options, or via
+  `POST /api/config`) immediately shrinks the `/agent/*` routes, the `/mcp`
+  tools, and what `/openapi.json` advertises, where before the old surface
+  stayed live until the next restart.
+- `agent_surface: off` — the shipped default — is now a true master switch.
+  With it off, `/agent/*` and `/mcp` return 404 behind ingress as if never
+  mounted; previously it only withheld the extra published port, leaving both
+  reachable. **If you were using the agent surface over ingress without setting
+  `agent_surface`, set `agent_surface: on` to keep it.** (#93)
+
 ## 0.14.0
 
 Version re-baseline. The `1.0.0-rc1`–`rc4` line is retired: after live use,
