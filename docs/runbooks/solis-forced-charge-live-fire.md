@@ -1,0 +1,325 @@
+# Runbook: Solis forced-charge live-fire
+
+Executable procedure for [#83](https://github.com/Kylevdm/ha-spark/issues/83) — prove by hand,
+with a person present, that a forced grid charge can be commanded on the Solis S5 AC-coupled
+inverter, before any ha-spark driver code depends on the sequence.
+
+**HITL.** Every write here is made by a human in the Home Assistant UI. ha-spark writes nothing;
+`proactive_mode` is irrelevant to this run.
+
+**No tier-A source exists for any Solis storage register.** Everything below is community-grade
+evidence about a model that is not on the integration's confirmed list. That is why this run
+exists — it is load-bearing, not a formality. A negative result is a valid resolution.
+
+## Sign conventions — read this first
+
+Derived from the measured overnight charge in
+[#100](https://github.com/Kylevdm/ha-spark/issues/100#issuecomment-5571695125) and re-confirmed
+arithmetically on 2026-09-07 (`-444 W` at `8.3 A × 53.6 V = 445 W`):
+
+| reading | charging / importing | discharging / exporting |
+|---|---|---|
+| `sensor.solisac_battery_power` | **negative** | positive |
+| `sensor.solisac_meter_active_power` | **negative** (import) | positive (export) |
+| `sensor.solisac_battery_current` | unsigned magnitude — no direction | — |
+
+> **Correction to check 1 on #83** (2026-07-30), which says to watch `battery_power` go *positive*.
+> That polarity is backwards. A successful forced charge drives `battery_power` **negative**.
+> Reading it the old way would score a working force as a failure.
+
+Re-verify both polarities against the baseline in step 0 before trusting them.
+
+## Preconditions
+
+| # | precondition | why | status 2026-09-07 15:35 BST |
+|---|---|---|---|
+| 1 | Run **well outside 23:30–05:30** | The inverter's own timed charge is armed at 60 A. A run inside the window cannot distinguish our write from its schedule ([#100](https://github.com/Kylevdm/ha-spark/issues/100)). | ✅ any time before ~23:00 |
+| 2 | **SoC ≤ ~95%** | Only a genuinely near-full pack confounds a negative result. Taper is *not* a factor below that — see the measured taper table below. | ✅ **84%**, ~4.3 kWh headroom |
+| 3 | Low solar *(preferred, not required)* | Makes grid import unambiguous. In daylight the force is still readable as a step change against a steady baseline; just record the pre-force baseline carefully. | ⚠️ daylight — dusk is cleaner |
+| 4 | **No Octopus dispatch slot during the run** | `automation.solis_off_dispatch_slot_starts_daytime` writes `select.solisac_power_switch` → `Off` mid-run, which would stop the test and confound it. Check `binary_sensor.octopus_energy_..._intelligent_dispatching` is `off` and no slot is imminent. | ⚠️ `off` now, but smart charge is `on` (target 08:00) — recheck at start |
+| 5 | **SoC reading is trustworthy** | The `12%` misreport of 2026-07-30 was the BMS lying plausibly. A false low SoC makes any negative result inconclusive. | ✅ 84% consistent with the overnight charge to 100% |
+| 6 | Overlay healthy | The instrument. | ✅ 43135=0, 43136=0 W, 33132=35, 43282=0 |
+| 7 | Person present, ready to abort | Forced grid charge is the most expensive thing this project can get wrong. | — |
+| 8 | **No Axle flexibility event during the run** | An Axle **export** event discharges the battery to grid — the exact opposite of this test. Check `sensor.axle_vpp_axle_event_window_state` is not `in_progress` and `sensor.axle_vpp_axle_event_minutes_to_start` leaves room. | ✅ if run **before 18:00 BST**; event is 19:00–20:00 |
+
+**Slot for today (2026-09-07): run before 18:00 BST.**
+
+The Axle export event is **19:00–20:00 BST**, so an 18:00 cutoff leaves a full hour of buffer —
+enough that a run which overruns or needs a repeat still finishes clear of it. The inverter's own
+timed window (23:30) is far away, so it is not a factor.
+
+| window | verdict |
+|---|---|
+| now → **18:00 BST** | ✅ **the slot.** Clear of Axle, clear of 23:30 |
+| 18:00 → 19:00 | ⚠️ buffer — do not start a run here |
+| 19:00 → 20:00 | ❌ Axle export event; observe only, write nothing |
+| 20:00 → 23:00 | ✅ fallback slot if today's run slips; darker, and post-event SoC is ~10–12% lower |
+| 23:30 → 05:30 | ❌ the inverter's own timed charge |
+
+**Solar is still up before 18:00.** Precondition 3 is preferred, not required — so take a careful
+30-second baseline of `battery_power` and `meter_active_power` immediately before step 1 and read
+the force as a **step change against that baseline**, not as an absolute value. If PV is swinging
+(broken cloud), wait for a steady minute before enabling.
+
+There is no need to wait for a low SoC on taper grounds — see below — but see the SoC gate, which
+is a different matter entirely and is the main thing this run is now chasing.
+
+### Measured: this pack does not taper below full
+
+Charge current by SoC band, from the overnight window of 2026-09-06 → 09-07 (read-only history):
+
+| SoC | 50% | 70% | **84%** | 92% | 98% | 100% |
+|---|---|---|---|---|---|---|
+| charge current | 59.1 A | 58.0 A | **57.4 A** | 57.0 A | 57.3 A | 0 A |
+
+Flat to within 3% from 50% all the way to 98%, then a cliff at full — an LFP plateau, not a ramp.
+SoC also climbed at a constant 2% per ~11.3 min throughout, independently confirming a constant rate.
+
+**Consequence for this run:** at 84% there is ~4.3 kWh of headroom and the pack will accept full
+current, so a few minutes at the 1.5 kW test setpoint (~0.1 kWh) is untroubled. The old `≤60%`
+precondition was over-conservative and is retired.
+
+The taper table comes from the **timed-window** path. It proves the pack and the inverter will
+charge at 84% — it says nothing about whether the RC path has an SoC gate of its own. It does.
+
+### The SoC gate — the actual reason SoC matters here
+
+**Owner field observation (2026-09-07): forced charge via the solax integration never worked
+unless SoC was below ~20%.**
+
+20% is exactly `number.solisac_battery_minimum_soc`. Working hypothesis:
+
+> The inverter honours a forced/grid charge only while SoC is below `battery_minimum_soc` — it
+> treats grid charging as an emergency recharge to restore the reserve, not a general command.
+
+Unconfirmed; `force_charge_soc` (10) is a weaker candidate threshold. If true, it reframes the
+map's whole "writes are not reliably accepted" history as **conditional actuation** rather than a
+flaky bus.
+
+**This does not postpone the run — it changes what the run is for.** The observation was made
+through solax, where 43135 is write-only with no read-back, so "it didn't work" could not be
+decomposed. The overlay now splits it:
+
+| 43135 read-back | battery current | conclusion |
+|---|---|---|
+| reads `1` | current flows | force works at this SoC — gate disproved |
+| **reads `1`** | **no current** | **write accepted, actuation refused → gate is real, and in firmware, not the write path** |
+| reads `0` | no current | the write itself was rejected — a different problem |
+
+The middle row is the decisive new information, and it is only reachable now that read-back exists.
+So a run at high SoC is worth doing on its own terms, not a wasted null. **Record the read-back
+state and the current independently at every step** — conflating them is precisely what left this
+question open for two months.
+
+### Optional follow-on probe — ⚠️ risky, do not run casually
+
+If the gate is confirmed, raise `number.solisac_battery_minimum_soc` above current SoC and retry
+the force. If it then charges, the gate is confirmed and located.
+
+**Hazard:** if `battery_minimum_soc` is a "keep above this" floor, raising it to 90% may cause the
+inverter to **grid-charge to 90% on its own**, unprompted, at a rate it chooses — an expensive
+runaway that was never commanded and cannot be stopped through the RC registers. Only with a person
+watching, at a cheap rate, reverted immediately. `battery_minimum_soc` writes are themselves in the
+known-flaky set, so a failed revert is a live possibility. Consider deferring this to its own
+sitting rather than bolting it onto the first run.
+
+## The Axle export event is worth observing in its own right
+
+**19:00–20:00 BST tonight, `import_export: export`.** Write nothing during it — but do not waste it.
+It is a **forced discharge, commanded by a third party, on this exact inverter, at high SoC**, and
+this map has never watched one happen.
+
+What it can settle, for free:
+
+- **Which control surface actually actuates.** Something makes this inverter export on demand.
+  Watch whether `switch.solis_control_rc_force_charge` / 43135 moves (the RC path also has a
+  *Force discharge* value), whether the timed-discharge registers change, or whether it is only
+  `select.solisac_power_switch`. Whichever moves is a **path known to work on this hardware** —
+  which is exactly what live-fire is trying to establish for the charge direction.
+- **Whether the ~20% SoC gate is charge-specific or general.** If a forced *discharge* succeeds at
+  ~83% SoC, the RC mechanism is not gated at high SoC as such, and the 20% observation points at
+  emergency-recharge semantics on the charge direction specifically. That materially narrows the
+  hypothesis, and it costs nothing to collect.
+- **Real actuation latency and rate** on this unit, in the discharge direction, for comparison
+  against whatever the charge test yields.
+
+The recorder (`live_fire_recorder.py`) already polls every entity needed; leaving it running across
+19:00–20:00 captures this with no writes and no risk. Record the findings on
+[#83](https://github.com/Kylevdm/ha-spark/issues/83) as a separate observation from the live-fire
+run proper — it is evidence about the control surface, not a test of our own write.
+
+## Instrumentation
+
+Watch throughout. Baseline all of them with a wall-clock timestamp before step 1.
+
+| what | entity | at rest |
+|---|---|---|
+| RC enable read-back | `switch.solis_control_rc_force_charge` | `off` |
+| RC power read-back | `sensor.solis_control_rc_force_charge_power` | `0` |
+| RC timeout read-back | `sensor.solis_control_rc_timeout` | `0` |
+| work mode bitfield | `sensor.solis_control_work_mode_bitfield` | `35` — **any change means something wrote 43110: abort** |
+| battery power | `sensor.solisac_battery_power` | signed, negative = charging |
+| battery SoC | `sensor.solisac_battery_soc` | |
+| battery current | `sensor.solisac_battery_current` | unsigned |
+| grid | `sensor.solisac_meter_active_power` | negative = importing |
+| bus health | `sensor.solisac_communication_health` | `Healthy` |
+| incumbent writer | `select.solisac_power_switch` | `On` — if it flips, an automation intervened |
+| SoC gate threshold | `number.solisac_battery_minimum_soc` | `20` — the suspected gate; record, do not write |
+| Axle window | `sensor.axle_vpp_axle_event_window_state` | not `in_progress` |
+
+**Timestamp every step.** The settling delay is one of the answers being bought here.
+
+### Write surfaces available
+
+| register | what | surface | writable? |
+|---|---|---|---|
+| 43135 | RC force charge enable | `switch.solis_control_rc_force_charge` | ✅ overlay switch |
+| 43136 | RC charge power | `sensor.solis_control_rc_force_charge_power` | ⚠️ **read-only** in the overlay — write via `modbus.write_register` |
+| 43282 | RC timeout (watchdog) | `sensor.solis_control_rc_timeout` | ⚠️ read-only — write via `modbus.write_register` |
+| 43135 (alt) | force charge | `select.solisac_inverter_battery_control_override` | write-only, no read-back; the fallback path |
+
+`number.solisac_battery_control_override_charge_power` **does not exist** on this instance, so the
+solax path has no native rate control. Rate bounding, if needed, is `number.solisac_battery_charge_current`
+— **DC amps**, multiply by battery voltage (~53.5 V) before comparing against anything on the AC side.
+
+## Sequence
+
+Ordering follows #87's companion-write rule: **enable first, then setpoints.** Solis firmware is
+reported not to latch RC setpoints written before the enable. If they latch this way and not the
+other, that is the root cause of the write-rejection history, confirmed.
+
+### Step 0 — baseline
+
+Record every instrumentation row above with a wall-clock time. Confirm the sign conventions:
+if the battery is idle, nudge nothing — just check that `battery_current × battery_voltage`
+matches `|battery_power|`.
+
+### Step 1 — enable RC
+
+Turn on `switch.solis_control_rc_force_charge` (writes 43135 = 1). **Note the wall-clock time.**
+
+### Step 2 — measure the settling delay
+
+Poll the switch until it reads `on` from a genuine register read, not its own optimistic write.
+**Record how long that took** — that is the real `verify: delay`, currently a 20 s guess in the overlay.
+
+### Step 3 — write the power setpoint (~1500 W)
+
+```yaml
+action: modbus.write_register
+data: {hub: solis_control, slave: 1, address: 43136, value: 150}
+```
+
+`value: 150` assumes the register unit is **10 W — unverified**. Check
+`sensor.solis_control_rc_force_charge_power`:
+
+- reads **1500 W** → scale is 10 W, as assumed. Continue.
+- reads **150 W** → scale is 1 W. Harmless; record it.
+- reads **15000 W** → scale is 100 W. **Back off immediately** — write 43135 = 0.
+
+### Step 4 — write the watchdog
+
+```yaml
+action: modbus.write_register
+data: {hub: solis_control, slave: 1, address: 43282, value: 5}
+```
+
+Confirm `sensor.solis_control_rc_timeout` reads **5**. If it still reads `0`, the setpoint did not
+latch even in the correct order — a significant negative result. Record it and stop.
+
+### Step 5 — observe actuation
+
+Within a minute or two expect grid import ≈ setpoint + house load, and `battery_power` to go
+**negative**. Record:
+
+- time from step 1 to first battery movement
+- actual charge power vs. the 1500 W commanded
+- whether it holds steady or drifts
+- SoC at the time
+
+### Step 6 — let the watchdog expire
+
+**Do not disable manually.** Wait past 5 minutes and record whether the force self-terminates and
+43135 returns to `0` on its own.
+
+This is the highest-value observation in the run. The overlay has **no keep-alive** — core `modbus:`
+writes once, unlike solax-modbus which resends every ~15 s ([#85](https://github.com/Kylevdm/ha-spark/issues/85)).
+So if the force persists past the timeout, 43135 latches in hardware with nothing sustaining it and
+nothing scheduled to stop it: that is the peak-rate runaway, reachable with no ha-spark bug at all.
+If it self-terminates, the hardware watchdog is real and the dead-man's-switch design is available.
+
+### Step 7 — re-run and revert manually
+
+Repeat steps 1–4, then turn the switch **off**. Record:
+
+- time from write to read-back `0`
+- whether charging actually stops, and how fast
+- **whether 43136 retains its value after RC goes off** — this settles #90's open question of whether
+  43136 reads `0` at rest because it is unset, or because RC setpoints latch only while enabled
+
+### Step 8 — repeat the force (check 10)
+
+**A single successful force proves nothing.** Writes to this device are known to stick only
+sometimes (`number.solisac_force_charge_soc` rejects most attempts). Run steps 1–2 at least three
+more times and record how many took. Note any pattern against SoC, mode, or time since last write.
+
+## Recording table
+
+Copy this per attempt into the #83 resolution comment.
+
+| step | wall clock | 43135 | 43136 | 43282 | mode | batt W | batt A | SoC | grid W | notes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 baseline | | | | | 35 | | | | | |
+| 1 enable | | | | | | | | | | |
+| 2 read-back on | | | | | | | | | | ← settling delay |
+| 3 power write | | | | | | | | | | ← scale check |
+| 4 timeout write | | | | | | | | | | |
+| 5 actuation | | | | | | | | | | |
+| 6 expiry | | | | | | | | | | ← watchdog real? |
+| 7 revert | | | | | | | | | | |
+
+## Abort conditions
+
+- **Work-mode bitfield ≠ 35** — something wrote 43110. Switch off, stop.
+- **Power read-back implausible** (step 3, 15000 W case).
+- **Mass `solisac_*` unavailability** or `communication_health` not `Healthy` — bus trouble. Switch off, stop.
+- **`select.solisac_power_switch` flips to `Off`** — an incumbent automation intervened mid-run. Results
+  from that point are confounded; stop and rerun outside the dispatch slot.
+- **Charge power materially exceeds the commanded setpoint** — the site has no rate ceiling you control.
+- **An Axle event starts** (`sensor.axle_vpp_axle_event_window_state` → `in_progress`) — the aggregator
+  and this test are now commanding opposite directions. Switch off, stop.
+
+**Hard stop ladder:** switch off `switch.solis_control_rc_force_charge` (43135 = 0) → failing that
+`select.solisac_inverter_battery_control_override` → `Off` → last resort `select.solisac_power_switch` → `Off`.
+
+## Questions this run answers
+
+- Does a write to 43135 actually take, with read-back proof? *(the map's central unknown)*
+- What is the real settling delay? → fixes `verify: delay` in the overlay.
+- Does 43282 govern 43135 — is the hardware watchdog real? → decides the dead-man's-switch design.
+- Does companion-write ordering matter? → likely root cause of the write-rejection history.
+- Is 43136 honoured, what is its scale, and what rate ceiling does the site allow? → bounds the forced-charge rate.
+- Does 43136 persist after RC goes off? → #90's open question.
+- Do forced-charge writes stick *reliably*? → check 10.
+
+## Checks deliberately not in this run
+
+From the original check list on #83, still open but orthogonal to the write path:
+
+- **Check 7 — photograph the model label.** The integration reports `model: None` and exposes no
+  serial entity, so the exact designation is unconfirmed. Do it while you are at the inverter.
+- **Check 9 — characterise the `force_charge_soc` rejection.** Worth its own sitting; it is a
+  different register with a different failure mode.
+- **Check 11 — restart HA mid-force.** Its premise has changed. It was written against solax-modbus's
+  ~15 s resend loop, where a restart silently drops the keep-alive. The overlay has no resend loop at
+  all, so **step 6 already tests the same latch-vs-transient question** without a restart. Re-run
+  check 11 only if the force is driven through the solax `select` rather than the overlay switch.
+- **Check 6 — timed-slot register conflict.** Settled by [#100](https://github.com/Kylevdm/ha-spark/issues/100):
+  43141 is charge current, confirmed against the observed 60 A clamp.
+
+## After the run
+
+1. Post the filled recording table and findings as a resolution comment on
+   [#83](https://github.com/Kylevdm/ha-spark/issues/83), then close it.
+2. Append a one-line gist to the map's Decisions-so-far ([#78](https://github.com/Kylevdm/ha-spark/issues/78)).
+3. Unblocks [#82](https://github.com/Kylevdm/ha-spark/issues/82) — the control-surface decision, now on measured facts.
