@@ -69,3 +69,30 @@ as price slots overlaid on the tariff schedule — not a separate planner
 concept and not a control authority; the planner responds to the prices
 and ha-spark's own drivers actuate. (Decision: Q2 of the 2026-07-12
 grilling session.)
+
+**Battery calibration** — the evidence-backed revision of planner input
+estimates such as effective capacity and charge efficiency from a household's
+own history. It is repeatable, rather than a one-time commissioning result:
+the estimate may be relearned as the battery or its configuration changes.
+
+**BMS measurement integrity** — whether the battery-management system's
+reported SoC is coherent with independent evidence such as pack voltage and
+observed energy flow. A discrepancy is not evidence of battery degradation or
+capacity change by itself: it can be a BMS setting or calibration problem, as
+with differently configured nominally identical packs.
+
+**Calibration trust gate** — the safeguard that prevents ha-spark from
+automatically replacing capacity or efficiency estimates while BMS measurement
+integrity is in doubt. It retains the last trusted estimate and makes the
+conflict visible to the owner instead of interpreting it as degradation.
+
+**Calibration lifecycle** — continuous relearning from qualifying local
+history after the calibration trust gate is clear. ha-spark publishes the
+current estimate and its confidence/evidence; the owner may reset it to the
+spec-informed prior. It never writes BMS settings.
+
+**Learning authority** — ha-spark may automatically use a
+confidence-qualified learned estimate as an input to its own planner, thereby
+changing future plans. Learning never reconfigures a BMS, inverter, or another
+system ha-spark does not own; those systems' measurements remain evidence, not
+configuration targets.
