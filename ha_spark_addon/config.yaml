@@ -76,6 +76,7 @@ options:
   octopus_product_code: ""
   octopus_tariff_code: ""
   soc_entity: ""
+  soc_max_report_age_minutes: 10.0
   battery_voltage_entity: ""
   solar_tomorrow_entity: ""
   octopus_rate_entity: ""
@@ -156,6 +157,7 @@ schema:
   octopus_product_code: str?
   octopus_tariff_code: str?
   soc_entity: str?
+  soc_max_report_age_minutes: float
   battery_voltage_entity: str?
   solar_tomorrow_entity: str?
   octopus_rate_entity: str?

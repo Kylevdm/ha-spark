@@ -99,6 +99,7 @@ _OPTION_KEYS = frozenset(
         # Entity IDs: exposed so other installs can map their own sensors/controls
         # (the code defaults match the author's setup).
         "soc_entity",
+        "soc_max_report_age_minutes",
         "battery_voltage_entity",
         "solar_tomorrow_entity",
         "octopus_rate_entity",
@@ -365,6 +366,10 @@ class Settings(BaseSettings):
     # onboard` (entity auto-discovery) or the `solis` preset (ha_spark/presets.py),
     # which holds the values for the original Solis/Solcast/Octopus/zappi setup.
     soc_entity: str = Field(default="")
+    # How old Home Assistant's top-level `last_reported` for the SoC sensor may
+    # be before the measurement is judged stale (ha_spark/energy/soc_integrity.py).
+    # Untrusted SoC blocks real charge writes, so this is a safety threshold.
+    soc_max_report_age_minutes: float = Field(default=10.0, gt=0)
     battery_voltage_entity: str = Field(default="")
     solar_tomorrow_entity: str = Field(default="")
     octopus_rate_entity: str = Field(default="")

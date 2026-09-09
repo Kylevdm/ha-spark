@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from ha_spark.config import (
     _OPTION_KEYS,
@@ -199,3 +200,23 @@ def test_explicit_devices_list_parses_through() -> None:
 
 def test_devices_in_option_keys() -> None:
     assert "devices" in _OPTION_KEYS
+
+
+def test_soc_max_report_age_defaults_to_ten_minutes() -> None:
+    assert Settings(ha_url="http://x", ha_token="t").soc_max_report_age_minutes == 10.0
+
+
+def test_soc_max_report_age_is_configurable_across_surfaces() -> None:
+    assert "soc_max_report_age_minutes" in _OPTION_KEYS
+    assert (
+        Settings(
+            ha_url="http://x", ha_token="t", soc_max_report_age_minutes=2.5
+        ).soc_max_report_age_minutes
+        == 2.5
+    )
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0])
+def test_soc_max_report_age_must_be_positive(bad: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(ha_url="http://x", ha_token="t", soc_max_report_age_minutes=bad)
