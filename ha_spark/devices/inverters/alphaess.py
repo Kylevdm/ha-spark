@@ -49,8 +49,8 @@ class AlphaESSDevice:
             f"{fmt_hhmm(intent.window_start)}-{fmt_hhmm(intent.window_end)}"
         )
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
-        if mode == "on" and not intent.soc_valid:
-            return [f"[BLOCKED] SoC unreadable; not {desc}"]
+        if mode == "on" and not intent.soc.ok:
+            return [f"[BLOCKED] {intent.soc.reason}; not {desc}"]
         if mode == "simulate":
             return [f"[SIMULATE] would {desc}"]
         if mode in ("off", "observe"):

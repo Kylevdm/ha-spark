@@ -21,6 +21,7 @@ from ha_spark.config import (
 )
 from ha_spark.energy.models import DispatchSlot, PlannerConfig, PlannerInputs, PricePoint
 from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.tariff import (
     DynamicTariffProvider,
     FixedTariffProvider,
@@ -31,6 +32,29 @@ from ha_spark.energy.tariff import (
 
 APPROX = 1e-9
 HORIZON = datetime(2026, 1, 15, 23, 30, tzinfo=UTC)
+
+
+def _soc(value: float) -> SocMeasurement:
+    now = datetime.now(UTC)
+    return SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=now,
+        value=value,
+        raw_state=str(value),
+        reported_at=now,
+        age_s=0.0,
+        max_age_s=600.0,
+    )
+
+
+def _soc_unavailable() -> SocMeasurement:
+    now = datetime.now(UTC)
+    return SocMeasurement(
+        status=SocStatus.UNAVAILABLE,
+        observed_at=now,
+        raw_state="unavailable",
+        max_age_s=600.0,
+    )
 
 
 def cfg(**kw: object) -> PlannerConfig:
@@ -59,8 +83,7 @@ def test_fixed_provider_prices_and_window_from_config() -> None:
     """Slots inside the window are cheap-rate; outside are standard-rate."""
     load = tuple(0.5 for _ in range(48))
     sched = fixed_schedule(
-        PlannerInputs(
-            soc_now=50, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+        PlannerInputs(soc=_soc(50), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
             load_slots=load, horizon_start=HORIZON,
         ),
         cfg(),
@@ -84,8 +107,7 @@ def test_fixed_provider_daytime_dispatch_becomes_controlled_window() -> None:
         end=datetime(2026, 1, 16, 4, 0, tzinfo=UTC),
     )
     sched = fixed_schedule(
-        PlannerInputs(
-            soc_now=50, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+        PlannerInputs(soc=_soc(50), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
             dispatches=(day, night),
         ),
         cfg(),
@@ -97,8 +119,7 @@ def test_fixed_provider_daytime_dispatch_becomes_controlled_window() -> None:
 
 
 def _slot_inputs() -> PlannerInputs:
-    return PlannerInputs(
-        soc_now=55,
+    return PlannerInputs(soc=_soc(55),
         solar_tomorrow_kwh=0.0,
         predicted_home_load_kwh=24.0,
         load_slots=tuple(0.5 for _ in range(48)),
@@ -177,8 +198,7 @@ def _points(prices: list[float]) -> tuple[PricePoint, ...]:
 
 
 def _dynamic_inputs(prices: list[float], *, load_slots: bool = True) -> PlannerInputs:
-    return PlannerInputs(
-        soc_now=55, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+    return PlannerInputs(soc=_soc(55), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
         load_slots=tuple(0.5 for _ in range(48)) if load_slots else None,
         horizon_start=HORIZON,
         dynamic_prices=_points(prices),
@@ -201,8 +221,7 @@ def test_dynamic_provider_still_honours_daytime_dispatches() -> None:
         start=datetime(2026, 1, 16, 13, 0, tzinfo=UTC),
         end=datetime(2026, 1, 16, 14, 30, tzinfo=UTC),
     )
-    inputs = PlannerInputs(
-        soc_now=55, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+    inputs = PlannerInputs(soc=_soc(55), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
         load_slots=tuple(0.5 for _ in range(48)), horizon_start=HORIZON,
         dynamic_prices=_points([0.1] * 48), dispatches=(day,),
     )
@@ -212,8 +231,7 @@ def test_dynamic_provider_still_honours_daytime_dispatches() -> None:
 
 def test_dynamic_provider_falls_back_without_prices() -> None:
     """No live prices at all (unread/empty sensor) -> falls back to fixed."""
-    inputs = PlannerInputs(
-        soc_now=55, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+    inputs = PlannerInputs(soc=_soc(55), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
         load_slots=tuple(0.5 for _ in range(48)), horizon_start=HORIZON,
     )
     assert _dynamic().schedule(inputs, cfg()) == fixed_schedule(inputs, cfg())
@@ -237,8 +255,7 @@ def test_dynamic_provider_marks_cheapest_slots_as_cheap() -> None:
 
 def test_dynamic_provider_uncovered_slot_costs_standard_rate() -> None:
     """A slot with no live price (partial sensor read) costs at the standard rate."""
-    inputs = PlannerInputs(
-        soc_now=55, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+    inputs = PlannerInputs(soc=_soc(55), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
         load_slots=tuple(0.5 for _ in range(48)), horizon_start=HORIZON,
         dynamic_prices=_points([0.05] * 10),  # only the first 10 slots are covered
     )
@@ -299,8 +316,7 @@ def test_octopus_intelligent_matches_fixed_dispatch_handling_without_live_prices
         charge_in_kwh=-5.2,
         source="octopus",
     )
-    inputs = PlannerInputs(
-        soc_now=55, solar_tomorrow_kwh=8.0, predicted_home_load_kwh=24.0,
+    inputs = PlannerInputs(soc=_soc(55), solar_tomorrow_kwh=8.0, predicted_home_load_kwh=24.0,
         load_slots=tuple(0.5 for _ in range(48)), horizon_start=HORIZON,
         dispatches=(dispatch,),
     )
@@ -316,8 +332,7 @@ def test_octopus_intelligent_overlays_live_prices_without_changing_dispatch_hand
         start=datetime(2026, 1, 16, 13, 30, tzinfo=UTC),
         end=datetime(2026, 1, 16, 15, 0, tzinfo=UTC),
     )
-    inputs = PlannerInputs(
-        soc_now=55, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+    inputs = PlannerInputs(soc=_soc(55), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
         load_slots=tuple(0.5 for _ in range(48)), horizon_start=HORIZON,
         dispatches=(dispatch,), dynamic_prices=_points([0.08] * 48),
     )
@@ -329,16 +344,14 @@ def test_octopus_intelligent_overlays_live_prices_without_changing_dispatch_hand
 
 
 def test_octopus_intelligent_falls_back_without_load_slots() -> None:
-    inputs = PlannerInputs(
-        soc_now=55, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+    inputs = PlannerInputs(soc=_soc(55), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
         dynamic_prices=_points([0.08] * 48),
     )
     assert _octopus().schedule(inputs, cfg()) == fixed_schedule(inputs, cfg())
 
 
 def test_octopus_intelligent_uncovered_slot_costs_standard_rate() -> None:
-    inputs = PlannerInputs(
-        soc_now=55, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+    inputs = PlannerInputs(soc=_soc(55), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
         load_slots=tuple(0.5 for _ in range(48)), horizon_start=HORIZON,
         dynamic_prices=_points([0.05] * 10),
     )

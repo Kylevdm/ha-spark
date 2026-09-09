@@ -47,8 +47,8 @@ def _contains(message: str, *keywords: str) -> bool:
 
 
 def _soc_line(plan: ChargePlan) -> str:
-    if not plan.soc_valid:
-        return "Battery SoC sensor is unreadable right now."
+    if not plan.soc.ok:
+        return f"Battery SoC is untrusted right now: {plan.soc.reason}."
     return f"Battery is at {plan.soc_now:.0f}% ({plan.usable_now_kwh:.2f} kWh usable)."
 
 
