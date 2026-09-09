@@ -96,3 +96,40 @@ async def test_build_dashboard_adds_people_card_from_csv_field() -> None:
         {"entity": "person.alice", "name": "person.alice"},
         {"entity": "person.bob", "name": "person.bob"},
     ]
+
+
+@respx.mock
+async def test_build_dashboard_includes_derived_base_load_card() -> None:
+    """Configured derive_*_entity options surface a 'Derived base load' card."""
+    respx.get("http://ha.test/api/states").mock(return_value=httpx.Response(200, json=[]))
+    settings = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        derive_grid_import_entity="sensor.grid_import",
+        derive_solar_generation_entity="sensor.solar",
+    )
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        dashboard = await build_dashboard(settings, rest)
+
+    cards = dashboard["views"][0]["cards"]
+    titles = [c["title"] for c in cards]
+    assert "Derived base load" in titles
+
+    derived_card = next(c for c in cards if c["title"] == "Derived base load")
+    entity_ids = [e["entity"] for e in derived_card["entities"]]
+    assert "sensor.grid_import" in entity_ids
+    assert "sensor.solar" in entity_ids
+    # Only configured components appear (the card filters by configured value).
+    assert len(derived_card["entities"]) == 2
+
+
+@respx.mock
+async def test_build_dashboard_skips_derived_card_when_unconfigured() -> None:
+    """No derive_*_entity set -> no Derived base load card."""
+    respx.get("http://ha.test/api/states").mock(return_value=httpx.Response(200, json=[]))
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        dashboard = await build_dashboard(settings, rest)
+
+    titles = [c["title"] for c in dashboard["views"][0]["cards"]]
+    assert "Derived base load" not in titles

@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.15.0
+
+- Derived base load (ADR-0001, #45): the load forecast can now be sourced
+  from base load **derived by energy balance** over the HA long-term
+  component statistics (`grid_import - grid_export + solar_generation +
+  battery_discharge - battery_charge - ev_charge`) instead of a single
+  user-supplied consumption sensor. Both the derived path and the
+  source-entity path write the same external statistic
+  (`ha_spark:house_load`), so the forecast chain is unchanged — no
+  need to repoint `consumption_energy_entity` between paths. A
+  one-time `ha-spark backfill-load --derive` (re)builds the history
+  from the configured components.
+- New `derive_*_entity` options for each of the six components (grid
+  import is required; the others are optional and contribute zero with
+  a degradation note when unset) plus per-component `derive_invert_*`
+  flags for the explicit sign convention. The same unit handling as
+  the source-entity backfill (`W`/`kW` mean-power or `kWh`/`Wh`
+  energy change) — an unsupported unit disables that component with a
+  clear reason, preserving old behaviour on a partial setup. The
+  per-component conversion preserves sign through to the formula so
+  the explicit `invert` flag actually changes the contribution (a
+  positive source with `invert=true` reaches the formula as a
+  non-zero negative, not silently zeroed).
+- New CLI flag `ha-spark backfill-load --derive` runs the energy-balance
+  backfill. `--from` (source-entity path) and `--derive` are mutually
+  exclusive at dispatch; the two paths write to the same external id,
+  so switching between them cannot collide on stale rows. The backfill
+  report names rows written, date range, every component's coverage
+  range (with omitted components stated as such), sign-convention
+  warnings, and omitted-component notes. The wizard (`ha-spark onboard`)
+  now surfaces candidates for every `derive_*_entity` field.
+- Scheduled rolling re-derivation: after every daily plan run the daemon
+  re-derives the trailing 48 h from component statistics and **upserts**
+  every derivable hour in that window (late-arriving or corrected
+  component rows overwrite their previous target values), with the
+  cumulative `sum` anchored on the latest target row strictly *before*
+  the recompute window so the running total never drops. Failures are
+  logged/reported and never block planning. The shared `derive_specs_from_settings`
+  helper feeds both the CLI and the scheduler so the per-component
+  entity-id / invert-flag mapping cannot drift.
+
+## 0.14.2
+
+- Solis forced charge is implemented as a **native** timed-slot control path
+  (#84). ha-spark writes the charge window and current directly to the inverter
+  holding registers via the `modbus.write_register` service on the thin
+  `solis_control` overlay hub, and reads them back through that hub's
+  `sensor.solis_control_*` entities — no dependency on the solax integration's
+  `number`/`button` entities for control. The window is a single 8-register
+  block write at 43143 (which *is* the commit — there is no separate commit
+  step); the charge current (43141) is written as DC amps ×10. Non-driven slots
+  (charge 2/3, all discharge) are zero-guarded (written to zero only when a
+  stale window is present, to spare register endurance). Forced charge is
+  refused unless the work-mode bitfield permits grid charging (bit 5).
+- All writes stay behind the existing actuation invariants — real writes only
+  under `proactive_mode: on` + `control: ha_spark`, refusal on an invalid SoC,
+  per-write read-back verification, per-action failure isolation, write-if-
+  changed. No live behaviour changes until the manual cutover (ADR-0003).
+- **Config:** added `solis_control_hub` (default `solis_control`) and
+  `solis_modbus_slave` (default `1`); **removed** the never-wired
+  `charge_window_start_entity` / `charge_window_end_entity` options (they wrote
+  the wrong HA domain and only ever ran in `simulate`). The `solis_control`
+  overlay is a one-time manual HA-config step — see
+  `docs/solis-control-modbus-overlay.yaml`.
+
+## 0.14.1
+
+- Agent surface gating is now evaluated per request instead of being frozen at
+  startup: lowering `agent_exposure` (in the add-on options, or via
+  `POST /api/config`) immediately shrinks the `/agent/*` routes, the `/mcp`
+  tools, and what `/openapi.json` advertises, where before the old surface
+  stayed live until the next restart.
+- `agent_surface: off` — the shipped default — is now a true master switch.
+  With it off, `/agent/*` and `/mcp` return 404 behind ingress as if never
+  mounted; previously it only withheld the extra published port, leaving both
+  reachable. **If you were using the agent surface over ingress without setting
+  `agent_surface`, set `agent_surface: on` to keep it.** (#93)
+
 ## 0.14.0
 
 Version re-baseline. The `1.0.0-rc1`–`rc4` line is retired: after live use,

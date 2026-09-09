@@ -9,6 +9,7 @@ import httpx
 import pytest
 import respx
 
+import ha_spark.devices.inverters.solis as solis_driver
 from ha_spark.config import Settings
 from ha_spark.devices import get_device, inverter_device
 from ha_spark.devices.base import Capability, ControlAuthority
@@ -66,17 +67,80 @@ def _state(entity_id: str, state: str) -> dict[str, object]:
     return {"entity_id": entity_id, "state": state, "attributes": {}}
 
 
-def _mock_read_back(settings: Settings, current: str, switch: str) -> None:
-    respx.get(f"http://ha.test/api/states/{settings.charge_current_entity}").mock(
-        return_value=httpx.Response(
-            200, json=_state(settings.charge_current_entity, current)
-        )
+@pytest.fixture(autouse=True)
+def _skip_read_back_delays(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep bounded read-back retry tests fast without changing production timing."""
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(solis_driver.asyncio, "sleep", no_sleep)
+
+
+HUB = "solis_control"
+_WINDOW_FIELDS = (
+    "timed_charge_start_hours",
+    "timed_charge_start_minutes",
+    "timed_charge_end_hours",
+    "timed_charge_end_minutes",
+    "timed_discharge_start_hours",
+    "timed_discharge_start_minutes",
+    "timed_discharge_end_hours",
+    "timed_discharge_end_minutes",
+)
+_SUFFIX = {1: "", 2: "_2", 3: "_3"}
+
+
+def _sensor(field: str) -> str:
+    return f"sensor.{HUB}_{field}"
+
+
+def _get(entity_id: str, value: str) -> None:
+    respx.get(f"http://ha.test/api/states/{entity_id}").mock(
+        return_value=httpx.Response(200, json=_state(entity_id, value))
     )
-    respx.get(f"http://ha.test/api/states/{settings.inverter_power_switch_entity}").mock(
-        return_value=httpx.Response(
-            200, json=_state(settings.inverter_power_switch_entity, switch)
-        )
+
+
+def _get_seq(entity_id: str, values: list[str]) -> None:
+    respx.get(f"http://ha.test/api/states/{entity_id}").mock(
+        side_effect=[httpx.Response(200, json=_state(entity_id, v)) for v in values]
     )
+
+
+def _mock_native(
+    *,
+    slot1: list[int] | None = None,
+    slot2: list[int] | None = None,
+    slot3: list[int] | None = None,
+    current: str = "0.0",
+    bitfield: str = "35",
+    switch: str = "Off",
+) -> None:
+    """Static read-back for the overlay sensors (each GET returns a fixed value)."""
+    for slot, vals in ((1, slot1), (2, slot2), (3, slot3)):
+        vals = vals if vals is not None else [0] * 8
+        for field, v in zip(_WINDOW_FIELDS, vals, strict=True):
+            _get(_sensor(field + _SUFFIX[slot]), str(v))
+    _get(_sensor("timed_charge_current"), current)
+    _get(_sensor("work_mode_bitfield"), bitfield)
+    _get("select.solisac_power_switch", switch)
+    _mock_refresh()
+
+
+def _mock_refresh() -> None:
+    respx.post("http://ha.test/api/services/homeassistant/update_entity").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+
+def _write_calls(route: respx.Route, address: int) -> list[object]:
+    """The values written to `address` via modbus.write_register."""
+    out = []
+    for call in route.calls:
+        body = json.loads(call.request.content)
+        if body.get("address") == address:
+            out.append(body.get("value"))
+    return out
 
 
 def test_solis_current_matches_legacy_sizing() -> None:
@@ -119,20 +183,82 @@ async def test_solis_observe_authority_never_writes_even_when_on() -> None:
 
 
 @respx.mock
-async def test_apply_writes_charge_current() -> None:
-    set_value = respx.post("http://ha.test/api/services/number/set_value").mock(
+async def test_apply_writes_window_block_and_current_natively() -> None:
+    write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    s = _settings(proactive_mode="on")
+    intent = _intent()  # 23:30 -> 05:30
+    expected_a = round(solis_current_a(intent, s))
+    # Current is confirmed before the previously inactive slot is written.
+    _mock_native(slot1=[0] * 8, current="0.0")
+    _get_seq(_sensor("timed_charge_current"), ["0.0", f"{expected_a}.0"])
+    for field, value in zip(_WINDOW_FIELDS, [23, 30, 5, 30, 0, 0, 0, 0], strict=True):
+        _get_seq(_sensor(field), ["0", "0", str(value)])
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        lines = await _solis_device(s, rest).apply(intent)
+    # One block write to 43143: charge 23:30-05:30, discharge half zeroed.
+    assert _write_calls(write, 43143) == [[23, 30, 5, 30, 0, 0, 0, 0]]
+    # Charge current 43141 written as DC amps x10.
+    assert _write_calls(write, 43141) == [expected_a * 10]
+    assert [json.loads(call.request.content)["address"] for call in write.calls] == [
+        43141,
+        43143,
+    ]
+    assert next(line for line in lines if "charge current" in line).startswith("[APPLIED]")
+
+
+@respx.mock
+async def test_apply_skips_writes_when_already_set() -> None:
+    write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(200, json=[])
     )
     s = _settings(proactive_mode="on")
     intent = _intent()
     expected_a = round(solis_current_a(intent, s))
-    _mock_read_back(s, current=f"{expected_a}.0", switch="Off")
+    # Everything already at target: no writes (register endurance).
+    _mock_native(slot1=[23, 30, 5, 30, 0, 0, 0, 0], current=f"{expected_a}.0")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(intent)
-    assert set_value.called
-    posted = set_value.calls.last.request.content
-    assert f'"value":{expected_a}'.encode() in posted or f'"value": {expected_a}'.encode() in posted
-    assert any(line.startswith("[APPLIED]") for line in lines)
+    assert write.call_count == 0
+    assert any(line.startswith("[SKIP]") for line in lines)
+
+
+@respx.mock
+async def test_apply_zero_guards_a_stale_nondriven_slot() -> None:
+    write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    s = _settings(proactive_mode="on")
+    intent = _intent()
+    expected_a = round(solis_current_a(intent, s))
+    # Slot 1 already set (no write); slot 2 carries a stale manual window.
+    _mock_native(
+        slot1=[23, 30, 5, 30, 0, 0, 0, 0],
+        slot2=[19, 0, 20, 0, 0, 0, 0, 0],
+        current=f"{expected_a}.0",
+    )
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        await _solis_device(s, rest).apply(intent)
+    assert _write_calls(write, 43153) == [[0] * 8]  # slot 2 zeroed
+    assert _write_calls(write, 43163) == []  # slot 3 already zero: untouched
+
+
+@respx.mock
+async def test_apply_blocks_when_grid_charge_not_permitted() -> None:
+    write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    s = _settings(proactive_mode="on")
+    # bitfield 3 == 0b11: bit 5 (grid charge) unset -> refuse the force.
+    _mock_native(bitfield="3")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        lines = await _solis_device(s, rest).apply(_intent())
+    assert _write_calls(write, 43143) == []
+    assert _write_calls(write, 43141) == []
+    window_line = next(line for line in lines if "charge window" in line)
+    assert window_line.startswith("[BLOCKED]")
+    assert "grid charging not permitted" in window_line
 
 
 @respx.mock
@@ -146,18 +272,28 @@ async def test_simulate_makes_no_service_calls() -> None:
 
 
 @respx.mock
-async def test_on_executes_service_calls_and_verifies_read_back() -> None:
-    set_value = respx.post("http://ha.test/api/services/number/set_value").mock(
+async def test_on_applies_and_verifies_read_back() -> None:
+    respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(200, json=[])
     )
     s = _settings(proactive_mode="on")
     intent = _intent()
     expected_a = round(solis_current_a(intent, s))
-    _mock_read_back(s, current=f"{expected_a}.0", switch="Off")
+    want = [23, 30, 5, 30, 0, 0, 0, 0]
+    _mock_refresh()
+    # Each block sensor: initial active-window check and write-if-changed read
+    # show 0; the bounded fresh read-back sees the target.
+    for field, v in zip(_WINDOW_FIELDS, want, strict=True):
+        _get_seq(_sensor(field), ["0", "0", str(v)])
+    _get_seq(_sensor("timed_charge_current"), ["0.0", f"{expected_a}.0"])
+    _get(_sensor("work_mode_bitfield"), "35")
+    for slot in (2, 3):
+        for field in _WINDOW_FIELDS:
+            _get(_sensor(field + _SUFFIX[slot]), "0")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(intent)
-    assert set_value.called
-    assert all(line.startswith("[APPLIED]") or line.startswith("[SKIP]") for line in lines)
+    window_line = next(line for line in lines if "charge window" in line)
+    assert window_line.startswith("[APPLIED]")
 
 
 @respx.mock
@@ -165,38 +301,159 @@ async def test_on_warns_when_read_back_mismatches() -> None:
     respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _settings(proactive_mode="on")
     intent = _intent()
-    _mock_read_back(s, current="0.0", switch="On")
+    # Current applies; slot 1 remains stale after its write and exhausts the
+    # bounded fresh-read attempts.
+    _mock_native(slot1=[0] * 8, current="0.0")
+    expected_a = round(solis_current_a(_intent(), s))
+    _get_seq(_sensor("timed_charge_current"), ["0.0", f"{expected_a}.0"])
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(intent)
-    current_line = next(line for line in lines if "set timed charge current" in line)
-    assert current_line.startswith("[WARNING]")
-    expected_a = round(solis_current_a(intent, s))
-    assert current_line.endswith(f"read back 0 A (wanted {expected_a:g} A)")
+    window_line = next(line for line in lines if "charge window" in line)
+    assert window_line.startswith("[WARNING]")
+    assert "read back slot 1" in window_line
 
 
 @respx.mock
 async def test_on_warns_when_read_back_read_fails() -> None:
     respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    # Work-mode assert reads fine; the slot read-backs fail.
+    _get(_sensor("work_mode_bitfield"), "35")
     respx.route(method="GET").mock(return_value=httpx.Response(500))
     s = _settings(proactive_mode="on")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(_intent())
-    current_line = next(line for line in lines if "set timed charge current" in line)
-    assert current_line.startswith("[WARNING]")
-    assert "read-back failed" in current_line
+    current_line = next(line for line in lines if "charge current" in line)
+    window_line = next(line for line in lines if "charge window" in line)
+    assert current_line.startswith("[FAILED]")
+    assert window_line.startswith("[BLOCKED]")
 
 
 @respx.mock
 async def test_on_isolates_action_failures() -> None:
-    respx.post("http://ha.test/api/services/number/set_value").mock(
+    respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(500)
     )
     s = _settings(proactive_mode="on")
-    intent = _intent(holds=(), target_soc=77.0, soc_now=50.0)
+    _mock_native(slot1=[0] * 8, current="0.0")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await _solis_device(s, rest).apply(intent)
-    current_line = next(line for line in lines if "set timed charge current" in line)
+        lines = await _solis_device(s, rest).apply(_intent())
+    current_line = next(line for line in lines if "charge current" in line)
+    window_line = next(line for line in lines if "charge window" in line)
     assert current_line.startswith("[FAILED]")
+    assert window_line.startswith("[BLOCKED]")
+
+
+@respx.mock
+async def test_apply_does_not_activate_new_window_when_current_write_fails() -> None:
+    """A failed current write cannot expose a new slot at the old current."""
+    write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
+        return_value=httpx.Response(500)
+    )
+    s = _settings(proactive_mode="on", max_charge_current_a=10.0)
+    _mock_native(slot1=[0] * 8, current="60.0")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        lines = await _solis_device(s, rest).apply(_intent(target_soc=90.0))
+    assert _write_calls(write, 43141) == [100]
+    assert _write_calls(write, 43143) == []
+    current_line = next(line for line in lines if "charge current" in line)
+    window_line = next(line for line in lines if "charge window" in line)
+    assert current_line.startswith("[FAILED]")
+    assert window_line.startswith("[BLOCKED]")
+    assert "planned current was not confirmed" in window_line
+
+
+@respx.mock
+async def test_apply_leaves_already_active_window_when_current_verification_fails() -> None:
+    """A current verification failure leaves an existing window deactivated."""
+    write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    refresh = respx.post(
+        "http://ha.test/api/services/homeassistant/update_entity"
+    ).mock(return_value=httpx.Response(200, json=[]))
+    s = _settings(proactive_mode="on", max_charge_current_a=10.0)
+    # Slot 1 is already active at 60 A. It is zeroed and freshly confirmed
+    # before the current transition; the current read-back then stays stale.
+    _mock_native(slot1=[23, 30, 5, 30, 0, 0, 0, 0], current="60.0")
+    for field, value in zip(_WINDOW_FIELDS, [23, 30, 5, 30, 0, 0, 0, 0], strict=True):
+        _get_seq(_sensor(field), [str(value), str(value), "0"])
+    _get_seq(_sensor("timed_charge_current"), ["60.0"] * 5)
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        lines = await _solis_device(s, rest).apply(_intent(target_soc=90.0))
+    assert _write_calls(write, 43143) == [[0] * 8]
+    assert _write_calls(write, 43141) == [100]
+    assert [json.loads(call.request.content)["address"] for call in write.calls] == [
+        43143,
+        43141,
+    ]
+    assert refresh.call_count == 2
+    assert next(line for line in lines if "deactivate timed slot 1" in line).startswith(
+        "[APPLIED]"
+    )
+    assert next(line for line in lines if "charge window" in line).startswith("[BLOCKED]")
+
+
+@respx.mock
+async def test_apply_blocks_current_when_active_window_cannot_be_deactivated() -> None:
+    """A failed slot-zero verification leaves no current transition to attempt."""
+    write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    refresh = respx.post(
+        "http://ha.test/api/services/homeassistant/update_entity"
+    ).mock(return_value=httpx.Response(200, json=[]))
+    s = _settings(proactive_mode="on", max_charge_current_a=10.0)
+    _mock_native(slot1=[23, 30, 5, 30, 0, 0, 0, 0], current="60.0")
+    for field, value in zip(_WINDOW_FIELDS, [23, 30, 5, 30, 0, 0, 0, 0], strict=True):
+        _get_seq(_sensor(field), [str(value)] * 5)
+    _get(_sensor("timed_charge_current"), "60.0")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        lines = await _solis_device(s, rest).apply(_intent(target_soc=90.0))
+    assert _write_calls(write, 43143) == [[0] * 8]
+    assert _write_calls(write, 43141) == []
+    assert refresh.call_count == 1
+    assert next(line for line in lines if "deactivate timed slot 1" in line).startswith(
+        "[WARNING]"
+    )
+    assert next(line for line in lines if "charge current" in line).startswith("[BLOCKED]")
+    assert next(line for line in lines if "charge window" in line).startswith("[BLOCKED]")
+
+
+@respx.mock
+async def test_current_verification_refreshes_and_retries_after_delayed_update() -> None:
+    """A delayed overlay sensor update is accepted within the fixed retry bound."""
+    write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    refresh = respx.post(
+        "http://ha.test/api/services/homeassistant/update_entity"
+    ).mock(return_value=httpx.Response(200, json=[]))
+    s = _settings(proactive_mode="on")
+    _get_seq(_sensor("timed_charge_current"), ["0.0", "0.0", "40.0"])
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        line = await _solis_device(s, rest).set_charge_rate(2040.0)
+    assert _write_calls(write, 43141) == [400]
+    assert refresh.call_count == 1
+    assert line.startswith("[APPLIED]")
+
+
+@respx.mock
+async def test_current_verification_is_bounded_when_overlay_stays_stale() -> None:
+    """A stale overlay produces a bounded warning rather than an infinite poll."""
+    write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    refresh = respx.post(
+        "http://ha.test/api/services/homeassistant/update_entity"
+    ).mock(return_value=httpx.Response(200, json=[]))
+    s = _settings(proactive_mode="on")
+    _get_seq(_sensor("timed_charge_current"), ["0.0", "0.0", "0.0", "0.0"])
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        line = await _solis_device(s, rest).set_charge_rate(2040.0)
+    assert _write_calls(write, 43141) == [400]
+    assert refresh.call_count == 1
+    assert line.startswith("[WARNING]")
+    assert "read back 0 A" in line
 
 
 @respx.mock
@@ -216,7 +473,9 @@ async def test_on_does_not_block_genuine_zero_soc() -> None:
     the moment a real charge is most needed."""
     s = _settings(proactive_mode="on")
     intent = _intent(soc_now=0, soc_valid=True)
-    _mock_read_back(s, "0", "Off")
+    _mock_native(slot1=[0] * 8, current="0.0")
+    expected_a = round(solis_current_a(intent, s))
+    _get_seq(_sensor("timed_charge_current"), ["0.0", f"{expected_a}.0"])
     respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(intent)
@@ -255,26 +514,24 @@ def test_planned_rate_w_matches_current_times_voltage() -> None:
 
 
 @respx.mock
-async def test_set_charge_rate_posts_amps_and_applies() -> None:
-    set_value = respx.post("http://ha.test/api/services/number/set_value").mock(
+async def test_set_charge_rate_writes_current_natively_and_applies() -> None:
+    write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(200, json=[])
     )
     s = _settings(proactive_mode="on", battery_voltage_v=51.0)
-    _mock_read_back(s, current="40.0", switch="Off")
+    # 2040 W / 51 V = 40 A; decide reads 0 -> write, verify reads 40.
+    _mock_refresh()
+    _get_seq(_sensor("timed_charge_current"), ["0.0", "40.0"])
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         line = await _solis_device(s, rest).set_charge_rate(2040.0)
-    assert set_value.called
-    posted = set_value.calls.last.request.content
-    assert b'"value":40' in posted or b'"value": 40' in posted
+    assert _write_calls(write, 43141) == [400]  # 40 A x10
     assert line.startswith("[APPLIED]")
 
 
 @respx.mock
 async def test_read_charge_rate_converts_amps_to_watts() -> None:
     s = _settings(battery_voltage_v=51.0)
-    respx.get(f"http://ha.test/api/states/{s.charge_current_entity}").mock(
-        return_value=httpx.Response(200, json=_state(s.charge_current_entity, "30"))
-    )
+    _get(_sensor("timed_charge_current"), "30")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         watts = await _solis_device(s, rest).read_charge_rate()
     assert watts == pytest.approx(30 * 51.0)
@@ -283,7 +540,7 @@ async def test_read_charge_rate_converts_amps_to_watts() -> None:
 @respx.mock
 async def test_read_charge_rate_raises_on_unreadable_sensor() -> None:
     s = _settings()
-    respx.get(f"http://ha.test/api/states/{s.charge_current_entity}").mock(
+    respx.get(f"http://ha.test/api/states/{_sensor('timed_charge_current')}").mock(
         return_value=httpx.Response(500)
     )
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
