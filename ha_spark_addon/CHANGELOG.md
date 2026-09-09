@@ -19,6 +19,22 @@
   concrete integrity reason: the plan-status sensor publishes
   `soc_status`/`soc_reason` in place of `soc_valid`, and a `[BLOCKED]`
   line quotes the reason.
+- SoC integrity monitoring (#114): the daemon observes the configured
+  `soc_entity` once per minute in every operating state, and that one
+  checked measurement is reused by planning, device application,
+  publication, and supply-guard work — one observation can increment
+  the failure count at most once. The first failed observation enters
+  **pending failure**: the resident program is left untouched, new
+  SoC-based programming and charge-rate increases are blocked for both
+  supported inverter types, while valid supply-guard reductions remain
+  available. Consecutive failures are counted and persisted across
+  restarts; any passing observation resets the count. New
+  `soc_failure_threshold` option (default `3`) sets how many consecutive
+  failures reach the fallback-entry threshold (fallback programming
+  itself lands with #115). Monitoring state is visible as the new
+  `sensor.ha_spark_soc_integrity` (operating state, failure count,
+  threshold, integrity reason and evidence), in the daemon log, and in
+  the plan report's untrusted-SoC line.
 
 ## 0.15.0
 

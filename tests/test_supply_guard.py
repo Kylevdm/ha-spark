@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import httpx
 import respx
 
@@ -9,6 +11,7 @@ from ha_spark.config import Settings
 from ha_spark.devices import inverter_device
 from ha_spark.devices.base import Capability
 from ha_spark.energy.scheduler import guard_tick
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.supply_guard import SupplyGuard, throttled_rate_w
 from ha_spark.ha.rest import HomeAssistantRest
 
@@ -177,3 +180,67 @@ def test_guard_dormant_for_inverter_without_rate() -> None:
     s = _guard_settings(inverter="alphaess")
     rest = HomeAssistantRest("http://ha.test", "tok")
     assert Capability.CHARGE_RATE not in inverter_device(s, rest).capabilities
+
+
+# --- pending SoC failure (#114): increases blocked, reductions allowed ---
+
+
+def _soc_measurement(ok: bool) -> SocMeasurement:
+    """One checked measurement: fresh pass, or stale fail (evidence-heavy)."""
+    now = datetime.now(UTC)
+    reported = now if ok else now - timedelta(hours=1)
+    return SocMeasurement(
+        status=SocStatus.OK if ok else SocStatus.STALE,
+        observed_at=now,
+        value=55.0,
+        raw_state="55",
+        reported_at=reported,
+        age_s=0.0 if ok else 3600.0,
+        max_age_s=600.0,
+    )
+
+
+@respx.mock
+async def test_tick_failed_soc_blocks_rate_increase() -> None:
+    """Pending failure: plenty of headroom would normally restore toward the
+    plan target (an increase); an untrusted SoC must not raise grid charging."""
+    posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    s = _guard_settings(proactive_mode="on")
+    _mock_state(s.grid_power_entity, "3000")  # light load, huge headroom
+    _mock_state("sensor.solis_control_timed_charge_current", "40")  # setpoint 2040 W
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        line = await SupplyGuard(s, rest).tick(target_w=4080.0, soc=_soc_measurement(False))
+    # Target capped at the live setpoint -> no delta -> no write.
+    assert line is None
+    assert posts.call_count == 0
+
+
+@respx.mock
+async def test_tick_failed_soc_still_allows_reduction() -> None:
+    """Pending failure: a valid supply measurement over the limit may still
+    reduce the setpoint — the guard keeps protecting the supply fuse."""
+    set_value = respx.post("http://ha.test/api/services/modbus/write_register").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    s = _guard_settings(proactive_mode="on")
+    _mock_state(s.grid_power_entity, "20000")  # over the 18000 W limit
+    _mock_state("sensor.solis_control_timed_charge_current", "40")  # setpoint 2040 W
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        line = await SupplyGuard(s, rest).tick(target_w=4080.0, soc=_soc_measurement(False))
+    # Target capped at 2040 W, then shed to the ~40 W of remaining headroom.
+    assert set_value.called
+    assert line is not None and "set charge current to 1 A" in line
+
+
+@respx.mock
+async def test_tick_passing_soc_restores_toward_target() -> None:
+    """A checked, passing measurement lifts the cap: restoration (increase)
+    toward the plan target works exactly as before #114."""
+    posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    s = _guard_settings(proactive_mode="simulate")
+    _mock_state(s.grid_power_entity, "3000")
+    _mock_state("sensor.solis_control_timed_charge_current", "5")  # throttled: 255 W
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        line = await SupplyGuard(s, rest).tick(target_w=2040.0, soc=_soc_measurement(True))
+    assert line is not None and "set charge current to 40 A (2040 W)" in line
+    assert posts.call_count == 0
