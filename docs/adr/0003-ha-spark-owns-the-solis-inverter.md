@@ -2,7 +2,8 @@
 
 Status: Accepted (2026-09-06); premise corrected 2026-09-07 (see "The
 overnight charge is inverter-resident"); control surface corrected 2026-09-08
-(see "The driven control surface is the timed-slot registers, not RC")
+(see "The driven control surface is the timed-slot registers, not RC");
+reconciled with the implemented driver 2026-09-09 (see the runbook)
 
 ## Context
 
@@ -117,6 +118,17 @@ The RC path (register 43135) is uncontested — no incumbent writes it — but
 live-fire found it the weaker surface (see above); it is not the driven path
 and stays a backlog investigation, not part of cutover.
 
+The implemented charge path (#84, merged as PR #105) writes the charge
+current at 43141 and the eight-register Slot 1 window block at 43143 through
+HA's `modbus.write_register`, with read-back through the overlay's own
+sensors. It zero-guards slots 2/3 and Slot 1's discharge half, writes only
+when values differ, and isolates failures per action; current confirmation
+is a prerequisite for activating Slot 1. Real charge writes still require
+`proactive_mode = on`, `control = ha_spark`, and a valid SoC. This completes
+the charge control surface — not the whole power-switch lifecycle (the
+driver writes `Off` for holds but not `On` back) and not commanded export
+(#57).
+
 ## Cutover runbook
 
 Executed by a human, in Home Assistant. ha-spark never programmatically
@@ -125,25 +137,41 @@ scope and stays with the operator.
 
 1. Run ha-spark in `proactive_mode = simulate`. Watch its intended
    power-switch / timed-slot actions against the live incumbent until the
-   behaviour ledger above checks out (rules 1–3 satisfied, rule 4 confirmed
-   irrelevant).
-2. Record the inverter's current slot-1 values (60 A, 23:30 → 05:30) as the
-   rollback baseline. No other action needed on the slot itself — it is
-   superseded, not cleared: ha-spark's first replan cycle after cutover
-   overwrites it with its own computed start/end/current — writing the
-   8-register window block is itself the commit (#84), so there is no
-   separate commit step.
+   behaviour ledger above checks out (rules 1–2 satisfied, rule 4 confirmed
+   irrelevant; rule 3 is demoted and not a validation gate). **Full takeover
+   remains pending:** the driver turns the power switch `Off` for holds but
+   does not restore `On` — resolve and verify that lifecycle before retiring
+   the incumbent for unattended operation; #84's charge implementation does
+   not supply it.
+2. Install the [native overlay](../solis-control-modbus-overlay.yaml)
+   manually if not already present. Confirm Modbus TCP (`type: tcp`), gateway
+   multi-host mode, storage-type caching OFF, and healthy overlay reads; the
+   driver asserts grid-charge permission through the work-mode sensor (33132,
+   input) and never changes work mode. Record the rollback baseline: the
+   charge current, all three window blocks, work mode, power-switch state,
+   and the automation states. No other action on Slot 1 — it is superseded,
+   not cleared, and the timed-mode bit is not disarmed: ha-spark's first
+   replan cycle after cutover overwrites Slot 1 with its own computed
+   start/end/current — writing the 8-register window block is itself the
+   commit (#84), so there is no separate commit step.
 3. **Make sure any automations that write this inverter are disabled** before
    flipping the gate — operator responsibility, not ha-spark's; ha-spark does
    not enable or disable HA automations itself, and which automations exist
    varies by installation. In **one coordinated step**: *disable* (not
    delete) the four incumbent automations **and** set `proactive_mode = on`.
    Disabling rather than deleting keeps them as an instant rollback if
-   ha-spark misbehaves live.
+   ha-spark misbehaves live. Observe the first replan replacing Slot 1 and
+   verifying its current/window and the unused slots — a failed or blocked
+   program is not a successful handover; confirm actual charging and stopping
+   on battery/grid telemetry as well as register reads.
 4. **Invariant:** ha-spark is never in `proactive_mode = on` while the
    incumbent automations are enabled, or while the timed-slot registers are
    being driven by anything other than ha-spark's own replan loop. Only one
-   controller drives the battery at a time.
+   controller drives the battery at a time. Returning to `simulate` stops new
+   writes but does not erase the resident program. For rollback: stop
+   ha-spark writes, restore and verify the recorded register and power-switch
+   state through HA, then restore the incumbent automations, with the
+   operator observing the result.
 
 The four incumbent automations, for the rollback record:
 `Solis on - grid charge slot starts (23:30)`,
