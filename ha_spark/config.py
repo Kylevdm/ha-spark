@@ -100,6 +100,7 @@ _OPTION_KEYS = frozenset(
         # (the code defaults match the author's setup).
         "soc_entity",
         "soc_max_report_age_minutes",
+        "soc_failure_threshold",
         "battery_voltage_entity",
         "solar_tomorrow_entity",
         "octopus_rate_entity",
@@ -378,6 +379,10 @@ class Settings(BaseSettings):
     # be before the measurement is judged stale (ha_spark/energy/soc_integrity.py).
     # Untrusted SoC blocks real charge writes, so this is a safety threshold.
     soc_max_report_age_minutes: float = Field(default=10.0, gt=0)
+    # Consecutive failed SoC observations before the fallback-entry threshold is
+    # reached (#114). The first failure already blocks new SoC-based programming
+    # and charge-rate increases; this counts toward fallback entry (#115).
+    soc_failure_threshold: int = Field(default=3, ge=1)
     battery_voltage_entity: str = Field(default="")
     solar_tomorrow_entity: str = Field(default="")
     octopus_rate_entity: str = Field(default="")

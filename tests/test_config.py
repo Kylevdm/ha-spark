@@ -239,3 +239,23 @@ def test_soc_max_report_age_is_configurable_across_surfaces() -> None:
 def test_soc_max_report_age_must_be_positive(bad: float) -> None:
     with pytest.raises(ValidationError):
         Settings(ha_url="http://x", ha_token="t", soc_max_report_age_minutes=bad)
+
+
+def test_soc_failure_threshold_defaults_to_three() -> None:
+    assert Settings(ha_url="http://x", ha_token="t").soc_failure_threshold == 3
+
+
+def test_soc_failure_threshold_is_configurable_across_surfaces() -> None:
+    assert "soc_failure_threshold" in _OPTION_KEYS
+    assert (
+        Settings(
+            ha_url="http://x", ha_token="t", soc_failure_threshold=5
+        ).soc_failure_threshold
+        == 5
+    )
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_soc_failure_threshold_must_be_at_least_one(bad: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(ha_url="http://x", ha_token="t", soc_failure_threshold=bad)

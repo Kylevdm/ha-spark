@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from ha_spark.config import Settings
 from ha_spark.devices import inverter_device
+from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -59,8 +60,16 @@ class SupplyGuard:
         self._rest = rest
         self._charger = inverter_device(settings, rest)
 
-    async def tick(self, target_w: float) -> str | None:
-        """One guard pass; returns the action line if a resize was applied."""
+    async def tick(
+        self, target_w: float, *, soc: SocMeasurement | None = None
+    ) -> str | None:
+        """One guard pass; returns the action line if a resize was applied.
+
+        ``soc`` is the daemon tick's checked measurement. While it failed
+        (pending SoC failure, #114) the target is capped at the live setpoint:
+        an untrusted reading must not *increase* grid charging, while a valid
+        supply-guard measurement may still reduce it.
+        """
         s = self._settings
         try:
             supply_w = float((await self._rest.get_state(s.grid_power_entity)).state)
@@ -68,6 +77,9 @@ class SupplyGuard:
         except Exception as exc:  # noqa: BLE001 - never throttle on bad data
             log.warning("Supply guard: read failed (%s); skipping", exc)
             return None
+
+        if soc is not None and not soc.ok:
+            target_w = min(target_w, setpoint_w)
 
         wanted_w = throttled_rate_w(
             supply_w,

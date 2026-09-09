@@ -11,6 +11,14 @@ the supply guard: throttle the battery's charge-current setpoint while
 whole-house draw exceeds `supply_max_current_a`, restoring toward the plan's
 current as headroom returns. Outside the window the timed-charge setpoint is
 inert (and there is nothing else ha-spark can shed), so the guard stays quiet.
+
+Every tick also makes exactly one checked SoC observation (`soc_monitor_tick`,
+#114): the daemon loop is the sole SoC observation cadence, and that one
+measurement is reused by planning, device application, and guard work. The
+first failed observation enters pending failure — new SoC-based programming
+and charge-rate increases are blocked while valid supply-guard reductions
+remain available — and consecutive failures are counted toward the configured
+fallback-entry threshold (`soc_failure_threshold`, default 3).
 """
 
 from __future__ import annotations
@@ -45,8 +53,15 @@ from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargePlan, PlannerInputs
 from ha_spark.energy.orchestrator import orchestrate
 from ha_spark.energy.plan_run import current_plan
-from ha_spark.energy.publish import publish_plan, publish_predictions, republish_last
+from ha_spark.energy.publish import (
+    publish_plan,
+    publish_predictions,
+    publish_soc_integrity,
+    republish_last,
+)
 from ha_spark.energy.report import format_plan
+from ha_spark.energy.soc_integrity import SocMeasurement
+from ha_spark.energy.soc_monitor import SocMonitor, observe_soc
 from ha_spark.energy.sources import parse_time
 from ha_spark.energy.supply_guard import SupplyGuard
 from ha_spark.energy.tariff import _in_overnight_window as in_window
@@ -84,12 +99,21 @@ async def _record_forecast(settings: Settings, plan: ChargePlan, inputs: Planner
         log.exception("Recording forecast failed")
 
 
-async def run_once(settings: Settings) -> ChargePlan:
-    """Compute the charge plan, log it, and apply it per PROACTIVE_MODE."""
+async def run_once(
+    settings: Settings, *, soc: SocMeasurement | None = None
+) -> ChargePlan:
+    """Compute the charge plan, log it, and apply it per PROACTIVE_MODE.
+
+    ``soc`` is the daemon tick's checked measurement, reused as-is so the
+    plan and its charge intent carry the exact observation the loop made
+    (no independent reread); a failed measurement blocks real writes at the
+    charger gate. Without one (CLI/agent callers) the plan makes its own
+    observation through the same shared path.
+    """
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        run = await current_plan(settings, rest)
+        run = await current_plan(settings, rest, soc=soc)
         plan, inputs, load_source = run.plan, run.inputs, run.load_source
         log.info("Charge plan:\n%s", format_plan(plan, load_source))
         intent = plan.charge_intent
@@ -204,12 +228,16 @@ async def sample_signals(settings: Settings, now: datetime) -> None:
                 )
 
 
-async def guard_tick(settings: Settings, target_w: float | None) -> float:
+async def guard_tick(
+    settings: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+) -> float:
     """One supply-guard pass; returns the target charge power (W) used.
 
     No-op for inverters without a settable charge rate (the guard has nothing
     to throttle). A daemon (re)started mid-window has no plan yet; adopt the
     current charge-rate setpoint (W) as the restore target rather than guessing.
+    ``soc`` is the tick's checked measurement: while it failed the guard can
+    only reduce (the cap is applied inside ``SupplyGuard.tick``).
     """
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
@@ -220,8 +248,34 @@ async def guard_tick(settings: Settings, target_w: float | None) -> float:
         if target_w is None:
             target_w = await charger.read_charge_rate()
             log.info("Supply guard: adopted current setpoint %.0f W as target", target_w)
-        await SupplyGuard(settings, rest).tick(target_w)
+        await SupplyGuard(settings, rest).tick(target_w, soc=soc)
     return target_w
+
+
+async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasurement | None:
+    """One per-minute SoC observation: check, count once, publish. Never raises.
+
+    The daemon loop's sole SoC observation cadence (#114): the returned
+    measurement is the one every consumer this tick (planning, device
+    application, guard work) must reuse. ``None`` when no ``soc_entity`` is
+    configured (nothing to observe) or when the tick itself failed — callers
+    then fall back to their own observation path and the next minute retries.
+    """
+    if not settings.soc_entity:
+        return None
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            measurement = await observe_soc(settings, rest)
+            snapshot = monitor.record(
+                measurement, failure_threshold=settings.soc_failure_threshold
+            )
+            await publish_soc_integrity(rest, snapshot, settings)
+            return measurement
+    except Exception:
+        log.exception("SoC monitor tick failed; will retry next minute")
+        return None
 
 
 async def _planned_rate_w(settings: Settings, plan: ChargePlan) -> float | None:
@@ -295,6 +349,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     last_run_date: date | None = None
     target_w: float | None = None
     last_signal_at: datetime | None = None
+    monitor = SocMonitor.load(settings)
     try:
         while True:
             settings = state.settings  # hot-reloaded by POST /api/config
@@ -308,17 +363,28 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                     await _charger_supports_live_rate(settings)
                 )
             now = datetime.now(tz)
+            # Sole SoC observation cadence (#114): one checked measurement per
+            # minute in every operating state, reused by everything below.
+            measurement = await soc_monitor_tick(settings, monitor)
             if should_run(now, run_time, last_run_date):
                 try:
-                    plan = await run_once(settings)
+                    plan = await run_once(settings, soc=measurement)
                     state.set_plan(plan)
                     last_run_date = now.date()
-                    target_w = await _planned_rate_w(settings, plan)
+                    if plan.soc.ok:
+                        target_w = await _planned_rate_w(settings, plan)
+                    else:
+                        # The plan was blocked on an untrusted SoC: its rate was
+                        # sized from soc_now == 0 and must not become the guard's
+                        # restore target. The guard adopts the live setpoint
+                        # instead (reductions only) until a plan is computed from
+                        # a trusted measurement (#116/#117 add the recompute).
+                        target_w = None
                 except Exception:
                     log.exception("Scheduled plan run failed; will retry next tick")
             if guard_enabled and in_window(now.time(), window_start, window_end):
                 try:
-                    target_w = await guard_tick(settings, target_w)
+                    target_w = await guard_tick(settings, target_w, soc=measurement)
                 except Exception:
                     log.exception("Supply guard tick failed; will retry next tick")
             if last_signal_at is None or now - last_signal_at >= SIGNAL_SAMPLE_INTERVAL:

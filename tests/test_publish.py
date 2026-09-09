@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
+import json
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
 import httpx
@@ -10,7 +11,12 @@ import respx
 
 from ha_spark.config import Settings
 from ha_spark.energy.models import ChargeIntent, ChargePlan
-from ha_spark.energy.publish import plan_to_payload, publish_plan, republish_last
+from ha_spark.energy.publish import (
+    plan_to_payload,
+    publish_plan,
+    publish_soc_integrity,
+    republish_last,
+)
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.ha.rest import HomeAssistantRest
 
@@ -156,3 +162,44 @@ def test_plan_status_publishes_ok_status_for_a_checked_soc() -> None:
     attrs = {eid: a for eid, _, a in entities}["sensor.ha_spark_plan_status"]
 
     assert attrs["soc_status"] == "ok"
+
+
+@respx.mock
+async def test_publish_soc_integrity_exposes_pending_state_and_evidence() -> None:
+    """The per-minute monitor sensor carries the pending state, the failure
+    count, and the observation's evidence — never a computed plan."""
+    from ha_spark.energy.soc_integrity import SocStatus
+    from ha_spark.energy.soc_monitor import SocMonitor, SocOperatingState
+
+    push = respx.post(f"{BASE}/states/sensor.ha_spark_soc_integrity").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    now = datetime.now(UTC)
+    stale = SocMeasurement(
+        status=SocStatus.STALE,
+        observed_at=now,
+        value=30.0,
+        raw_state="30",
+        reported_at=now - timedelta(hours=1),
+        age_s=3600.0,
+        max_age_s=600.0,
+    )
+    monitor = SocMonitor()  # no path: persistence is not under test here
+    snapshot = monitor.record(stale, failure_threshold=3)
+    assert snapshot.state is SocOperatingState.PENDING_FAILURE
+
+    async with HomeAssistantRest(BASE, "t") as rest:
+        await publish_soc_integrity(rest, snapshot, Settings())
+
+    assert push.called
+    body = json.loads(push.calls[0].request.content)
+    assert body["state"] == "pending_failure"
+    attrs = body["attributes"]
+    assert attrs["consecutive_failures"] == 1
+    assert attrs["failure_threshold"] == 3
+    assert attrs["soc_status"] == "stale"
+    assert "over the 600s maximum" in attrs["soc_reason"]
+    assert attrs["soc_value"] == 30.0
+    assert attrs["soc_age_s"] == 3600.0
+    # A monitoring verdict, not a plan: no plan attribute ever appears.
+    assert not any(k.startswith("plan") or k == "model" for k in attrs)

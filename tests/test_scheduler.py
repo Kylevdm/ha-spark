@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
@@ -186,7 +188,7 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
 ) -> None:
     calls: list[str] = []
 
-    async def fake_run_once(_s: Settings) -> ChargePlan:
+    async def fake_run_once(_s: Settings, *, soc: SocMeasurement | None = None) -> ChargePlan:
         calls.append("run")
         if len(calls) == 1:
             raise RuntimeError("boom")
@@ -293,7 +295,7 @@ async def test_run_forever_publishes_plan_to_api_state(
         captured["state"] = state
         return object()  # never actually served; make_server is stubbed too
 
-    async def fake_run_once(_s: Settings) -> ChargePlan:
+    async def fake_run_once(_s: Settings, *, soc: SocMeasurement | None = None) -> ChargePlan:
         return _plan()
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
@@ -317,10 +319,12 @@ async def test_run_forever_guard_ticks_only_inside_window(
 ) -> None:
     guard_targets: list[float | None] = []
 
-    async def fake_run_once(_s: Settings) -> ChargePlan:
+    async def fake_run_once(_s: Settings, *, soc: SocMeasurement | None = None) -> ChargePlan:
         return _plan()
 
-    async def fake_guard_tick(_s: Settings, target_w: float | None) -> float:
+    async def fake_guard_tick(
+        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+    ) -> float:
         guard_targets.append(target_w)
         assert target_w is not None
         return target_w
@@ -343,7 +347,7 @@ async def test_run_forever_guard_ticks_only_inside_window(
 
     s = Settings(
         ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
-        grid_power_entity="sensor.house_supply_power",
+        grid_power_entity="sensor.house_supply_power", v2l_power_entity="",
     )
     with pytest.raises(stop):
         await run_forever(s, poll_seconds=0)
@@ -355,10 +359,12 @@ async def test_run_forever_guard_ticks_only_inside_window(
 async def test_run_forever_no_guard_when_entity_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_run_once(_s: Settings) -> ChargePlan:
+    async def fake_run_once(_s: Settings, *, soc: SocMeasurement | None = None) -> ChargePlan:
         return _plan()
 
-    async def fail_guard_tick(_s: Settings, target_w: float | None) -> float:
+    async def fail_guard_tick(
+        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+    ) -> float:
         raise AssertionError("guard must not run when grid_power_entity is empty")
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
@@ -380,10 +386,12 @@ async def test_run_forever_no_guard_when_charger_has_no_live_rate(
     """AlphaESS has no settable rate -> the guard branch never fires, even with
     grid_power_entity set."""
 
-    async def fake_run_once(_s: Settings) -> ChargePlan:
+    async def fake_run_once(_s: Settings, *, soc: SocMeasurement | None = None) -> ChargePlan:
         return _plan()
 
-    async def fail_guard_tick(_s: Settings, target_w: float | None) -> float:
+    async def fail_guard_tick(
+        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+    ) -> float:
         raise AssertionError("guard must not run for an inverter without a live rate")
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
@@ -407,7 +415,9 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
 ) -> None:
     attempts: list[datetime] = []
 
-    async def boom_guard_tick(_s: Settings, target_w: float | None) -> float:
+    async def boom_guard_tick(
+        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+    ) -> float:
         attempts.append(datetime.now())
         raise RuntimeError("HA unreachable")
 
@@ -423,7 +433,7 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
 
     s = Settings(
         ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
-        grid_power_entity="sensor.house_supply_power",
+        grid_power_entity="sensor.house_supply_power", v2l_power_entity="",
     )
     with caplog.at_level("ERROR"), pytest.raises(stop):
         await run_forever(s, poll_seconds=0)
@@ -541,7 +551,7 @@ async def test_run_forever_samples_signals_every_interval(
 ) -> None:
     sampled: list[datetime] = []
 
-    async def fake_run_once(_s: Settings) -> ChargePlan:
+    async def fake_run_once(_s: Settings, *, soc: SocMeasurement | None = None) -> ChargePlan:
         return _plan()
 
     async def fake_sample_signals(_s: Settings, now: datetime) -> None:
@@ -734,3 +744,390 @@ def test_derive_specs_for_scheduler_uses_shared_helper() -> None:
     # Grid export is not configured (no entity) but the invert flag is set;
     # the helper must not include it when no entity id is present.
     assert "grid_export" not in specs
+
+
+# --- SoC integrity monitoring in the one-minute loop (#114) ---
+
+
+def _soc_resp(state: str, reported: datetime) -> httpx.Response:
+    """One HA SoC-entity response; ``reported`` drives the freshness check."""
+    return httpx.Response(
+        200,
+        json={
+            "entity_id": "sensor.soc",
+            "state": state,
+            "attributes": {},
+            "last_reported": reported.isoformat(),
+        },
+    )
+
+
+def _soc_get(states: list[str], reported: list[datetime]) -> None:
+    """Mock the SoC entity read with one response per daemon tick."""
+    respx.get("http://ha.test/api/states/sensor.soc").mock(
+        side_effect=[
+            _soc_resp(state, rep) for state, rep in zip(states, reported, strict=True)
+        ]
+    )
+
+
+def _integrity_posts() -> list[tuple[str, dict[str, object]]]:
+    """The (state, attributes) of every soc-integrity sensor push this test saw."""
+    out: list[tuple[str, dict[str, object]]] = []
+    for call in respx.calls:
+        if call.request.url.path != "/api/states/sensor.ha_spark_soc_integrity":
+            continue
+        body = json.loads(call.request.content)
+        out.append((body["state"], body["attributes"]))
+    return out
+
+
+def _patch_monitor_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    ticks: list[datetime],
+    *,
+    run_once_socs: list[SocMeasurement | None] | None = None,
+    guard_socs: list[SocMeasurement | None] | None = None,
+) -> type[Exception]:
+    """Patch the loop like ``_patch_loop``, optionally capturing tick SoCs."""
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    if run_once_socs is not None:
+        async def fake_run_once(
+            _s: Settings, *, soc: SocMeasurement | None = None
+        ) -> ChargePlan:
+            run_once_socs.append(soc)
+            return _plan()
+    else:
+        async def fake_run_once(
+            _s: Settings, *, soc: SocMeasurement | None = None
+        ) -> ChargePlan:
+            return _plan()
+
+    if guard_socs is not None:
+        async def fake_guard_tick(
+            _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+        ) -> float:
+            guard_socs.append(soc)
+            assert target_w is not None
+            return target_w
+    else:
+        async def fake_guard_tick(
+            _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+        ) -> float:
+            assert target_w is not None
+            return target_w
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "guard_tick", fake_guard_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    return _patch_loop(monkeypatch, ticks)
+
+
+@respx.mock
+async def test_loop_isolated_soc_failure_then_pass_resets_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One bad minute is tolerated: pending failure, then a passing observation
+    resets the count and returns to normal operation."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    now = datetime.now(UTC)
+    _soc_get(["unavailable", "55"], [now, now])
+    run_socs: list[SocMeasurement | None] = []
+    stop = _patch_monitor_loop(
+        monkeypatch,
+        [datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 22, 1)],
+        run_once_socs=run_socs,
+    )
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        v2l_power_entity="",
+    )
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    # The plan run consumed the tick's failed measurement (blocked at the
+    # charger gate), and the passing tick reset the count.
+    assert run_socs[0] is not None and not run_socs[0].ok
+    assert run_socs[0].status is SocStatus.UNAVAILABLE
+    published = _integrity_posts()
+    assert [state for state, _ in published] == ["pending_failure", "normal"]
+    assert published[0][1]["consecutive_failures"] == 1
+    assert published[1][1]["consecutive_failures"] == 0
+    assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
+        "consecutive_failures": 0
+    }
+
+
+@respx.mock
+async def test_loop_third_consecutive_failure_reaches_fallback_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The default third consecutive failed observation reaches the fallback-
+    entry threshold (the fallback write itself lands with #115)."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50", "50", "50"], [stale, stale, stale])
+    stop = _patch_monitor_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 22, 0),
+            datetime(2026, 6, 10, 22, 1),
+            datetime(2026, 6, 10, 22, 2),
+        ],
+    )
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        v2l_power_entity="",
+    )
+    with caplog.at_level("WARNING"), pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    published = _integrity_posts()
+    assert [state for state, _ in published] == [
+        "pending_failure",
+        "pending_failure",
+        "fallback_threshold",
+    ]
+    assert published[-1][1]["consecutive_failures"] == 3
+    assert published[-1][1]["failure_threshold"] == 3
+    assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
+        "consecutive_failures": 3
+    }
+    assert "fallback-entry threshold reached" in caplog.text
+
+
+@respx.mock
+async def test_loop_custom_threshold_behaves_equivalently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50", "50"], [stale, stale])
+    stop = _patch_monitor_loop(
+        monkeypatch,
+        [datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 22, 1)],
+    )
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        soc_failure_threshold=2, v2l_power_entity="",
+    )
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    published = _integrity_posts()
+    assert [state for state, _ in published] == ["pending_failure", "fallback_threshold"]
+    assert published[-1][1]["failure_threshold"] == 2
+
+
+@respx.mock
+async def test_loop_observes_once_per_tick_and_reuses_the_measurement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Observation identity: one failed tick where the plan run, the guard, and
+    publication all consume the same observation increments the count once."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    soc_get = respx.get("http://ha.test/api/states/sensor.soc").mock(
+        return_value=_soc_resp("50", stale)
+    )
+    run_socs: list[SocMeasurement | None] = []
+    guard_socs: list[SocMeasurement | None] = []
+    # 23:30: plan run time AND inside the charge window -> both fire this tick.
+    stop = _patch_monitor_loop(
+        monkeypatch, [datetime(2026, 6, 10, 23, 30)],
+        run_once_socs=run_socs, guard_socs=guard_socs,
+    )
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="23:30",
+        charge_window_start="23:30", charge_window_end="05:30",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        grid_power_entity="sensor.house_supply_power", v2l_power_entity="",
+    )
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    # Exactly one HA read for the SoC this tick, and the very same measurement
+    # object reached the plan run and the guard.
+    assert soc_get.call_count == 1
+    assert run_socs[0] is guard_socs[0]
+    assert run_socs[0] is not None and not run_socs[0].ok
+    # Counted once, not once per consumer.
+    assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
+        "consecutive_failures": 1
+    }
+    published = _integrity_posts()
+    assert [state for state, _ in published] == ["pending_failure"]
+    assert published[0][1]["soc_status"] == "stale"
+
+
+@respx.mock
+async def test_loop_skips_monitoring_without_soc_entity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No configured soc_entity -> nothing to observe: no reads, no publishes,
+    no persisted monitor state (the plan run observes through its own path)."""
+    gets = respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop = _patch_monitor_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0)])
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        db_path=str(tmp_path / "ledger.db"), v2l_power_entity="",
+    )
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert gets.call_count == 0
+    assert _integrity_posts() == []
+    assert not (tmp_path / "ha_spark_soc_monitor.json").exists()
+
+
+def _failed_soc() -> SocMeasurement:
+    """One stale checked measurement: parseable value, unusably old report."""
+    now = datetime.now(UTC)
+    return SocMeasurement(
+        status=SocStatus.STALE,
+        observed_at=now,
+        value=30.0,
+        raw_state="30",
+        reported_at=now - timedelta(hours=1),
+        age_s=3600.0,
+        max_age_s=600.0,
+    )
+
+
+async def _fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+    return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+
+@respx.mock
+async def test_run_once_failed_soc_leaves_solis_resident_program_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """First-failure policy on Solis: the plan run consumes the tick's failed
+    measurement, no register is written (resident program untouched), and the
+    blocked action line names the concrete integrity reason."""
+    monkeypatch.setattr(sources, "predict_home_load", _fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="on",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+    )
+    failed = _failed_soc()
+    with caplog.at_level("WARNING"):
+        plan = await run_once(s, soc=failed)
+
+    # The plan carries the exact tick measurement (no independent reread).
+    assert plan.soc is failed
+    assert any("[BLOCKED]" in r.message and "not charging to" in r.message
+               for r in caplog.records)
+    assert any("over the 600s maximum" in r.message for r in caplog.records)
+    # No service call left the process: the resident program is untouched
+    # (only reads and sensor publishes happened).
+    for call in respx.calls:
+        assert not call.request.url.path.startswith("/api/services/")
+
+
+@respx.mock
+async def test_run_once_failed_soc_blocks_alphaess_programming(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """First-failure policy on AlphaESS: any failed integrity observation
+    blocks new charge programming (no fallback, no service call)."""
+    monkeypatch.setattr(sources, "predict_home_load", _fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="on",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        inverter="alphaess", alphaess_serial="SN1",
+    )
+    with caplog.at_level("INFO"):
+        plan = await run_once(s, soc=_failed_soc())
+
+    assert not plan.soc.ok
+    assert any("[BLOCKED]" in r.message and "not charge to" in r.message
+               for r in caplog.records)
+    for call in respx.calls:
+        assert not call.request.url.path.startswith("/api/services/")
+
+
+@respx.mock
+async def test_loop_blocked_plan_rate_never_becomes_guard_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plan blocked on an untrusted SoC was sized from soc_now == 0 (likely
+    max current): its rate must not become the supply guard's restore target.
+    The guard adopts the live setpoint instead — reductions only."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50"], [stale])
+
+    async def fake_run_once(
+        _s: Settings, *, soc: SocMeasurement | None = None
+    ) -> ChargePlan:
+        # A plan computed from the tick's failed measurement: blocked at the
+        # charger gate, but still a plan object (existence != applied).
+        failed = soc if soc is not None and not soc.ok else _failed_soc()
+        return replace(
+            _plan(ChargeIntent(
+                target_soc_pct=90.0, soc=failed,
+                window_start=time(23, 30), window_end=time(5, 30),
+            )),
+            soc=failed,  # compute_plan carries the same measurement at both levels
+        )
+
+    guard_targets: list[float | None] = []
+
+    async def capture_guard_tick(
+        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+    ) -> float:
+        guard_targets.append(target_w)
+        # Like the real guard_tick: adopt (echo) the live setpoint when no
+        # trusted target exists, so later ticks keep it as the ceiling.
+        return target_w if target_w is not None else 2040.0
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    planned_calls: list[object] = []
+
+    async def fake_planned_rate_w(_s: Settings, _plan: ChargePlan) -> float:
+        planned_calls.append(_plan)
+        return 4000.0
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "guard_tick", capture_guard_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    monkeypatch.setattr(scheduler, "_planned_rate_w", fake_planned_rate_w)
+    stop = _patch_loop(
+        monkeypatch,
+        [datetime(2026, 6, 10, 23, 30), datetime(2026, 6, 10, 23, 45)],
+    )
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="23:30",
+        charge_window_start="23:30", charge_window_end="05:30",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        grid_power_entity="sensor.house_supply_power", v2l_power_entity="",
+    )
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert planned_calls == []  # the blocked plan's rate was never consulted
+    # First in-window tick: no trusted target (None) -> the guard adopts the
+    # live setpoint; the adopted value, not the blocked plan's rate, is the
+    # ceiling the second tick sees.
+    assert guard_targets == [None, 2040.0]
