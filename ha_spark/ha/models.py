@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError, field_validator
 
 
 class EntityState(BaseModel):
@@ -16,6 +16,26 @@ class EntityState(BaseModel):
     attributes: dict[str, Any] = Field(default_factory=dict)
     last_changed: datetime | None = None
     last_updated: datetime | None = None
+    # When Home Assistant last received a report for this entity, whether or not
+    # the value changed. SoC freshness is judged on this and nothing else
+    # (`ha_spark/energy/soc_integrity.py`) — an unchanged but actively reported
+    # value must stay usable, which `last_changed`/`last_updated` cannot express.
+    last_reported: datetime | None = None
+
+    @field_validator("last_changed", "last_updated", "last_reported", mode="before")
+    @classmethod
+    def _tolerate_bad_timestamps(cls, value: Any) -> Any:
+        """An unparseable timestamp degrades to None rather than failing the read.
+
+        These come from outside the process; one malformed field must not make
+        the whole entity state unreadable for every other consumer.
+        """
+        if value is None or isinstance(value, datetime):
+            return value
+        try:
+            return TypeAdapter(datetime).validate_python(value)
+        except ValidationError:
+            return None
 
     @property
     def domain(self) -> str:
