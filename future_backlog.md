@@ -11,24 +11,24 @@ The deterministic planner still decides; every controllable device carries a
 `control == ha_spark` **and** `PROACTIVE_MODE == on`. Do not reintroduce
 hardcoded Solis/Octopus/zappi assumptions into the planner.
 
-- **9 — EV drivers + supplier authority** (deferred,
+- **Phase 9: EV drivers + supplier authority** (deferred,
   [#61](https://github.com/Kylevdm/ha-spark/issues/61)): EV charger drivers; EV
   defaults to `supplier` (observe & plan around) with an optional `ha_spark`
   path; reads V2L availability.
-- **10.2 — Half-hourly cadence + phone digest** (0.16.0): the plan recomputed
+- **Phase 10.2: Half-hourly cadence + phone digest** (0.16.0): the plan recomputed
   every tariff slot; the phone surface gets a daily digest.
-- **10.3 — Reservations + Axle provider** (0.17.0): reservations as the
+- **Phase 10.3: Reservations + Axle provider** (0.17.0): reservations as the
   planner's lookahead mechanism; flexibility events priced into the tariff
   schedule via an Axle provider.
-- **10.4 — V2L refill source** (0.18.0): the car battery as a refill source for
+- **Phase 10.4: V2L refill source** (0.18.0): the car battery as a refill source for
   the house battery (car → rectifier → house battery), chosen by cost and
   availability.
-- **11 — Heat pump (observe + model)** (1.1.0): heat-pump device fed into the
+- **Phase 11: Heat pump (observe + model)** (1.1.0): heat-pump device fed into the
   load model; control deferred.
-- **12 — Driver-aware onboarding** (1.2.0): `onboard` proposes driver +
+- **Phase 12: Driver-aware onboarding** (1.2.0): `onboard` proposes driver +
   provider + entity map + capability coverage; per-driver/supplier presets;
   multi-device.
-- **13 — MCP agent surface** (1.8.0): the remaining MCP work beyond the shipped
+- **Phase 13: MCP agent surface** (1.8.0): the remaining MCP work beyond the shipped
   agent surface. Inbound surface must require a token, bind to ingress not an
   open port, and gate read vs. act under the same authority/PROACTIVE_MODE as
   the CLI.

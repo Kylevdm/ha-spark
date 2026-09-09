@@ -35,7 +35,7 @@ class Device(Protocol):
   discharge holds. Returns a list of human-readable action lines
   (`"[APPLIED] ..."`, `"[SIMULATE] would ..."`, `"[OBSERVE] ..."`,
   `"[FAILED] ...: ..."`, `"[BLOCKED] ..."`). These are logged and surfaced
-  to the user, not just for debugging.
+  to the user rather than kept for debugging.
 - **`capabilities`**: what this driver can do, as a frozenset of
   `Capability` values. `CHARGE_WINDOW` (write window + target SOC, floor
   tier), `CHARGE_RATE` (settable live charge power in W, rate tier),
