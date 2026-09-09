@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Checked SoC measurements (#113): the Boolean `soc_valid` contract is
+  replaced by one immutable checked measurement produced from a single
+  Home Assistant observation. It records the observed value or read
+  failure, the integrity verdict, the observation and report times, the
+  measured age, and the violated threshold. Planning and actuation
+  consume the value from that exact measurement, so one read can never
+  certify a different read, and a failed read degrades to a blocked
+  plan instead of crashing.
+- Freshness is judged solely on Home Assistant's top-level
+  `last_reported` for the SoC entity — never `last_updated` or an
+  attribute — so an unchanged but actively reported SoC stays usable.
+  Missing, malformed, naive, and future timestamps are rejected.
+- New `soc_max_report_age_minutes` option (default `10.0`) sets how
+  stale that report may be. Operator-visible output now names the
+  concrete integrity reason: the plan-status sensor publishes
+  `soc_status`/`soc_reason` in place of `soc_valid`, and a `[BLOCKED]`
+  line quotes the reason.
+
 ## 0.15.0
 
 - Derived base load (ADR-0001, #45): the load forecast can now be sourced

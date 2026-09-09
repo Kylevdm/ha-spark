@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
 import httpx
@@ -12,6 +12,7 @@ import respx
 from ha_spark.config import Settings
 from ha_spark.energy import sources
 from ha_spark.energy.models import LoadForecast
+from ha_spark.energy.soc_integrity import SocStatus
 from ha_spark.energy.sources import build_schedule, gather_inputs, pre_window_drain
 from ha_spark.energy.tariff import fixed_schedule
 from ha_spark.ha.rest import HomeAssistantRest
@@ -19,10 +20,20 @@ from ha_spark.ha.rest import HomeAssistantRest
 BASE = "http://ha.test/api"
 
 
-def _state(eid: str, state: str, attrs: dict[str, Any] | None = None) -> httpx.Response:
-    return httpx.Response(
-        200, json={"entity_id": eid, "state": state, "attributes": attrs or {}}
-    )
+def _state(
+    eid: str,
+    state: str,
+    attrs: dict[str, Any] | None = None,
+    *,
+    last_reported: str | None = "now",
+) -> httpx.Response:
+    """A state payload. ``last_reported`` defaults to a just-now timestamp."""
+    body: dict[str, Any] = {"entity_id": eid, "state": state, "attributes": attrs or {}}
+    if last_reported == "now":
+        body["last_reported"] = datetime.now(UTC).isoformat()
+    elif last_reported is not None:
+        body["last_reported"] = last_reported
+    return httpx.Response(200, json=body)
 
 
 def _settings() -> Settings:
@@ -68,7 +79,9 @@ async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) 
         inputs, cfg, load_source = await gather_inputs(s, rest)
 
     assert inputs.soc_now == 30.0
-    assert inputs.soc_valid is True
+    assert inputs.soc.ok is True
+    assert inputs.soc.value == 30.0
+    assert inputs.soc.status is SocStatus.OK
     assert cfg.voltage_v == 51.0
     assert inputs.solar_tomorrow_kwh == 8.75
     assert inputs.predicted_home_load_kwh == 24.0
@@ -92,7 +105,8 @@ async def test_gather_inputs_tolerates_missing_entities(monkeypatch: pytest.Monk
         inputs, cfg, _ = await gather_inputs(s, rest)
 
     assert inputs.soc_now == 0.0
-    assert inputs.soc_valid is False
+    assert inputs.soc.ok is False
+    assert inputs.soc.status is SocStatus.READ_FAILED
     assert cfg.voltage_v == s.battery_voltage_v  # fell back to config default
     assert inputs.dispatches == ()
 
@@ -187,7 +201,8 @@ async def test_gather_inputs_flags_unavailable_soc(monkeypatch: pytest.MonkeyPat
         inputs, _, _ = await gather_inputs(s, rest)
 
     assert inputs.soc_now == 0.0
-    assert inputs.soc_valid is False
+    assert inputs.soc.ok is False
+    assert inputs.soc.status is SocStatus.UNAVAILABLE
 
 
 @respx.mock
@@ -505,3 +520,60 @@ async def test_gather_inputs_skips_ha_dispatch_sensor_for_octopus_intelligent(
         assert "states/binary_sensor.dispatch" not in {
             str(c.request.url) for c in respx.calls
         }
+
+
+async def _gather_with_soc(
+    monkeypatch: pytest.MonkeyPatch, soc_response: httpx.Response, **overrides: object
+) -> Any:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.get(f"{BASE}/states/sensor.soc").mock(return_value=soc_response)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = _settings().model_copy(update=overrides)
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, _, _ = await gather_inputs(s, rest)
+    return inputs
+
+
+@respx.mock
+async def test_gather_inputs_rejects_stale_soc_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale = (datetime.now(UTC) - timedelta(minutes=11)).isoformat()
+    inputs = await _gather_with_soc(
+        monkeypatch, _state("sensor.soc", "30", last_reported=stale)
+    )
+
+    assert inputs.soc.status is SocStatus.STALE
+    assert inputs.soc_now == 0.0  # the stale 30% must not reach the planner
+    assert inputs.soc.value == 30.0  # ...but it is kept as evidence
+
+
+@respx.mock
+async def test_gather_inputs_honours_configured_max_report_age(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reported = (datetime.now(UTC) - timedelta(minutes=11)).isoformat()
+    inputs = await _gather_with_soc(
+        monkeypatch,
+        _state("sensor.soc", "30", last_reported=reported),
+        soc_max_report_age_minutes=30.0,
+    )
+
+    assert inputs.soc.ok is True
+    assert inputs.soc_now == 30.0
+
+
+@respx.mock
+async def test_gather_inputs_rejects_soc_without_last_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = await _gather_with_soc(
+        monkeypatch, _state("sensor.soc", "30", last_reported=None)
+    )
+
+    assert inputs.soc.status is SocStatus.REPORT_TIME_UNUSABLE
+    assert inputs.soc_now == 0.0

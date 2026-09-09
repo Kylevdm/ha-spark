@@ -25,17 +25,32 @@ from ha_spark.energy.scheduler import (
     sample_signals,
     should_run,
 )
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.ha.rest import HomeAssistantRest
+
+
+def _soc(value: float) -> SocMeasurement:
+    now = datetime.now(UTC)
+    return SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=now,
+        value=value,
+        raw_state=str(value),
+        reported_at=now,
+        age_s=0.0,
+        max_age_s=600.0,
+    )
+
 
 # A concrete intent so plan.charge_intent drives a real planned charge rate (W).
 _INTENT = ChargeIntent(
-    target_soc_pct=77.0, soc_now=30.0, window_start=time(23, 30), window_end=time(5, 30)
+    target_soc_pct=77.0, soc=_soc(30.0), window_start=time(23, 30), window_end=time(5, 30)
 )
 
 
 def _plan(intent: ChargeIntent = _INTENT) -> ChargePlan:
     return ChargePlan(
-        soc_now=30, capacity_kwh=26.88, solar_kwh=8.75, effective_solar_kwh=8.75,
+        soc=_soc(30), capacity_kwh=26.88, solar_kwh=8.75, effective_solar_kwh=8.75,
         load_kwh=24.2, cheap_covered_kwh=0.0, usable_now_kwh=2.69,
         deficit_kwh=12.8, buffer_pct=0.0, required_kwh=12.8,
         target_soc=77, window_hours=6.0,

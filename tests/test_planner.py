@@ -9,7 +9,31 @@ import pytest
 
 from ha_spark.energy.models import DispatchSlot, PlannerConfig, PlannerInputs
 from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.tariff import fixed_schedule
+
+
+def _soc(value: float) -> SocMeasurement:
+    now = datetime.now(UTC)
+    return SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=now,
+        value=value,
+        raw_state=str(value),
+        reported_at=now,
+        age_s=0.0,
+        max_age_s=600.0,
+    )
+
+
+def _soc_unavailable() -> SocMeasurement:
+    now = datetime.now(UTC)
+    return SocMeasurement(
+        status=SocStatus.UNAVAILABLE,
+        observed_at=now,
+        raw_state="unavailable",
+        max_age_s=600.0,
+    )
 
 
 def _plan(inp: PlannerInputs, cfg: PlannerConfig) -> Any:
@@ -43,7 +67,7 @@ def test_window_hours_wraps_midnight() -> None:
 
 
 def test_basic_required_and_current() -> None:
-    inp = PlannerInputs(soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
+    inp = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
     plan = _plan(inp, cfg())
     # deficit 15.45 - usable 2.688 = 12.76 kWh; target 30 + 12.76/26.88*100 ~ 77%
     assert round(plan.required_kwh, 2) == 12.76
@@ -54,23 +78,49 @@ def test_basic_required_and_current() -> None:
 
 
 def test_zero_need_when_full_and_sunny() -> None:
-    inp = PlannerInputs(soc_now=90, solar_tomorrow_kwh=30, predicted_home_load_kwh=10)
+    inp = PlannerInputs(soc=_soc(90), solar_tomorrow_kwh=30, predicted_home_load_kwh=10)
     plan = _plan(inp, cfg())
     assert plan.required_kwh == 0
     assert plan.charge_intent.target_soc_pct == pytest.approx(plan.soc_now)
 
 
+def test_plan_carries_the_exact_checked_measurement() -> None:
+    """Identity, not equality: one read must never certify a different read."""
+    measurement = _soc(37.5)
+    inp = PlannerInputs(
+        soc=measurement, solar_tomorrow_kwh=3, predicted_home_load_kwh=10
+    )
+    plan = _plan(inp, cfg())
+
+    assert plan.soc is measurement
+    assert plan.charge_intent.soc is measurement
+    assert plan.soc_now == 37.5
+    assert plan.charge_intent.soc_now == 37.5
+
+
+def test_failed_measurement_gives_the_planner_no_soc_value() -> None:
+    """A failed measurement's SoC is 0 everywhere, and stays flagged."""
+    inp = PlannerInputs(
+        soc=_soc_unavailable(), solar_tomorrow_kwh=3, predicted_home_load_kwh=10
+    )
+    plan = _plan(inp, cfg())
+
+    assert plan.soc_now == 0.0
+    assert plan.charge_intent.soc_now == 0.0
+    assert plan.charge_intent.soc.ok is False
+
+
 def test_soc_validity_passes_through_to_plan() -> None:
     inp = PlannerInputs(
-        soc_now=0, solar_tomorrow_kwh=3, predicted_home_load_kwh=10, soc_valid=False
+        soc=_soc_unavailable(), solar_tomorrow_kwh=3, predicted_home_load_kwh=10
     )
-    assert _plan(inp, cfg()).soc_valid is False
-    valid = PlannerInputs(soc_now=30, solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
-    assert _plan(valid, cfg()).soc_valid is True
+    assert _plan(inp, cfg()).soc.ok is False
+    valid = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
+    assert _plan(valid, cfg()).soc.ok is True
 
 
 def test_buffer_inflates_required_within_headroom() -> None:
-    inp = PlannerInputs(soc_now=20, solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
+    inp = PlannerInputs(soc=_soc(20), solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
     plan = _plan(inp, cfg(buffer_pct=20.0))
     # deficit = 10 - 3 = 7; usable_now = 0 (soc at min); buffered = 7 * 1.2 = 8.4.
     assert plan.deficit_kwh == pytest.approx(7.0)
@@ -79,7 +129,7 @@ def test_buffer_inflates_required_within_headroom() -> None:
 
 
 def test_headroom_caps_required() -> None:
-    inp = PlannerInputs(soc_now=85, solar_tomorrow_kwh=0, predicted_home_load_kwh=50)
+    inp = PlannerInputs(soc=_soc(85), solar_tomorrow_kwh=0, predicted_home_load_kwh=50)
     plan = _plan(inp, cfg())
     headroom = 26.88 * (90 - 85) / 100  # 1.344
     assert round(plan.required_kwh, 3) == round(headroom, 3)
@@ -92,8 +142,7 @@ def _slot(hh: int, mm: int) -> DispatchSlot:
 
 
 def test_daytime_dispatch_emits_stop_discharge() -> None:
-    inp = PlannerInputs(
-        soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2,
+    inp = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2,
         dispatches=(_slot(13, 0),),
     )
     plan = _plan(inp, cfg())
@@ -102,8 +151,7 @@ def test_daytime_dispatch_emits_stop_discharge() -> None:
 
 
 def test_overnight_dispatch_does_not_stop_discharge() -> None:
-    inp = PlannerInputs(
-        soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2,
+    inp = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2,
         dispatches=(_slot(2, 0),),
     )
     plan = _plan(inp, cfg())
@@ -112,7 +160,7 @@ def test_overnight_dispatch_does_not_stop_discharge() -> None:
 
 
 def test_plan_emits_charge_intent() -> None:
-    inp = PlannerInputs(soc_now=50.0, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=20.0)
+    inp = PlannerInputs(soc=_soc(50.0), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=20.0)
     plan = _plan(inp, cfg())
     intent = plan.charge_intent
     assert intent.target_soc_pct == plan.target_soc
@@ -123,8 +171,7 @@ def test_plan_emits_charge_intent() -> None:
 
 
 def test_daytime_dispatch_becomes_a_hold() -> None:
-    inp = PlannerInputs(
-        soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2,
+    inp = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2,
         dispatches=(_slot(13, 0),),
     )
     plan = _plan(inp, cfg())
@@ -144,8 +191,7 @@ def _slot_inputs(
     soc_now: float = 20.0,
 ) -> PlannerInputs:
     load_slots = (load,) * 48
-    return PlannerInputs(
-        soc_now=soc_now,
+    return PlannerInputs(soc=_soc(soc_now),
         solar_tomorrow_kwh=sum(solar_slots) if solar_slots else 0.0,
         predicted_home_load_kwh=sum(load_slots),
         dispatches=dispatches,
@@ -196,7 +242,7 @@ def test_slot_model_costs() -> None:
 
 
 def test_daily_model_also_reports_costs() -> None:
-    inp = PlannerInputs(soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
+    inp = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
     plan = _plan(inp, cfg())
     assert plan.model == "daily"
     assert plan.expensive_load_kwh is None
@@ -212,7 +258,7 @@ def test_slot_model_respects_headroom_and_max_current() -> None:
 
 
 def test_fill_strategy_charges_to_cap() -> None:
-    inp = PlannerInputs(soc_now=69, solar_tomorrow_kwh=3.4, predicted_home_load_kwh=17.7)
+    inp = PlannerInputs(soc=_soc(69), solar_tomorrow_kwh=3.4, predicted_home_load_kwh=17.7)
     plan = _plan(inp, cfg(strategy="fill"))
     headroom = 26.88 * (90 - 69) / 100
     assert plan.required_kwh == pytest.approx(headroom)
@@ -223,16 +269,15 @@ def test_fill_strategy_charges_to_cap() -> None:
 
 
 def test_fill_strategy_zero_at_cap() -> None:
-    inp = PlannerInputs(soc_now=90, solar_tomorrow_kwh=3.4, predicted_home_load_kwh=17.7)
+    inp = PlannerInputs(soc=_soc(90), solar_tomorrow_kwh=3.4, predicted_home_load_kwh=17.7)
     plan = _plan(inp, cfg(strategy="fill"))
     assert plan.required_kwh == 0.0
     assert plan.charge_intent.target_soc_pct == pytest.approx(plan.soc_now)
 
 
 def test_pre_window_drain_reduces_usable() -> None:
-    base = PlannerInputs(soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
-    drained = PlannerInputs(
-        soc_now=30,
+    base = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
+    drained = PlannerInputs(soc=_soc(30),
         solar_tomorrow_kwh=8.75,
         predicted_home_load_kwh=24.2,
         pre_window_drain_kwh=1.0,
@@ -247,7 +292,7 @@ def test_pre_window_drain_reduces_usable() -> None:
 
 
 def test_charge_efficiency_inflates_purchase_and_current() -> None:
-    inp = PlannerInputs(soc_now=20, solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
+    inp = PlannerInputs(soc=_soc(20), solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
     lossless = _plan(inp, cfg())
     lossy = _plan(inp, cfg(charge_efficiency=0.9))
     # Stored energy target is unchanged; the AC purchase and current grow by 1/0.9.
@@ -263,7 +308,7 @@ def test_charge_efficiency_inflates_purchase_and_current() -> None:
 
 def test_export_revenue_adjusts_both_costs_equally() -> None:
     # Daily model: 10 kWh solar vs 6 kWh load -> 4 kWh exported.
-    inp = PlannerInputs(soc_now=50, solar_tomorrow_kwh=10, predicted_home_load_kwh=6)
+    inp = PlannerInputs(soc=_soc(50), solar_tomorrow_kwh=10, predicted_home_load_kwh=6)
     without = _plan(inp, cfg())
     with_export = _plan(inp, cfg(rate_export=0.15))
     assert without.export_revenue is None
@@ -286,8 +331,7 @@ def test_slot_model_export_revenue_sums_per_slot_surplus() -> None:
 
 
 def test_dispatch_ev_kwh_sums_magnitudes() -> None:
-    inp = PlannerInputs(
-        soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2,
+    inp = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2,
         dispatches=(_slot(13, 0), _slot(2, 0)),
     )
     # each fixture dispatch plans -2.0 kWh into the car
@@ -295,5 +339,5 @@ def test_dispatch_ev_kwh_sums_magnitudes() -> None:
 
 
 def test_dispatch_ev_kwh_none_without_dispatches() -> None:
-    inp = PlannerInputs(soc_now=30, solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
+    inp = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
     assert _plan(inp, cfg()).dispatch_ev_kwh is None

@@ -98,7 +98,8 @@ def plan_to_payload(plan: ChargePlan, settings: Settings) -> list[Entity]:
                 "friendly_name": "ha-spark plan status",
                 "strategy": plan.strategy,
                 "proactive_mode": settings.proactive_mode,
-                "soc_valid": plan.soc_valid,
+                "soc_status": plan.soc.status.value,
+                "soc_reason": plan.soc.reason,
             },
         ),
         (

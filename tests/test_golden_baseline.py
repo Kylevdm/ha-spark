@@ -24,9 +24,33 @@ from ha_spark.energy.models import (
     PlannerInputs,
 )
 from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.tariff import TariffSchedule, fixed_schedule
 
 APPROX = 1e-6  # golden values recorded to 6 dp
+
+
+def _soc(value: float) -> SocMeasurement:
+    now = datetime.now(UTC)
+    return SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=now,
+        value=value,
+        raw_state=str(value),
+        reported_at=now,
+        age_s=0.0,
+        max_age_s=600.0,
+    )
+
+
+def _soc_unavailable() -> SocMeasurement:
+    now = datetime.now(UTC)
+    return SocMeasurement(
+        status=SocStatus.UNAVAILABLE,
+        observed_at=now,
+        raw_state="unavailable",
+        max_age_s=600.0,
+    )
 
 
 def cfg(**kw: Any) -> PlannerConfig:
@@ -57,7 +81,7 @@ SOLAR_SLOTS = tuple(1.0 if 20 <= i < 28 else 0.0 for i in range(48))
 
 def test_golden_daily_zero_solar() -> None:
     """v1 daily balance, zero-solar day: full deficit, headroom-capped charge."""
-    inputs = PlannerInputs(soc_now=40, solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0)
+    inputs = PlannerInputs(soc=_soc(40), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0)
     config = cfg()
     plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
     assert plan.model == "daily"
@@ -72,8 +96,7 @@ def test_golden_daily_zero_solar() -> None:
 
 def test_golden_slots_no_dispatch() -> None:
     """v2 slot horizon, no-dispatch night: expensive-slot need drives sizing."""
-    inputs = PlannerInputs(
-        soc_now=55,
+    inputs = PlannerInputs(soc=_soc(55),
         solar_tomorrow_kwh=8.0,
         predicted_home_load_kwh=sum(LOAD_SLOTS),
         load_slots=LOAD_SLOTS,
@@ -102,8 +125,7 @@ def test_golden_slots_dispatch_overlap() -> None:
         charge_in_kwh=-5.2,
         source="octopus",
     )
-    inputs = PlannerInputs(
-        soc_now=55,
+    inputs = PlannerInputs(soc=_soc(55),
         solar_tomorrow_kwh=8.0,
         predicted_home_load_kwh=sum(LOAD_SLOTS),
         load_slots=LOAD_SLOTS,
@@ -137,8 +159,7 @@ def test_golden_daily_midnight_wrap_dispatch_classification() -> None:
         end=datetime(2026, 1, 16, 14, 30, tzinfo=UTC),
         charge_in_kwh=-2.4,
     )
-    inputs = PlannerInputs(
-        soc_now=35,
+    inputs = PlannerInputs(soc=_soc(35),
         solar_tomorrow_kwh=6.0,
         predicted_home_load_kwh=22.0,
         dispatches=(night, day),
@@ -159,7 +180,7 @@ def test_golden_daily_midnight_wrap_dispatch_classification() -> None:
 def test_golden_fill_strategy_with_export_revenue() -> None:
     """Fill-to-cap on a sunny day with export: revenue offsets both projections
     identically (reporting honesty, no decision change)."""
-    inputs = PlannerInputs(soc_now=60, solar_tomorrow_kwh=30.0, predicted_home_load_kwh=12.0)
+    inputs = PlannerInputs(soc=_soc(60), solar_tomorrow_kwh=30.0, predicted_home_load_kwh=12.0)
     config = cfg(rate_export=0.15, strategy="fill")
     plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
     assert plan.model == "daily"

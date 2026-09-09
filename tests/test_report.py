@@ -2,21 +2,35 @@
 
 from __future__ import annotations
 
-from datetime import time
+from datetime import UTC, datetime, time
 
 from ha_spark.energy.models import ChargeIntent, ChargePlan
 from ha_spark.energy.report import format_plan
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+
+
+def _soc(value: float) -> SocMeasurement:
+    now = datetime.now(UTC)
+    return SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=now,
+        value=value,
+        raw_state=str(value),
+        reported_at=now,
+        age_s=0.0,
+        max_age_s=600.0,
+    )
 
 
 def _plan(**kw: object) -> ChargePlan:
     base: dict[str, object] = dict(
-        soc_now=69, capacity_kwh=26.88, solar_kwh=3.4, effective_solar_kwh=3.4,
+        soc=_soc(69), capacity_kwh=26.88, solar_kwh=3.4, effective_solar_kwh=3.4,
         load_kwh=17.7, cheap_covered_kwh=0.0, usable_now_kwh=13.17,
         deficit_kwh=9.23, buffer_pct=20.0, required_kwh=0.0,
         target_soc=69, window_hours=6.0, ev_charging=False,
         ha_template_needed=None,
         charge_intent=ChargeIntent(
-            target_soc_pct=69, soc_now=69, window_start=time(23, 30), window_end=time(5, 30)
+            target_soc_pct=69, soc=_soc(69), window_start=time(23, 30), window_end=time(5, 30)
         ),
     )
     base.update(kw)
@@ -52,3 +66,24 @@ def test_report_shows_target_and_window() -> None:
     out = format_plan(_plan(), "median")
     assert "Charge to" in out and "%" in out
     assert "Charge current" not in out
+
+
+def test_report_names_the_concrete_integrity_reason() -> None:
+    stale = SocMeasurement(
+        status=SocStatus.STALE,
+        observed_at=datetime.now(UTC),
+        value=42.0,
+        raw_state="42.0",
+        reported_at=datetime.now(UTC),
+        age_s=900.0,
+        max_age_s=600.0,
+    )
+    out = format_plan(_plan(soc=stale), "test")
+
+    assert "untrusted" in out
+    assert stale.reason in out
+    assert "900s" in out and "600s" in out  # measured age and violated threshold
+
+
+def test_report_does_not_flag_a_trusted_soc() -> None:
+    assert "untrusted" not in format_plan(_plan(), "test")

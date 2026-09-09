@@ -18,8 +18,8 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
         solar += f" (haircut -> {plan.effective_solar_kwh:.2f})"
 
     soc = f"{plan.soc_now:.0f}%"
-    if not plan.soc_valid:
-        soc += "  (SoC sensor unreadable!)"
+    if not plan.soc.ok:
+        soc += f"  (untrusted: {plan.soc.reason})"
 
     lines = [
         "Charge plan:",
