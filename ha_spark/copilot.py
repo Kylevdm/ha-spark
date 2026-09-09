@@ -5,8 +5,8 @@ no idea what tonight's plan actually is. ``build_grounding`` computes the same
 plan the ``plan`` command prints and renders it as a compact facts block;
 ``grounded_system_prompt`` wraps it in instructions that keep the model to
 explaining real decisions in the home-energy domain — it never claims to have
-changed a setting (the deterministic planner decides and acts, a ROADMAP
-non-goal for the LLM).
+changed a setting (the deterministic planner decides and acts; an LLM
+controlling hardware is a CLAUDE.md non-goal).
 """
 
 from __future__ import annotations
