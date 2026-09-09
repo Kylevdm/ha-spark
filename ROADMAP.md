@@ -1,6 +1,6 @@
 # ha-spark roadmap
 
-*The home energy autopilot that explains itself — and sets up in 15 minutes.*
+*The home energy autopilot that explains itself and sets up in 15 minutes.*
 
 > **Phases and status live in the GitHub tracker, not this file:**
 > [milestones](https://github.com/Kylevdm/ha-spark/milestones) (one per
@@ -13,17 +13,17 @@
 
 ha-spark plans your home's energy day for you: it forecasts tomorrow's solar and
 household load, works out how much overnight charge your battery actually needs
-at the cheap rate, and actuates the inverter itself — no template sensors, no
+at the cheap rate, and actuates the inverter itself. No template sensors, no
 hand-written automations, no YAML.
 
 Two design rules define the project:
 
 1. **A deterministic planner decides; an LLM only explains.** Battery setpoints
    come from an auditable energy-balance model, never from a language model.
-   The natural-language layer sits *on top* — "what's the plan for tonight?",
-   "why are you charging to 80%?", "what did you save this week?" — and runs
-   against a local Ollama instance with a deterministic fallback, so there is
-   no cloud dependency and no hallucinated control.
+   The natural-language layer sits on top: "what's the plan for tonight?",
+   "why are you charging to 80%?", "what did you save this week?". It runs
+   against your own Ollama instance (LAN or Tailscale) with a deterministic
+   fallback, so there is no cloud dependency and no hallucinated control.
 2. **Trust is earned, not assumed.** ha-spark starts in observe/simulate mode,
    logging exactly what it *would* have done alongside what your current setup
    did, with a cost backtest to quantify the difference. You flip it to real
@@ -38,15 +38,15 @@ subscription, no data leaving your network.
 [Predbat](https://github.com/springfall2008/batpred) are excellent, mature
 projects and the right choice for many households today. ha-spark makes a
 different bet: that most people with a battery and solar want an autopilot they
-can install, understand, and trust in an evening — not an optimization
+can install, understand, and trust in an evening, not an optimization
 framework to configure.
 
 | | EMHASS | Predbat | ha-spark |
 |---|---|---|---|
 | Optimizes a plan | ✅ LP solver | ✅ | ✅ energy-balance planner ([why not LP](docs/adr/0002-auditable-over-optimal-planning.md)) |
 | Actuates hardware itself | ❌ user wires automations | ✅ | ✅ with guard rails (SoC validity, read-back, failure isolation) |
-| Setup effort | YAML + sensor templates + REST commands | YAML; docs assume HA/file-editing fluency | add-on options UI; onboarding wizard planned |
-| Explains decisions in plain language | ❌ | ❌ | ✅ planned (local LLM over the deterministic plan) |
+| Setup effort | YAML + sensor templates + REST commands | YAML; docs assume HA/file-editing fluency | add-on options UI + onboarding wizard |
+| Explains decisions in plain language | ❌ | ❌ | ✅ local LLM over the deterministic plan |
 | Try-before-trust mode | ❌ | partial (read-only mode) | ✅ simulate mode + savings backtest |
 | Cloud dependence | none | none (paid cloud version exists) | none, by design |
 
@@ -70,19 +70,25 @@ First simulated plan within 15 minutes of install, zero YAML.
 A read-only natural-language surface over the planner and live state: ask what
 the plan is, why it chose what it chose, and what it saved you. Later, NL
 requests adjust *planner configuration* ("keep the battery above 30% this
-weekend") — they never bypass the planner to actuate hardware directly.
+weekend"). They never bypass the planner to actuate hardware directly.
 
 ## Where the plan lives
 
-- **Shipped:** everything through add-on v0.9.0 (deterministic planner, Solis
-  actuation with guard rails, simulate mode + backtest, onboarding wizard, NL
-  copilot, forecast ledger + weather-aware ML, context store, occupancy
-  habits), then Phase 7 (device-driver core, 1.0.0) —
+- **Shipped:** everything through add-on v0.15.0. Deterministic planner,
+  device-driver core (Phase 7, per-device `control` authority), multi-supplier
+  tariffs (Phase 8: `fixed`, `dynamic`, `octopus_intelligent`), native Solis
+  timed-slot actuation with guard rails, simulate mode + backtest, onboarding
+  wizard, NL copilot, forecast ledger + weather-aware ML, context store,
+  occupancy habits, derived base load (0.15.0). On `master` awaiting release:
+  checked SoC measurements (#113) and V2L observe/tally/notify (#123).
   `ha_spark_addon/CHANGELOG.md` is the shipped record.
-- **In flight and next:** the [milestones](https://github.com/Kylevdm/ha-spark/milestones),
-  currently Phase 8 (multi-supplier tariffs) then the competitive-MVP
-  sub-phases 10.1–10.4 (epic [#43](https://github.com/Kylevdm/ha-spark/issues/43)).
-  Phase 9 (EV charger drivers) is formally deferred
+- **In flight and next:** the [milestones](https://github.com/Kylevdm/ha-spark/milestones).
+  Phase 8 is closed; the competitive-MVP sub-phases 10.2–10.4 are next
+  (half-hourly cadence + phone digest, reservations + Axle provider, V2L
+  refill source; epic [#43](https://github.com/Kylevdm/ha-spark/issues/43)),
+  then Phase 11 (heat-pump observe + model), Phase 12 (driver-aware
+  onboarding), and Phase 13 (MCP agent surface). Phase 9 (EV charger drivers)
+  is formally deferred
   ([#61](https://github.com/Kylevdm/ha-spark/issues/61)).
 - **Someday:** the post-1.0 bucket
   ([#62](https://github.com/Kylevdm/ha-spark/issues/62)).
