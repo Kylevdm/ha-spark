@@ -2,8 +2,8 @@
 
 Local-first battery charge planner for Home Assistant. Once a day (at
 `plan_run_time`, default 22:00 local) it forecasts tomorrow's household load
-and solar yield, sizes the overnight cheap-rate charge, and — when
-`proactive_mode` is `on` — sets the inverter's timed charge current.
+and solar yield, sizes the overnight cheap-rate charge, and sets the
+inverter's timed charge current when `proactive_mode` is `on`.
 
 ## Installation
 
@@ -32,10 +32,17 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `ev_plug_entity` / `ev_status_entity` | EV charger plug/status sensors |
 | `consumption_energy_entity` | True household load energy statistic (excluding battery/EV charging) |
 | `grid_power_entity` | Optional whole-house supply power sensor (W); enables the supply guard |
-| `charge_current_entity` | Optional inverter timed-charge current `number` entity for dashboard/telemetry (Solis control itself is native — see below) |
+| `charge_current_entity` | Optional inverter timed-charge current `number` entity for dashboard/telemetry (Solis control itself is native; see below) |
 | `inverter_power_switch_entity` | Inverter power switch `select` entity (used for the dispatch stop-discharge hold) |
 | `ha_template_charge_needed_entity` | Optional HA template sensor for comparison logging |
 | `inverter` | Which inverter ha-spark controls: `solis` (default) or `alphaess` |
+| `solis_control_hub` | Name of the thin HA `modbus:` overlay hub ha-spark drives the Solis timed-slot registers through (default `solis_control`; see `docs/solis-control-modbus-overlay.yaml`) |
+| `solis_modbus_slave` | Modbus slave/unit id on that hub (default `1`) |
+| `alphaess_serial` | AlphaESS system serial (only needed when `inverter: alphaess`) |
+| `person_entities` | Optional comma-separated `person`/`device_tracker` entity ids for occupancy signal recording |
+| `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
+| `outdoor_weather_entity` | Weather entity with a `temperature` attribute (default `weather.home`) for signal recording |
+| `v2l_power_entity` | Optional V2L discharge-power sensor (W); enables the V2L tally (see "V2L" below) |
 
 ### Derived base load (ADR-0001, optional)
 
@@ -46,8 +53,8 @@ previous night and the historical statistics carry the same pollution. The
 derived path rebuilds base load by **energy balance** from your HA
 long-term component statistics and overwrites the same external id
 (`ha_spark:house_load`) the source-entity backfill below writes to. The
-forecast chain keeps consuming `consumption_energy_entity` unchanged — no
-need to repoint it between the two paths.
+forecast chain keeps consuming `consumption_energy_entity` unchanged, so
+there is no need to repoint it between the two paths.
 
 Per hour: `base = grid_import - grid_export + solar_generation + battery_discharge - battery_charge - ev_charge`.
 
@@ -59,15 +66,15 @@ Per hour: `base = grid_import - grid_export + solar_generation + battery_dischar
 | `derive_battery_charge_entity` | Optional battery-charge statistic id. |
 | `derive_battery_discharge_entity` | Optional battery-discharge statistic id. |
 | `derive_ev_charge_entity` | Optional EV-charge statistic id. |
-| `derive_invert_*` | Explicit sign-convention flag per component (`true` flips the canonical direction after unit conversion). Never inferred — a mis-signed export or battery-charge sensor would silently break the balance otherwise. |
+| `derive_invert_*` | Explicit sign-convention flag per component (`true` flips the canonical direction after unit conversion). Never inferred; a mis-signed export or battery-charge sensor would silently break the balance otherwise. |
 
 Run `ha-spark backfill-load --derive` to write the full history
 (lookback `BACKFILL_LOOKBACK_DAYS`, default 730). After every scheduled
 plan run the daemon also re-derives the trailing 48 h from the component
-statistics — every derivable hour in that window is recomputed and
-upserted (late-arriving or corrected component rows overwrite their
-previous target values so the consumer never trains on stale base
-load), with the cumulative `sum` anchored on the latest target row
+statistics. Every derivable hour in that window is recomputed and
+upserted, so late-arriving or corrected component rows overwrite their
+previous target values and the consumer never trains on stale base
+load. The cumulative `sum` is anchored on the latest target row
 *before* the window. A failed re-derivation is logged and never blocks
 planning. Use `--from` for the source-entity path or `--derive` for
 this one; the two are mutually exclusive at dispatch and write to the
@@ -75,27 +82,21 @@ same external id.
 
 Each hourly component must use a supported unit (`W`/`kW` mean-power or
 `kWh`/`Wh` energy change). An unsupported unit disables that component
-with a clear reason in the run report — old behaviour on a partial
-setup.
-| `solis_control_hub` | Name of the thin HA `modbus:` overlay hub ha-spark drives the Solis timed-slot registers through (default `solis_control`; see `docs/solis-control-modbus-overlay.yaml`) |
-| `solis_modbus_slave` | Modbus slave/unit id on that hub (default `1`) |
-| `alphaess_serial` | AlphaESS system serial (only needed when `inverter: alphaess`) |
+with a clear reason in the run report, preserving old behaviour on a
+partial setup.
 
 **Solis control is native.** ha-spark writes the Solis timed-slot charge
 registers directly via the `modbus.write_register` service on the
 `solis_control` overlay hub and reads them back through that hub's
-`sensor.solis_control_*` entities — it does not depend on the solax integration
-for control. The overlay is a one-time manual HA-config step
+`sensor.solis_control_*` entities. It does not depend on the solax
+integration for control. The overlay is a one-time manual HA-config step
 (`docs/solis-control-modbus-overlay.yaml`); an add-on cannot inject `modbus:`
 config into your `configuration.yaml`.
-| `person_entities` | Optional comma-separated `person`/`device_tracker` entity ids for occupancy signal recording |
-| `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
-| `outdoor_weather_entity` | Weather entity with a `temperature` attribute (default `weather.home`) for signal recording |
 
 ### Multiple inverters / device control (optional)
 
-Single-inverter installs need no change here — the flat `inverter` +
-entity-ID options above are still read directly (in memory, `options.json` is
+Single-inverter installs need no change here. The flat `inverter` +
+entity-ID options above are still read directly (in memory; `options.json` is
 never rewritten). `devices` is the structured alternative for installs that
 want explicit per-device authority:
 
@@ -114,27 +115,27 @@ devices:
 
 `control` is the authority gate: a real write requires **both**
 `control: ha_spark` **and** `proactive_mode: on`. `observe` (ha-spark reads and
-plans around the device but never writes it) and `supplier` (reserved — a
-third party is expected to control it) both compute and log a `[OBSERVE]`
+plans around the device but never writes it) and `supplier` (reserved; a
+third party is expected to control it) both compute and log an `[OBSERVE]`
 action line instead of writing, regardless of `proactive_mode`. Leave
 `control` unset for `ha_spark` (the default, and what the flat-key migration
 always produces).
 
 ### Planner
 
-- `proactive_mode` — `off` (compute only), `simulate` (log the writes it
+- `proactive_mode`: `off` (compute only), `simulate` (log the writes it
   *would* make; default), `on` (really set the charge current). Run in
   `simulate` for a few nights and check the log before switching to `on`.
 - `battery_capacity_kwh`, `battery_voltage_v`, `min_soc`, `target_soc_cap`,
-  `max_charge_current_a` — battery/inverter model.
-- `charge_strategy` — `deficit` buys only the forecast shortfall; `fill`
+  `max_charge_current_a`: battery/inverter model.
+- `charge_strategy`: `deficit` buys only the forecast shortfall; `fill`
   charges to `target_soc_cap` every night (wins once export rate exceeds the
   off-peak rate).
 - `charge_buffer_pct`, `charge_efficiency`, `solar_haircut_k`,
-  `solar_percentile`, `expected_load_kwh` — forecast/sizing knobs; the
+  `solar_percentile`, `expected_load_kwh`: forecast/sizing knobs; the
   defaults are sensible.
-- `charge_window_start` / `charge_window_end` — your cheap-rate window.
-- `plan_run_time` — local HH:MM at which the daily plan runs.
+- `charge_window_start` / `charge_window_end`: your cheap-rate window.
+- `plan_run_time`: local HH:MM at which the daily plan runs.
 
 ### Supply guard (optional)
 
@@ -157,24 +158,24 @@ respect `proactive_mode` exactly like the nightly plan. Leave
 
 When scikit-learn is available, a weather-aware gradient-boosted quantile model
 can forecast tomorrow's load instead of the slot-profile median, using
-Open-Meteo temperatures (heating degree hours →
-heat-pump demand), day-of-week/season, recent-load lags, recorded occupancy,
-and UK bank holidays.
+Open-Meteo temperatures (heating degree hours drive heat-pump demand),
+day-of-week/season, recent-load lags, recorded occupancy, and UK bank
+holidays.
 
-- `load_model` — `median` (profile only), `ml` (always prefer the model when
+- `load_model`: `median` (profile only), `ml` (always prefer the model when
   it can run), or `auto` (default): use ML only once `ha-spark forecast-eval`
   shows it beating the median over the trailing 14 days. Both forecasts are
   shadow-recorded nightly, so `auto` switches by itself once the model earns
-  it — and switches back if it stops winning.
-- `buffer_mode` — `fixed` keeps `charge_buffer_pct`; `quantile` replaces it
+  it, and switches back if it stops winning.
+- `buffer_mode`: `fixed` keeps `charge_buffer_pct`; `quantile` replaces it
   with the model's own uncertainty, (P90 − P50)/P50, whenever the ML forecast
   drives the plan (confident days buy less margin).
-- `latitude` / `longitude` — site coordinates for Open-Meteo; leave unset to
+- `latitude` / `longitude`: site coordinates for Open-Meteo; leave unset to
   use HA's own configured location. Fetched past temperatures are cached into
   the signal ledger, so the model still runs from recorded data when
   Open-Meteo is unreachable.
 
-The deterministic planner is unchanged — the model only supplies the load
+The deterministic planner is unchanged. The model only supplies the load
 numbers fed into it, and falls back to the median chain on any failure.
 
 ### Context facts (away / guests)
@@ -194,7 +195,7 @@ ha-spark context remove 3
 by `guests_load_factor` (default 1.3), and `high_usage`/`low_usage` by the
 `--factor` you give. Overlapping facts multiply. Every active fact is printed
 in the plan report's forecast line, so each adjustment is visible and can be
-removed by id. Facts are data only — they never actuate hardware.
+removed by id. Facts are data only; they never actuate hardware.
 
 You can also set them in plain language through `ha-spark ask` (and so any
 chat surface wired to it):
@@ -210,7 +211,7 @@ When the Ollama tier is reachable it extracts the dates (returning strict
 JSON, validated before anything is stored); offline, a deterministic parser
 handles ISO dates and phrases like "next week", "this weekend", and "for a
 fortnight". Either way the fact is echoed back with an undo command, and the
-language model never controls hardware — it only records reviewable facts.
+language model never controls hardware. It only records reviewable facts.
 
 ### Learned habits
 
@@ -225,54 +226,89 @@ As occupancy and away history accumulate, ha-spark learns from it:
 
 `ha-spark learn-factors` shows the current learned away factor, tomorrow's
 predicted occupancy, and any advisory habit predictions. The daemon logs those
-predictions each run, labelled with `proactive_mode` — they are advisory only
+predictions each run, labelled with `proactive_mode`. They are advisory only
 and never actuate hardware.
+
+### V2L (vehicle-to-load, optional)
+
+V2L is a manual physical adapter with no control API, so ha-spark only ever
+reads it. When `v2l_power_entity` is set, each daemon tick reads the car's
+V2L discharge power (W), integrates it into the kWh delivered this session,
+values it against the configured rates (less a round-trip efficiency),
+publishes `sensor.ha_spark_v2l_*`, and fires timely HA notifications. The
+planner and the drivers are untouched.
+
+| Option | What it must be |
+|---|---|
+| `v2l_power_entity` | V2L discharge-power sensor (W). Empty (the default) disables the feature. |
+| `v2l_round_trip_efficiency` | Round-trip efficiency folding the charge and discharge conversion losses into one knob (default `0.85`). The refill cost is computed as delivered kWh divided by this. |
+| `v2l_peak_rate_gbp` | £/kWh import rate being offset while V2L runs (default `0.30`). |
+| `v2l_offpeak_rate_gbp` | £/kWh cheap rate used to refill the car later (default `0.07`). |
+| `v2l_cutoff_time` | Local time the cheap window starts; the unplug notification fires at or after it (default `01:00`). |
+| `v2l_notify_service` | HA `notify.<service>` target (e.g. `mobile_app_x`). Empty means no notifications fire. |
+| `v2l_budget_kwh` | Optional V2L budget in kWh, a stand-in for car SoC (the car has no HA integration, so its SoC is not read). `0` disables the predictive plug-in warning. |
+
+Published sensors: `sensor.ha_spark_v2l_power_w` (current discharge power),
+`sensor.ha_spark_v2l_energy_kwh` (session total), and
+`sensor.ha_spark_v2l_net_saving_gbp` (avoided peak import minus the
+cheap-rate refill cost; it can go negative and is reported honestly). The
+session tally is persisted across restarts and resets at the start of a new
+day once the car is idle.
+
+Three notifications, each firing at most once per session: an unplug nudge at
+the cutoff (the cheap window is starting, so stop paying the peak rate to
+feed the house), a plug-in-to-recharge nudge when V2L stops, and a predictive
+heads-up when you are about to reach your `v2l_budget_kwh`. `ha-spark v2l`
+prints the live tally from the CLI. Nothing here actuates anything; the
+planner already reads live SoC at plan time, so the V2L offset is captured
+implicitly.
 
 ### Forecast ledger
 
 Every nightly run records the forecast it used (model, total kWh, per-slot
 breakdown) for the date it predicted. `ha-spark forecast-eval [--days N]`
 joins those recorded forecasts against actual consumption and reports
-MAE/MAPE per model — the baseline a future ML model must beat before it can
-drive plans (`load_model: auto`).
+MAE/MAPE per model. That is the baseline a future ML model must beat before
+it can drive plans (`load_model: auto`).
 
 A signal sampler also runs every 30 minutes, recording household signals used
 by later phases: `occupancy_home_frac` (from `person_entities`),
 `heatpump_kwh` (from `heatpump_energy_entity`), and `temp_out_c` (from
-`outdoor_weather_entity`). All three are optional — leave them unset to skip
-that signal; an unreadable entity logs a warning and is skipped without
+`outdoor_weather_entity`). All three are optional; leave them unset to skip
+that signal. An unreadable entity logs a warning and is skipped without
 affecting the others.
 
 ### Tariff
 
-`rate_offpeak_gbp_kwh`, `rate_peak_gbp_kwh`, `rate_export_gbp_kwh` — used for
+`rate_offpeak_gbp_kwh`, `rate_peak_gbp_kwh`, `rate_export_gbp_kwh`: used for
 the cost projection printed with each plan and by `ha-spark backtest`.
 
 `tariff_provider` selects how plans are costed: `fixed` (default) uses the
-rates above plus the charge window — this is the provider every existing
-install is already on, so upgrading needs no config changes; `dynamic` costs each half-hour slot at its
-live price from an HA price sensor, choosing the cheapest slots as "cheap" for
-costing (the charge window itself is unchanged). Set `dynamic_rates_entity` to
-an entity whose `rates` attribute is a list of `{start, end, value_inc_vat}`
-(e.g. the BottlecapDave Octopus Energy integration's
-`event....current_day_rates`); `dynamic_rates_entity_tomorrow` is optional and
-covers tomorrow's slots the same way. A missing/bad read falls back to the
-fixed rates — `ha-spark health` reports the live provider status.
+rates above plus the charge window. This is the provider every existing
+install is already on, so upgrading needs no config changes. `dynamic` costs
+each half-hour slot at its live price from an HA price sensor, choosing the
+cheapest slots as "cheap" for costing (the charge window itself is unchanged).
+Set `dynamic_rates_entity` to an entity whose `rates` attribute is a list of
+`{start, end, value_inc_vat}` (e.g. the BottlecapDave Octopus Energy
+integration's `event....current_day_rates`); `dynamic_rates_entity_tomorrow`
+is optional and covers tomorrow's slots the same way. A missing or bad read
+falls back to the fixed rates. `ha-spark health` reports the live provider
+status.
 
 `octopus_intelligent` is a first-class Octopus Intelligent tariff: prices come
 from the Octopus standard-unit-rates REST API and planned dispatch windows
-come straight from the Octopus API (Kraken GraphQL) instead of an HA sensor —
-dispatch/cheap-window handling is otherwise identical to `fixed`. Requires
+come straight from the Octopus API (Kraken GraphQL) instead of an HA sensor.
+Dispatch and cheap-window handling is otherwise identical to `fixed`. Requires
 `octopus_api_key`, `octopus_account_number` (for the dispatches query), and
 `octopus_product_code`/`octopus_tariff_code` (for the rates endpoint, e.g.
 `INTELLI-VAR-22-10-14` / `E-1R-INTELLI-VAR-22-10-14-A`). An auth or API
-failure falls back to the fixed rates/dispatches — `ha-spark health` reports
+failure falls back to the fixed rates/dispatches. `ha-spark health` reports
 the live provider status; the API key is never logged or echoed.
 
 ### Octopus API (optional)
 
 `octopus_api_key`, `octopus_mpan`, `octopus_meter_serial` enable
-`ha-spark pull-consumption` (grid-import history for cost backtesting only —
+`ha-spark pull-consumption` (grid-import history for cost backtesting only;
 it is **not** used as the load forecast). The same `octopus_api_key` also
 drives the `octopus_intelligent` tariff provider above.
 
@@ -291,7 +327,7 @@ ha-spark ask "what does tonight cost vs no battery?"
 ```
 
 The model is given the same plan the `plan` command prints and is scoped to
-home energy — it explains and reports only, and never controls hardware. If
+home energy. It explains and reports only, and never controls hardware. If
 Ollama is down, the deterministic offline parser answers the energy queries it
 recognises instead.
 
@@ -302,9 +338,9 @@ via Home Assistant, not exposed to the host network). Reach it at
 `http://localhost:8099` from within the add-on's network, or through the
 companion integration proxy once wired up. Endpoints:
 
-- `GET /api/plan` — current computed charge plan (same data as `ha-spark plan`)
+- `GET /api/plan`: current computed charge plan (same data as `ha-spark plan`)
 - Config hot-reload: edit `/data/options.json` and the daemon detects the change
-  and reloads within seconds — no restart needed.
+  and reloads within seconds. No restart needed.
 
 ### Agent surface
 
@@ -312,19 +348,19 @@ Off by default. Set `agent_surface: on` to let an external model (e.g. Claude,
 or any OpenAPI-compatible tool client) read ha-spark's data and, optionally,
 trigger a few gated actions.
 
-- `agent_surface` (`off` | `on`) — master switch, off by default.
-- `agent_exposure` (`read` | `read_act` | `read_write`, default `read_act`) —
+- `agent_surface` (`off` | `on`): master switch, off by default.
+- `agent_exposure` (`read` | `read_act` | `read_write`, default `read_act`):
   how much is exposed. `read` is data-only (states, plan, forecast,
-  predictions, health). `read_act` additionally exposes `add_context` and
-  `run_plan`. `read_write` additionally exposes `set_config`.
-- `agent_api_token` — bearer token for the published port. Leave blank and the
+  predictions, health). `read_act` also exposes `add_context` and
+  `run_plan`. `read_write` also exposes `set_config`.
+- `agent_api_token`: bearer token for the published port. Leave blank and the
   add-on generates one on first start and prints it **once** to the add-on
   log; it's a `password` field, so it's never shown back in the UI.
-- `agent_expose_port` (`bool`, default `false`) — publish the agent surface on
+- `agent_expose_port` (`bool`, default `false`): publish the agent surface on
   the host network for clients that can't reach add-on ingress.
 
-The agent surface is always served over HA's authenticated ingress proxy —
-no token needed there, since ingress already authenticates the user. For
+The agent surface is always served over HA's authenticated ingress proxy, so
+no token is needed there; ingress already authenticates the user. For
 external clients (Claude Desktop, open-webui on your LAN/Tailnet) that can't
 go through ingress, set `agent_expose_port: true` and map host port **8098**
 (the `ports:` entry in this add-on's configuration). Requests on that
@@ -335,16 +371,16 @@ published port require the bearer token.
   <token>`.
 - **Claude (Desktop, or via your own reverse proxy)**: point an MCP
   (Streamable HTTP) connector at `http://<host>:8098/mcp`, with the same
-  bearer token. The server 307-redirects `/mcp` → `/mcp/`, which MCP clients
+  bearer token. The server 307-redirects `/mcp` to `/mcp/`, which MCP clients
   follow automatically.
-- **claude.ai (web)** additionally needs a public HTTPS endpoint in front of
-  the published port — a reverse proxy or Nabu Casa — since claude.ai cannot
-  reach a bare LAN/Tailnet address. That's a deployment step you manage
-  yourself, not something the add-on sets up.
+- **claude.ai (web)** also needs a public HTTPS endpoint in front of
+  the published port, such as a reverse proxy or Nabu Casa, since claude.ai
+  cannot reach a bare LAN/Tailnet address. That's a deployment step you
+  manage yourself, not something the add-on sets up.
 
 Act and write tools still pass the existing `proactive_mode` gate, and the
-model never reaches `call_service` directly — the deterministic planner
-remains the sole decider. Nothing here changes that.
+model never reaches `call_service` directly. The deterministic planner
+remains the sole decider; nothing here changes that.
 
 ## Onboarding
 
@@ -361,14 +397,14 @@ remains the sole decider. Nothing here changes that.
    - `ha-spark onboard --write` also prints a ready-to-paste options fragment.
    - `ha-spark onboard --json` emits the proposals for tooling.
 
-   Proposals are advisory — review them and set the options in the
+   Proposals are advisory. Review them and set the options in the
    **Configuration** tab yourself; the wizard never rewrites your config.
 3. The load forecast needs hourly household-load history:
-   - `ha-spark backfill-load --list` — list statistics usable as a backfill
+   - `ha-spark backfill-load --list`: list statistics usable as a backfill
      source, then `ha-spark backfill-load --from <entity_id>` to import one
      as `ha_spark:house_load` history. `ha-spark onboard` reports when the
      history is sufficient.
-   - Or `ha-spark backfill-load --derive` — once you've configured any
+   - Or `ha-spark backfill-load --derive`, once you've configured any
      `derive_*_entity` option (grid import is required; the others are
      optional and degrade with a note). The derived path rebuilds base
      load by energy balance and overwrites the same `ha_spark:house_load`
@@ -378,7 +414,7 @@ remains the sole decider. Nothing here changes that.
      (upserting every derivable hour in that window so late-arriving
      component stats repair history), so a manual rerun is only needed
      once.
-4. `ha-spark plan` — print tonight's plan without applying it.
+4. `ha-spark plan`: print tonight's plan without applying it.
 5. Leave the add-on running; it executes the plan daily at `plan_run_time`.
    When the simulated decisions look right, set `proactive_mode: on`.
 
