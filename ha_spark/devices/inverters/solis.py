@@ -99,8 +99,11 @@ class SolisDevice:
     async def apply(self, intent: ChargeIntent) -> list[str]:
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         # SoC-unreadable guard: soc_now==0 from a dead sensor would size a max charge.
-        if mode == "on" and not intent.soc_valid:
-            line = f"[BLOCKED] SoC unreadable; not charging to {intent.target_soc_pct:.0f}%"
+        if mode == "on" and not intent.soc.ok:
+            line = (
+                f"[BLOCKED] {intent.soc.reason}; not charging to "
+                f"{intent.target_soc_pct:.0f}%"
+            )
             log.warning(line)
             return [line]
         lines: list[str] = []

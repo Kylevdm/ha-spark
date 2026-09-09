@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import time
+from datetime import UTC, datetime, time
 from typing import Any
 
 import pytest
@@ -11,20 +11,41 @@ from ha_spark import intent_parser
 from ha_spark.config import Settings
 from ha_spark.energy.models import ChargeIntent, ChargePlan
 from ha_spark.energy.plan_run import PlanRun
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.intent_parser import parse_offline
+
+
+def _soc(value: float | None = None) -> SocMeasurement:
+    now = datetime.now(UTC)
+    if value is None:
+        return SocMeasurement(
+            status=SocStatus.UNAVAILABLE,
+            observed_at=now,
+            raw_state="unavailable",
+            max_age_s=600.0,
+        )
+    return SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=now,
+        value=value,
+        raw_state=str(value),
+        reported_at=now,
+        age_s=0.0,
+        max_age_s=600.0,
+    )
 
 REST = object()  # parse_offline only forwards this to current_plan
 
 
 def _plan(**kw: object) -> ChargePlan:
     base: dict[str, object] = dict(
-        soc_now=69, capacity_kwh=26.88, solar_kwh=3.4, effective_solar_kwh=3.4,
+        soc=_soc(69), capacity_kwh=26.88, solar_kwh=3.4, effective_solar_kwh=3.4,
         load_kwh=17.7, cheap_covered_kwh=0.0, usable_now_kwh=13.17,
         deficit_kwh=9.23, buffer_pct=20.0, required_kwh=0.0,
         target_soc=69, window_hours=6.0, ev_charging=False,
         ha_template_needed=None,
         charge_intent=ChargeIntent(
-            target_soc_pct=69, soc_now=69, window_start=time(23, 30), window_end=time(5, 30)
+            target_soc_pct=69, soc=_soc(69), window_start=time(23, 30), window_end=time(5, 30)
         ),
     )
     base.update(kw)
@@ -57,10 +78,10 @@ async def test_soc_query_returns_battery_line(monkeypatch: pytest.MonkeyPatch) -
 
 
 async def test_soc_query_flags_unreadable_sensor(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_plan(monkeypatch, _plan(soc_valid=False))
+    _patch_plan(monkeypatch, _plan(soc=_soc()))
     result = await parse_offline("battery?", Settings(), REST)  # type: ignore[arg-type]
     assert result.matched
-    assert "unreadable" in result.text
+    assert "Battery SoC is untrusted right now:" in result.text
 
 
 async def test_solar_query_returns_forecast(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -21,6 +21,7 @@ from ha_spark.energy.octopus import (
     fetch_planned_dispatches,
     fetch_standard_unit_rates,
 )
+from ha_spark.energy.soc_integrity import check_soc
 from ha_spark.energy.solar import distribute_solar
 from ha_spark.energy.tariff import (
     DynamicTariffProvider,
@@ -224,6 +225,15 @@ async def gather_inputs(
             return None
 
     soc = await state(settings.soc_entity)
+    # One checked observation per gather; every downstream consumer reads its
+    # value from this exact measurement rather than re-reading the sensor.
+    soc_measurement = check_soc(
+        soc,
+        observed_at=datetime.now(UTC),
+        max_age=timedelta(minutes=settings.soc_max_report_age_minutes),
+    )
+    if not soc_measurement.ok:
+        log.warning("SoC measurement failed integrity check: %s", soc_measurement.reason)
     voltage = await state(settings.battery_voltage_entity)
     solar = await state(settings.solar_tomorrow_entity)
     ev_status = await state(settings.ev_status_entity)
@@ -310,8 +320,7 @@ async def gather_inputs(
         solar_slots, _ = _slot_horizon(solar_day, window_start, window_end, tz)
 
     inputs = PlannerInputs(
-        soc_now=_to_float(soc.state if soc else None, 0.0),
-        soc_valid=_opt_float(soc.state if soc else None) is not None,
+        soc=soc_measurement,
         pre_window_drain_kwh=drain,
         solar_tomorrow_kwh=solar_kwh,
         predicted_home_load_kwh=forecast.total_kwh,

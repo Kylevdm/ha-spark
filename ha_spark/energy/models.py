@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time
 
+from ha_spark.energy.soc_integrity import SocMeasurement
+
 # Half-hour slots in a (non-DST-transition) day; the planner horizon is always 48.
 SLOTS_PER_DAY = 48
 
@@ -110,12 +112,12 @@ class PlannerConfig:
 class PlannerInputs:
     """Live inputs gathered from HA."""
 
-    soc_now: float
+    # The checked SoC observation these inputs were built from. Planning reads
+    # its value through `soc_now`, never by re-reading the sensor, so one read
+    # can never certify a different read.
+    soc: SocMeasurement
     solar_tomorrow_kwh: float
     predicted_home_load_kwh: float
-    # False when the SoC sensor was unreadable (soc_now then defaults to 0);
-    # chargers must refuse real writes on an invalid SoC.
-    soc_valid: bool = True
     # Forecast battery drain between plan time and the charge-window start
     # (the horizon starts at the window, so this load is otherwise invisible).
     pre_window_drain_kwh: float = 0.0
@@ -131,29 +133,40 @@ class PlannerInputs:
     # by start; empty when the dynamic provider isn't in use or the read failed.
     dynamic_prices: tuple[PricePoint, ...] = ()
 
+    @property
+    def soc_now(self) -> float:
+        """The checked SoC percentage; 0 when the measurement failed."""
+        return self.soc.soc_now
+
 
 @dataclass(frozen=True)
 class ChargeIntent:
     """Inverter-agnostic charge command: reach ``target_soc_pct`` by ``window_end``.
 
-    ``soc_now`` is carried so a rate-based adapter (Solis) can re-derive the kWh
-    to add without re-reading the sensor. ``holds`` are daytime dispatch windows
-    during which the battery must stop discharging (hold for cheap grid).
+    ``soc`` is the checked measurement the plan was sized from, carried so a
+    rate-based adapter (Solis) can re-derive the kWh to add without re-reading
+    the sensor, and so every charger sees the same integrity verdict and its
+    evidence. ``holds`` are daytime dispatch windows during which the battery
+    must stop discharging (hold for cheap grid).
     """
 
     target_soc_pct: float
-    soc_now: float
+    soc: SocMeasurement  # failed -> chargers must refuse real writes
     window_start: time
     window_end: time
     holds: tuple[tuple[datetime, datetime], ...] = ()
-    soc_valid: bool = True  # False -> SoC sensor unreadable; chargers must refuse real writes
+
+    @property
+    def soc_now(self) -> float:
+        """The checked SoC percentage; 0 when the measurement failed."""
+        return self.soc.soc_now
 
 
 @dataclass(frozen=True)
 class ChargePlan:
     """The computed plan: the numbers, plus the ChargeIntent a Charger realizes."""
 
-    soc_now: float
+    soc: SocMeasurement  # failed -> block real writes
     capacity_kwh: float
     solar_kwh: float
     effective_solar_kwh: float
@@ -168,7 +181,6 @@ class ChargePlan:
     ev_charging: bool
     ha_template_needed: float | None
     charge_intent: ChargeIntent  # control contract: the sole charge-control surface
-    soc_valid: bool = True  # False -> SoC sensor unreadable; block real writes
     model: str = "daily"  # "slots" (per-slot horizon) | "daily" (v1 balance)
     expensive_load_kwh: float | None = None  # net load in peak-rate slots (slot model)
     # Per-slot import price (£/kWh) the planner costed against (slot model only).
@@ -182,3 +194,8 @@ class ChargePlan:
     # EV energy Octopus plans to deliver across the dispatches (None when there
     # are no dispatches) — reported, not planned: Octopus controls the EV.
     dispatch_ev_kwh: float | None = None
+
+    @property
+    def soc_now(self) -> float:
+        """The checked SoC percentage; 0 when the measurement failed."""
+        return self.soc.soc_now
