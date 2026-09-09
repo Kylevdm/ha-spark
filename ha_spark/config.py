@@ -15,12 +15,14 @@ environment variables, a local ``.env`` file, and built-in defaults.
 from __future__ import annotations
 
 import json
+from datetime import time
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from ha_spark.devices.base import ControlAuthority
 from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
@@ -60,6 +62,9 @@ _OPTION_KEYS = frozenset(
         "rate_offpeak_gbp_kwh",
         "rate_peak_gbp_kwh",
         "rate_export_gbp_kwh",
+        "tariff_provider",
+        "dynamic_rates_entity",
+        "dynamic_rates_entity_tomorrow",
         "charge_efficiency",
         "solar_percentile",
         "profile_min_days",
@@ -67,10 +72,28 @@ _OPTION_KEYS = frozenset(
         "timezone",
         "plan_run_time",
         "backfill_source_entity",
+        # Derived base-load (ADR-0001): per-component statistic IDs + invert flags.
+        # Grid import is required when any of these are set; the others are
+        # optional and contribute zero with a degradation note when unset.
+        "derive_grid_import_entity",
+        "derive_grid_export_entity",
+        "derive_solar_generation_entity",
+        "derive_battery_charge_entity",
+        "derive_battery_discharge_entity",
+        "derive_ev_charge_entity",
+        "derive_invert_grid_import",
+        "derive_invert_grid_export",
+        "derive_invert_solar_generation",
+        "derive_invert_battery_charge",
+        "derive_invert_battery_discharge",
+        "derive_invert_ev_charge",
         "octopus_api_key",
         "octopus_mpan",
         "octopus_meter_serial",
         "octopus_api_url",
+        "octopus_account_number",
+        "octopus_product_code",
+        "octopus_tariff_code",
         # Battery model fallback.
         "battery_voltage_v",
         # Entity IDs: exposed so other installs can map their own sensors/controls
@@ -91,9 +114,11 @@ _OPTION_KEYS = frozenset(
         "ha_template_charge_needed_entity",
         # Inverter selector + AlphaESS control (Task 3).
         "inverter",
-        "charge_window_start_entity",
-        "charge_window_end_entity",
+        "solis_control_hub",
+        "solis_modbus_slave",
         "alphaess_serial",
+        # Structured device config (Phase 7): list of controllable devices.
+        "devices",
         # Forecast ledger: signal sampling (Phase 6A).
         "person_entities",
         "heatpump_energy_entity",
@@ -130,6 +155,96 @@ _SECRET_OPTION_KEYS = frozenset({"octopus_api_key", "agent_api_token"})
 
 class ConfigError(RuntimeError):
     """Raised when the runtime configuration is invalid or incomplete."""
+
+
+class FixedTariffConfig(BaseModel):
+    """The ``fixed`` tariff provider's settings, validated at startup.
+
+    Slice 1 keeps the existing flat rate/window config keys as the fixed
+    provider's sole config source (no keys renamed, so no config break); this
+    validates them up front so a bad tariff value is caught with a message
+    naming the offending field rather than degrading a plan later. A later
+    slice adds the provider selector these settings become nested under.
+    """
+
+    rate_offpeak: float = Field(ge=0)
+    rate_peak: float = Field(ge=0)
+    rate_export: float = Field(ge=0)
+    window_start: str
+    window_end: str
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _hhmm(cls, v: str) -> str:
+        try:
+            h, m = v.split(":")
+            time(int(h), int(m))
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"must be HH:MM (got {v!r})") from exc
+        return v
+
+
+def validate_fixed_tariff(settings: Settings) -> None:
+    """Validate the fixed provider's tariff settings; raise ConfigError on a bad field."""
+    try:
+        FixedTariffConfig(
+            rate_offpeak=settings.rate_offpeak_gbp_kwh,
+            rate_peak=settings.rate_peak_gbp_kwh,
+            rate_export=settings.rate_export_gbp_kwh,
+            window_start=settings.charge_window_start,
+            window_end=settings.charge_window_end,
+        )
+    except ValidationError as exc:
+        raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
+
+
+class DynamicTariffConfig(BaseModel):
+    """The ``dynamic`` tariff provider's settings, validated at startup."""
+
+    dynamic_rates_entity: str = Field(min_length=1)
+
+
+def validate_dynamic_tariff(settings: Settings) -> None:
+    """When `tariff_provider` is "dynamic", require a rates entity; else no-op."""
+    if settings.tariff_provider != "dynamic":
+        return
+    try:
+        DynamicTariffConfig(dynamic_rates_entity=settings.dynamic_rates_entity)
+    except ValidationError as exc:
+        raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
+
+
+class OctopusIntelligentTariffConfig(BaseModel):
+    """The ``octopus_intelligent`` tariff provider's settings, validated at startup."""
+
+    octopus_api_key: str = Field(min_length=1)
+    octopus_account_number: str = Field(min_length=1)
+    octopus_product_code: str = Field(min_length=1)
+    octopus_tariff_code: str = Field(min_length=1)
+
+
+def validate_octopus_intelligent_tariff(settings: Settings) -> None:
+    """When `tariff_provider` is "octopus_intelligent", require API config; else no-op."""
+    if settings.tariff_provider != "octopus_intelligent":
+        return
+    try:
+        OctopusIntelligentTariffConfig(
+            octopus_api_key=settings.octopus_api_key,
+            octopus_account_number=settings.octopus_account_number,
+            octopus_product_code=settings.octopus_product_code,
+            octopus_tariff_code=settings.octopus_tariff_code,
+        )
+    except ValidationError as exc:
+        raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
+
+class DeviceConfig(BaseModel):
+    """One controllable device. Phase 7 ships type == "inverter" only."""
+
+    id: str
+    type: Literal["inverter"] = "inverter"
+    driver: str
+    control: ControlAuthority = ControlAuthority.HA_SPARK
+    entities: dict[str, str] = Field(default_factory=dict)
 
 
 class Settings(BaseSettings):
@@ -199,6 +314,16 @@ class Settings(BaseSettings):
     # Export/feed-in rate (GBP/kWh); 0 disables export revenue in cost projections.
     rate_export_gbp_kwh: float = Field(default=0.0)
 
+    # Tariff provider: "fixed" costs against rate_offpeak/rate_peak + the charge
+    # window above; "dynamic" costs each slot at its live price from an HA
+    # half-hourly price sensor (falls back to fixed on a missing/bad read).
+    tariff_provider: Literal["fixed", "dynamic", "octopus_intelligent"] = Field(default="fixed")
+    dynamic_rates_entity: str = Field(default="")
+    # Optional: a second entity for tomorrow's rates (many integrations publish
+    # today/tomorrow as separate entities). Blank is fine — slots past today's
+    # coverage just fall back to the fixed rate.
+    dynamic_rates_entity_tomorrow: str = Field(default="")
+
     # v2 slot-profile load model (from imported Octopus half-hourly consumption).
     profile_min_days: int = Field(default=7)
     profile_history_days: int = Field(default=60)
@@ -211,11 +336,38 @@ class Settings(BaseSettings):
     # or energy sensor); the CLI's --from flag overrides it.
     backfill_source_entity: str = Field(default="")
 
+    # Derived base load (ADR-0001): per-component HA statistic IDs.
+    # `derive_grid_import_entity` is required when any are set; the others
+    # contribute zero with a degradation note when unset. The invert flags
+    # are explicit (never inferred): true flips the canonical sign after the
+    # usual unit conversion, so a mis-signed sensor never silently corrupts
+    # the balance.
+    derive_grid_import_entity: str = Field(default="")
+    derive_grid_export_entity: str = Field(default="")
+    derive_solar_generation_entity: str = Field(default="")
+    derive_battery_charge_entity: str = Field(default="")
+    derive_battery_discharge_entity: str = Field(default="")
+    derive_ev_charge_entity: str = Field(default="")
+    derive_invert_grid_import: bool = Field(default=False)
+    derive_invert_grid_export: bool = Field(default=False)
+    derive_invert_solar_generation: bool = Field(default=False)
+    derive_invert_battery_charge: bool = Field(default=False)
+    derive_invert_battery_discharge: bool = Field(default=False)
+    derive_invert_ev_charge: bool = Field(default=False)
+
     # Octopus REST API (for `pull-consumption`; CSV import needs none of these).
+    # `octopus_api_key` also drives the `octopus_intelligent` tariff provider
+    # below (Kraken GraphQL auth + REST standard-unit-rates).
     octopus_api_key: str = Field(default="")
     octopus_mpan: str = Field(default="")
     octopus_meter_serial: str = Field(default="")
     octopus_api_url: str = Field(default="https://api.octopus.energy/v1")
+    # Octopus Intelligent tariff provider: account number for the GraphQL
+    # plannedDispatches query, product/tariff code for the standard-unit-rates
+    # REST endpoint (e.g. "INTELLI-VAR-22-10-14" / "E-1R-INTELLI-VAR-22-10-14-A").
+    octopus_account_number: str = Field(default="")
+    octopus_product_code: str = Field(default="")
+    octopus_tariff_code: str = Field(default="")
 
     # HA entity IDs (all overridable). Blank by default; set via `ha-spark
     # onboard` (entity auto-discovery) or the `solis` preset (ha_spark/presets.py),
@@ -240,11 +392,19 @@ class Settings(BaseSettings):
 
     # Inverter selector: picks the Charger adapter (ha_spark/energy/chargers.py).
     inverter: Literal["solis", "alphaess"] = Field(default="solis")
-    # Charge window time entities (Solis); blank skips the window write.
-    charge_window_start_entity: str = Field(default="")
-    charge_window_end_entity: str = Field(default="")
+    # Solis native control: the thin HA `modbus:` overlay hub (#90) ha-spark
+    # writes the timed-slot registers through (`modbus.write_register`) and reads
+    # back via its `sensor.<hub>_*` entities. The window/current/work-mode
+    # registers are fixed in the driver (docs/solis-control-modbus-overlay.yaml).
+    solis_control_hub: str = Field(default="solis_control")
+    solis_modbus_slave: int = Field(default=1)
     # AlphaESS system serial for the alphaess.setbatterycharge service call.
     alphaess_serial: str = Field(default="")
+
+    # Structured device config (Phase 7): a list of controllable devices. Left
+    # empty in flat-config installs; the after-validator synthesizes one inverter
+    # device from the flat entity keys below so existing setups need no change.
+    devices: list[DeviceConfig] = Field(default_factory=list)
 
     # Forecast ledger signal sampling (Phase 6A): recorded so training data
     # accumulates ahead of the models (6B+) that will consume it.
@@ -308,6 +468,28 @@ class Settings(BaseSettings):
         if isinstance(v, str) and v.strip().isdigit():
             return int(v.strip())
         return v
+
+    @model_validator(mode="after")
+    def _synthesize_devices(self) -> Settings:
+        """Dual-read shim: if no structured ``devices``, build one inverter device
+        from the flat entity keys in memory. Idempotent; never rewrites options.json."""
+        if not self.devices:
+            self.devices = [
+                DeviceConfig(
+                    id="main_inverter",
+                    type="inverter",
+                    driver=self.inverter,
+                    control=ControlAuthority.HA_SPARK,
+                    entities={
+                        # charge_current is telemetry/dashboard only for Solis
+                        # (control is native modbus via solis_control_hub); kept
+                        # generic here for the dashboard row and other drivers.
+                        "charge_current": self.charge_current_entity,
+                        "power_switch": self.inverter_power_switch_entity,
+                    },
+                )
+            ]
+        return self
 
     @property
     def is_standalone(self) -> bool:
@@ -374,4 +556,8 @@ def load_settings(*, validate: bool = True) -> Settings:
             "SUPERVISOR_TOKEN automatically; for standalone/dev set HA_URL and "
             "HA_TOKEN (see .env.example)."
         )
+    if validate:
+        validate_fixed_tariff(settings)
+        validate_dynamic_tariff(settings)
+        validate_octopus_intelligent_tariff(settings)
     return settings

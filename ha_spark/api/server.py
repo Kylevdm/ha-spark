@@ -24,8 +24,10 @@ from typing import Any
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 
 from ha_spark.agent import auth, tools
+from ha_spark.agent.exposure import OPERATION_TIERS, allowed, surface_on
 from ha_spark.config import _OPTION_KEYS, _SECRET_OPTION_KEYS, Settings, load_settings
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.publish import plan_to_payload
@@ -81,6 +83,11 @@ class AppState:
             value = getattr(self.settings, key)
             if key in _SECRET_OPTION_KEYS and value:
                 out[key] = _REDACTED
+            elif key == "devices":
+                # `devices` holds pydantic DeviceConfig models (synthesized from
+                # the flat keys when unset); dump to JSON-safe primitives so the
+                # config response/persistence stays serializable.
+                out[key] = [d.model_dump(mode="json") for d in value]
             else:
                 out[key] = value
         return out
@@ -120,72 +127,142 @@ def _state_of(request: Request) -> AppState:
     return state
 
 
-def _agent_router(state: AppState) -> APIRouter:
-    """Build the ``/agent/*`` router, gated by ``state.settings.agent_exposure``."""
-    router = APIRouter(prefix="/agent")
-    exposure = state.settings.agent_exposure
+class _Gate:
+    """FastAPI dependency enforcing :func:`~ha_spark.agent.exposure.allowed`.
 
-    @router.get("/plan")
+    Resolves the operation's tier from :data:`OPERATION_TIERS` and evaluates the
+    live ``state.settings`` per request, so runtime exposure changes apply
+    without a rebuild. A denied tier 404s, reading the same as a route that was
+    never registered -- in particular never a 405, since the path/method always
+    matches and the dependency rejects before the handler runs.
+    """
+
+    def __init__(self, state: AppState, operation: str) -> None:
+        self._state = state
+        # Public: the schema filter reads the operation back off the registered
+        # route's own gate rather than restating the binding (see
+        # :func:`_gate_bindings`).
+        self.operation = operation
+
+    async def __call__(self) -> None:
+        if not allowed(self._state, OPERATION_TIERS[self.operation]):
+            raise HTTPException(status_code=404)
+
+
+# (path, lowercase method, operation) per gated route -- lowercase to match the
+# schema's method keys.
+_GateBindings = tuple[tuple[str, str, str], ...]
+
+
+def _gate_bindings(router: APIRouter) -> _GateBindings:
+    """The route -> operation binding, read back off each route's own :class:`_Gate`.
+
+    The gate the request path evaluates is the only place a route's operation is
+    named, so the schema filter cannot drift from what is enforced and adding a
+    route needs no second edit (#93 flagged this matrix being written twice).
+    Only the *binding* is static here; the exposure decision it feeds is still
+    taken per request against the live settings.
+    """
+    bindings: list[tuple[str, str, str]] = []
+    for route in router.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        for dependency in route.dependencies:
+            gate = dependency.dependency
+            if isinstance(gate, _Gate):
+                bindings.extend(
+                    (route.path, method.lower(), gate.operation) for method in route.methods or ()
+                )
+    return tuple(bindings)
+
+
+class _SparkAPI(FastAPI):
+    """App whose ``/openapi.json`` reflects the *current* gate.
+
+    Routes are registered once and gated per request (:class:`_Gate`), so the
+    advertised schema must apply the same predicate per call: an operation
+    denied at the live tier is filtered out, keeping "absent below this tier"
+    true for discovery as well as execution.
+    """
+
+    def __init__(self, *args: Any, gate_bindings: _GateBindings, **kwargs: Any) -> None:
+        self._gate_bindings = gate_bindings
+        super().__init__(*args, **kwargs)
+
+    def openapi(self) -> dict[str, Any]:
+        self.openapi_schema = None  # settings may have changed since the last call
+        schema = super().openapi()
+        state: AppState = getattr(self.state, STATE_ATTR)
+        paths: dict[str, Any] = schema.get("paths", {})
+        for path, method, operation in self._gate_bindings:
+            if allowed(state, OPERATION_TIERS[operation]):
+                continue
+            ops: dict[str, Any] | None = paths.get(path)
+            if ops is not None:
+                ops.pop(method, None)
+                if not ops:
+                    paths.pop(path, None)
+        return schema
+
+
+def _agent_router(state: AppState) -> APIRouter:
+    """Build the ``/agent/*`` router: every route registered once, each behind a
+    request-time :class:`_Gate`.
+
+    ``state.settings`` is read per request (never captured here), so
+    ``POST /api/config`` exposure changes take effect without a restart, and
+    ``agent_surface == "off"`` denies every route (#93).
+    """
+    router = APIRouter(prefix="/agent")
+
+    @router.get("/plan", dependencies=[Depends(_Gate(state, "get_plan"))])
     async def plan() -> tools.PlanResult:
         return await tools.get_plan(state.settings)
 
-    @router.get("/state")
+    @router.get("/state", dependencies=[Depends(_Gate(state, "get_state"))])
     async def state_() -> tools.StateResult:
         return await tools.get_state(state.settings)
 
-    @router.get("/forecast")
+    @router.get("/forecast", dependencies=[Depends(_Gate(state, "get_forecast"))])
     async def forecast() -> tools.ForecastResult:
         return await tools.get_forecast(state.settings)
 
-    @router.get("/predictions")
+    @router.get("/predictions", dependencies=[Depends(_Gate(state, "get_predictions"))])
     async def predictions() -> tools.PredictionsResult:
         return await tools.get_predictions(state.settings)
 
-    @router.get("/health")
+    @router.get("/health", dependencies=[Depends(_Gate(state, "get_health"))])
     async def health_() -> tools.HealthResult:
         return await tools.get_health(state.settings)
 
-    @router.get("/context")
+    @router.get("/context", dependencies=[Depends(_Gate(state, "get_context"))])
     async def context() -> tools.ContextResult:
         return await tools.get_context(state.settings)
 
-    if exposure in ("read_act", "read_write"):
+    @router.post("/context", dependencies=[Depends(_Gate(state, "add_context"))])
+    async def add_context(body: dict[str, object]) -> tools.ContextResult:
+        try:
+            return await tools.add_context(
+                state.settings,
+                str(body["kind"]),
+                date.fromisoformat(str(body["start_date"])),
+                date.fromisoformat(str(body["end_date"])),
+                note=str(body.get("note", "")),
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        @router.post("/context")
-        async def add_context(body: dict[str, object]) -> tools.ContextResult:
-            try:
-                return await tools.add_context(
-                    state.settings,
-                    str(body["kind"]),
-                    date.fromisoformat(str(body["start_date"])),
-                    date.fromisoformat(str(body["end_date"])),
-                    note=str(body.get("note", "")),
-                )
-            except (KeyError, ValueError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+    @router.post("/run", dependencies=[Depends(_Gate(state, "run_plan"))])
+    async def run() -> tools.PlanResult:
+        return await tools.run_plan(state.settings)
 
-        @router.post("/run")
-        async def run() -> tools.PlanResult:
-            return await tools.run_plan(state.settings)
-
-    else:
-        # GET /context is always registered, so without an explicit POST
-        # handler here Starlette would answer POST /agent/context with 405
-        # (path matches, method doesn't) instead of 404. Register one that
-        # 404s, so "absent below this tier" reads the same for every route.
-        @router.post("/context", include_in_schema=False)
-        async def add_context_unavailable(body: dict[str, object] | None = None) -> None:
-            raise HTTPException(status_code=404)
-
-    if exposure == "read_write":
-
-        @router.post("/config")
-        async def config(body: dict[str, object]) -> dict[str, Any]:
-            try:
-                state.apply_options(body)
-            except Exception as exc:  # noqa: BLE001 - validation failure -> 400
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            return state.current_options()
+    @router.post("/config", dependencies=[Depends(_Gate(state, "set_config"))])
+    async def config(body: dict[str, object]) -> dict[str, Any]:
+        try:
+            state.apply_options(body)
+        except Exception as exc:  # noqa: BLE001 - validation failure -> 400
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return state.current_options()
 
     return router
 
@@ -206,11 +283,15 @@ def build_app(state: AppState, *, require_token: bool = False, token: str = "") 
     # so we adopt it as the app's lifespan or /mcp 500s with "Task group is not
     # initialized". Build the app and read its lifespan BEFORE creating FastAPI.
     mcp_app = build_mcp(state).streamable_http_app()
-    app = FastAPI(
+    # Built before the app so the schema filter is handed the bindings of the
+    # very router that gets included below -- one object, no restated table.
+    agent_router = _agent_router(state)
+    app = _SparkAPI(
         title="ha-spark",
         docs_url=None,
         redoc_url=None,
         lifespan=mcp_app.router.lifespan_context,
+        gate_bindings=_gate_bindings(agent_router),
     )
     setattr(app.state, STATE_ATTR, state)
 
@@ -261,13 +342,35 @@ def build_app(state: AppState, *, require_token: bool = False, token: str = "") 
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(_state_of(request).current_options())
 
-    app.include_router(_agent_router(state))
+    app.include_router(agent_router)
     # FastAPI router dependencies (the ``_auth`` gate above) do NOT propagate to a
     # mounted ASGI sub-app, so on the published port /mcp would otherwise be
     # reachable without the bearer token while /api/* and /agent/* require it.
     # Wrap the mount in the same check so every inbound surface is gated alike.
-    app.mount("/mcp", _token_gated(mcp_app, token) if require_token else mcp_app)
+    # The surface gate is applied first (checked on every request), then the
+    # token gate outermost so auth 401s before the surface 404s, matching the
+    # /agent/* ordering (router-level _auth runs before the route _Gate).
+    mcp_mount = _surface_gated(mcp_app, state)
+    app.mount("/mcp", _token_gated(mcp_mount, token) if require_token else mcp_mount)
     return app
+
+
+def _surface_gated(asgi_app: Any, state: AppState) -> Any:
+    """Wrap an ASGI app so ``agent_surface == "off"`` 404s it like an unmounted path.
+
+    The MCP-level gate denies tools individually (see ``mcp_server._Gated``);
+    this removes the surface itself, so with the master switch off ``/mcp``
+    reads exactly as if it were never mounted. Checked per request against the
+    live ``state.settings``. Non-HTTP scopes (lifespan) pass through untouched.
+    """
+
+    async def gated(scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and not surface_on(state):
+            await JSONResponse({"detail": "Not Found"}, status_code=404)(scope, receive, send)
+            return
+        await asgi_app(scope, receive, send)
+
+    return gated
 
 
 def _token_gated(asgi_app: Any, token: str) -> Any:

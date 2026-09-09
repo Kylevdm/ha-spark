@@ -33,17 +33,23 @@ from ha_spark.api.server import (
     stop_server,
 )
 from ha_spark.config import Settings
-from ha_spark.energy.chargers import charger_for
+from ha_spark.devices import Capability, inverter_device
+from ha_spark.energy.derived_base_load import (
+    BACKFILL_NAME,
+    BACKFILL_STATISTIC_ID,
+    derive_specs_from_settings,
+    rerive_trailing_window,
+)
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargePlan, PlannerInputs
 from ha_spark.energy.orchestrator import orchestrate
-from ha_spark.energy.planner import _in_overnight_window as in_window
-from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.publish import publish_plan, publish_predictions, republish_last
 from ha_spark.energy.report import format_plan
-from ha_spark.energy.sources import gather_inputs, parse_time
+from ha_spark.energy.sources import parse_time
 from ha_spark.energy.supply_guard import SupplyGuard
+from ha_spark.energy.tariff import _in_overnight_window as in_window
 from ha_spark.energy.v2l import run_v2l_tick
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
@@ -83,17 +89,18 @@ async def run_once(settings: Settings) -> ChargePlan:
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        inputs, cfg, load_source = await gather_inputs(settings, rest)
-        plan = compute_plan(inputs, cfg)
+        run = await current_plan(settings, rest)
+        plan, inputs, load_source = run.plan, run.inputs, run.load_source
         log.info("Charge plan:\n%s", format_plan(plan, load_source))
         intent = plan.charge_intent
         assert intent is not None  # planner always sets it
-        lines = await charger_for(settings, rest).apply(intent)
+        lines = await inverter_device(settings, rest).apply(intent)
         for line in lines:
             log.info(line)
         await publish_plan(rest, plan, settings)
     await _record_forecast(settings, plan, inputs, load_source)
     await _run_orchestrator(settings)
+    await _run_derived_rerive(settings)
     return plan
 
 
@@ -111,6 +118,44 @@ async def _run_orchestrator(settings: Settings) -> None:
             await publish_predictions(rest, decisions, settings)
     except Exception:
         log.exception("Proactive orchestrator failed")
+
+
+async def _run_derived_rerive(settings: Settings) -> None:
+    """Re-derive the trailing 48h of base-load history (best-effort).
+
+    No-op when grid import is unconfigured (the source-entity backfill path
+    is still available via ``backfill-load --from``). A failure here must
+    never block the daily plan run; it logs + reports so the operator can
+    inspect the daemon log.
+    """
+    specs = derive_specs_from_settings(settings)
+    if not specs.get("grid_import") or not specs["grid_import"].entity_id:
+        return
+    try:
+        result = await rerive_trailing_window(
+            settings,
+            specs,
+            statistic_id=BACKFILL_STATISTIC_ID,
+            statistic_name=BACKFILL_NAME,
+        )
+    except Exception:
+        log.exception("Derived base-load rerive failed; will retry next tick")
+        return
+    if result is None:
+        return
+    if result.rows_imported:
+        log.info(
+            "Derived base-load rerive: %d rows upserted (%s)",
+            result.rows_imported,
+            result.span,
+        )
+    if result.negative_clamped:
+        log.warning(
+            "Derived base-load rerive: %d hour(s) clamped to 0 — check invert flags",
+            result.negative_clamped,
+        )
+    for note in result.degradation:
+        log.info("Derived base-load rerive: %s", note)
 
 
 async def sample_signals(settings: Settings, now: datetime) -> None:
@@ -169,8 +214,8 @@ async def guard_tick(settings: Settings, target_w: float | None) -> float:
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        charger = charger_for(settings, rest)
-        if not charger.supports_live_rate:
+        charger = inverter_device(settings, rest)
+        if Capability.CHARGE_RATE not in charger.capabilities:
             return target_w or 0.0
         if target_w is None:
             target_w = await charger.read_charge_rate()
@@ -182,7 +227,7 @@ async def guard_tick(settings: Settings, target_w: float | None) -> float:
 async def _planned_rate_w(settings: Settings, plan: ChargePlan) -> float | None:
     """The plan's charge rate (W) for the active charger, or None if unset.
 
-    ``charger_for``/``planned_rate_w`` perform no I/O; the rest client just
+    ``inverter_device``/``planned_rate_w`` perform no I/O; the rest client just
     satisfies the constructor and is closed straight away.
     """
     if plan.charge_intent is None:
@@ -190,7 +235,7 @@ async def _planned_rate_w(settings: Settings, plan: ChargePlan) -> float | None:
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        return charger_for(settings, rest).planned_rate_w(plan.charge_intent)
+        return inverter_device(settings, rest).planned_rate_w(plan.charge_intent)
 
 
 async def _charger_supports_live_rate(settings: Settings) -> bool:
@@ -198,7 +243,7 @@ async def _charger_supports_live_rate(settings: Settings) -> bool:
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        return charger_for(settings, rest).supports_live_rate
+        return Capability.CHARGE_RATE in inverter_device(settings, rest).capabilities
 
 
 async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:

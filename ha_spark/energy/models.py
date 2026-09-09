@@ -59,6 +59,15 @@ class LoadForecast:
 
 
 @dataclass(frozen=True)
+class PricePoint:
+    """One half-hourly import price read from a dynamic-tariff price sensor."""
+
+    start: datetime
+    end: datetime
+    price: float  # GBP/kWh, inc. VAT
+
+
+@dataclass(frozen=True)
 class DispatchSlot:
     """A planned Octopus dispatch (cheap import) window."""
 
@@ -118,6 +127,9 @@ class PlannerInputs:
     load_slots: tuple[float, ...] | None = None
     solar_slots: tuple[float, ...] | None = None
     horizon_start: datetime | None = None
+    # Live per-slot import prices from a `dynamic` tariff price sensor, sorted
+    # by start; empty when the dynamic provider isn't in use or the read failed.
+    dynamic_prices: tuple[PricePoint, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -159,6 +171,8 @@ class ChargePlan:
     soc_valid: bool = True  # False -> SoC sensor unreadable; block real writes
     model: str = "daily"  # "slots" (per-slot horizon) | "daily" (v1 balance)
     expensive_load_kwh: float | None = None  # net load in peak-rate slots (slot model)
+    # Per-slot import price (£/kWh) the planner costed against (slot model only).
+    slot_prices: tuple[float, ...] | None = None
     baseline_cost: float | None = None  # projected GBP without battery
     planned_cost: float | None = None  # projected GBP with this plan
     charge_efficiency: float = 1.0  # round-trip efficiency used for sizing

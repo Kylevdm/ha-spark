@@ -9,7 +9,13 @@ import pytest
 import respx
 
 from ha_spark.config import Settings
-from ha_spark.energy.octopus import OctopusApiError, fetch_consumption, parse_octopus_csv
+from ha_spark.energy.octopus import (
+    OctopusApiError,
+    fetch_consumption,
+    fetch_planned_dispatches,
+    fetch_standard_unit_rates,
+    parse_octopus_csv,
+)
 
 API = "http://octo.test/v1"
 
@@ -121,3 +127,224 @@ async def test_api_error_when_unconfigured() -> None:
         await fetch_consumption(
             _settings(api_key=""), period_from=datetime(2026, 6, 1, tzinfo=UTC)
         )
+
+
+# --- standard-unit-rates (P8.5, #39) ---
+
+
+def _rates_settings(**kw: str) -> Settings:
+    base = dict(
+        octopus_api_url=API, octopus_api_key="sk_test",
+        octopus_product_code="INTELLI-VAR-22-10-14",
+        octopus_tariff_code="E-1R-INTELLI-VAR-22-10-14-A",
+    )
+    base.update(kw)
+    return Settings(**base)  # type: ignore[arg-type]
+
+
+@respx.mock
+async def test_rates_follows_pagination_and_authenticates() -> None:
+    url = (
+        f"{API}/products/INTELLI-VAR-22-10-14/electricity-tariffs/"
+        "E-1R-INTELLI-VAR-22-10-14-A/standard-unit-rates/"
+    )
+    route = respx.get(url__startswith=url).mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={
+                    "next": f"{url}?page=2",
+                    "results": [
+                        {"valid_from": "2026-06-01T00:00:00Z", "valid_to": "2026-06-01T00:30:00Z",
+                         "value_inc_vat": 0.12}
+                    ],
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "next": None,
+                    "results": [
+                        {"valid_from": "2026-06-01T00:30:00Z", "valid_to": "2026-06-01T01:00:00Z",
+                         "value_inc_vat": 0.09}
+                    ],
+                },
+            ),
+        ]
+    )
+    points = await fetch_standard_unit_rates(
+        _rates_settings(), period_from=datetime(2026, 6, 1, tzinfo=UTC)
+    )
+    assert [p.price for p in points] == [0.12, 0.09]
+    assert route.call_count == 2
+    auth_header = route.calls[0].request.headers["authorization"]
+    assert auth_header.startswith("Basic ")
+
+
+@respx.mock
+async def test_rates_tolerates_malformed_results() -> None:
+    url = (
+        f"{API}/products/INTELLI-VAR-22-10-14/electricity-tariffs/"
+        "E-1R-INTELLI-VAR-22-10-14-A/standard-unit-rates/"
+    )
+    respx.get(url__startswith=url).mock(
+        return_value=httpx.Response(
+            200,
+            json={"next": None, "results": ["not-a-dict", {"valid_from": "bad"}]},
+        )
+    )
+    points = await fetch_standard_unit_rates(
+        _rates_settings(), period_from=datetime(2026, 6, 1, tzinfo=UTC)
+    )
+    assert points == ()
+
+
+@respx.mock
+async def test_rates_error_on_http_failure() -> None:
+    respx.get(url__regex=r".*").mock(return_value=httpx.Response(401))
+    with pytest.raises(OctopusApiError, match="request failed"):
+        await fetch_standard_unit_rates(
+            _rates_settings(), period_from=datetime(2026, 6, 1, tzinfo=UTC)
+        )
+
+
+async def test_rates_error_when_unconfigured() -> None:
+    with pytest.raises(OctopusApiError, match="not configured"):
+        await fetch_standard_unit_rates(
+            _rates_settings(octopus_product_code=""), period_from=datetime(2026, 6, 1, tzinfo=UTC)
+        )
+
+
+@respx.mock
+async def test_rates_error_on_non_json_body() -> None:
+    """A 200 response with a non-JSON body (proxy/error page) degrades, never crashes."""
+    respx.get(url__regex=r".*").mock(
+        return_value=httpx.Response(200, content=b"<html>not json</html>")
+    )
+    with pytest.raises(OctopusApiError, match="request failed"):
+        await fetch_standard_unit_rates(
+            _rates_settings(), period_from=datetime(2026, 6, 1, tzinfo=UTC)
+        )
+
+
+# --- planned dispatches (P8.5, #39) ---
+
+
+def _dispatch_settings(**kw: str) -> Settings:
+    base = dict(
+        octopus_api_url=API, octopus_api_key="sk_test", octopus_account_number="A-1234ABCD"
+    )
+    base.update(kw)
+    return Settings(**base)  # type: ignore[arg-type]
+
+
+@respx.mock
+async def test_dispatches_authenticates_then_queries() -> None:
+    graphql = f"{API}/graphql/"
+    route = respx.post(graphql).mock(
+        side_effect=[
+            httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": "jwt-abc"}}}),
+            httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "plannedDispatches": [
+                            {"startDt": "2026-06-01T13:00:00Z", "endDt": "2026-06-01T13:30:00Z",
+                             "delta": -2.0, "meta": {"source": "smart-charge"}}
+                        ]
+                    }
+                },
+            ),
+        ]
+    )
+    slots = await fetch_planned_dispatches(_dispatch_settings())
+    assert len(slots) == 1
+    assert slots[0].charge_in_kwh == -2.0
+    assert slots[0].source == "smart-charge"
+    assert route.call_count == 2
+
+    # The API key is sent once, only in the token-exchange variables — never
+    # in the dispatches query, and never in the Authorization header (that
+    # carries the short-lived JWT, not the raw key).
+    token_call, dispatches_call = route.calls
+    assert token_call.request.content.count(b"sk_test") == 1
+    assert b"sk_test" not in dispatches_call.request.content
+    assert dispatches_call.request.headers["authorization"] == "JWT jwt-abc"
+
+
+@respx.mock
+async def test_dispatches_auth_failure_raises() -> None:
+    graphql = f"{API}/graphql/"
+    respx.post(graphql).mock(
+        return_value=httpx.Response(200, json={"errors": [{"message": "invalid API key"}]})
+    )
+    with pytest.raises(OctopusApiError, match="auth rejected"):
+        await fetch_planned_dispatches(_dispatch_settings())
+
+
+@respx.mock
+async def test_dispatches_error_on_non_json_auth_body() -> None:
+    """A non-JSON auth response degrades to OctopusApiError, never crashes."""
+    graphql = f"{API}/graphql/"
+    respx.post(graphql).mock(return_value=httpx.Response(200, content=b"not json"))
+    with pytest.raises(OctopusApiError, match="auth request failed"):
+        await fetch_planned_dispatches(_dispatch_settings())
+
+
+@respx.mock
+async def test_dispatches_error_on_non_json_query_body() -> None:
+    """A non-JSON dispatches-query response degrades to OctopusApiError, never crashes."""
+    graphql = f"{API}/graphql/"
+    respx.post(graphql).mock(
+        side_effect=[
+            httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": "jwt-abc"}}}),
+            httpx.Response(200, content=b"not json"),
+        ]
+    )
+    with pytest.raises(OctopusApiError, match="dispatches request failed"):
+        await fetch_planned_dispatches(_dispatch_settings())
+
+
+@respx.mock
+async def test_dispatches_query_rejected_raises() -> None:
+    graphql = f"{API}/graphql/"
+    respx.post(graphql).mock(
+        side_effect=[
+            httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": "jwt-abc"}}}),
+            httpx.Response(200, json={"errors": [{"message": "bad account number"}]}),
+        ]
+    )
+    with pytest.raises(OctopusApiError, match="dispatches request rejected"):
+        await fetch_planned_dispatches(_dispatch_settings())
+
+
+@respx.mock
+async def test_dispatches_tolerates_malformed_entries() -> None:
+    graphql = f"{API}/graphql/"
+    respx.post(graphql).mock(
+        side_effect=[
+            httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": "jwt-abc"}}}),
+            httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "plannedDispatches": [
+                            "not-a-dict",
+                            {"startDt": "bad", "endDt": "also-bad", "delta": -1.0},
+                            {"startDt": "2026-06-01T13:00:00Z", "endDt": "2026-06-01T13:30:00Z"},
+                        ]
+                    }
+                },
+            ),
+        ]
+    )
+    slots = await fetch_planned_dispatches(_dispatch_settings())
+    # The third entry parses (no `delta` -> charge_in_kwh defaults to 0.0);
+    # the first two are skipped.
+    assert len(slots) == 1
+    assert slots[0].charge_in_kwh == 0.0
+
+
+async def test_dispatches_error_when_unconfigured() -> None:
+    with pytest.raises(OctopusApiError, match="not configured"):
+        await fetch_planned_dispatches(_dispatch_settings(octopus_account_number=""))

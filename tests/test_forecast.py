@@ -347,7 +347,13 @@ async def test_learned_away_factor_overrides_config(
 
     monkeypatch.setattr(forecast, "statistics_during_period", fake_stats)
     settings = Settings(
-        db_path=str(tmp_path / "ctx.db"), load_model="median", away_load_factor=0.7
+        db_path=str(tmp_path / "ctx.db"),
+        load_model="median",
+        away_load_factor=0.7,
+        # The fixture computes "tomorrow" in UTC; the default Europe/London tz
+        # disagrees on the date between 23:00 and 00:00 UTC during BST, so the
+        # away fact silently misses the forecast target. Keep them aligned.
+        timezone="UTC",
     )
     async with ContextStore(settings.db_path) as store:
         # Record the past away block (for learning) and tomorrow (active).

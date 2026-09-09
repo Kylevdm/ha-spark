@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Architecture review — ha-spark</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose" });
+    </script>
+    <style>
+      .seam { stroke-dasharray: 4 4; }
+      .diagram-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; }
+    </style>
+  </head>
+  <body class="bg-stone-50 text-slate-900 font-sans">
+    <main class="max-w-5xl mx-auto px-6 py-12 space-y-12">
+
+      <header class="space-y-3">
+        <h1 class="font-serif text-3xl">Architecture review — <span class="font-mono text-2xl">ha-spark</span></h1>
+        <p class="text-sm text-slate-500">2026-08-18 · hot spots weighted by recent churn: tariff schedule, device-driver core, agent surface, config</p>
+        <div class="flex gap-5 text-xs text-slate-600 items-center flex-wrap">
+          <span class="inline-flex items-center gap-1.5"><span class="inline-block w-4 h-3 border border-slate-400 bg-white"></span> module</span>
+          <span class="inline-flex items-center gap-1.5"><span class="inline-block w-5 border-t-2 border-dashed border-slate-400"></span> seam</span>
+          <span class="inline-flex items-center gap-1.5"><span class="inline-block w-5 border-t-2 border-red-600"></span> leakage</span>
+          <span class="inline-flex items-center gap-1.5"><span class="inline-block w-4 h-3 bg-slate-800"></span> deep module</span>
+        </div>
+      </header>
+
+      <section id="candidates" class="space-y-10">
+
+        <!-- ============ CANDIDATE 1 ============ -->
+        <article id="c1" class="rounded-xl border border-slate-200 bg-white p-6 space-y-5 shadow-sm">
+          <div class="flex items-start justify-between gap-4">
+            <h2 class="font-serif text-xl">1 · Give the plan pipeline a module — three call sites silently drop the tariff schedule</h2>
+            <span class="shrink-0 rounded-full bg-emerald-100 text-emerald-800 text-xs font-semibold px-3 py-1">Strong</span>
+          </div>
+          <p class="font-mono text-sm text-slate-600">energy/planner.py:52-63 · energy/sources.py:200 · agent/tools.py:62,85 · intent_parser.py:92 · cli.py:104 · scheduler.py:86 · copilot.py:43</p>
+
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <pre class="mermaid">
+flowchart LR
+  subgraph before ["BEFORE — six callers each re-wire the pipeline"]
+    S1[scheduler] -->|"inputs + schedule"| CP[compute_plan]
+    C1[cli plan] -->|"inputs + schedule"| CP
+    CO[copilot] -->|"inputs + schedule"| CP
+    A1["agent get_plan"] -.->|"inputs only"| CP
+    A2["agent get_forecast"] -.->|"inputs only"| CP
+    IP[intent_parser] -.->|"inputs only"| CP
+    CP -.->|"schedule=None → fixed_schedule()"| FX[silent fixed fallback]
+  end
+  classDef leak stroke:#dc2626,stroke-width:2px,color:#dc2626;
+  class A1,A2,IP,FX leak
+            </pre>
+            <p class="text-xs text-slate-500 mt-2">Dashed red callers pass no schedule; the <code>None</code> default silently substitutes the fixed two-rate provider. On a <em>dynamic</em> or <em>octopus_intelligent</em> install, <code>/agent/plan</code>, the MCP tools, and offline <code>ask</code> answers describe a different plan than the one the daemon applies.</p>
+          </div>
+
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <div class="grid grid-cols-2 gap-6 items-end">
+              <div>
+                <p class="diagram-label text-slate-400 mb-2">After — one deep module</p>
+                <div class="border-2 border-slate-800 rounded-md overflow-hidden">
+                  <div class="bg-slate-800 text-white text-xs font-mono px-3 py-2">current_plan(settings, rest) → PlanRun</div>
+                  <div class="p-3 space-y-1.5 bg-gradient-to-br from-slate-50 to-slate-100">
+                    <div class="text-xs font-mono text-slate-400">gather_inputs · REST lifecycle</div>
+                    <div class="text-xs font-mono text-slate-400">provider selection · build_schedule</div>
+                    <div class="text-xs font-mono text-slate-400">compute_plan(…, schedule) — required arg</div>
+                  </div>
+                </div>
+              </div>
+              <div class="text-xs text-slate-600 space-y-1.5">
+                <p>Six call sites shrink to one line each.</p>
+                <p><code class="font-mono">compute_plan</code>'s <code class="font-mono">schedule</code> default is deleted — the tariff schedule becomes part of the planner's interface, and the fixed fallback must be requested explicitly.</p>
+              </div>
+            </div>
+          </div>
+
+          <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+            <div><dt class="font-semibold">Problem</dt><dd class="text-slate-600">Pure planner, pure providers, both deeply tested — the defect lives in the wiring, where nothing tests it. No locality.</dd></div>
+            <div><dt class="font-semibold">Solution</dt><dd class="text-slate-600">One deep module (<code class="font-mono">energy/plan_run.py</code>) hides REST → inputs → schedule → plan; delete the <code class="font-mono">schedule=None</code> default.</dd></div>
+          </dl>
+          <ul class="flex flex-wrap gap-2 text-xs">
+            <li class="rounded bg-emerald-50 text-emerald-800 px-2.5 py-1">Fixes a live plan-divergence bug</li>
+            <li class="rounded bg-emerald-50 text-emerald-800 px-2.5 py-1">Leverage: one interface, six call sites</li>
+            <li class="rounded bg-emerald-50 text-emerald-800 px-2.5 py-1">Locality: wiring bugs concentrate in one module</li>
+            <li class="rounded bg-emerald-50 text-emerald-800 px-2.5 py-1">Unlocks daemon-vs-agent parity test</li>
+          </ul>
+        </article>
+
+        <!-- ============ CANDIDATE 2 ============ -->
+        <article id="c2" class="rounded-xl border border-slate-200 bg-white p-6 space-y-5 shadow-sm">
+          <div class="flex items-start justify-between gap-4">
+            <h2 class="font-serif text-xl">2 · Make the tariff schedule the backtest's sole tariff contract</h2>
+            <span class="shrink-0 rounded-full bg-emerald-100 text-emerald-800 text-xs font-semibold px-3 py-1">Strong</span>
+          </div>
+          <p class="font-mono text-sm text-slate-600">energy/backtest.py:48-83 · cli.py:291-319 · energy/tariff.py:64-83</p>
+
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <div class="grid grid-cols-2 gap-8">
+              <div>
+                <p class="diagram-label text-slate-400 mb-3">Before — interface wider than behaviour</p>
+                <div class="flex gap-3 items-end h-44">
+                  <div class="flex flex-col justify-end w-1/2">
+                    <div class="border border-red-400 bg-red-50 rounded-t-md h-32 p-2 space-y-1">
+                      <div class="text-[10px] font-mono">intervals</div>
+                      <div class="text-[10px] font-mono text-red-700">window_start ⟵ redundant</div>
+                      <div class="text-[10px] font-mono text-red-700">window_end ⟵ redundant</div>
+                      <div class="text-[10px] font-mono text-red-700">schedule ⟵ 2 of 7 fields read</div>
+                      <div class="text-[10px] font-mono">tz</div>
+                    </div>
+                    <div class="diagram-label text-center text-slate-500 py-1">interface</div>
+                  </div>
+                  <div class="flex flex-col justify-end w-1/2">
+                    <div class="border border-slate-300 bg-slate-100 rounded-t-md h-12"></div>
+                    <div class="diagram-label text-center text-slate-500 py-1">implementation<br/>(~15 lines)</div>
+                  </div>
+                </div>
+              </div>
+              <div>
+                <p class="diagram-label text-slate-400 mb-3">After — deep</p>
+                <div class="flex gap-3 items-end h-44">
+                  <div class="flex flex-col justify-end w-1/2">
+                    <div class="border-2 border-slate-800 bg-white rounded-t-md h-12 p-2">
+                      <div class="text-[10px] font-mono">intervals, schedule, tz</div>
+                    </div>
+                    <div class="diagram-label text-center text-slate-500 py-1">interface</div>
+                  </div>
+                  <div class="flex flex-col justify-end w-1/2">
+                    <div class="bg-slate-800 rounded-t-md h-32 p-2 space-y-1">
+                      <div class="text-[10px] font-mono text-slate-300">classify by cheap_fracs</div>
+                      <div class="text-[10px] font-mono text-slate-300">window fallback when prices empty</div>
+                      <div class="text-[10px] font-mono text-slate-300">per-slot pricing</div>
+                    </div>
+                    <div class="diagram-label text-center text-slate-500 py-1">implementation</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+            <div><dt class="font-semibold">Problem</dt><dd class="text-slate-600">A false seam: <code class="font-mono">backtest_cost</code> takes a <code class="font-mono">TariffSchedule</code> but reads only the two flat rates, and the CLI hand-builds a bare schedule with <code class="font-mono">prices=()</code>. On an Octopus Intelligent install the backtest — the input to the <strong>readiness signal</strong> — rates everything at a tariff the site isn't on.</dd></div>
+            <div><dt class="font-semibold">Solution</dt><dd class="text-slate-600">Classify each interval by <code class="font-mono">schedule.cheap_fracs</code>; drop the redundant window params; have the CLI build the schedule via <code class="font-mono">build_schedule</code> (candidate 1's module exposes it).</dd></div>
+          </dl>
+          <ul class="flex flex-wrap gap-2 text-xs">
+            <li class="rounded bg-emerald-50 text-emerald-800 px-2.5 py-1">Readiness signal measured on the real tariff</li>
+            <li class="rounded bg-emerald-50 text-emerald-800 px-2.5 py-1">Interface shrinks: 4 params → 2</li>
+            <li class="rounded bg-emerald-50 text-emerald-800 px-2.5 py-1">Dynamic-tariff backtest becomes writable as a test</li>
+          </ul>
+        </article>
+
+        <!-- ============ CANDIDATE 3 ============ -->
+        <article id="c3" class="rounded-xl border border-slate-200 bg-white p-6 space-y-5 shadow-sm">
+          <div class="flex items-start justify-between gap-4">
+            <h2 class="font-serif text-xl">3 · Move agent-exposure gating from build time to request time</h2>
+            <span class="shrink-0 rounded-full bg-emerald-100 text-emerald-800 text-xs font-semibold px-3 py-1">Strong</span>
+          </div>
+          <p class="font-mono text-sm text-slate-600">api/server.py:128-131,269,274 · agent/mcp_server.py:38 · scheduler.py:221 · config.py:392</p>
+
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <div class="grid grid-cols-2 gap-8">
+              <div>
+                <p class="diagram-label text-slate-400 mb-3">Before — gate read once, at build</p>
+                <div class="space-y-2">
+                  <div class="border border-slate-300 rounded p-2 text-[11px] font-mono bg-slate-50">build_app() reads exposure <span class="text-red-600">once</span> → routes frozen</div>
+                  <div class="border-t-2 border-red-600 relative"><span class="absolute -top-2.5 right-0 text-[10px] text-red-600 bg-white px-1">hot-reload drifts past the route table</span></div>
+                  <div class="border border-slate-300 rounded p-2 text-[11px] font-mono bg-slate-50">POST /api/config rewrites settings — routes unchanged until restart</div>
+                  <div class="border border-red-300 bg-red-50 rounded p-2 text-[11px] font-mono">agent_surface: <b>off</b> → /agent/* and /mcp still mounted behind ingress</div>
+                </div>
+              </div>
+              <div>
+                <p class="diagram-label text-slate-400 mb-3">After — one predicate, read per request</p>
+                <div class="border-2 border-slate-800 rounded-md overflow-hidden">
+                  <div class="bg-slate-800 text-white text-xs font-mono px-3 py-2">allowed(state, tier) → bool</div>
+                  <div class="p-3 space-y-1.5 bg-gradient-to-br from-slate-50 to-slate-100">
+                    <div class="text-xs font-mono text-slate-400">agent_surface == "off" → deny all</div>
+                    <div class="text-xs font-mono text-slate-400">exposure matrix (read / read_act / read_write)</div>
+                    <div class="text-xs font-mono text-slate-400">reads state.settings at call time</div>
+                  </div>
+                </div>
+                <p class="text-[11px] text-slate-500 mt-2">Both adapters — FastAPI dependency and MCP tool guard — call the same predicate. Two adapters: the seam is real.</p>
+              </div>
+            </div>
+          </div>
+
+          <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+            <div><dt class="font-semibold">Problem</dt><dd class="text-slate-600">The exposure matrix is written twice (HTTP router + MCP) and captured at build time, so hot-reload can't move it; and <code class="font-mono">agent_surface: off</code> — the shipped default, documented as the master switch — gates only the extra published port, not the ingress-mounted <code class="font-mono">/agent/*</code> and <code class="font-mono">/mcp</code>.</dd></div>
+            <div><dt class="font-semibold">Solution</dt><dd class="text-slate-600">Register routes/tools once; a single <code class="font-mono">allowed(state, tier)</code> predicate reads <code class="font-mono">state.settings</code> per call and folds <code class="font-mono">agent_surface</code> into the same gate.</dd></div>
+          </dl>
+          <ul class="flex flex-wrap gap-2 text-xs">
+            <li class="rounded bg-emerald-50 text-emerald-800 px-2.5 py-1">Config's stated interface becomes the implemented one</li>
+            <li class="rounded bg-emerald-50 text-emerald-800 px-2.5 py-1">Exposure matrix written once, not twice</li>
+            <li class="rounded bg-emerald-50 text-emerald-800 px-2.5 py-1">Hot-reload gate tests become writable</li>
+          </ul>
+          <div class="rounded-md bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-900">Security-relevant: CLAUDE.md requires every inbound surface be gated alike. Ingress is authenticated, so this is drift, not an open door — but the fix is the safe default.</div>
+        </article>
+
+        <!-- ============ CANDIDATE 4 ============ -->
+        <article id="c4" class="rounded-xl border border-slate-200 bg-white p-6 space-y-5 shadow-sm">
+          <div class="flex items-start justify-between gap-4">
+            <h2 class="font-serif text-xl">4 · Seal the Device seam — per-device config belongs in DeviceConfig</h2>
+            <span class="shrink-0 rounded-full bg-amber-100 text-amber-800 text-xs font-semibold px-3 py-1">Worth exploring</span>
+          </div>
+          <p class="font-mono text-sm text-slate-600">config.py:217-224,410-429 · devices/base.py:42-51 · devices/inverters/solis.py:28-60 · alphaess.py:67 · scheduler.py:181-200,234</p>
+
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <pre class="mermaid">
+flowchart LR
+  subgraph before ["BEFORE — config leaks around the seam"]
+    DC[DeviceConfig<br/>id · driver · entities] --> DEV[Device driver]
+    ST[Settings flat keys] -.->|"alphaess_serial<br/>max_charge_current_a<br/>battery params"| DEV
+    DEV --> HW[inverter]
+  end
+  subgraph after ["AFTER — DeviceConfig is the whole story"]
+    DC2["DeviceConfig<br/>id · driver · entities · params"] --> DEV2[Device driver]
+    DEV2 --> HW2[inverter]
+  end
+  classDef leak stroke:#dc2626,stroke-width:2px,color:#dc2626;
+  classDef deep fill:#1e293b,color:#fff;
+  class ST leak
+  class DEV2 deep
+            </pre>
+            <p class="text-xs text-slate-500 mt-2">Drivers read identity and limits straight from <code>Settings</code>, so a second device of the same driver is unrepresentable — two AlphaESS units would share one serial. The dual-read shim isn't a shim any more; it's a second, parallel config path.</p>
+          </div>
+
+          <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+            <div><dt class="font-semibold">Problem</dt><dd class="text-slate-600">The <code class="font-mono">Device</code> interface (4 members — genuinely deep) is undermined by its constructors reaching past <code class="font-mono">DeviceConfig</code> into flat <code class="font-mono">Settings</code> keys; <code class="font-mono">scheduler.py</code> still keys guard reconfiguration off the flat <code class="font-mono">settings.inverter</code>; and <code class="font-mono">capabilities</code> needs a live REST client to answer a no-I/O question.</dd></div>
+            <div><dt class="font-semibold">Solution</dt><dd class="text-slate-600">Push per-device knobs into <code class="font-mono">DeviceConfig</code> (typed fields or a <code class="font-mono">params</code> sibling of <code class="font-mono">entities</code>); flat keys feed synthesis only. Trivial adjacent deletions: <code class="font-mono">energy/chargers.py</code> (dead re-export) and both <code class="font-mono">supports_live_rate</code> attrs (superseded by <code class="font-mono">Capability.CHARGE_RATE</code>).</dd></div>
+          </dl>
+          <ul class="flex flex-wrap gap-2 text-xs">
+            <li class="rounded bg-amber-50 text-amber-800 px-2.5 py-1">Two devices per driver becomes representable</li>
+            <li class="rounded bg-amber-50 text-amber-800 px-2.5 py-1">Structured devices path finally testable end-to-end</li>
+            <li class="rounded bg-amber-50 text-amber-800 px-2.5 py-1">Dissolves scheduler's REST-client dance for capabilities</li>
+            <li class="rounded bg-emerald-50 text-emerald-800 px-2.5 py-1">Dead-code deletions: Strong, trivial</li>
+          </ul>
+        </article>
+
+        <!-- ============ CANDIDATE 5 ============ -->
+        <article id="c5" class="rounded-xl border border-slate-200 bg-white p-6 space-y-5 shadow-sm">
+          <div class="flex items-start justify-between gap-4">
+            <h2 class="font-serif text-xl">5 · Fold the habits "orchestrator" into one prediction module</h2>
+            <span class="shrink-0 rounded-full bg-amber-100 text-amber-800 text-xs font-semibold px-3 py-1">Worth exploring</span>
+          </div>
+          <p class="font-mono text-sm text-slate-600">energy/orchestrator.py (127) · cli.py:346-402 · energy/habits.py · energy/context.py · energy/ledger.py</p>
+
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <div class="grid grid-cols-2 gap-8">
+              <div>
+                <p class="diagram-label text-slate-400 mb-3">Before — shallow exports + a duplicate</p>
+                <div class="space-y-1.5">
+                  <div class="border border-slate-300 rounded px-2 py-1 text-[11px] font-mono bg-slate-50">decide_outcome() → <span class="text-red-600">return "advisory"</span></div>
+                  <div class="border border-slate-300 rounded px-2 py-1 text-[11px] font-mono bg-slate-50">decisions_for() → list comprehension</div>
+                  <div class="border border-slate-300 rounded px-2 py-1 text-[11px] font-mono bg-slate-50">_gather_context() ← the real behaviour</div>
+                  <div class="border border-red-400 bg-red-50 rounded px-2 py-1 text-[11px] font-mono">cli.py:346-402 — a second copy, without the try/except</div>
+                </div>
+              </div>
+              <div>
+                <p class="diagram-label text-slate-400 mb-3">After — one deep module</p>
+                <div class="border-2 border-slate-800 rounded-md overflow-hidden">
+                  <div class="bg-slate-800 text-white text-xs font-mono px-3 py-2">predictions_for_tomorrow(settings) → list[Decision]</div>
+                  <div class="p-3 space-y-1.5 bg-gradient-to-br from-slate-50 to-slate-100">
+                    <div class="text-xs font-mono text-slate-400">ledger + context store + HA statistics assembly</div>
+                    <div class="text-xs font-mono text-slate-400">away-date expansion · outcome mapping</div>
+                    <div class="text-xs font-mono text-slate-400">statistics-failure degradation</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+            <div><dt class="font-semibold">Problem</dt><dd class="text-slate-600">Shallow module — <code class="font-mono">decide_outcome</code> is 11 lines of docstring wrapping <code class="font-mono">return "advisory"</code>, extracted only so tests can call it — and the CLI reimplements <code class="font-mono">_gather_context</code> inline, minus the error handling. The name misleads: the real plan orchestration lives in <code class="font-mono">scheduler.py</code>.</dd></div>
+            <div><dt class="font-semibold">Solution</dt><dd class="text-slate-600">Rename to <code class="font-mono">habit_predictions.py</code> (or fold into <code class="font-mono">habits.py</code>), expose one function, delete the CLI copy.</dd></div>
+          </dl>
+          <ul class="flex flex-wrap gap-2 text-xs">
+            <li class="rounded bg-amber-50 text-amber-800 px-2.5 py-1">Locality: one HabitContext assembly, not two</li>
+            <li class="rounded bg-amber-50 text-amber-800 px-2.5 py-1">CLI inherits the daemon's error handling</li>
+            <li class="rounded bg-amber-50 text-amber-800 px-2.5 py-1">Name stops colliding with the real orchestrator</li>
+          </ul>
+        </article>
+
+        <!-- ============ CANDIDATE 6 ============ -->
+        <article id="c6" class="rounded-xl border border-slate-200 bg-white p-6 space-y-5 shadow-sm">
+          <div class="flex items-start justify-between gap-4">
+            <h2 class="font-serif text-xl">6 · Carve seams into run_forever — tick + server lifecycle</h2>
+            <span class="shrink-0 rounded-full bg-amber-100 text-amber-800 text-xs font-semibold px-3 py-1">Worth exploring</span>
+          </div>
+          <p class="font-mono text-sm text-slate-600">energy/scheduler.py:203-289 · tests/test_scheduler.py (six monkeypatched module attrs per test)</p>
+
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <div class="grid grid-cols-2 gap-8">
+              <div>
+                <p class="diagram-label text-slate-400 mb-3">Before — four concerns, no seam</p>
+                <div class="space-y-0.5">
+                  <div class="h-9 border-l-4 border-slate-400 bg-slate-50 px-2 flex items-center text-[11px] font-mono">ingress + agent-port uvicorn lifecycle</div>
+                  <div class="h-9 border-l-4 border-slate-400 bg-slate-50 px-2 flex items-center text-[11px] font-mono">supply-guard capability detection</div>
+                  <div class="h-9 border-l-4 border-slate-400 bg-slate-50 px-2 flex items-center text-[11px] font-mono">daily plan trigger + guard tick + signal sampling</div>
+                  <div class="h-9 border-l-4 border-red-500 bg-red-50 px-2 flex items-center text-[11px] font-mono text-red-700">tests monkeypatch 6 module attrs to run one loop</div>
+                </div>
+              </div>
+              <div>
+                <p class="diagram-label text-slate-400 mb-3">After — two named seams</p>
+                <div class="space-y-2">
+                  <div class="border-2 border-slate-800 rounded px-2 py-1.5 text-[11px] font-mono">async with api_servers(state, settings): …</div>
+                  <div class="border-2 border-slate-800 rounded px-2 py-1.5 text-[11px] font-mono">async def tick(state, now) → None</div>
+                  <div class="border border-slate-300 border-dashed rounded px-2 py-1.5 text-[11px] font-mono text-slate-500">run_forever = servers + clock + tick loop</div>
+                </div>
+                <p class="text-[11px] text-slate-500 mt-2">Tests call <code>tick</code> with a real clock value; <code>_FakeDatetime</code> and the fake-server plumbing go away.</p>
+              </div>
+            </div>
+          </div>
+
+          <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+            <div><dt class="font-semibold">Problem</dt><dd class="text-slate-600">Tests reach past the interface — they know the module's internal names, so renames break them and real wiring changes slip through. The interface is supposed to be the test surface; here there isn't one.</dd></div>
+            <div><dt class="font-semibold">Solution</dt><dd class="text-slate-600">Extract <code class="font-mono">api_servers</code> (context manager hiding both uvicorn servers and their teardown) and <code class="font-mono">tick(state, now)</code> (one loop iteration, clock passed in).</dd></div>
+          </dl>
+          <ul class="flex flex-wrap gap-2 text-xs">
+            <li class="rounded bg-amber-50 text-amber-800 px-2.5 py-1">Loop tests stop monkeypatching module internals</li>
+            <li class="rounded bg-amber-50 text-amber-800 px-2.5 py-1">Server lifecycle testable through one seam</li>
+            <li class="rounded bg-amber-50 text-amber-800 px-2.5 py-1">Pairs with candidate 4's no-REST capabilities fix</li>
+          </ul>
+        </article>
+
+        <!-- ============ CANDIDATE 7 ============ -->
+        <article id="c7" class="rounded-xl border border-slate-200 bg-white p-6 space-y-5 shadow-sm">
+          <div class="flex items-start justify-between gap-4">
+            <h2 class="font-serif text-xl">7 · Reservations exist in the domain model, not in the code</h2>
+            <span class="shrink-0 rounded-full bg-slate-200 text-slate-700 text-xs font-semibold px-3 py-1">Speculative</span>
+          </div>
+          <p class="font-mono text-sm text-slate-600">energy/planner.py:159-190 (ChargePlan) · report.py · publish.py · intent_parser.py · copilot.py</p>
+
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <div class="grid grid-cols-2 gap-8">
+              <div>
+                <p class="diagram-label text-slate-400 mb-3">Before — the plan is a bag of ~25 floats</p>
+                <div class="grid grid-cols-5 gap-1">
+                  <div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div><div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div><div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div><div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div><div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div>
+                  <div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div><div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div><div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div><div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div><div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div>
+                  <div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div><div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div><div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div><div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div><div class="h-6 bg-slate-100 border border-slate-300 rounded-sm"></div>
+                </div>
+                <p class="text-[11px] text-slate-500 mt-2">Every consumer — report, publish, intent parser, copilot — must understand every field individually.</p>
+              </div>
+              <div>
+                <p class="diagram-label text-slate-400 mb-3">After — plan lines trace to reservations</p>
+                <div class="border-2 border-slate-800 rounded-md overflow-hidden">
+                  <div class="bg-slate-800 text-white text-xs font-mono px-3 py-2">reservations: tuple[Reservation, ...]</div>
+                  <div class="p-3 bg-gradient-to-br from-slate-50 to-slate-100 text-xs font-mono text-slate-500">(at_time, kwh_target, reason)<br/>"reserve 3 kWh for the 17:00 event"</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+            <div><dt class="font-semibold">Problem</dt><dd class="text-slate-600">CONTEXT.md and ADR-0002 say every plan line must trace to a <strong>reservation</strong>; <code class="font-mono">grep -i reservation</code> across <code class="font-mono">ha_spark/</code> returns zero hits. The planner computes a single scalar deficit → target SoC.</dd></div>
+            <div><dt class="font-semibold">Solution</dt><dd class="text-slate-600">Not a refactor to do now — the thing to <em>design before the next planner feature</em> (flexibility events, V2L budget), since both must be expressed as reservations per ADR-0002. Stays inside merit-order + reservations; no optimizer.</dd></div>
+          </dl>
+          <ul class="flex flex-wrap gap-2 text-xs">
+            <li class="rounded bg-slate-100 text-slate-700 px-2.5 py-1">Copilot explains from one structure, not 25 fields</li>
+            <li class="rounded bg-slate-100 text-slate-700 px-2.5 py-1">Natural home for V2L budget + flexibility events</li>
+            <li class="rounded bg-slate-100 text-slate-700 px-2.5 py-1">Candidates 1–2 get easier once the plan is a richer value</li>
+          </ul>
+          <div class="rounded-md bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-900">Aligned with ADR-0002, not against it — this implements the reservation mechanism the ADR already committed to.</div>
+        </article>
+
+      </section>
+
+      <!-- ============ TOP RECOMMENDATION ============ -->
+      <section id="top-recommendation" class="rounded-xl border-2 border-emerald-600 bg-emerald-50/50 p-8 space-y-3">
+        <p class="diagram-label text-emerald-700">Top recommendation</p>
+        <h2 class="font-serif text-2xl"><a href="#c1" class="underline decoration-emerald-400 underline-offset-4">1 · Give the plan pipeline a module</a></h2>
+        <p class="text-sm text-slate-700 max-w-3xl">It fixes a live bug — agent, MCP, and offline-ask answers diverge from the daemon's plan on any non-fixed tariff — while creating the deep module candidates 2 and 7 want to build on. Deleting <code class="font-mono">compute_plan</code>'s <code class="font-mono">schedule=None</code> default turns the whole class of silent-fallback bugs into type errors, and the parity test it unlocks (daemon plan == agent plan under a dynamic tariff) is exactly the test the codebase can't write today.</p>
+      </section>
+
+      <footer class="text-xs text-slate-400 pt-4 border-t border-slate-200">
+        Agent vs API note: <code>agent/tools.py</code> behind its two adapters (FastAPI router, MCP) is the best-factored seam in the codebase — two adapters, real seam. The remaining duplication there is the exposure matrix (candidate 3) and the <code>GET /api/plan</code>-serves-cached vs <code>get_plan</code>-recomputes naming collision.
+      </footer>
+
+    </main>
+  </body>
+</html>

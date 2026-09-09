@@ -11,12 +11,12 @@ import dataclasses
 from datetime import UTC, date, datetime
 
 from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ha_spark.config import Settings
 from ha_spark.energy.context import ContextStore
 from ha_spark.energy.orchestrator import orchestrate
-from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.energy.sources import gather_inputs
 from ha_spark.ha.rest import HomeAssistantRest
@@ -30,6 +30,8 @@ class PlanResult(BaseModel):
 
 class StateResult(BaseModel):
     inputs: dict[str, object]
+    # {id, type, driver, control} per configured device — no entity IDs/secrets.
+    devices: list[dict[str, str]] = Field(default_factory=list)
 
 
 class ForecastResult(BaseModel):
@@ -56,8 +58,7 @@ def _rest(settings: Settings) -> HomeAssistantRest:
 
 async def get_plan(settings: Settings) -> PlanResult:
     async with _rest(settings) as rest:
-        inputs, cfg, _src = await gather_inputs(settings, rest)
-        plan = compute_plan(inputs, cfg)
+        plan = (await current_plan(settings, rest)).plan
     entities = [
         {"entity_id": eid, "state": value, "attributes": attrs}
         for eid, value, attrs in plan_to_payload(plan, settings)
@@ -70,15 +71,18 @@ async def get_state(settings: Settings) -> StateResult:
         inputs, _cfg, _src = await gather_inputs(settings, rest)
     data = jsonable_encoder(dataclasses.asdict(inputs))
     data.pop("load_slots", None)  # large; available via get_forecast
-    return StateResult(inputs=data)
+    devices = [
+        {"id": d.id, "type": d.type, "driver": d.driver, "control": d.control.value}
+        for d in settings.devices
+    ]
+    return StateResult(inputs=data, devices=devices)
 
 
 async def get_forecast(settings: Settings) -> ForecastResult:
     async with _rest(settings) as rest:
-        inputs, cfg, source = await gather_inputs(settings, rest)
-        plan = compute_plan(inputs, cfg)
-    slots = list(inputs.load_slots) if inputs.load_slots is not None else None
-    return ForecastResult(load_kwh=plan.load_kwh, slots=slots, source=source)
+        run = await current_plan(settings, rest)
+    slots = list(run.inputs.load_slots) if run.inputs.load_slots is not None else None
+    return ForecastResult(load_kwh=run.plan.load_kwh, slots=slots, source=run.load_source)
 
 
 async def get_predictions(settings: Settings) -> PredictionsResult:

@@ -21,7 +21,7 @@ from ha_spark.config import Settings
 async def test_published_port_requires_token(tmp_path: Path) -> None:
     settings = Settings(  # type: ignore[call-arg]
         ha_url="http://ha.test", ha_token="x", agent_api_token="sekret",
-        db_path=str(tmp_path / "t.db"),
+        db_path=str(tmp_path / "t.db"), agent_surface="on",
     )
     state = AppState(settings=settings, options_path=tmp_path / "options.json")
     token = resolve_token(settings, tmp_path / "agent_token")

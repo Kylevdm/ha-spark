@@ -11,8 +11,9 @@ from ha_spark import copilot
 from ha_spark.config import Settings
 from ha_spark.copilot import COPILOT_SYSTEM, build_grounding, grounded_system_prompt
 from ha_spark.energy.models import ChargeIntent, ChargePlan
+from ha_spark.energy.plan_run import PlanRun
 
-REST = object()  # only forwarded to gather_inputs (mocked)
+REST = object()  # only forwarded to current_plan (mocked)
 
 
 def _plan() -> ChargePlan:
@@ -29,11 +30,13 @@ def _plan() -> ChargePlan:
 
 
 async def test_build_grounding_renders_plan(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_gather(settings: Settings, rest: Any) -> tuple[object, object, str]:
-        return object(), object(), "slot profile (14d hourly house stats)"
+    async def fake_current_plan(settings: Settings, rest: Any) -> PlanRun:
+        return PlanRun(
+            plan=_plan(), inputs=object(), cfg=object(), schedule=object(),  # type: ignore[arg-type]
+            load_source="slot profile (14d hourly house stats)",
+        )
 
-    monkeypatch.setattr(copilot, "gather_inputs", fake_gather)
-    monkeypatch.setattr(copilot, "compute_plan", lambda inputs, cfg: _plan())
+    monkeypatch.setattr(copilot, "current_plan", fake_current_plan)
 
     grounding = await build_grounding(Settings(), REST)  # type: ignore[arg-type]
     assert grounding is not None
@@ -43,10 +46,10 @@ async def test_build_grounding_renders_plan(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 async def test_build_grounding_returns_none_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def boom(settings: Settings, rest: Any) -> tuple[object, object, str]:
+    async def boom(settings: Settings, rest: Any) -> PlanRun:
         raise RuntimeError("HA down")
 
-    monkeypatch.setattr(copilot, "gather_inputs", boom)
+    monkeypatch.setattr(copilot, "current_plan", boom)
     assert await build_grounding(Settings(), REST) is None  # type: ignore[arg-type]
 
 

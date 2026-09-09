@@ -9,7 +9,7 @@ Pure functions over data the earlier phases already accumulate:
 - ``learn_away_factor`` — the empirical load multiplier on past ``away``
   context periods (6C/6D) versus same-day-type normal days. Used in place of
   the configured ``away_load_factor`` once enough away history exists.
-- ``predict_actions`` — the seed of the usernotes ``predict_actions(context)``
+- ``predict_actions`` — the seed of the planned ``predict_actions(context)``
   habit API: advisory ``(action, confidence, reason)`` tuples the orchestrator
   logs or (later) executes, gated by ``PROACTIVE_MODE``. It never acts itself.
 

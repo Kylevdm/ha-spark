@@ -8,24 +8,36 @@ alone would pass even with a broken mount.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+from mcp.server.fastmcp.exceptions import ToolError
 
 from ha_spark.agent.mcp_server import build_mcp
 from ha_spark.api.server import AppState, build_app
 from ha_spark.config import Settings
 
 
-def _state(tmp_path: Path, exposure: str) -> AppState:
+def _state(tmp_path: Path, exposure: str, surface: str = "on") -> AppState:
+    options_path = tmp_path / "options.json"
+    settings_kw: dict[str, object] = {
+        "ha_url": "http://ha.test",
+        "ha_token": "x",
+        "db_path": str(tmp_path / "t.db"),
+        "agent_surface": surface,
+        "agent_exposure": exposure,
+    }
     return AppState(  # type: ignore[call-arg]
-        settings=Settings(  # type: ignore[call-arg]
-            ha_url="http://ha.test",
-            ha_token="x",
-            db_path=str(tmp_path / "t.db"),
-            agent_exposure=exposure,  # type: ignore[arg-type]
+        settings=Settings(**settings_kw),  # type: ignore[arg-type]
+        options_path=options_path,
+        # reload rebuilds Settings from the persisted options file merged over the
+        # original settings_kw (tests/test_agent_routes.py's pattern), so
+        # apply_options can model a runtime exposure change without load_settings().
+        reload=lambda: Settings(
+            **{**settings_kw, **json.loads(options_path.read_text(encoding="utf-8"))}
         ),
-        options_path=tmp_path / "options.json",
     )
 
 
@@ -78,6 +90,24 @@ def test_mcp_endpoint_initializes(tmp_path: Path) -> None:
     assert "serverInfo" in r.text
 
 
+def test_mcp_mount_404_when_surface_off(tmp_path: Path) -> None:
+    """agent_surface="off" must 404 the whole /mcp mount, as if never mounted."""
+    init = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "t", "version": "1"},
+        },
+    }
+    hdr = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+    with TestClient(build_app(_state(tmp_path, "read_write", surface="off"))) as client:
+        r = client.post("/mcp/", json=init, headers=hdr)
+    assert r.status_code == 404
+
+
 def test_mcp_requires_token_on_published_port(tmp_path: Path) -> None:
     """On the published port (require_token), /mcp must reject a token-less request.
 
@@ -103,3 +133,28 @@ def test_mcp_requires_token_on_published_port(tmp_path: Path) -> None:
         assert "sekret" not in no_token.text
         ok = client.post("/mcp/", json=init, headers={**hdr, "Authorization": "Bearer sekret"})
         assert ok.status_code == 200
+
+
+async def test_mcp_tools_follow_runtime_exposure_change(tmp_path: Path) -> None:
+    """Demoting exposure at runtime (AppState.apply_options, which POST /api/config
+    drives) shrinks list_tools and rejects calls on the same server -- the MCP
+    gate is evaluated per call, never captured at build_mcp time (#93)."""
+    state = _state(tmp_path, "read_write")
+    mcp = build_mcp(state)
+    assert "set_config" in {t.name for t in await mcp.list_tools()}
+
+    state.apply_options({"agent_exposure": "read"})
+    names = {t.name for t in await mcp.list_tools()}
+    assert "set_config" not in names and "run_plan" not in names
+    assert "get_plan" in names
+    with pytest.raises(ToolError):
+        await mcp.call_tool("set_config", {"updates": {}})
+
+
+async def test_mcp_denies_every_tool_when_surface_off(tmp_path: Path) -> None:
+    """agent_surface="off" is deny-all inside the MCP gate too: no tools are
+    listed and any call is rejected as an unknown tool (#93)."""
+    mcp = build_mcp(_state(tmp_path, "read_write", surface="off"))
+    assert await mcp.list_tools() == []
+    with pytest.raises(ToolError):
+        await mcp.call_tool("get_plan", {})
