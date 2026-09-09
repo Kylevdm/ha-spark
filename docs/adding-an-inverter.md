@@ -75,7 +75,7 @@ never reaches past the `Charger` interface into entity IDs or services.
    (currently `Literal["solis", "alphaess"]`).
 3. Add any new config fields the adapter needs (entity IDs, service params,
    serials) — blank-string defaults, documented with a comment, matching the
-   pattern of `charge_current_entity`, `charge_window_start_entity`,
+   pattern of `charge_current_entity`, `solis_control_hub`,
    `alphaess_serial`.
 4. Register the class in `charger_for`'s dict dispatch
    (`ha_spark/energy/chargers.py`):

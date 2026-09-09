@@ -80,7 +80,7 @@ incumbent's behaviour is decomposed and each rule assigned a disposition:
 |---|---|---|
 | 1 | Fixed overnight grid-charge, 23:30 → 05:30 at 60 A — **inverter-resident, not automation-driven** (see above) | **Replace** with planner-chosen dynamic charging (#84 force-charge + #46 replan cadence). Same outcome — cheap overnight charge — with the amount and timing chosen by the planner rather than a blunt fixed window. **Replacing it requires disarming the inverter's own timed window** (#100); disabling the mirror automations does not stop it. |
 | 2 | Discharge-off during Octopus dispatch slots | **Keep** — already implemented: the planner emits dispatch `holds`. |
-| 3 | Discharge-off while the car charges | **Keep as a safety floor.** Raise a stop-discharge hold whenever `ev_charging` is active (the Zappi input is already ingested via `ev_status_entity`). This covers ad-hoc boosts *outside* a formal dispatch slot, which today's dispatch-only `holds` miss. **Hard precondition of cutover.** The richer "charge the battery based on what the car is doing, weighing grid carbon" ambition is explicitly *not* this floor — it is a separate feature (#98). |
+| 3 | Discharge-off while the car charges | **Demoted, 2026-09-08 (map owner): not a cutover precondition.** The owner's supplier already controls EV charge timing, so ha-spark forcing a discharge-off floor is redundant control, not a safety gap. What's actually wanted is *awareness*, not a hold — most plausibly smart-charging visibility via the Octopus integration/API — which is unscoped and parked in map #78's fog rather than tracked on #84. The richer "charge the battery based on what the car is doing, weighing grid carbon" ambition remains a separate feature (#98). |
 | 4 | 05:30 "if dispatch still active, stay Off" boundary | **Drop** — an artefact of the fixed-window design that dissolves under dynamic planning plus rule 2. |
 
 The force-charge override path (register 43135) is uncontested — no incumbent
@@ -135,24 +135,37 @@ The four incumbent automations, for the rollback record:
 
 ## Consequences
 
+- **Control surface is native modbus, not the solax entities (#84, 2026-09-08).**
+  #82's provisional write-list reached for the solax `number.solisac_timed_*`
+  entities plus the `update_charge_discharge_times` commit button. #84 instead
+  carries the #87/#90 principle through to the surface live-fire chose: ha-spark
+  writes the timed-slot holding registers *natively* via `modbus.write_register`
+  on the thin `solis_control` overlay hub and verifies through that hub's own
+  `sensor.solis_control_*` entities, so the control path does not depend on the
+  solax integration. The solax `update_charge_discharge_times` button is itself
+  a `WRITE_MULTI` block write starting at 43143 (source: `plugin_solis.py`), so
+  writing that 8-register window block *is* the commit — there is no separate
+  commit step, and #57/#84's "shrink-before-grow" ordering rule is moot for a
+  single atomic block write and was dropped. Register semantics are now
+  ha-spark's to own (no tier-A source); the map covers the flash-endurance and
+  RTC-drift caveats. The overlay YAML is a one-time manual HA-config step
+  (`docs/solis-control-modbus-overlay.yaml`); auto-provisioning it from the
+  add-on is an open follow-up, not part of #84.
 - The current `solis.py` `power_switch = Off` write during `holds` is harmless
   while `simulate` holds, but it is **not** the full lifecycle takeover
-  requires (it never writes `On`, and its stop-discharge is dispatch-only, not
-  car-aware). Completing that — including the rule-3 `ev_charging` safety floor
-  as a cutover precondition — is #84's work, tracked there.
-- ha-spark must reproduce, before cutover, behaviour the incumbent got for free
-  from raw HA state (the car-charging discharge floor). The Zappi input is
-  already wired, so this is a planner rule, not a new integration.
+  requires (it never writes `On`, and its stop-discharge is dispatch-only).
+  Completing that is #84's work, tracked there. The rule-3 car-charging
+  discharge floor is **not** part of it — demoted 2026-09-08, see the ledger
+  above.
 - Carbon-aware, EV-coupled battery charging — "green now vs dirtier later" — is
   a genuinely new optimization objective (cost and carbon can conflict) and is
   spun out as **#98**, sequenced after #84. It does not block this decision or
   #84, and must stay compatible with ADR-0002 (auditable-over-optimal): any
   carbon lookahead expressed as a named reservation with a sentence-shaped
   reason, not an opaque multi-objective score.
-- **Disarming the timed window is a hard cutover precondition**, alongside the
-  rule-3 car-charging discharge floor. Both are tracked outside this ADR (#100
-  and #84 respectively). Until the window is disarmed, `proactive_mode = on` is
-  unsafe in a way `simulate` validation cannot reveal: simulate compares
+- **Disarming the timed window is a hard cutover precondition**, tracked
+  outside this ADR (#100). Until the window is disarmed, `proactive_mode = on`
+  is unsafe in a way `simulate` validation cannot reveal: simulate compares
   ha-spark's intentions against the incumbent, and the incumbent it is being
   compared against is partly the inverter itself.
 - The rollback surface is larger than "re-enable four automations". A full

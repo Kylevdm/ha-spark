@@ -69,6 +69,18 @@ def test_to_import_stats_builds_sorted_cumulative_sum() -> None:
     ]
 
 
+def test_to_import_stats_continues_from_start_sum() -> None:
+    """The rolling re-derivation anchors the cumulative ``sum`` on prior imported rows."""
+    t1 = _T0.replace(hour=(_T0.hour + 1) % 24)
+    later, earlier = max(_T0, t1), min(_T0, t1)
+    stats = to_import_stats([(earlier, 1.0), (later, 2.0)], start_sum=10.0)
+    # Cumulative: 10 + 1 = 11, 11 + 2 = 13.
+    assert stats == [
+        {"start": earlier.isoformat(), "state": 1.0, "sum": 11.0},
+        {"start": later.isoformat(), "state": 2.0, "sum": 13.0},
+    ]
+
+
 def _settings() -> Settings:
     return Settings(ha_url="http://ha.test", ha_token="t")
 
