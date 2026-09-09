@@ -351,8 +351,8 @@ trigger a few gated actions.
 - `agent_surface` (`off` | `on`): master switch, off by default.
 - `agent_exposure` (`read` | `read_act` | `read_write`, default `read_act`):
   how much is exposed. `read` is data-only (states, plan, forecast,
-  predictions, health). `read_act` additionally exposes `add_context` and
-  `run_plan`. `read_write` additionally exposes `set_config`.
+  predictions, health). `read_act` also exposes `add_context` and
+  `run_plan`. `read_write` also exposes `set_config`.
 - `agent_api_token`: bearer token for the published port. Leave blank and the
   add-on generates one on first start and prints it **once** to the add-on
   log; it's a `password` field, so it's never shown back in the UI.
@@ -373,7 +373,7 @@ published port require the bearer token.
   (Streamable HTTP) connector at `http://<host>:8098/mcp`, with the same
   bearer token. The server 307-redirects `/mcp` to `/mcp/`, which MCP clients
   follow automatically.
-- **claude.ai (web)** additionally needs a public HTTPS endpoint in front of
+- **claude.ai (web)** also needs a public HTTPS endpoint in front of
   the published port, such as a reverse proxy or Nabu Casa, since claude.ai
   cannot reach a bare LAN/Tailnet address. That's a deployment step you
   manage yourself, not something the add-on sets up.
