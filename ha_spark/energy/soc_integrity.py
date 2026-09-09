@@ -133,6 +133,9 @@ def check_soc(
     if raw.strip().lower() in _UNAVAILABLE_STATES:
         return fail
 
+    # Parsed here rather than through sources._opt_float: sources imports this
+    # module (reuse would be circular), and _opt_float cannot tell a malformed
+    # state from a non-finite one, which are separate diagnostic evidence.
     try:
         value = float(raw)
     except (TypeError, ValueError):

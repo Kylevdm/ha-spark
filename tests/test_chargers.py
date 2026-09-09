@@ -492,6 +492,78 @@ async def test_on_blocks_all_writes_when_soc_invalid() -> None:
 
 
 @respx.mock
+@pytest.mark.parametrize(
+    ("measurement", "evidence"),
+    [
+        (
+            SocMeasurement(
+                status=SocStatus.STALE,
+                observed_at=datetime.now(UTC),
+                value=55.0,
+                raw_state="55.0",
+                reported_at=datetime.now(UTC),
+                age_s=900.0,
+                max_age_s=600.0,
+            ),
+            "900s",
+        ),
+        (
+            SocMeasurement(
+                status=SocStatus.MALFORMED,
+                observed_at=datetime.now(UTC),
+                raw_state="forty",
+                max_age_s=600.0,
+            ),
+            "forty",
+        ),
+        (
+            SocMeasurement(
+                status=SocStatus.READ_FAILED,
+                observed_at=datetime.now(UTC),
+                max_age_s=600.0,
+            ),
+            "read from Home Assistant failed",
+        ),
+    ],
+    ids=["stale", "malformed", "read_failed"],
+)
+async def test_on_blocks_writes_for_every_failed_status(
+    measurement: SocMeasurement, evidence: str
+) -> None:
+    """Any failed integrity status blocks real writes and names its own reason."""
+    posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    s = _settings(proactive_mode="on")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        lines = await _solis_device(s, rest).apply(_intent(soc=measurement))
+
+    assert posts.call_count == 0
+    assert all(line.startswith("[BLOCKED]") for line in lines)
+    assert any(evidence in line for line in lines)
+
+
+@respx.mock
+async def test_alphaess_on_blocks_writes_for_a_stale_soc() -> None:
+    """AlphaESS refuses new programming on any failed integrity observation."""
+    posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    stale = SocMeasurement(
+        status=SocStatus.STALE,
+        observed_at=datetime.now(UTC),
+        value=55.0,
+        raw_state="55.0",
+        reported_at=datetime.now(UTC),
+        age_s=900.0,
+        max_age_s=600.0,
+    )
+    s = _settings(proactive_mode="on", inverter="alphaess")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        lines = await _alpha_device(s, rest).apply(_intent(soc=stale))
+
+    assert posts.call_count == 0
+    assert all(line.startswith("[BLOCKED]") for line in lines)
+    assert any("900s" in line for line in lines)
+
+
+@respx.mock
 async def test_on_does_not_block_genuine_zero_soc() -> None:
     """A real 0% reading (soc ok) must NOT be blocked -- that's exactly
     the moment a real charge is most needed."""

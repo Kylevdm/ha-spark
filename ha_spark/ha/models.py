@@ -7,6 +7,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError, field_validator
 
+# Built once: TypeAdapter construction is not free, and this runs per entity read.
+_DATETIME_ADAPTER = TypeAdapter(datetime)
+
 
 class EntityState(BaseModel):
     """A single entity's state as returned by ``/api/states`` or a state event."""
@@ -22,18 +25,20 @@ class EntityState(BaseModel):
     # value must stay usable, which `last_changed`/`last_updated` cannot express.
     last_reported: datetime | None = None
 
-    @field_validator("last_changed", "last_updated", "last_reported", mode="before")
+    @field_validator("last_reported", mode="before")
     @classmethod
-    def _tolerate_bad_timestamps(cls, value: Any) -> Any:
-        """An unparseable timestamp degrades to None rather than failing the read.
+    def _tolerate_bad_report_time(cls, value: Any) -> Any:
+        """An unparseable `last_reported` degrades to None rather than failing the read.
 
-        These come from outside the process; one malformed field must not make
+        It comes from outside the process and gates actuation, so a malformed
+        value must reach the SoC integrity check as "unusable" rather than make
         the whole entity state unreadable for every other consumer.
+        `last_changed`/`last_updated` keep their existing strict behaviour.
         """
         if value is None or isinstance(value, datetime):
             return value
         try:
-            return TypeAdapter(datetime).validate_python(value)
+            return _DATETIME_ADAPTER.validate_python(value)
         except ValidationError:
             return None
 
