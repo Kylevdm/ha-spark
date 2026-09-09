@@ -50,6 +50,7 @@ from ha_spark.energy.report import format_plan
 from ha_spark.energy.sources import parse_time
 from ha_spark.energy.supply_guard import SupplyGuard
 from ha_spark.energy.tariff import _in_overnight_window as in_window
+from ha_spark.energy.v2l import run_v2l_tick
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -326,6 +327,11 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                     last_signal_at = now
                 except Exception:
                     log.exception("Signal sampling failed; will retry next tick")
+            if settings.v2l_power_entity:
+                try:
+                    await run_v2l_tick(settings, now)
+                except Exception:
+                    log.exception("V2L tick failed; will retry next tick")
             await asyncio.sleep(poll_seconds)
     finally:
         if serve_task is not None:
