@@ -24,6 +24,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | Option | What it must be |
 |---|---|
 | `soc_entity` | Battery state of charge (%) |
+| `soc_max_report_age_minutes` | How old Home Assistant's `last_reported` for `soc_entity` may be before the SoC is treated as stale and real charge writes are blocked (default `10.0`) |
 | `battery_voltage_entity` | Battery voltage (V) |
 | `solar_tomorrow_entity` | Solcast "forecast tomorrow" sensor (with `detailedForecast` attribute) |
 | `octopus_rate_entity` | Octopus current electricity rate sensor |
