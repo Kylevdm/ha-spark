@@ -4,7 +4,8 @@ Shared by both router tiers (Phase 6D): the remote LLM extracts a fact as
 strict JSON, the offline parser extracts the same shape with deterministic
 date parsing, and both funnel through one validated :class:`ExtractedContext`
 and one :func:`record_context` writer. This path only ever *writes reviewable
-facts* to the context store — it never actuates hardware (a ROADMAP non-goal).
+facts* to the context store — it never actuates hardware (a CLAUDE.md
+non-goal).
 Every recorded fact is echoed back with its planner effect and an undo command.
 """
 
