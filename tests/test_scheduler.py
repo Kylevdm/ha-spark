@@ -12,8 +12,8 @@ import respx
 
 from ha_spark.api.server import AppState
 from ha_spark.config import Settings
+from ha_spark.devices import inverter_device
 from ha_spark.energy import scheduler, sources
-from ha_spark.energy.chargers import charger_for
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, LoadForecast
@@ -47,7 +47,7 @@ def _plan(intent: ChargeIntent = _INTENT) -> ChargePlan:
 def _planned_w(settings: Settings, intent: ChargeIntent) -> float:
     """The watts the active charger plans for ``intent`` (pure)."""
     rest = HomeAssistantRest(settings.ha_rest_url, settings.auth_token)
-    return charger_for(settings, rest).planned_rate_w(intent)
+    return inverter_device(settings, rest).planned_rate_w(intent)
 
 
 def test_should_run_at_or_after_run_time_once_per_day() -> None:
@@ -103,6 +103,67 @@ async def test_run_once_computes_and_applies_plan(
     assert rows[0].model == "baseline"
     assert rows[0].total_kwh == plan.load_kwh
     assert rows[0].source == "test"
+
+
+@respx.mock
+async def test_dynamic_plan_parity_between_scheduler_and_agent_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#91: under ``tariff_provider="dynamic"`` the daily scheduler and the agent
+    ``get_plan`` surface must cost against the *same* live prices. Before the fix
+    ``get_plan`` silently used the fixed fallback, so its cost differed from the
+    plan the daemon applied.
+
+    The issue frames this as identical ``slot_prices``, but the agent payload
+    never exposes ``slot_prices`` (see ``plan_to_payload``); ``baseline_cost``
+    sums each slot at its live import price, so it is the faithful price-derived
+    observable that stands in for the raw prices here."""
+    from ha_spark.agent import tools
+
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        # 48 slot-of-day kWh -> triggers the v2 slot horizon (and slot_prices).
+        return LoadForecast(total_kwh=24.0, slots=tuple(0.5 for _ in range(48)), source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+
+    # One wide live-rate point spanning the whole horizon at a distinctive price,
+    # so every slot is priced 0.99 regardless of today's date — nothing like the
+    # fixed 0.069/0.30, so a fixed-fallback bug would show up in the cost.
+    now = datetime.now(UTC)
+    rates = [{
+        "start": (now - timedelta(days=1)).isoformat(),
+        "end": (now + timedelta(days=3)).isoformat(),
+        "value_inc_vat": 0.99,
+    }]
+    respx.get("http://ha.test/api/states/sensor.dynamic_rates").mock(
+        return_value=httpx.Response(
+            200, json={"entity_id": "sensor.dynamic_rates", "state": "0.99",
+                       "attributes": {"rates": rates}},
+        )
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="off",
+        db_path=str(tmp_path / "ledger.db"),
+        tariff_provider="dynamic", dynamic_rates_entity="sensor.dynamic_rates",
+    )
+
+    plan = await run_once(s)
+    # The dynamic schedule actually flowed through the daemon's plan.
+    assert plan.model == "slots"
+    assert plan.slot_prices == tuple(0.99 for _ in range(48))
+
+    # baseline_cost tallies each slot at its live import price, so it reflects the
+    # 0.99 dynamic prices (unlike planned_cost, which costs at the representative
+    # cheap/standard rates). Under the old bug get_plan would report the fixed
+    # fallback's baseline here, diverging from the daemon's.
+    result = await tools.get_plan(s)
+    baseline_cost = next(
+        e["state"] for e in result.plan if e["entity_id"] == "sensor.ha_spark_baseline_cost"
+    )
+    assert baseline_cost == f"{plan.baseline_cost:.2f}"
 
 
 async def test_run_forever_runs_once_per_day_and_retries_on_error(
@@ -361,7 +422,10 @@ async def test_guard_tick_adopts_setpoint_as_target_on_restart() -> None:
         ha_url="http://ha.test", ha_token="t", proactive_mode="simulate",
         grid_power_entity="sensor.house_supply_power", battery_voltage_v=51.0,
     )
-    for entity, state in ((s.grid_power_entity, "2000"), (s.charge_current_entity, "30")):
+    for entity, state in (
+        (s.grid_power_entity, "2000"),
+        ("sensor.solis_control_timed_charge_current", "30"),
+    ):
         respx.get(f"http://ha.test/api/states/{entity}").mock(
             return_value=httpx.Response(
                 200, json={"entity_id": entity, "state": state, "attributes": {}}
@@ -519,3 +583,139 @@ async def test_run_once_logs_proactive_decisions(
         await run_once(s)
 
     assert any("Proactive decision" in r.message for r in caplog.records)
+
+
+@respx.mock
+async def test_run_once_triggers_derived_rerive_when_configured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Scheduled plan run also re-derives trailing base-load history when configured."""
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+
+    rerive_calls: list[object] = []
+
+    async def fake_rerive(
+        settings: Settings,
+        specs: dict[str, object],
+        *,
+        statistic_id: str,
+        statistic_name: str,
+        window_hours: int = 48,
+    ) -> object:
+        rerive_calls.append(specs)
+        from datetime import UTC, datetime
+
+        from ha_spark.energy.derived_base_load import DerivedBackfillResult
+        return DerivedBackfillResult(
+            rows_imported=10,
+            span="2026-06-11 00:00 .. 2026-06-11 09:00 UTC",
+            degradation=[],
+            negative_clamped=0,
+            coverage={"grid_import": (datetime(2026, 6, 10, tzinfo=UTC),
+                                      datetime(2026, 6, 11, tzinfo=UTC))},
+        )
+
+    monkeypatch.setattr(scheduler, "rerive_trailing_window", fake_rerive)
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="off",
+        db_path=str(tmp_path / "ledger.db"),
+        derive_grid_import_entity="sensor.grid_import",
+    )
+    with caplog.at_level("INFO"):
+        await run_once(s)
+    assert len(rerive_calls) == 1
+    assert "10 rows upserted" in caplog.text
+
+
+@respx.mock
+async def test_run_once_skips_derived_rerive_without_grid_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No grid import configured -> rerive is a no-op (source-entity path still works)."""
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+
+    rerive_calls: list[object] = []
+
+    async def fake_rerive(*args: object, **kwargs: object) -> object:
+        rerive_calls.append(args)
+        raise AssertionError("should not be called without grid import")
+
+    monkeypatch.setattr(scheduler, "rerive_trailing_window", fake_rerive)
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="off",
+        db_path=str(tmp_path / "ledger.db"),
+    )
+    await run_once(s)
+    assert rerive_calls == []
+
+
+@respx.mock
+async def test_run_once_rerive_failure_does_not_block_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rerive failure is logged but never aborts the plan run."""
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+
+    async def boom_rerive(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("ws down")
+
+    monkeypatch.setattr(scheduler, "rerive_trailing_window", boom_rerive)
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="off",
+        db_path=str(tmp_path / "ledger.db"),
+        derive_grid_import_entity="sensor.grid_import",
+    )
+    with caplog.at_level("INFO"):
+        await run_once(s)
+    assert any("Derived base-load rerive failed" in r.message for r in caplog.records)
+    # The plan still ran successfully.
+    assert any("Charge plan" in r.message for r in caplog.records)
+
+
+def test_derive_specs_for_scheduler_uses_shared_helper() -> None:
+    """The scheduler reads the shared derive_specs_from_settings helper.
+
+    A duplicate helper here would let the CLI and scheduler drift apart
+    (different defaults for the same Settings options); the test pins
+    that both code paths read from the same module-level mapper.
+    """
+    from ha_spark.energy import scheduler
+    from ha_spark.energy.derived_base_load import derive_specs_from_settings
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t",
+        derive_grid_import_entity="sensor.gi",
+        derive_solar_generation_entity="sensor.sol",
+        derive_invert_grid_export=True,
+    )
+    # The scheduler module exposes the same helper, not its own copy.
+    assert scheduler.derive_specs_from_settings is derive_specs_from_settings
+    specs = derive_specs_from_settings(s)
+    assert specs["grid_import"].entity_id == "sensor.gi"
+    assert specs["solar_generation"].entity_id == "sensor.sol"
+    # Grid export is not configured (no entity) but the invert flag is set;
+    # the helper must not include it when no entity id is present.
+    assert "grid_export" not in specs

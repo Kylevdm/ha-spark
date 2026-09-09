@@ -33,6 +33,13 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
         lines.append(
             f"  Peak-slot load     {plan.expensive_load_kwh:.2f} kWh (after solar)"
         )
+    if plan.slot_prices:
+        lo, hi = min(plan.slot_prices), max(plan.slot_prices)
+        cheap = sum(1 for p in plan.slot_prices if p <= lo + 1e-9)
+        lines.append(
+            f"  Slot import price  £{lo:.3f}–£{hi:.3f}/kWh  "
+            f"({cheap}/{len(plan.slot_prices)} slots cheap)"
+        )
     deficit = f"{plan.deficit_kwh:.2f} kWh"
     if plan.buffer_pct > 0 and plan.deficit_kwh > 0:
         buffered = plan.deficit_kwh * (1.0 + plan.buffer_pct / 100.0)

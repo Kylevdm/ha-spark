@@ -18,25 +18,31 @@ import yaml
 
 from ha_spark.config import ConfigError, Settings, load_settings
 from ha_spark.dashboard import build_dashboard
+from ha_spark.devices import inverter_device
 from ha_spark.energy import habits
 from ha_spark.energy.backtest import backtest_cost, format_backtest
-from ha_spark.energy.chargers import charger_for
 from ha_spark.energy.context import KINDS, ContextStore
+from ha_spark.energy.derived_base_load import (
+    BACKFILL_NAME,
+    backfill_derived_load,
+    derive_specs_from_settings,
+)
 from ha_spark.energy.eval import actual_kwh_by_date, evaluate, format_eval
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ConsumptionInterval
 from ha_spark.energy.octopus import OctopusApiError, fetch_consumption, parse_octopus_csv
 from ha_spark.energy.onboarding import (
+    BACKFILL_LOOKBACK_DAYS,
     BACKFILL_STATISTIC_ID,
     SUPPORTED_UNITS,
     backfill_load,
     statistic_unit,
 )
-from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever, run_once
-from ha_spark.energy.sources import _to_float, gather_inputs, parse_time
+from ha_spark.energy.sources import _to_float
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.energy.v2l import load_session, savings
 from ha_spark.ha.models import StateChangedEvent
@@ -128,13 +134,13 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        inputs, cfg, load_source = await gather_inputs(settings, rest)
-        plan = compute_plan(inputs, cfg)
+        run = await current_plan(settings, rest)
+        plan, load_source = run.plan, run.load_source
         print(format_plan(plan, load_source))
         if apply:
             intent = plan.charge_intent
             assert intent is not None  # planner always sets it
-            lines = await charger_for(settings, rest).apply(intent)
+            lines = await inverter_device(settings, rest).apply(intent)
             print(f"\nActions (PROACTIVE_MODE={settings.proactive_mode}):")
             for line in lines:
                 print(f"  {line}")
@@ -255,8 +261,26 @@ async def _cmd_generate_dashboard(settings: Settings, *, output: str) -> int:
     return 0
 
 
-async def _cmd_backfill_load(settings: Settings, *, source: str | None, list_only: bool) -> int:
-    """Backfill ha_spark:house_load from an existing statistic, or list candidates."""
+async def _cmd_backfill_load(
+    settings: Settings, *, source: str | None, list_only: bool, derive: bool
+) -> int:
+    """Backfill ha_spark:house_load from an existing statistic, or list candidates.
+
+    Two paths write the same external id (``ha_spark:house_load``) so the
+    forecast chain (``consumption_energy_entity``) consumes the result
+    unchanged — no need to repoint between paths:
+
+    - The source-entity path (``--from`` / ``BACKFILL_SOURCE_ENTITY``)
+      copies a single power/energy sensor's hourly rows into the target.
+    - The derived path (``--derive``, enabled by setting any
+      ``derive_*_entity`` option) computes base load by energy balance
+      over per-component statistic IDs and writes the result to the same
+      target.
+
+    The two paths are mutually exclusive at dispatch so they never run
+    in the same session. ``--list`` shows backfill-capable source
+    candidates regardless of which path is in use.
+    """
     if list_only:
         metas = await list_statistic_ids(
             settings.ha_websocket_url, settings.auth_token, timeout=settings.ha_timeout
@@ -266,6 +290,48 @@ async def _cmd_backfill_load(settings: Settings, *, source: str | None, list_onl
             kind = "mean power" if meta.get("has_mean") else "energy sum"
             print(f"{meta['statistic_id']:<70} {statistic_unit(meta):<4} ({kind})")
         print(f"\n{len(candidates)} backfill-capable statistics.")
+        return 0
+    if derive:
+        specs = derive_specs_from_settings(settings)
+        if not specs.get("grid_import") or not specs["grid_import"].entity_id:
+            print(
+                "Derived backfill requires DERIVE_GRID_IMPORT_ENTITY; "
+                "configure it or use --from for the source-entity path.",
+                file=sys.stderr,
+            )
+            return 2
+        from datetime import UTC, datetime, timedelta  # local import: keeps CLI startup lean
+
+        start = datetime.now(UTC) - timedelta(days=BACKFILL_LOOKBACK_DAYS)
+        try:
+            result = await backfill_derived_load(
+                settings,
+                specs,
+                statistic_id=BACKFILL_STATISTIC_ID,
+                statistic_name=BACKFILL_NAME,
+                start=start,
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(f"Derived backfill failed: {exc}", file=sys.stderr)
+            return 2
+        print(
+            f"Imported {result.rows_imported} hourly stats ({result.span}) "
+            f"into {BACKFILL_STATISTIC_ID}."
+        )
+        if result.negative_clamped:
+            print(
+                f"⚠ {result.negative_clamped} hour(s) had a negative derived base "
+                "(clamped to zero) — check derive_invert_* flags."
+            )
+        if result.degradation:
+            print("Notes:")
+            for note in result.degradation:
+                print(f"  {note}")
+        print(
+            f"{BACKFILL_STATISTIC_ID} now holds the derived base-load series; "
+            "point CONSUMPTION_ENERGY_ENTITY at it (or run `ha-spark onboard` "
+            "to confirm readiness)."
+        )
         return 0
     entity = source or settings.backfill_source_entity
     if not entity:
@@ -317,25 +383,28 @@ def _cmd_import_csv(settings: Settings, paths: list[str]) -> int:
 
 
 async def _cmd_backtest(settings: Settings, *, days: int) -> int:
-    """Rate stored grid import under the two-rate tariff and print the summary."""
+    """Rate stored grid import under the current tariff schedule and print the summary."""
     since = datetime.now(UTC) - timedelta(days=days)
     async with ConsumptionStore(settings.db_path) as store:
         intervals = await store.load_since(since)
-    summary = backtest_cost(
-        intervals,
-        window_start=parse_time(settings.charge_window_start),
-        window_end=parse_time(settings.charge_window_end),
-        rate_offpeak=settings.rate_offpeak_gbp_kwh,
-        rate_peak=settings.rate_peak_gbp_kwh,
-        tz=load_timezone(settings.timezone),
-    )
-    if summary is None:
+    if not intervals:
         print(
             "No stored consumption in the window; run `import-csv` or "
             "`pull-consumption` first.",
             file=sys.stderr,
         )
         return 2
+    # Cost against the same schedule the planner runs on (the dynamic/intelligent
+    # cheap pattern isn't in the stored kWh) — a fixed install degrades to the
+    # two flat rates, exactly as before.
+    async with HomeAssistantRest(
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+    ) as rest:
+        run = await current_plan(settings, rest)
+    summary = backtest_cost(
+        intervals, schedule=run.schedule, tz=load_timezone(settings.timezone)
+    )
+    assert summary is not None  # intervals is non-empty
     print(format_backtest(summary))
     return 0
 
@@ -641,22 +710,37 @@ def build_parser() -> argparse.ArgumentParser:
     p_bf = sub.add_parser(
         "backfill-load",
         help="Rebuild house-load history from an existing HA statistic",
-        description="Read hourly long-term statistics from a source entity (mean-power "
-        "W/kW or energy Wh/kWh — unit auto-detected), convert to hourly kWh, and import "
-        "them as the external statistic ha_spark:house_load via the recorder WS API. "
-        "Afterwards set CONSUMPTION_ENERGY_ENTITY=ha_spark:house_load. Idempotent.",
+        description="Rebuild ha_spark:house_load history for the load forecast. Two "
+        "paths write the same external id (the forecast chain consumes it "
+        "unchanged, no need to repoint ``consumption_energy_entity``): the "
+        "source-entity path (``--from`` / ``BACKFILL_SOURCE_ENTITY``) copies a "
+        "single power/energy sensor's hourly rows into ``ha_spark:house_load``, "
+        "and the derived path (``--derive``) computes base load by energy "
+        "balance over per-component statistic IDs (``derive_grid_import_entity`` "
+        "etc., with explicit invert flags) and writes the result to the same id. "
+        "Both paths are idempotent (recorder upserts by statistic_id+start); "
+        "they are mutually exclusive at dispatch. ``--list`` shows "
+        "backfill-capable source candidates regardless of path.",
     )
     p_bf.add_argument(
         "--from",
         dest="source",
         metavar="ENTITY_ID",
-        help="Source statistic to build history from (default: BACKFILL_SOURCE_ENTITY)",
+        help="Source statistic to build history from (default: BACKFILL_SOURCE_ENTITY). "
+        "Mutually exclusive with --derive.",
     )
     p_bf.add_argument(
         "--list",
         dest="list_only",
         action="store_true",
         help="List backfill-capable statistics (with units) instead of importing",
+    )
+    p_bf.add_argument(
+        "--derive",
+        dest="derive",
+        action="store_true",
+        help="Derive base load from per-component statistic IDs (DERIVE_*_ENTITY "
+        "options). Writes the derived series into ha_spark:house_load.",
     )
 
     p_csv = sub.add_parser(
@@ -801,8 +885,20 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_cmd_generate_dashboard(settings, output=args.output))
 
     if args.command == "backfill-load":
+        if args.derive and (args.source or settings.backfill_source_entity):
+            print(
+                "--derive and --from / BACKFILL_SOURCE_ENTITY are mutually exclusive; "
+                "pick one path.",
+                file=sys.stderr,
+            )
+            return 2
         return asyncio.run(
-            _cmd_backfill_load(settings, source=args.source, list_only=args.list_only)
+            _cmd_backfill_load(
+                settings,
+                source=args.source,
+                list_only=args.list_only,
+                derive=args.derive,
+            )
         )
 
     if args.command == "import-csv":

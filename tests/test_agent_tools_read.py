@@ -24,6 +24,20 @@ async def test_get_plan_returns_entities(tmp_path: Path) -> None:
     assert isinstance(result.plan, list)
 
 
+@respx.mock
+async def test_get_state_reports_device_control(tmp_path: Path) -> None:
+    respx.get("http://ha.test/api/states").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    s = Settings(  # type: ignore[call-arg]
+        ha_url="http://ha.test", ha_token="x", db_path=str(tmp_path / "t.db"), inverter="solis"
+    )
+    result = await tools.get_state(s)
+    assert result.devices == [
+        {"id": "main_inverter", "type": "inverter", "driver": "solis", "control": "ha_spark"}
+    ]
+
+
 async def test_get_context_lists_added_facts(tmp_path: Path) -> None:
     s = _settings(tmp_path)
     from ha_spark.energy.context import ContextStore

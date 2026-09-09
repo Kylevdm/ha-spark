@@ -1,6 +1,6 @@
 ---
 name: ha-spark
-version: "0.13.0"
+version: "0.15.0"
 slug: ha_spark_addon
 description: Local-first battery charge planner and automation agent for Home Assistant
 url: https://github.com/Kylevdm/ha-spark
@@ -46,11 +46,35 @@ options:
   rate_offpeak_gbp_kwh: 0.069
   rate_peak_gbp_kwh: 0.30
   rate_export_gbp_kwh: 0.0
+  tariff_provider: fixed
+  dynamic_rates_entity: ""
+  dynamic_rates_entity_tomorrow: ""
   profile_min_days: 7
   profile_history_days: 60
   timezone: Europe/London
   plan_run_time: "22:00"
+  # Derived base-load (ADR-0001): per-component statistic IDs. Grid import is
+  # required when any are set; the others contribute zero with a degradation
+  # note when unset. The invert flags are explicit — never inferred.
+  derive_grid_import_entity: ""
+  derive_grid_export_entity: ""
+  derive_solar_generation_entity: ""
+  derive_battery_charge_entity: ""
+  derive_battery_discharge_entity: ""
+  derive_ev_charge_entity: ""
+  derive_invert_grid_import: false
+  derive_invert_grid_export: false
+  derive_invert_solar_generation: false
+  derive_invert_battery_charge: false
+  derive_invert_battery_discharge: false
+  derive_invert_ev_charge: false
+  octopus_api_key: ""
+  octopus_mpan: ""
+  octopus_meter_serial: ""
   octopus_api_url: "https://api.octopus.energy/v1"
+  octopus_account_number: ""
+  octopus_product_code: ""
+  octopus_tariff_code: ""
   soc_entity: ""
   battery_voltage_entity: ""
   solar_tomorrow_entity: ""
@@ -65,9 +89,10 @@ options:
   inverter_power_switch_entity: ""
   ha_template_charge_needed_entity: ""
   inverter: solis
-  charge_window_start_entity: ""
-  charge_window_end_entity: ""
+  solis_control_hub: "solis_control"
+  solis_modbus_slave: 1
   alphaess_serial: ""
+  devices: []
   outdoor_weather_entity: weather.home
   load_model: auto
   buffer_mode: fixed
@@ -110,15 +135,33 @@ schema:
   rate_offpeak_gbp_kwh: float
   rate_peak_gbp_kwh: float
   rate_export_gbp_kwh: float
+  tariff_provider: list(fixed|dynamic|octopus_intelligent)
+  dynamic_rates_entity: str
+  dynamic_rates_entity_tomorrow: str
   profile_min_days: int
   profile_history_days: int
   timezone: str
   plan_run_time: match(^\d{2}:\d{2}$)
   backfill_source_entity: str?
+  derive_grid_import_entity: str?
+  derive_grid_export_entity: str?
+  derive_solar_generation_entity: str?
+  derive_battery_charge_entity: str?
+  derive_battery_discharge_entity: str?
+  derive_ev_charge_entity: str?
+  derive_invert_grid_import: bool
+  derive_invert_grid_export: bool
+  derive_invert_solar_generation: bool
+  derive_invert_battery_charge: bool
+  derive_invert_battery_discharge: bool
+  derive_invert_ev_charge: bool
   octopus_api_key: password?
   octopus_mpan: str?
   octopus_meter_serial: str?
   octopus_api_url: url
+  octopus_account_number: str?
+  octopus_product_code: str?
+  octopus_tariff_code: str?
   soc_entity: str?
   battery_voltage_entity: str?
   solar_tomorrow_entity: str?
@@ -134,9 +177,17 @@ schema:
   inverter_power_switch_entity: str?
   ha_template_charge_needed_entity: str?
   inverter: list(solis|alphaess)
-  charge_window_start_entity: str?
-  charge_window_end_entity: str?
+  solis_control_hub: str?
+  solis_modbus_slave: int
   alphaess_serial: str?
+  devices:
+    - id: str
+      type: list(inverter)
+      driver: list(solis|alphaess)
+      control: list(observe|ha_spark|supplier)?
+      entities:
+        charge_current: str?
+        power_switch: str?
   person_entities: str?
   heatpump_energy_entity: str?
   outdoor_weather_entity: str?

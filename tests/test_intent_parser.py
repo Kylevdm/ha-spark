@@ -10,9 +10,10 @@ import pytest
 from ha_spark import intent_parser
 from ha_spark.config import Settings
 from ha_spark.energy.models import ChargeIntent, ChargePlan
+from ha_spark.energy.plan_run import PlanRun
 from ha_spark.intent_parser import parse_offline
 
-REST = object()  # parse_offline only forwards this to gather_inputs
+REST = object()  # parse_offline only forwards this to current_plan
 
 
 def _plan(**kw: object) -> ChargePlan:
@@ -31,11 +32,13 @@ def _plan(**kw: object) -> ChargePlan:
 
 
 def _patch_plan(monkeypatch: pytest.MonkeyPatch, plan: ChargePlan) -> None:
-    async def fake_gather(settings: Settings, rest: Any) -> tuple[object, object, str]:
-        return object(), object(), "test"
+    async def fake_current_plan(settings: Settings, rest: Any) -> PlanRun:
+        return PlanRun(
+            plan=plan, inputs=object(), cfg=object(), schedule=object(),  # type: ignore[arg-type]
+            load_source="test",
+        )
 
-    monkeypatch.setattr(intent_parser, "gather_inputs", fake_gather)
-    monkeypatch.setattr(intent_parser, "compute_plan", lambda inputs, cfg: plan)
+    monkeypatch.setattr(intent_parser, "current_plan", fake_current_plan)
 
 
 async def test_plan_query_returns_full_report(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -99,10 +102,10 @@ async def test_unmatched_message_returns_help() -> None:
 
 
 async def test_plan_failure_is_reported_not_raised(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def boom(settings: Settings, rest: Any) -> tuple[object, object, str]:
+    async def boom(settings: Settings, rest: Any) -> PlanRun:
         raise RuntimeError("HA is down")
 
-    monkeypatch.setattr(intent_parser, "gather_inputs", boom)
+    monkeypatch.setattr(intent_parser, "current_plan", boom)
     result = await parse_offline("plan?", Settings(), REST)  # type: ignore[arg-type]
     assert result.matched
     assert "Could not compute the charge plan" in result.text

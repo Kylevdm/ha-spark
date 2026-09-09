@@ -59,6 +59,42 @@ RULES: tuple[Rule, ...] = (
          ("heatpump", "heat_pump", "ashp"), optional=True),
     Rule("outdoor_weather_entity", ("weather",), (), (), ("home", "forecast"),
          ("temperature",), optional=True),
+    # Derived base-load components (ADR-0001): surfaced only when the
+    # user has set any derive_*_entity option. The grid-import rule is
+    # required when derivation is in play; the rest are optional and
+    # contribute zero with a degradation note when unset. Discovery
+    # surfaces the most obvious matches per component so the wizard can
+    # either accept the default or pick a different one.
+    Rule(
+        "derive_grid_import_entity", ("sensor",), ("energy",), ("kWh",),
+        ("grid_import", "import", "consumption", "grid"),
+        optional=True,
+    ),
+    Rule(
+        "derive_grid_export_entity", ("sensor",), ("energy",), ("kWh",),
+        ("grid_export", "export", "feed_in", "feedin"),
+        optional=True,
+    ),
+    Rule(
+        "derive_solar_generation_entity", ("sensor",), ("energy",), ("kWh",),
+        ("solar", "pv", "production"),
+        optional=True,
+    ),
+    Rule(
+        "derive_battery_charge_entity", ("sensor",), ("energy",), ("kWh",),
+        ("battery_charge", "charge_in", "battery_in"),
+        optional=True,
+    ),
+    Rule(
+        "derive_battery_discharge_entity", ("sensor",), ("energy",), ("kWh",),
+        ("battery_discharge", "discharge", "battery_out"),
+        optional=True,
+    ),
+    Rule(
+        "derive_ev_charge_entity", ("sensor",), ("energy",), ("kWh",),
+        ("ev", "charger", "vehicle"),
+        optional=True,
+    ),
 )
 
 # Score weights.

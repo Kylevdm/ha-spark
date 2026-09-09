@@ -2,18 +2,18 @@
 
 The consumption store holds Octopus grid *import* (what the meter actually
 drew, already shaped by battery/solar), so this is an actual-cost summary
-under the configured two-rate tariff — not a counterfactual planner replay.
+rated against the current tariff schedule — not a counterfactual planner replay.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
-from ha_spark.energy.models import ConsumptionInterval
-from ha_spark.energy.planner import _in_overnight_window
+from ha_spark.energy.models import SLOTS_PER_DAY, ConsumptionInterval
+from ha_spark.energy.tariff import TariffSchedule, _in_overnight_window
 
 
 @dataclass(frozen=True)
@@ -45,39 +45,79 @@ class BacktestSummary:
         return self.offpeak_cost + self.peak_cost
 
 
+def _slot_index(t: time) -> int:
+    """Half-hour slot-of-day for a clock time (0 == 00:00, 47 == 23:30)."""
+    return t.hour * 2 + t.minute // 30
+
+
+def _window_end(window_start: time, window_hours: float) -> time:
+    """The charge window's end clock time, ``window_hours`` after its start (wraps)."""
+    total = window_start.hour * 60 + window_start.minute + round(window_hours * 60)
+    total %= 24 * 60
+    return time(total // 60, total % 60)
+
+
+def _cheap_fraction_by_time(schedule: TariffSchedule) -> Callable[[time], float]:
+    """A local-clock-time → off-peak-fraction classifier drawn from ``schedule``.
+
+    With per-slot ``prices`` (the dynamic/intelligent path), the schedule's own
+    ``cheap_fracs`` decide: each slot's supplier-controlled-cheap fraction, keyed
+    off the clock via ``window_start`` (``cheap_fracs[0]`` is the window start).
+    Without them (the v1 fixed path) it falls back to the flat charge window
+    ``[window_start, window_start + window_hours)``. A schedule missing
+    ``window_start`` cannot anchor either, so everything rates peak.
+    """
+    window_start = schedule.window_start
+    if window_start is None:
+        return lambda _t: 0.0
+    if schedule.prices and schedule.cheap_fracs:
+        fracs = schedule.cheap_fracs
+        start_idx = _slot_index(window_start)
+
+        def by_slot(t: time) -> float:
+            slot = (_slot_index(t) - start_idx) % SLOTS_PER_DAY
+            return fracs[slot] if slot < len(fracs) else 0.0
+
+        return by_slot
+    window_end = _window_end(window_start, schedule.window_hours)
+    return lambda t: 1.0 if _in_overnight_window(t, window_start, window_end) else 0.0
+
+
 def backtest_cost(
     intervals: Sequence[ConsumptionInterval],
     *,
-    window_start: time,
-    window_end: time,
-    rate_offpeak: float,
-    rate_peak: float,
+    schedule: TariffSchedule,
     tz: ZoneInfo,
 ) -> BacktestSummary | None:
     """Rate each interval off-peak/peak by its local start time; None if empty.
 
-    Off-peak is the fixed (possibly midnight-wrapping) charge window. Historic
-    Octopus dispatch slots are not stored, so dispatch-time import rates as
-    peak — the summary slightly overstates the true cost.
+    Off-peak coverage comes from ``schedule`` alone: its per-slot ``cheap_fracs``
+    on a dynamic/intelligent tariff, or the flat charge window it carries on the
+    fixed path (see :func:`_cheap_fraction_by_time`) — so a dynamic install is
+    rated on the tariff it's actually on, not the two flat rates. A partly-cheap
+    slot splits its energy between the buckets. Off-peak is rated at
+    ``cheap_rate``, peak at ``standard_rate``. Historic Octopus dispatch slots
+    are not stored, so dispatch-time import rates by the current cheap pattern,
+    not its own — a documented approximation.
     """
     if not intervals:
         return None
+    cheap_fraction = _cheap_fraction_by_time(schedule)
     offpeak_kwh = peak_kwh = 0.0
     dates = set()
     for interval in intervals:
         local = interval.start.astimezone(tz)
         dates.add(local.date())
-        if _in_overnight_window(local.time(), window_start, window_end):
-            offpeak_kwh += interval.kwh
-        else:
-            peak_kwh += interval.kwh
+        frac = cheap_fraction(local.time())
+        offpeak_kwh += frac * interval.kwh
+        peak_kwh += (1.0 - frac) * interval.kwh
     starts = [interval.start for interval in intervals]
     return BacktestSummary(
         days=len(dates),
         offpeak_kwh=offpeak_kwh,
         peak_kwh=peak_kwh,
-        rate_offpeak=rate_offpeak,
-        rate_peak=rate_peak,
+        rate_offpeak=schedule.cheap_rate,
+        rate_peak=schedule.standard_rate,
         first=min(starts),
         last=max(starts),
     )

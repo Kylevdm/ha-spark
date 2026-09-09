@@ -21,7 +21,7 @@ empty, and dormant for inverters without a settable charge rate.
 from __future__ import annotations
 
 from ha_spark.config import Settings
-from ha_spark.energy.chargers import charger_for
+from ha_spark.devices import inverter_device
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -57,7 +57,7 @@ class SupplyGuard:
     def __init__(self, settings: Settings, rest: HomeAssistantRest) -> None:
         self._settings = settings
         self._rest = rest
-        self._charger = charger_for(settings, rest)
+        self._charger = inverter_device(settings, rest)
 
     async def tick(self, target_w: float) -> str | None:
         """One guard pass; returns the action line if a resize was applied."""
