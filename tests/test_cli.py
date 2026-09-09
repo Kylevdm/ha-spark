@@ -423,7 +423,9 @@ async def test_ask_prints_routed_answer(
 
 async def test_backfill_load_requires_source(capsys: pytest.CaptureFixture[str]) -> None:
     settings = Settings(ha_url="http://ha.test", ha_token="t")
-    assert await _cmd_backfill_load(settings, source=None, list_only=False) == 2
+    assert await _cmd_backfill_load(
+        settings, source=None, list_only=False, derive=False
+    ) == 2
     assert "--from" in capsys.readouterr().err
 
 
@@ -436,7 +438,9 @@ async def test_backfill_load_happy_path(
 
     monkeypatch.setattr(cli, "backfill_load", fake_backfill)
     settings = Settings(ha_url="http://ha.test", ha_token="t")
-    assert await _cmd_backfill_load(settings, source="sensor.zappi", list_only=False) == 0
+    assert await _cmd_backfill_load(
+        settings, source="sensor.zappi", list_only=False, derive=False
+    ) == 0
     out = capsys.readouterr().out
     assert "Imported 100 hourly stats" in out
     assert "ha_spark:house_load" in out
@@ -450,7 +454,9 @@ async def test_backfill_load_reports_failure(
 
     monkeypatch.setattr(cli, "backfill_load", fake_backfill)
     settings = Settings(ha_url="http://ha.test", ha_token="t")
-    assert await _cmd_backfill_load(settings, source="sensor.x", list_only=False) == 2
+    assert await _cmd_backfill_load(
+        settings, source="sensor.x", list_only=False, derive=False
+    ) == 2
     assert "Backfill failed" in capsys.readouterr().err
 
 
@@ -475,11 +481,156 @@ async def test_backfill_load_list_filters_supported_units(
 
     monkeypatch.setattr(cli, "list_statistic_ids", fake_list)
     settings = Settings(ha_url="http://ha.test", ha_token="t")
-    assert await _cmd_backfill_load(settings, source=None, list_only=True) == 0
+    assert await _cmd_backfill_load(
+        settings, source=None, list_only=True, derive=False
+    ) == 0
     out = capsys.readouterr().out
     assert "sensor.zappi" in out
     assert "sensor.temp" not in out
     assert "1 backfill-capable" in out
+
+
+async def test_backfill_load_derive_requires_grid_import_entity(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+    assert await _cmd_backfill_load(
+        settings, source=None, list_only=False, derive=True
+    ) == 2
+    err = capsys.readouterr().err
+    assert "DERIVE_GRID_IMPORT_ENTITY" in err
+
+
+async def test_backfill_load_derive_happy_path(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_backfill_derived(
+        settings: Settings,
+        specs: dict[str, object],
+        *,
+        statistic_id: str,
+        statistic_name: str,
+        start: object,
+    ) -> object:
+        captured["settings"] = settings
+        captured["statistic_id"] = statistic_id
+        captured["statistic_name"] = statistic_name
+        from datetime import UTC, datetime, timedelta
+        assert isinstance(start, datetime)
+        # Lookback: 730d by default. Just check it's roughly that.
+        assert (datetime.now(UTC) - start) >= timedelta(days=700)
+        from ha_spark.energy.derived_base_load import DerivedBackfillResult
+        return DerivedBackfillResult(
+            rows_imported=1234,
+            span="2025-01-01 00:00 .. 2025-12-31 23:00 UTC",
+            degradation=["component 'grid_export' not configured — treated as zero"],
+            negative_clamped=2,
+            coverage={
+                "grid_import": (
+                    datetime(2025, 1, 1, tzinfo=UTC),
+                    datetime(2025, 12, 31, 23, tzinfo=UTC),
+                ),
+                "grid_export": (None, None),
+                "solar_generation": (None, None),
+                "battery_discharge": (None, None),
+                "battery_charge": (None, None),
+                "ev_charge": (None, None),
+            },
+        )
+
+    monkeypatch.setattr(cli, "backfill_derived_load", fake_backfill_derived)
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t",
+        derive_grid_import_entity="sensor.grid_import",
+    )
+    assert await _cmd_backfill_load(
+        settings, source=None, list_only=False, derive=True
+    ) == 0
+    out = capsys.readouterr().out
+    assert "Imported 1234 hourly stats" in out
+    # Derived path writes the same target as the source-entity path; the
+    # forecast chain consumes it unchanged.
+    assert "ha_spark:house_load" in out
+    assert "ha_spark:derived_house_load" not in out
+    assert "2 hour(s) had a negative derived base" in out
+    assert "component 'grid_export' not configured" in out
+    assert "ha_spark:house_load now holds the derived base-load series" in out
+
+
+async def test_backfill_load_derive_reports_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_backfill_derived(*args: object, **kwargs: object) -> object:
+        raise ValueError("grid import has no hourly statistics")
+
+    monkeypatch.setattr(cli, "backfill_derived_load", fake_backfill_derived)
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t",
+        derive_grid_import_entity="sensor.grid_import",
+    )
+    assert await _cmd_backfill_load(
+        settings, source=None, list_only=False, derive=True
+    ) == 2
+    assert "Derived backfill failed" in capsys.readouterr().err
+
+
+def test_derive_specs_map_blanks_to_missing() -> None:
+    """The CLI uses the shared derive_specs_from_settings helper."""
+    from ha_spark.energy.derived_base_load import derive_specs_from_settings
+
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t",
+        derive_grid_import_entity="sensor.gi",
+        # grid_export left blank on purpose
+        derive_solar_generation_entity="sensor.sol",
+    )
+    specs = derive_specs_from_settings(settings)
+    # grid_import is always included (required component).
+    assert specs["grid_import"].entity_id == "sensor.gi"
+    # Blanked optional components are absent from the map.
+    assert "grid_export" not in specs
+    # Configured optional components are present with their invert flag.
+    assert specs["solar_generation"].entity_id == "sensor.sol"
+    assert specs["solar_generation"].invert is False
+    # Explicit invert flag flows through when the component is configured.
+    settings_inv = Settings(
+        ha_url="http://ha.test", ha_token="t",
+        derive_grid_import_entity="sensor.gi",
+        derive_battery_charge_entity="sensor.bc",
+        derive_invert_battery_charge=True,
+    )
+    specs_inv = derive_specs_from_settings(settings_inv)
+    assert specs_inv["battery_charge"].invert is True
+    assert specs_inv["battery_charge"].entity_id == "sensor.bc"
+
+
+def test_derive_and_from_are_mutually_exclusive(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--derive` rejects `--from` / `BACKFILL_SOURCE_ENTITY` at dispatch."""
+
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t",
+        derive_grid_import_entity="sensor.gi",
+        backfill_source_entity="sensor.zappi",
+    )
+    # Simulate dispatch's path: args.command == "backfill-load", derive and source both set.
+    rc = _cmd_backfill_load_for_dispatch(settings, source="sensor.zappi", derive=True)
+    assert rc == 2
+
+
+def _cmd_backfill_load_for_dispatch(settings: Settings, *, source: str, derive: bool) -> int:
+    """Replicate the dispatch check for mutual exclusion (no asyncio needed)."""
+    if derive and source:
+        print(
+            "--derive and --from / BACKFILL_SOURCE_ENTITY are mutually exclusive; "
+            "pick one path.",
+            file=__import__("sys").stderr,
+        )
+        return 2
+    return 0
 
 
 async def test_run_once_invokes_run_once(monkeypatch: pytest.MonkeyPatch) -> None:

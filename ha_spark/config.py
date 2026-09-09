@@ -72,6 +72,21 @@ _OPTION_KEYS = frozenset(
         "timezone",
         "plan_run_time",
         "backfill_source_entity",
+        # Derived base-load (ADR-0001): per-component statistic IDs + invert flags.
+        # Grid import is required when any of these are set; the others are
+        # optional and contribute zero with a degradation note when unset.
+        "derive_grid_import_entity",
+        "derive_grid_export_entity",
+        "derive_solar_generation_entity",
+        "derive_battery_charge_entity",
+        "derive_battery_discharge_entity",
+        "derive_ev_charge_entity",
+        "derive_invert_grid_import",
+        "derive_invert_grid_export",
+        "derive_invert_solar_generation",
+        "derive_invert_battery_charge",
+        "derive_invert_battery_discharge",
+        "derive_invert_ev_charge",
         "octopus_api_key",
         "octopus_mpan",
         "octopus_meter_serial",
@@ -99,8 +114,8 @@ _OPTION_KEYS = frozenset(
         "ha_template_charge_needed_entity",
         # Inverter selector + AlphaESS control (Task 3).
         "inverter",
-        "charge_window_start_entity",
-        "charge_window_end_entity",
+        "solis_control_hub",
+        "solis_modbus_slave",
         "alphaess_serial",
         # Structured device config (Phase 7): list of controllable devices.
         "devices",
@@ -313,6 +328,25 @@ class Settings(BaseSettings):
     # or energy sensor); the CLI's --from flag overrides it.
     backfill_source_entity: str = Field(default="")
 
+    # Derived base load (ADR-0001): per-component HA statistic IDs.
+    # `derive_grid_import_entity` is required when any are set; the others
+    # contribute zero with a degradation note when unset. The invert flags
+    # are explicit (never inferred): true flips the canonical sign after the
+    # usual unit conversion, so a mis-signed sensor never silently corrupts
+    # the balance.
+    derive_grid_import_entity: str = Field(default="")
+    derive_grid_export_entity: str = Field(default="")
+    derive_solar_generation_entity: str = Field(default="")
+    derive_battery_charge_entity: str = Field(default="")
+    derive_battery_discharge_entity: str = Field(default="")
+    derive_ev_charge_entity: str = Field(default="")
+    derive_invert_grid_import: bool = Field(default=False)
+    derive_invert_grid_export: bool = Field(default=False)
+    derive_invert_solar_generation: bool = Field(default=False)
+    derive_invert_battery_charge: bool = Field(default=False)
+    derive_invert_battery_discharge: bool = Field(default=False)
+    derive_invert_ev_charge: bool = Field(default=False)
+
     # Octopus REST API (for `pull-consumption`; CSV import needs none of these).
     # `octopus_api_key` also drives the `octopus_intelligent` tariff provider
     # below (Kraken GraphQL auth + REST standard-unit-rates).
@@ -350,9 +384,12 @@ class Settings(BaseSettings):
 
     # Inverter selector: picks the Charger adapter (ha_spark/energy/chargers.py).
     inverter: Literal["solis", "alphaess"] = Field(default="solis")
-    # Charge window time entities (Solis); blank skips the window write.
-    charge_window_start_entity: str = Field(default="")
-    charge_window_end_entity: str = Field(default="")
+    # Solis native control: the thin HA `modbus:` overlay hub (#90) ha-spark
+    # writes the timed-slot registers through (`modbus.write_register`) and reads
+    # back via its `sensor.<hub>_*` entities. The window/current/work-mode
+    # registers are fixed in the driver (docs/solis-control-modbus-overlay.yaml).
+    solis_control_hub: str = Field(default="solis_control")
+    solis_modbus_slave: int = Field(default=1)
     # AlphaESS system serial for the alphaess.setbatterycharge service call.
     alphaess_serial: str = Field(default="")
 
@@ -419,9 +456,10 @@ class Settings(BaseSettings):
                     driver=self.inverter,
                     control=ControlAuthority.HA_SPARK,
                     entities={
+                        # charge_current is telemetry/dashboard only for Solis
+                        # (control is native modbus via solis_control_hub); kept
+                        # generic here for the dashboard row and other drivers.
                         "charge_current": self.charge_current_entity,
-                        "window_start": self.charge_window_start_entity,
-                        "window_end": self.charge_window_end_entity,
                         "power_switch": self.inverter_power_switch_entity,
                     },
                 )

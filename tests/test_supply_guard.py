@@ -80,7 +80,8 @@ async def test_tick_skips_small_deltas_without_writing() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _guard_settings(proactive_mode="on")
     _mock_state(s.grid_power_entity, "5000")  # well under the limit
-    _mock_state(s.charge_current_entity, "40")  # 40 A * 51 V = 2040 W, already at target
+    # 40 A * 51 V = 2040 W, already at target
+    _mock_state("sensor.solis_control_timed_charge_current", "40")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         line = await SupplyGuard(s, rest).tick(target_w=2040.0)
     assert line is None
@@ -92,7 +93,7 @@ async def test_tick_simulate_logs_but_does_not_write() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _guard_settings(proactive_mode="simulate")
     _mock_state(s.grid_power_entity, "20000")  # over the limit
-    _mock_state(s.charge_current_entity, "40")  # setpoint 2040 W
+    _mock_state("sensor.solis_control_timed_charge_current", "40")  # setpoint 2040 W
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         line = await SupplyGuard(s, rest).tick(target_w=2040.0)
     # other load ~17960 W; headroom ~40 W -> shed to ~40 W (~1 A).
@@ -103,12 +104,12 @@ async def test_tick_simulate_logs_but_does_not_write() -> None:
 
 @respx.mock
 async def test_tick_on_writes_and_verifies_read_back() -> None:
-    set_value = respx.post("http://ha.test/api/services/number/set_value").mock(
+    set_value = respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(200, json=[])
     )
     s = _guard_settings(proactive_mode="on")
     _mock_state(s.grid_power_entity, "20000")
-    _mock_state(s.charge_current_entity, "40")  # also serves the read-back
+    _mock_state("sensor.solis_control_timed_charge_current", "40")  # also serves the read-back
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         line = await SupplyGuard(s, rest).tick(target_w=2040.0)
     # 20 kW incl. 2040 W battery -> other load ~17960, headroom ~40 W -> ~1 A.
@@ -123,7 +124,7 @@ async def test_tick_restores_toward_target_when_headroom_returns() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _guard_settings(proactive_mode="simulate")
     _mock_state(s.grid_power_entity, "3000")  # EV gone, light house load
-    _mock_state(s.charge_current_entity, "5")  # previously throttled (255 W)
+    _mock_state("sensor.solis_control_timed_charge_current", "5")  # previously throttled (255 W)
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         line = await SupplyGuard(s, rest).tick(target_w=2040.0)
     # headroom huge -> restore to target 2040 W (40 A).
@@ -138,7 +139,7 @@ async def test_tick_unreadable_grid_sensor_does_nothing() -> None:
     respx.get(f"http://ha.test/api/states/{s.grid_power_entity}").mock(
         return_value=httpx.Response(500)
     )
-    _mock_state(s.charge_current_entity, "40")
+    _mock_state("sensor.solis_control_timed_charge_current", "40")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         line = await SupplyGuard(s, rest).tick(target_w=2040.0)
     assert line is None
@@ -150,7 +151,7 @@ async def test_tick_unreadable_setpoint_does_nothing() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _guard_settings(proactive_mode="on")
     _mock_state(s.grid_power_entity, "20000")
-    respx.get(f"http://ha.test/api/states/{s.charge_current_entity}").mock(
+    respx.get("http://ha.test/api/states/sensor.solis_control_timed_charge_current").mock(
         return_value=httpx.Response(500)
     )
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:

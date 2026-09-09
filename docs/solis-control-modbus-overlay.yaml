@@ -1,0 +1,87 @@
+# ha-spark: Solis native-modbus control overlay (`solis_control` hub)
+# =====================================================================
+# A THIN core-HA `modbus:` overlay carrying only the registers ha-spark drives.
+# It sits ALONGSIDE homeassistant-solax-modbus (which keeps all telemetry
+# entities untouched) — this does NOT replace or rebuild solax/solis_modbus.
+#
+# Provenance: register map from map #78 (#80 bit table, #100 register dump),
+# cross-checked live 2026-09-08. The window block matches solax-modbus's
+# WRITE_MULTI for the "update charge/discharge times" button (plugin_solis.py),
+# so writing the 8-register block at 43143 *is* the commit — there is no
+# separate commit register/coil. NO tier-A source exists for these registers.
+#
+# HOW TO INSTALL (one-time, manual — an HA add-on cannot inject `modbus:` into
+# your configuration.yaml; see #84 for the auto-provision follow-up):
+#   1. Merge the `modbus:` block below into your HA configuration.yaml (or an
+#      `!include`d modbus.yaml). If you already ran #90, extend that same
+#      `solis_control` hub with the `sensor:` entries under "TIMED-SLOT" below.
+#   2. Set host/port to your RS485->Ethernet gateway (Waveshare in Modbus
+#      gateway mode, multi-host enabled, "Storage-type Modbus" OFF — #88).
+#   3. Restart HA. Confirm the `sensor.solis_control_*` entities read plausible
+#      values before setting ha-spark `proactive_mode: on`.
+#
+# ha-spark writes via the `modbus.write_register` service (hub: solis_control,
+# slave: 1) and reads back through the `sensor.solis_control_*` entities named
+# here. Keep these names — ha-spark derives the entity_ids from the hub name
+# (`solis_control_hub` option).
+
+modbus:
+  - name: solis_control            # == ha-spark `solis_control_hub`
+    type: tcp                       # RS485-over-TCP gateway
+    host: 192.0.2.10               # <-- your gateway IP
+    port: 502                      # <-- your gateway Modbus port
+    # A short scan_interval helps the normal `homeassistant.update_entity`
+    # refresh converge quickly. After each Modbus write ha-spark requests that
+    # refresh and observes the overlay with a fixed, bounded retry window before
+    # it reports success or failure. 5 s is a reasonable balance against bus load.
+    sensors:
+      # --- Work mode: read-only input register. Bit 5 (mask 32) == grid
+      # charging permitted. ha-spark asserts this before a forced charge and
+      # NEVER writes 33132.
+      - name: Solis Control Work Mode Bitfield
+        address: 33132
+        input_type: input
+        data_type: uint16
+        scan_interval: 5
+
+      # --- TIMED-SLOT registers ha-spark drives (add these to the #90 hub) ---
+      # Charge current: DC amps, register scaled x10 (raw 600 == 60.0 A).
+      - name: Solis Control Timed Charge Current
+        address: 43141
+        input_type: holding
+        data_type: uint16
+        scale: 0.1
+        precision: 1
+        unit_of_measurement: A
+        scan_interval: 5
+
+      # Slot 1 window block: 43143..43150, in this order (charge then discharge).
+      # ha-spark writes charge start/end and holds the discharge half at 0.
+      - {name: Solis Control Timed Charge Start Hours,     address: 43143, input_type: holding, data_type: uint16, scan_interval: 5}
+      - {name: Solis Control Timed Charge Start Minutes,   address: 43144, input_type: holding, data_type: uint16, scan_interval: 5}
+      - {name: Solis Control Timed Charge End Hours,       address: 43145, input_type: holding, data_type: uint16, scan_interval: 5}
+      - {name: Solis Control Timed Charge End Minutes,     address: 43146, input_type: holding, data_type: uint16, scan_interval: 5}
+      - {name: Solis Control Timed Discharge Start Hours,  address: 43147, input_type: holding, data_type: uint16, scan_interval: 5}
+      - {name: Solis Control Timed Discharge Start Minutes, address: 43148, input_type: holding, data_type: uint16, scan_interval: 5}
+      - {name: Solis Control Timed Discharge End Hours,    address: 43149, input_type: holding, data_type: uint16, scan_interval: 5}
+      - {name: Solis Control Timed Discharge End Minutes,  address: 43150, input_type: holding, data_type: uint16, scan_interval: 5}
+
+      # Slots 2 & 3 window blocks (43153.., 43163..): ha-spark only READS these
+      # to zero-guard them (write zeros if a stale manual window is present), so
+      # only the fields it checks are exposed.
+      - {name: Solis Control Timed Charge Start Hours 2,     address: 43153, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Charge Start Minutes 2,   address: 43154, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Charge End Hours 2,       address: 43155, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Charge End Minutes 2,     address: 43156, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Discharge Start Hours 2,  address: 43157, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Discharge Start Minutes 2, address: 43158, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Discharge End Hours 2,    address: 43159, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Discharge End Minutes 2,  address: 43160, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Charge Start Hours 3,     address: 43163, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Charge Start Minutes 3,   address: 43164, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Charge End Hours 3,       address: 43165, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Charge End Minutes 3,     address: 43166, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Discharge Start Hours 3,  address: 43167, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Discharge Start Minutes 3, address: 43168, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Discharge End Hours 3,    address: 43169, input_type: holding, data_type: uint16, scan_interval: 30}
+      - {name: Solis Control Timed Discharge End Minutes 3,  address: 43170, input_type: holding, data_type: uint16, scan_interval: 30}
