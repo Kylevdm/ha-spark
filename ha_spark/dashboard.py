@@ -27,8 +27,6 @@ _CATEGORIES: list[tuple[str, list[tuple[str, str]]]] = [
         ("ev_plug_entity", "EV Plug"),
         ("ev_status_entity", "EV Status"),
         ("charge_current_entity", "Charge Current"),
-        ("charge_window_start_entity", "Charge Window Start"),
-        ("charge_window_end_entity", "Charge Window End"),
         ("ha_template_charge_needed_entity", "Charge Needed"),
     ]),
     ("Grid & Tariff", [
@@ -42,6 +40,14 @@ _CATEGORIES: list[tuple[str, list[tuple[str, str]]]] = [
         ("heatpump_energy_entity", "Heat Pump Energy"),
         ("outdoor_weather_entity", "Outdoor Weather"),
         ("backfill_source_entity", "Backfill Source"),
+    ]),
+    ("Derived base load", [
+        ("derive_grid_import_entity", "Grid Import"),
+        ("derive_grid_export_entity", "Grid Export"),
+        ("derive_solar_generation_entity", "Solar Generation"),
+        ("derive_battery_charge_entity", "Battery Charge"),
+        ("derive_battery_discharge_entity", "Battery Discharge"),
+        ("derive_ev_charge_entity", "EV Charge"),
     ]),
 ]
 

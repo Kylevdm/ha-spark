@@ -46,6 +46,36 @@ Closed maps whose **Not yet specified** patches are all marked. Record maps with
 
 Wanted work outside every current map's destination and owned by nobody. An idea that never came from a map belongs here too. Group into subject subsections once there are enough entries to scan; other entries then refer to them by name.
 
+### Derived base-load correctness (from PR #106 review, 2026-09-09)
+
+Raised by the owner review on
+[PR #106](https://github.com/Kylevdm/ha-spark/pull/106#issuecomment-5593336109).
+The Solis findings from that review are resolved in commits `849c706` and
+`2ac51c8`; these derived-load findings remain unowned.
+
+- **Reject nonfinite component statistics before import.**
+  `build_component_series` converts external timestamps and values with
+  `float(...)` but does not reject NaN or infinity
+  (`ha_spark/energy/derived_base_load.py:337-339`), so nonfinite data can
+  contaminate cumulative recorder imports. Add explicit finite-value validation
+  and regression coverage proving invalid timestamps and values never reach
+  `recorder/import_statistics`. Trigger: before derived base-load imports are
+  enabled in production.
+- **Preserve cumulative continuity across retained gap rows.** Historical and
+  rolling rebuilds derive only hours having grid-import data, while existing
+  target rows at skipped hours remain stored; later regenerated sums can
+  therefore fall below a retained middle row
+  (`ha_spark/energy/derived_base_load.py:487,583`). Reconcile retained target
+  rows into the running sum and cover an internal grid-import gap plus repeat-run
+  idempotence. Trigger: before PR #106 is merged.
+- **Disable derivation on any configured component's unsupported unit.**
+  `_gather_components` currently catches `ValueError` and omits the invalid
+  component (`ha_spark/energy/derived_base_load.py:390-392`), which can import a
+  materially wrong load history as if that component were zero. Propagate this
+  failure for configured components while preserving the optional-unconfigured
+  path, with a non-grid component regression test. Trigger: before derived
+  base-load imports are enabled in production.
+
 ### Architecture deepening (2026-08-18 review)
 
 Raised by the 2026-08-18 architecture review
@@ -91,3 +121,23 @@ dropped tariff schedule), #92 (backtest tariff contract), and #93
   manager and a `tick(state, now)` function. Pairs with the device-seam
   entry's no-REST `capabilities` fix. Trigger: the next scheduler feature that
   needs loop tests.
+
+### Solis control provisioning (from #84, 2026-09-08)
+
+- **Zero-touch install of the `solis_control` modbus overlay — up to a
+  supporting companion integration.** #84 ships native Solis forced charge
+  driving the `solis_control` overlay hub
+  (`ha_spark/devices/inverters/solis.py`), but the overlay itself
+  (`docs/solis-control-modbus-overlay.yaml`) is a one-time **manual** HA-config
+  step: an HA add-on cannot inject a `modbus:` block into a user's
+  `configuration.yaml`. Want: make it as easy as possible to install/use so
+  users don't hand-edit YAML. Two shapes weighed in-session: (a) the add-on
+  writes a package file into the HA config dir and the user enables a
+  `packages:` include (still one manual enable + restart); (b) a **companion
+  custom-integration** doing native `pymodbus`, limited to only the registers
+  ha-spark needs — with the map's standing constraint that it **must not**
+  rebuild solax/solis_modbus. Beyond map #78's destination (deliver forced
+  charge), which #84 met with the manual overlay; adjacent to #59 (driver-aware
+  onboarding) but distinct — onboarding maps existing entities, this provisions
+  a control surface. Trigger: none yet (a user hitting the manual-install
+  friction, or a decision to invest in the companion integration).

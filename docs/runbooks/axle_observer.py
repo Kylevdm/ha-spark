@@ -8,7 +8,15 @@ identify WHICH surface a third party actually uses to command this inverter.
 Read-only: never writes to Home Assistant.
 """
 from __future__ import annotations
-import csv, json, os, pathlib, sys, time, urllib.error, urllib.request
+
+import csv
+import json
+import os
+import pathlib
+import sys
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 
 ENTITIES = {

@@ -166,8 +166,6 @@ def test_devices_synthesized_from_flat_keys_when_absent() -> None:
         supervisor_token="sup",
         inverter="solis",
         charge_current_entity="number.cc",
-        charge_window_start_entity="time.ws",
-        charge_window_end_entity="time.we",
         inverter_power_switch_entity="select.pw",
     )  # type: ignore[call-arg]
     assert len(s.devices) == 1
@@ -178,7 +176,7 @@ def test_devices_synthesized_from_flat_keys_when_absent() -> None:
     assert d.driver == "solis"
     assert d.control == ControlAuthority.HA_SPARK
     assert d.entities["charge_current"] == "number.cc"
-    assert d.entities["window_start"] == "time.ws"
+    assert d.entities["power_switch"] == "select.pw"
 
 
 def test_explicit_devices_list_parses_through() -> None:
