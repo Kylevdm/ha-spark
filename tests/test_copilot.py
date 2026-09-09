@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import time
+from datetime import UTC, datetime, time
 from typing import Any
 
 import pytest
@@ -12,19 +12,33 @@ from ha_spark.config import Settings
 from ha_spark.copilot import COPILOT_SYSTEM, build_grounding, grounded_system_prompt
 from ha_spark.energy.models import ChargeIntent, ChargePlan
 from ha_spark.energy.plan_run import PlanRun
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+
+
+def _soc(value: float) -> SocMeasurement:
+    now = datetime.now(UTC)
+    return SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=now,
+        value=value,
+        raw_state=str(value),
+        reported_at=now,
+        age_s=0.0,
+        max_age_s=600.0,
+    )
 
 REST = object()  # only forwarded to current_plan (mocked)
 
 
 def _plan() -> ChargePlan:
     return ChargePlan(
-        soc_now=42, capacity_kwh=26.88, solar_kwh=8.75, effective_solar_kwh=8.75,
+        soc=_soc(42), capacity_kwh=26.88, solar_kwh=8.75, effective_solar_kwh=8.75,
         load_kwh=24.2, cheap_covered_kwh=0.0, usable_now_kwh=5.9,
         deficit_kwh=12.8, buffer_pct=20.0, required_kwh=12.8,
         target_soc=77, window_hours=6.0,
         ev_charging=False, ha_template_needed=None,
         charge_intent=ChargeIntent(
-            target_soc_pct=77, soc_now=42, window_start=time(23, 30), window_end=time(5, 30)
+            target_soc_pct=77, soc=_soc(42), window_start=time(23, 30), window_end=time(5, 30)
         ),
     )
 

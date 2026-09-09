@@ -148,16 +148,14 @@ def compute_plan(
     holds = controlled
     intent = ChargeIntent(
         target_soc_pct=target_soc,
-        soc_now=inputs.soc_now,
+        soc=inputs.soc,
         window_start=cfg.window_start,
         window_end=cfg.window_end,
         holds=holds,
-        soc_valid=inputs.soc_valid,
     )
 
     return ChargePlan(
-        soc_now=inputs.soc_now,
-        soc_valid=inputs.soc_valid,
+        soc=inputs.soc,
         capacity_kwh=cfg.capacity_kwh,
         solar_kwh=inputs.solar_tomorrow_kwh,
         effective_solar_kwh=effective_solar,

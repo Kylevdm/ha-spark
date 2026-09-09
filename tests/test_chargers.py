@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import time
+from datetime import UTC, datetime, time
 
 import httpx
 import pytest
@@ -16,6 +16,7 @@ from ha_spark.devices.base import Capability, ControlAuthority
 from ha_spark.devices.inverters.alphaess import AlphaESSDevice
 from ha_spark.devices.inverters.solis import SolisDevice, solis_current_a
 from ha_spark.energy.models import ChargeIntent
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.ha.rest import HomeAssistantRest
 
 
@@ -52,15 +53,36 @@ def _alpha_device(
     return AlphaESSDevice(config, s, rest)
 
 
+def _soc(value: float) -> SocMeasurement:
+    now = datetime.now(UTC)
+    return SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=now,
+        value=value,
+        raw_state=str(value),
+        reported_at=now,
+        age_s=0.0,
+        max_age_s=600.0,
+    )
+
+
+def _bad_soc() -> SocMeasurement:
+    return SocMeasurement(
+        status=SocStatus.UNAVAILABLE,
+        observed_at=datetime.now(UTC),
+        raw_state="unavailable",
+        max_age_s=600.0,
+    )
+
+
 def _intent(
     target_soc: float = 77.0,
-    soc_now: float = 50.0,
+    soc: SocMeasurement | None = None,
     holds: tuple[tuple, ...] = (),
-    soc_valid: bool = True,
 ) -> ChargeIntent:
-    return ChargeIntent(
-        target_soc, soc_now, time(23, 30), time(5, 30), holds=holds, soc_valid=soc_valid
-    )
+    if soc is None:
+        soc = _soc(50.0)
+    return ChargeIntent(target_soc, soc, time(23, 30), time(5, 30), holds=holds)
 
 
 def _state(entity_id: str, state: str) -> dict[str, object]:
@@ -460,19 +482,93 @@ async def test_current_verification_is_bounded_when_overlay_stays_stale() -> Non
 async def test_on_blocks_all_writes_when_soc_invalid() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _settings(proactive_mode="on")
-    intent = _intent(soc_valid=False)
+    intent = _intent(soc=_bad_soc())
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(intent)
     assert posts.call_count == 0
-    assert all(line.startswith("[BLOCKED] SoC unreadable") for line in lines)
+    assert all(
+        line.startswith("[BLOCKED]") and "unavailable" in line for line in lines
+    )
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("measurement", "evidence"),
+    [
+        (
+            SocMeasurement(
+                status=SocStatus.STALE,
+                observed_at=datetime.now(UTC),
+                value=55.0,
+                raw_state="55.0",
+                reported_at=datetime.now(UTC),
+                age_s=900.0,
+                max_age_s=600.0,
+            ),
+            "900s",
+        ),
+        (
+            SocMeasurement(
+                status=SocStatus.MALFORMED,
+                observed_at=datetime.now(UTC),
+                raw_state="forty",
+                max_age_s=600.0,
+            ),
+            "forty",
+        ),
+        (
+            SocMeasurement(
+                status=SocStatus.READ_FAILED,
+                observed_at=datetime.now(UTC),
+                max_age_s=600.0,
+            ),
+            "read from Home Assistant failed",
+        ),
+    ],
+    ids=["stale", "malformed", "read_failed"],
+)
+async def test_on_blocks_writes_for_every_failed_status(
+    measurement: SocMeasurement, evidence: str
+) -> None:
+    """Any failed integrity status blocks real writes and names its own reason."""
+    posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    s = _settings(proactive_mode="on")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        lines = await _solis_device(s, rest).apply(_intent(soc=measurement))
+
+    assert posts.call_count == 0
+    assert all(line.startswith("[BLOCKED]") for line in lines)
+    assert any(evidence in line for line in lines)
+
+
+@respx.mock
+async def test_alphaess_on_blocks_writes_for_a_stale_soc() -> None:
+    """AlphaESS refuses new programming on any failed integrity observation."""
+    posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    stale = SocMeasurement(
+        status=SocStatus.STALE,
+        observed_at=datetime.now(UTC),
+        value=55.0,
+        raw_state="55.0",
+        reported_at=datetime.now(UTC),
+        age_s=900.0,
+        max_age_s=600.0,
+    )
+    s = _settings(proactive_mode="on", inverter="alphaess")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        lines = await _alpha_device(s, rest).apply(_intent(soc=stale))
+
+    assert posts.call_count == 0
+    assert all(line.startswith("[BLOCKED]") for line in lines)
+    assert any("900s" in line for line in lines)
 
 
 @respx.mock
 async def test_on_does_not_block_genuine_zero_soc() -> None:
-    """A real 0% reading (soc_valid=True) must NOT be blocked -- that's exactly
+    """A real 0% reading (soc ok) must NOT be blocked -- that's exactly
     the moment a real charge is most needed."""
     s = _settings(proactive_mode="on")
-    intent = _intent(soc_now=0, soc_valid=True)
+    intent = _intent(soc=_soc(0))
     _mock_native(slot1=[0] * 8, current="0.0")
     expected_a = round(solis_current_a(intent, s))
     _get_seq(_sensor("timed_charge_current"), ["0.0", f"{expected_a}.0"])
@@ -486,7 +582,7 @@ async def test_on_does_not_block_genuine_zero_soc() -> None:
 async def test_simulate_unaffected_by_invalid_soc() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _settings(proactive_mode="simulate")
-    intent = _intent(soc_valid=False)
+    intent = _intent(soc=_bad_soc())
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(intent)
     assert posts.call_count == 0
@@ -609,7 +705,7 @@ async def test_alphaess_apply_blocks_when_soc_invalid() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _settings(inverter="alphaess", proactive_mode="on")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await _alpha_device(s, rest).apply(_intent(soc_valid=False))
+        lines = await _alpha_device(s, rest).apply(_intent(soc=_bad_soc()))
     assert posts.call_count == 0
     assert "[BLOCKED]" in lines[0]
 
@@ -619,7 +715,7 @@ async def test_alphaess_apply_does_not_block_genuine_zero_soc() -> None:
     s = _settings(inverter="alphaess", proactive_mode="on", alphaess_serial="SN123")
     respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await _alpha_device(s, rest).apply(_intent(soc_now=0, soc_valid=True))
+        lines = await _alpha_device(s, rest).apply(_intent(soc=_soc(0)))
     assert not any(line.startswith("[BLOCKED]") for line in lines)
 
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import time
+from datetime import UTC, datetime, time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -11,11 +11,25 @@ from fastapi.testclient import TestClient
 from ha_spark.api.server import AppState, build_app
 from ha_spark.config import Settings
 from ha_spark.energy.models import ChargeIntent, ChargePlan
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+
+
+def _soc(value: float) -> SocMeasurement:
+    now = datetime.now(UTC)
+    return SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=now,
+        value=value,
+        raw_state=str(value),
+        reported_at=now,
+        age_s=0.0,
+        max_age_s=600.0,
+    )
 
 
 def _plan(**overrides: object) -> ChargePlan:
     defaults: dict[str, object] = dict(
-        soc_now=40.0,
+        soc=_soc(40.0),
         capacity_kwh=26.88,
         solar_kwh=5.0,
         effective_solar_kwh=5.0,
@@ -30,7 +44,7 @@ def _plan(**overrides: object) -> ChargePlan:
         ev_charging=False,
         ha_template_needed=None,
         charge_intent=ChargeIntent(
-            target_soc_pct=90.0, soc_now=40.0, window_start=time(23, 30), window_end=time(5, 30)
+            target_soc_pct=90.0, soc=_soc(40.0), window_start=time(23, 30), window_end=time(5, 30)
         ),
     )
     defaults.update(overrides)
