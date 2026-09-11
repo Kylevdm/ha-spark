@@ -6,6 +6,7 @@ import json
 from datetime import UTC, datetime, time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from ha_spark.api.server import AppState, build_app
@@ -97,6 +98,32 @@ def test_get_config_returns_options(tmp_path: Path) -> None:
         resp = client.get("/api/config")
     assert resp.status_code == 200
     assert "min_soc" in resp.json()
+
+
+@pytest.mark.parametrize("previous_mode", ["off", "simulate"])
+def test_proactive_mode_on_transition_warns_about_conflicting_automation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, previous_mode: str
+) -> None:
+    state = _state(tmp_path, proactive_mode=previous_mode)
+
+    with caplog.at_level("WARNING"):
+        state.apply_options({"proactive_mode": "on"})
+
+    assert any(
+        "disable any pre-existing automations or manual schedules" in record.message
+        for record in caplog.records
+    )
+
+
+def test_proactive_mode_reload_without_transition_does_not_warn(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    state = _state(tmp_path, proactive_mode="on")
+
+    with caplog.at_level("WARNING"):
+        state.apply_options({"proactive_mode": "on"})
+
+    assert not any("pre-existing automations" in record.message for record in caplog.records)
 
 
 def test_config_roundtrip_persists_and_reloads(tmp_path: Path) -> None:
