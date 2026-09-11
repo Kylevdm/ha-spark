@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Proactive-mode handoff warning (#104): changing `proactive_mode` from `off` or
+  `simulate` to `on` logs a reminder to disable pre-existing automations or
+  manual schedules that write the same devices before proceeding.
 - Checked SoC measurements (#113): the Boolean `soc_valid` contract is
   replaced by one immutable checked measurement produced from a single
   Home Assistant observation. It records the observed value or read
