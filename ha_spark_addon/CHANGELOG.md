@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Half-hourly replanning (#46): the daemon recomputes the current plan on each
+  local half-hour slot, including after startup during the day. It skips the
+  inverter call when the commanded target, window, and holds are unchanged, so
+  fresh SoC observations do not cause repeated device writes.
 - Proactive-mode handoff warning (#104): changing `proactive_mode` from `off` or
   `simulate` to `on` logs a reminder to disable pre-existing automations or
   manual schedules that write the same devices before proceeding.

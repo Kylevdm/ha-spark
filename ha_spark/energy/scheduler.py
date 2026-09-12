@@ -1,10 +1,9 @@
-"""Daily scheduled plan + apply loop.
+"""Half-hourly scheduled plan + apply loop.
 
 `run_once` computes and applies a single charge plan (the same path as
 `ha-spark plan --apply`). `run_forever` wakes once a minute and calls
-`run_once` exactly once per local calendar day, at `settings.plan_run_time`.
-A failed run is retried on the next tick (since `last_run_date` is left
-unset) until it succeeds or the day rolls over.
+`run_once` once per local half-hour slot. A failed run is retried on the next
+tick because the completed slot is not recorded until the run succeeds.
 
 When `grid_power_entity` is set, every tick inside the charge window also runs
 the supply guard: throttle the battery's charge-current setpoint while
@@ -24,7 +23,7 @@ fallback-entry threshold (`soc_failure_threshold`, default 3).
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import uvicorn
@@ -50,7 +49,7 @@ from ha_spark.energy.derived_base_load import (
 )
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
-from ha_spark.energy.models import ChargePlan, PlannerInputs
+from ha_spark.energy.models import ChargeIntent, ChargePlan, PlannerInputs
 from ha_spark.energy.orchestrator import orchestrate
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.publish import (
@@ -75,9 +74,34 @@ log = get_logger(__name__)
 SIGNAL_SAMPLE_INTERVAL = timedelta(minutes=30)
 
 
-def should_run(now: datetime, run_time: time, last_run_date: date | None) -> bool:
-    """True once per calendar day, at or after ``run_time`` local time."""
-    return now.time() >= run_time and now.date() != last_run_date
+REPLAN_INTERVAL = timedelta(minutes=30)
+
+
+def _slot_start(now: datetime) -> datetime:
+    """Return the local half-hour slot containing ``now``."""
+    slot_minutes = int(REPLAN_INTERVAL.total_seconds() // 60)
+    minute = now.minute - now.minute % slot_minutes
+    return now.replace(minute=minute, second=0, microsecond=0)
+
+
+def should_run(now: datetime, last_run_slot: datetime | None) -> bool:
+    """True when the current local half-hour slot has not run successfully."""
+    return _slot_start(now) != last_run_slot
+
+
+def setpoint_changed(previous: ChargeIntent, current: ChargeIntent) -> bool:
+    """Return whether a plan changes the command sent to an inverter.
+
+    SoC is deliberately excluded. The daemon measures SoC every minute, so a
+    fresh observation alone must not turn an unchanged plan into another device
+    write.
+    """
+    return (
+        previous.target_soc_pct != current.target_soc_pct
+        or previous.window_start != current.window_start
+        or previous.window_end != current.window_end
+        or previous.holds != current.holds
+    )
 
 
 async def _record_forecast(settings: Settings, plan: ChargePlan, inputs: PlannerInputs,
@@ -100,7 +124,10 @@ async def _record_forecast(settings: Settings, plan: ChargePlan, inputs: Planner
 
 
 async def run_once(
-    settings: Settings, *, soc: SocMeasurement | None = None
+    settings: Settings,
+    *,
+    soc: SocMeasurement | None = None,
+    previous_plan: ChargePlan | None = None,
 ) -> ChargePlan:
     """Compute the charge plan, log it, and apply it per PROACTIVE_MODE.
 
@@ -118,7 +145,14 @@ async def run_once(
         log.info("Charge plan:\n%s", format_plan(plan, load_source))
         intent = plan.charge_intent
         assert intent is not None  # planner always sets it
-        lines = await inverter_device(settings, rest).apply(intent)
+        if (
+            previous_plan is not None
+            and previous_plan.soc.ok
+            and not setpoint_changed(previous_plan.charge_intent, intent)
+        ):
+            lines = ["[SKIP] charge setpoint unchanged"]
+        else:
+            lines = await inverter_device(settings, rest).apply(intent)
         for line in lines:
             log.info(line)
         await publish_plan(rest, plan, settings)
@@ -149,7 +183,7 @@ async def _run_derived_rerive(settings: Settings) -> None:
 
     No-op when grid import is unconfigured (the source-entity backfill path
     is still available via ``backfill-load --from``). A failure here must
-    never block the daily plan run; it logs + reports so the operator can
+    never block the scheduled plan run; it logs + reports so the operator can
     inspect the daemon log.
     """
     specs = derive_specs_from_settings(settings)
@@ -301,7 +335,7 @@ async def _charger_supports_live_rate(settings: Settings) -> bool:
 
 
 async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
-    """Loop: run the plan once per day at ``settings.plan_run_time``.
+    """Loop: recompute and apply the plan once per local half-hour slot.
 
     Serves the add-on HTTP API (behind ingress) sharing an :class:`AppState`
     with this loop: ``POST /api/config`` rewrites the options and the loop picks
@@ -346,15 +380,21 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             await republish_last(rest, settings)
     except Exception:
         log.exception("Republishing last known states failed")
-    last_run_date: date | None = None
+    last_run_slot: datetime | None = None
+    last_plan: ChargePlan | None = None
+    last_settings = settings
     target_w: float | None = None
     last_signal_at: datetime | None = None
     monitor = SocMonitor.load(settings)
     try:
         while True:
             settings = state.settings  # hot-reloaded by POST /api/config
+            if settings is not last_settings:
+                # Never reuse a previous plan's command across a hot reload.
+                last_plan = None
+                target_w = None
+                last_settings = settings
             tz = load_timezone(settings.timezone)
-            run_time = parse_time(settings.plan_run_time)
             window_start = parse_time(settings.charge_window_start)
             window_end = parse_time(settings.charge_window_end)
             if (settings.grid_power_entity, settings.inverter) != guard_cfg:
@@ -366,11 +406,14 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             # Sole SoC observation cadence (#114): one checked measurement per
             # minute in every operating state, reused by everything below.
             measurement = await soc_monitor_tick(settings, monitor)
-            if should_run(now, run_time, last_run_date):
+            if should_run(now, last_run_slot):
                 try:
-                    plan = await run_once(settings, soc=measurement)
+                    plan = await run_once(
+                        settings, soc=measurement, previous_plan=last_plan
+                    )
                     state.set_plan(plan)
-                    last_run_date = now.date()
+                    last_run_slot = _slot_start(now)
+                    last_plan = plan
                     if plan.soc.ok:
                         target_w = await _planned_rate_w(settings, plan)
                     else:
