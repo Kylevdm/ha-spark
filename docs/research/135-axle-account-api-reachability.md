@@ -6,20 +6,18 @@ Date: 2026-09-12. All requests were read-only. The probes printed only HTTP
 status codes and JSON field names. No credential, token, site identifier, asset
 identifier, or response value was printed, copied into this file, or committed.
 
-## Interim answer
+## Answer
 
-No documented Axle site or asset endpoint is verified as reachable with this
-household's Axle Events-Only static token. The account-specific cross-token
-question remains unresolved and this evidence is not sufficient to close the
-ticket.
+The household's Axle Events-Only static token does not authenticate against the
+documented site or asset API. A live read-only probe returned HTTP 200 from
+`GET /vpp/home-assistant/event`, then HTTP 403 from the site list, asset list,
+site flex-events, site price-curve, and asset dispatch-schedule endpoints.
 
-The account-specific test could not be completed because the Axle Events-Only
-static token, an Axle organisation credential, `site_id`, and `asset_id` were
-not available to the research process. The repository's local environment has
-a separate Home Assistant access token, but it has no Axle or VPP credential
-variables and no site or asset identifier variables. Home Assistant exposes the
-installed Axle integration and its event entities, but its read APIs did not
-expose the Axle Events-Only token or Axle identifiers.
+The successful Home Assistant response contained `start_time`, `end_time`,
+`import_export`, `updated_at`, and the undocumented `opted_out` field. It still
+contained no rate, event identifier, site identifier, or asset identifier.
+Because `opted_out` is absent from Axle's first-party contract, ha-spark should
+not depend on it.
 
 The first-party documentation answers the contract question:
 
@@ -41,12 +39,12 @@ The first-party documentation answers the contract question:
   per-endpoint permission list.
   [Component token](https://docs.axle.energy/api-reference/auth/component-token)
 
-The practical answer for [Choose the event-source contract for the supervised
+The answer for [Choose the event-source contract for the supervised
 Axle prototype](https://github.com/Kylevdm/ha-spark/issues/130) is therefore
-unchanged. The four-field Home Assistant endpoint is the only documented and
-locally evidenced per-household route. It has an upcoming window and direction,
-but no rate. No first-party contract establishes that this household can use a
-documented site or asset endpoint.
+settled for this Events-Only account. The four-field Home Assistant endpoint is
+the only authenticated per-household route. It has an upcoming window and
+direction, but no rate. The static token cannot use the documented site or
+asset endpoints.
 
 ## What the documented endpoints contain
 
@@ -99,12 +97,17 @@ This changes which documented feed could exist, but not the access result:
 
 ### Local account-access evidence
 
-The process environment and `/home/kyle/ha-agent/.env` were inspected by key
-name only:
+The process environment and `/home/kyle/ha-agent/.env` were initially inspected
+by key name only:
 
 - No key name matched Axle, VPP, `site_id`, or `asset_id`.
 - `HA_URL` and `HA_TOKEN` were present. Their values were used only for
   read-only Home Assistant requests.
+
+The account owner then supplied `AXLE_HA_TOKEN` locally. Its value was passed to
+curl through standard input, never printed or placed in the process argument
+list. No organisation bearer, component bearer, `site_id`, or `asset_id` was
+supplied.
 
 The Home Assistant requests produced these results:
 
@@ -117,20 +120,20 @@ The Home Assistant requests produced these results:
 
 No Axle entity returned `site_id` or `asset_id` as an attribute field. These
 checks establish that the integration is installed and the household event
-fields reach Home Assistant. They do not recover the Axle token and do not test
-whether it works on another Axle endpoint.
+fields reach Home Assistant. The later direct Axle probes below test the token
+against both endpoint families.
 
-The account-specific credential matrix remains:
+The completed account-specific credential matrix is:
 
 | Credential | Endpoint family | Account-specific result |
 | --- | --- | --- |
-| Axle Events-Only static token | `/vpp/home-assistant/event` | Indirectly evidenced by the installed entities; the token itself was unavailable for a direct probe |
-| Axle Events-Only static token | Documented `/entities/site` and `/entities/asset` GETs | Not tested because Home Assistant did not expose the token |
+| Axle Events-Only static token | `/vpp/home-assistant/event` | HTTP 200; fields were `end_time`, `import_export`, `opted_out`, `start_time`, and `updated_at` |
+| Axle Events-Only static token | Documented `/entities/site` and `/entities/asset` GETs | HTTP 403 from every tested endpoint |
 | Organisation bearer | Documented `/entities/site` and `/entities/asset` GETs | Not tested because no organisation credential or bearer was available |
 | Component bearer | Documented `/entities/site` and `/entities/asset` GETs | Not tested because minting one requires an organisation-authenticated API client |
 | Any Axle API bearer | Real site and asset resource GETs | Not tested because no `site_id` or `asset_id` was available |
 
-### Axle production auth-gate evidence
+### Axle production endpoint evidence
 
 The public OpenAPI request returned HTTP 200 and contained all documented paths
 and schemas cited above. The following production GET probes used either no
@@ -147,59 +150,22 @@ Authorization header or the fixed non-credential string
 | `/entities/site/{zero-uuid}/price-curve` | fixed non-credential | 401 |
 | `/entities/asset/{zero-uuid}/todays-dispatch-schedule` | fixed non-credential | 401 |
 
-These probes confirm that production protects both API families. They do not
-answer cross-token compatibility. Only the real Axle Events-Only static token
-and a real API bearer can answer that account-specific question.
+These probes confirm that production protects both API families. The real
+Events-Only token then produced this result:
 
-## Safe completion procedure for the account owner
+| Probe | HTTP status | Returned field presence |
+| --- | ---: | --- |
+| `/vpp/home-assistant/event` | 200 | `end_time`, `import_export`, `opted_out`, `start_time`, `updated_at` |
+| `/entities/site?page_size=1` | 403 | `detail` only |
+| `/entities/asset?page_size=1` | 403 | `detail` only |
+| `/entities/site/{zero-uuid}/flex-events` | 403 | `detail` only |
+| `/entities/site/{zero-uuid}/price-curve` | 403 | `detail` only |
+| `/entities/asset/{zero-uuid}/todays-dispatch-schedule` | 403 | `detail` only |
 
-The remaining test needs the account owner to supply credentials locally. Do
-not paste them into an issue, terminal transcript, command argument, or shell
-with tracing enabled. Place an already obtained bearer in an environment
-variable, then make GET requests whose output filter prints only the status and
-field names. Feed the Authorization header to curl through standard input so it
-does not appear in the process argument list. Do not call an auth or onboarding
-POST as part of this test.
-
-Required local variables:
-
-- `AXLE_HA_TOKEN` for the static Events Only token.
-- `AXLE_API_BEARER` for an already obtained organisation or component bearer,
-  if the account has one.
-- `AXLE_SITE_ID` and `AXLE_ASSET_ID`, if known.
-
-Use this pattern for each token and endpoint:
-
-```bash
-set +x
-body_file=$(mktemp)
-trap 'rm -f "$body_file"' EXIT
-status=$(
-  printf 'header = "Authorization: Bearer %s"\n' "$AXLE_HA_TOKEN" |
-    curl -sS --config - --output "$body_file" --write-out '%{http_code}' \
-      --header 'Accept: application/json' \
-      'https://api.axle.energy/entities/site?limit=1'
-)
-printf 'status=%s\n' "$status"
-jq 'if type == "object" then keys | sort else type end' "$body_file"
-rm -f "$body_file"
-trap - EXIT
-```
-
-Repeat the same GET with `AXLE_API_BEARER`. If site and asset identifiers are
-available, probe `flex-events`, `price-curve`, and
-`todays-dispatch-schedule`. For a 200 response, print only these structures:
-
-```bash
-jq '{top_level_fields: (keys | sort), event_fields: ((.events[0]? // {}) | keys | sort)}'
-jq '{top_level_fields: (keys | sort), price_fields: ((.half_hourly_traded_prices[0]? // {}) | keys | sort)}'
-jq '{top_level_fields: (keys | sort), period_fields: ((.periods[0]? // {}) | keys | sort)}'
-```
-
-A 200 from a documented endpoint with `AXLE_HA_TOKEN` would establish token
-reuse. A 401 or 403 would rule it out for that endpoint. A 404 is not enough to
-separate an unknown identifier from lack of authorisation because Axle
-documents both causes together on several resource endpoints.
+This directly rules out cross-token compatibility for the tested documented
+site and asset endpoints. A separate organisation or component bearer could
+still access them, but that is a partner API route and no such credential was
+available for this household test.
 
 ## Sources
 
