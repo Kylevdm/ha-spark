@@ -7,6 +7,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ha_spark.config import Settings
+from ha_spark.energy.axle import AxleApiError, read_axle_event
 from ha_spark.energy.forecast import load_timezone, predict_home_load
 from ha_spark.energy.models import (
     SLOTS_PER_DAY,
@@ -25,6 +26,7 @@ from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.energy.soc_monitor import observe_soc
 from ha_spark.energy.solar import distribute_solar
 from ha_spark.energy.tariff import (
+    AxleTariffProvider,
     DynamicTariffProvider,
     FixedTariffProvider,
     OctopusIntelligentProvider,
@@ -210,6 +212,10 @@ def build_schedule(
         return DynamicTariffProvider(fallback=fixed).schedule(inputs, cfg)
     if settings.tariff_provider == "octopus_intelligent":
         return OctopusIntelligentProvider(fallback=fixed).schedule(inputs, cfg)
+    if settings.tariff_provider == "axle":
+        return AxleTariffProvider(
+            fallback=fixed, event_rate_gbp_kwh=settings.axle_event_rate_gbp_kwh
+        ).schedule(inputs, cfg)
     return fixed.schedule(inputs, cfg)
 
 
@@ -240,6 +246,13 @@ async def gather_inputs(
     ha_needed = await state(settings.ha_template_charge_needed_entity)
 
     voltage_v = _to_float(voltage.state if voltage else None, settings.battery_voltage_v)
+
+    flexibility_event = None
+    if settings.tariff_provider == "axle":
+        try:
+            flexibility_event = await read_axle_event(settings, rest)
+        except AxleApiError as exc:
+            log.warning("Could not read Axle event: %s", exc)
 
     dispatches: tuple[DispatchSlot, ...]
     if settings.tariff_provider == "octopus_intelligent":
@@ -325,6 +338,7 @@ async def gather_inputs(
         solar_tomorrow_kwh=solar_kwh,
         predicted_home_load_kwh=forecast.total_kwh,
         dispatches=dispatches,
+        flexibility_event=flexibility_event,
         ev_charging=ev_charging,
         ha_template_needed=_opt_float(ha_needed.state) if ha_needed else None,
         load_slots=load_slots,

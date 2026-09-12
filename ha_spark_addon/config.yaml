@@ -75,6 +75,10 @@ options:
   octopus_account_number: ""
   octopus_product_code: ""
   octopus_tariff_code: ""
+  axle_api_key: ""
+  axle_api_url: "https://api.axle.energy"
+  axle_event_entity: ""
+  axle_event_rate_gbp_kwh: 1.0
   soc_entity: ""
   soc_max_report_age_minutes: 10.0
   soc_failure_threshold: 3
@@ -137,7 +141,7 @@ schema:
   rate_offpeak_gbp_kwh: float
   rate_peak_gbp_kwh: float
   rate_export_gbp_kwh: float
-  tariff_provider: list(fixed|dynamic|octopus_intelligent)
+  tariff_provider: list(fixed|dynamic|octopus_intelligent|axle)
   dynamic_rates_entity: str
   dynamic_rates_entity_tomorrow: str
   profile_min_days: int
@@ -164,6 +168,10 @@ schema:
   octopus_account_number: str?
   octopus_product_code: str?
   octopus_tariff_code: str?
+  axle_api_key: password?
+  axle_api_url: url
+  axle_event_entity: str?
+  axle_event_rate_gbp_kwh: float(0,)
   soc_entity: str?
   soc_max_report_age_minutes: float
   soc_failure_threshold: int

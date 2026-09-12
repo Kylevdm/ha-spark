@@ -94,6 +94,10 @@ _OPTION_KEYS = frozenset(
         "octopus_account_number",
         "octopus_product_code",
         "octopus_tariff_code",
+        "axle_api_key",
+        "axle_api_url",
+        "axle_event_entity",
+        "axle_event_rate_gbp_kwh",
         # Battery model fallback.
         "battery_voltage_v",
         # Entity IDs: exposed so other installs can map their own sensors/controls
@@ -152,7 +156,7 @@ _OPTION_KEYS = frozenset(
 # Subset of _OPTION_KEYS that hold secrets. These must never appear in cleartext
 # in any response (CLAUDE.md top-priority rule): the API masks them before
 # returning options. Kept here next to _OPTION_KEYS so the two stay in sync.
-_SECRET_OPTION_KEYS = frozenset({"octopus_api_key", "agent_api_token"})
+_SECRET_OPTION_KEYS = frozenset({"octopus_api_key", "axle_api_key", "agent_api_token"})
 
 
 class ConfigError(RuntimeError):
@@ -239,6 +243,35 @@ def validate_octopus_intelligent_tariff(settings: Settings) -> None:
     except ValidationError as exc:
         raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
 
+
+class AxleTariffConfig(BaseModel):
+    """The supervised Axle event provider's settings."""
+
+    axle_api_key: str = ""
+    axle_event_entity: str = ""
+    axle_event_rate_gbp_kwh: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _source_configured(self) -> AxleTariffConfig:
+        if not self.axle_api_key and not self.axle_event_entity:
+            raise ValueError("set axle_api_key or axle_event_entity")
+        return self
+
+
+def validate_axle_tariff(settings: Settings) -> None:
+    """When ``tariff_provider`` is ``axle``, require one event source."""
+    if settings.tariff_provider != "axle":
+        return
+    try:
+        AxleTariffConfig(
+            axle_api_key=settings.axle_api_key,
+            axle_event_entity=settings.axle_event_entity,
+            axle_event_rate_gbp_kwh=settings.axle_event_rate_gbp_kwh,
+        )
+    except ValidationError as exc:
+        raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
+
+
 class DeviceConfig(BaseModel):
     """One controllable device. Phase 7 ships type == "inverter" only."""
 
@@ -319,7 +352,9 @@ class Settings(BaseSettings):
     # Tariff provider: "fixed" costs against rate_offpeak/rate_peak + the charge
     # window above; "dynamic" costs each slot at its live price from an HA
     # half-hourly price sensor (falls back to fixed on a missing/bad read).
-    tariff_provider: Literal["fixed", "dynamic", "octopus_intelligent"] = Field(default="fixed")
+    tariff_provider: Literal["fixed", "dynamic", "octopus_intelligent", "axle"] = Field(
+        default="fixed"
+    )
     dynamic_rates_entity: str = Field(default="")
     # Optional: a second entity for tomorrow's rates (many integrations publish
     # today/tomorrow as separate entities). Blank is fine — slots past today's
@@ -371,6 +406,13 @@ class Settings(BaseSettings):
     octopus_account_number: str = Field(default="")
     octopus_product_code: str = Field(default="")
     octopus_tariff_code: str = Field(default="")
+
+    # Axle supervised export-event source. The API key is the static token from
+    # Axle's Home Assistant account page; the entity is the optional HA mirror.
+    axle_api_key: str = Field(default="")
+    axle_api_url: str = Field(default="https://api.axle.energy")
+    axle_event_entity: str = Field(default="")
+    axle_event_rate_gbp_kwh: float = Field(default=1.0, ge=0)
 
     # HA entity IDs (all overridable). Blank by default; set via `ha-spark
     # onboard` (entity auto-discovery) or the `solis` preset (ha_spark/presets.py),
@@ -571,4 +613,5 @@ def load_settings(*, validate: bool = True) -> Settings:
         validate_fixed_tariff(settings)
         validate_dynamic_tariff(settings)
         validate_octopus_intelligent_tariff(settings)
+        validate_axle_tariff(settings)
     return settings
