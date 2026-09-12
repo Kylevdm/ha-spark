@@ -149,16 +149,23 @@ def test_post_config_rejects_non_object(tmp_path: Path) -> None:
 
 def test_get_config_redacts_secrets(tmp_path: Path) -> None:
     """Set secrets must never leave the process in cleartext (CLAUDE.md top rule)."""
-    state = _state(tmp_path, octopus_api_key="SECRET_OCTO", agent_api_token="SECRET_AGENT")
+    state = _state(
+        tmp_path,
+        octopus_api_key="SECRET_OCTO",
+        axle_api_key="SECRET_AXLE",
+        agent_api_token="SECRET_AGENT",
+    )
     with _client(state) as client:
         resp = client.get("/api/config")
     assert resp.status_code == 200
     # Raw response text carries neither secret.
     assert "SECRET_OCTO" not in resp.text
+    assert "SECRET_AXLE" not in resp.text
     assert "SECRET_AGENT" not in resp.text
     body = resp.json()
     # Keys are still present (response shape preserved) but redacted.
     assert body["octopus_api_key"] == "***"
+    assert body["axle_api_key"] == "***"
     assert body["agent_api_token"] == "***"
 
 

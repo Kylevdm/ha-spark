@@ -84,6 +84,17 @@ class DispatchSlot:
 
 
 @dataclass(frozen=True)
+class FlexibilityEvent:
+    """A validated aggregator event used to price a planning window."""
+
+    start: datetime
+    end: datetime
+    direction: str
+    updated_at: datetime
+    rate_gbp_kwh: float
+
+
+@dataclass(frozen=True)
 class PlannerConfig:
     """Fixed model coefficients (from Settings)."""
 
@@ -122,6 +133,7 @@ class PlannerInputs:
     # (the horizon starts at the window, so this load is otherwise invisible).
     pre_window_drain_kwh: float = 0.0
     dispatches: tuple[DispatchSlot, ...] = ()
+    flexibility_event: FlexibilityEvent | None = None
     ev_charging: bool = False
     ha_template_needed: float | None = None
     # v2 per-slot horizon (48 half-hour slots starting at the charge-window start

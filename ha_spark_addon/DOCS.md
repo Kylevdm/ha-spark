@@ -271,6 +271,15 @@ dispatch/cheap-window handling is otherwise identical to `fixed`. Requires
 failure falls back to the fixed rates/dispatches — `ha-spark health` reports
 the live provider status; the API key is never logged or echoed.
 
+`axle` adds the supervised Axle export-event source. Set `axle_api_key` to the
+static token from Axle's Home Assistant account page. `axle_event_entity` may
+hold the Home Assistant mirror entity for fallback when the direct request
+fails. Set `axle_event_rate_gbp_kwh` to the paid export rate because Axle's
+Home Assistant event response does not include a rate. The provider accepts
+only explicit, fresh export windows. Import events and malformed or stale
+responses produce no export slots. The API key is a password and is never
+written to logs or reports.
+
 ### Octopus API (optional)
 
 `octopus_api_key`, `octopus_mpan`, `octopus_meter_serial` enable
