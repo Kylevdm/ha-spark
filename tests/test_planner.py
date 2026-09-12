@@ -10,7 +10,7 @@ import pytest
 from ha_spark.energy.models import DispatchSlot, PlannerConfig, PlannerInputs
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
-from ha_spark.energy.tariff import fixed_schedule
+from ha_spark.energy.tariff import TariffSchedule, fixed_schedule
 
 
 def _soc(value: float) -> SocMeasurement:
@@ -208,6 +208,55 @@ def test_slot_model_charges_for_expensive_slots_only() -> None:
     assert plan.expensive_load_kwh == pytest.approx(18.0)
     # SoC at min -> usable 0; required = 18 kWh within headroom (18.816).
     assert plan.required_kwh == pytest.approx(18.0)
+
+
+def test_slot_model_reservation_drives_required_charge() -> None:
+    # The reservation carries the existing buffer, while required_kwh subtracts
+    # the energy already available at the window start.
+    plan = _plan(_slot_inputs(load=0.2, soc_now=50.0), cfg(buffer_pct=20.0))
+    assert len(plan.reservations) == 1
+    reservation = plan.reservations[0]
+    assert reservation.name == "reach-next-cheap-slot"
+    assert reservation.obligation_kind == "reach-next-cheap-slot"
+    assert reservation.target_slot == 48
+    assert reservation.energy_kwh == pytest.approx(8.64)
+    assert plan.required_kwh == pytest.approx(8.64 - plan.usable_now_kwh)
+
+
+def test_slot_model_reservation_targets_a_cheap_slot_mid_horizon() -> None:
+    load_slots = (1.0,) * 8
+    inputs = PlannerInputs(
+        soc=_soc(20.0),
+        solar_tomorrow_kwh=0.0,
+        predicted_home_load_kwh=8.0,
+        load_slots=load_slots,
+        solar_slots=(0.0,) * 8,
+        horizon_start=_HORIZON_START,
+    )
+    schedule = TariffSchedule(
+        cheap_rate=0.069,
+        standard_rate=0.30,
+        export_rate=0.0,
+        window_hours=0.5,
+        prices=(0.30, 0.30, 0.30, 0.30, 0.069, 0.30, 0.30, 0.30),
+        cheap_fracs=(0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0),
+    )
+    plan = compute_plan(inputs, cfg(buffer_pct=0.0), schedule)
+
+    reservation = plan.reservations[0]
+    assert reservation.target_slot == 4
+    assert reservation.target_time == _HORIZON_START + timedelta(hours=2)
+    assert reservation.energy_kwh == pytest.approx(4.0)
+    assert "cheap slot" in reservation.reason
+
+
+def test_slot_model_reservation_cap_names_shortfall() -> None:
+    plan = _plan(_slot_inputs(load=2.0, soc_now=20.0), cfg(buffer_pct=20.0))
+
+    reservation = plan.reservations[0]
+    assert reservation.energy_kwh == pytest.approx(26.88 * 0.70)
+    assert "capped" in reservation.reason
+    assert "shortfall" in reservation.reason
 
 
 def test_slot_model_subtracts_solar_per_slot() -> None:

@@ -163,6 +163,28 @@ class ChargeIntent:
 
 
 @dataclass(frozen=True)
+class Reservation:
+    """Battery energy reserved for a named obligation in the slot horizon."""
+
+    name: str
+    target_slot: int
+    energy_kwh: float
+    obligation_kind: str
+    reason: str
+    target_time: datetime | None = None
+
+    @property
+    def obligation(self) -> str:
+        """Compatibility spelling for callers describing the obligation."""
+        return self.obligation_kind
+
+    @property
+    def target(self) -> datetime | int:
+        """The concrete target time when available, otherwise the slot index."""
+        return self.target_time if self.target_time is not None else self.target_slot
+
+
+@dataclass(frozen=True)
 class ChargePlan:
     """The computed plan: the numbers, plus the ChargeIntent a Charger realizes."""
 
@@ -194,6 +216,9 @@ class ChargePlan:
     # EV energy Octopus plans to deliver across the dispatches (None when there
     # are no dispatches) — reported, not planned: Octopus controls the EV.
     dispatch_ev_kwh: float | None = None
+    # Named battery obligations computed from the slot horizon. The daily model
+    # intentionally leaves this empty to preserve its legacy contract.
+    reservations: tuple[Reservation, ...] = ()
 
     @property
     def soc_now(self) -> float:

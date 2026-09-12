@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, time
 
-from ha_spark.energy.models import ChargeIntent, ChargePlan
+from ha_spark.energy.models import ChargeIntent, ChargePlan, Reservation
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 
@@ -87,3 +87,17 @@ def test_report_names_the_concrete_integrity_reason() -> None:
 
 def test_report_does_not_flag_a_trusted_soc() -> None:
     assert "untrusted" not in format_plan(_plan(), "test")
+
+
+def test_report_renders_reservation_reason() -> None:
+    reservation = Reservation(
+        name="reach-next-cheap-slot",
+        target_slot=48,
+        energy_kwh=8.64,
+        obligation_kind="reach-next-cheap-slot",
+        reason="Reserving 8.64 kWh through the planning horizon because no cheap slot appears.",
+    )
+    out = format_plan(_plan(reservations=(reservation,)), "slot profile")
+
+    assert "Reservations:" in out
+    assert reservation.reason in out
