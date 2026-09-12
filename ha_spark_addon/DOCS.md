@@ -1,8 +1,8 @@
 # ha-spark
 
-Local-first battery charge planner for Home Assistant. Once a day (at
-`plan_run_time`, default 22:00 local) it forecasts tomorrow's household load
-and solar yield, sizes the overnight cheap-rate charge, and — when
+Local-first battery charge planner for Home Assistant. Every local half-hour it
+recomputes tomorrow's household load and solar yield, sizes the overnight
+cheap-rate charge, and, when
 `proactive_mode` is `on` — sets the inverter's timed charge current.
 
 ## Installation
@@ -135,7 +135,8 @@ always produces).
   `solar_percentile`, `expected_load_kwh` — forecast/sizing knobs; the
   defaults are sensible.
 - `charge_window_start` / `charge_window_end` — your cheap-rate window.
-- `plan_run_time` — local HH:MM at which the daily plan runs.
+- `plan_run_time` — retained for compatibility; the daemon recomputes the plan
+  every local half-hour slot.
 
 ### Supply guard (optional)
 
@@ -380,7 +381,7 @@ remains the sole decider. Nothing here changes that.
      component stats repair history), so a manual rerun is only needed
      once.
 4. `ha-spark plan` — print tonight's plan without applying it.
-5. Leave the add-on running; it executes the plan daily at `plan_run_time`.
+5. Leave the add-on running; it recomputes the plan every local half-hour.
    When the simulated decisions look right, set `proactive_mode: on`.
 
 ## Data

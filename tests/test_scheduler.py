@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -67,27 +68,43 @@ def _planned_w(settings: Settings, intent: ChargeIntent) -> float:
     return inverter_device(settings, rest).planned_rate_w(intent)
 
 
-def test_should_run_at_or_after_run_time_once_per_day() -> None:
-    run_time = time(22, 0)
-    assert should_run(datetime(2026, 6, 10, 22, 0), run_time, None) is True
-    assert should_run(datetime(2026, 6, 10, 23, 59), run_time, None) is True
+def test_should_run_first_half_hour_slot_immediately() -> None:
+    now = datetime(2026, 6, 10, 12, 17)
+    assert should_run(now, None) is True
 
 
-def test_should_run_false_before_run_time() -> None:
-    run_time = time(22, 0)
-    assert should_run(datetime(2026, 6, 10, 21, 59), run_time, None) is False
+def test_should_run_false_until_the_next_half_hour_slot() -> None:
+    now = datetime(2026, 6, 10, 12, 17)
+    assert should_run(now, datetime(2026, 6, 10, 12, 0)) is False
+    assert should_run(datetime(2026, 6, 10, 12, 30), datetime(2026, 6, 10, 12, 0)) is True
 
 
-def test_should_run_false_if_already_run_today() -> None:
-    run_time = time(22, 0)
-    assert should_run(datetime(2026, 6, 10, 22, 30), run_time, date(2026, 6, 10)) is False
+def test_should_run_runs_after_a_missed_slot_without_catching_up() -> None:
+    now = datetime(2026, 6, 10, 13, 17)
+    assert should_run(now, datetime(2026, 6, 10, 12, 0)) is True
 
 
-def test_should_run_true_again_next_day() -> None:
-    run_time = time(22, 0)
-    # New day at midnight: not yet time again until 22:00.
-    assert should_run(datetime(2026, 6, 11, 0, 0), run_time, date(2026, 6, 10)) is False
-    assert should_run(datetime(2026, 6, 11, 22, 0), run_time, date(2026, 6, 10)) is True
+def test_should_run_uses_local_slot_start() -> None:
+    assert should_run(datetime(2026, 6, 11, 0, 0), datetime(2026, 6, 10, 23, 30)) is True
+
+
+def test_setpoint_change_ignores_fresh_soc_observation() -> None:
+    from ha_spark.energy.scheduler import setpoint_changed
+
+    previous = _INTENT
+    current = replace(_INTENT, soc=_soc(31.0))
+    assert setpoint_changed(previous, current) is False
+
+
+def test_setpoint_change_detects_target_window_and_hold_changes() -> None:
+    from ha_spark.energy.scheduler import setpoint_changed
+
+    assert setpoint_changed(_INTENT, replace(_INTENT, target_soc_pct=78.0)) is True
+    assert setpoint_changed(_INTENT, replace(_INTENT, window_start=time(0, 0))) is True
+    assert setpoint_changed(
+        _INTENT,
+        replace(_INTENT, holds=((datetime(2026, 6, 10, 12, 0), datetime(2026, 6, 10, 12, 30)),)),
+    ) is True
 
 
 @respx.mock
@@ -120,6 +137,69 @@ async def test_run_once_computes_and_applies_plan(
     assert rows[0].model == "baseline"
     assert rows[0].total_kwh == plan.load_kwh
     assert rows[0].source == "test"
+
+
+async def test_run_once_skips_unchanged_command_after_fresh_soc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    applied: list[ChargeIntent] = []
+    previous = _plan()
+    current_intent = replace(previous.charge_intent, soc=_soc(31.0))
+    current = replace(previous, soc=current_intent.soc, charge_intent=current_intent)
+
+    async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
+        return SimpleNamespace(plan=current, inputs=object(), load_source="test")
+
+    class FakeDevice:
+        async def apply(self, intent: ChargeIntent) -> list[str]:
+            applied.append(intent)
+            return ["[APPLIED] test"]
+
+    async def noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_args: FakeDevice())
+    monkeypatch.setattr(scheduler, "publish_plan", noop)
+    monkeypatch.setattr(scheduler, "_record_forecast", noop)
+    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
+    monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
+
+    result = await run_once(Settings(), soc=current.soc, previous_plan=previous)
+
+    assert result is current
+    assert applied == []
+
+
+async def test_run_once_retries_after_untrusted_previous_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    applied: list[ChargeIntent] = []
+    failed = _failed_soc()
+    previous = replace(_plan(), soc=failed, charge_intent=replace(_INTENT, soc=failed))
+    current = _plan()
+
+    async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
+        return SimpleNamespace(plan=current, inputs=object(), load_source="test")
+
+    class FakeDevice:
+        async def apply(self, intent: ChargeIntent) -> list[str]:
+            applied.append(intent)
+            return ["[APPLIED] test"]
+
+    async def noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_args: FakeDevice())
+    monkeypatch.setattr(scheduler, "publish_plan", noop)
+    monkeypatch.setattr(scheduler, "_record_forecast", noop)
+    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
+    monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
+
+    await run_once(Settings(), soc=current.soc, previous_plan=previous)
+
+    assert applied == [current.charge_intent]
 
 
 @respx.mock
@@ -188,7 +268,12 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
 ) -> None:
     calls: list[str] = []
 
-    async def fake_run_once(_s: Settings, *, soc: SocMeasurement | None = None) -> ChargePlan:
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+    ) -> ChargePlan:
         calls.append("run")
         if len(calls) == 1:
             raise RuntimeError("boom")
@@ -197,14 +282,14 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
     class _StopLoop(Exception):
         pass
 
-    # Tick sequence: fail at 22:00, retry succeeds at 22:00 (still same day),
-    # then no more runs until the next day at 22:00.
+    # Tick sequence: fail at 22:00, retry succeeds in the same slot, then run
+    # again at 22:30 and once more after midnight.
     ticks = iter(
         [
             datetime(2026, 6, 10, 22, 0),
             datetime(2026, 6, 10, 22, 0),
-            datetime(2026, 6, 10, 23, 0),
-            datetime(2026, 6, 11, 22, 0),
+            datetime(2026, 6, 10, 22, 30),
+            datetime(2026, 6, 11, 0, 0),
         ]
     )
 
@@ -216,10 +301,15 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
             except StopIteration as exc:
                 raise _StopLoop from exc
 
+    original_sleep = asyncio.sleep
+
     async def fake_sleep(_seconds: float) -> None:
-        return None
+        await original_sleep(0)
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    async def noop_v2l_tick(_s: Settings, _now: datetime) -> None:
         return None
 
     def fake_make_server(_app: object, _host: str, _port: int) -> object:
@@ -237,15 +327,17 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
     monkeypatch.setattr(scheduler, "make_server", fake_make_server)
     monkeypatch.setattr(scheduler, "serve_in_background", fake_serve_in_background)
     monkeypatch.setattr(scheduler, "stop_server", fake_stop_server)
+    monkeypatch.setattr(scheduler, "run_v2l_tick", noop_v2l_tick)
     monkeypatch.setattr(scheduler.asyncio, "sleep", fake_sleep)
 
-    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00", v2l_power_entity=""
+    )
     with pytest.raises(_StopLoop):
         await run_forever(s, poll_seconds=0)
 
-    # First tick fails (retry), second tick (still 22:00) succeeds, third
-    # tick (23:00, already run today) skips, fourth tick (next day) runs again.
-    assert calls == ["run", "run", "run"]
+    # First tick fails (retry), second tick succeeds, then each new slot runs.
+    assert calls == ["run", "run", "run", "run"]
 
 
 def _patch_loop(
@@ -265,7 +357,12 @@ def _patch_loop(
             except StopIteration as exc:
                 raise _StopLoop from exc
 
+    original_sleep = asyncio.sleep
+
     async def fake_sleep(_seconds: float) -> None:
+        await original_sleep(0)
+
+    async def noop_v2l_tick(_s: Settings, _now: datetime) -> None:
         return None
 
     def fake_make_server(_app: object, _host: str, _port: int) -> object:
@@ -282,6 +379,7 @@ def _patch_loop(
     monkeypatch.setattr(scheduler, "make_server", fake_make_server)
     monkeypatch.setattr(scheduler, "serve_in_background", fake_serve_in_background)
     monkeypatch.setattr(scheduler, "stop_server", fake_stop_server)
+    monkeypatch.setattr(scheduler, "run_v2l_tick", noop_v2l_tick)
     return _StopLoop
 
 
@@ -295,7 +393,12 @@ async def test_run_forever_publishes_plan_to_api_state(
         captured["state"] = state
         return object()  # never actually served; make_server is stubbed too
 
-    async def fake_run_once(_s: Settings, *, soc: SocMeasurement | None = None) -> ChargePlan:
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+    ) -> ChargePlan:
         return _plan()
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
@@ -319,7 +422,12 @@ async def test_run_forever_guard_ticks_only_inside_window(
 ) -> None:
     guard_targets: list[float | None] = []
 
-    async def fake_run_once(_s: Settings, *, soc: SocMeasurement | None = None) -> ChargePlan:
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+    ) -> ChargePlan:
         return _plan()
 
     async def fake_guard_tick(
@@ -359,7 +467,12 @@ async def test_run_forever_guard_ticks_only_inside_window(
 async def test_run_forever_no_guard_when_entity_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_run_once(_s: Settings, *, soc: SocMeasurement | None = None) -> ChargePlan:
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+    ) -> ChargePlan:
         return _plan()
 
     async def fail_guard_tick(
@@ -386,7 +499,12 @@ async def test_run_forever_no_guard_when_charger_has_no_live_rate(
     """AlphaESS has no settable rate -> the guard branch never fires, even with
     grid_power_entity set."""
 
-    async def fake_run_once(_s: Settings, *, soc: SocMeasurement | None = None) -> ChargePlan:
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+    ) -> ChargePlan:
         return _plan()
 
     async def fail_guard_tick(
@@ -415,6 +533,14 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
 ) -> None:
     attempts: list[datetime] = []
 
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+    ) -> ChargePlan:
+        return _plan()
+
     async def boom_guard_tick(
         _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
     ) -> float:
@@ -425,6 +551,7 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
         return None
 
     monkeypatch.setattr(scheduler, "guard_tick", boom_guard_tick)
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
     monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
     stop = _patch_loop(
         monkeypatch,
@@ -551,7 +678,12 @@ async def test_run_forever_samples_signals_every_interval(
 ) -> None:
     sampled: list[datetime] = []
 
-    async def fake_run_once(_s: Settings, *, soc: SocMeasurement | None = None) -> ChargePlan:
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+    ) -> ChargePlan:
         return _plan()
 
     async def fake_sample_signals(_s: Settings, now: datetime) -> None:
@@ -795,13 +927,19 @@ def _patch_monitor_loop(
 
     if run_once_socs is not None:
         async def fake_run_once(
-            _s: Settings, *, soc: SocMeasurement | None = None
+            _s: Settings,
+            *,
+            soc: SocMeasurement | None = None,
+            previous_plan: ChargePlan | None = None,
         ) -> ChargePlan:
             run_once_socs.append(soc)
             return _plan()
     else:
         async def fake_run_once(
-            _s: Settings, *, soc: SocMeasurement | None = None
+            _s: Settings,
+            *,
+            soc: SocMeasurement | None = None,
+            previous_plan: ChargePlan | None = None,
         ) -> ChargePlan:
             return _plan()
 
@@ -1076,7 +1214,10 @@ async def test_loop_blocked_plan_rate_never_becomes_guard_target(
     _soc_get(["50"], [stale])
 
     async def fake_run_once(
-        _s: Settings, *, soc: SocMeasurement | None = None
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
     ) -> ChargePlan:
         # A plan computed from the tick's failed measurement: blocked at the
         # charger gate, but still a plan object (existence != applied).

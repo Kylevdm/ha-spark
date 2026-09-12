@@ -158,7 +158,7 @@ async def _cmd_ask(settings: Settings, message: str) -> int:
 
 
 async def _cmd_run(settings: Settings, *, once: bool) -> int:
-    """Run the planner daemon: compute & apply once, or loop daily."""
+    """Run the planner daemon: compute & apply once, or loop half-hourly."""
     if once:
         await run_once(settings)
         return 0
@@ -565,7 +565,7 @@ examples:
   ha-spark plan                            compute tonight's charge plan
   ha-spark plan --apply                    ...and run the charger (per PROACTIVE_MODE)
   ha-spark ask "what's tonight's plan"     answer via Ollama, or offline if unreachable
-  ha-spark run                             daemon: plan + apply daily at PLAN_RUN_TIME
+  ha-spark run                             daemon: plan + apply every half-hour
   ha-spark run --once                      plan + apply immediately, then exit
   ha-spark backfill-load --list            show statistics usable as a load source
   ha-spark backfill-load --from sensor.x   rebuild house-load history from sensor.x
@@ -696,10 +696,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = sub.add_parser(
         "run",
-        help="Daemon: compute & apply the plan once per day",
-        description="Long-running loop that computes and applies the charge plan once "
-        "per local calendar day at PLAN_RUN_TIME (default 22:00), retrying on failure "
-        "until the day rolls over. Writes are still gated by PROACTIVE_MODE.",
+        help="Daemon: compute & apply the plan every half-hour",
+        description="Long-running loop that recomputes the charge plan every local "
+        "half-hour slot. Writes are still gated by PROACTIVE_MODE.",
     )
     p_run.add_argument(
         "--once",

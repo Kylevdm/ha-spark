@@ -331,7 +331,8 @@ class Settings(BaseSettings):
     profile_history_days: int = Field(default=60)
     timezone: str = Field(default="Europe/London")
 
-    # Local time (HH:MM) at which `ha-spark run` computes/applies the daily plan.
+    # Retained for configuration compatibility; the daemon now replans every
+    # local half-hour slot.
     plan_run_time: str = Field(default="22:00")
 
     # Statistic whose history seeds `ha-spark backfill-load` (a true-load power
