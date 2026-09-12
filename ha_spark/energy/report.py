@@ -40,12 +40,22 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
             f"  Slot import price  £{lo:.3f}–£{hi:.3f}/kWh  "
             f"({cheap}/{len(plan.slot_prices)} slots cheap)"
         )
+    if plan.reservations:
+        lines.append("  Reservations:")
+        for reservation in plan.reservations:
+            lines.append(
+                f"    {reservation.name}  {reservation.energy_kwh:.2f} kWh  "
+                f"— {reservation.reason}"
+            )
     deficit = f"{plan.deficit_kwh:.2f} kWh"
     if plan.buffer_pct > 0 and plan.deficit_kwh > 0:
         buffered = plan.deficit_kwh * (1.0 + plan.buffer_pct / 100.0)
         deficit += f"  (+{plan.buffer_pct:.0f}% buffer -> {buffered:.2f})"
 
     required = f"{plan.required_kwh:.2f} kWh"
+    if plan.reservations and plan.strategy != "fill":
+        names = ", ".join(reservation.name for reservation in plan.reservations)
+        required += f"  (funds {names})"
     if plan.strategy == "fill":
         required += f"  (fill to {plan.target_soc:.0f}%)"
     if plan.charge_efficiency < 1 and plan.required_kwh > 0:

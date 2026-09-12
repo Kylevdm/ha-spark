@@ -36,17 +36,95 @@ the battery holds (doesn't discharge) while cheap grid covers the house.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from ha_spark.energy.models import (
     ChargeIntent,
     ChargePlan,
     PlannerConfig,
     PlannerInputs,
+    Reservation,
 )
 from ha_spark.energy.tariff import TariffSchedule
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def _slot_reservation(
+    inputs: PlannerInputs,
+    cfg: PlannerConfig,
+    schedule: TariffSchedule,
+    net: list[float],
+) -> Reservation:
+    """Build the tracer reservation for the slot-model horizon.
+
+    The reservation ends at the first cheap slot after the current expensive
+    run. If no later cheap slot is represented, the horizon end is the hard
+    target. This makes the existing fixed schedule (cheap window first,
+    expensive daytime afterward) reserve exactly its expensive-slot need.
+    """
+    fracs = schedule.cheap_fracs
+    first_expensive = next(
+        (i for i, fraction in enumerate(fracs) if fraction < 1.0 - 1e-9),
+        None,
+    )
+    if first_expensive is None:
+        target_slot = len(net)
+    else:
+        target_slot = next(
+            (
+                i
+                for i in range(first_expensive + 1, len(fracs))
+                if fracs[i] > 1e-9
+            ),
+            len(net),
+        )
+
+    expensive_need = sum(
+        (1.0 - fraction) * energy
+        for fraction, energy in zip(fracs[:target_slot], net[:target_slot], strict=True)
+    )
+    buffered_need = expensive_need * (1.0 + cfg.buffer_pct / 100.0)
+    usable_capacity = max(0.0, cfg.capacity_kwh * (cfg.target_cap - cfg.min_soc) / 100.0)
+    energy = min(buffered_need, usable_capacity)
+    shortfall = max(0.0, buffered_need - energy)
+
+    target_time = None
+    target_label = f"slot {target_slot}"
+    if inputs.horizon_start is not None:
+        target_time = inputs.horizon_start + timedelta(minutes=30 * target_slot)
+        target_label = (
+            target_time.strftime("%H:%M") if target_slot < len(net) else "the horizon end"
+        )
+
+    if expensive_need <= 1e-9:
+        reason = "No expensive forecast load needs to be carried to the next cheap slot."
+    elif target_slot < len(net):
+        reason = (
+            f"Reserving {energy:.2f} kWh to cover forecast house load until the "
+            f"{target_label} cheap slot."
+        )
+    else:
+        reason = (
+            f"Reserving {energy:.2f} kWh to cover forecast house load through the "
+            "planning horizon because no later cheap slot appears in the horizon."
+        )
+    if shortfall > 1e-9:
+        reason = (
+            f"{reason[:-1]} The reservation is capped at usable battery capacity, "
+            f"leaving a {shortfall:.2f} kWh forecast shortfall."
+        )
+
+    return Reservation(
+        name="reach-next-cheap-slot",
+        target_slot=target_slot,
+        energy_kwh=energy,
+        obligation_kind="reach-next-cheap-slot",
+        reason=reason,
+        target_time=target_time,
+    )
 
 
 def compute_plan(
@@ -73,6 +151,7 @@ def compute_plan(
     headroom = max(0.0, cfg.capacity_kwh * (cfg.target_cap - inputs.soc_now) / 100.0)
 
     expensive_load_kwh: float | None = None
+    reservations: tuple[Reservation, ...] = ()
     if inputs.load_slots is not None:
         # --- v2 per-slot horizon: cost against the schedule's per-slot prices ---
         model = "slots"
@@ -98,6 +177,7 @@ def compute_plan(
             max(0.0, solar * cfg.solar_haircut_k - load)
             for load, solar in zip(inputs.load_slots, solar_slots, strict=False)
         )
+        reservations = (_slot_reservation(inputs, cfg, schedule, net),)
     else:
         # --- v1 daily balance ---
         model = "daily"
@@ -120,12 +200,17 @@ def compute_plan(
     # The horizon starts at the window, so load between now and then drains
     # the battery invisibly — size against the usable energy at window start.
     usable_at_window = usable_now - inputs.pre_window_drain_kwh
+    reservation_need = sum(reservation.energy_kwh for reservation in reservations)
     if cfg.strategy == "fill":
         # Fill to the cap regardless of need: optimal once export pays more
         # than off-peak; surplus carries over to later days (not costed here).
         required = headroom
     else:
-        required = _clamp(buffered_deficit - usable_at_window, 0.0, headroom)
+        required = _clamp(
+            (reservation_need if reservations else buffered_deficit) - usable_at_window,
+            0.0,
+            headroom,
+        )
     uncovered = max(0.0, buffered_deficit - usable_at_window - required)
     # The grid supplies required/efficiency AC kWh to store `required` kWh
     # (round-trip: AC->DC charging now, DC->AC discharge to the load later).
@@ -184,4 +269,5 @@ def compute_plan(
         dispatch_ev_kwh=(
             sum(abs(d.charge_in_kwh) for d in inputs.dispatches) if inputs.dispatches else None
         ),
+        reservations=reservations,
     )
