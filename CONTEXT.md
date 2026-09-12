@@ -69,3 +69,15 @@ as price slots overlaid on the tariff schedule — not a separate planner
 concept and not a control authority; the planner responds to the prices
 and ha-spark's own drivers actuate. (Decision: Q2 of the 2026-07-12
 grilling session.)
+
+**Supply current limit** — the site's maximum AC current in either the import
+or export direction. It is distinct from the inverter's DC battery-current
+ceiling and from any stricter DNO export limit.
+
+**Export ceiling** — the maximum grid-export power for a slot after applying
+the relevant site or DNO limit and the power available from the battery and
+solar generation after serving house load.
+
+**Export priority** — during a paid flexibility event, export revenue outranks
+discretionary battery charging. It does not outrank house supply or the
+reservation needed to protect the household after the event.
