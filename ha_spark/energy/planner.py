@@ -419,8 +419,13 @@ def compute_plan(
         # than off-peak; surplus carries over to later days (not costed here).
         required = headroom
     else:
+        # The reservation only reaches the next cheap slot, which assumes that
+        # slot can refill the battery. A short daytime dispatch cannot, so it
+        # is a floor on the overnight buy, not the whole obligation — the
+        # buffered horizon deficit still stands.
+        obligation = max(reservation_need, buffered_deficit) if reservations else buffered_deficit
         required = _clamp(
-            (reservation_need if reservations else buffered_deficit) - usable_at_window,
+            obligation - usable_at_window,
             0.0,
             headroom,
         )
