@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Half-hourly replanning (#46): the daemon recomputes the current plan on each
+  local half-hour slot, including after startup during the day. It skips the
+  inverter call when the commanded target, window, and holds are unchanged, so
+  fresh SoC observations do not cause repeated device writes.
+- Proactive-mode handoff warning (#104): changing `proactive_mode` from `off` or
+  `simulate` to `on` logs a reminder to disable pre-existing automations or
+  manual schedules that write the same devices before proceeding.
 - Checked SoC measurements (#113): the Boolean `soc_valid` contract is
   replaced by one immutable checked measurement produced from a single
   Home Assistant observation. It records the observed value or read
@@ -19,6 +26,22 @@
   concrete integrity reason: the plan-status sensor publishes
   `soc_status`/`soc_reason` in place of `soc_valid`, and a `[BLOCKED]`
   line quotes the reason.
+- SoC integrity monitoring (#114): the daemon observes the configured
+  `soc_entity` once per minute in every operating state, and that one
+  checked measurement is reused by planning, device application,
+  publication, and supply-guard work — one observation can increment
+  the failure count at most once. The first failed observation enters
+  **pending failure**: the resident program is left untouched, new
+  SoC-based programming and charge-rate increases are blocked for both
+  supported inverter types, while valid supply-guard reductions remain
+  available. Consecutive failures are counted and persisted across
+  restarts; any passing observation resets the count. New
+  `soc_failure_threshold` option (default `3`) sets how many consecutive
+  failures reach the fallback-entry threshold (fallback programming
+  itself lands with #115). Monitoring state is visible as the new
+  `sensor.ha_spark_soc_integrity` (operating state, failure count,
+  threshold, integrity reason and evidence), in the daemon log, and in
+  the plan report's untrusted-SoC line.
 
 ## 0.15.0
 

@@ -49,6 +49,8 @@ _OPTION_KEYS = frozenset(
         "min_soc",
         "target_soc_cap",
         "max_charge_current_a",
+        "battery_discharge_ceiling_kw",
+        "dno_export_limit_kw",
         "charge_buffer_pct",
         "charge_strategy",
         "solar_haircut_k",
@@ -94,12 +96,17 @@ _OPTION_KEYS = frozenset(
         "octopus_account_number",
         "octopus_product_code",
         "octopus_tariff_code",
+        "axle_api_key",
+        "axle_api_url",
+        "axle_event_entity",
+        "axle_event_rate_gbp_kwh",
         # Battery model fallback.
         "battery_voltage_v",
         # Entity IDs: exposed so other installs can map their own sensors/controls
         # (the code defaults match the author's setup).
         "soc_entity",
         "soc_max_report_age_minutes",
+        "soc_failure_threshold",
         "battery_voltage_entity",
         "solar_tomorrow_entity",
         "octopus_rate_entity",
@@ -151,7 +158,7 @@ _OPTION_KEYS = frozenset(
 # Subset of _OPTION_KEYS that hold secrets. These must never appear in cleartext
 # in any response (CLAUDE.md top-priority rule): the API masks them before
 # returning options. Kept here next to _OPTION_KEYS so the two stay in sync.
-_SECRET_OPTION_KEYS = frozenset({"octopus_api_key", "agent_api_token"})
+_SECRET_OPTION_KEYS = frozenset({"octopus_api_key", "axle_api_key", "agent_api_token"})
 
 
 class ConfigError(RuntimeError):
@@ -238,6 +245,35 @@ def validate_octopus_intelligent_tariff(settings: Settings) -> None:
     except ValidationError as exc:
         raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
 
+
+class AxleTariffConfig(BaseModel):
+    """The supervised Axle event provider's settings."""
+
+    axle_api_key: str = ""
+    axle_event_entity: str = ""
+    axle_event_rate_gbp_kwh: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _source_configured(self) -> AxleTariffConfig:
+        if not self.axle_api_key and not self.axle_event_entity:
+            raise ValueError("set axle_api_key or axle_event_entity")
+        return self
+
+
+def validate_axle_tariff(settings: Settings) -> None:
+    """When ``tariff_provider`` is ``axle``, require one event source."""
+    if settings.tariff_provider != "axle":
+        return
+    try:
+        AxleTariffConfig(
+            axle_api_key=settings.axle_api_key,
+            axle_event_entity=settings.axle_event_entity,
+            axle_event_rate_gbp_kwh=settings.axle_event_rate_gbp_kwh,
+        )
+    except ValidationError as exc:
+        raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
+
+
 class DeviceConfig(BaseModel):
     """One controllable device. Phase 7 ships type == "inverter" only."""
 
@@ -290,6 +326,11 @@ class Settings(BaseSettings):
     min_soc: float = Field(default=20.0)
     target_soc_cap: float = Field(default=90.0)
     max_charge_current_a: float = Field(default=62.5)
+    # Conservative planning ceiling for battery discharge.  It is distinct
+    # from Solis's fixed hardware command and keeps the planner inverter-agnostic.
+    battery_discharge_ceiling_kw: float = Field(default=3.2, ge=0)
+    # Installation-specific grid-export cap. Kyle's approved G98 limit is 7.36 kW.
+    dno_export_limit_kw: float = Field(default=7.36, ge=0)
     # Safety margin applied to the forecast deficit before sizing the charge.
     charge_buffer_pct: float = Field(default=20.0)
     # Round-trip AC->DC->AC efficiency: the planner buys required/efficiency.
@@ -318,7 +359,9 @@ class Settings(BaseSettings):
     # Tariff provider: "fixed" costs against rate_offpeak/rate_peak + the charge
     # window above; "dynamic" costs each slot at its live price from an HA
     # half-hourly price sensor (falls back to fixed on a missing/bad read).
-    tariff_provider: Literal["fixed", "dynamic", "octopus_intelligent"] = Field(default="fixed")
+    tariff_provider: Literal["fixed", "dynamic", "octopus_intelligent", "axle"] = Field(
+        default="fixed"
+    )
     dynamic_rates_entity: str = Field(default="")
     # Optional: a second entity for tomorrow's rates (many integrations publish
     # today/tomorrow as separate entities). Blank is fine — slots past today's
@@ -330,7 +373,8 @@ class Settings(BaseSettings):
     profile_history_days: int = Field(default=60)
     timezone: str = Field(default="Europe/London")
 
-    # Local time (HH:MM) at which `ha-spark run` computes/applies the daily plan.
+    # Retained for configuration compatibility; the daemon now replans every
+    # local half-hour slot.
     plan_run_time: str = Field(default="22:00")
 
     # Statistic whose history seeds `ha-spark backfill-load` (a true-load power
@@ -370,6 +414,13 @@ class Settings(BaseSettings):
     octopus_product_code: str = Field(default="")
     octopus_tariff_code: str = Field(default="")
 
+    # Axle supervised export-event source. The API key is the static token from
+    # Axle's Home Assistant account page; the entity is the optional HA mirror.
+    axle_api_key: str = Field(default="")
+    axle_api_url: str = Field(default="https://api.axle.energy")
+    axle_event_entity: str = Field(default="")
+    axle_event_rate_gbp_kwh: float = Field(default=1.0, ge=0)
+
     # HA entity IDs (all overridable). Blank by default; set via `ha-spark
     # onboard` (entity auto-discovery) or the `solis` preset (ha_spark/presets.py),
     # which holds the values for the original Solis/Solcast/Octopus/zappi setup.
@@ -378,6 +429,10 @@ class Settings(BaseSettings):
     # be before the measurement is judged stale (ha_spark/energy/soc_integrity.py).
     # Untrusted SoC blocks real charge writes, so this is a safety threshold.
     soc_max_report_age_minutes: float = Field(default=10.0, gt=0)
+    # Consecutive failed SoC observations before the fallback-entry threshold is
+    # reached (#114). The first failure already blocks new SoC-based programming
+    # and charge-rate increases; this counts toward fallback entry (#115).
+    soc_failure_threshold: int = Field(default=3, ge=1)
     battery_voltage_entity: str = Field(default="")
     solar_tomorrow_entity: str = Field(default="")
     octopus_rate_entity: str = Field(default="")
@@ -565,4 +620,5 @@ def load_settings(*, validate: bool = True) -> Settings:
         validate_fixed_tariff(settings)
         validate_dynamic_tariff(settings)
         validate_octopus_intelligent_tariff(settings)
+        validate_axle_tariff(settings)
     return settings

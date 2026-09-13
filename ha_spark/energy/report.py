@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import time
+from datetime import datetime, time
 
 from ha_spark.energy.models import ChargePlan
 
 
 def _fmt(t: time) -> str:
     return f"{t.hour:02d}:{t.minute:02d}"
+
+
+def _fmt_window(start: datetime, end: datetime) -> str:
+    return f"{start.hour:02d}:{start.minute:02d}-{end.hour:02d}:{end.minute:02d}"
 
 
 def format_plan(plan: ChargePlan, load_source: str) -> str:
@@ -40,12 +44,34 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
             f"  Slot import price  £{lo:.3f}–£{hi:.3f}/kWh  "
             f"({cheap}/{len(plan.slot_prices)} slots cheap)"
         )
+    if plan.reservations:
+        lines.append("  Reservations:")
+        for reservation in plan.reservations:
+            lines.append(
+                f"    {reservation.name}  {reservation.energy_kwh:.2f} kWh  "
+                f"— {reservation.reason}"
+            )
+    if plan.charge_intent.export is not None:
+        export = plan.charge_intent.export
+        lines.append(
+            f"  Paid export       {_fmt_window(export.window_start, export.window_end)}  "
+            f"{export.planned_export_kw:.2f} kW planned "
+            f"(DNO limit {export.dno_export_limit_kw:.2f} kW; "
+            f"{len(export.selected_slots)} complete slots)"
+        )
+    if plan.export_skips:
+        lines.append("  Skipped paid export slots:")
+        for skip in plan.export_skips:
+            lines.append(f"    {_fmt(skip.start.time())}  — {skip.reason}")
     deficit = f"{plan.deficit_kwh:.2f} kWh"
     if plan.buffer_pct > 0 and plan.deficit_kwh > 0:
         buffered = plan.deficit_kwh * (1.0 + plan.buffer_pct / 100.0)
         deficit += f"  (+{plan.buffer_pct:.0f}% buffer -> {buffered:.2f})"
 
     required = f"{plan.required_kwh:.2f} kWh"
+    if plan.reservations and plan.strategy != "fill":
+        names = ", ".join(reservation.name for reservation in plan.reservations)
+        required += f"  (funds {names})"
     if plan.strategy == "fill":
         required += f"  (fill to {plan.target_soc:.0f}%)"
     if plan.charge_efficiency < 1 and plan.required_kwh > 0:
