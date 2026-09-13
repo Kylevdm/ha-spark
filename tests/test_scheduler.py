@@ -419,6 +419,46 @@ async def test_run_forever_publishes_plan_to_api_state(
     assert state.plan is not None
 
 
+async def test_run_forever_reports_when_the_previous_run_happened_not_its_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``previous_at`` is the previous run's wall-clock time, not its slot start.
+
+    The power-switch reconcile is a function of the clock, and dispatch bounds
+    are whatever Home Assistant reports — a hold can open and close inside one
+    half-hour slot. Rounding this to the slot start hides a boundary crossed by a
+    mid-slot run (a restart, or a retry after a failed tick) and leaves the
+    inverter held off (#140).
+    """
+    seen: list[datetime | None] = []
+
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+        previous_at: datetime | None = None,
+    ) -> ChargePlan:
+        seen.append(previous_at)
+        return _plan()
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    # A restart mid-slot, then the next slot's run.
+    stop = _patch_loop(
+        monkeypatch, [datetime(2026, 6, 10, 22, 10), datetime(2026, 6, 10, 22, 30)]
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert seen == [None, datetime(2026, 6, 10, 22, 10)]
+
+
 async def test_run_forever_guard_ticks_only_inside_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

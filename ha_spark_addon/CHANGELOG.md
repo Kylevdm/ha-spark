@@ -38,8 +38,11 @@
   for a hold hours in the future. A hold boundary now counts as a changed
   command, so the reconcile is not skipped as an unchanged setpoint, and it is
   exempt from the SoC-unreadable guard because it commands no SoC-derived
-  magnitude — charge programming stays blocked. An active hold beats export: the
-  inverter is held `Off` and export is refused with an explicit reason.
+  magnitude — charge programming stays blocked. It settles before anything else
+  reads the switch, so a hold ending does not refuse an export event against a
+  state the same tick is correcting. A hold that *overlaps* an export window
+  refuses the whole event with an explicit reason; a hold elsewhere in the day
+  leaves it alone.
 - Half-hourly replanning (#46): the daemon recomputes the current plan on each
   local half-hour slot, including after startup during the day. It skips the
   inverter call when the commanded target, window, and holds are unchanged, so
