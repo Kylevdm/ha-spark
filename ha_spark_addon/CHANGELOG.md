@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Slot energy reservations (#47): slot plans carry a buffered, capped
+  reach-next-cheap-slot reservation, and the required charge and its report
+  explanation trace to it. The reservation is a floor on the overnight buy, not
+  the whole obligation — a short daytime dispatch cannot refill the battery for
+  the evening, so the buffered horizon deficit still stands alongside it.
+- Axle flexibility events as a tariff overlay (#48): a new `axle` tariff
+  provider accepts only a fresh, explicit export window from Axle's documented
+  Home Assistant event route or a configured Home Assistant mirror, and overlays
+  the configured event rate into per-slot export prices. Planning and control
+  authority are unchanged — Axle supplies event facts and prices, never
+  setpoints. New `axle_api_key`, `axle_api_url`, `axle_event_entity`, and
+  `axle_event_rate_gbp_kwh` options; `axle_api_key` is marked `password`.
+  `updated_at` is treated as Axle's change timestamp, not a freshness
+  heartbeat, so a normally-published event is not rejected on every poll.
+- Supervised Axle export delivery (#51): the planner calculates the maximum
+  export available under a new `dno_export_limit_kw` after protecting house
+  load and the post-event reservation, selects only complete half-hour slots it
+  can fund, and emits an inverter-agnostic export intent that is part of the
+  scheduler's setpoint comparison. The Solis driver programs Slot 1 timed
+  discharge at the measured 62.5 A ceiling, in inverter-local wall-clock time,
+  and requires the power switch to be `On` — it never turns it on itself. Every
+  write keeps the authority gate, fresh finite in-range SoC check, read-back
+  verification, and per-action failure isolation. New
+  `battery_discharge_ceiling_kw` and `dno_export_limit_kw` options.
+  **Prototype status:** export has not yet been actuated on hardware; the
+  supervised paid-event proof is #134.
 - Half-hourly replanning (#46): the daemon recomputes the current plan on each
   local half-hour slot, including after startup during the day. It skips the
   inverter call when the commanded target, window, and holds are unchanged, so
