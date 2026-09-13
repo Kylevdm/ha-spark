@@ -409,6 +409,11 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     except Exception:
         log.exception("Republishing last known states failed")
     last_run_slot: datetime | None = None
+    # When the previous run actually happened, not the slot it belonged to: the
+    # power-switch reconcile is a function of the clock, and dispatch bounds are
+    # whatever HA reports, so rounding this to the slot start can hide a hold
+    # boundary crossed by a mid-slot run and leave the inverter held off (#140).
+    last_run_at: datetime | None = None
     last_plan: ChargePlan | None = None
     last_settings = settings
     target_w: float | None = None
@@ -420,6 +425,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             if settings is not last_settings:
                 # Never reuse a previous plan's command across a hot reload.
                 last_plan = None
+                last_run_at = None
                 target_w = None
                 last_settings = settings
             tz = load_timezone(settings.timezone)
@@ -440,10 +446,11 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         settings,
                         soc=measurement,
                         previous_plan=last_plan,
-                        previous_at=last_run_slot,
+                        previous_at=last_run_at,
                     )
                     state.set_plan(plan)
                     last_run_slot = _slot_start(now)
+                    last_run_at = now
                     last_plan = plan
                     if plan.soc.ok:
                         target_w = await _planned_rate_w(settings, plan)

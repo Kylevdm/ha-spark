@@ -109,6 +109,13 @@ class SolisDevice:
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         tz = ZoneInfo(self._settings.timezone)
         now = datetime.now(tz)
+        # The power-switch reconcile runs first and unconditionally (#140). It is
+        # exempt from the SoC guard below — it commands no SoC-derived magnitude,
+        # and freezing the inverter `Off` on an unrelated dead sensor is the
+        # failure it exists to remove — and it must settle before anything else
+        # reads the switch, or `_require_power_switch_on` would refuse export on
+        # the very tick a hold ends, against a state already being corrected.
+        lines: list[str] = [await self._reconcile_power_switch(intent, now)]
         # SoC-unreadable guard: soc_now==0 from a dead sensor would size a max charge.
         if mode == "on" and not intent.soc.ok:
             line = (
@@ -116,12 +123,8 @@ class SolisDevice:
                 f"{intent.target_soc_pct:.0f}%"
             )
             log.warning(line)
-            # The power-switch reconcile is deliberately exempt (#140): it has no
-            # SoC-derived magnitude, and freezing the inverter `Off` on an
-            # unrelated dead sensor is the failure the reconcile exists to
-            # remove. Charge programming stays blocked.
-            return [line, await self._reconcile_power_switch(intent, now)]
-        lines: list[str] = []
+            lines.append(line)
+            return lines
         raw_export = getattr(intent, "export", None)
         export_store = ExportEventStore(self._settings.db_path)
         export = _export_window(intent, tz)
@@ -132,10 +135,14 @@ class SolisDevice:
         elif export_ready:
             assert export is not None
             export_error = _validate_export(intent, export)
-            if export_error is None and intent.hold_active(now):
-                # Hold beats export on overlap: the inverter is about to be held
-                # `Off`, so there is nothing to export with.
-                export_error = "a dispatch hold is active and holds the inverter off"
+            if export_error is None and intent.hold_overlaps(*export):
+                # Hold beats export on overlap: the reconcile will hold the
+                # inverter `Off` inside the event, so refuse the whole window
+                # rather than program a discharge that is cut mid-slot. Tested
+                # against the window, not the clock: a morning dispatch must not
+                # refuse an evening event, and an evening dispatch must refuse it
+                # even when the plan is computed hours earlier.
+                export_error = "a dispatch hold overlaps the export window"
             if mode == "on" and export_error is None:
                 export_error = await self._require_power_switch_on()
             if export_error is not None:
@@ -176,7 +183,6 @@ class SolisDevice:
         # window (charge 2/3, any discharge) can't actuate behind the plan.
         for slot in (2, 3):
             lines.append(await self._zero_guard_slot(slot))
-        lines.append(await self._reconcile_power_switch(intent, now))
         if mode == "on":
             if raw_export is not None or export_store.exists:
                 await self._persist_export_state(raw_export, export, export_ready, window_line)

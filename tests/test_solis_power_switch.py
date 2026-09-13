@@ -171,19 +171,65 @@ async def test_switch_already_in_the_desired_state_is_never_written(tmp_path) ->
     assert any(line.startswith("[SKIP]") and "Off" in line for line in lines)
 
 
+def _export_discharge_writes(rest: FakeRest) -> list[dict[str, object]]:
+    return [
+        call[2]
+        for call in rest.calls
+        if call[0:2] == ("modbus", "write_register") and int(call[2]["address"]) == 43142
+    ]
+
+
 @pytest.mark.asyncio
-async def test_active_hold_beats_export_and_the_refusal_is_explicit(tmp_path) -> None:
+async def test_hold_overlapping_the_export_window_refuses_the_whole_event(tmp_path) -> None:
+    """Hold beats export on overlap — judged against the window, not the clock.
+
+    The hold is tomorrow, inside the event: nothing is held right now, so the
+    refusal cannot come from the power-switch precondition.
+    """
+    rest = FakeRest(switch="On")
+    export = _export()
+    hold = (
+        export.window_start + timedelta(minutes=15),
+        export.window_start + timedelta(minutes=45),
+    )
+    lines = await _device(rest, tmp_path).apply(_intent(holds=(hold,), export=export))
+
+    assert _options(rest) == []
+    assert any("export refused" in line and "hold overlaps" in line for line in lines)
+    assert _export_discharge_writes(rest) == []
+
+
+@pytest.mark.asyncio
+async def test_a_hold_the_export_window_never_reaches_does_not_refuse_it(tmp_path) -> None:
+    """A dispatch earlier today must not cost tomorrow's paid event."""
     rest = FakeRest(switch="On")
     lines = await _device(rest, tmp_path).apply(
-        _intent(holds=(_window(-10),), export=_export())
+        _intent(holds=(_window(-180),), export=_export())
     )
 
-    assert _options(rest) == ["Off"]
-    assert any("export refused" in line and "hold" in line for line in lines)
-    assert not any(
-        call[0:2] == ("modbus", "write_register") and int(call[2]["address"]) == 43142
-        for call in rest.calls
+    assert not any("export refused" in line for line in lines)
+    assert _export_discharge_writes(rest) != []
+
+
+@pytest.mark.asyncio
+async def test_export_is_programmed_on_the_tick_the_reconcile_turns_the_switch_on(
+    tmp_path,
+) -> None:
+    """The reconcile settles before anything reads the switch.
+
+    A switch left `Off` by a hold that has just ended must not make
+    `_require_power_switch_on` refuse the event against a state this very tick
+    is correcting — the next chance to program it could be slots away, because
+    an otherwise-unchanged plan is skipped as an unchanged setpoint.
+    """
+    rest = FakeRest(switch="Off")
+    lines = await _device(rest, tmp_path).apply(
+        _intent(holds=(_window(-40),), export=_export())
     )
+
+    assert _options(rest) == ["On"]
+    assert not any("export refused" in line for line in lines)
+    assert _export_discharge_writes(rest) != []
 
 
 @pytest.mark.asyncio
