@@ -7,6 +7,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ha_spark.config import Settings
+from ha_spark.energy.axle import AxleApiError, read_axle_event
 from ha_spark.energy.forecast import load_timezone, predict_home_load
 from ha_spark.energy.models import (
     SLOTS_PER_DAY,
@@ -21,9 +22,11 @@ from ha_spark.energy.octopus import (
     fetch_planned_dispatches,
     fetch_standard_unit_rates,
 )
-from ha_spark.energy.soc_integrity import check_soc
+from ha_spark.energy.soc_integrity import SocMeasurement
+from ha_spark.energy.soc_monitor import observe_soc
 from ha_spark.energy.solar import distribute_solar
 from ha_spark.energy.tariff import (
+    AxleTariffProvider,
     DynamicTariffProvider,
     FixedTariffProvider,
     OctopusIntelligentProvider,
@@ -186,6 +189,10 @@ def build_config(
         min_soc=settings.min_soc,
         target_cap=settings.target_soc_cap,
         max_current_a=settings.max_charge_current_a,
+        battery_discharge_ceiling_kw=settings.battery_discharge_ceiling_kw,
+        dno_export_limit_kw=settings.dno_export_limit_kw,
+        supply_max_current_a=settings.supply_max_current_a,
+        supply_voltage_v=settings.supply_voltage_v,
         solar_haircut_k=settings.solar_haircut_k,
         window_start=parse_time(settings.charge_window_start),
         window_end=parse_time(settings.charge_window_end),
@@ -209,13 +216,23 @@ def build_schedule(
         return DynamicTariffProvider(fallback=fixed).schedule(inputs, cfg)
     if settings.tariff_provider == "octopus_intelligent":
         return OctopusIntelligentProvider(fallback=fixed).schedule(inputs, cfg)
+    if settings.tariff_provider == "axle":
+        return AxleTariffProvider(
+            fallback=fixed, event_rate_gbp_kwh=settings.axle_event_rate_gbp_kwh
+        ).schedule(inputs, cfg)
     return fixed.schedule(inputs, cfg)
 
 
 async def gather_inputs(
-    settings: Settings, rest: HomeAssistantRest
+    settings: Settings, rest: HomeAssistantRest, *, soc: SocMeasurement | None = None
 ) -> tuple[PlannerInputs, PlannerConfig, str]:
-    """Read live HA state and build (inputs, config, load-forecast source)."""
+    """Read live HA state and build (inputs, config, load-forecast source).
+
+    ``soc`` is the daemon tick's already-checked measurement: when supplied
+    it is used as-is, so the plan is sized from the exact observation the
+    loop made (no independent reread). Otherwise one observation is made
+    here through the same shared :func:`observe_soc` path.
+    """
 
     async def state(entity_id: str) -> EntityState | None:
         try:
@@ -224,14 +241,7 @@ async def gather_inputs(
             log.warning("Could not read %s (%s)", entity_id, exc)
             return None
 
-    soc = await state(settings.soc_entity)
-    # One checked observation per gather; every downstream consumer reads its
-    # value from this exact measurement rather than re-reading the sensor.
-    soc_measurement = check_soc(
-        soc,
-        observed_at=datetime.now(UTC),
-        max_age=timedelta(minutes=settings.soc_max_report_age_minutes),
-    )
+    soc_measurement = soc if soc is not None else await observe_soc(settings, rest)
     if not soc_measurement.ok:
         log.warning("SoC measurement failed integrity check: %s", soc_measurement.reason)
     voltage = await state(settings.battery_voltage_entity)
@@ -240,6 +250,13 @@ async def gather_inputs(
     ha_needed = await state(settings.ha_template_charge_needed_entity)
 
     voltage_v = _to_float(voltage.state if voltage else None, settings.battery_voltage_v)
+
+    flexibility_event = None
+    if settings.tariff_provider == "axle":
+        try:
+            flexibility_event = await read_axle_event(settings, rest)
+        except AxleApiError as exc:
+            log.warning("Could not read Axle event: %s", exc)
 
     dispatches: tuple[DispatchSlot, ...]
     if settings.tariff_provider == "octopus_intelligent":
@@ -325,6 +342,7 @@ async def gather_inputs(
         solar_tomorrow_kwh=solar_kwh,
         predicted_home_load_kwh=forecast.total_kwh,
         dispatches=dispatches,
+        flexibility_event=flexibility_event,
         ev_charging=ev_charging,
         ha_template_needed=_opt_float(ha_needed.state) if ha_needed else None,
         load_slots=load_slots,

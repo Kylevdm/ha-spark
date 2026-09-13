@@ -18,6 +18,7 @@ from typing import Any
 from ha_spark.config import Settings
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.orchestrator import Decision
+from ha_spark.energy.soc_monitor import SocMonitorSnapshot
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -156,6 +157,43 @@ async def publish_plan(rest: HomeAssistantRest, plan: ChargePlan, settings: Sett
         path.write_text(json.dumps(entities), encoding="utf-8")
     except OSError:
         log.warning("Caching published states failed", exc_info=True)
+
+
+async def publish_soc_integrity(
+    rest: HomeAssistantRest, snapshot: SocMonitorSnapshot, settings: Settings
+) -> None:
+    """Push the per-minute SoC monitoring state as sensor.ha_spark_soc_integrity.
+
+    Deliberately a standalone sensor, not plan-status attributes: it is updated
+    every minute and must never imply a computed plan was applied. Best-effort
+    per entity, and never written to the republish cache — a restarted daemon
+    republishes a *fresh* observation, not a stale monitoring verdict.
+    """
+    m = snapshot.measurement
+    await _push(
+        rest,
+        [
+            (
+                "sensor.ha_spark_soc_integrity",
+                snapshot.state.value,
+                {
+                    "friendly_name": "ha-spark SoC integrity",
+                    "consecutive_failures": snapshot.consecutive_failures,
+                    "failure_threshold": snapshot.failure_threshold,
+                    "soc_status": m.status.value,
+                    "soc_reason": m.reason,
+                    "soc_value": m.value,
+                    "soc_observed_at": m.observed_at.isoformat(),
+                    "soc_reported_at": (
+                        m.reported_at.isoformat() if m.reported_at else None
+                    ),
+                    "soc_age_s": m.age_s,
+                    "soc_max_age_s": m.max_age_s,
+                    "proactive_mode": settings.proactive_mode,
+                },
+            )
+        ],
+    )
 
 
 async def publish_predictions(

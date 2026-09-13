@@ -20,7 +20,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime, time
 from typing import Protocol
 
-from ha_spark.energy.models import DispatchSlot, PlannerConfig, PlannerInputs, PricePoint
+from ha_spark.energy.models import (
+    DispatchSlot,
+    FlexibilityEvent,
+    PlannerConfig,
+    PlannerInputs,
+    PricePoint,
+)
 
 
 def _in_overnight_window(t: time, start: time, end: time) -> bool:
@@ -65,8 +71,9 @@ def _cheap_fractions(
 class TariffSchedule:
     """Normalised tariff over the planning horizon — the sole contract to the planner.
 
-    ``prices``/``cheap_fracs`` are per-slot over the 48-slot horizon (empty on
-    the v1 daily path, which has no horizon). ``cheap_fracs[i]`` is the
+    ``prices``/``cheap_fracs``/``export_prices`` fields are per-slot over the
+    48-slot horizon (empty on the v1 daily path, which has no horizon).
+    ``cheap_fracs[i]`` is the
     supplier-controlled-cheap fraction of slot ``i``: during it, cheap grid runs
     the house so the battery need not, and import is billed at ``cheap_rate``.
     ``controlled_windows`` are the daytime dispatch windows the battery holds
@@ -85,6 +92,7 @@ class TariffSchedule:
     prices: tuple[float, ...] = ()
     cheap_fracs: tuple[float, ...] = ()
     controlled_windows: tuple[tuple[datetime, datetime], ...] = ()
+    export_prices: tuple[float, ...] = ()
 
 
 class TariffProvider(Protocol):
@@ -234,3 +242,48 @@ class OctopusIntelligentProvider:
             p if p is not None else self.fallback.standard_rate for p in raw_prices
         )
         return replace(base, prices=prices)
+
+
+def _event_export_prices(
+    n_slots: int,
+    horizon_start: datetime | None,
+    event: FlexibilityEvent | None,
+    default_rate: float,
+) -> tuple[float, ...]:
+    """Price only the part of the slot horizon covered by an export event."""
+    prices = [default_rate] * n_slots
+    if horizon_start is None or event is None or event.direction != "export":
+        return tuple(prices)
+    start = _hours_since(horizon_start, event.start)
+    end = _hours_since(horizon_start, event.end)
+    for i in range(n_slots):
+        slot_start, slot_end = i * 0.5, (i + 1) * 0.5
+        if max(start, slot_start) < min(end, slot_end):
+            prices[i] = event.rate_gbp_kwh
+    return tuple(prices)
+
+
+@dataclass(frozen=True)
+class AxleTariffProvider:
+    """Overlay a validated Axle export event on the existing tariff schedule."""
+
+    fallback: FixedTariffProvider
+    event_rate_gbp_kwh: float | None = None
+
+    def schedule(self, inputs: PlannerInputs, cfg: PlannerConfig) -> TariffSchedule:
+        base = self.fallback.schedule(inputs, cfg)
+        if inputs.load_slots is None:
+            return base
+        default_rate = base.export_rate
+        event = inputs.flexibility_event
+        if event is not None and self.event_rate_gbp_kwh is not None:
+            event = replace(event, rate_gbp_kwh=self.event_rate_gbp_kwh)
+        return replace(
+            base,
+            export_prices=_event_export_prices(
+                len(inputs.load_slots),
+                inputs.horizon_start,
+                event,
+                default_rate,
+            ),
+        )
