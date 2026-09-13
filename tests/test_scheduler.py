@@ -273,6 +273,7 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
         *,
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
+        previous_at: datetime | None = None,
     ) -> ChargePlan:
         calls.append("run")
         if len(calls) == 1:
@@ -398,6 +399,7 @@ async def test_run_forever_publishes_plan_to_api_state(
         *,
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
+        previous_at: datetime | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -427,6 +429,7 @@ async def test_run_forever_guard_ticks_only_inside_window(
         *,
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
+        previous_at: datetime | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -472,6 +475,7 @@ async def test_run_forever_no_guard_when_entity_unset(
         *,
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
+        previous_at: datetime | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -504,6 +508,7 @@ async def test_run_forever_no_guard_when_charger_has_no_live_rate(
         *,
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
+        previous_at: datetime | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -538,6 +543,7 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
         *,
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
+        previous_at: datetime | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -683,6 +689,7 @@ async def test_run_forever_samples_signals_every_interval(
         *,
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
+        previous_at: datetime | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -931,6 +938,7 @@ def _patch_monitor_loop(
             *,
             soc: SocMeasurement | None = None,
             previous_plan: ChargePlan | None = None,
+            previous_at: datetime | None = None,
         ) -> ChargePlan:
             run_once_socs.append(soc)
             return _plan()
@@ -940,6 +948,7 @@ def _patch_monitor_loop(
             *,
             soc: SocMeasurement | None = None,
             previous_plan: ChargePlan | None = None,
+            previous_at: datetime | None = None,
         ) -> ChargePlan:
             return _plan()
 
@@ -1218,6 +1227,7 @@ async def test_loop_blocked_plan_rate_never_becomes_guard_target(
         *,
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
+        previous_at: datetime | None = None,
     ) -> ChargePlan:
         # A plan computed from the tick's failed measurement: blocked at the
         # charger gate, but still a plan object (existence != applied).
