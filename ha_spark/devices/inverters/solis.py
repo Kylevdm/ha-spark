@@ -107,7 +107,14 @@ class SolisDevice:
 
     async def apply(self, intent: ChargeIntent) -> list[str]:
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
-        tz = ZoneInfo(self._settings.timezone)
+        # load_timezone, not ZoneInfo: a minimal container without tzdata (or a
+        # typo'd option) must degrade to UTC, not raise before the reconcile and
+        # the SoC guard have run and cost the daemon every device write.
+        # Imported here for the same reason as the TYPE_CHECKING block above:
+        # forecast imports config, which imports devices.base at runtime.
+        from ha_spark.energy.forecast import load_timezone
+
+        tz = load_timezone(self._settings.timezone)
         now = datetime.now(tz)
         # The power-switch reconcile runs first and unconditionally (#140). It is
         # exempt from the SoC guard below — it commands no SoC-derived magnitude,
@@ -439,8 +446,14 @@ class SolisDevice:
         if not entity:
             return "[SKIP] no power_switch entity configured; discharge left as-is"
         try:
-            if (await self._rest.get_state(entity)).state.strip().lower() == wanted.lower():
-                return f"[SKIP] {desc} (already set)"
+            # The pre-read only suppresses a redundant write. A failed read must
+            # fall through to the write, never skip it: a flaky GET on the tick a
+            # dispatch opens would otherwise drop the hold entirely.
+            try:
+                if (await self._rest.get_state(entity)).state.strip().lower() == wanted.lower():
+                    return f"[SKIP] {desc} (already set)"
+            except Exception as exc:  # noqa: BLE001 - write anyway, then verify
+                log.warning("Power-switch pre-read failed (%r); writing %s anyway", exc, wanted)
             await self._rest.call_service(
                 "select", "select_option", {"entity_id": entity, "option": wanted}
             )
