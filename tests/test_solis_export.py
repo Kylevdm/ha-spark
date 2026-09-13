@@ -2,16 +2,19 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from ha_spark.config import Settings
-from ha_spark.devices.inverters.solis import SolisDevice
+from ha_spark.devices.inverters.solis import SolisDevice, _export_window
 from ha_spark.energy.export_store import ExportEventStore
 from ha_spark.energy.models import ChargeIntent, ExportIntent
 from ha_spark.energy.scheduler import setpoint_changed
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.ha.models import EntityState
+
+_LONDON = ZoneInfo("Europe/London")
 
 
 def _soc(value: float = 60.0) -> SocMeasurement:
@@ -27,8 +30,11 @@ def _soc(value: float = 60.0) -> SocMeasurement:
     )
 
 
-def _export(*, event_start: int = 10, event_end: int = 12) -> ExportIntent:
-    start = (datetime.now(UTC) + timedelta(days=1)).replace(
+def _export(
+    *, event_start: int = 10, event_end: int = 12, tz: ZoneInfo = _LONDON
+) -> ExportIntent:
+    # Local tz by default, as the planner builds its slots from a local horizon.
+    start = (datetime.now(tz) + timedelta(days=1)).replace(
         hour=event_start, minute=0, second=0, microsecond=0
     )
     end = start.replace(hour=event_end)
@@ -125,11 +131,12 @@ class FailedCleanupReadback(FakeRest):
         return await super().get_state(entity_id)
 
 
-def _device(rest: FakeRest, tmp_path) -> SolisDevice:
+def _device(rest: FakeRest, tmp_path, *, timezone: str = "Europe/London") -> SolisDevice:
     settings = Settings(
         proactive_mode="on",
         db_path=str(tmp_path / "events.db"),
         inverter_power_switch_entity="select.solisac_power_switch",
+        timezone=timezone,
     )
     return SolisDevice(settings.devices[0], settings, rest)  # type: ignore[arg-type]
 
@@ -150,8 +157,8 @@ async def test_export_programs_fixed_current_and_atomic_window(tmp_path) -> None
         saved = await store.load()
     assert saved is not None
     expected_identity = (
-        f"export|{export.event_identity[1].isoformat()}|"
-        f"{export.event_identity[2].isoformat()}"
+        f"export|{export.event_identity[1].astimezone(UTC).isoformat()}|"
+        f"{export.event_identity[2].astimezone(UTC).isoformat()}"
     )
     assert saved[0] == expected_identity
 
@@ -253,8 +260,8 @@ async def test_failed_cleanup_keeps_last_verified_event_record(tmp_path) -> None
         saved = await store.load()
     assert saved is not None
     assert saved[0] == (
-        f"export|{export.event_identity[1].isoformat()}|"
-        f"{export.event_identity[2].isoformat()}"
+        f"export|{export.event_identity[1].astimezone(UTC).isoformat()}|"
+        f"{export.event_identity[2].astimezone(UTC).isoformat()}"
     )
 
 
@@ -296,3 +303,45 @@ def test_export_cancellation_and_replacement_are_setpoint_changes() -> None:
     accepted = _intent(_export())
     assert setpoint_changed(accepted, _intent()) is True
     assert setpoint_changed(accepted, replace(accepted, export=_export(event_start=11))) is True
+
+
+def test_export_window_is_resolved_to_inverter_local_wall_clock() -> None:
+    """Slot 1 discharge registers are local wall-clock, like the charge half."""
+    london = _LONDON
+    # A BST event: 18:00-19:00 local is 17:00-18:00 UTC. An adapter may hand the
+    # window over in UTC; the registers must still read 18:00-19:00.
+    start = datetime(2026, 7, 15, 17, 0, tzinfo=UTC)
+    end = datetime(2026, 7, 15, 18, 0, tzinfo=UTC)
+    intent = _intent(
+        ExportIntent(
+            event_identity=("export", start, end),
+            window_start=start,
+            window_end=end,
+            planned_export_kw=3.2,
+            dno_export_limit_kw=7.36,
+            selected_slots=(start,),
+            slot_export_kw=(3.2,),
+        )
+    )
+
+    window = _export_window(intent, london)
+
+    assert window is not None
+    assert (window[0].hour, window[0].minute) == (18, 0)
+    assert (window[1].hour, window[1].minute) == (19, 0)
+
+
+@pytest.mark.asyncio
+async def test_export_registers_follow_the_configured_timezone(tmp_path) -> None:
+    """A non-UTC household clock shifts the programmed window, not the identity."""
+    rest = FakeRest()
+    export = _export(tz=ZoneInfo("UTC"))  # tomorrow 10:00-12:00 UTC
+    device = _device(rest, tmp_path, timezone="Asia/Kolkata")  # UTC+5:30, no DST
+
+    await device.apply(_intent(export))
+
+    block = next(
+        call[2]["value"] for call in rest.calls
+        if call[0:2] == ("modbus", "write_register") and call[2]["address"] == 43143
+    )
+    assert block == [23, 30, 5, 30, 15, 30, 17, 30]
