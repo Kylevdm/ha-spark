@@ -141,3 +141,26 @@ dropped tariff schedule), #92 (backtest tariff contract), and #93
   onboarding) but distinct — onboarding maps existing entities, this provisions
   a control surface. Trigger: none yet (a user hitting the manual-install
   friction, or a decision to invest in the companion integration).
+
+### Axle adoption (from map #128, 2026-09-12)
+
+- **Discuss a supported ha-spark adoption path with Axle at v1.0.0.** The
+  supervised prototype can use Axle's Events Only Home Assistant endpoint, but
+  the documented dispatch webhook and site/asset REST surfaces are
+  OEM/partner-scoped or require organisation credentials and an onboarded asset
+  (`docs/research/129-axle-event-contract.md:19-40`). Establish whether Axle
+  will support ha-spark adoption and, if so, which authenticated per-user or
+  partner integration contract applies. This is beyond map #128's one-event
+  prototype destination. Trigger: ha-spark reaches v1.0.0.
+
+### Release and installation observability (2026-09-12)
+
+- **Show the running ha-spark build version in `ha-spark health`.** The doctor
+  currently reports the Home Assistant version but not the application build
+  (`ha_spark/health.py:60-68`); the package metadata and add-on version also
+  disagree today (`ha_spark/__init__.py:3`, `pyproject.toml:7`,
+  `ha_spark_addon/config.yaml:3`). Expose an unambiguous installed version or
+  build reference in the health output, and align its source of truth with the
+  add-on release mechanism so operators can verify which code is running during
+  upgrades and supervised control trials. Trigger: before the next add-on
+  migration or real-control trial.
