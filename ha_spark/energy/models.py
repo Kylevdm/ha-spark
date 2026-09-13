@@ -218,6 +218,28 @@ class ChargeIntent:
         """The checked SoC percentage; 0 when the measurement failed."""
         return self.soc.soc_now
 
+    def hold_active(self, now: datetime) -> bool:
+        """True when ``now`` falls inside a hold window (start inclusive, end exclusive).
+
+        The inverter-agnostic expression of "the battery must not discharge right
+        now". Hold bounds come from a dispatch attribute HA renders itself, so
+        they may arrive naive; a naive bound is read on ``now``'s own clock
+        rather than discarded, so an unannotated dispatch never leaves a hold
+        silently inactive.
+        """
+        return any(
+            _align(start, now) <= now < _align(end, now) for start, end in self.holds
+        )
+
+
+def _align(moment: datetime, now: datetime) -> datetime:
+    """Put ``moment`` on the same aware/naive footing as ``now`` for comparison."""
+    if (moment.tzinfo is None) == (now.tzinfo is None):
+        return moment
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=now.tzinfo)
+    return moment.astimezone().replace(tzinfo=None)
+
 
 @dataclass(frozen=True)
 class Reservation:

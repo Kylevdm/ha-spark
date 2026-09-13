@@ -1,6 +1,8 @@
 """Solis inverter driver: native timed-slot charge control over a thin HA
 ``modbus:`` overlay (the ``solis_control`` hub stood up in #90), plus the
-power-switch stop-discharge hold (unchanged, ADR-0003 rule 2).
+declarative power-switch reconcile (ADR-0003 rule 2, #140): ha-spark owns both
+edges of the whole-inverter enable, driving it to ``Off`` while a dispatch hold
+is active and ``On`` otherwise.
 
 Control surface (decided in #82, validated by live-fire #83, register map from
 #100/#80 — **no tier-A source; cross-checked live 2026-09-08**): the timed-slot
@@ -105,6 +107,8 @@ class SolisDevice:
 
     async def apply(self, intent: ChargeIntent) -> list[str]:
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        tz = ZoneInfo(self._settings.timezone)
+        now = datetime.now(tz)
         # SoC-unreadable guard: soc_now==0 from a dead sensor would size a max charge.
         if mode == "on" and not intent.soc.ok:
             line = (
@@ -112,11 +116,15 @@ class SolisDevice:
                 f"{intent.target_soc_pct:.0f}%"
             )
             log.warning(line)
-            return [line]
+            # The power-switch reconcile is deliberately exempt (#140): it has no
+            # SoC-derived magnitude, and freezing the inverter `Off` on an
+            # unrelated dead sensor is the failure the reconcile exists to
+            # remove. Charge programming stays blocked.
+            return [line, await self._reconcile_power_switch(intent, now)]
         lines: list[str] = []
         raw_export = getattr(intent, "export", None)
         export_store = ExportEventStore(self._settings.db_path)
-        export = _export_window(intent, ZoneInfo(self._settings.timezone))
+        export = _export_window(intent, tz)
         export_ready = export is not None
         if raw_export is not None and export is None:
             export_ready = False
@@ -124,6 +132,10 @@ class SolisDevice:
         elif export_ready:
             assert export is not None
             export_error = _validate_export(intent, export)
+            if export_error is None and intent.hold_active(now):
+                # Hold beats export on overlap: the inverter is about to be held
+                # `Off`, so there is nothing to export with.
+                export_error = "a dispatch hold is active and holds the inverter off"
             if mode == "on" and export_error is None:
                 export_error = await self._require_power_switch_on()
             if export_error is not None:
@@ -164,13 +176,7 @@ class SolisDevice:
         # window (charge 2/3, any discharge) can't actuate behind the plan.
         for slot in (2, 3):
             lines.append(await self._zero_guard_slot(slot))
-        for start, end in intent.holds:
-            lines.append(
-                await self._stop_discharge(
-                    f"turn inverter off (stop discharge) during dispatch "
-                    f"{start:%H:%M}-{end:%H:%M}"
-                )
-            )
+        lines.append(await self._reconcile_power_switch(intent, now))
         if mode == "on":
             if raw_export is not None or export_store.exists:
                 await self._persist_export_state(raw_export, export, export_ready, window_line)
@@ -404,7 +410,20 @@ class SolisDevice:
             return False, f"[WARNING] {desc}, but {mismatch}"
         return True, f"[APPLIED] {desc}"
 
-    async def _stop_discharge(self, desc: str) -> str:
+    async def _reconcile_power_switch(self, intent: ChargeIntent, now: datetime) -> str:
+        """Converge the whole-inverter enable on the state the clock implies (#140).
+
+        Desired state is a pure function of ``now`` and ``intent.holds``: ``Off``
+        while a hold is active, ``On`` otherwise. Nothing is remembered, so a
+        restart or a crash mid-hold converges on the next tick, and ha-spark owns
+        both edges rather than only ever subtracting (ADR-0003).
+
+        It must never read export state. If the switch is ``On`` during a paid
+        export that is because no hold is active, not because export asked —
+        ``_require_power_switch_on`` stays a read-only refusal.
+        """
+        wanted = "Off" if intent.hold_active(now) else "On"
+        desc = f"set inverter power switch to {wanted}"
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         if mode == "simulate":
             return f"[SIMULATE] would {desc}"
@@ -414,11 +433,14 @@ class SolisDevice:
         if not entity:
             return "[SKIP] no power_switch entity configured; discharge left as-is"
         try:
+            if (await self._rest.get_state(entity)).state.strip().lower() == wanted.lower():
+                return f"[SKIP] {desc} (already set)"
             await self._rest.call_service(
-                "select", "select_option", {"entity_id": entity, "option": "Off"}
+                "select", "select_option", {"entity_id": entity, "option": wanted}
             )
-            mismatch = await self._read_back_option(entity, "Off")
-        except Exception as exc:  # noqa: BLE001
+            mismatch = await self._read_back_option(entity, wanted)
+        except Exception as exc:  # noqa: BLE001 - isolate this action's failure
+            log.error("[FAILED] %s: %r", desc, exc)
             return f"[FAILED] {desc}: {exc!r}"
         return f"[WARNING] {desc}, but {mismatch}" if mismatch else f"[APPLIED] {desc}"
 
