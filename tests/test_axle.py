@@ -93,10 +93,27 @@ def test_parse_malformed_event_fails_closed(payload: dict[str, object]) -> None:
         parse_axle_event(payload, now=NOW, rate_gbp_kwh=1.0)
 
 
-def test_parse_stale_event_fails_closed() -> None:
-    with pytest.raises(AxleApiError, match="stale"):
+def test_parse_accepts_an_event_published_hours_ago() -> None:
+    """`updated_at` is a change timestamp, not a heartbeat.
+
+    Axle moves it only when it modifies the event, and events are normally
+    published around four hours ahead. Treating it as a freshness signal
+    rejected every poll after the first, so export never fired.
+    """
+    event = parse_axle_event(
+        _payload(updated_at=(NOW - timedelta(hours=4)).isoformat()),
+        now=NOW,
+        rate_gbp_kwh=1.0,
+    )
+
+    assert event is not None
+    assert event.updated_at == NOW - timedelta(hours=4)
+
+
+def test_parse_future_dated_update_fails_closed() -> None:
+    with pytest.raises(AxleApiError, match="future"):
         parse_axle_event(
-            _payload(updated_at=(NOW - timedelta(minutes=11)).isoformat()),
+            _payload(updated_at=(NOW + timedelta(hours=1)).isoformat()),
             now=NOW,
             rate_gbp_kwh=1.0,
         )

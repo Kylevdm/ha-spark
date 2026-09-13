@@ -13,7 +13,9 @@ from ha_spark.config import Settings
 from ha_spark.energy.models import FlexibilityEvent
 from ha_spark.ha.rest import HomeAssistantRest
 
-_MAX_EVENT_AGE = timedelta(minutes=10)
+# Tolerance for a future-dated `updated_at`: absorbs ordinary clock skew
+# between Axle and the household without accepting a nonsense timestamp.
+_UPDATED_AT_SKEW = timedelta(minutes=5)
 
 
 class AxleApiError(RuntimeError):
@@ -58,9 +60,12 @@ def parse_axle_event(
     updated_at = _timestamp(payload.get("updated_at"), "updated_at")
     if end <= start:
         raise AxleApiError("Axle event end_time must be after start_time")
-    age = now.astimezone(UTC) - updated_at
-    if age < timedelta(0) or age > _MAX_EVENT_AGE:
-        raise AxleApiError("Axle event is stale or dated in the future")
+    # `updated_at` is a change timestamp, not a heartbeat: Axle moves it only
+    # when it modifies the event, and events are published hours ahead. Read
+    # freshness is a property of the fetch, not of this field. A future date
+    # means clock skew or a malformed payload, so that still fails closed.
+    if updated_at > now.astimezone(UTC) + _UPDATED_AT_SKEW:
+        raise AxleApiError("Axle event updated_at is dated in the future")
 
     direction = payload.get("import_export")
     if not isinstance(direction, str) or direction not in {"import", "export"}:
