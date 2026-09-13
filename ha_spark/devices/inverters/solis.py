@@ -28,6 +28,7 @@ import math
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, TypeVar
+from zoneinfo import ZoneInfo
 
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
 from ha_spark.devices.registry import register
@@ -115,7 +116,7 @@ class SolisDevice:
         lines: list[str] = []
         raw_export = getattr(intent, "export", None)
         export_store = ExportEventStore(self._settings.db_path)
-        export = _export_window(intent)
+        export = _export_window(intent, ZoneInfo(self._settings.timezone))
         export_ready = export is not None
         if raw_export is not None and export is None:
             export_ready = False
@@ -613,8 +614,14 @@ class SolisDevice:
         return None if got.lower() == wanted.lower() else f"read back {got!r} (wanted {wanted!r})"
 
 
-def _export_window(intent: ChargeIntent) -> tuple[datetime, datetime] | None:
-    """Read the optional planner export value without coupling to its model type."""
+def _export_window(intent: ChargeIntent, tz: ZoneInfo) -> tuple[datetime, datetime] | None:
+    """Read the optional planner export value without coupling to its model type.
+
+    Resolved to ``tz`` — the household clock the inverter runs on. The Slot 1
+    window registers hold local wall-clock time, and the charge half of that
+    same block is written from ``intent.window_start``, a local ``time``. Both
+    halves must share one basis or a BST event is programmed an hour early.
+    """
     value = getattr(intent, "export", None)
     if value is None:
         return None
@@ -629,7 +636,7 @@ def _export_window(intent: ChargeIntent) -> tuple[datetime, datetime] | None:
         return None
     if start.tzinfo is None or end.tzinfo is None:
         return None
-    return start.astimezone(UTC), end.astimezone(UTC)
+    return start.astimezone(tz), end.astimezone(tz)
 
 
 def _validate_export(intent: ChargeIntent, export: tuple[datetime, datetime]) -> str | None:
