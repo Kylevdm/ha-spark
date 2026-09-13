@@ -34,6 +34,8 @@ options:
   min_soc: 20.0
   target_soc_cap: 90.0
   max_charge_current_a: 62.5
+  battery_discharge_ceiling_kw: 3.2
+  dno_export_limit_kw: 7.36
   charge_buffer_pct: 20.0
   charge_efficiency: 0.9
   charge_strategy: deficit
@@ -129,6 +131,8 @@ schema:
   min_soc: float(0,100)
   target_soc_cap: float(0,100)
   max_charge_current_a: float
+  battery_discharge_ceiling_kw: float(0,)
+  dno_export_limit_kw: float(0,)
   charge_buffer_pct: float
   charge_efficiency: float(0,1)
   charge_strategy: list(deficit|fill)

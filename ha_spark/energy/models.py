@@ -93,6 +93,44 @@ class FlexibilityEvent:
     updated_at: datetime
     rate_gbp_kwh: float
 
+    @property
+    def identity(self) -> tuple[str, datetime, datetime]:
+        """Stable event identity from the Axle household snapshot contract.
+
+        Axle's Home Assistant endpoint has no event id.  ``updated_at`` proves
+        a snapshot is fresh but changes without making the event a different
+        obligation, so identity is exactly direction and window.
+        """
+        return (self.direction, self.start, self.end)
+
+
+@dataclass(frozen=True)
+class ExportSkip:
+    """One paid-event slot deliberately not scheduled, with an auditable reason."""
+
+    start: datetime
+    reason: str
+
+
+@dataclass(frozen=True)
+class ExportIntent:
+    """Inverter-agnostic export request for selected paid-event slots.
+
+    ``planned_export_kw`` is the lowest calculated export ceiling across the
+    selected slots, so a single-window inverter adapter has a conservative
+    power figure to report.  ``slot_export_kw`` preserves each slot's actual
+    ceiling for audits; the Solis prototype deliberately commands its fixed
+    verified current rather than trying to modulate to those figures.
+    """
+
+    event_identity: tuple[str, datetime, datetime]
+    window_start: datetime
+    window_end: datetime
+    planned_export_kw: float
+    dno_export_limit_kw: float
+    selected_slots: tuple[datetime, ...]
+    slot_export_kw: tuple[float, ...]
+
 
 @dataclass(frozen=True)
 class PlannerConfig:
@@ -106,6 +144,12 @@ class PlannerConfig:
     solar_haircut_k: float
     window_start: time
     window_end: time
+    # Conservative DC battery output ceiling used only for export planning.
+    # Solis actuation remains fixed at its separately verified 62.5 A command.
+    battery_discharge_ceiling_kw: float = 3.2
+    dno_export_limit_kw: float = 7.36
+    supply_max_current_a: float = 75.0
+    supply_voltage_v: float = 240.0
     rate_offpeak: float = 0.069  # GBP/kWh inside the window / dispatch slots
     rate_peak: float = 0.30
     rate_export: float = 0.0  # GBP/kWh feed-in; 0 disables export revenue
@@ -167,6 +211,7 @@ class ChargeIntent:
     window_start: time
     window_end: time
     holds: tuple[tuple[datetime, datetime], ...] = ()
+    export: ExportIntent | None = None
 
     @property
     def soc_now(self) -> float:
@@ -231,6 +276,9 @@ class ChargePlan:
     # Named battery obligations computed from the slot horizon. The daily model
     # intentionally leaves this empty to preserve its legacy contract.
     reservations: tuple[Reservation, ...] = ()
+    # Skips are part of the plan rather than silently becoming lower-current
+    # delivery: every accepted export slot is always a complete half-hour.
+    export_skips: tuple[ExportSkip, ...] = ()
 
     @property
     def soc_now(self) -> float:
