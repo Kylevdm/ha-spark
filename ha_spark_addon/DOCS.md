@@ -280,6 +280,11 @@ only explicit, fresh export windows. Import events and malformed or stale
 responses produce no export slots. The API key is a password and is never
 written to logs or reports.
 
+For paid export, `battery_discharge_ceiling_kw` is the conservative battery
+output used by the planner, while `dno_export_limit_kw` is the installation's
+grid-export limit (Kyle's is 7.36 kW). Both caps are independent of the Solis
+prototype's fixed 62.5 A timed-discharge command.
+
 ### Octopus API (optional)
 
 `octopus_api_key`, `octopus_mpan`, `octopus_meter_serial` enable

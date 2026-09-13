@@ -55,8 +55,20 @@ modbus:
         unit_of_measurement: A
         scan_interval: 5
 
+      # Discharge current: DC amps, register scaled x10 (raw 625 == 62.5 A).
+      # The prototype uses this fixed ceiling during an accepted Axle event.
+      - name: Solis Control Timed Discharge Current
+        address: 43142
+        input_type: holding
+        data_type: uint16
+        scale: 0.1
+        precision: 1
+        unit_of_measurement: A
+        scan_interval: 5
+
       # Slot 1 window block: 43143..43150, in this order (charge then discharge).
-      # ha-spark writes charge start/end and holds the discharge half at 0.
+      # ha-spark writes charge start/end and, for an accepted Axle event,
+      # the discharge start/end in the same atomic block.
       - {name: Solis Control Timed Charge Start Hours,     address: 43143, input_type: holding, data_type: uint16, scan_interval: 5}
       - {name: Solis Control Timed Charge Start Minutes,   address: 43144, input_type: holding, data_type: uint16, scan_interval: 5}
       - {name: Solis Control Timed Charge End Hours,       address: 43145, input_type: holding, data_type: uint16, scan_interval: 5}

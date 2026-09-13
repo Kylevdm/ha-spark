@@ -49,6 +49,8 @@ _OPTION_KEYS = frozenset(
         "min_soc",
         "target_soc_cap",
         "max_charge_current_a",
+        "battery_discharge_ceiling_kw",
+        "dno_export_limit_kw",
         "charge_buffer_pct",
         "charge_strategy",
         "solar_haircut_k",
@@ -324,6 +326,11 @@ class Settings(BaseSettings):
     min_soc: float = Field(default=20.0)
     target_soc_cap: float = Field(default=90.0)
     max_charge_current_a: float = Field(default=62.5)
+    # Conservative planning ceiling for battery discharge.  It is distinct
+    # from Solis's fixed hardware command and keeps the planner inverter-agnostic.
+    battery_discharge_ceiling_kw: float = Field(default=3.2, ge=0)
+    # Installation-specific grid-export cap. Kyle's approved G98 limit is 7.36 kW.
+    dno_export_limit_kw: float = Field(default=7.36, ge=0)
     # Safety margin applied to the forecast deficit before sizing the charge.
     charge_buffer_pct: float = Field(default=20.0)
     # Round-trip AC->DC->AC efficiency: the planner buys required/efficiency.

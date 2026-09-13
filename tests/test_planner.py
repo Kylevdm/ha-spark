@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from ha_spark.energy.models import DispatchSlot, PlannerConfig, PlannerInputs
+from ha_spark.energy.models import DispatchSlot, FlexibilityEvent, PlannerConfig, PlannerInputs
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.tariff import TariffSchedule, fixed_schedule
@@ -176,6 +176,199 @@ def test_daytime_dispatch_becomes_a_hold() -> None:
     )
     plan = _plan(inp, cfg())
     assert len(plan.charge_intent.holds) == 1
+
+
+def test_axle_export_reserves_a_full_event_and_the_post_event_cheap_slot() -> None:
+    """A funded event uses whole slots at the DNO ceiling and holds back after it."""
+    event = FlexibilityEvent(
+        start=datetime(2026, 6, 9, 17, 0, tzinfo=UTC),
+        end=datetime(2026, 6, 9, 18, 0, tzinfo=UTC),
+        direction="export",
+        updated_at=datetime(2026, 6, 9, 16, 0, tzinfo=UTC),
+        rate_gbp_kwh=1.0,
+    )
+    inputs = PlannerInputs(
+        soc=_soc(20.0),
+        solar_tomorrow_kwh=1.0,
+        predicted_home_load_kwh=24.0,
+        load_slots=(0.5,) * 48,  # 1 kW forecast house load
+        solar_slots=(0.0,) * 35 + (0.5, 0.5) + (0.0,) * 11,
+        horizon_start=_HORIZON_START,
+        flexibility_event=event,
+    )
+
+    plan = _plan(
+        inputs,
+        cfg(
+            capacity_kwh=40.0,
+            battery_discharge_ceiling_kw=3.2,
+            dno_export_limit_kw=7.36,
+            supply_max_current_a=75.0,
+            supply_voltage_v=240.0,
+        ),
+    )
+
+    export = plan.charge_intent.export
+    assert export is not None
+    assert export.event_identity == ("export", event.start, event.end)
+    assert (export.window_start, export.window_end) == (event.start, event.end)
+    # min(7.36 DNO, 3.2 battery + 1.0 solar - 1.0 house) = 3.2 kW.
+    assert export.planned_export_kw == pytest.approx(3.2)
+    assert export.dno_export_limit_kw == pytest.approx(7.36)
+    assert export.selected_slots == (event.start, event.start + timedelta(minutes=30))
+
+    event_reservation, post_event_reservation = plan.reservations
+    assert event_reservation.name == "axle-export-event"
+    # 11.5 kWh of net house load through the event (the event's solar serves
+    # its 1 kWh house load) plus 3.2 kWh of
+    # selected export must survive until the event end.
+    assert event_reservation.energy_kwh == pytest.approx(14.7)
+    assert post_event_reservation.name == "reach-next-cheap-slot"
+    # The 18:00--23:30 post-event run is entirely protected separately.
+    assert post_event_reservation.energy_kwh == pytest.approx(5.5)
+    assert plan.export_revenue == pytest.approx(3.2)
+
+
+def test_axle_export_underfunding_selects_a_contiguous_suffix_of_full_slots() -> None:
+    event = FlexibilityEvent(
+        start=datetime(2026, 6, 9, 16, 30, tzinfo=UTC),
+        end=datetime(2026, 6, 9, 18, 0, tzinfo=UTC),
+        direction="export",
+        updated_at=datetime(2026, 6, 9, 16, 0, tzinfo=UTC),
+        rate_gbp_kwh=1.0,
+    )
+    plan = _plan(
+        PlannerInputs(
+            soc=_soc(20.0), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=0.0,
+            load_slots=(0.0,) * 48, solar_slots=(0.0,) * 48,
+            horizon_start=_HORIZON_START, flexibility_event=event,
+        ),
+        cfg(
+            capacity_kwh=5.0, target_cap=90.0, min_soc=20.0,
+            battery_discharge_ceiling_kw=3.2, dno_export_limit_kw=7.36,
+        ),
+    )
+
+    export = plan.charge_intent.export
+    assert export is not None
+    # 3.5 kWh usable capacity funds only two 1.6 kWh slots. Working backwards
+    # keeps the selected window contiguous and nearest the event end.
+    assert export.selected_slots == (
+        datetime(2026, 6, 9, 17, 0, tzinfo=UTC),
+        datetime(2026, 6, 9, 17, 30, tzinfo=UTC),
+    )
+    assert export.window_end == event.end
+    assert len(plan.export_skips) == 1
+    assert "reserved house or post-event energy" in plan.export_skips[0].reason
+
+
+def test_axle_export_skips_the_event_when_no_complete_slot_is_fundable() -> None:
+    event = FlexibilityEvent(
+        start=datetime(2026, 6, 9, 17, 0, tzinfo=UTC),
+        end=datetime(2026, 6, 9, 18, 0, tzinfo=UTC), direction="export",
+        updated_at=datetime(2026, 6, 9, 16, 0, tzinfo=UTC), rate_gbp_kwh=1.0,
+    )
+    plan = _plan(
+        PlannerInputs(
+            soc=_soc(20.0), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=0.0,
+            load_slots=(0.0,) * 48, solar_slots=(0.0,) * 48,
+            horizon_start=_HORIZON_START, flexibility_event=event,
+        ),
+        cfg(capacity_kwh=2.0, battery_discharge_ceiling_kw=3.2, dno_export_limit_kw=7.36),
+    )
+
+    assert plan.charge_intent.export is None
+    assert len(plan.export_skips) == 2
+    assert any("reserved house or post-event energy" in skip.reason for skip in plan.export_skips)
+
+
+def test_axle_export_does_not_overlap_a_dispatch_hold() -> None:
+    event = FlexibilityEvent(
+        start=datetime(2026, 6, 9, 17, 0, tzinfo=UTC),
+        end=datetime(2026, 6, 9, 18, 0, tzinfo=UTC), direction="export",
+        updated_at=datetime(2026, 6, 9, 16, 0, tzinfo=UTC), rate_gbp_kwh=1.0,
+    )
+    hold_start = datetime(2026, 6, 9, 17, 30, tzinfo=UTC)
+    plan = _plan(
+        PlannerInputs(
+            soc=_soc(20.0), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=0.0,
+            load_slots=(0.0,) * 48, solar_slots=(0.0,) * 48,
+            horizon_start=_HORIZON_START, flexibility_event=event,
+            dispatches=(DispatchSlot(hold_start, hold_start + timedelta(minutes=30)),),
+        ),
+        cfg(battery_discharge_ceiling_kw=3.2, dno_export_limit_kw=7.36),
+    )
+
+    assert plan.charge_intent.export is None
+    assert len(plan.charge_intent.holds) == 1
+    assert any("dispatch hold" in skip.reason for skip in plan.export_skips)
+
+
+def test_axle_export_overlapping_charge_window_suppresses_discretionary_charge() -> None:
+    event = FlexibilityEvent(
+        start=_HORIZON_START,
+        end=_HORIZON_START + timedelta(minutes=30),
+        direction="export",
+        updated_at=_HORIZON_START - timedelta(minutes=1),
+        rate_gbp_kwh=1.0,
+    )
+    plan = _plan(
+        PlannerInputs(
+            soc=_soc(50.0), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=0.5,
+            load_slots=(0.5,) + (0.0,) * 47, solar_slots=(0.0,) * 48,
+            horizon_start=_HORIZON_START, flexibility_event=event,
+        ),
+        cfg(battery_discharge_ceiling_kw=3.2, dno_export_limit_kw=7.36),
+    )
+
+    assert plan.charge_intent.export is not None
+    assert plan.required_kwh == 0.0
+    assert plan.charge_intent.target_soc_pct == plan.soc_now
+    # 0.5 kWh house load plus 1.1 kWh export at the 2.2 kW safe ceiling.
+    assert plan.reservations[0].energy_kwh == pytest.approx(1.6)
+
+
+def test_axle_export_skips_a_slot_the_fixed_current_would_push_over_the_dno_limit() -> None:
+    event = FlexibilityEvent(
+        start=datetime(2026, 6, 9, 17, 0, tzinfo=UTC),
+        end=datetime(2026, 6, 9, 17, 30, tzinfo=UTC), direction="export",
+        updated_at=datetime(2026, 6, 9, 16, 0, tzinfo=UTC), rate_gbp_kwh=1.0,
+    )
+    plan = _plan(
+        PlannerInputs(
+            soc=_soc(90.0), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=0.0,
+            load_slots=(0.0,) * 48, solar_slots=(0.0,) * 48,
+            horizon_start=_HORIZON_START, flexibility_event=event,
+        ),
+        cfg(battery_discharge_ceiling_kw=3.2, dno_export_limit_kw=2.0),
+    )
+
+    assert plan.charge_intent.export is None
+    assert "fixed discharge command would exceed the DNO" in plan.export_skips[0].reason
+
+
+def test_axle_export_skips_a_slot_the_fixed_current_would_push_over_the_supply_limit() -> None:
+    event = FlexibilityEvent(
+        start=datetime(2026, 6, 9, 17, 0, tzinfo=UTC),
+        end=datetime(2026, 6, 9, 17, 30, tzinfo=UTC), direction="export",
+        updated_at=datetime(2026, 6, 9, 16, 0, tzinfo=UTC), rate_gbp_kwh=1.0,
+    )
+    plan = _plan(
+        PlannerInputs(
+            soc=_soc(90.0), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=0.0,
+            load_slots=(0.0,) * 48, solar_slots=(0.0,) * 48,
+            horizon_start=_HORIZON_START, flexibility_event=event,
+        ),
+        cfg(
+            battery_discharge_ceiling_kw=3.2,
+            dno_export_limit_kw=7.36,
+            supply_max_current_a=10.0,
+            supply_voltage_v=240.0,
+        ),
+    )
+
+    assert plan.charge_intent.export is None
+    assert "DNO or supply limit" in plan.export_skips[0].reason
 
 
 # --- v2 per-slot model ---

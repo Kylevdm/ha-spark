@@ -101,6 +101,10 @@ def setpoint_changed(previous: ChargeIntent, current: ChargeIntent) -> bool:
         or previous.window_start != current.window_start
         or previous.window_end != current.window_end
         or previous.holds != current.holds
+        # The export value is an optional planner extension.  Comparing the
+        # value itself catches changed/cancelled event windows while keeping
+        # legacy inverter intents source-compatible.
+        or getattr(previous, "export", None) != getattr(current, "export", None)
     )
 
 

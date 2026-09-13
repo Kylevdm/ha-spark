@@ -13,7 +13,7 @@ from ha_spark.config import Settings
 from ha_spark.energy import sources
 from ha_spark.energy.models import LoadForecast
 from ha_spark.energy.soc_integrity import SocStatus
-from ha_spark.energy.sources import build_schedule, gather_inputs, pre_window_drain
+from ha_spark.energy.sources import build_config, build_schedule, gather_inputs, pre_window_drain
 from ha_spark.energy.tariff import fixed_schedule
 from ha_spark.ha.rest import HomeAssistantRest
 
@@ -47,6 +47,23 @@ def _settings() -> Settings:
         ev_status_entity="sensor.ev",
         ha_template_charge_needed_entity="sensor.tmpl",
     )
+
+
+def test_build_config_threads_export_limits_to_the_pure_planner() -> None:
+    cfg = build_config(
+        Settings(
+            battery_discharge_ceiling_kw=3.2,
+            dno_export_limit_kw=7.36,
+            supply_max_current_a=60.0,
+            supply_voltage_v=230.0,
+        ),
+        voltage_v=51.0,
+    )
+
+    assert cfg.battery_discharge_ceiling_kw == 3.2
+    assert cfg.dno_export_limit_kw == 7.36
+    assert cfg.supply_max_current_a == 60.0
+    assert cfg.supply_voltage_v == 230.0
 
 
 @respx.mock
@@ -117,9 +134,10 @@ async def test_gather_inputs_reads_axle_event_source(monkeypatch: pytest.MonkeyP
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    now = datetime.now(UTC)
     event = {
-        "start_time": "2026-09-12T17:00:00+00:00",
-        "end_time": "2026-09-12T18:00:00+00:00",
+        "start_time": (now + timedelta(hours=1)).isoformat(),
+        "end_time": (now + timedelta(hours=2)).isoformat(),
         "import_export": "export",
         "updated_at": datetime.now(UTC).isoformat(),
     }

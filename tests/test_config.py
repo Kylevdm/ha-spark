@@ -181,6 +181,15 @@ def test_v2l_options_load_from_overlay() -> None:
     assert Settings().v2l_cutoff_time == "01:00"
 
 
+def test_export_planner_limits_are_configurable_across_addon_surfaces() -> None:
+    settings = Settings(battery_discharge_ceiling_kw=3.2, dno_export_limit_kw=7.36)
+
+    assert settings.battery_discharge_ceiling_kw == 3.2
+    assert settings.dno_export_limit_kw == 7.36
+    assert "battery_discharge_ceiling_kw" in _OPTION_KEYS
+    assert "dno_export_limit_kw" in _OPTION_KEYS
+
+
 def test_devices_synthesized_from_flat_keys_when_absent() -> None:
     s = Settings(
         supervisor_token="sup",
