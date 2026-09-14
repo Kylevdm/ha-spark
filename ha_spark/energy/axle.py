@@ -115,10 +115,12 @@ async def read_axle_event(
     now: datetime | None = None,
 ) -> FlexibilityEvent | None:
     """Read Axle directly, falling back to the configured HA mirror on failure."""
+    direct_read_failed = False
     if settings.axle_api_key:
         try:
             return await fetch_axle_event(settings, now=now)
         except AxleApiError:
+            direct_read_failed = True
             if not settings.axle_event_entity:
                 raise
     if not settings.axle_event_entity:
@@ -133,8 +135,13 @@ async def read_axle_event(
         raise AxleApiError("Home Assistant Axle event state is unavailable")
     if "start_time" not in payload and state_value:
         payload["start_time"] = state.state
-    return parse_axle_event(
+    event = parse_axle_event(
         payload or None,
         now=now or datetime.now(UTC),
         rate_gbp_kwh=settings.axle_event_rate_gbp_kwh,
     )
+    if direct_read_failed and event is None:
+        raise AxleApiError(
+            "Home Assistant Axle mirror returned no event after the direct read failed"
+        )
+    return event

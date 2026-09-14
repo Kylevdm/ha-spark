@@ -246,6 +246,28 @@ async def test_read_axle_event_uses_ha_mirror_when_api_fails() -> None:
 
 
 @respx.mock
+async def test_read_axle_event_does_not_treat_empty_mirror_as_cancellation() -> None:
+    respx.get(f"{AXLE}/vpp/home-assistant/event").mock(return_value=httpx.Response(503))
+    respx.get(f"{HA}/states/sensor.axle_event").mock(
+        return_value=httpx.Response(
+            200,
+            json={"entity_id": "sensor.axle_event", "state": "", "attributes": {}},
+        )
+    )
+    settings = Settings(
+        ha_url="http://ha.test",
+        ha_token="ha-token",
+        axle_api_url=AXLE,
+        axle_api_key="secret-token",
+        axle_event_entity="sensor.axle_event",
+    )
+
+    with pytest.raises(AxleApiError, match="returned no event"):
+        async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+            await read_axle_event(settings, rest, now=NOW)
+
+
+@respx.mock
 async def test_read_axle_event_does_not_turn_malformed_api_data_into_cancellation() -> None:
     respx.get(f"{AXLE}/vpp/home-assistant/event").mock(
         return_value=httpx.Response(200, json={"start_time": _payload()["start_time"]})
