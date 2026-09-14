@@ -49,9 +49,11 @@
   discharged the battery at 18:30 *today* — intentional export outside a paid
   window, costing a peak-rate refill and earning nothing. The driver now refuses
   a window whose clock face would next come round before its own event, and says
-  so. The refusal is a deferral, not an abort: the event is re-offered every
-  tick and arms itself once its clock face is the next occurrence, so nothing is
-  remembered. An event already under way stays armed, so a day-of pickup still
+  so. It also refuses while an earlier day's window is still open on the clock:
+  tomorrow's 18:30-19:30 programmed at 18:31 today would put the inverter inside
+  it at once and export unpaid until 19:30. The refusal is a deferral, not an
+  abort: the event is re-offered every tick and arms itself once the next time
+  its window opens is the event's own, so nothing is remembered. An event already under way stays armed, so a day-of pickup still
   delivers the remainder. A pending export event now always counts as a changed
   setpoint: arming is a function of the clock, not the plan, and an event
   announced a day ahead yields an identical intent every tick — so the

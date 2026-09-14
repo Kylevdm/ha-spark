@@ -119,8 +119,8 @@ def setpoint_changed(
     write-if-changed. Omitting them compares the plans alone.
 
     A pending export event is always a changed command, for the same reason one
-    step further on (#144). The Solis driver arms an export window only once its
-    clock face next comes round at the event, which is a function of the clock,
+    step further on (#144). The Solis driver arms an export window only once the
+    next time its window opens is the event's own, which is a function of the clock,
     not of the plan — and an Axle event announced a day ahead produces an equal
     ``ExportIntent`` tick after tick. Comparing plans alone would skip every
     apply between announcement and event, so the window would never be

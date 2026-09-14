@@ -36,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import TYPE_CHECKING, TypeVar
 from zoneinfo import ZoneInfo
 
@@ -838,6 +838,15 @@ def _next_wall_clock_occurrence(wall: datetime, now: datetime) -> datetime:
     return datetime.combine(now.date() + timedelta(days=1), face, tzinfo=now.tzinfo)
 
 
+def _clock_window_open(t: time, start: time, end: time) -> bool:
+    """True when clock time ``t`` is inside ``[start, end)``, which may wrap midnight."""
+    if start < end:
+        return start <= t < end
+    if start > end:
+        return t >= start or t < end
+    return False
+
+
 def _export_not_yet_armed(export: tuple[datetime, datetime], now: datetime) -> str | None:
     """Refuse a window whose clock face would come round before its own event.
 
@@ -848,18 +857,29 @@ def _export_not_yet_armed(export: tuple[datetime, datetime], now: datetime) -> s
     peak-rate refill and earns nothing.
 
     This is a deferral, not a terminal abort: the event is re-offered on every
-    tick and arms itself once its clock face next comes round at the event, so
-    no scheduling state is needed. A window already under way stays armed, so a
+    tick and arms itself once the next time its window opens is the event's own,
+    so no scheduling state is needed. A window already under way stays armed, so a
     day-of pickup still delivers the remainder instead of waiting a day.
+
+    Passing the start's clock face is not enough: until the clock also leaves
+    the window, programming it puts the inverter inside it at once. Tuesday's
+    18:30-19:30 programmed at Monday 18:31 would export unpaid until Monday
+    19:30, so an earlier day's still-open window is refused too.
 
     An event inside a fall-back night's repeated hour is refused outright rather
     than armed: its clock face comes round twice, the register fires on the
     first, and the event may mean the second. Refusing loses one event an hour
     before the clocks go back; arming could export an hour early, unpaid.
     """
-    start, _ = export
+    start, end = export
     if now.astimezone(UTC) >= start.astimezone(UTC):
         return None
+    if _clock_window_open(now.time(), start.time(), end.time()):
+        return (
+            f"the {start:%H:%M}-{end:%H:%M} window is already open on the clock at "
+            f"{now:%a %d %b %H:%M}, before the event starts {start:%a %d %b %H:%M}; "
+            "not yet armed"
+        )
     occurrence = _next_wall_clock_occurrence(start, now)
     if occurrence.astimezone(UTC) == start.astimezone(UTC):
         return None
