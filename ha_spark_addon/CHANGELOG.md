@@ -130,6 +130,18 @@
   `sensor.ha_spark_soc_integrity` (operating state, failure count,
   threshold, integrity reason and evidence), in the daemon log, and in
   the plan report's untrusted-SoC line.
+- V2L observe + tally + notify (#123): when `v2l_power_entity` is set, the
+  daemon reads the car's V2L discharge power (W) each tick, integrates it
+  into the kWh delivered this session, values it against
+  `v2l_peak_rate_gbp` less a `v2l_round_trip_efficiency`-discounted
+  cheap-rate refill cost, and publishes `sensor.ha_spark_v2l_power_w` /
+  `_energy_kwh` / `_net_saving_gbp`. Three fire-once notifications go through
+  `v2l_notify_service` (HA `notify`): unplug at `v2l_cutoff_time` (the cheap
+  window is starting), plug in to recharge when V2L stops, and a predictive
+  heads-up against `v2l_budget_kwh`. The session tally is persisted across
+  restarts and resets daily once the car is idle; `ha-spark v2l` prints the
+  live tally. V2L is a manual physical adapter with no control API, so this
+  is read/observe + notify only: the planner and the drivers are untouched.
 
 ## 0.15.0
 
