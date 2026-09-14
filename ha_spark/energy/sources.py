@@ -223,6 +223,35 @@ def build_schedule(
     return fixed.schedule(inputs, cfg)
 
 
+async def read_dispatches(
+    settings: Settings, rest: HomeAssistantRest
+) -> tuple[tuple[DispatchSlot, ...], bool]:
+    """Read the HA dispatch entity: ``(dispatches, trusted)`` (#143 §3).
+
+    The one definition of hold trust on the HA-entity path, shared by
+    :func:`gather_inputs` and the per-minute reconcile. Untrusted only when
+    ``dispatch_entity`` is set and the read failed or reports ``unavailable``/
+    ``unknown``: then an empty result means "unreadable", not "no dispatch". An
+    unset entity is a household with no dispatch source — no holds, not
+    unreadable ones, and no read. Every provider folds dispatches into holds, so
+    distrusting it would refuse every export for ever.
+
+    A failure is logged at debug only: the per-minute caller would otherwise put
+    1440 identical warnings a day into the add-on log, so each caller reports an
+    untrusted result at its own cadence.
+    """
+    if not settings.dispatch_entity:
+        return (), True
+    try:
+        dispatch = await rest.get_state(settings.dispatch_entity)
+    except Exception as exc:  # noqa: BLE001 - a missing entity must not crash the plan
+        log.debug("Could not read %s (%s)", settings.dispatch_entity, exc)
+        return (), False
+    if str(dispatch.state).lower() in ("unavailable", "unknown"):
+        return (), False
+    return _parse_dispatches(dispatch.attributes.get("planned_dispatches")), True
+
+
 async def gather_inputs(
     settings: Settings, rest: HomeAssistantRest, *, soc: SocMeasurement | None = None
 ) -> tuple[PlannerInputs, PlannerConfig, str]:
@@ -272,17 +301,9 @@ async def gather_inputs(
             dispatches = ()
             dispatches_trusted = False
     else:
-        dispatch = await state(settings.dispatch_entity)
-        dispatches = _parse_dispatches(
-            dispatch.attributes.get("planned_dispatches") if dispatch else None
-        )
-        # An unset entity is a household with no dispatch source: no holds, not
-        # unreadable ones. Every provider folds dispatches into holds, so
-        # distrusting it would refuse every export for ever.
-        if settings.dispatch_entity and (
-            dispatch is None or str(dispatch.state).lower() in ("unavailable", "unknown")
-        ):
-            dispatches_trusted = False
+        dispatches, dispatches_trusted = await read_dispatches(settings, rest)
+        if not dispatches_trusted:
+            log.warning("Dispatch entity %s unreadable; holds untrusted", settings.dispatch_entity)
     ev_charging = bool(ev_status and str(ev_status.state).lower() in _EV_ACTIVE)
 
     dynamic_prices: tuple[PricePoint, ...] = ()

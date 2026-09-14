@@ -13,7 +13,8 @@ inert (and there is nothing else ha-spark can shed), so the guard stays quiet.
 
 Every tick also reconciles the inverter's hold state (`reconcile_tick`, #143):
 a read-first pass that converges the whole-inverter enable on what the clock and
-the last plan's dispatch holds imply. It is deliberately independent of
+the dispatch holds imply. On the HA-entity path it re-reads the dispatch entity
+each minute; the Octopus API path reuses the last plan's holds. It is deliberately independent of
 `setpoint_changed` — a hold boundary is a clock event, not a plan change, and
 dispatch bounds need not land on a half-hour.
 
@@ -31,6 +32,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import NamedTuple
 
 import httpx
 import uvicorn
@@ -68,8 +70,9 @@ from ha_spark.energy.publish import (
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.energy.soc_monitor import SocMonitor, observe_soc
-from ha_spark.energy.sources import parse_time
+from ha_spark.energy.sources import parse_time, read_dispatches
 from ha_spark.energy.supply_guard import SupplyGuard
+from ha_spark.energy.tariff import _controlled_windows
 from ha_spark.energy.tariff import _in_overnight_window as in_window
 from ha_spark.energy.v2l import run_v2l_tick
 from ha_spark.ha.rest import HomeAssistantRest
@@ -358,6 +361,7 @@ async def guard_tick(
 UNTRUSTED_HOLDS_LINE = (
     "[SKIP] hold data untrusted and no trusted hold set yet; power switch left as-is"
 )
+UNREADABLE_DISPATCH_LINE = "[SKIP] dispatch entity unreadable; using the last trusted holds"
 
 
 def hold_reconcile_intent(
@@ -379,6 +383,13 @@ def hold_reconcile_intent(
     return replace(intent, holds=trusted_holds)
 
 
+class ReconcileResult(NamedTuple):
+    """One reconcile pass: its action lines, and the caller's trusted hold set after it."""
+
+    lines: list[str]
+    trusted_holds: tuple[tuple[datetime, datetime], ...] | None
+
+
 async def reconcile_tick(
     settings: Settings,
     plan: ChargePlan | None,
@@ -386,7 +397,7 @@ async def reconcile_tick(
     *,
     previous: list[str] | None = None,
     trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
-) -> list[str]:
+) -> ReconcileResult:
     """One per-minute power-switch reconcile pass. Never raises.
 
     The clock seam (#143). ``apply`` is a plan diff on the half-hourly replan
@@ -416,27 +427,51 @@ async def reconcile_tick(
 
     ``trusted_holds`` is the caller's last trusted hold set, substituted when
     this plan's hold data is untrusted (see :func:`hold_reconcile_intent`).
+
+    On the HA-entity dispatch path the pass re-reads the dispatch entity (#143
+    §4) — a cached ``GET`` of what BottlecapDave's integration last polled —
+    so a dispatch published *and* started inside one slot holds within a
+    minute rather than being missed. The holds are folded through the same
+    ``_controlled_windows`` the planner uses, so an overnight dispatch stays
+    cheap charge coverage, never a hold. A trusted read replaces the returned
+    trusted set; a failed one falls back to it. The ``octopus_intelligent``
+    path keeps the last plan's holds: per-minute Kraken polling would be 30x
+    the current rate against an API whose own client caps refreshes.
     """
     if plan is None or plan.charge_intent is None:
-        return []
-    intent = hold_reconcile_intent(plan.charge_intent, trusted_holds)
-    if intent is None:
-        lines = [UNTRUSTED_HOLDS_LINE]
-    else:
-        try:
-            async with HomeAssistantRest(
-                settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
-            ) as rest:
-                lines = await inverter_device(settings, rest).reconcile_holds(intent, now)
-        except Exception:
-            log.exception("Hold reconcile tick failed; will retry next minute")
-            return []
+        return ReconcileResult([], trusted_holds)
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            fresh = plan.charge_intent
+            read_lines: list[str] = []
+            if settings.tariff_provider != "octopus_intelligent" and settings.dispatch_entity:
+                dispatches, trusted = await read_dispatches(settings, rest)
+                if trusted:
+                    trusted_holds = _controlled_windows(
+                        dispatches, fresh.window_start, fresh.window_end
+                    )
+                    fresh = replace(fresh, holds=trusted_holds, hold_trusted=True)
+                else:
+                    fresh = replace(fresh, hold_trusted=False)
+                    read_lines = [UNREADABLE_DISPATCH_LINE]
+            intent = hold_reconcile_intent(fresh, trusted_holds)
+            if intent is None:
+                lines = [UNTRUSTED_HOLDS_LINE]
+            else:
+                lines = read_lines + await inverter_device(settings, rest).reconcile_holds(
+                    intent, now
+                )
+    except Exception:
+        log.exception("Hold reconcile tick failed; will retry next minute")
+        return ReconcileResult([], trusted_holds)
     for line in lines:
         if previous is not None and line in previous:
             log.debug(line)
         else:
             log.info(line)
-    return lines
+    return ReconcileResult(lines, trusted_holds)
 
 
 async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasurement | None:
@@ -543,9 +578,10 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     # The previous reconcile pass's lines, so a per-minute pass logs only what
     # changed rather than the same line 1440 times a day.
     last_reconcile_lines: list[str] = []
-    # The hold set from the last plan whose dispatch read was trusted (#143 §3).
-    # A failed read's empty holds mean "unreadable", so the reconcile evaluates
-    # the clock against this instead. `None` until a trusted plan exists.
+    # The hold set from the last trusted dispatch read (#143 §3): a trusted plan,
+    # or on the HA-entity path the per-minute reconcile's own read (§4). A failed
+    # read's empty holds mean "unreadable", so the reconcile evaluates the clock
+    # against this instead. `None` until a trusted read exists.
     last_trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None
     last_settings = settings
     target_w: float | None = None
@@ -581,7 +617,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             # immediately back, two writes and a momentarily wrong whole-inverter
             # enable whenever a dispatch is announced or cancelled between slots.
             if not should_run(now, last_run_slot):
-                last_reconcile_lines = await reconcile_tick(
+                last_reconcile_lines, last_trusted_holds = await reconcile_tick(
                     settings,
                     last_plan,
                     now,

@@ -1481,10 +1481,12 @@ async def test_run_forever_reconciles_every_minute_not_every_slot(
         *,
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
-    ) -> list[str]:
+    ) -> scheduler.ReconcileResult:
         plans.append(plan)
         reconciled.append(now)
-        return ["[SKIP] set inverter power switch to On (already set)"]
+        return scheduler.ReconcileResult(
+            ["[SKIP] set inverter power switch to On (already set)"], trusted_holds
+        )
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
         return None
@@ -1534,9 +1536,9 @@ async def test_run_forever_does_not_reconcile_twice_on_a_slot_boundary(
         *,
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
-    ) -> list[str]:
+    ) -> scheduler.ReconcileResult:
         reconciled.append(now)
-        return []
+        return scheduler.ReconcileResult([], trusted_holds)
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
         return None
@@ -1565,7 +1567,7 @@ async def test_reconcile_tick_logs_only_what_changed(
 
     with caplog.at_level("INFO", logger="ha_spark.energy.scheduler"):
         first = await scheduler.reconcile_tick(settings, _plan(), now)
-        repeat = await scheduler.reconcile_tick(settings, _plan(), now, previous=first)
+        repeat = await scheduler.reconcile_tick(settings, _plan(), now, previous=first.lines)
 
     assert first == repeat
     assert len(caplog.records) == 1
@@ -1644,7 +1646,7 @@ async def test_an_untrusted_tick_with_no_trusted_holds_yet_does_nothing(
     )
 
     assert device.intents == []
-    assert any("untrusted" in line for line in lines)
+    assert any("untrusted" in line for line in lines.lines)
 
 
 async def test_a_trusted_tick_reconciles_against_its_own_holds(
@@ -1718,9 +1720,9 @@ async def test_run_forever_remembers_holds_only_from_trusted_plans(
         *,
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
-    ) -> list[str]:
+    ) -> scheduler.ReconcileResult:
         reconcile_saw.append(trusted_holds)
-        return []
+        return scheduler.ReconcileResult([], trusted_holds)
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
         return None
@@ -1768,12 +1770,12 @@ async def test_run_forever_forgets_trusted_holds_on_hot_reload(
         *,
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
-    ) -> list[str]:
+    ) -> scheduler.ReconcileResult:
         reconcile_saw.append(trusted_holds)
         captured[0].settings = Settings(
             ha_url="http://ha.test", ha_token="t", plan_run_time="22:00"
         )
-        return []
+        return scheduler.ReconcileResult([], trusted_holds)
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
         return None
@@ -1796,3 +1798,208 @@ async def test_run_forever_forgets_trusted_holds_on_hot_reload(
         await run_forever(s, poll_seconds=0)
 
     assert reconcile_saw == [(_HOLD,), None]
+
+
+# --- #140/#143 §4: the per-minute pass tracks Dave's poll on the HA-entity path ---
+
+_DISPATCH_URL = "http://ha.test/api/states/binary_sensor.dispatch"
+
+
+def _dispatch_state(state: str, dispatches: list[dict[str, str]] | None = None) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "entity_id": "binary_sensor.dispatch",
+            "state": state,
+            "attributes": {"planned_dispatches": dispatches or []},
+        },
+    )
+
+
+def _dispatch_settings(**kw: object) -> Settings:
+    base: dict[str, object] = dict(
+        ha_url="http://ha.test", ha_token="t", dispatch_entity="binary_sensor.dispatch"
+    )
+    base.update(kw)
+    return Settings(**base)  # type: ignore[arg-type]
+
+
+@respx.mock
+async def test_a_dispatch_published_mid_slot_is_honoured_on_the_next_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Published *and* started inside one slot: the next minute holds, without a replan."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    respx.get(_DISPATCH_URL).mock(
+        return_value=_dispatch_state(
+            "on", [{"start": "2026-06-10T22:00:00", "end": "2026-06-10T23:00:00"}]
+        )
+    )
+    inside = datetime(2026, 6, 10, 22, 15)
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(), _plan(replace(_INTENT, holds=())), inside, trusted_holds=()
+    )
+
+    [intent] = device.intents
+    assert intent.hold_active(inside) is True
+    assert intent.hold_trusted is True
+    assert result.trusted_holds == (_HOLD,)
+
+
+@respx.mock
+async def test_a_fresh_overnight_dispatch_is_not_a_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Holds are controlled windows, not raw dispatches: switching the inverter
+    ``Off`` during the cheap overnight charge would waste it."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    respx.get(_DISPATCH_URL).mock(
+        return_value=_dispatch_state(
+            "on", [{"start": "2026-06-11T01:00:00", "end": "2026-06-11T02:00:00"}]
+        )
+    )
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(), _plan(), datetime(2026, 6, 11, 1, 15), trusted_holds=()
+    )
+
+    [intent] = device.intents
+    assert intent.holds == ()
+    assert result.trusted_holds == ()
+
+
+@pytest.mark.parametrize(
+    "response", [httpx.Response(404), _dispatch_state("unavailable")], ids=["missing", "down"]
+)
+async def test_an_unreadable_dispatch_entity_per_minute_falls_back_to_the_trusted_holds(
+    monkeypatch: pytest.MonkeyPatch, response: httpx.Response
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    inside = datetime(2026, 6, 10, 22, 15)
+
+    with respx.mock:
+        respx.get(_DISPATCH_URL).mock(return_value=response)
+        result = await scheduler.reconcile_tick(
+            _dispatch_settings(), _plan(replace(_INTENT, holds=())), inside, trusted_holds=(_HOLD,)
+        )
+
+    [intent] = device.intents
+    assert intent.hold_active(inside) is True
+    assert result.trusted_holds == (_HOLD,)
+
+
+@respx.mock
+async def test_the_octopus_path_never_polls_dispatches_per_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-minute Kraken polling would be 30x the rate Dave's own cap allows."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    route = respx.get(_DISPATCH_URL).mock(return_value=_dispatch_state("off"))
+    octopus = respx.route(url__startswith="http://octo.test").mock(
+        return_value=httpx.Response(500)
+    )
+    plan = _plan(replace(_INTENT, holds=(_HOLD,)))
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(
+            tariff_provider="octopus_intelligent",
+            octopus_api_url="http://octo.test/v1",
+            octopus_api_key="sk_test",
+            octopus_account_number="A-1234ABCD",
+        ),
+        plan,
+        datetime(2026, 6, 10, 22, 15),
+        trusted_holds=(_HOLD,),
+    )
+
+    assert not route.called
+    assert not octopus.called
+    assert device.intents == [plan.charge_intent]
+    assert result.trusted_holds == (_HOLD,)
+
+
+@respx.mock
+async def test_an_unset_dispatch_entity_is_not_read_per_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    any_get = respx.route(method="GET").mock(return_value=httpx.Response(404))
+    plan = _plan()
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(dispatch_entity=""), plan, datetime(2026, 6, 10, 22, 15)
+    )
+
+    assert not any_get.called
+    assert device.intents == [plan.charge_intent]
+    assert result.trusted_holds is None
+
+
+async def test_run_forever_keeps_the_holds_a_per_minute_read_trusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reconcile_saw: list[object] = []
+
+    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+        return _plan()
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> scheduler.ReconcileResult:
+        reconcile_saw.append(trusted_holds)
+        return scheduler.ReconcileResult([], (_HOLD,))
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    stop = _patch_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 22, 0),
+            datetime(2026, 6, 10, 22, 1),  # the fresh read sees a dispatch
+            datetime(2026, 6, 10, 22, 2),
+        ],
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert reconcile_saw == [(), (_HOLD,)]
+
+
+async def test_a_dispatch_entity_down_for_hours_logs_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A renamed or removed entity must not put 1440 warnings a day into the log."""
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: _IntentRecordingDevice())
+    now = datetime(2026, 6, 10, 22, 15)
+
+    with respx.mock, caplog.at_level("INFO"):
+        respx.get(_DISPATCH_URL).mock(return_value=httpx.Response(404))
+        first = await scheduler.reconcile_tick(
+            _dispatch_settings(), _plan(), now, trusted_holds=(_HOLD,)
+        )
+        await scheduler.reconcile_tick(
+            _dispatch_settings(), _plan(), now, previous=first.lines, trusted_holds=(_HOLD,)
+        )
+
+    about_dispatch = [
+        r for r in caplog.records
+        if r.name.startswith("ha_spark") and "dispatch" in r.getMessage()
+    ]
+    assert len(about_dispatch) == 1
