@@ -41,7 +41,12 @@ from ha_spark.energy.onboarding import (
 )
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.report import format_plan
-from ha_spark.energy.scheduler import run_forever, run_once
+from ha_spark.energy.scheduler import (
+    UNTRUSTED_HOLDS_LINE,
+    hold_reconcile_intent,
+    run_forever,
+    run_once,
+)
 from ha_spark.energy.sources import _to_float
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.energy.v2l import load_session, savings
@@ -143,8 +148,15 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
             device = inverter_device(settings, rest)
             # Reconcile the power switch first, as every device-driving caller
             # does (#143): the CLI owns the inverter no less than the daemon.
-            lines = await device.reconcile_holds(
-                intent, datetime.now(load_timezone(settings.timezone))
+            # A one-shot has no trusted hold history, so an untrusted read
+            # leaves the switch as-is (#143 §3).
+            reconcile_intent = hold_reconcile_intent(intent, None)
+            lines = (
+                await device.reconcile_holds(
+                    reconcile_intent, datetime.now(load_timezone(settings.timezone))
+                )
+                if reconcile_intent is not None
+                else [UNTRUSTED_HOLDS_LINE]
             )
             lines.extend(await device.apply(intent))
             print(f"\nActions (PROACTIVE_MODE={settings.proactive_mode}):")

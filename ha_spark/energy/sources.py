@@ -259,6 +259,8 @@ async def gather_inputs(
             log.warning("Could not read Axle event: %s", exc)
 
     dispatches: tuple[DispatchSlot, ...]
+    # Whether an empty `dispatches` means "none" or "unreadable" (#143 §3).
+    dispatches_trusted = True
     if settings.tariff_provider == "octopus_intelligent":
         # Octopus Intelligent dispatches come straight from the Octopus API —
         # no HA sensor read (avoids a pointless call + the sensor-shaped
@@ -268,11 +270,19 @@ async def gather_inputs(
         except OctopusApiError as exc:
             log.warning("Could not read Octopus planned dispatches (%s)", exc)
             dispatches = ()
+            dispatches_trusted = False
     else:
         dispatch = await state(settings.dispatch_entity)
         dispatches = _parse_dispatches(
             dispatch.attributes.get("planned_dispatches") if dispatch else None
         )
+        # An unset entity is a household with no dispatch source: no holds, not
+        # unreadable ones. Every provider folds dispatches into holds, so
+        # distrusting it would refuse every export for ever.
+        if settings.dispatch_entity and (
+            dispatch is None or str(dispatch.state).lower() in ("unavailable", "unknown")
+        ):
+            dispatches_trusted = False
     ev_charging = bool(ev_status and str(ev_status.state).lower() in _EV_ACTIVE)
 
     dynamic_prices: tuple[PricePoint, ...] = ()
@@ -342,6 +352,7 @@ async def gather_inputs(
         solar_tomorrow_kwh=solar_kwh,
         predicted_home_load_kwh=forecast.total_kwh,
         dispatches=dispatches,
+        dispatches_trusted=dispatches_trusted,
         flexibility_event=flexibility_event,
         ev_charging=ev_charging,
         ha_template_needed=_opt_float(ha_needed.state) if ha_needed else None,

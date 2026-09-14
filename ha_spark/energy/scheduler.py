@@ -29,6 +29,7 @@ fallback-entry threshold (`soc_failure_threshold`, default 3).
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -172,6 +173,7 @@ async def run_once(
     soc: SocMeasurement | None = None,
     previous_plan: ChargePlan | None = None,
     previous_at: datetime | None = None,
+    trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
 ) -> ChargePlan:
     """Compute the charge plan, log it, and apply it per PROACTIVE_MODE.
 
@@ -180,6 +182,9 @@ async def run_once(
     (no independent reread); a failed measurement blocks real writes at the
     charger gate. Without one (CLI/agent callers) the plan makes its own
     observation through the same shared path.
+
+    ``trusted_holds`` is the daemon's last trusted hold set, used by the
+    reconcile when this plan's hold data is untrusted (#143 §3).
     """
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
@@ -196,8 +201,13 @@ async def run_once(
         # reads it as an export precondition. The daemon repeats this every
         # minute; here it also covers the skipped-setpoint path below, which
         # would otherwise leave the clock unserved for a whole slot.
-        lines = await device.reconcile_holds(
-            intent, datetime.now(load_timezone(settings.timezone))
+        reconcile_intent = hold_reconcile_intent(intent, trusted_holds)
+        lines = (
+            await device.reconcile_holds(
+                reconcile_intent, datetime.now(load_timezone(settings.timezone))
+            )
+            if reconcile_intent is not None
+            else [UNTRUSTED_HOLDS_LINE]
         )
         if (
             previous_plan is not None
@@ -345,12 +355,37 @@ async def guard_tick(
     return target_w
 
 
+UNTRUSTED_HOLDS_LINE = (
+    "[SKIP] hold data untrusted and no trusted hold set yet; power switch left as-is"
+)
+
+
+def hold_reconcile_intent(
+    intent: ChargeIntent, trusted_holds: tuple[tuple[datetime, datetime], ...] | None
+) -> ChargeIntent | None:
+    """The intent a reconcile pass may act on, or ``None`` when it must do nothing.
+
+    Degraded hold data is ignored, never believed (#143 §3). A trusted intent is
+    used as-is. An untrusted one, whose empty holds mean "unreadable" rather than
+    "no dispatch", is evaluated against the last trusted hold set instead, so a
+    hold still ends on its own known end time: no expiry timer, no stuck ``Off``.
+    With no trusted set yet (boot into a failed read, a hot reload, the CLI)
+    there is no picture, and no picture never writes ``On``.
+    """
+    if intent.hold_trusted:
+        return intent
+    if trusted_holds is None:
+        return None
+    return replace(intent, holds=trusted_holds)
+
+
 async def reconcile_tick(
     settings: Settings,
     plan: ChargePlan | None,
     now: datetime,
     *,
     previous: list[str] | None = None,
+    trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
 ) -> list[str]:
     """One per-minute power-switch reconcile pass. Never raises.
 
@@ -378,19 +413,24 @@ async def reconcile_tick(
     day into the add-on log — most of them ``[SKIP] ... (already set)``, or in
     the default ``simulate`` mode a write that never happens — and bury the plan
     and guard activity an operator actually reads it for.
+
+    ``trusted_holds`` is the caller's last trusted hold set, substituted when
+    this plan's hold data is untrusted (see :func:`hold_reconcile_intent`).
     """
     if plan is None or plan.charge_intent is None:
         return []
-    try:
-        async with HomeAssistantRest(
-            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
-        ) as rest:
-            lines = await inverter_device(settings, rest).reconcile_holds(
-                plan.charge_intent, now
-            )
-    except Exception:
-        log.exception("Hold reconcile tick failed; will retry next minute")
-        return []
+    intent = hold_reconcile_intent(plan.charge_intent, trusted_holds)
+    if intent is None:
+        lines = [UNTRUSTED_HOLDS_LINE]
+    else:
+        try:
+            async with HomeAssistantRest(
+                settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+            ) as rest:
+                lines = await inverter_device(settings, rest).reconcile_holds(intent, now)
+        except Exception:
+            log.exception("Hold reconcile tick failed; will retry next minute")
+            return []
     for line in lines:
         if previous is not None and line in previous:
             log.debug(line)
@@ -503,6 +543,10 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     # The previous reconcile pass's lines, so a per-minute pass logs only what
     # changed rather than the same line 1440 times a day.
     last_reconcile_lines: list[str] = []
+    # The hold set from the last plan whose dispatch read was trusted (#143 §3).
+    # A failed read's empty holds mean "unreadable", so the reconcile evaluates
+    # the clock against this instead. `None` until a trusted plan exists.
+    last_trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None
     last_settings = settings
     target_w: float | None = None
     last_signal_at: datetime | None = None
@@ -514,6 +558,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                 # Never reuse a previous plan's command across a hot reload.
                 last_plan = None
                 last_run_at = None
+                last_trusted_holds = None
                 target_w = None
                 last_settings = settings
             tz = load_timezone(settings.timezone)
@@ -537,7 +582,11 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             # enable whenever a dispatch is announced or cancelled between slots.
             if not should_run(now, last_run_slot):
                 last_reconcile_lines = await reconcile_tick(
-                    settings, last_plan, now, previous=last_reconcile_lines
+                    settings,
+                    last_plan,
+                    now,
+                    previous=last_reconcile_lines,
+                    trusted_holds=last_trusted_holds,
                 )
             if should_run(now, last_run_slot):
                 try:
@@ -546,11 +595,14 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         soc=measurement,
                         previous_plan=last_plan,
                         previous_at=last_run_at,
+                        trusted_holds=last_trusted_holds,
                     )
                     state.set_plan(plan)
                     last_run_slot = _slot_start(now)
                     last_run_at = now
                     last_plan = plan
+                    if plan.charge_intent is not None and plan.charge_intent.hold_trusted:
+                        last_trusted_holds = plan.charge_intent.holds
                     if plan.soc.ok:
                         target_w = await _planned_rate_w(settings, plan)
                     else:

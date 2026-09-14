@@ -177,6 +177,10 @@ class PlannerInputs:
     # (the horizon starts at the window, so this load is otherwise invisible).
     pre_window_drain_kwh: float = 0.0
     dispatches: tuple[DispatchSlot, ...] = ()
+    # False when the dispatch source could not be read (the Octopus call raised,
+    # or the configured entity was missing/unavailable/unknown), so an empty
+    # ``dispatches`` stops meaning both "no dispatch" and "unreadable" (#143 §3).
+    dispatches_trusted: bool = True
     flexibility_event: FlexibilityEvent | None = None
     ev_charging: bool = False
     ha_template_needed: float | None = None
@@ -203,7 +207,11 @@ class ChargeIntent:
     rate-based adapter (Solis) can re-derive the kWh to add without re-reading
     the sensor, and so every charger sees the same integrity verdict and its
     evidence. ``holds`` are daytime dispatch windows during which the battery
-    must stop discharging (hold for cheap grid).
+    must stop discharging (hold for cheap grid). ``hold_trusted`` is the
+    dispatch read's verdict on them, as ``soc`` carries the SoC read's: when
+    False the holds are degraded, never evidence that no hold is active — the
+    reconcile uses the last trusted set instead and no new export window is
+    programmed (#143 §3).
     """
 
     target_soc_pct: float
@@ -212,6 +220,7 @@ class ChargeIntent:
     window_end: time
     holds: tuple[tuple[datetime, datetime], ...] = ()
     export: ExportIntent | None = None
+    hold_trusted: bool = True
 
     @property
     def soc_now(self) -> float:
