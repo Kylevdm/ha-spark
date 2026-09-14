@@ -812,7 +812,10 @@ class SolisDevice:
                     make_notice("started", event_id, start, end),
                 )
             return
-        if export_error is None or "not yet armed" in export_error:
+        if export_error is None or any(
+            retryable in export_error
+            for retryable in ("not yet armed", "hold data untrusted")
+        ):
             return
         safe_state = (
             "no export window remains programmed"

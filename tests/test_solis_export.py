@@ -393,6 +393,17 @@ async def test_abort_notification_reports_refusal_and_safe_result(tmp_path) -> N
 
 
 @pytest.mark.asyncio
+async def test_untrusted_hold_refusal_does_not_emit_terminal_abort(tmp_path) -> None:
+    rest = FakeRest()
+    device = _device(rest, tmp_path, notify_service="mobile_app_phone")
+
+    await device.apply(replace(_intent(_export()), hold_trusted=False))
+
+    notifications = [call for call in rest.calls if call[0:2] == ("notify", "mobile_app_phone")]
+    assert notifications == []
+
+
+@pytest.mark.asyncio
 async def test_failed_cleanup_keeps_last_verified_event_record(tmp_path) -> None:
     rest = FakeRest()
     export = _export()
