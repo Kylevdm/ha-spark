@@ -186,6 +186,25 @@ one-supervised-event destination.
   this untested composition is now the whole delivery path rather than one
   route into it.
 
+### Register write endurance (from #140 step 5, 2026-09-14)
+
+- **Back off re-writes the inverter keeps rejecting.** Every Solis write is
+  read-first, so broken *reads* cost no register writes (and since #143 §5 the
+  relinquish path's one blind write is the only exception). But when reads work
+  and show a persistent mismatch — the inverter or overlay accepts the service
+  call yet never takes the value — each pass writes again: the per-minute power
+  switch reconcile (`ha_spark/devices/inverters/solis.py:472-512`) reaches
+  1,440 writes a day, and `apply`'s window and current writes
+  (`solis.py:233`, `:401`, `:428`) 48. An owner away for two weeks would see
+  ~20,000 writes to a register with finite EEPROM endurance
+  (research #109). Want: a bounded backoff (e.g. doubling 1→60 min) on
+  repeated confirmed mismatches, plus a surfaced warning so the fault is noticed.
+  It needs remembered failure state, which the reconcile deliberately does not
+  hold today (it remembers nothing, so restarts converge), so decide where that
+  state lives. Out of #140 step 5's scope, which only changed the relinquish
+  path. Trigger: a read-back mismatch observed persisting across passes in the
+  add-on log, or before unattended operation.
+
 ### Release and installation observability (2026-09-12)
 
 - **Show the running ha-spark build version in `ha-spark health`.** The doctor
