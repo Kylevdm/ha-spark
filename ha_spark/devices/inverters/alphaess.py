@@ -47,6 +47,10 @@ class AlphaESSDevice:
         """No hold surface: AlphaESS exposes no whole-inverter enable to drive."""
         return []
 
+    async def write_safe_state(self) -> list[str]:
+        """No hold surface, so nothing is left steered when ha-spark lets go."""
+        return []
+
     async def apply(self, intent: ChargeIntent) -> list[str]:
         stop_soc = round(intent.target_soc_pct)
         desc = (

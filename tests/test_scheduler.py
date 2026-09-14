@@ -1615,20 +1615,23 @@ async def test_an_untrusted_tick_reconciles_against_the_last_trusted_holds(
 async def test_a_trusted_hold_still_ends_on_its_own_end_time_while_reads_fail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No expiry timer and no stuck ``Off``: the known end time releases the hold."""
-    device = _IntentRecordingDevice()
+    """No expiry timer and no stuck ``Off``: the known end time releases the hold.
+
+    Past the last known end with reads still failing, the release is the
+    relinquish path's safe state (#143 §5), which writes ``On`` without the
+    reconcile's pre-read.
+    """
+    device = _RelinquishRecordingDevice()
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
-    after = datetime(2026, 6, 10, 23, 5)
 
     await scheduler.reconcile_tick(
         Settings(ha_url="http://ha.test", ha_token="t"),
         _untrusted_plan(),
-        after,
+        datetime(2026, 6, 10, 23, 5),
         trusted_holds=(_HOLD,),
     )
 
-    [intent] = device.intents
-    assert intent.hold_active(after) is False
+    assert device.safe_states == 1
 
 
 async def test_an_untrusted_tick_with_no_trusted_holds_yet_does_nothing(
@@ -2003,3 +2006,236 @@ async def test_a_dispatch_entity_down_for_hours_logs_once(
         if r.name.startswith("ha_spark") and "dispatch" in r.getMessage()
     ]
     assert len(about_dispatch) == 1
+
+
+# --- #143 §5: relinquishing control writes the safe state, once ---
+
+
+class _RelinquishRecordingDevice:
+    def __init__(self) -> None:
+        self.reconciled: list[ChargeIntent] = []
+        self.safe_states = 0
+
+    def planned_rate_w(self, intent: ChargeIntent) -> float:
+        return 0.0
+
+    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+        self.reconciled.append(intent)
+        return ["[WARNING] set inverter power switch to On refused: state unreadable"]
+
+    async def write_safe_state(self) -> list[str]:
+        self.safe_states += 1
+        return ["[APPLIED] set inverter power switch to On (relinquishing control)"]
+
+
+async def test_untrusted_reads_inside_a_known_hold_never_relinquish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _RelinquishRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+
+    result = await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"),
+        _untrusted_plan(),
+        datetime(2026, 6, 10, 22, 15),
+        trusted_holds=(_HOLD,),
+    )
+
+    assert device.safe_states == 0
+    assert result.trusted_holds == (_HOLD,)
+
+
+async def test_untrusted_past_every_known_hold_end_relinquishes_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    device = _RelinquishRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+    later_hold = (datetime(2026, 6, 10, 21, 0), datetime(2026, 6, 10, 21, 30))
+
+    with caplog.at_level("WARNING", logger="ha_spark.energy.scheduler"):
+        first = await scheduler.reconcile_tick(
+            settings,
+            _untrusted_plan(),
+            datetime(2026, 6, 10, 23, 0),  # exactly the last known end
+            trusted_holds=(later_hold, _HOLD),
+        )
+    second = await scheduler.reconcile_tick(
+        settings,
+        _untrusted_plan(),
+        datetime(2026, 6, 10, 23, 1),
+        previous=first.lines,
+        trusted_holds=first.trusted_holds,
+    )
+
+    assert device.safe_states == 1
+    assert first.trusted_holds == ()
+    assert any("relinquishing control" in r.getMessage() for r in caplog.records)
+    # Once relinquished there is nothing left to steer; the next pass is a plain one.
+    assert second.trusted_holds == ()
+    assert len(device.reconciled) == 1
+
+
+async def test_untrusted_with_no_known_holds_never_relinquishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _RelinquishRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+
+    for trusted in (None, ()):
+        await scheduler.reconcile_tick(
+            settings, _untrusted_plan(), datetime(2026, 6, 10, 23, 5), trusted_holds=trusted
+        )
+
+    assert device.safe_states == 0
+
+
+async def test_a_trusted_tick_past_every_hold_end_never_relinquishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _RelinquishRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+
+    result = await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"),
+        _plan(replace(_INTENT, holds=(_HOLD,))),
+        datetime(2026, 6, 10, 23, 5),
+        trusted_holds=(_HOLD,),
+    )
+
+    assert device.safe_states == 0
+    assert len(device.reconciled) == 1
+    assert result.trusted_holds == (_HOLD,)
+
+
+async def _run_forever_until_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    device: _RelinquishRecordingDevice,
+    *,
+    plan: ChargePlan | None,
+    shutdown_at: datetime = datetime(2026, 6, 10, 23, 5),
+) -> None:
+    """One slot tick, then a cancel (as SIGTERM delivers it) with ``shutdown_at`` left
+    on the clock for the ``finally``."""
+
+    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+        if plan is None:
+            raise RuntimeError("no plan")
+        return plan
+
+    async def cancelled_sample_signals(_s: Settings, _now: datetime) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "sample_signals", cancelled_sample_signals)
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    _patch_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0), shutdown_at])
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(asyncio.CancelledError):
+        await run_forever(s, poll_seconds=0)
+
+
+async def test_run_forever_writes_the_safe_state_once_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _RelinquishRecordingDevice()
+    await _run_forever_until_cancelled(
+        monkeypatch, device, plan=_plan(replace(_INTENT, holds=(_HOLD,)))
+    )
+
+    assert device.safe_states == 1
+
+
+async def test_run_forever_without_a_plan_has_nothing_to_relinquish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _RelinquishRecordingDevice()
+    await _run_forever_until_cancelled(monkeypatch, device, plan=None)
+
+    assert device.safe_states == 0
+
+
+async def test_shutdown_inside_a_known_hold_leaves_the_hold_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart mid-dispatch must not drain the battery into the car (#143 §1).
+
+    Same rule as the per-minute relinquish: only past every known hold end. The
+    next process picks the hold up within a minute.
+    """
+    device = _RelinquishRecordingDevice()
+    await _run_forever_until_cancelled(
+        monkeypatch,
+        device,
+        plan=_plan(replace(_INTENT, holds=(_HOLD,))),
+        shutdown_at=datetime(2026, 6, 10, 22, 20),
+    )
+
+    assert device.safe_states == 0
+
+
+async def test_a_relinquish_is_reported_so_the_loop_can_reapply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _RelinquishRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+
+    fired = await scheduler.reconcile_tick(
+        settings, _untrusted_plan(), datetime(2026, 6, 10, 23, 5), trusted_holds=(_HOLD,)
+    )
+    plain = await scheduler.reconcile_tick(
+        settings, _untrusted_plan(), datetime(2026, 6, 10, 22, 15), trusted_holds=(_HOLD,)
+    )
+
+    assert fired.relinquished is True
+    assert plain.relinquished is False
+
+
+async def test_run_forever_reapplies_the_plan_after_a_relinquish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The safe state overwrote Slot 1; an unchanged plan must not skip restoring it."""
+    previous_seen: list[object] = []
+    relinquish_at = datetime(2026, 6, 10, 22, 1)
+
+    async def fake_run_once(_s: Settings, **kw: object) -> ChargePlan:
+        previous_seen.append(kw.get("previous_plan"))
+        return _plan()
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> scheduler.ReconcileResult:
+        return scheduler.ReconcileResult([], trusted_holds, relinquished=now == relinquish_at)
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: _RelinquishRecordingDevice())
+    stop = _patch_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 22, 0),
+            relinquish_at,
+            datetime(2026, 6, 10, 22, 30),  # forced re-apply
+            datetime(2026, 6, 10, 23, 0),  # back to the ordinary diff
+        ],
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert previous_seen[0] is None
+    assert previous_seen[1] is None
+    assert previous_seen[2] is not None

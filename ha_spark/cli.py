@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import signal
 import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -180,10 +181,26 @@ async def _cmd_run(settings: Settings, *, once: bool) -> int:
     if once:
         await run_once(settings)
         return 0
+    # The add-on stops with SIGTERM, whose default action exits without
+    # unwinding: cancel the loop instead so its `finally` hands control back to
+    # the inverter (#143 §5). Cancel once only: uvicorn re-raises the SIGTERM it
+    # captured when its server stops, inside that very `finally`, and a second
+    # cancel would cut the safe-state write short.
+    task = asyncio.current_task()
+    assert task is not None  # always called from inside the event loop
+
+    def _cancel_once() -> None:
+        if not task.cancelling():
+            task.cancel()
+
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, _cancel_once)
     try:
         await run_forever(settings)
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
     return 0
 
 

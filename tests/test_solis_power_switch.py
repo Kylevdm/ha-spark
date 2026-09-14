@@ -134,13 +134,19 @@ class FakeRest:
 
 
 def _device(
-    rest: FakeRest, tmp_path, *, mode: str = "on", control: ControlAuthority | None = None
+    rest: FakeRest,
+    tmp_path,
+    *,
+    mode: str = "on",
+    control: ControlAuthority | None = None,
+    **settings_kw: str,
 ) -> SolisDevice:
     settings = Settings(
         proactive_mode=mode,
         db_path=str(tmp_path / "events.db"),
         inverter_power_switch_entity=_SWITCH,
         timezone="Europe/London",
+        **settings_kw,  # type: ignore[arg-type]
     )
     config = settings.devices[0]
     if control is not None:
@@ -486,3 +492,194 @@ async def test_untrusted_hold_data_still_clears_an_unverified_resident_window(tm
     await _device(rest, tmp_path).apply(replace(_intent(export=export), hold_trusted=False))
 
     assert _discharge_half(rest) == [0, 0, 0, 0]
+
+
+# --- #143 §5: the safe state written when ha-spark relinquishes control ---
+
+_SAFE_BLOCK = [23, 30, 5, 30, 0, 0, 0, 0]
+
+
+def _register_writes(rest: FakeRest) -> list[tuple[int, object]]:
+    return [
+        (int(call[2]["address"]), call[2]["value"])
+        for call in rest.calls
+        if call[0:2] == ("modbus", "write_register")
+    ]
+
+
+class _UnreadableSwitchRest(FakeRest):
+    """The select's GET fails, as it does through the outage §5 bounds."""
+
+    async def get_state(self, entity_id: str) -> EntityState:
+        if entity_id == _SWITCH:
+            raise RuntimeError("HA unreachable")
+        return await super().get_state(entity_id)
+
+
+class _FailingSwitchWriteRest(FakeRest):
+    async def call_service(
+        self, domain: str, service: str, data: dict[str, object] | None = None
+    ) -> list[EntityState]:
+        if (domain, service) == ("select", "select_option"):
+            raise RuntimeError("select write refused")
+        return await super().call_service(domain, service, data)
+
+
+@pytest.mark.asyncio
+async def test_safe_state_switches_on_and_writes_the_default_window(tmp_path) -> None:
+    rest = FakeRest(switch="Off")
+    lines = await _device(rest, tmp_path).write_safe_state()
+
+    assert _options(rest) == ["On"]
+    # Charge 23:30-05:30, discharge zeroed; never the currents (43141/43142).
+    assert _register_writes(rest) == [(43143, _SAFE_BLOCK)]
+    assert [line.split("]")[0] + "]" for line in lines] == ["[APPLIED]", "[APPLIED]"]
+
+
+@pytest.mark.asyncio
+async def test_safe_state_already_in_place_writes_nothing(tmp_path) -> None:
+    """A clean restart must not cost register writes (endurance, #109)."""
+    rest = FakeRest(switch="On")
+    fields = (
+        "timed_charge_start_hours", "timed_charge_start_minutes",
+        "timed_charge_end_hours", "timed_charge_end_minutes",
+        "timed_discharge_start_hours", "timed_discharge_start_minutes",
+        "timed_discharge_end_hours", "timed_discharge_end_minutes",
+    )
+    for field, value in zip(fields, _SAFE_BLOCK, strict=True):
+        rest.states[f"sensor.solis_control_{field}"] = str(value)
+
+    lines = await _device(rest, tmp_path).write_safe_state()
+
+    assert rest.calls == []
+    assert all(line.startswith("[SKIP]") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_safe_state_releases_the_switch_even_when_it_is_unreadable(tmp_path) -> None:
+    """The bound on the reconcile's refused blind release: relinquishing writes ``On``."""
+    rest = _UnreadableSwitchRest(switch="Off")
+    await _device(rest, tmp_path).write_safe_state()
+
+    assert _options(rest) == ["On"]
+
+
+@pytest.mark.asyncio
+async def test_safe_state_failed_switch_write_still_writes_the_window(tmp_path) -> None:
+    rest = _FailingSwitchWriteRest(switch="Off")
+    lines = await _device(rest, tmp_path).write_safe_state()
+
+    assert _register_writes(rest) == [(43143, _SAFE_BLOCK)]
+    assert lines[0].startswith("[FAILED]")
+    assert lines[1].startswith("[APPLIED]")
+
+
+@pytest.mark.asyncio
+async def test_safe_state_in_simulate_writes_nothing(tmp_path) -> None:
+    rest = FakeRest(switch="Off")
+    lines = await _device(rest, tmp_path, mode="simulate").write_safe_state()
+
+    assert rest.calls == []
+    assert len(lines) == 2
+    assert all(line.startswith("[SIMULATE] would") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_safe_state_under_observe_writes_nothing(tmp_path) -> None:
+    rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path, control=ControlAuthority.OBSERVE)
+
+    lines = await device.write_safe_state()
+
+    assert rest.calls == []
+    assert all(line.startswith("[OBSERVE]") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_a_device_without_a_hold_surface_has_no_safe_state_to_write() -> None:
+    settings = Settings(inverter="alphaess")
+    device = AlphaESSDevice(settings.devices[0], settings, object())  # type: ignore[arg-type]
+
+    assert await device.write_safe_state() == []
+
+
+_BLOCK_FIELDS = (
+    "timed_charge_start_hours", "timed_charge_start_minutes",
+    "timed_charge_end_hours", "timed_charge_end_minutes",
+    "timed_discharge_start_hours", "timed_discharge_start_minutes",
+    "timed_discharge_end_hours", "timed_discharge_end_minutes",
+)
+
+
+def _set_slot_one(rest: FakeRest, block: list[int]) -> None:
+    for field, value in zip(_BLOCK_FIELDS, block, strict=True):
+        rest.states[f"sensor.solis_control_{field}"] = str(value)
+
+
+class _UnreadableSlotRest(FakeRest):
+    async def get_state(self, entity_id: str) -> EntityState:
+        if entity_id.startswith("sensor.solis_control_timed_"):
+            raise RuntimeError("overlay unavailable")
+        return await super().get_state(entity_id)
+
+
+async def _record_export(tmp_path, *, ends_in: timedelta) -> None:
+    async with ExportEventStore(str(tmp_path / "events.db")) as store:
+        await store.save("export|test", datetime.now(UTC) + ends_in)
+
+
+@pytest.mark.asyncio
+async def test_safe_state_uses_the_configured_charge_window(tmp_path) -> None:
+    """A 00:30-04:30 tariff must not be grid-charged at peak across 23:30-05:30."""
+    rest = FakeRest(switch="On")
+    device = _device(
+        rest, tmp_path, charge_window_start="00:30", charge_window_end="04:30"
+    )
+
+    await device.write_safe_state()
+
+    assert _register_writes(rest) == [(43143, [0, 30, 4, 30, 0, 0, 0, 0])]
+
+
+@pytest.mark.asyncio
+async def test_safe_state_keeps_a_verified_export_that_is_still_live(tmp_path) -> None:
+    """Relinquishing mid-event must not kill a paid Axle export (#143 §3's rule)."""
+    rest = FakeRest(switch="On")
+    _set_slot_one(rest, [1, 0, 2, 0, 16, 0, 19, 0])
+    await _record_export(tmp_path, ends_in=timedelta(hours=1))
+
+    await _device(rest, tmp_path).write_safe_state()
+
+    assert _register_writes(rest) == [(43143, [23, 30, 5, 30, 16, 0, 19, 0])]
+
+
+@pytest.mark.asyncio
+async def test_safe_state_zeroes_an_export_window_with_no_live_record(tmp_path) -> None:
+    rest = FakeRest(switch="On")
+    _set_slot_one(rest, [23, 30, 5, 30, 16, 0, 19, 0])
+    await _record_export(tmp_path, ends_in=-timedelta(minutes=5))
+
+    await _device(rest, tmp_path).write_safe_state()
+
+    assert _register_writes(rest) == [(43143, _SAFE_BLOCK)]
+
+
+@pytest.mark.asyncio
+async def test_unreadable_slot_with_a_live_export_is_left_alone(tmp_path) -> None:
+    """A blind write cannot preserve a window it cannot see; it would zero the event."""
+    rest = _UnreadableSlotRest(switch="On")
+    await _record_export(tmp_path, ends_in=timedelta(hours=1))
+
+    lines = await _device(rest, tmp_path).write_safe_state()
+
+    assert _register_writes(rest) == []
+    assert lines[1].startswith("[BLOCKED]")
+
+
+@pytest.mark.asyncio
+async def test_unreadable_slot_with_no_live_export_is_written_once_blind(tmp_path) -> None:
+    rest = _UnreadableSlotRest(switch="On")
+
+    await _device(rest, tmp_path).write_safe_state()
+
+    assert _register_writes(rest) == [(43143, _SAFE_BLOCK)]
