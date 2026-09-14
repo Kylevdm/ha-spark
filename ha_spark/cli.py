@@ -140,7 +140,13 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
         if apply:
             intent = plan.charge_intent
             assert intent is not None  # planner always sets it
-            lines = await inverter_device(settings, rest).apply(intent)
+            device = inverter_device(settings, rest)
+            # Reconcile the power switch first, as every device-driving caller
+            # does (#143): the CLI owns the inverter no less than the daemon.
+            lines = await device.reconcile_holds(
+                intent, datetime.now(load_timezone(settings.timezone))
+            )
+            lines.extend(await device.apply(intent))
             print(f"\nActions (PROACTIVE_MODE={settings.proactive_mode}):")
             for line in lines:
                 print(f"  {line}")

@@ -180,6 +180,16 @@ async def run_once(
         log.info("Charge plan:\n%s", format_plan(plan, load_source))
         intent = plan.charge_intent
         assert intent is not None  # planner always sets it
+        device = inverter_device(settings, rest)
+        # One reconcile pass before anything else, on every device-driving
+        # caller (#143): an owner that abdicates when invoked from the CLI is
+        # not one (ADR-0003), and the switch must have settled before `apply`
+        # reads it as an export precondition. The daemon repeats this every
+        # minute; here it also covers the skipped-setpoint path below, which
+        # would otherwise leave the clock unserved for a whole slot.
+        lines = await device.reconcile_holds(
+            intent, datetime.now(load_timezone(settings.timezone))
+        )
         if (
             previous_plan is not None
             and previous_plan.soc.ok
@@ -190,9 +200,9 @@ async def run_once(
                 now=datetime.now(load_timezone(settings.timezone)),
             )
         ):
-            lines = ["[SKIP] charge setpoint unchanged"]
+            lines.append("[SKIP] charge setpoint unchanged")
         else:
-            lines = await inverter_device(settings, rest).apply(intent)
+            lines.extend(await device.apply(intent))
         for line in lines:
             log.info(line)
         await publish_plan(rest, plan, settings)
