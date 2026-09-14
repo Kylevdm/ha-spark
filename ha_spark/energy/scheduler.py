@@ -89,13 +89,31 @@ def should_run(now: datetime, last_run_slot: datetime | None) -> bool:
     return _slot_start(now) != last_run_slot
 
 
-def setpoint_changed(previous: ChargeIntent, current: ChargeIntent) -> bool:
+def setpoint_changed(
+    previous: ChargeIntent,
+    current: ChargeIntent,
+    *,
+    since: datetime | None = None,
+    now: datetime | None = None,
+) -> bool:
     """Return whether a plan changes the command sent to an inverter.
 
     SoC is deliberately excluded. The daemon measures SoC every minute, so a
     fresh observation alone must not turn an unchanged plan into another device
     write.
+
+    ``since``/``now`` are when ``previous`` was applied and the current tick.
+    The power-switch reconcile (#140) is a function of the clock as well as the
+    plan, so crossing a hold boundary is a changed command even between
+    identical intents — without this the reconcile would never run, because a
+    hold ending is not a plan change. Omitting them compares the plans alone.
     """
+    if (
+        since is not None
+        and now is not None
+        and previous.hold_active(since) != current.hold_active(now)
+    ):
+        return True
     return (
         previous.target_soc_pct != current.target_soc_pct
         or previous.window_start != current.window_start
@@ -132,6 +150,7 @@ async def run_once(
     *,
     soc: SocMeasurement | None = None,
     previous_plan: ChargePlan | None = None,
+    previous_at: datetime | None = None,
 ) -> ChargePlan:
     """Compute the charge plan, log it, and apply it per PROACTIVE_MODE.
 
@@ -152,7 +171,12 @@ async def run_once(
         if (
             previous_plan is not None
             and previous_plan.soc.ok
-            and not setpoint_changed(previous_plan.charge_intent, intent)
+            and not setpoint_changed(
+                previous_plan.charge_intent,
+                intent,
+                since=previous_at,
+                now=datetime.now(load_timezone(settings.timezone)),
+            )
         ):
             lines = ["[SKIP] charge setpoint unchanged"]
         else:
@@ -385,6 +409,11 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     except Exception:
         log.exception("Republishing last known states failed")
     last_run_slot: datetime | None = None
+    # When the previous run actually happened, not the slot it belonged to: the
+    # power-switch reconcile is a function of the clock, and dispatch bounds are
+    # whatever HA reports, so rounding this to the slot start can hide a hold
+    # boundary crossed by a mid-slot run and leave the inverter held off (#140).
+    last_run_at: datetime | None = None
     last_plan: ChargePlan | None = None
     last_settings = settings
     target_w: float | None = None
@@ -396,6 +425,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             if settings is not last_settings:
                 # Never reuse a previous plan's command across a hot reload.
                 last_plan = None
+                last_run_at = None
                 target_w = None
                 last_settings = settings
             tz = load_timezone(settings.timezone)
@@ -413,10 +443,14 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             if should_run(now, last_run_slot):
                 try:
                     plan = await run_once(
-                        settings, soc=measurement, previous_plan=last_plan
+                        settings,
+                        soc=measurement,
+                        previous_plan=last_plan,
+                        previous_at=last_run_at,
                     )
                     state.set_plan(plan)
                     last_run_slot = _slot_start(now)
+                    last_run_at = now
                     last_plan = plan
                     if plan.soc.ok:
                         target_w = await _planned_rate_w(settings, plan)

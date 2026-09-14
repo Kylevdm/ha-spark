@@ -164,7 +164,14 @@ async def test_export_programs_fixed_current_and_atomic_window(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_export_refuses_power_switch_off_without_turning_it_on(tmp_path) -> None:
+async def test_export_refuses_a_power_switch_that_is_off(tmp_path) -> None:
+    """Export is a read-only refusal: it never asks for the switch to be turned on.
+
+    Since #140 the hold reconcile owns both edges, so a switch left ``Off`` with
+    no hold active is driven back to ``On`` on this same tick — by the clock, not
+    by export, which stays refused. ``tests/test_solis_power_switch.py`` pins the
+    separation: with a hold active the switch goes ``Off`` and export is refused.
+    """
     rest = FakeRest(power="Off")
     lines = await _device(rest, tmp_path).apply(_intent(_export()))
 
@@ -176,7 +183,9 @@ async def test_export_refuses_power_switch_off_without_turning_it_on(tmp_path) -
         and call[2]["value"][4:] != [0, 0, 0, 0]
     ]
     assert export_blocks == []
-    assert not any(call[0:2] == ("select", "select_option") for call in rest.calls)
+    assert [
+        call[2]["option"] for call in rest.calls if call[0:2] == ("select", "select_option")
+    ] == ["On"]
 
 
 @pytest.mark.asyncio

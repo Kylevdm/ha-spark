@@ -28,6 +28,21 @@
   `battery_discharge_ceiling_kw` and `dno_export_limit_kw` options.
   **Prototype status:** export has not yet been actuated on hardware; the
   supervised paid-event proof is #134.
+- Full power-switch ownership (#140): ha-spark now drives both edges of the
+  Solis whole-inverter enable through a declarative reconcile — `Off` while a
+  dispatch hold is active, `On` otherwise — instead of only ever writing `Off`.
+  Desired state is a pure function of the clock and the plan's holds, so nothing
+  is remembered and a restart mid-hold converges on the next tick. This fixes
+  two defects: once the incumbent Home Assistant automations are disabled at
+  cutover nothing else ever sent `On`, and the old loop wrote `Off` immediately
+  for a hold hours in the future. A hold boundary now counts as a changed
+  command, so the reconcile is not skipped as an unchanged setpoint, and it is
+  exempt from the SoC-unreadable guard because it commands no SoC-derived
+  magnitude — charge programming stays blocked. It settles before anything else
+  reads the switch, so a hold ending does not refuse an export event against a
+  state the same tick is correcting. A hold that *overlaps* an export window
+  refuses the whole event with an explicit reason; a hold elsewhere in the day
+  leaves it alone.
 - Half-hourly replanning (#46): the daemon recomputes the current plan on each
   local half-hour slot, including after startup during the day. It skips the
   inverter call when the commanded target, window, and holds are unchanged, so
