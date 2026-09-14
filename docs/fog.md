@@ -161,19 +161,23 @@ against its acceptance criteria before closing it. Neither blocked that ticket:
 both concern unattended operation, which is explicitly beyond map #128's
 one-supervised-event destination.
 
-- **The persisted export-event record is write-only.** `_persist_export_state`
+- **The persisted export event's identity is write-only.** `_persist_export_state`
   saves the accepted event identity and verified end
-  (`ha_spark/devices/inverters/solis.py:498-513`), and `exists` gates the
-  save/clear, but `ExportEventStore.load()` has no production caller — only
-  tests read it (`ha_spark/energy/export_store.py:32`). Restart-safe cleanup
-  works without it: the first authorized `apply` with no fresh event zeros slot
-  1's discharge half and read-back verifies, and that clear is deliberately not
-  gated on grid-charge permission (`solis.py:242-247`). So the record buys
-  nothing today. Decide whether a persisted identity earns its place — comparing
-  a resident window against the *last accepted event* rather than against "no
-  fresh event" is what would let ha-spark distinguish its own leftover schedule
-  from a human's manual one — or delete it. Trigger: unattended event delivery,
-  where a wrong resident window is not caught by a supervising human.
+  (`ha_spark/devices/inverters/solis.py:681`). *Updated 2026-09-14 (#140):* the
+  record now has production readers, but only of its **verified end**. The
+  untrusted-holds export guard keeps a resident window whose recorded end is
+  still ahead (`solis.py:665-667`, #143 §3), and the relinquish safe state keeps
+  the discharge half on the same rule, refusing a blind Slot 1 write while such
+  an event is live (`solis.py:571-573`, #143 §5). The identity (`event_id`) is
+  still read by nothing. Restart-safe cleanup still works without it: the first
+  authorized `apply` with no fresh event zeros slot 1's discharge half and
+  read-back verifies, not gated on grid-charge permission (`solis.py:273`).
+  Remaining decision: whether the identity earns its place — comparing a
+  resident window against the *last accepted event* rather than "a verified end
+  is still ahead" is what would let ha-spark tell its own leftover schedule from
+  a human's manual one — or reduce the record to the end time. Trigger:
+  unattended event delivery, where a wrong resident window is not caught by a
+  supervising human.
 - **No scheduler test exercises a day-of Axle event.** #51's own test list asks
   for "next-replan pickup of a day-of event"; the behaviour falls out of
   `should_run`'s half-hourly slot logic (`ha_spark/energy/scheduler.py:87`) plus
