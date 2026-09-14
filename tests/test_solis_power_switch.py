@@ -23,7 +23,6 @@ from ha_spark.devices.inverters.alphaess import AlphaESSDevice
 from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.energy.export_store import ExportEventStore
 from ha_spark.energy.models import ChargeIntent, ExportIntent
-from ha_spark.energy.scheduler import setpoint_changed
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.ha.models import EntityState
 
@@ -301,14 +300,6 @@ async def test_untrusted_soc_still_reconciles_but_blocks_charge_programming(tmp_
     assert _options(rest) == ["On"]
     assert not any(call[0] == "modbus" for call in rest.calls)
     assert any(line.startswith("[BLOCKED]") for line in lines)
-
-
-def test_setpoint_changed_across_a_hold_boundary_with_identical_intents() -> None:
-    start, end = _window(-30)
-    intent = _intent(holds=((start, end),))
-
-    assert setpoint_changed(intent, intent, since=start, now=end) is True
-    assert setpoint_changed(intent, intent, since=start, now=end - timedelta(minutes=1)) is False
 
 
 @pytest.mark.parametrize(

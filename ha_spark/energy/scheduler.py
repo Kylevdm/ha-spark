@@ -102,9 +102,6 @@ def should_run(now: datetime, last_run_slot: datetime | None) -> bool:
 def setpoint_changed(
     previous: ChargeIntent,
     current: ChargeIntent,
-    *,
-    since: datetime | None = None,
-    now: datetime | None = None,
 ) -> bool:
     """Return whether a plan changes the command sent to an inverter.
 
@@ -112,32 +109,11 @@ def setpoint_changed(
     fresh observation alone must not turn an unchanged plan into another device
     write.
 
-    ``since``/``now`` are when ``previous`` was applied and the current tick;
-    crossing a hold boundary counts as a changed command even between identical
-    intents. This no longer carries the reconcile — that is its own per-minute
-    seam as of #143, and ``run_once`` runs it before consulting this function at
-    all — so the clause now only re-runs the charge program across a boundary.
-    It comes out with the ``previous_at`` plumbing that feeds it (#143 §6);
-    until then it costs reads, not writes, because every device write is
-    write-if-changed. Omitting them compares the plans alone.
-
-    A pending export event is always a changed command, for the same reason one
-    step further on (#144). The Solis driver arms an export window only once the
-    next time its window opens is the event's own, which is a function of the clock,
-    not of the plan — and an Axle event announced a day ahead produces an equal
-    ``ExportIntent`` tick after tick. Comparing plans alone would skip every
-    apply between announcement and event, so the window would never be
-    programmed and the paid event would be missed outright. Re-applying is
-    cheap: every device write is write-if-changed and read-back verified, so an
-    unchanged program costs reads, not writes.
+    A pending export event is always a changed command because its device
+    programming depends on the clock as well as the plan. Otherwise, a change
+    in the charge target, window, holds, or export intent is a changed command.
     """
     if getattr(current, "export", None) is not None:
-        return True
-    if (
-        since is not None
-        and now is not None
-        and previous.hold_active(since) != current.hold_active(now)
-    ):
         return True
     return (
         previous.target_soc_pct != current.target_soc_pct
@@ -175,7 +151,6 @@ async def run_once(
     *,
     soc: SocMeasurement | None = None,
     previous_plan: ChargePlan | None = None,
-    previous_at: datetime | None = None,
     trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
 ) -> ChargePlan:
     """Compute the charge plan, log it, and apply it per PROACTIVE_MODE.
@@ -218,8 +193,6 @@ async def run_once(
             and not setpoint_changed(
                 previous_plan.charge_intent,
                 intent,
-                since=previous_at,
-                now=datetime.now(load_timezone(settings.timezone)),
             )
         ):
             lines.append("[SKIP] charge setpoint unchanged")
@@ -594,11 +567,6 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     except Exception:
         log.exception("Republishing last known states failed")
     last_run_slot: datetime | None = None
-    # When the previous run actually happened, not the slot it belonged to: the
-    # power-switch reconcile is a function of the clock, and dispatch bounds are
-    # whatever HA reports, so rounding this to the slot start can hide a hold
-    # boundary crossed by a mid-slot run and leave the inverter held off (#140).
-    last_run_at: datetime | None = None
     last_plan: ChargePlan | None = None
     # The previous reconcile pass's lines, so a per-minute pass logs only what
     # changed rather than the same line 1440 times a day.
@@ -621,7 +589,6 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             if settings is not last_settings:
                 # Never reuse a previous plan's command across a hot reload.
                 last_plan = None
-                last_run_at = None
                 last_trusted_holds = None
                 target_w = None
                 last_settings = settings
@@ -660,12 +627,10 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         settings,
                         soc=measurement,
                         previous_plan=None if reapply else last_plan,
-                        previous_at=last_run_at,
                         trusted_holds=last_trusted_holds,
                     )
                     state.set_plan(plan)
                     last_run_slot = _slot_start(now)
-                    last_run_at = now
                     last_plan = plan
                     reapply = False
                     if plan.charge_intent is not None and plan.charge_intent.hold_trusted:
