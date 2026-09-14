@@ -11,6 +11,12 @@ whole-house draw exceeds `supply_max_current_a`, restoring toward the plan's
 current as headroom returns. Outside the window the timed-charge setpoint is
 inert (and there is nothing else ha-spark can shed), so the guard stays quiet.
 
+Every tick also reconciles the inverter's hold state (`reconcile_tick`, #143):
+a read-first pass that converges the whole-inverter enable on what the clock and
+the last plan's dispatch holds imply. It is deliberately independent of
+`setpoint_changed` — a hold boundary is a clock event, not a plan change, and
+dispatch bounds need not land on a half-hour.
+
 Every tick also makes exactly one checked SoC observation (`soc_monitor_tick`,
 #114): the daemon loop is the sole SoC observation cadence, and that one
 measurement is reused by planning, device application, and guard work. The
@@ -102,11 +108,14 @@ def setpoint_changed(
     fresh observation alone must not turn an unchanged plan into another device
     write.
 
-    ``since``/``now`` are when ``previous`` was applied and the current tick.
-    The power-switch reconcile (#140) is a function of the clock as well as the
-    plan, so crossing a hold boundary is a changed command even between
-    identical intents — without this the reconcile would never run, because a
-    hold ending is not a plan change. Omitting them compares the plans alone.
+    ``since``/``now`` are when ``previous`` was applied and the current tick;
+    crossing a hold boundary counts as a changed command even between identical
+    intents. This no longer carries the reconcile — that is its own per-minute
+    seam as of #143, and ``run_once`` runs it before consulting this function at
+    all — so the clause now only re-runs the charge program across a boundary.
+    It comes out with the ``previous_at`` plumbing that feeds it (#143 §6);
+    until then it costs reads, not writes, because every device write is
+    write-if-changed. Omitting them compares the plans alone.
 
     A pending export event is always a changed command, for the same reason one
     step further on (#144). The Solis driver arms an export window only once its
@@ -336,6 +345,60 @@ async def guard_tick(
     return target_w
 
 
+async def reconcile_tick(
+    settings: Settings,
+    plan: ChargePlan | None,
+    now: datetime,
+    *,
+    previous: list[str] | None = None,
+) -> list[str]:
+    """One per-minute power-switch reconcile pass. Never raises.
+
+    The clock seam (#143). ``apply`` is a plan diff on the half-hourly replan
+    cadence, but whether a dispatch hold is active *right now* is a function of
+    the clock, and Octopus dispatch bounds are whatever HA reports — need not be
+    half-hour aligned, and can open and close inside one slot. Driving the
+    reconcile from here converges a sub-slot hold, a failed write, and an
+    external change (the select flipped in the HA UI, a leftover automation)
+    within a minute rather than at the next plan change.
+
+    It is cheap by construction: ``reconcile_holds`` is read-first, so steady
+    state is one *cached* ``GET`` of the select per minute and zero register
+    writes. The cadence is not a new precedent — ``soc_monitor_tick`` and the
+    writing ``guard_tick`` already run here.
+
+    With no plan yet (boot, or ``last_plan`` cleared by a hot reload) this does
+    nothing at all: no picture is not evidence that no hold is active, and
+    writing ``On`` merely because a plan has not loaded would release a live
+    dispatch on every restart.
+
+    Returns the pass's action lines so the caller can pass them back as
+    ``previous``: only lines that changed since the last pass are logged. A
+    per-minute pass that logged unconditionally would put 1440 identical lines a
+    day into the add-on log — most of them ``[SKIP] ... (already set)``, or in
+    the default ``simulate`` mode a write that never happens — and bury the plan
+    and guard activity an operator actually reads it for.
+    """
+    if plan is None or plan.charge_intent is None:
+        return []
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            lines = await inverter_device(settings, rest).reconcile_holds(
+                plan.charge_intent, now
+            )
+    except Exception:
+        log.exception("Hold reconcile tick failed; will retry next minute")
+        return []
+    for line in lines:
+        if previous is not None and line in previous:
+            log.debug(line)
+        else:
+            log.info(line)
+    return lines
+
+
 async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasurement | None:
     """One per-minute SoC observation: check, count once, publish. Never raises.
 
@@ -437,6 +500,9 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     # boundary crossed by a mid-slot run and leave the inverter held off (#140).
     last_run_at: datetime | None = None
     last_plan: ChargePlan | None = None
+    # The previous reconcile pass's lines, so a per-minute pass logs only what
+    # changed rather than the same line 1440 times a day.
+    last_reconcile_lines: list[str] = []
     last_settings = settings
     target_w: float | None = None
     last_signal_at: datetime | None = None
@@ -462,6 +528,17 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             # Sole SoC observation cadence (#114): one checked measurement per
             # minute in every operating state, reused by everything below.
             measurement = await soc_monitor_tick(settings, monitor)
+            # The clock cadence (#143), independent of `setpoint_changed`: the
+            # power switch converges within a minute, not at the next plan
+            # change. Only on ticks that do not replan — `run_once` makes its own
+            # pass with the freshly computed plan, and reconciling here first
+            # would drive the switch to the *stale* plan's state and then
+            # immediately back, two writes and a momentarily wrong whole-inverter
+            # enable whenever a dispatch is announced or cancelled between slots.
+            if not should_run(now, last_run_slot):
+                last_reconcile_lines = await reconcile_tick(
+                    settings, last_plan, now, previous=last_reconcile_lines
+                )
             if should_run(now, last_run_slot):
                 try:
                     plan = await run_once(

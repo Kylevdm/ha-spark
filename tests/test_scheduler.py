@@ -1385,3 +1385,174 @@ def test_a_pending_export_event_always_re_applies(tmp_path) -> None:
     # Without an event the plan-value comparison still governs.
     plain = ChargeIntent(77.0, soc, time(23, 30), time(5, 30))
     assert setpoint_changed(plain, plain) is False
+
+
+class _RecordingDevice:
+    """A device that records every reconcile pass the loop drives."""
+
+    def __init__(self, seen: list[datetime], *, boom: bool = False) -> None:
+        self._seen = seen
+        self._boom = boom
+
+    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+        self._seen.append(now)
+        if self._boom:
+            raise RuntimeError("HA unreachable")
+        return ["[SKIP] set inverter power switch to On (already set)"]
+
+
+async def test_reconcile_tick_does_nothing_before_a_plan_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No picture yet is not evidence that no hold is active.
+
+    Writing ``On`` merely because a plan has not loaded would release a live
+    dispatch across every restart and every hot reload (the precedent is
+    ``guard_tick``, which adopts rather than guesses).
+    """
+    seen: list[datetime] = []
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: _RecordingDevice(seen))
+
+    await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"), None, datetime(2026, 6, 10, 22, 0)
+    )
+
+    assert seen == []
+
+
+async def test_reconcile_tick_drives_the_device_with_the_ticks_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[datetime] = []
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: _RecordingDevice(seen))
+    now = datetime(2026, 6, 10, 22, 1)
+
+    await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"), _plan(), now
+    )
+
+    assert seen == [now]
+
+
+async def test_reconcile_tick_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed pass is logged and retried next minute; it cannot abort the loop."""
+    seen: list[datetime] = []
+    monkeypatch.setattr(
+        scheduler, "inverter_device", lambda *_a: _RecordingDevice(seen, boom=True)
+    )
+
+    await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"), _plan(), datetime(2026, 6, 10, 22, 0)
+    )
+
+    assert seen == [datetime(2026, 6, 10, 22, 0)]
+
+
+async def test_run_forever_reconciles_every_minute_not_every_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reconcile answers the clock, so it cannot ride the half-hourly replan.
+
+    A hold that opens and closes between two slot runs (17:35-17:55) would
+    otherwise never be applied at all, and a failed write would wait out the
+    rest of the dispatch (#143 hole 2).
+    """
+    reconciled: list[datetime] = []
+    plans: list[ChargePlan | None] = []
+
+    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+        return _plan()
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+    ) -> list[str]:
+        plans.append(plan)
+        reconciled.append(now)
+        return ["[SKIP] set inverter power switch to On (already set)"]
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    # One slot boundary, then three ticks inside the same slot: only the first
+    # runs the planner, but every one of them reconciles.
+    ticks = [
+        datetime(2026, 6, 10, 22, 0),
+        datetime(2026, 6, 10, 22, 1),
+        datetime(2026, 6, 10, 22, 2),
+        datetime(2026, 6, 10, 22, 3),
+    ]
+    stop = _patch_loop(monkeypatch, ticks)
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    # Every tick inside the slot reconciles; the slot boundary itself does not,
+    # because `run_once` reconciles there with the plan it just computed.
+    assert reconciled == ticks[1:]
+    assert all(plan is not None for plan in plans)
+
+
+async def test_run_forever_does_not_reconcile_twice_on_a_slot_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slot tick must reconcile once, against the plan it just computed.
+
+    Reconciling here as well would use the *stale* plan first: when a dispatch
+    is announced or cancelled between slots, the switch is driven to the old
+    plan's state and then immediately back — two writes and a momentarily wrong
+    whole-inverter enable inside one tick.
+    """
+    reconciled: list[datetime] = []
+
+    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+        return _plan()
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+    ) -> list[str]:
+        reconciled.append(now)
+        return []
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    stop = _patch_loop(
+        monkeypatch, [datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 22, 30)]
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert reconciled == []
+
+
+async def test_reconcile_tick_logs_only_what_changed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """1440 identical lines a day would bury the plan and guard activity."""
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: _RecordingDevice([]))
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+    now = datetime(2026, 6, 10, 22, 0)
+
+    with caplog.at_level("INFO", logger="ha_spark.energy.scheduler"):
+        first = await scheduler.reconcile_tick(settings, _plan(), now)
+        repeat = await scheduler.reconcile_tick(settings, _plan(), now, previous=first)
+
+    assert first == repeat
+    assert len(caplog.records) == 1
