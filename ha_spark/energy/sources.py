@@ -281,11 +281,13 @@ async def gather_inputs(
     voltage_v = _to_float(voltage.state if voltage else None, settings.battery_voltage_v)
 
     flexibility_event = None
+    flexibility_event_trusted = True
     if settings.tariff_provider == "axle":
         try:
             flexibility_event = await read_axle_event(settings, rest)
         except AxleApiError as exc:
             log.warning("Could not read Axle event: %s", exc)
+            flexibility_event_trusted = False
 
     dispatches: tuple[DispatchSlot, ...]
     # Whether an empty `dispatches` means "none" or "unreadable" (#143 §3).
@@ -375,6 +377,7 @@ async def gather_inputs(
         dispatches=dispatches,
         dispatches_trusted=dispatches_trusted,
         flexibility_event=flexibility_event,
+        flexibility_event_trusted=flexibility_event_trusted,
         ev_charging=ev_charging,
         ha_template_needed=_opt_float(ha_needed.state) if ha_needed else None,
         load_slots=load_slots,

@@ -141,6 +141,15 @@ class SolisDevice:
             return lines
         raw_export = getattr(intent, "export", None)
         export_store = ExportEventStore(self._settings.db_path)
+        if (
+            mode == "on"
+            and raw_export is None
+            and not getattr(intent, "export_trusted", True)
+            and await self._has_live_verified_export(now)
+        ):
+            line = "[SKIP] Axle event read untrusted; preserving the verified export window"
+            log.warning(line)
+            return [line]
         export = _export_window(intent, tz)
         export_ready = export is not None
         # Slot 1's verified discharge half, kept when an untrusted hold read
@@ -699,6 +708,18 @@ class SolisDevice:
                     await store.clear()
         except Exception as exc:  # noqa: BLE001 - persistence cannot undo HA writes
             log.error("Export event state persistence failed: %r", exc)
+
+    async def _has_live_verified_export(self, now: datetime) -> bool:
+        """Return whether the last verified Axle export is still in progress.
+
+        A failed Axle read is not a cancellation. Keep the whole apply pass
+        away from Slot 1 while the durable record says a verified event has not
+        ended; otherwise the ordinary no-export path would clear a paid event
+        during a transient provider failure (#148).
+        """
+        async with ExportEventStore(self._settings.db_path) as store:
+            record = await store.load()
+        return record is not None and record[1] > now.astimezone(UTC)
 
     # --- modbus helpers ---
 

@@ -475,6 +475,7 @@ def compute_plan(
         holds=holds,
         export=export,
         hold_trusted=inputs.dispatches_trusted,
+        export_trusted=inputs.flexibility_event_trusted,
     )
 
     return ChargePlan(

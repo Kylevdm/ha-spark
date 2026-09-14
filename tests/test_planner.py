@@ -98,6 +98,19 @@ def test_plan_carries_the_exact_checked_measurement() -> None:
     assert plan.charge_intent.soc_now == 37.5
 
 
+def test_plan_carries_an_untrusted_axle_event_read() -> None:
+    inputs = PlannerInputs(
+        soc=_soc(37.5),
+        solar_tomorrow_kwh=3,
+        predicted_home_load_kwh=10,
+        flexibility_event_trusted=False,
+    )
+
+    plan = _plan(inputs, cfg())
+
+    assert plan.charge_intent.export_trusted is False
+
+
 def test_failed_measurement_gives_the_planner_no_soc_value() -> None:
     """A failed measurement's SoC is 0 everywhere, and stays flagged."""
     inp = PlannerInputs(
