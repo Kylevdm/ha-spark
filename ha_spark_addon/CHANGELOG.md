@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+## 0.17.0
+
+- Per-minute hold reconcile (#140): hold reconciliation now runs through its
+  own `reconcile_holds`/`reconcile_tick` seam, independently of the half-hourly
+  replan. Holds that start and end between replans, failed switch writes, and
+  external switch changes now converge within a minute.
+- Hold trust (#140): the asymmetric pre-read may close a hold when state is
+  unreadable, but never opens one. Degraded dispatch reads are ignored rather
+  than believed, new export windows are refused while holds are untrusted, and
+  the dispatch entity is re-read each minute on the Home Assistant entity path
+  only.
+- Relinquish safe state (#140): when ha-spark relinquishes control, including
+  on clean shutdown, Solis is returned to `On`, the configured cheap charge
+  window (default `23:30`-`05:30`), and an empty discharge window
+  (`00:00`-`00:00`).
+- Plan diff purity (#140): `setpoint_changed` is again a pure plan diff; hold
+  edges belong to the per-minute reconcile seam.
+- Power-switch write behaviour (#140): `select.solisac_power_switch` is a
+  `solax_modbus` select whose Home Assistant state is set optimistically on
+  write. The per-minute pre-read therefore sees a successful write at once,
+  keeping steady-state register writes at zero. A rejected write is retried
+  once per minute by design. Native register 43007 is #146.
+
 - Slot energy reservations (#47): slot plans carry a buffered, capped
   reach-next-cheap-slot reservation, and the required charge and its report
   explanation trace to it. The reservation is a floor on the overnight buy, not
