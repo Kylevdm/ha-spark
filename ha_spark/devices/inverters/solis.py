@@ -83,10 +83,6 @@ _READ_BACK_DELAY_SECONDS = 0.1
 _GRID_CHARGE_BIT = 1 << 5
 _EXPORT_CURRENT_A = 62.5
 _EXPORT_CURRENT_RAW = 625
-# Slack allowed when matching an export window's clock face to its event. The
-# planner emits slot-aligned datetimes, so this only absorbs sub-minute noise
-# from a third-party adapter; it stays far below a 30 minute slot.
-_ARMING_TOLERANCE_SECONDS = 60.0
 T = TypeVar("T")
 
 
@@ -727,11 +723,20 @@ def _next_wall_clock_occurrence(wall: datetime, now: datetime) -> datetime:
     Recombines a date with the time of day rather than adding a ``timedelta``,
     so a DST boundary in between moves the UTC offset and leaves the clock face
     alone — which is what the Slot 1 registers actually hold.
+
+    Comparisons are made on the absolute instant (``astimezone(UTC)``), never
+    between two same-zone aware datetimes: Python compares those by clock face
+    and ignores ``fold``, which would make the two distinct 01:30s of a
+    fall-back night look identical. ``fold`` is then forced to 0 on the
+    candidate — ``datetime.time()`` carries it through, so it has to be cleared
+    deliberately — making this the *first* 01:30 of such a night, which is
+    exactly the one the register fires on.
     """
-    today = datetime.combine(now.date(), wall.time(), tzinfo=now.tzinfo)
-    if today >= now:
+    face = wall.time().replace(fold=0)
+    today = datetime.combine(now.date(), face, tzinfo=now.tzinfo)
+    if today.astimezone(UTC) >= now.astimezone(UTC):
         return today
-    return datetime.combine(now.date() + timedelta(days=1), wall.time(), tzinfo=now.tzinfo)
+    return datetime.combine(now.date() + timedelta(days=1), face, tzinfo=now.tzinfo)
 
 
 def _export_not_yet_armed(export: tuple[datetime, datetime], now: datetime) -> str | None:
@@ -747,12 +752,17 @@ def _export_not_yet_armed(export: tuple[datetime, datetime], now: datetime) -> s
     tick and arms itself once its clock face next comes round at the event, so
     no scheduling state is needed. A window already under way stays armed, so a
     day-of pickup still delivers the remainder instead of waiting a day.
+
+    An event inside a fall-back night's repeated hour is refused outright rather
+    than armed: its clock face comes round twice, the register fires on the
+    first, and the event may mean the second. Refusing loses one event an hour
+    before the clocks go back; arming could export an hour early, unpaid.
     """
     start, _ = export
-    if now >= start:
+    if now.astimezone(UTC) >= start.astimezone(UTC):
         return None
     occurrence = _next_wall_clock_occurrence(start, now)
-    if abs((occurrence - start).total_seconds()) <= _ARMING_TOLERANCE_SECONDS:
+    if occurrence.astimezone(UTC) == start.astimezone(UTC):
         return None
     return (
         f"the {start:%H:%M} window would next fire {occurrence:%a %d %b %H:%M}, "
