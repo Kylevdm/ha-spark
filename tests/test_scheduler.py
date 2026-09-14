@@ -108,6 +108,10 @@ def test_setpoint_change_detects_target_window_and_hold_changes() -> None:
     ) is True
 
 
+def test_setpoint_change_retries_an_untrusted_axle_event_read() -> None:
+    assert setpoint_changed(_INTENT, replace(_INTENT, export_trusted=False)) is True
+
+
 @respx.mock
 async def test_run_once_computes_and_applies_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture

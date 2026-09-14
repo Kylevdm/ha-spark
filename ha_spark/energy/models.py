@@ -182,6 +182,10 @@ class PlannerInputs:
     # ``dispatches`` stops meaning both "no dispatch" and "unreadable" (#143 §3).
     dispatches_trusted: bool = True
     flexibility_event: FlexibilityEvent | None = None
+    # False when the Axle event source could not be read. An empty event then
+    # means "unreadable", not "cancelled", so a verified resident export must
+    # not be cleared (#148).
+    flexibility_event_trusted: bool = True
     ev_charging: bool = False
     ha_template_needed: float | None = None
     # v2 per-slot horizon (48 half-hour slots starting at the charge-window start
@@ -221,6 +225,9 @@ class ChargeIntent:
     holds: tuple[tuple[datetime, datetime], ...] = ()
     export: ExportIntent | None = None
     hold_trusted: bool = True
+    # False means an empty export is an unreadable Axle event, not a
+    # cancellation (#148).
+    export_trusted: bool = True
 
     @property
     def soc_now(self) -> float:

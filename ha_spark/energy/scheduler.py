@@ -112,7 +112,12 @@ def setpoint_changed(
     A pending export event is always a changed command because its device
     programming depends on the clock as well as the plan. Otherwise, a change
     in the charge target, window, holds, or export intent is a changed command.
+    An unreadable Axle event is also always a changed command so the device gets
+    a chance to preserve a verified resident export until the read recovers or
+    the verified window ends (#148).
     """
+    if not getattr(current, "export_trusted", True):
+        return True
     if getattr(current, "export", None) is not None:
         return True
     return (

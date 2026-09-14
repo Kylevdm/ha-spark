@@ -60,8 +60,17 @@ def _export(
     )
 
 
-def _intent(export: ExportIntent | None = None) -> ChargeIntent:
-    return ChargeIntent(77.0, _soc(), time(23, 30), time(5, 30), export=export)
+def _intent(
+    export: ExportIntent | None = None, *, export_trusted: bool = True
+) -> ChargeIntent:
+    return ChargeIntent(
+        77.0,
+        _soc(),
+        time(23, 30),
+        time(5, 30),
+        export=export,
+        export_trusted=export_trusted,
+    )
 
 
 class FakeRest:
@@ -283,6 +292,33 @@ async def test_failed_cleanup_keeps_last_verified_event_record(tmp_path) -> None
         f"export|{export.event_identity[1].astimezone(UTC).isoformat()}|"
         f"{export.event_identity[2].astimezone(UTC).isoformat()}"
     )
+
+
+@pytest.mark.asyncio
+async def test_untrusted_axle_read_preserves_a_live_verified_export(tmp_path) -> None:
+    rest = FakeRest()
+    export = _export()
+    device = _device(rest, tmp_path)
+    await device.apply(_intent(export))
+    rest.calls.clear()
+
+    lines = await device.apply(_intent(export_trusted=False))
+
+    assert lines == ["[SKIP] Axle event read untrusted; preserving the verified export window"]
+    assert not any(call[0] == "modbus" for call in rest.calls)
+    block = [
+        rest.states[f"sensor.solis_control_{field}"]
+        for field in (
+            "timed_discharge_start_hours",
+            "timed_discharge_start_minutes",
+            "timed_discharge_end_hours",
+            "timed_discharge_end_minutes",
+        )
+    ]
+    assert block == [str(export.window_start.hour), "0", str(export.window_end.hour), "0"]
+
+    async with ExportEventStore(str(tmp_path / "events.db")) as store:
+        assert await store.load() is not None
 
 
 @pytest.mark.asyncio

@@ -158,6 +158,7 @@ async def test_gather_inputs_reads_axle_event_source(monkeypatch: pytest.MonkeyP
 
     assert inputs.flexibility_event is not None
     assert inputs.flexibility_event.direction == "export"
+    assert inputs.flexibility_event_trusted is True
 
 
 @respx.mock
@@ -184,6 +185,7 @@ async def test_gather_inputs_degrades_on_malformed_axle_event(
         inputs, cfg, _ = await gather_inputs(s, rest)
 
     assert inputs.flexibility_event is None
+    assert inputs.flexibility_event_trusted is False
     assert build_schedule(s, inputs, cfg).export_prices == ()
 
 
