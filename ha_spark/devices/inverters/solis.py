@@ -469,13 +469,29 @@ class SolisDevice:
         if not entity:
             return "[SKIP] no power_switch entity configured; discharge left as-is"
         try:
-            # The pre-read only suppresses a redundant write. A failed read must
-            # fall through to the write, never skip it: a flaky GET on the tick a
-            # dispatch opens would otherwise drop the hold entirely.
+            # The pre-read suppresses a redundant write, and on a failure it
+            # decides asymmetrically (#143): unreadable evidence may *close* a
+            # hold, never open one. Falling through to `Off` keeps a flaky GET
+            # on the tick a dispatch opens from dropping the hold; falling
+            # through to `On` at the per-minute cadence would instead be up to
+            # 60 blind, unverifiable releases an hour through an HA outage, each
+            # one freeing a battery ha-spark can no longer see to discharge.
             try:
                 if (await self._rest.get_state(entity)).state.strip().lower() == wanted.lower():
                     return f"[SKIP] {desc} (already set)"
-            except Exception as exc:  # noqa: BLE001 - write anyway, then verify
+            except Exception as exc:  # noqa: BLE001 - direction decides
+                if wanted == "On":
+                    # Not a benign skip: while the reads stay broken the inverter
+                    # is left disabled, the house entirely on grid import. This
+                    # direction is still the safe one, but it is unbounded here
+                    # on purpose — the bound is the relinquish path (#143 §5),
+                    # which writes the safe state once ha-spark is past every
+                    # known hold end and still has no picture.
+                    log.warning("Power-switch unreadable (%r); not releasing a hold", exc)
+                    return (
+                        f"[WARNING] {desc} refused: state unreadable ({exc!r}); "
+                        "a hold is never released blind"
+                    )
                 log.warning("Power-switch pre-read failed (%r); writing %s anyway", exc, wanted)
             await self._rest.call_service(
                 "select", "select_option", {"entity_id": entity, "option": wanted}
@@ -671,11 +687,26 @@ class SolisDevice:
         return None
 
     async def _read_back_option(self, entity: str, wanted: str) -> str | None:
-        try:
-            got = str((await self._rest.get_state(entity)).state)
-        except Exception as exc:  # noqa: BLE001
-            return f"read-back failed: {exc!r}"
-        return None if got.lower() == wanted.lower() else f"read back {got!r} (wanted {wanted!r})"
+        """Confirm a select took the option, retrying the same bounded few times
+        as every other read-back here.
+
+        HA's state machine is asynchronous with respect to the overlay, so the
+        first read after a write can still carry the old option. Without the
+        retry the reconcile reports a mismatch it would have seen settle, and —
+        because it remembers nothing and now runs every minute — writes the
+        register again on the next pass, and the one after that. The bound stays
+        finite so a permanently stale overlay can never hold the caller."""
+        got = ""
+        for attempt in range(_READ_BACK_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(_READ_BACK_DELAY_SECONDS)
+            try:
+                got = str((await self._rest.get_state(entity)).state)
+            except Exception as exc:  # noqa: BLE001
+                return f"read-back failed: {exc!r}"
+            if got.lower() == wanted.lower():
+                return None
+        return f"read back {got!r} (wanted {wanted!r})"
 
 
 def _export_window(intent: ChargeIntent, tz: ZoneInfo) -> tuple[datetime, datetime] | None:

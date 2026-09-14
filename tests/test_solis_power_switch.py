@@ -315,3 +315,45 @@ async def test_unauthorized_modes_compute_the_reconcile_without_writing(
 
     assert rest.calls == []
     assert any("Off" in line for line in lines)
+
+
+class BlindRest(FakeRest):
+    """HA reachable for writes, but every state read fails.
+
+    The shape of an HA outage or a flaky proxy at the moment the reconcile runs.
+    """
+
+    async def get_state(self, entity_id: str) -> EntityState:
+        raise TimeoutError("state machine unreachable")
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_switch_is_still_driven_off_for_an_active_hold(tmp_path) -> None:
+    """Unreadable evidence may close a hold: a flaky GET must not drop it.
+
+    The battery discharging into the car at 7 kW on cheap grid is the failure
+    #140 exists to prevent, so this direction writes blind and lets the
+    read-back report what it can.
+    """
+    rest = BlindRest(switch="On")
+    lines = await _reconcile(_device(rest, tmp_path), _intent(holds=(_window(-10),)))
+
+    assert _options(rest) == ["Off"]
+    assert any("Off" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_switch_is_never_driven_on(tmp_path) -> None:
+    """Unreadable evidence may never *open* a hold.
+
+    At the per-minute cadence (#143) a fall-through here would be up to 60
+    blind, unverifiable register writes an hour through an HA outage — and each
+    one is the release of a hold ha-spark can no longer see.
+    """
+    rest = BlindRest(switch="Off")
+    lines = await _reconcile(_device(rest, tmp_path), _intent(holds=(_window(-180),)))
+
+    assert _options(rest) == []
+    # A refused release is reported as a warning, not a skip: while it holds,
+    # the inverter is disabled and the house is entirely on grid import.
+    assert any(line.startswith("[WARNING]") and "unreadable" in line for line in lines)
