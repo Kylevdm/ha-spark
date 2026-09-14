@@ -218,6 +218,41 @@ class ChargeIntent:
         """The checked SoC percentage; 0 when the measurement failed."""
         return self.soc.soc_now
 
+    def hold_active(self, now: datetime) -> bool:
+        """True when ``now`` falls inside a hold window (start inclusive, end exclusive).
+
+        The inverter-agnostic expression of "the battery must not discharge right
+        now". ``now`` must be timezone-aware — the household clock the caller
+        already resolved.
+        """
+        return any(_align(start, now) <= now < _align(end, now) for start, end in self.holds)
+
+    def hold_overlaps(self, start: datetime, end: datetime) -> bool:
+        """True when any hold intersects ``[start, end)``.
+
+        Distinct from :meth:`hold_active`: a decision about a *future* window
+        (does a dispatch cut into tonight's export event?) must compare intervals,
+        not sample the clock, or it both refuses windows a passing hold cannot
+        reach and admits windows a later hold will interrupt.
+        """
+        return any(
+            _align(hold_start, start) < end and start < _align(hold_end, start)
+            for hold_start, hold_end in self.holds
+        )
+
+
+def _align(moment: datetime, reference: datetime) -> datetime:
+    """Read a naive hold bound on ``reference``'s clock.
+
+    Hold bounds come from a dispatch attribute HA renders itself, so they may
+    arrive without an offset; a naive bound is read on the caller's resolved
+    household clock rather than discarded, so an unannotated dispatch never
+    leaves a hold silently inactive. A naive ``reference`` is a caller bug —
+    guessing a zone for it is how a BST hold reads as inactive for its whole
+    duration — so it is left to raise on comparison rather than coerced.
+    """
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=reference.tzinfo)
+
 
 @dataclass(frozen=True)
 class Reservation:

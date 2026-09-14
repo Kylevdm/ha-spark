@@ -481,14 +481,16 @@ async def test_current_verification_is_bounded_when_overlay_stays_stale() -> Non
 @respx.mock
 async def test_on_blocks_all_writes_when_soc_invalid() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    # The power-switch reconcile is exempt from the SoC guard (#140); park it in
+    # its desired state so this test stays about charge programming alone.
+    _get("select.solisac_power_switch", "On")
     s = _settings(proactive_mode="on")
     intent = _intent(soc=_bad_soc())
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(intent)
     assert posts.call_count == 0
-    assert all(
-        line.startswith("[BLOCKED]") and "unavailable" in line for line in lines
-    )
+    assert any(line.startswith("[BLOCKED]") and "unavailable" in line for line in lines)
+    assert not any(line.startswith("[APPLIED]") for line in lines)
 
 
 @respx.mock
@@ -532,12 +534,14 @@ async def test_on_blocks_writes_for_every_failed_status(
 ) -> None:
     """Any failed integrity status blocks real writes and names its own reason."""
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    _get("select.solisac_power_switch", "On")  # see #140: reconcile is exempt
     s = _settings(proactive_mode="on")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(_intent(soc=measurement))
 
     assert posts.call_count == 0
-    assert all(line.startswith("[BLOCKED]") for line in lines)
+    assert any(line.startswith("[BLOCKED]") for line in lines)
+    assert not any(line.startswith("[APPLIED]") for line in lines)
     assert any(evidence in line for line in lines)
 
 

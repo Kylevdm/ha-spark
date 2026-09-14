@@ -153,6 +153,35 @@ dropped tariff schedule), #92 (backtest tariff contract), and #93
   partner integration contract applies. This is beyond map #128's one-event
   prototype destination. Trigger: ha-spark reaches v1.0.0.
 
+### Axle export loose ends (from #51, 2026-09-14)
+
+Raised while verifying
+[Event delivery: planner exports during an Axle slot via reservations](https://github.com/Kylevdm/ha-spark/issues/51)
+against its acceptance criteria before closing it. Neither blocked that ticket:
+both concern unattended operation, which is explicitly beyond map #128's
+one-supervised-event destination.
+
+- **The persisted export-event record is write-only.** `_persist_export_state`
+  saves the accepted event identity and verified end
+  (`ha_spark/devices/inverters/solis.py:498-513`), and `exists` gates the
+  save/clear, but `ExportEventStore.load()` has no production caller — only
+  tests read it (`ha_spark/energy/export_store.py:32`). Restart-safe cleanup
+  works without it: the first authorized `apply` with no fresh event zeros slot
+  1's discharge half and read-back verifies, and that clear is deliberately not
+  gated on grid-charge permission (`solis.py:242-247`). So the record buys
+  nothing today. Decide whether a persisted identity earns its place — comparing
+  a resident window against the *last accepted event* rather than against "no
+  fresh event" is what would let ha-spark distinguish its own leftover schedule
+  from a human's manual one — or delete it. Trigger: unattended event delivery,
+  where a wrong resident window is not caught by a supervising human.
+- **No scheduler test exercises a day-of Axle event.** #51's own test list asks
+  for "next-replan pickup of a day-of event"; the behaviour falls out of
+  `should_run`'s half-hourly slot logic (`ha_spark/energy/scheduler.py:87`) plus
+  the export value in `setpoint_changed`, each tested separately, but nothing
+  tests the composition — the exact path a paid event arrives on. Trigger: the
+  supervised proof (#134) is the live test; write the unit test if that proof
+  surfaces a pickup problem, or before unattended delivery.
+
 ### Release and installation observability (2026-09-12)
 
 - **Show the running ha-spark build version in `ha-spark health`.** The doctor
