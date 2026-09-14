@@ -17,6 +17,15 @@ automation or enter an event window by hand.
       overlay is healthy.
 - [ ] The incumbent automations that write the Solis power switch or timed
       discharge window are disabled for this run.
+- [ ] The four clocks agree before real control is enabled. Confirm that the
+      configured `timezone` matches Home Assistant's timezone, the add-on
+      container's UTC clock matches a trusted UTC source, and the Solis RTC
+      shows the same local date, hour, and minute. Record any seconds offset
+      and its direction. Do not continue if any comparison has an unexplained
+      offset, or if the known offset can cross a Slot 1 minute or date
+      boundary. Slot 1 stores a date-less local wall-clock window, so a
+      timezone or clock mismatch can arm it on the wrong day or at the wrong
+      time.
 - [ ] SoC is fresh, finite, and in the configured 0–100% range.
 - [ ] No dispatch hold overlaps the planned export window.
 - [ ] The event came from a fresh explicit Axle API/HA source. Never type an
@@ -25,6 +34,27 @@ automation or enter an event window by hand.
       value disables notices; notifications are reminders, not proof of a write.
 - [ ] Record a baseline timestamp, SoC, battery power, solar power, house load,
       grid power, inverter power switch, work mode, and the Solis Slot 1 window.
+
+Record the clock check before proceeding. Use UTC for the record timestamp and
+write down the exact timezone and clock readings. The Solis RTC reading must
+come from the supported local inverter interface, not an inferred event time.
+
+| Check | Result |
+| --- | --- |
+| Checked at (UTC) | |
+| Configured `timezone` | |
+| Home Assistant timezone | |
+| Add-on container UTC | |
+| Solis RTC and timezone basis | |
+| Largest unexplained offset | |
+| Operator / outcome | |
+
+The largest unexplained offset must be zero before the event. A known offset
+must be recorded with its direction and remain within the same date and minute
+as the reference clock. Keep the record with the event evidence for #134. A
+failed or incomplete clock check is an abort condition. Leave
+`proactive_mode` at `simulate` and do not enable real control until the check
+passes.
 
 The accepted-event notice is the preparation prompt. It includes the event
 window, planned export, DNO limit, and the requirement to keep a person present.
