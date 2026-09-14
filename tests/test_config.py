@@ -181,6 +181,14 @@ def test_v2l_options_load_from_overlay() -> None:
     assert Settings().v2l_cutoff_time == "01:00"
 
 
+def test_generic_notify_service_is_available_without_changing_v2l_notify() -> None:
+    s = Settings(notify_service="mobile_app_phone", v2l_notify_service="mobile_app_car")
+
+    assert s.notify_service == "mobile_app_phone"
+    assert s.v2l_notify_service == "mobile_app_car"
+    assert "notify_service" in _OPTION_KEYS
+
+
 def test_export_planner_limits_are_configurable_across_addon_surfaces() -> None:
     settings = Settings(battery_discharge_ceiling_kw=3.2, dno_export_limit_kw=7.36)
 

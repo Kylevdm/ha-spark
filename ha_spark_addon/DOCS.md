@@ -290,6 +290,14 @@ only explicit, fresh export windows. Import events and malformed or stale
 responses produce no export slots. The API key is a password and is never
 written to logs or reports.
 
+Set `notify_service` to the Home Assistant `notify.<service>` target for the
+human-present export lifecycle notices. ha-spark sends one notice when an event
+is accepted, after a verified export start, after verified cleanup, and for a
+terminal abort. Notices are deduplicated by event identity and lifecycle
+transition, and never count as proof that a hardware write succeeded. Leave it
+blank to disable them. The supervised procedure is in
+`docs/runbooks/supervised-axle-export.md`.
+
 For paid export, `battery_discharge_ceiling_kw` is the conservative battery
 output used by the planner, while `dno_export_limit_kw` is the installation's
 grid-export limit (Kyle's is 7.36 kW). Both caps are independent of the Solis
