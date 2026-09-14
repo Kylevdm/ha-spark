@@ -43,6 +43,16 @@
   state the same tick is correcting. A hold that *overlaps* an export window
   refuses the whole event with an explicit reason; a hold elsewhere in the day
   leaves it alone.
+- No day-early export (#144): the Solis Slot 1 discharge registers hold a clock
+  face and no date, while the planner offers an event as soon as it enters the
+  24 h horizon. Programming tomorrow's 18:30 event at noon today would have
+  discharged the battery at 18:30 *today* — intentional export outside a paid
+  window, costing a peak-rate refill and earning nothing. The driver now refuses
+  a window whose clock face would next come round before its own event, and says
+  so. The refusal is a deferral, not an abort: the event is re-offered every
+  tick and arms itself once its clock face is the next occurrence, so nothing is
+  remembered. An event already under way stays armed, so a day-of pickup still
+  delivers the remainder.
 - Half-hourly replanning (#46): the daemon recomputes the current plan on each
   local half-hour slot, including after startup during the day. It skips the
   inverter call when the commanded target, window, and holds are unchanged, so

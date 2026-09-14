@@ -16,6 +16,12 @@ step**: writing the 8-register window block *is* the commit (see
 ``docs/solis-control-modbus-overlay.yaml`` and RUN-83-log). The charge-current
 register (43141) is a standalone single-register write that applies on write.
 
+Slot windows carry a clock face and no date, so an export window is only
+programmed once that clock face next comes round *at* its own event (#144).
+Until then the event is deferred and re-offered each tick; without this, an
+Axle event with a day's notice would discharge the battery a day early, outside
+the paid window.
+
 PROACTIVE_MODE + control authority (via ``effective_mode``) gate side effects:
 ``simulate``/``observe`` -> log intended writes only; ``on`` -> real
 ``call_service``; ``off`` -> compute only. Each write isolates its own failure
@@ -28,7 +34,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, TypeVar
 from zoneinfo import ZoneInfo
 
@@ -77,6 +83,10 @@ _READ_BACK_DELAY_SECONDS = 0.1
 _GRID_CHARGE_BIT = 1 << 5
 _EXPORT_CURRENT_A = 62.5
 _EXPORT_CURRENT_RAW = 625
+# Slack allowed when matching an export window's clock face to its event. The
+# planner emits slot-aligned datetimes, so this only absorbs sub-minute noise
+# from a third-party adapter; it stays far below a 30 minute slot.
+_ARMING_TOLERANCE_SECONDS = 60.0
 T = TypeVar("T")
 
 
@@ -142,6 +152,8 @@ class SolisDevice:
         elif export_ready:
             assert export is not None
             export_error = _validate_export(intent, export)
+            if export_error is None:
+                export_error = _export_not_yet_armed(export, now)
             if export_error is None and intent.hold_overlaps(*export):
                 # Hold beats export on overlap: the reconcile will hold the
                 # inverter `Off` inside the event, so refuse the whole window
@@ -707,6 +719,45 @@ def _validate_export(intent: ChargeIntent, export: tuple[datetime, datetime]) ->
     if not intent.soc.ok or not math.isfinite(soc) or not 0 <= soc <= 100:
         return intent.soc.reason if not intent.soc.ok else "SoC is outside 0-100%"
     return None
+
+
+def _next_wall_clock_occurrence(wall: datetime, now: datetime) -> datetime:
+    """First moment at or after ``now`` showing ``wall``'s clock face.
+
+    Recombines a date with the time of day rather than adding a ``timedelta``,
+    so a DST boundary in between moves the UTC offset and leaves the clock face
+    alone — which is what the Slot 1 registers actually hold.
+    """
+    today = datetime.combine(now.date(), wall.time(), tzinfo=now.tzinfo)
+    if today >= now:
+        return today
+    return datetime.combine(now.date() + timedelta(days=1), wall.time(), tzinfo=now.tzinfo)
+
+
+def _export_not_yet_armed(export: tuple[datetime, datetime], now: datetime) -> str | None:
+    """Refuse a window whose clock face would come round before its own event.
+
+    The Slot 1 discharge registers carry a time of day and no date, while the
+    planner's 24 h horizon offers an event as soon as it enters the horizon.
+    Programming tomorrow's 18:30 event at noon today would discharge the battery
+    at 18:30 *today* — intentional export outside a paid window, which costs a
+    peak-rate refill and earns nothing.
+
+    This is a deferral, not a terminal abort: the event is re-offered on every
+    tick and arms itself once its clock face next comes round at the event, so
+    no scheduling state is needed. A window already under way stays armed, so a
+    day-of pickup still delivers the remainder instead of waiting a day.
+    """
+    start, _ = export
+    if now >= start:
+        return None
+    occurrence = _next_wall_clock_occurrence(start, now)
+    if abs((occurrence - start).total_seconds()) <= _ARMING_TOLERANCE_SECONDS:
+        return None
+    return (
+        f"the {start:%H:%M} window would next fire {occurrence:%a %d %b %H:%M}, "
+        f"before the event starts {start:%a %d %b %H:%M}; not yet armed"
+    )
 
 
 def _export_identity(value: object, start: datetime, end: datetime) -> str:

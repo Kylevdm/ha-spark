@@ -56,10 +56,14 @@ def _intent(
 
 
 def _export() -> ExportIntent:
-    start = (datetime.now(_LONDON) + timedelta(days=1)).replace(
-        hour=10, minute=0, second=0, microsecond=0
+    # Relative to now, not a fixed time of day: since #144 an event is only
+    # armed once its clock face next comes round at the event itself, so a
+    # pinned "tomorrow at 10:00" would be refused whenever the suite runs
+    # before 10:00.
+    start = (datetime.now(_LONDON) + timedelta(hours=2)).replace(
+        minute=0, second=0, microsecond=0
     )
-    end = start.replace(hour=12)
+    end = start + timedelta(hours=2)
     return ExportIntent(
         event_identity=("export", start, end),
         window_start=start,
