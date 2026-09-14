@@ -144,6 +144,7 @@ async def test_run_once_skips_unchanged_command_after_fresh_soc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     applied: list[ChargeIntent] = []
+    reconciled: list[ChargeIntent] = []
     previous = _plan()
     current_intent = replace(previous.charge_intent, soc=_soc(31.0))
     current = replace(previous, soc=current_intent.soc, charge_intent=current_intent)
@@ -155,6 +156,10 @@ async def test_run_once_skips_unchanged_command_after_fresh_soc(
         async def apply(self, intent: ChargeIntent) -> list[str]:
             applied.append(intent)
             return ["[APPLIED] test"]
+
+        async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+            reconciled.append(intent)
+            return ["[SKIP] set inverter power switch to On (already set)"]
 
     async def noop(*_args: object, **_kwargs: object) -> None:
         return None
@@ -170,12 +175,16 @@ async def test_run_once_skips_unchanged_command_after_fresh_soc(
 
     assert result is current
     assert applied == []
+    # A skipped setpoint must still serve the clock (#143): the reconcile is a
+    # separate seam, so a slot with no plan change still converges the switch.
+    assert reconciled == [current_intent]
 
 
 async def test_run_once_retries_after_untrusted_previous_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     applied: list[ChargeIntent] = []
+    reconciled: list[ChargeIntent] = []
     failed = _failed_soc()
     previous = replace(_plan(), soc=failed, charge_intent=replace(_INTENT, soc=failed))
     current = _plan()
@@ -187,6 +196,10 @@ async def test_run_once_retries_after_untrusted_previous_plan(
         async def apply(self, intent: ChargeIntent) -> list[str]:
             applied.append(intent)
             return ["[APPLIED] test"]
+
+        async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+            reconciled.append(intent)
+            return ["[SKIP] set inverter power switch to On (already set)"]
 
     async def noop(*_args: object, **_kwargs: object) -> None:
         return None
@@ -201,6 +214,7 @@ async def test_run_once_retries_after_untrusted_previous_plan(
     await run_once(Settings(), soc=current.soc, previous_plan=previous)
 
     assert applied == [current.charge_intent]
+    assert reconciled == [current.charge_intent]
 
 
 @respx.mock

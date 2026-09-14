@@ -1,7 +1,7 @@
 """Device-driver core: capabilities, control authority, and the actuation gate."""
 from __future__ import annotations
 
-from datetime import time
+from datetime import datetime, time
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -41,11 +41,20 @@ def effective_mode(control: ControlAuthority, proactive_mode: str) -> str:
 
 @runtime_checkable
 class Device(Protocol):
-    """Realizes a ChargeIntent via a specific inverter; returns action lines."""
+    """Realizes a ChargeIntent via a specific inverter; returns action lines.
+
+    ``apply`` is the plan seam: driven by a plan diff, on the half-hourly replan
+    cadence. ``reconcile_holds`` is the *clock* seam (#143): a cheap read-first
+    pass every caller makes before it applies, and the daemon repeats every
+    minute, because whether a dispatch hold is active right now is a function of
+    the clock and cannot wait for a plan field to change. Inverters with no
+    hold surface answer with an empty list.
+    """
 
     capabilities: frozenset[Capability]
 
     async def apply(self, intent: ChargeIntent) -> list[str]: ...
+    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]: ...
     async def set_charge_rate(self, watts: float) -> str: ...
     async def read_charge_rate(self) -> float: ...
     def planned_rate_w(self, intent: ChargeIntent) -> float: ...

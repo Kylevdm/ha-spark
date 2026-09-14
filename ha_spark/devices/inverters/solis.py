@@ -2,7 +2,9 @@
 ``modbus:`` overlay (the ``solis_control`` hub stood up in #90), plus the
 declarative power-switch reconcile (ADR-0003 rule 2, #140): ha-spark owns both
 edges of the whole-inverter enable, driving it to ``Off`` while a dispatch hold
-is active and ``On`` otherwise.
+is active and ``On`` otherwise. That reconcile is ``reconcile_holds``, a seam of
+its own rather than a step of ``apply`` (#143) — it answers to the clock, not to
+a plan diff, so it runs every minute while ``apply`` stays half-hourly.
 
 Control surface (decided in #82, validated by live-fire #83, register map from
 #100/#80 — **no tier-A source; cross-checked live 2026-09-08**): the timed-slot
@@ -122,13 +124,12 @@ class SolisDevice:
 
         tz = load_timezone(self._settings.timezone)
         now = datetime.now(tz)
-        # The power-switch reconcile runs first and unconditionally (#140). It is
-        # exempt from the SoC guard below — it commands no SoC-derived magnitude,
-        # and freezing the inverter `Off` on an unrelated dead sensor is the
-        # failure it exists to remove — and it must settle before anything else
-        # reads the switch, or `_require_power_switch_on` would refuse export on
-        # the very tick a hold ends, against a state already being corrected.
-        lines: list[str] = [await self._reconcile_power_switch(intent, now)]
+        # The power-switch reconcile is not here: it is `reconcile_holds`, its own
+        # per-minute seam (#143). Every caller makes one pass before it applies,
+        # so the switch has already settled by the time `_require_power_switch_on`
+        # reads it — otherwise export would be refused on the very tick a hold
+        # ends, against a state already being corrected.
+        lines: list[str] = []
         # SoC-unreadable guard: soc_now==0 from a dead sensor would size a max charge.
         if mode == "on" and not intent.soc.ok:
             line = (
@@ -431,7 +432,7 @@ class SolisDevice:
             return False, f"[WARNING] {desc}, but {mismatch}"
         return True, f"[APPLIED] {desc}"
 
-    async def _reconcile_power_switch(self, intent: ChargeIntent, now: datetime) -> str:
+    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
         """Converge the whole-inverter enable on the state the clock implies (#140).
 
         Desired state is a pure function of ``now`` and ``intent.holds``: ``Off``
@@ -439,10 +440,24 @@ class SolisDevice:
         restart or a crash mid-hold converges on the next tick, and ha-spark owns
         both edges rather than only ever subtracting (ADR-0003).
 
+        Read-first, and deliberately cheap enough for the per-minute cadence it
+        is driven at (#143): steady state is one *cached* ``GET`` of the select
+        and zero register writes. The read hits HA's state machine, not modbus,
+        and the read-back does not call ``homeassistant.update_entity``, so
+        nothing here forces an inverter poll. The register is written only at a
+        genuine hold edge, to correct an external change, or to retry a failure.
+
+        It is exempt from the SoC guard in ``apply``: it commands no SoC-derived
+        magnitude, and freezing the inverter ``Off`` on an unrelated dead sensor
+        is exactly the failure it exists to remove.
+
         It must never read export state. If the switch is ``On`` during a paid
         export that is because no hold is active, not because export asked —
         ``_require_power_switch_on`` stays a read-only refusal.
         """
+        return [await self._reconcile_power_switch(intent, now)]
+
+    async def _reconcile_power_switch(self, intent: ChargeIntent, now: datetime) -> str:
         wanted = "Off" if intent.hold_active(now) else "On"
         desc = f"set inverter power switch to {wanted}"
         mode = effective_mode(self._config.control, self._settings.proactive_mode)

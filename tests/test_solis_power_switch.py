@@ -3,6 +3,11 @@
 Desired state is a pure function of the clock and ``intent.holds``:
 ``Off`` while a hold is active, ``On`` otherwise. No remembered edge, so a
 restart mid-hold converges on the next tick.
+
+The reconcile is its own ``Device`` seam (``reconcile_holds``), not part of
+``apply`` (#143): ``apply`` is a plan diff on the half-hour, while the desired
+state is a function of the clock and must converge within a minute. Every
+device-driving caller makes one pass before it applies.
 """
 from __future__ import annotations
 
@@ -14,6 +19,7 @@ import pytest
 
 from ha_spark.config import Settings
 from ha_spark.devices.base import ControlAuthority
+from ha_spark.devices.inverters.alphaess import AlphaESSDevice
 from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.energy.models import ChargeIntent, ExportIntent
 from ha_spark.energy.scheduler import setpoint_changed
@@ -132,6 +138,15 @@ def _device(
     return SolisDevice(config, settings, rest)  # type: ignore[arg-type]
 
 
+def _now() -> datetime:
+    return datetime.now(_LONDON)
+
+
+async def _reconcile(device: SolisDevice, intent: ChargeIntent) -> list[str]:
+    """One reconcile pass on the household clock, as every caller makes."""
+    return await device.reconcile_holds(intent, _now())
+
+
 def _options(rest: FakeRest) -> list[str]:
     return [
         str(call[2]["option"])
@@ -143,7 +158,7 @@ def _options(rest: FakeRest) -> list[str]:
 @pytest.mark.asyncio
 async def test_future_hold_does_not_switch_the_inverter_off_yet(tmp_path) -> None:
     rest = FakeRest(switch="On")
-    await _device(rest, tmp_path).apply(_intent(holds=(_window(180),)))
+    await _reconcile(_device(rest, tmp_path), _intent(holds=(_window(180),)))
 
     assert _options(rest) == []
 
@@ -151,7 +166,7 @@ async def test_future_hold_does_not_switch_the_inverter_off_yet(tmp_path) -> Non
 @pytest.mark.asyncio
 async def test_active_hold_switches_off_and_verifies_read_back(tmp_path) -> None:
     rest = FakeRest(switch="On")
-    lines = await _device(rest, tmp_path).apply(_intent(holds=(_window(-10),)))
+    lines = await _reconcile(_device(rest, tmp_path), _intent(holds=(_window(-10),)))
 
     assert _options(rest) == ["Off"]
     assert any(line.startswith("[APPLIED]") and "Off" in line for line in lines)
@@ -160,7 +175,7 @@ async def test_active_hold_switches_off_and_verifies_read_back(tmp_path) -> None
 @pytest.mark.asyncio
 async def test_no_active_hold_switches_the_inverter_back_on(tmp_path) -> None:
     rest = FakeRest(switch="Off")
-    lines = await _device(rest, tmp_path).apply(_intent(holds=(_window(-180),)))
+    lines = await _reconcile(_device(rest, tmp_path), _intent(holds=(_window(-180),)))
 
     assert _options(rest) == ["On"]
     assert any(line.startswith("[APPLIED]") and "On" in line for line in lines)
@@ -169,10 +184,33 @@ async def test_no_active_hold_switches_the_inverter_back_on(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_switch_already_in_the_desired_state_is_never_written(tmp_path) -> None:
     rest = FakeRest(switch="Off")
-    lines = await _device(rest, tmp_path).apply(_intent(holds=(_window(-10),)))
+    lines = await _reconcile(_device(rest, tmp_path), _intent(holds=(_window(-10),)))
 
     assert _options(rest) == []
     assert any(line.startswith("[SKIP]") and "Off" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_apply_never_touches_the_power_switch(tmp_path) -> None:
+    """``apply`` is a plan diff; the switch belongs to the reconcile seam.
+
+    Left in ``apply``, the switch would only converge when some plan field
+    changed on a half-hour boundary — the defect #143 hole 2 records.
+    """
+    rest = FakeRest(switch="On")
+    lines = await _device(rest, tmp_path).apply(_intent(holds=(_window(-10),)))
+
+    assert _options(rest) == []
+    assert not any("power switch" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_a_device_without_the_hold_capability_reconciles_to_nothing() -> None:
+    """The seam is narrow: every other inverter answers with a no-op."""
+    settings = Settings(inverter="alphaess")
+    device = AlphaESSDevice(settings.devices[0], settings, object())  # type: ignore[arg-type]
+
+    assert await device.reconcile_holds(_intent(holds=(_window(-10),)), _now()) == []
 
 
 def _export_discharge_writes(rest: FakeRest) -> list[dict[str, object]]:
@@ -227,9 +265,9 @@ async def test_export_is_programmed_on_the_tick_the_reconcile_turns_the_switch_o
     an otherwise-unchanged plan is skipped as an unchanged setpoint.
     """
     rest = FakeRest(switch="Off")
-    lines = await _device(rest, tmp_path).apply(
-        _intent(holds=(_window(-40),), export=_export())
-    )
+    device = _device(rest, tmp_path)
+    intent = _intent(holds=(_window(-40),), export=_export())
+    lines = await _reconcile(device, intent) + await device.apply(intent)
 
     assert _options(rest) == ["On"]
     assert not any("export refused" in line for line in lines)
@@ -239,8 +277,10 @@ async def test_export_is_programmed_on_the_tick_the_reconcile_turns_the_switch_o
 @pytest.mark.asyncio
 async def test_untrusted_soc_still_reconciles_but_blocks_charge_programming(tmp_path) -> None:
     rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path)
     bad_soc = replace(_soc(), status=SocStatus.UNAVAILABLE, value=None, raw_state="unavailable")
-    lines = await _device(rest, tmp_path).apply(_intent(soc=bad_soc))
+    intent = _intent(soc=bad_soc)
+    lines = await _reconcile(device, intent) + await device.apply(intent)
 
     assert _options(rest) == ["On"]
     assert not any(call[0] == "modbus" for call in rest.calls)
@@ -271,7 +311,7 @@ async def test_unauthorized_modes_compute_the_reconcile_without_writing(
     rest = FakeRest(switch="On")
     device = _device(rest, tmp_path, mode=mode, control=control)
 
-    lines = await device.apply(_intent(holds=(_window(-10),)))
+    lines = await _reconcile(device, _intent(holds=(_window(-10),)))
 
     assert rest.calls == []
     assert any("Off" in line for line in lines)
