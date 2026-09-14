@@ -505,14 +505,106 @@ class SolisDevice:
                         "a hold is never released blind"
                     )
                 log.warning("Power-switch pre-read failed (%r); writing %s anyway", exc, wanted)
-            await self._rest.call_service(
-                "select", "select_option", {"entity_id": entity, "option": wanted}
-            )
-            mismatch = await self._read_back_option(entity, wanted)
+            mismatch = await self._select_option(entity, wanted)
         except Exception as exc:  # noqa: BLE001 - isolate this action's failure
             log.error("[FAILED] %s: %r", desc, exc)
             return f"[FAILED] {desc}: {exc!r}"
         return f"[WARNING] {desc}, but {mismatch}" if mismatch else f"[APPLIED] {desc}"
+
+    async def write_safe_state(self) -> list[str]:
+        """Leave the inverter self-managing when ha-spark stops steering (#143 §5).
+
+        Inverter ``On``, Slot 1 charging across the configured cheap window, and
+        a discharge window that is zeroed unless it is a verified export still
+        running. The scheduler decides *when* (past every known hold end with no
+        trusted picture, or a clean shutdown) and fires it once; this only writes.
+        It is the designated bound on the reconcile's refused blind release, so an
+        unreadable switch is written ``On`` here rather than refused. Retries are
+        not this method's: they belong to the read-first reconcile and ``apply``,
+        which never write blind, so broken reads cannot cost the inverter a
+        register write a minute. Each action is gated and isolated like every
+        other write; it never touches the charge or discharge current.
+        """
+        return [await self._write_safe_power_switch(), await self._write_safe_slot_block()]
+
+    async def _write_safe_power_switch(self) -> str:
+        desc = "set inverter power switch to On (relinquishing control)"
+        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        if mode == "simulate":
+            return f"[SIMULATE] would {desc}"
+        if mode in ("off", "observe"):
+            return f"[{mode.upper()}] computed: {desc}"
+        entity = self._config.entities.get("power_switch", "")
+        if not entity:
+            return "[SKIP] no power_switch entity configured; discharge left as-is"
+        try:
+            try:
+                if (await self._rest.get_state(entity)).state.strip().lower() == "on":
+                    return f"[SKIP] {desc} (already set)"
+            except Exception as exc:  # noqa: BLE001 - unreadable is written, not refused
+                log.warning("Power-switch pre-read failed (%r); writing On anyway", exc)
+            mismatch = await self._select_option(entity, "On")
+        except Exception as exc:  # noqa: BLE001 - isolate this action's failure
+            log.error("[FAILED] %s: %r", desc, exc)
+            return f"[FAILED] {desc}: {exc!r}"
+        return f"[WARNING] {desc}, but {mismatch}" if mismatch else f"[APPLIED] {desc}"
+
+    async def _write_safe_slot_block(self) -> str:
+        # Imported here for the same import-cycle reason as in `apply`.
+        from ha_spark.energy.sources import parse_time
+
+        try:
+            start = parse_time(self._settings.charge_window_start)
+            end = parse_time(self._settings.charge_window_end)
+        except ValueError as exc:
+            line = f"[FAILED] set charge window (relinquishing control): {exc!r}"
+            log.error(line)
+            return line
+        charge = [start.hour, start.minute, end.hour, end.minute]
+        desc = f"set charge window {fmt_hhmm(start)}-{fmt_hhmm(end)} (relinquishing control)"
+        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        if mode == "simulate":
+            return f"[SIMULATE] would {desc}"
+        if mode in ("off", "observe"):
+            return f"[{mode.upper()}] computed: {desc}"
+        try:
+            async with ExportEventStore(self._settings.db_path) as store:
+                record = await store.load()
+            export_live = record is not None and record[1] > datetime.now(UTC)
+            try:
+                resident: list[int] | None = await self._read_slot_block(1)
+            except Exception as exc:  # noqa: BLE001 - decided below
+                log.warning("Slot 1 pre-read failed (%r)", exc)
+                resident = None
+            if resident is None:
+                if export_live:
+                    # A blind block write cannot carry a window it cannot see:
+                    # it would zero a paid export mid-event.
+                    line = f"[BLOCKED] {desc}: slot 1 unreadable while a verified export is live"
+                    log.warning(line)
+                    return line
+                discharge = [0, 0, 0, 0]
+            else:
+                # Same keep rule as #143 §3: only a window ha-spark verified and
+                # recorded, whose end is still ahead. Anything else is zeroed.
+                kept = resident[4:]
+                discharge = kept if export_live and any(kept) else [0, 0, 0, 0]
+            want = [*charge, *discharge]
+            if resident == want:
+                return f"[SKIP] {desc} (already set)"
+            await self._write_register(_SLOT_BLOCK_REG[1], want)
+            mismatch = await self._verify_slot_block(1, want, refresh=True)
+        except Exception as exc:  # noqa: BLE001 - isolate this action's failure
+            log.error("[FAILED] %s: %r", desc, exc)
+            return f"[FAILED] {desc}: {exc!r}"
+        return f"[WARNING] {desc}, but {mismatch}" if mismatch else f"[APPLIED] {desc}"
+
+    async def _select_option(self, entity: str, option: str) -> str | None:
+        """Write a select option and confirm it; returns the read-back mismatch."""
+        await self._rest.call_service(
+            "select", "select_option", {"entity_id": entity, "option": option}
+        )
+        return await self._read_back_option(entity, option)
 
     async def _write_discharge_current_result(self) -> tuple[bool, str]:
         """Set and verify the fixed full-rate command used for paid export."""

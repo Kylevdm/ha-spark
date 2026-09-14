@@ -384,10 +384,12 @@ def hold_reconcile_intent(
 
 
 class ReconcileResult(NamedTuple):
-    """One reconcile pass: its action lines, and the caller's trusted hold set after it."""
+    """One reconcile pass: its action lines, the caller's trusted hold set after it,
+    and whether it relinquished control (so the next replan re-applies the plan)."""
 
     lines: list[str]
     trusted_holds: tuple[tuple[datetime, datetime], ...] | None
+    relinquished: bool = False
 
 
 async def reconcile_tick(
@@ -437,9 +439,20 @@ async def reconcile_tick(
     trusted set; a failed one falls back to it. The ``octopus_intelligent``
     path keeps the last plan's holds: per-minute Kraken polling would be 30x
     the current rate against an API whose own client caps refreshes.
+
+    Relinquishing control (#143 §5): once the clock is past every known hold end
+    and the hold data is *still* untrusted, ha-spark has no picture left to steer
+    by, so it writes the device's safe state instead of reconciling — and
+    returns an empty trusted set so it fires once: the one blind write is the
+    bound, and any retry goes through the read-first reconcile and ``apply``,
+    which never write blind (register endurance). Inside a known hold an
+    untrusted read never relinquishes, a trusted one never does, and with no
+    known holds (``None`` or ``()``) there is nothing to relinquish from. This is
+    the bound on the reconcile's refused blind release: no counter, no tunable.
     """
     if plan is None or plan.charge_intent is None:
         return ReconcileResult([], trusted_holds)
+    relinquished = False
     try:
         async with HomeAssistantRest(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
@@ -459,19 +472,31 @@ async def reconcile_tick(
             intent = hold_reconcile_intent(fresh, trusted_holds)
             if intent is None:
                 lines = [UNTRUSTED_HOLDS_LINE]
+            elif (
+                not fresh.hold_trusted
+                and trusted_holds
+                and now >= max(end for _, end in trusted_holds)
+            ):
+                log.warning(
+                    "[WARNING] relinquishing control: past every known hold end and hold "
+                    "data still untrusted; writing the inverter safe state"
+                )
+                relinquished = True
+                trusted_holds = ()
+                lines = read_lines + await inverter_device(settings, rest).write_safe_state()
             else:
                 lines = read_lines + await inverter_device(settings, rest).reconcile_holds(
                     intent, now
                 )
     except Exception:
         log.exception("Hold reconcile tick failed; will retry next minute")
-        return ReconcileResult([], trusted_holds)
+        return ReconcileResult([], trusted_holds, relinquished)
     for line in lines:
         if previous is not None and line in previous:
             log.debug(line)
         else:
             log.info(line)
-    return ReconcileResult(lines, trusted_holds)
+    return ReconcileResult(lines, trusted_holds, relinquished)
 
 
 async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasurement | None:
@@ -583,6 +608,9 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     # read's empty holds mean "unreadable", so the reconcile evaluates the clock
     # against this instead. `None` until a trusted read exists.
     last_trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None
+    # Set when a reconcile pass relinquished control (#143 §5): the safe state
+    # overwrote Slot 1, so the next replan must apply even an unchanged plan.
+    reapply = False
     last_settings = settings
     target_w: float | None = None
     last_signal_at: datetime | None = None
@@ -617,19 +645,21 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             # immediately back, two writes and a momentarily wrong whole-inverter
             # enable whenever a dispatch is announced or cancelled between slots.
             if not should_run(now, last_run_slot):
-                last_reconcile_lines, last_trusted_holds = await reconcile_tick(
+                reconciled = await reconcile_tick(
                     settings,
                     last_plan,
                     now,
                     previous=last_reconcile_lines,
                     trusted_holds=last_trusted_holds,
                 )
+                last_reconcile_lines, last_trusted_holds = reconciled[:2]
+                reapply = reapply or reconciled.relinquished
             if should_run(now, last_run_slot):
                 try:
                     plan = await run_once(
                         settings,
                         soc=measurement,
-                        previous_plan=last_plan,
+                        previous_plan=None if reapply else last_plan,
                         previous_at=last_run_at,
                         trusted_holds=last_trusted_holds,
                     )
@@ -637,6 +667,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                     last_run_slot = _slot_start(now)
                     last_run_at = now
                     last_plan = plan
+                    reapply = False
                     if plan.charge_intent is not None and plan.charge_intent.hold_trusted:
                         last_trusted_holds = plan.charge_intent.holds
                     if plan.soc.ok:
@@ -672,3 +703,28 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             await stop_server(server, serve_task)
         if port_server is not None and port_task is not None:
             await stop_server(port_server, port_task)
+        # One best-effort relinquish on a clean shutdown (#143 §5). No plan means
+        # ha-spark never steered, so there is nothing to hand back. Same rule as
+        # the per-minute relinquish: never while a known hold end is still ahead,
+        # or every restart mid-dispatch would release the hold and drain the
+        # battery into the car until the next process holds it again (#143 §1).
+        # SIGKILL/OOM never reach here; that is the runbook's (#131/#134).
+        if last_plan is not None:
+            try:
+                shutdown_at = datetime.now(load_timezone(settings.timezone))
+                if last_trusted_holds and shutdown_at < max(
+                    end for _, end in last_trusted_holds
+                ):
+                    log.warning(
+                        "Not relinquishing control on shutdown: a known dispatch hold "
+                        "is still ahead"
+                    )
+                else:
+                    async with HomeAssistantRest(
+                        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+                    ) as rest:
+                        log.warning("[WARNING] relinquishing control on shutdown")
+                        for line in await inverter_device(settings, rest).write_safe_state():
+                            log.info(line)
+            except Exception:
+                log.exception("Writing the safe state on shutdown failed")
