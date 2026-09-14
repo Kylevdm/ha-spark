@@ -4,6 +4,12 @@
 
 ## 0.17.0
 
+- Supervised Axle lifecycle notices (#133): the generic `notify_service` option
+  sends deduplicated accepted, verified-start, verified-cleanup, and terminal
+  abort notices through Home Assistant, with no Telegram-specific credential or
+  claim that a notice proves a hardware write. The operator runbook covers
+  enablement, observation, abort, cleanup, restart recovery, and return to
+  simulate.
 - Per-minute hold reconcile (#140): hold reconciliation now runs through its
   own `reconcile_holds`/`reconcile_tick` seam, independently of the half-hourly
   replan. Holds that start and end between replans, failed switch writes, and

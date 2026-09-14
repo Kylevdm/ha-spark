@@ -81,6 +81,7 @@ options:
   axle_api_url: "https://api.axle.energy"
   axle_event_entity: ""
   axle_event_rate_gbp_kwh: 1.0
+  notify_service: ""
   soc_entity: ""
   soc_max_report_age_minutes: 10.0
   soc_failure_threshold: 3
@@ -176,6 +177,7 @@ schema:
   axle_api_url: url
   axle_event_entity: str?
   axle_event_rate_gbp_kwh: float(0,)
+  notify_service: str?
   soc_entity: str?
   soc_max_report_age_minutes: float
   soc_failure_threshold: int

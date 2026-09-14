@@ -42,6 +42,12 @@ from zoneinfo import ZoneInfo
 
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
 from ha_spark.devices.registry import register
+from ha_spark.energy.export_notifications import (
+    ExportNotificationStore,
+    make_notice,
+    parse_event_id,
+    send_once,
+)
 from ha_spark.energy.export_store import ExportEventStore
 from ha_spark.energy.models import ChargeIntent, window_hours
 from ha_spark.logging import get_logger
@@ -141,6 +147,11 @@ class SolisDevice:
             return lines
         raw_export = getattr(intent, "export", None)
         export_store = ExportEventStore(self._settings.db_path)
+        previous_export_record = None
+        if mode == "on" and raw_export is None and export_store.exists:
+            async with export_store:
+                previous_export_record = await export_store.load()
+        export_error: str | None = None
         if (
             mode == "on"
             and raw_export is None
@@ -157,7 +168,8 @@ class SolisDevice:
         kept_discharge: list[int] | None = None
         if raw_export is not None and export is None:
             export_ready = False
-            lines.append("[BLOCKED] export refused: malformed export window")
+            export_error = "malformed export window"
+            lines.append(f"[BLOCKED] export refused: {export_error}")
         elif export_ready:
             assert export is not None
             export_error = _validate_export(intent, export)
@@ -185,6 +197,7 @@ class SolisDevice:
                 lines.append(discharge_line)
                 export_ready = discharge_ok
                 if not discharge_ok:
+                    export_error = "discharge current was not confirmed"
                     lines.append("[BLOCKED] export refused: discharge current was not confirmed")
         # Grid-charge gate for the whole forced-charge program: read the work
         # mode once. A real write is refused when bit 5 is unset (firmware would
@@ -212,13 +225,27 @@ class SolisDevice:
             kept_discharge=kept_discharge,
         )
         lines.append(window_line)
+        window_verified = window_line.startswith(("[APPLIED]", "[SKIP]"))
+        if mode == "on" and raw_export is not None and export_ready and not window_verified:
+            export_ready = False
+            export_error = "timed export window was not confirmed"
         # Zero-guard the slots the planner does not drive so a stale manual
         # window (charge 2/3, any discharge) can't actuate behind the plan.
         for slot in (2, 3):
             lines.append(await self._zero_guard_slot(slot))
-        if mode == "on":
+        if mode in ("on", "simulate"):
             if raw_export is not None or export_store.exists:
                 await self._persist_export_state(raw_export, export, export_ready, window_line)
+            await self._notify_export_lifecycle(
+                raw_export,
+                export,
+                export_ready,
+                export_error,
+                window_line,
+                now,
+                previous_export_record,
+                mode,
+            )
         return lines
 
     async def set_charge_rate(self, watts: float) -> str:
@@ -709,6 +736,103 @@ class SolisDevice:
         except Exception as exc:  # noqa: BLE001 - persistence cannot undo HA writes
             log.error("Export event state persistence failed: %r", exc)
 
+    async def _notify_export_lifecycle(
+        self,
+        raw_export: object,
+        export: tuple[datetime, datetime] | None,
+        export_ready: bool,
+        export_error: str | None,
+        window_line: str,
+        now: datetime,
+        previous_record: tuple[str, datetime] | None,
+        mode: str,
+    ) -> None:
+        """Notify only verified export transitions; notification is never a gate."""
+        service = self._settings.notify_service
+        if not service:
+            return
+        store = ExportNotificationStore(self._settings.db_path)
+        if mode != "on":
+            context = _export_notification_context(raw_export, export)
+            if context is None or not export_ready or export_error is not None:
+                return
+            event_id, start, end, planned_kw, dno_limit_kw = context
+            await send_once(
+                store,
+                self._rest,
+                service,
+                make_notice(
+                    "accepted",
+                    event_id,
+                    start,
+                    end,
+                    planned_export_kw=planned_kw,
+                    dno_export_limit_kw=dno_limit_kw,
+                ),
+            )
+            return
+        if raw_export is None:
+            if previous_record is None or not window_line.startswith(("[APPLIED]", "[SKIP]")):
+                return
+            parsed = parse_event_id(previous_record[0])
+            if parsed is None:
+                return
+            _, start, end = parsed
+            await send_once(
+                store,
+                self._rest,
+                service,
+                make_notice("cleanup", previous_record[0], start, end),
+            )
+            return
+
+        context = _export_notification_context(raw_export, export)
+        if context is None:
+            return
+        event_id, start, end, planned_kw, dno_limit_kw = context
+        if export_ready and window_line.startswith(("[APPLIED]", "[SKIP]")):
+            await send_once(
+                store,
+                self._rest,
+                service,
+                make_notice(
+                    "accepted",
+                    event_id,
+                    start,
+                    end,
+                    planned_export_kw=planned_kw,
+                    dno_export_limit_kw=dno_limit_kw,
+                ),
+            )
+            if now.astimezone(UTC) >= start.astimezone(UTC):
+                await send_once(
+                    store,
+                    self._rest,
+                    service,
+                    make_notice("started", event_id, start, end),
+                )
+            return
+        if export_error is None or "not yet armed" in export_error:
+            return
+        safe_state = (
+            "no export window remains programmed"
+            if window_line.startswith(("[APPLIED]", "[SKIP]"))
+            else "the Solis export state was not verified; remain in simulate and inspect it"
+        )
+        await send_once(
+            store,
+            self._rest,
+            service,
+            make_notice(
+                "aborted",
+                event_id,
+                start,
+                end,
+                reason=export_error,
+                safe_state=safe_state,
+            ),
+        )
+
     async def _has_live_verified_export(self, now: datetime) -> bool:
         """Return whether the last verified Axle export is still in progress.
 
@@ -1023,6 +1147,50 @@ def _export_identity(value: object, start: datetime, end: datetime) -> str:
     # Compatibility for a third-party adapter that has not yet supplied the
     # resolved identity; planner-owned ExportIntent always does.
     return f"export|{start.astimezone(UTC).isoformat()}|{end.astimezone(UTC).isoformat()}"
+
+
+def _export_notification_context(
+    value: object, resolved: tuple[datetime, datetime] | None
+) -> tuple[str, datetime, datetime, float | None, float | None] | None:
+    """Extract notification-safe identity and planning details from an export value."""
+    get = (
+        value.get
+        if isinstance(value, dict)
+        else lambda name, default=None: getattr(value, name, default)
+    )
+    identity = get("event_identity")
+    if isinstance(identity, tuple) and len(identity) == 3:
+        direction, start, end = identity
+        if (
+            isinstance(direction, str)
+            and isinstance(start, datetime)
+            and isinstance(end, datetime)
+            and start.tzinfo is not None
+            and end.tzinfo is not None
+        ):
+            return (
+                _export_identity(value, start, end),
+                start,
+                end,
+                _finite_number(get("planned_export_kw")),
+                _finite_number(get("dno_export_limit_kw")),
+            )
+    if resolved is None:
+        return None
+    start, end = resolved
+    return (
+        _export_identity(value, start, end),
+        start,
+        end,
+        _finite_number(get("planned_export_kw")),
+        _finite_number(get("dno_export_limit_kw")),
+    )
+
+
+def _finite_number(value: object) -> float | None:
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return None
 
 
 def solis_current_a(intent: ChargeIntent, settings: Settings) -> float:

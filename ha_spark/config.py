@@ -100,6 +100,7 @@ _OPTION_KEYS = frozenset(
         "axle_api_url",
         "axle_event_entity",
         "axle_event_rate_gbp_kwh",
+        "notify_service",
         # Battery model fallback.
         "battery_voltage_v",
         # Entity IDs: exposed so other installs can map their own sensors/controls
@@ -420,6 +421,9 @@ class Settings(BaseSettings):
     axle_api_url: str = Field(default="https://api.axle.energy")
     axle_event_entity: str = Field(default="")
     axle_event_rate_gbp_kwh: float = Field(default=1.0, ge=0)
+    # Generic HA notify.<service> target for supervised export lifecycle notices.
+    # V2L retains its separate v2l_notify_service contract.
+    notify_service: str = Field(default="")
 
     # HA entity IDs (all overridable). Blank by default; set via `ha-spark
     # onboard` (entity auto-discovery) or the `solis` preset (ha_spark/presets.py),

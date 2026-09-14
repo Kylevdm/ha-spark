@@ -151,12 +151,19 @@ class FailedCleanupReadback(FakeRest):
         return await super().get_state(entity_id)
 
 
-def _device(rest: FakeRest, tmp_path, *, timezone: str = "Europe/London") -> SolisDevice:
+def _device(
+    rest: FakeRest,
+    tmp_path,
+    *,
+    timezone: str = "Europe/London",
+    notify_service: str = "",
+) -> SolisDevice:
     settings = Settings(
         proactive_mode="on",
         db_path=str(tmp_path / "events.db"),
         inverter_power_switch_entity="select.solisac_power_switch",
         timezone=timezone,
+        notify_service=notify_service,
     )
     return SolisDevice(settings.devices[0], settings, rest)  # type: ignore[arg-type]
 
@@ -275,6 +282,114 @@ async def test_unchanged_export_program_skips_modbus_writes(tmp_path) -> None:
 
     assert not any(call[0] == "modbus" for call in rest.calls)
     assert any(line.startswith("[SKIP]") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_accepted_export_notification_is_sent_once_for_replanning(tmp_path) -> None:
+    rest = FakeRest()
+    device = _device(rest, tmp_path, notify_service="mobile_app_phone")
+    intent = _intent(_export())
+
+    await device.apply(intent)
+    await device.apply(intent)
+
+    notifications = [call for call in rest.calls if call[0:2] == ("notify", "mobile_app_phone")]
+    assert len(notifications) == 1
+    assert notifications[0][2]["title"] == "Axle export accepted"
+    assert "Required preparation" in notifications[0][2]["message"]
+
+
+@pytest.mark.asyncio
+async def test_simulate_mode_notifies_of_an_accepted_event_without_claiming_a_write(
+    tmp_path,
+) -> None:
+    rest = FakeRest()
+    settings = Settings(
+        proactive_mode="simulate",
+        db_path=str(tmp_path / "events.db"),
+        inverter_power_switch_entity="select.solisac_power_switch",
+        notify_service="mobile_app_phone",
+    )
+    device = SolisDevice(settings.devices[0], settings, rest)  # type: ignore[arg-type]
+
+    await device.apply(_intent(_export()))
+
+    notifications = [call for call in rest.calls if call[0:2] == ("notify", "mobile_app_phone")]
+    assert [call[2]["title"] for call in notifications] == ["Axle export accepted"]
+    assert not any(call[0] == "modbus" for call in rest.calls)
+
+
+@pytest.mark.asyncio
+async def test_changed_export_identity_gets_a_new_acceptance_notice(tmp_path) -> None:
+    rest = FakeRest()
+    device = _device(rest, tmp_path, notify_service="mobile_app_phone")
+
+    await device.apply(_intent(_export(hours_ahead=2.0)))
+    await device.apply(_intent(_export(hours_ahead=3.0)))
+
+    notifications = [call for call in rest.calls if call[0:2] == ("notify", "mobile_app_phone")]
+    assert [call[2]["title"] for call in notifications] == [
+        "Axle export accepted",
+        "Axle export accepted",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_notification_follows_verified_discharge_clear(tmp_path) -> None:
+    rest = FakeRest()
+    device = _device(rest, tmp_path, notify_service="mobile_app_phone")
+    export = _export()
+
+    await device.apply(_intent(export))
+    rest.calls.clear()
+    await device.apply(_intent())
+    await device.apply(_intent())
+
+    notifications = [call for call in rest.calls if call[0:2] == ("notify", "mobile_app_phone")]
+    assert len(notifications) == 1
+    assert notifications[0][2]["title"] == "Axle export cleanup verified"
+    assert "cleared and read back" in notifications[0][2]["message"]
+
+
+@pytest.mark.asyncio
+async def test_started_notification_follows_verified_active_export(tmp_path) -> None:
+    rest = FakeRest()
+    device = _device(rest, tmp_path, notify_service="mobile_app_phone")
+    now = datetime.now(_LONDON).replace(second=0, microsecond=0)
+    start = now - timedelta(minutes=30)
+    end = now + timedelta(minutes=30)
+    export = ExportIntent(
+        event_identity=("export", start, end),
+        window_start=start,
+        window_end=end,
+        planned_export_kw=3.2,
+        dno_export_limit_kw=7.36,
+        selected_slots=(start,),
+        slot_export_kw=(3.2,),
+    )
+
+    await device.apply(_intent(export))
+
+    notifications = [call for call in rest.calls if call[0:2] == ("notify", "mobile_app_phone")]
+    assert [call[2]["title"] for call in notifications] == [
+        "Axle export accepted",
+        "Axle export started",
+    ]
+    assert "read back successfully" in notifications[1][2]["message"]
+
+
+@pytest.mark.asyncio
+async def test_abort_notification_reports_refusal_and_safe_result(tmp_path) -> None:
+    rest = FakeRest(power="Off")
+    device = _device(rest, tmp_path, notify_service="mobile_app_phone")
+
+    await device.apply(_intent(_export()))
+
+    notifications = [call for call in rest.calls if call[0:2] == ("notify", "mobile_app_phone")]
+    assert len(notifications) == 1
+    assert notifications[0][2]["title"] == "Axle export aborted"
+    assert "power_switch is 'Off'" in notifications[0][2]["message"]
+    assert "no export window remains programmed" in notifications[0][2]["message"]
 
 
 @pytest.mark.asyncio
