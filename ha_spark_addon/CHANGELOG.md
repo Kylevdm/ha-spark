@@ -52,7 +52,13 @@
   so. The refusal is a deferral, not an abort: the event is re-offered every
   tick and arms itself once its clock face is the next occurrence, so nothing is
   remembered. An event already under way stays armed, so a day-of pickup still
-  delivers the remainder.
+  delivers the remainder. A pending export event now always counts as a changed
+  setpoint: arming is a function of the clock, not the plan, and an event
+  announced a day ahead yields an identical intent every tick — so the
+  unchanged-setpoint skip would have suppressed the very tick that arms the
+  window, missing the event outright. An event inside a fall-back night's
+  repeated hour is refused rather than armed, because the register holds a clock
+  face that comes round twice and fires on the first.
 - Half-hourly replanning (#46): the daemon recomputes the current plan on each
   local half-hour slot, including after startup during the day. It skips the
   inverter call when the commanded target, window, and holds are unchanged, so

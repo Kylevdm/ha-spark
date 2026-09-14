@@ -7,7 +7,11 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from ha_spark.config import Settings
-from ha_spark.devices.inverters.solis import SolisDevice, _export_window
+from ha_spark.devices.inverters.solis import (
+    SolisDevice,
+    _export_not_yet_armed,
+    _export_window,
+)
 from ha_spark.energy.export_store import ExportEventStore
 from ha_spark.energy.models import ChargeIntent, ExportIntent
 from ha_spark.energy.scheduler import setpoint_changed
@@ -468,3 +472,65 @@ async def test_a_midnight_wrapping_window_is_judged_on_its_start(tmp_path) -> No
     # The end's hour may be on the far side of midnight; the registers carry the
     # clock face either way, and the inverter reads the end as following the start.
     assert block[4:] == [start.hour, start.minute, end.hour, end.minute]
+
+
+# --- arming guard, with a pinned clock ---------------------------------------
+# `apply()` reads its own `datetime.now(tz)`, so the device-level tests above
+# can only express "relative to now". These drive `_export_not_yet_armed`
+# directly, which is where the midnight-wrap and DST cases become expressible.
+
+
+def _at(year: int, month: int, day: int, hour: int, minute: int = 0, *, fold: int = 0):
+    return datetime(year, month, day, hour, minute, tzinfo=_LONDON, fold=fold)
+
+
+def test_a_day_early_window_is_deferred_until_its_clock_face_has_passed() -> None:
+    """Tue 18:30 is refused every hour of Monday up to Monday's own 18:30.
+
+    From 19:00 Monday it is armed, and correctly so: Monday's 18:30 is spent, so
+    the next 18:30 the register can fire on is the event's own.
+    """
+    start, end = _at(2026, 9, 15, 18, 30), _at(2026, 9, 15, 19, 30)
+    for hour in range(19):
+        assert _export_not_yet_armed((start, end), _at(2026, 9, 14, hour, 0)) is not None, hour
+    for hour in range(19, 24):
+        assert _export_not_yet_armed((start, end), _at(2026, 9, 14, hour, 0)) is None, hour
+
+
+def test_the_window_arms_the_moment_its_clock_face_is_the_next_occurrence() -> None:
+    start, end = _at(2026, 9, 15, 18, 30), _at(2026, 9, 15, 19, 30)
+
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 14, 18, 29)) is not None
+    # One minute past Monday's 18:30 the next 18:30 is the event's own.
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 14, 18, 31)) is None
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 15, 12, 0)) is None
+
+
+def test_a_midnight_wrapping_window_is_armed_on_the_evening_it_starts() -> None:
+    """23:30-00:30 is judged on its start; the end lands on the next date."""
+    start, end = _at(2026, 9, 15, 23, 30), _at(2026, 9, 16, 0, 30)
+
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 15, 20, 0)) is None
+    # A day earlier the same clock face comes round first on the 14th.
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 14, 20, 0)) is not None
+
+
+def test_a_window_already_under_way_stays_armed() -> None:
+    start, end = _at(2026, 9, 15, 18, 30), _at(2026, 9, 15, 19, 30)
+
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 15, 18, 45)) is None
+
+
+def test_an_event_in_the_fall_back_repeated_hour_is_refused_not_armed() -> None:
+    """01:30 happens twice on 2026-10-25; the register fires on the first.
+
+    Comparing two same-zone aware datetimes ignores `fold`, so the second 01:30
+    would look like the first and arm 1.5 h early — an hour of unpaid export.
+    Refusing loses one event a year; arming exports outside the paid window.
+    """
+    start = _at(2026, 10, 25, 1, 30, fold=1)  # the second 01:30, GMT
+    end = _at(2026, 10, 25, 2, 30, fold=1)
+    now = _at(2026, 10, 25, 1, 0, fold=0)  # the first 01:00, still BST
+
+    assert now.astimezone(UTC) < start.astimezone(UTC)  # the event is genuinely ahead
+    assert _export_not_yet_armed((start, end), now) is not None

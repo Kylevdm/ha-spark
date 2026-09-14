@@ -181,6 +181,10 @@ one-supervised-event destination.
   tests the composition — the exact path a paid event arrives on. Trigger: the
   supervised proof (#134) is the live test; write the unit test if that proof
   surfaces a pickup problem, or before unattended delivery.
+  **Raised in priority by #144 (2026-09-14):** the day-early arming guard makes
+  the day-of tick the *only* tick on which an export window is programmed, so
+  this untested composition is now the whole delivery path rather than one
+  route into it.
 
 ### Release and installation observability (2026-09-12)
 
