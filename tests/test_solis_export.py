@@ -484,26 +484,42 @@ def _at(year: int, month: int, day: int, hour: int, minute: int = 0, *, fold: in
     return datetime(year, month, day, hour, minute, tzinfo=_LONDON, fold=fold)
 
 
-def test_a_day_early_window_is_deferred_until_its_clock_face_has_passed() -> None:
-    """Tue 18:30 is refused every hour of Monday up to Monday's own 18:30.
+def test_a_day_early_window_is_deferred_until_its_clock_window_has_closed() -> None:
+    """Tue 18:30-19:30 is refused every hour of Monday until Monday's window closes.
 
-    From 19:00 Monday it is armed, and correctly so: Monday's 18:30 is spent, so
-    the next 18:30 the register can fire on is the event's own.
+    From 20:00 Monday it is armed, and correctly so: Monday's 18:30-19:30 is
+    spent, so the next time the register's window opens is the event's own.
     """
     start, end = _at(2026, 9, 15, 18, 30), _at(2026, 9, 15, 19, 30)
-    for hour in range(19):
+    for hour in range(20):
         assert _export_not_yet_armed((start, end), _at(2026, 9, 14, hour, 0)) is not None, hour
-    for hour in range(19, 24):
+    for hour in range(20, 24):
         assert _export_not_yet_armed((start, end), _at(2026, 9, 14, hour, 0)) is None, hour
 
 
-def test_the_window_arms_the_moment_its_clock_face_is_the_next_occurrence() -> None:
+def test_the_window_arms_once_the_day_before_has_left_its_clock_window() -> None:
+    """Past Monday's 18:30 is not enough: Monday's 18:30-19:30 is still open.
+
+    The registers carry no date, so programming Tuesday's window at Monday 18:31
+    puts the inverter inside it at once and exports unpaid until 19:30. It arms
+    only when the clock has left the window, from which point the next time it
+    opens is the event's own.
+    """
     start, end = _at(2026, 9, 15, 18, 30), _at(2026, 9, 15, 19, 30)
 
     assert _export_not_yet_armed((start, end), _at(2026, 9, 14, 18, 29)) is not None
-    # One minute past Monday's 18:30 the next 18:30 is the event's own.
-    assert _export_not_yet_armed((start, end), _at(2026, 9, 14, 18, 31)) is None
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 14, 18, 31)) is not None
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 14, 19, 29)) is not None
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 14, 19, 30)) is None
     assert _export_not_yet_armed((start, end), _at(2026, 9, 15, 12, 0)) is None
+
+
+def test_a_midnight_wrapping_window_still_open_from_the_night_before_is_not_armed() -> None:
+    """At 00:15 the previous night's 23:30-00:30 is open on the clock."""
+    start, end = _at(2026, 9, 15, 23, 30), _at(2026, 9, 16, 0, 30)
+
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 15, 0, 15)) is not None
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 15, 0, 30)) is None
 
 
 def test_a_midnight_wrapping_window_is_armed_on_the_evening_it_starts() -> None:
