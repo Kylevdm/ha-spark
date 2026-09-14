@@ -738,3 +738,32 @@ async def test_a_failed_octopus_dispatch_fetch_is_untrusted(
 
     assert inputs.dispatches == ()
     assert inputs.dispatches_trusted is False
+
+
+@respx.mock
+async def test_read_dispatches_parses_a_readable_entity_as_trusted() -> None:
+    """The one definition of trust `gather_inputs` and the per-minute reconcile share."""
+    respx.get(f"{BASE}/states/binary_sensor.dispatch").mock(
+        return_value=_state(
+            "binary_sensor.dispatch",
+            "on",
+            {"planned_dispatches": [{"start": "2026-06-10T22:00:00+01:00",
+                                     "end": "2026-06-10T23:00:00+01:00"}]},
+        )
+    )
+    s = _settings()
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        dispatches, trusted = await sources.read_dispatches(s, rest)
+
+    assert [d.start.hour for d in dispatches] == [22]
+    assert trusted is True
+
+
+@respx.mock
+async def test_read_dispatches_makes_no_read_for_an_unset_entity() -> None:
+    any_get = respx.route(method="GET").mock(return_value=httpx.Response(404))
+    s = _settings().model_copy(update={"dispatch_entity": ""})
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        assert await sources.read_dispatches(s, rest) == ((), True)
+
+    assert not any_get.called
