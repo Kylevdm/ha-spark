@@ -21,6 +21,7 @@ from ha_spark.config import Settings
 from ha_spark.devices.base import ControlAuthority
 from ha_spark.devices.inverters.alphaess import AlphaESSDevice
 from ha_spark.devices.inverters.solis import SolisDevice
+from ha_spark.energy.export_store import ExportEventStore
 from ha_spark.energy.models import ChargeIntent, ExportIntent
 from ha_spark.energy.scheduler import setpoint_changed
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
@@ -114,6 +115,15 @@ class FakeRest:
             self.states[str(payload["entity_id"])] = str(payload["option"])
         if domain == "modbus" and service == "write_register":
             address = int(payload["address"])
+            if address == 43143:
+                fields = (
+                    "timed_charge_start_hours", "timed_charge_start_minutes",
+                    "timed_charge_end_hours", "timed_charge_end_minutes",
+                    "timed_discharge_start_hours", "timed_discharge_start_minutes",
+                    "timed_discharge_end_hours", "timed_discharge_end_minutes",
+                )
+                for field, value in zip(fields, list(payload["value"]), strict=True):  # type: ignore[call-overload]
+                    self.states[f"sensor.solis_control_{field}"] = str(value)
             if address == 43142:
                 self.states["sensor.solis_control_timed_discharge_current"] = "62.5"
             if address == 43141:
@@ -357,3 +367,122 @@ async def test_an_unreadable_switch_is_never_driven_on(tmp_path) -> None:
     # A refused release is reported as a warning, not a skip: while it holds,
     # the inverter is disabled and the house is entirely on grid import.
     assert any(line.startswith("[WARNING]") and "unreadable" in line for line in lines)
+
+
+# --- #143 §3: export is gated by the same hold trust ---
+
+
+def _program_slot_one_export(rest: FakeRest, export: ExportIntent) -> None:
+    """Leave Slot 1's discharge half resident at ``export``'s window, as a prior tick would."""
+    for field, value in (
+        ("timed_discharge_start_hours", export.window_start.hour),
+        ("timed_discharge_start_minutes", export.window_start.minute),
+        ("timed_discharge_end_hours", export.window_end.hour),
+        ("timed_discharge_end_minutes", export.window_end.minute),
+    ):
+        rest.states[f"sensor.solis_control_{field}"] = str(value)
+
+
+def _slot_one_writes(rest: FakeRest) -> list[object]:
+    return [
+        call[2]["value"]
+        for call in rest.calls
+        if call[0:2] == ("modbus", "write_register") and int(call[2]["address"]) == 43143
+    ]
+
+
+@pytest.mark.asyncio
+async def test_untrusted_hold_data_refuses_a_new_export_window(tmp_path) -> None:
+    """A failed dispatch read must not program a paid export across a hold it can't see.
+
+    The degraded empty holds pass ``hold_overlaps``; the reconcile would then
+    drive the switch ``Off`` mid-event and kill the export half-delivered.
+    """
+    rest = FakeRest(switch="On")
+    intent = replace(_intent(export=_export()), hold_trusted=False)
+    lines = await _device(rest, tmp_path).apply(intent)
+
+    assert any("export refused" in line and "untrusted" in line for line in lines)
+    assert _export_discharge_writes(rest) == []
+    assert all(value[4:] == [0, 0, 0, 0] for value in _slot_one_writes(rest))  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_untrusted_hold_data_leaves_an_already_programmed_export_alone(tmp_path) -> None:
+    rest = FakeRest(switch="On")
+    rest.states["sensor.solis_control_timed_discharge_current"] = "62.5"
+    export = _export()
+    _program_slot_one_export(rest, export)
+    intent = replace(_intent(export=export), hold_trusted=False)
+    lines = await _device(rest, tmp_path).apply(intent)
+
+    assert not any("export refused" in line for line in lines)
+    discharge = [
+        int(rest.states[f"sensor.solis_control_{field}"])
+        for field in (
+            "timed_discharge_start_hours", "timed_discharge_start_minutes",
+            "timed_discharge_end_hours", "timed_discharge_end_minutes",
+        )
+    ]
+    assert discharge == [
+        export.window_start.hour, export.window_start.minute,
+        export.window_end.hour, export.window_end.minute,
+    ]
+
+
+def _discharge_half(rest: FakeRest) -> list[int]:
+    return [
+        int(rest.states[f"sensor.solis_control_{field}"])
+        for field in (
+            "timed_discharge_start_hours", "timed_discharge_start_minutes",
+            "timed_discharge_end_hours", "timed_discharge_end_minutes",
+        )
+    ]
+
+
+def _shifted(export: ExportIntent) -> ExportIntent:
+    """The same event, as a trusted plan trimmed it around a dispatch hold."""
+    start = export.window_start + timedelta(minutes=30)
+    return replace(export, window_start=start, selected_slots=(start,))
+
+
+@pytest.mark.asyncio
+async def test_untrusted_hold_data_never_clears_a_live_verified_export(tmp_path) -> None:
+    """Losing the dispatch read must not cost the paid window already accepted.
+
+    A trusted plan trimmed the event around a dispatch; with the holds now
+    unreadable the planner offers the whole event instead. That wider window is
+    new and refused, but refusing it must not zero the verified one resident in
+    Slot 1 on every tick the read stays down.
+    """
+    rest = FakeRest(switch="On")
+    rest.states["sensor.solis_control_timed_discharge_current"] = "62.5"
+    export = _export()
+    accepted = _shifted(export)
+    _program_slot_one_export(rest, accepted)
+    async with ExportEventStore(str(tmp_path / "events.db")) as store:
+        await store.save("export|accepted", accepted.window_end)
+
+    lines = await _device(rest, tmp_path).apply(
+        replace(_intent(export=export), hold_trusted=False)
+    )
+
+    assert any("export refused" in line and "untrusted" in line for line in lines)
+    assert _discharge_half(rest) == [
+        accepted.window_start.hour, accepted.window_start.minute,
+        accepted.window_end.hour, accepted.window_end.minute,
+    ]
+    async with ExportEventStore(str(tmp_path / "events.db")) as store:
+        assert await store.load() is not None
+
+
+@pytest.mark.asyncio
+async def test_untrusted_hold_data_still_clears_an_unverified_resident_window(tmp_path) -> None:
+    """Only a window ha-spark verified is preserved; anything else stays guarded."""
+    rest = FakeRest(switch="On")
+    export = _export()
+    _program_slot_one_export(rest, _shifted(export))
+
+    await _device(rest, tmp_path).apply(replace(_intent(export=export), hold_trusted=False))
+
+    assert _discharge_half(rest) == [0, 0, 0, 0]

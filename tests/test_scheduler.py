@@ -289,6 +289,7 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         previous_at: datetime | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ) -> ChargePlan:
         calls.append("run")
         if len(calls) == 1:
@@ -415,6 +416,7 @@ async def test_run_forever_publishes_plan_to_api_state(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         previous_at: datetime | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -453,6 +455,7 @@ async def test_run_forever_reports_when_the_previous_run_happened_not_its_slot(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         previous_at: datetime | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ) -> ChargePlan:
         seen.append(previous_at)
         return _plan()
@@ -485,6 +488,7 @@ async def test_run_forever_guard_ticks_only_inside_window(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         previous_at: datetime | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -531,6 +535,7 @@ async def test_run_forever_no_guard_when_entity_unset(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         previous_at: datetime | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -564,6 +569,7 @@ async def test_run_forever_no_guard_when_charger_has_no_live_rate(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         previous_at: datetime | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -599,6 +605,7 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         previous_at: datetime | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -745,6 +752,7 @@ async def test_run_forever_samples_signals_every_interval(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         previous_at: datetime | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -994,6 +1002,7 @@ def _patch_monitor_loop(
             soc: SocMeasurement | None = None,
             previous_plan: ChargePlan | None = None,
             previous_at: datetime | None = None,
+            trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ) -> ChargePlan:
             run_once_socs.append(soc)
             return _plan()
@@ -1004,6 +1013,7 @@ def _patch_monitor_loop(
             soc: SocMeasurement | None = None,
             previous_plan: ChargePlan | None = None,
             previous_at: datetime | None = None,
+            trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ) -> ChargePlan:
             return _plan()
 
@@ -1283,6 +1293,7 @@ async def test_loop_blocked_plan_rate_never_becomes_guard_target(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         previous_at: datetime | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ) -> ChargePlan:
         # A plan computed from the tick's failed measurement: blocked at the
         # charger gate, but still a plan object (existence != applied).
@@ -1469,6 +1480,7 @@ async def test_run_forever_reconciles_every_minute_not_every_slot(
         now: datetime,
         *,
         previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ) -> list[str]:
         plans.append(plan)
         reconciled.append(now)
@@ -1521,6 +1533,7 @@ async def test_run_forever_does_not_reconcile_twice_on_a_slot_boundary(
         now: datetime,
         *,
         previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ) -> list[str]:
         reconciled.append(now)
         return []
@@ -1556,3 +1569,230 @@ async def test_reconcile_tick_logs_only_what_changed(
 
     assert first == repeat
     assert len(caplog.records) == 1
+
+
+# --- #140/#143 §3: degraded hold data is ignored, not believed ---
+
+_HOLD = (datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 23, 0))
+
+
+def _untrusted_plan() -> ChargePlan:
+    """A plan built from a failed dispatch read: its empty holds mean "unreadable"."""
+    return _plan(replace(_INTENT, holds=(), hold_trusted=False))
+
+
+class _IntentRecordingDevice:
+    def __init__(self) -> None:
+        self.intents: list[ChargeIntent] = []
+
+    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+        self.intents.append(intent)
+        return ["[SKIP] set inverter power switch to Off (already set)"]
+
+
+async def test_an_untrusted_tick_reconciles_against_the_last_trusted_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inside the last trusted hold, a failed read must keep the inverter held ``Off``."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    inside = datetime(2026, 6, 10, 22, 15)
+
+    await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"),
+        _untrusted_plan(),
+        inside,
+        trusted_holds=(_HOLD,),
+    )
+
+    [intent] = device.intents
+    assert intent.holds == (_HOLD,)
+    assert intent.hold_active(inside) is True
+
+
+async def test_a_trusted_hold_still_ends_on_its_own_end_time_while_reads_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No expiry timer and no stuck ``Off``: the known end time releases the hold."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    after = datetime(2026, 6, 10, 23, 5)
+
+    await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"),
+        _untrusted_plan(),
+        after,
+        trusted_holds=(_HOLD,),
+    )
+
+    [intent] = device.intents
+    assert intent.hold_active(after) is False
+
+
+async def test_an_untrusted_tick_with_no_trusted_holds_yet_does_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Booting into a failed read is no picture, and no picture never writes ``On``."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+
+    lines = await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"),
+        _untrusted_plan(),
+        datetime(2026, 6, 10, 22, 15),
+        trusted_holds=None,
+    )
+
+    assert device.intents == []
+    assert any("untrusted" in line for line in lines)
+
+
+async def test_a_trusted_tick_reconciles_against_its_own_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    plan = _plan(replace(_INTENT, holds=()))
+
+    await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"),
+        plan,
+        datetime(2026, 6, 10, 22, 15),
+        trusted_holds=(_HOLD,),
+    )
+
+    assert device.intents == [plan.charge_intent]
+
+
+async def test_run_once_reconciles_an_untrusted_plan_against_the_trusted_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The slot tick's own pass is the one a failed read reaches first."""
+    reconciled: list[ChargeIntent] = []
+    current = _untrusted_plan()
+
+    async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
+        return SimpleNamespace(plan=current, inputs=object(), load_source="test")
+
+    class FakeDevice:
+        async def apply(self, intent: ChargeIntent) -> list[str]:
+            return ["[APPLIED] test"]
+
+        async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+            reconciled.append(intent)
+            return []
+
+    async def noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_args: FakeDevice())
+    monkeypatch.setattr(scheduler, "publish_plan", noop)
+    monkeypatch.setattr(scheduler, "_record_forecast", noop)
+    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
+    monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
+
+    await run_once(Settings(), soc=current.soc, trusted_holds=(_HOLD,))
+    await run_once(Settings(), soc=current.soc)
+
+    # With a trusted set it substitutes; without one it does not reconcile at all.
+    assert [intent.holds for intent in reconciled] == [(_HOLD,)]
+
+
+async def test_run_forever_remembers_holds_only_from_trusted_plans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted = _plan(replace(_INTENT, holds=(_HOLD,)))
+    plans = iter([trusted, _untrusted_plan()])
+    run_once_saw: list[object] = []
+    reconcile_saw: list[object] = []
+
+    async def fake_run_once(_s: Settings, **kw: object) -> ChargePlan:
+        run_once_saw.append(kw.get("trusted_holds"))
+        return next(plans)
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> list[str]:
+        reconcile_saw.append(trusted_holds)
+        return []
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    stop = _patch_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 22, 0),  # trusted plan
+            datetime(2026, 6, 10, 22, 1),
+            datetime(2026, 6, 10, 22, 30),  # untrusted plan
+            datetime(2026, 6, 10, 22, 31),
+        ],
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert run_once_saw == [None, (_HOLD,)]
+    assert reconcile_saw == [(_HOLD,), (_HOLD,)]
+
+
+async def test_run_forever_forgets_trusted_holds_on_hot_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reload may change the dispatch source; the old picture is not evidence."""
+    captured: list[AppState] = []
+    reconcile_saw: list[object] = []
+
+    class _CapturingState(AppState):
+        def __init__(self, **kw: object) -> None:
+            super().__init__(**kw)  # type: ignore[arg-type]
+            captured.append(self)
+
+    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+        return _plan(replace(_INTENT, holds=(_HOLD,)))
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> list[str]:
+        reconcile_saw.append(trusted_holds)
+        captured[0].settings = Settings(
+            ha_url="http://ha.test", ha_token="t", plan_run_time="22:00"
+        )
+        return []
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "AppState", _CapturingState)
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    stop = _patch_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 22, 0),
+            datetime(2026, 6, 10, 22, 1),  # reconciles, then the options are rewritten
+            datetime(2026, 6, 10, 22, 2),
+        ],
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert reconcile_saw == [(_HOLD,), None]

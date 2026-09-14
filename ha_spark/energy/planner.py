@@ -474,6 +474,7 @@ def compute_plan(
         window_end=cfg.window_end,
         holds=holds,
         export=export,
+        hold_trusted=inputs.dispatches_trusted,
     )
 
     return ChargePlan(

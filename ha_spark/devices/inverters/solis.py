@@ -143,6 +143,9 @@ class SolisDevice:
         export_store = ExportEventStore(self._settings.db_path)
         export = _export_window(intent, tz)
         export_ready = export is not None
+        # Slot 1's verified discharge half, kept when an untrusted hold read
+        # refuses a new window (#143 §3).
+        kept_discharge: list[int] | None = None
         if raw_export is not None and export is None:
             export_ready = False
             lines.append("[BLOCKED] export refused: malformed export window")
@@ -159,6 +162,10 @@ class SolisDevice:
                 # refuse an evening event, and an evening dispatch must refuse it
                 # even when the plan is computed hours earlier.
                 export_error = "a dispatch hold overlaps the export window"
+            if export_error is None and not intent.hold_trusted:
+                export_error, kept_discharge = await self._untrusted_holds_export(
+                    export, mode, now
+                )
             if mode == "on" and export_error is None:
                 export_error = await self._require_power_switch_on()
             if export_error is not None:
@@ -193,6 +200,7 @@ class SolisDevice:
             intent,
             window_block,
             export_window=export if export_ready else None,
+            kept_discharge=kept_discharge,
         )
         lines.append(window_line)
         # Zero-guard the slots the planner does not drive so a stale manual
@@ -228,6 +236,7 @@ class SolisDevice:
         blocked: str | None,
         *,
         export_window: tuple[datetime, datetime] | None = None,
+        kept_discharge: list[int] | None = None,
     ) -> str:
         """Program charge slot 1's window block, write-if-changed, read-back verified.
 
@@ -243,13 +252,16 @@ class SolisDevice:
                 f" and export {export_start:%H:%M}-{export_end:%H:%M}"
                 f" at {_EXPORT_CURRENT_A:g} A"
             )
+        elif kept_discharge is not None:
+            desc += " and keep the verified export window"
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         if mode == "simulate":
             log.info("[SIMULATE] would %s", desc)
             return f"[SIMULATE] would {desc}"
         if mode in ("off", "observe"):
             return f"[{mode.upper()}] computed: {desc}"
-        if blocked and export_window is None:
+        keeps_discharge = export_window is not None or kept_discharge is not None
+        if blocked and not keeps_discharge:
             # Grid-charge permission is not a prerequisite for clearing a
             # resident discharge schedule. Inspect the block first so an
             # ordinary blocked charge request still reports BLOCKED when no
@@ -261,8 +273,8 @@ class SolisDevice:
             if any(existing[4:]):
                 return await self._clear_discharge_window(desc)
             return f"[BLOCKED] {desc}: {blocked}"
-        zero_charge = export_window is not None and solis_current_a(intent, self._settings) <= 0
-        if blocked and export_window is not None and not zero_charge:
+        zero_charge = keeps_discharge and solis_current_a(intent, self._settings) <= 0
+        if blocked and keeps_discharge and not zero_charge:
             # An export write must not be gated by the charge-only work-mode
             # bit. Preserve the resident charge half and replace the discharge
             # half in one atomic Slot 1 block.
@@ -288,7 +300,7 @@ class SolisDevice:
                 export_window[1].minute,
             ]
             if export_window is not None
-            else [0, 0, 0, 0]
+            else kept_discharge or [0, 0, 0, 0]
         )
         want_block = [*charge_values, *discharge_values]
         try:
@@ -522,6 +534,47 @@ class SolisDevice:
             log.warning("[WARNING] %s, but %s", desc, mismatch)
             return False, f"[WARNING] {desc}, but {mismatch}"
         return True, f"[APPLIED] {desc}" if wrote else f"[SKIP] {desc} (already set)"
+
+    async def _untrusted_holds_export(
+        self, export: tuple[datetime, datetime], mode: str, now: datetime
+    ) -> tuple[str | None, list[int] | None]:
+        """Refuse a *new* export window while hold data is untrusted (#143 §3).
+
+        Returns the refusal (``None`` to proceed) and the Slot 1 discharge half
+        to keep in place of the refused window.
+
+        A failed dispatch read leaves the holds empty, so ``hold_overlaps``
+        would admit a window across a dispatch ha-spark can no longer see, and
+        the reconcile would then drive the switch ``Off`` mid-event and kill the
+        export half-delivered. Same class of refusal as #132's underfunded
+        event, and the next tick retries.
+
+        An already-programmed window is left alone. When it is this very window,
+        re-applying it is a write-if-changed no-op. When it differs — a trusted
+        plan trimmed the event around a dispatch, and with the holds gone the
+        planner now offers the whole event — refusing must not zero it, or the
+        paid window is cleared on every tick the read stays down. Only a window
+        ha-spark verified and recorded, and whose end is still ahead, is kept:
+        anything else resident stays subject to the usual guard. It is captured
+        here, before the charge-current step can deactivate Slot 1. Outside
+        ``on`` nothing is resident, and an unreadable slot fails closed.
+        """
+        refusal = "hold data untrusted; not programming a new export window"
+        if mode != "on":
+            return refusal, None
+        try:
+            resident = (await self._read_slot_block(1))[4:]
+        except Exception:  # noqa: BLE001 - fail closed
+            return refusal, None
+        start, end = export
+        if resident == [start.hour, start.minute, end.hour, end.minute]:
+            return None, None
+        if any(resident):
+            async with ExportEventStore(self._settings.db_path) as store:
+                record = await store.load()
+            if record is not None and record[1] > now.astimezone(UTC):
+                return f"{refusal}; keeping the verified window already in Slot 1", resident
+        return refusal, None
 
     async def _require_power_switch_on(self) -> str | None:
         entity = self._config.entities.get("power_switch", "")

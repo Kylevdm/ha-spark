@@ -653,3 +653,88 @@ async def test_gather_inputs_rejects_soc_without_last_reported(
 
     assert inputs.soc.status is SocStatus.REPORT_TIME_UNUSABLE
     assert inputs.soc_now == 0.0
+
+
+# --- #140/#143 §3: hold trust — `()` must stop meaning both "none" and "unreadable" ---
+
+
+async def _gather_with_dispatch(
+    monkeypatch: pytest.MonkeyPatch, dispatch: httpx.Response, **kw: Any
+) -> Any:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    with respx.mock:
+        respx.get(f"{BASE}/states/binary_sensor.dispatch").mock(return_value=dispatch)
+        respx.route(method="GET").mock(return_value=httpx.Response(404))
+        s = _settings().model_copy(update=kw)
+        async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+            inputs, _cfg, _src = await gather_inputs(s, rest)
+    return inputs
+
+
+async def test_a_readable_dispatch_entity_with_no_dispatches_is_trusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = await _gather_with_dispatch(
+        monkeypatch,
+        _state("binary_sensor.dispatch", "off", {"planned_dispatches": []}),
+    )
+
+    assert inputs.dispatches == ()
+    assert inputs.dispatches_trusted is True
+
+
+async def test_a_missing_dispatch_entity_is_untrusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = await _gather_with_dispatch(monkeypatch, httpx.Response(404))
+
+    assert inputs.dispatches == ()
+    assert inputs.dispatches_trusted is False
+
+
+@pytest.mark.parametrize("unreadable", ["unavailable", "unknown"])
+async def test_an_unavailable_dispatch_entity_is_untrusted(
+    monkeypatch: pytest.MonkeyPatch, unreadable: str
+) -> None:
+    inputs = await _gather_with_dispatch(
+        monkeypatch, _state("binary_sensor.dispatch", unreadable)
+    )
+
+    assert inputs.dispatches_trusted is False
+
+
+async def test_no_dispatch_entity_configured_is_trusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A household with no dispatch source has no holds, not unreadable ones.
+
+    Every tariff provider folds dispatches into holds, so treating the unset
+    entity as untrusted would refuse every Axle export for ever.
+    """
+    inputs = await _gather_with_dispatch(monkeypatch, httpx.Response(404), dispatch_entity="")
+
+    assert inputs.dispatches_trusted is True
+
+
+@respx.mock
+async def test_a_failed_octopus_dispatch_fetch_is_untrusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET", url__startswith="http://ha.test").mock(
+        return_value=httpx.Response(404)
+    )
+    respx.route(url__startswith="http://octo.test").mock(return_value=httpx.Response(401))
+
+    s = _octopus_settings()
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, _cfg, _src = await gather_inputs(s, rest)
+
+    assert inputs.dispatches == ()
+    assert inputs.dispatches_trusted is False

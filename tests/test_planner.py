@@ -178,6 +178,15 @@ def test_daytime_dispatch_becomes_a_hold() -> None:
     assert len(plan.charge_intent.holds) == 1
 
 
+@pytest.mark.parametrize("trusted", [True, False])
+def test_hold_trust_travels_from_inputs_onto_the_intent(trusted: bool) -> None:
+    """The reconcile and export gate see the read's verdict, not just its holds (#143 §3)."""
+    inp = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2,
+        dispatches_trusted=trusted,
+    )
+    assert _plan(inp, cfg()).charge_intent.hold_trusted is trusted
+
+
 def test_axle_export_reserves_a_full_event_and_the_post_event_cheap_slot() -> None:
     """A funded event uses whole slots at the DNO ceiling and holds back after it."""
     event = FlexibilityEvent(
