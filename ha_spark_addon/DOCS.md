@@ -38,6 +38,16 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `ha_template_charge_needed_entity` | Optional HA template sensor for comparison logging |
 | `inverter` | Which inverter ha-spark controls: `solis` (default) or `alphaess` |
 
+### Power-switch holds
+
+On the Solis path, ha-spark re-reads dispatch state and reconciles
+`inverter_power_switch_entity` every minute, separately from the half-hourly
+plan. It turns the switch `Off` during an active dispatch hold and `On`
+otherwise. When ha-spark relinquishes control, including during a clean
+shutdown, it writes a safe state: `On`, the configured cheap charge window
+(default `23:30`-`05:30`), and an empty discharge window (`00:00`-`00:00`). If
+dispatch state cannot be trusted, ha-spark will not open a new export window.
+
 ### Derived base load (ADR-0001, optional)
 
 ha-spark's load forecast normally trusts a single user-supplied consumption
