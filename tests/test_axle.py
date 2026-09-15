@@ -301,3 +301,27 @@ async def test_read_axle_event_treats_unavailable_ha_state_as_failure() -> None:
     with pytest.raises(AxleApiError):
         async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
             await read_axle_event(settings, rest, now=NOW)
+
+
+@pytest.mark.parametrize("failure", ["transport", "status", "malformed"])
+@respx.mock
+async def test_axle_failures_never_expose_the_api_key(failure: str, caplog) -> None:
+    secret = "axle-api-key-sentinel"
+    route = respx.get(f"{AXLE}/vpp/home-assistant/event")
+    if failure == "transport":
+        route.mock(side_effect=httpx.ConnectError(f"transport failed: {secret}"))
+    elif failure == "status":
+        route.mock(return_value=httpx.Response(503, text=f"upstream failed: {secret}"))
+    else:
+        route.mock(return_value=httpx.Response(200, json={"start_time": secret}))
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(AxleApiError) as caught:
+            await fetch_axle_event(
+                Settings(axle_api_url=AXLE, axle_api_key=secret),
+                now=NOW,
+            )
+
+    assert secret not in caplog.text
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)
