@@ -176,9 +176,10 @@ def test_v2l_options_load_from_overlay() -> None:
     assert s.v2l_round_trip_efficiency == 0.8
     assert s.v2l_budget_kwh == 5.0
     # defaults
-    assert Settings().v2l_power_entity == ""
-    assert Settings().v2l_round_trip_efficiency == 0.85
-    assert Settings().v2l_cutoff_time == "01:00"
+    defaults = Settings(_env_file=None)
+    assert defaults.v2l_power_entity == ""
+    assert defaults.v2l_round_trip_efficiency == 0.85
+    assert defaults.v2l_cutoff_time == "01:00"
 
 
 def test_generic_notify_service_is_available_without_changing_v2l_notify() -> None:
