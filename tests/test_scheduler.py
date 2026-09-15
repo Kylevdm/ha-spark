@@ -26,6 +26,7 @@ from ha_spark.energy.scheduler import (
     run_forever,
     run_once,
     sample_signals,
+    setpoint_changed,
     should_run,
 )
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
@@ -1322,3 +1323,51 @@ async def test_loop_blocked_plan_rate_never_becomes_guard_target(
     # live setpoint; the adopted value, not the blocked plan's rate, is the
     # ceiling the second tick sees.
     assert guard_targets == [None, 2040.0]
+
+
+def test_a_pending_export_event_always_re_applies(tmp_path) -> None:
+    """The arming boundary is a clock event, not a plan change (#144).
+
+    An Axle event announced a day ahead yields an equal `ExportIntent` on every
+    tick. Comparing plans alone would report "unchanged" right through the tick
+    that would have armed the window, so the event would never be programmed.
+    """
+    from datetime import UTC, datetime, time, timedelta
+    from zoneinfo import ZoneInfo
+
+    from ha_spark.energy.models import ChargeIntent, ExportIntent
+    from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+
+    london = ZoneInfo("Europe/London")
+    observed = datetime.now(UTC)
+    soc = SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=observed,
+        value=60.0,
+        raw_state="60",
+        reported_at=observed,
+        age_s=0.0,
+        max_age_s=600.0,
+    )
+    start = datetime(2026, 9, 15, 18, 30, tzinfo=london)
+    end = start + timedelta(hours=1)
+    export = ExportIntent(
+        event_identity=("export", start, end),
+        window_start=start,
+        window_end=end,
+        planned_export_kw=3.2,
+        dno_export_limit_kw=7.36,
+        selected_slots=(start,),
+        slot_export_kw=(3.2,),
+    )
+    pending = ChargeIntent(77.0, soc, time(23, 30), time(5, 30), export=export)
+
+    assert setpoint_changed(
+        pending,
+        pending,
+        since=datetime(2026, 9, 14, 12, 0, tzinfo=london),
+        now=datetime(2026, 9, 15, 18, 30, tzinfo=london),
+    ) is True
+    # Without an event the plan-value comparison still governs.
+    plain = ChargeIntent(77.0, soc, time(23, 30), time(5, 30))
+    assert setpoint_changed(plain, plain) is False

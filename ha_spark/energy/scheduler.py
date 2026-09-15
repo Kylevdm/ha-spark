@@ -107,7 +107,19 @@ def setpoint_changed(
     plan, so crossing a hold boundary is a changed command even between
     identical intents — without this the reconcile would never run, because a
     hold ending is not a plan change. Omitting them compares the plans alone.
+
+    A pending export event is always a changed command, for the same reason one
+    step further on (#144). The Solis driver arms an export window only once its
+    clock face next comes round at the event, which is a function of the clock,
+    not of the plan — and an Axle event announced a day ahead produces an equal
+    ``ExportIntent`` tick after tick. Comparing plans alone would skip every
+    apply between announcement and event, so the window would never be
+    programmed and the paid event would be missed outright. Re-applying is
+    cheap: every device write is write-if-changed and read-back verified, so an
+    unchanged program costs reads, not writes.
     """
+    if getattr(current, "export", None) is not None:
+        return True
     if (
         since is not None
         and now is not None
