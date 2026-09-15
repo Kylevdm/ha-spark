@@ -375,5 +375,5 @@ async def test_cmd_v2l_prints_tally(tmp_path: Path, capsys) -> None:  # type: ig
 async def test_cmd_v2l_unconfigured_returns_2(tmp_path: Path) -> None:
     from ha_spark.cli import _cmd_v2l
 
-    s = Settings(db_path=str(tmp_path / "ha_spark.db"))
+    s = Settings(db_path=str(tmp_path / "ha_spark.db"), v2l_power_entity="")
     assert await _cmd_v2l(s) == 2
