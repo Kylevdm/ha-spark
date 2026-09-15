@@ -7,7 +7,11 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from ha_spark.config import Settings
-from ha_spark.devices.inverters.solis import SolisDevice, _export_window
+from ha_spark.devices.inverters.solis import (
+    SolisDevice,
+    _export_not_yet_armed,
+    _export_window,
+)
 from ha_spark.energy.export_store import ExportEventStore
 from ha_spark.energy.models import ChargeIntent, ExportIntent
 from ha_spark.energy.scheduler import setpoint_changed
@@ -31,13 +35,20 @@ def _soc(value: float = 60.0) -> SocMeasurement:
 
 
 def _export(
-    *, event_start: int = 10, event_end: int = 12, tz: ZoneInfo = _LONDON
+    *, hours_ahead: float = 2.0, duration_h: float = 2.0, tz: ZoneInfo = _LONDON
 ) -> ExportIntent:
+    """An armed event: near enough that its clock face next comes round at it.
+
+    Built relative to ``now`` rather than pinned to a time of day. A fixed
+    "tomorrow at 10:00" is only armed when the suite happens to run after
+    10:00 — before that the day-early guard refuses it, which is the whole
+    point of #144.
+    """
     # Local tz by default, as the planner builds its slots from a local horizon.
-    start = (datetime.now(tz) + timedelta(days=1)).replace(
-        hour=event_start, minute=0, second=0, microsecond=0
+    start = (datetime.now(tz) + timedelta(hours=hours_ahead)).replace(
+        minute=0, second=0, microsecond=0
     )
-    end = start.replace(hour=event_end)
+    end = start + timedelta(hours=duration_h)
     return ExportIntent(
         event_identity=("export", start, end),
         window_start=start,
@@ -311,7 +322,7 @@ def test_export_value_is_part_of_scheduler_setpoint() -> None:
 def test_export_cancellation_and_replacement_are_setpoint_changes() -> None:
     accepted = _intent(_export())
     assert setpoint_changed(accepted, _intent()) is True
-    assert setpoint_changed(accepted, replace(accepted, export=_export(event_start=11))) is True
+    assert setpoint_changed(accepted, replace(accepted, export=_export(hours_ahead=3))) is True
 
 
 def test_export_window_is_resolved_to_inverter_local_wall_clock() -> None:
@@ -344,7 +355,8 @@ def test_export_window_is_resolved_to_inverter_local_wall_clock() -> None:
 async def test_export_registers_follow_the_configured_timezone(tmp_path) -> None:
     """A non-UTC household clock shifts the programmed window, not the identity."""
     rest = FakeRest()
-    export = _export(tz=ZoneInfo("UTC"))  # tomorrow 10:00-12:00 UTC
+    kolkata = ZoneInfo("Asia/Kolkata")
+    export = _export(tz=ZoneInfo("UTC"))  # a whole UTC hour, so :30 in IST
     device = _device(rest, tmp_path, timezone="Asia/Kolkata")  # UTC+5:30, no DST
 
     await device.apply(_intent(export))
@@ -353,4 +365,172 @@ async def test_export_registers_follow_the_configured_timezone(tmp_path) -> None
         call[2]["value"] for call in rest.calls
         if call[0:2] == ("modbus", "write_register") and call[2]["address"] == 43143
     )
-    assert block == [23, 30, 5, 30, 15, 30, 17, 30]
+    start_ist = export.window_start.astimezone(kolkata)
+    end_ist = export.window_end.astimezone(kolkata)
+    assert block == [23, 30, 5, 30, start_ist.hour, 30, end_ist.hour, 30]
+
+
+def _discharge_writes(rest: FakeRest) -> list[dict[str, object]]:
+    """Every write that could actuate a discharge: the current, or Slot 1's second half."""
+    out: list[dict[str, object]] = []
+    for call in rest.calls:
+        if call[0:2] != ("modbus", "write_register"):
+            continue
+        payload = call[2]
+        if int(payload["address"]) == 43142:
+            out.append(payload)
+        if int(payload["address"]) == 43143 and any(list(payload["value"])[4:]):
+            out.append(payload)
+    return out
+
+
+@pytest.mark.asyncio
+async def test_an_event_a_day_out_is_refused_until_its_clock_face_comes_round(tmp_path) -> None:
+    """The Slot 1 registers hold no date, so a day-early write exports a day early.
+
+    25 hours ahead puts the event's clock face roughly an hour from now: writing
+    it today would discharge the battery tonight, outside the paid window.
+    """
+    rest = FakeRest()
+    export = _export(hours_ahead=25.0)
+
+    lines = await _device(rest, tmp_path).apply(_intent(export))
+
+    assert any("export refused" in line and "not yet armed" in line for line in lines)
+    assert _discharge_writes(rest) == []
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_event_arms_once_its_clock_face_is_the_next_occurrence(tmp_path) -> None:
+    """The same event, re-offered nearer the time, programs normally."""
+    rest = FakeRest()
+
+    lines = await _device(rest, tmp_path).apply(_intent(_export(hours_ahead=2.0)))
+
+    assert not any("export refused" in line for line in lines)
+    assert _discharge_writes(rest) != []
+
+
+@pytest.mark.asyncio
+async def test_a_day_early_refusal_leaves_no_event_record_to_clean_up(tmp_path) -> None:
+    """Deferral is not a verified event: nothing is persisted, nothing is cleared."""
+    rest = FakeRest()
+
+    await _device(rest, tmp_path).apply(_intent(_export(hours_ahead=25.0)))
+
+    async with ExportEventStore(str(tmp_path / "events.db")) as store:
+        assert await store.load() is None
+
+
+@pytest.mark.asyncio
+async def test_an_event_already_under_way_is_still_armed_for_its_remainder(tmp_path) -> None:
+    """A day-of pickup mid-event must deliver the rest, not defer for 24 hours."""
+    rest = FakeRest()
+    now = datetime.now(_LONDON).replace(second=0, microsecond=0)
+    start = now - timedelta(minutes=30)
+    end = now + timedelta(minutes=30)
+    export = ExportIntent(
+        event_identity=("export", start, end),
+        window_start=start,
+        window_end=end,
+        planned_export_kw=3.2,
+        dno_export_limit_kw=7.36,
+        selected_slots=(start,),
+        slot_export_kw=(3.2,),
+    )
+
+    lines = await _device(rest, tmp_path).apply(_intent(export))
+
+    assert not any("export refused" in line for line in lines)
+    assert _discharge_writes(rest) != []
+
+
+@pytest.mark.asyncio
+async def test_a_midnight_wrapping_window_is_judged_on_its_start(tmp_path) -> None:
+    """Only the start's clock face decides arming; the end may be the next day."""
+    rest = FakeRest()
+    now = datetime.now(_LONDON).replace(second=0, microsecond=0)
+    start = (now + timedelta(hours=1)).replace(minute=0)
+    end = start + timedelta(hours=2)
+    wrapping = ExportIntent(
+        event_identity=("export", start, end),
+        window_start=start,
+        window_end=end,
+        planned_export_kw=3.2,
+        dno_export_limit_kw=7.36,
+        selected_slots=(start,),
+        slot_export_kw=(3.2,),
+    )
+
+    lines = await _device(rest, tmp_path).apply(_intent(wrapping))
+
+    assert not any("export refused" in line for line in lines)
+    block = next(
+        call[2]["value"] for call in rest.calls
+        if call[0:2] == ("modbus", "write_register") and int(call[2]["address"]) == 43143
+    )
+    # The end's hour may be on the far side of midnight; the registers carry the
+    # clock face either way, and the inverter reads the end as following the start.
+    assert block[4:] == [start.hour, start.minute, end.hour, end.minute]
+
+
+# --- arming guard, with a pinned clock ---------------------------------------
+# `apply()` reads its own `datetime.now(tz)`, so the device-level tests above
+# can only express "relative to now". These drive `_export_not_yet_armed`
+# directly, which is where the midnight-wrap and DST cases become expressible.
+
+
+def _at(year: int, month: int, day: int, hour: int, minute: int = 0, *, fold: int = 0):
+    return datetime(year, month, day, hour, minute, tzinfo=_LONDON, fold=fold)
+
+
+def test_a_day_early_window_is_deferred_until_its_clock_face_has_passed() -> None:
+    """Tue 18:30 is refused every hour of Monday up to Monday's own 18:30.
+
+    From 19:00 Monday it is armed, and correctly so: Monday's 18:30 is spent, so
+    the next 18:30 the register can fire on is the event's own.
+    """
+    start, end = _at(2026, 9, 15, 18, 30), _at(2026, 9, 15, 19, 30)
+    for hour in range(19):
+        assert _export_not_yet_armed((start, end), _at(2026, 9, 14, hour, 0)) is not None, hour
+    for hour in range(19, 24):
+        assert _export_not_yet_armed((start, end), _at(2026, 9, 14, hour, 0)) is None, hour
+
+
+def test_the_window_arms_the_moment_its_clock_face_is_the_next_occurrence() -> None:
+    start, end = _at(2026, 9, 15, 18, 30), _at(2026, 9, 15, 19, 30)
+
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 14, 18, 29)) is not None
+    # One minute past Monday's 18:30 the next 18:30 is the event's own.
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 14, 18, 31)) is None
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 15, 12, 0)) is None
+
+
+def test_a_midnight_wrapping_window_is_armed_on_the_evening_it_starts() -> None:
+    """23:30-00:30 is judged on its start; the end lands on the next date."""
+    start, end = _at(2026, 9, 15, 23, 30), _at(2026, 9, 16, 0, 30)
+
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 15, 20, 0)) is None
+    # A day earlier the same clock face comes round first on the 14th.
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 14, 20, 0)) is not None
+
+
+def test_a_window_already_under_way_stays_armed() -> None:
+    start, end = _at(2026, 9, 15, 18, 30), _at(2026, 9, 15, 19, 30)
+
+    assert _export_not_yet_armed((start, end), _at(2026, 9, 15, 18, 45)) is None
+
+
+def test_an_event_in_the_fall_back_repeated_hour_is_refused_not_armed() -> None:
+    """01:30 happens twice on 2026-10-25; the register fires on the first.
+
+    Comparing two same-zone aware datetimes ignores `fold`, so the second 01:30
+    would look like the first and arm 1.5 h early — an hour of unpaid export.
+    Refusing loses one event a year; arming exports outside the paid window.
+    """
+    start = _at(2026, 10, 25, 1, 30, fold=1)  # the second 01:30, GMT
+    end = _at(2026, 10, 25, 2, 30, fold=1)
+    now = _at(2026, 10, 25, 1, 0, fold=0)  # the first 01:00, still BST
+
+    assert now.astimezone(UTC) < start.astimezone(UTC)  # the event is genuinely ahead
+    assert _export_not_yet_armed((start, end), now) is not None
