@@ -325,3 +325,41 @@ async def test_axle_failures_never_expose_the_api_key(failure: str, caplog) -> N
     assert secret not in caplog.text
     assert secret not in str(caught.value)
     assert secret not in repr(caught.value)
+
+
+@pytest.mark.parametrize("failure", ["transport", "status", "malformed"])
+@respx.mock
+async def test_axle_ha_mirror_failures_never_expose_the_auth_token(
+    failure: str, caplog
+) -> None:
+    secret = "ha-auth-token-sentinel"
+    route = respx.get(f"{HA}/states/sensor.axle_event")
+    if failure == "transport":
+        route.mock(side_effect=httpx.ConnectError(f"transport failed: {secret}"))
+    elif failure == "status":
+        route.mock(return_value=httpx.Response(503, text=f"upstream failed: {secret}"))
+    else:
+        route.mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "entity_id": "sensor.axle_event",
+                    "state": "on",
+                    "attributes": secret,
+                },
+            )
+        )
+    settings = Settings(
+        ha_url="http://ha.test",
+        ha_token=secret,
+        axle_event_entity="sensor.axle_event",
+    )
+
+    with caplog.at_level("INFO"):
+        async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+            with pytest.raises(AxleApiError) as caught:
+                await read_axle_event(settings, rest, now=NOW)
+
+    assert secret not in caplog.text
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)
