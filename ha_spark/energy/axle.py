@@ -27,8 +27,8 @@ def _timestamp(value: Any, field: str) -> datetime:
         raise AxleApiError(f"Axle event has no usable {field}")
     try:
         parsed = datetime.fromisoformat(value)
-    except ValueError as exc:
-        raise AxleApiError(f"Axle event has an invalid {field}") from exc
+    except ValueError:
+        raise AxleApiError(f"Axle event has an invalid {field}") from None
     if parsed.tzinfo is None:
         raise AxleApiError(f"Axle event {field} must include a timezone")
     return parsed.astimezone(UTC)
@@ -97,8 +97,8 @@ async def fetch_axle_event(
             response = await client.get(url)
             response.raise_for_status()
             payload = response.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        raise AxleApiError("Axle event request failed") from exc
+    except (httpx.HTTPError, ValueError):
+        raise AxleApiError("Axle event request failed") from None
     if payload is not None and not isinstance(payload, dict):
         raise AxleApiError("Axle event response is not an object")
     return parse_axle_event(
@@ -127,8 +127,8 @@ async def read_axle_event(
         raise AxleApiError("Axle event source is not configured")
     try:
         state = await rest.get_state(settings.axle_event_entity)
-    except Exception as exc:  # noqa: BLE001 - source failures degrade the schedule
-        raise AxleApiError("Home Assistant Axle event read failed") from exc
+    except Exception:  # noqa: BLE001 - source failures degrade the schedule
+        raise AxleApiError("Home Assistant Axle event read failed") from None
     payload = dict(state.attributes)
     state_value = state.state.strip().lower()
     if state_value in {"unknown", "unavailable"}:
