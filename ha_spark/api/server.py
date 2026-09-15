@@ -101,6 +101,7 @@ class AppState:
         clobber the real secret with the mask. Raises if the merged config fails
         validation (the caller maps that to 400).
         """
+        previous_mode = self.settings.proactive_mode
         current: dict[str, Any] = {}
         if self.options_path.exists():
             current = json.loads(self.options_path.read_text(encoding="utf-8"))
@@ -115,6 +116,13 @@ class AppState:
         self.options_path.parent.mkdir(parents=True, exist_ok=True)
         self.options_path.write_text(json.dumps(current), encoding="utf-8")
         self.settings = self.reload()
+        if previous_mode in ("off", "simulate") and self.settings.proactive_mode == "on":
+            log.warning(
+                "proactive_mode transitioned from %s to on; disable any pre-existing "
+                "automations or manual schedules that write the same devices before "
+                "proceeding",
+                previous_mode,
+            )
         return self.settings
 
 

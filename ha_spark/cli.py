@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import signal
 import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -41,7 +42,12 @@ from ha_spark.energy.onboarding import (
 )
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.report import format_plan
-from ha_spark.energy.scheduler import run_forever, run_once
+from ha_spark.energy.scheduler import (
+    UNTRUSTED_HOLDS_LINE,
+    hold_reconcile_intent,
+    run_forever,
+    run_once,
+)
 from ha_spark.energy.sources import _to_float
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.energy.v2l import load_session, savings
@@ -140,7 +146,20 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
         if apply:
             intent = plan.charge_intent
             assert intent is not None  # planner always sets it
-            lines = await inverter_device(settings, rest).apply(intent)
+            device = inverter_device(settings, rest)
+            # Reconcile the power switch first, as every device-driving caller
+            # does (#143): the CLI owns the inverter no less than the daemon.
+            # A one-shot has no trusted hold history, so an untrusted read
+            # leaves the switch as-is (#143 §3).
+            reconcile_intent = hold_reconcile_intent(intent, None)
+            lines = (
+                await device.reconcile_holds(
+                    reconcile_intent, datetime.now(load_timezone(settings.timezone))
+                )
+                if reconcile_intent is not None
+                else [UNTRUSTED_HOLDS_LINE]
+            )
+            lines.extend(await device.apply(intent))
             print(f"\nActions (PROACTIVE_MODE={settings.proactive_mode}):")
             for line in lines:
                 print(f"  {line}")
@@ -158,14 +177,30 @@ async def _cmd_ask(settings: Settings, message: str) -> int:
 
 
 async def _cmd_run(settings: Settings, *, once: bool) -> int:
-    """Run the planner daemon: compute & apply once, or loop daily."""
+    """Run the planner daemon: compute & apply once, or loop half-hourly."""
     if once:
         await run_once(settings)
         return 0
+    # The add-on stops with SIGTERM, whose default action exits without
+    # unwinding: cancel the loop instead so its `finally` hands control back to
+    # the inverter (#143 §5). Cancel once only: uvicorn re-raises the SIGTERM it
+    # captured when its server stops, inside that very `finally`, and a second
+    # cancel would cut the safe-state write short.
+    task = asyncio.current_task()
+    assert task is not None  # always called from inside the event loop
+
+    def _cancel_once() -> None:
+        if not task.cancelling():
+            task.cancel()
+
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, _cancel_once)
     try:
         await run_forever(settings)
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
     return 0
 
 
@@ -565,7 +600,7 @@ examples:
   ha-spark plan                            compute tonight's charge plan
   ha-spark plan --apply                    ...and run the charger (per PROACTIVE_MODE)
   ha-spark ask "what's tonight's plan"     answer via Ollama, or offline if unreachable
-  ha-spark run                             daemon: plan + apply daily at PLAN_RUN_TIME
+  ha-spark run                             daemon: plan + apply every half-hour
   ha-spark run --once                      plan + apply immediately, then exit
   ha-spark backfill-load --list            show statistics usable as a load source
   ha-spark backfill-load --from sensor.x   rebuild house-load history from sensor.x
@@ -696,10 +731,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = sub.add_parser(
         "run",
-        help="Daemon: compute & apply the plan once per day",
-        description="Long-running loop that computes and applies the charge plan once "
-        "per local calendar day at PLAN_RUN_TIME (default 22:00), retrying on failure "
-        "until the day rolls over. Writes are still gated by PROACTIVE_MODE.",
+        help="Daemon: compute & apply the plan every half-hour",
+        description="Long-running loop that recomputes the charge plan every local "
+        "half-hour slot. Writes are still gated by PROACTIVE_MODE.",
     )
     p_run.add_argument(
         "--once",

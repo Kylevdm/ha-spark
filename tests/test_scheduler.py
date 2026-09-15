@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, date, datetime, time, timedelta
+import json
+from dataclasses import replace
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -23,6 +26,7 @@ from ha_spark.energy.scheduler import (
     run_forever,
     run_once,
     sample_signals,
+    setpoint_changed,
     should_run,
 )
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
@@ -65,27 +69,47 @@ def _planned_w(settings: Settings, intent: ChargeIntent) -> float:
     return inverter_device(settings, rest).planned_rate_w(intent)
 
 
-def test_should_run_at_or_after_run_time_once_per_day() -> None:
-    run_time = time(22, 0)
-    assert should_run(datetime(2026, 6, 10, 22, 0), run_time, None) is True
-    assert should_run(datetime(2026, 6, 10, 23, 59), run_time, None) is True
+def test_should_run_first_half_hour_slot_immediately() -> None:
+    now = datetime(2026, 6, 10, 12, 17)
+    assert should_run(now, None) is True
 
 
-def test_should_run_false_before_run_time() -> None:
-    run_time = time(22, 0)
-    assert should_run(datetime(2026, 6, 10, 21, 59), run_time, None) is False
+def test_should_run_false_until_the_next_half_hour_slot() -> None:
+    now = datetime(2026, 6, 10, 12, 17)
+    assert should_run(now, datetime(2026, 6, 10, 12, 0)) is False
+    assert should_run(datetime(2026, 6, 10, 12, 30), datetime(2026, 6, 10, 12, 0)) is True
 
 
-def test_should_run_false_if_already_run_today() -> None:
-    run_time = time(22, 0)
-    assert should_run(datetime(2026, 6, 10, 22, 30), run_time, date(2026, 6, 10)) is False
+def test_should_run_runs_after_a_missed_slot_without_catching_up() -> None:
+    now = datetime(2026, 6, 10, 13, 17)
+    assert should_run(now, datetime(2026, 6, 10, 12, 0)) is True
 
 
-def test_should_run_true_again_next_day() -> None:
-    run_time = time(22, 0)
-    # New day at midnight: not yet time again until 22:00.
-    assert should_run(datetime(2026, 6, 11, 0, 0), run_time, date(2026, 6, 10)) is False
-    assert should_run(datetime(2026, 6, 11, 22, 0), run_time, date(2026, 6, 10)) is True
+def test_should_run_uses_local_slot_start() -> None:
+    assert should_run(datetime(2026, 6, 11, 0, 0), datetime(2026, 6, 10, 23, 30)) is True
+
+
+def test_setpoint_change_ignores_fresh_soc_observation() -> None:
+    from ha_spark.energy.scheduler import setpoint_changed
+
+    previous = _INTENT
+    current = replace(_INTENT, soc=_soc(31.0))
+    assert setpoint_changed(previous, current) is False
+
+
+def test_setpoint_change_detects_target_window_and_hold_changes() -> None:
+    from ha_spark.energy.scheduler import setpoint_changed
+
+    assert setpoint_changed(_INTENT, replace(_INTENT, target_soc_pct=78.0)) is True
+    assert setpoint_changed(_INTENT, replace(_INTENT, window_start=time(0, 0))) is True
+    assert setpoint_changed(
+        _INTENT,
+        replace(_INTENT, holds=((datetime(2026, 6, 10, 12, 0), datetime(2026, 6, 10, 12, 30)),)),
+    ) is True
+
+
+def test_setpoint_change_retries_an_untrusted_axle_event_read() -> None:
+    assert setpoint_changed(_INTENT, replace(_INTENT, export_trusted=False)) is True
 
 
 @respx.mock
@@ -118,6 +142,83 @@ async def test_run_once_computes_and_applies_plan(
     assert rows[0].model == "baseline"
     assert rows[0].total_kwh == plan.load_kwh
     assert rows[0].source == "test"
+
+
+async def test_run_once_skips_unchanged_command_after_fresh_soc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    applied: list[ChargeIntent] = []
+    reconciled: list[ChargeIntent] = []
+    previous = _plan()
+    current_intent = replace(previous.charge_intent, soc=_soc(31.0))
+    current = replace(previous, soc=current_intent.soc, charge_intent=current_intent)
+
+    async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
+        return SimpleNamespace(plan=current, inputs=object(), load_source="test")
+
+    class FakeDevice:
+        async def apply(self, intent: ChargeIntent) -> list[str]:
+            applied.append(intent)
+            return ["[APPLIED] test"]
+
+        async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+            reconciled.append(intent)
+            return ["[SKIP] set inverter power switch to On (already set)"]
+
+    async def noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_args: FakeDevice())
+    monkeypatch.setattr(scheduler, "publish_plan", noop)
+    monkeypatch.setattr(scheduler, "_record_forecast", noop)
+    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
+    monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
+
+    result = await run_once(Settings(), soc=current.soc, previous_plan=previous)
+
+    assert result is current
+    assert applied == []
+    # A skipped setpoint must still serve the clock (#143): the reconcile is a
+    # separate seam, so a slot with no plan change still converges the switch.
+    assert reconciled == [current_intent]
+
+
+async def test_run_once_retries_after_untrusted_previous_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    applied: list[ChargeIntent] = []
+    reconciled: list[ChargeIntent] = []
+    failed = _failed_soc()
+    previous = replace(_plan(), soc=failed, charge_intent=replace(_INTENT, soc=failed))
+    current = _plan()
+
+    async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
+        return SimpleNamespace(plan=current, inputs=object(), load_source="test")
+
+    class FakeDevice:
+        async def apply(self, intent: ChargeIntent) -> list[str]:
+            applied.append(intent)
+            return ["[APPLIED] test"]
+
+        async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+            reconciled.append(intent)
+            return ["[SKIP] set inverter power switch to On (already set)"]
+
+    async def noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_args: FakeDevice())
+    monkeypatch.setattr(scheduler, "publish_plan", noop)
+    monkeypatch.setattr(scheduler, "_record_forecast", noop)
+    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
+    monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
+
+    await run_once(Settings(), soc=current.soc, previous_plan=previous)
+
+    assert applied == [current.charge_intent]
+    assert reconciled == [current.charge_intent]
 
 
 @respx.mock
@@ -186,7 +287,13 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
 ) -> None:
     calls: list[str] = []
 
-    async def fake_run_once(_s: Settings) -> ChargePlan:
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> ChargePlan:
         calls.append("run")
         if len(calls) == 1:
             raise RuntimeError("boom")
@@ -195,14 +302,14 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
     class _StopLoop(Exception):
         pass
 
-    # Tick sequence: fail at 22:00, retry succeeds at 22:00 (still same day),
-    # then no more runs until the next day at 22:00.
+    # Tick sequence: fail at 22:00, retry succeeds in the same slot, then run
+    # again at 22:30 and once more after midnight.
     ticks = iter(
         [
             datetime(2026, 6, 10, 22, 0),
             datetime(2026, 6, 10, 22, 0),
-            datetime(2026, 6, 10, 23, 0),
-            datetime(2026, 6, 11, 22, 0),
+            datetime(2026, 6, 10, 22, 30),
+            datetime(2026, 6, 11, 0, 0),
         ]
     )
 
@@ -214,10 +321,15 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
             except StopIteration as exc:
                 raise _StopLoop from exc
 
+    original_sleep = asyncio.sleep
+
     async def fake_sleep(_seconds: float) -> None:
-        return None
+        await original_sleep(0)
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    async def noop_v2l_tick(_s: Settings, _now: datetime) -> None:
         return None
 
     def fake_make_server(_app: object, _host: str, _port: int) -> object:
@@ -235,15 +347,17 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
     monkeypatch.setattr(scheduler, "make_server", fake_make_server)
     monkeypatch.setattr(scheduler, "serve_in_background", fake_serve_in_background)
     monkeypatch.setattr(scheduler, "stop_server", fake_stop_server)
+    monkeypatch.setattr(scheduler, "run_v2l_tick", noop_v2l_tick)
     monkeypatch.setattr(scheduler.asyncio, "sleep", fake_sleep)
 
-    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00", v2l_power_entity=""
+    )
     with pytest.raises(_StopLoop):
         await run_forever(s, poll_seconds=0)
 
-    # First tick fails (retry), second tick (still 22:00) succeeds, third
-    # tick (23:00, already run today) skips, fourth tick (next day) runs again.
-    assert calls == ["run", "run", "run"]
+    # First tick fails (retry), second tick succeeds, then each new slot runs.
+    assert calls == ["run", "run", "run", "run"]
 
 
 def _patch_loop(
@@ -263,7 +377,12 @@ def _patch_loop(
             except StopIteration as exc:
                 raise _StopLoop from exc
 
+    original_sleep = asyncio.sleep
+
     async def fake_sleep(_seconds: float) -> None:
+        await original_sleep(0)
+
+    async def noop_v2l_tick(_s: Settings, _now: datetime) -> None:
         return None
 
     def fake_make_server(_app: object, _host: str, _port: int) -> object:
@@ -280,6 +399,7 @@ def _patch_loop(
     monkeypatch.setattr(scheduler, "make_server", fake_make_server)
     monkeypatch.setattr(scheduler, "serve_in_background", fake_serve_in_background)
     monkeypatch.setattr(scheduler, "stop_server", fake_stop_server)
+    monkeypatch.setattr(scheduler, "run_v2l_tick", noop_v2l_tick)
     return _StopLoop
 
 
@@ -293,7 +413,13 @@ async def test_run_forever_publishes_plan_to_api_state(
         captured["state"] = state
         return object()  # never actually served; make_server is stubbed too
 
-    async def fake_run_once(_s: Settings) -> ChargePlan:
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> ChargePlan:
         return _plan()
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
@@ -317,10 +443,18 @@ async def test_run_forever_guard_ticks_only_inside_window(
 ) -> None:
     guard_targets: list[float | None] = []
 
-    async def fake_run_once(_s: Settings) -> ChargePlan:
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> ChargePlan:
         return _plan()
 
-    async def fake_guard_tick(_s: Settings, target_w: float | None) -> float:
+    async def fake_guard_tick(
+        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+    ) -> float:
         guard_targets.append(target_w)
         assert target_w is not None
         return target_w
@@ -343,7 +477,7 @@ async def test_run_forever_guard_ticks_only_inside_window(
 
     s = Settings(
         ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
-        grid_power_entity="sensor.house_supply_power",
+        grid_power_entity="sensor.house_supply_power", v2l_power_entity="",
     )
     with pytest.raises(stop):
         await run_forever(s, poll_seconds=0)
@@ -355,10 +489,18 @@ async def test_run_forever_guard_ticks_only_inside_window(
 async def test_run_forever_no_guard_when_entity_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_run_once(_s: Settings) -> ChargePlan:
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> ChargePlan:
         return _plan()
 
-    async def fail_guard_tick(_s: Settings, target_w: float | None) -> float:
+    async def fail_guard_tick(
+        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+    ) -> float:
         raise AssertionError("guard must not run when grid_power_entity is empty")
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
@@ -380,10 +522,18 @@ async def test_run_forever_no_guard_when_charger_has_no_live_rate(
     """AlphaESS has no settable rate -> the guard branch never fires, even with
     grid_power_entity set."""
 
-    async def fake_run_once(_s: Settings) -> ChargePlan:
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> ChargePlan:
         return _plan()
 
-    async def fail_guard_tick(_s: Settings, target_w: float | None) -> float:
+    async def fail_guard_tick(
+        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+    ) -> float:
         raise AssertionError("guard must not run for an inverter without a live rate")
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
@@ -407,7 +557,18 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
 ) -> None:
     attempts: list[datetime] = []
 
-    async def boom_guard_tick(_s: Settings, target_w: float | None) -> float:
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> ChargePlan:
+        return _plan()
+
+    async def boom_guard_tick(
+        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+    ) -> float:
         attempts.append(datetime.now())
         raise RuntimeError("HA unreachable")
 
@@ -415,6 +576,7 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
         return None
 
     monkeypatch.setattr(scheduler, "guard_tick", boom_guard_tick)
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
     monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
     stop = _patch_loop(
         monkeypatch,
@@ -423,7 +585,7 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
 
     s = Settings(
         ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
-        grid_power_entity="sensor.house_supply_power",
+        grid_power_entity="sensor.house_supply_power", v2l_power_entity="",
     )
     with caplog.at_level("ERROR"), pytest.raises(stop):
         await run_forever(s, poll_seconds=0)
@@ -541,7 +703,13 @@ async def test_run_forever_samples_signals_every_interval(
 ) -> None:
     sampled: list[datetime] = []
 
-    async def fake_run_once(_s: Settings) -> ChargePlan:
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> ChargePlan:
         return _plan()
 
     async def fake_sample_signals(_s: Settings, now: datetime) -> None:
@@ -734,3 +902,1291 @@ def test_derive_specs_for_scheduler_uses_shared_helper() -> None:
     # Grid export is not configured (no entity) but the invert flag is set;
     # the helper must not include it when no entity id is present.
     assert "grid_export" not in specs
+
+
+# --- SoC integrity monitoring in the one-minute loop (#114) ---
+
+
+def _soc_resp(state: str, reported: datetime) -> httpx.Response:
+    """One HA SoC-entity response; ``reported`` drives the freshness check."""
+    return httpx.Response(
+        200,
+        json={
+            "entity_id": "sensor.soc",
+            "state": state,
+            "attributes": {},
+            "last_reported": reported.isoformat(),
+        },
+    )
+
+
+def _soc_get(states: list[str], reported: list[datetime]) -> None:
+    """Mock the SoC entity read with one response per daemon tick."""
+    respx.get("http://ha.test/api/states/sensor.soc").mock(
+        side_effect=[
+            _soc_resp(state, rep) for state, rep in zip(states, reported, strict=True)
+        ]
+    )
+
+
+def _integrity_posts() -> list[tuple[str, dict[str, object]]]:
+    """The (state, attributes) of every soc-integrity sensor push this test saw."""
+    out: list[tuple[str, dict[str, object]]] = []
+    for call in respx.calls:
+        if call.request.url.path != "/api/states/sensor.ha_spark_soc_integrity":
+            continue
+        body = json.loads(call.request.content)
+        out.append((body["state"], body["attributes"]))
+    return out
+
+
+def _patch_monitor_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    ticks: list[datetime],
+    *,
+    run_once_socs: list[SocMeasurement | None] | None = None,
+    guard_socs: list[SocMeasurement | None] | None = None,
+) -> type[Exception]:
+    """Patch the loop like ``_patch_loop``, optionally capturing tick SoCs."""
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    if run_once_socs is not None:
+        async def fake_run_once(
+            _s: Settings,
+            *,
+            soc: SocMeasurement | None = None,
+            previous_plan: ChargePlan | None = None,
+            trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ) -> ChargePlan:
+            run_once_socs.append(soc)
+            return _plan()
+    else:
+        async def fake_run_once(
+            _s: Settings,
+            *,
+            soc: SocMeasurement | None = None,
+            previous_plan: ChargePlan | None = None,
+            trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ) -> ChargePlan:
+            return _plan()
+
+    if guard_socs is not None:
+        async def fake_guard_tick(
+            _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+        ) -> float:
+            guard_socs.append(soc)
+            assert target_w is not None
+            return target_w
+    else:
+        async def fake_guard_tick(
+            _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+        ) -> float:
+            assert target_w is not None
+            return target_w
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "guard_tick", fake_guard_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    return _patch_loop(monkeypatch, ticks)
+
+
+@respx.mock
+async def test_loop_isolated_soc_failure_then_pass_resets_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One bad minute is tolerated: pending failure, then a passing observation
+    resets the count and returns to normal operation."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    now = datetime.now(UTC)
+    _soc_get(["unavailable", "55"], [now, now])
+    run_socs: list[SocMeasurement | None] = []
+    stop = _patch_monitor_loop(
+        monkeypatch,
+        [datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 22, 1)],
+        run_once_socs=run_socs,
+    )
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        v2l_power_entity="",
+    )
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    # The plan run consumed the tick's failed measurement (blocked at the
+    # charger gate), and the passing tick reset the count.
+    assert run_socs[0] is not None and not run_socs[0].ok
+    assert run_socs[0].status is SocStatus.UNAVAILABLE
+    published = _integrity_posts()
+    assert [state for state, _ in published] == ["pending_failure", "normal"]
+    assert published[0][1]["consecutive_failures"] == 1
+    assert published[1][1]["consecutive_failures"] == 0
+    assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
+        "consecutive_failures": 0
+    }
+
+
+@respx.mock
+async def test_loop_third_consecutive_failure_reaches_fallback_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The default third consecutive failed observation reaches the fallback-
+    entry threshold (the fallback write itself lands with #115)."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50", "50", "50"], [stale, stale, stale])
+    stop = _patch_monitor_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 22, 0),
+            datetime(2026, 6, 10, 22, 1),
+            datetime(2026, 6, 10, 22, 2),
+        ],
+    )
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        v2l_power_entity="",
+    )
+    with caplog.at_level("WARNING"), pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    published = _integrity_posts()
+    assert [state for state, _ in published] == [
+        "pending_failure",
+        "pending_failure",
+        "fallback_threshold",
+    ]
+    assert published[-1][1]["consecutive_failures"] == 3
+    assert published[-1][1]["failure_threshold"] == 3
+    assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
+        "consecutive_failures": 3
+    }
+    assert "fallback-entry threshold reached" in caplog.text
+
+
+@respx.mock
+async def test_loop_custom_threshold_behaves_equivalently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50", "50"], [stale, stale])
+    stop = _patch_monitor_loop(
+        monkeypatch,
+        [datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 22, 1)],
+    )
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        soc_failure_threshold=2, v2l_power_entity="",
+    )
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    published = _integrity_posts()
+    assert [state for state, _ in published] == ["pending_failure", "fallback_threshold"]
+    assert published[-1][1]["failure_threshold"] == 2
+
+
+@respx.mock
+async def test_loop_observes_once_per_tick_and_reuses_the_measurement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Observation identity: one failed tick where the plan run, the guard, and
+    publication all consume the same observation increments the count once."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    soc_get = respx.get("http://ha.test/api/states/sensor.soc").mock(
+        return_value=_soc_resp("50", stale)
+    )
+    run_socs: list[SocMeasurement | None] = []
+    guard_socs: list[SocMeasurement | None] = []
+    # 23:30: plan run time AND inside the charge window -> both fire this tick.
+    stop = _patch_monitor_loop(
+        monkeypatch, [datetime(2026, 6, 10, 23, 30)],
+        run_once_socs=run_socs, guard_socs=guard_socs,
+    )
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="23:30",
+        charge_window_start="23:30", charge_window_end="05:30",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        grid_power_entity="sensor.house_supply_power", v2l_power_entity="",
+    )
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    # Exactly one HA read for the SoC this tick, and the very same measurement
+    # object reached the plan run and the guard.
+    assert soc_get.call_count == 1
+    assert run_socs[0] is guard_socs[0]
+    assert run_socs[0] is not None and not run_socs[0].ok
+    # Counted once, not once per consumer.
+    assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
+        "consecutive_failures": 1
+    }
+    published = _integrity_posts()
+    assert [state for state, _ in published] == ["pending_failure"]
+    assert published[0][1]["soc_status"] == "stale"
+
+
+@respx.mock
+async def test_loop_skips_monitoring_without_soc_entity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No configured soc_entity -> nothing to observe: no reads, no publishes,
+    no persisted monitor state (the plan run observes through its own path)."""
+    gets = respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop = _patch_monitor_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0)])
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        db_path=str(tmp_path / "ledger.db"), v2l_power_entity="",
+    )
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert gets.call_count == 0
+    assert _integrity_posts() == []
+    assert not (tmp_path / "ha_spark_soc_monitor.json").exists()
+
+
+def _failed_soc() -> SocMeasurement:
+    """One stale checked measurement: parseable value, unusably old report."""
+    now = datetime.now(UTC)
+    return SocMeasurement(
+        status=SocStatus.STALE,
+        observed_at=now,
+        value=30.0,
+        raw_state="30",
+        reported_at=now - timedelta(hours=1),
+        age_s=3600.0,
+        max_age_s=600.0,
+    )
+
+
+async def _fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+    return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+
+@respx.mock
+async def test_run_once_failed_soc_leaves_solis_resident_program_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """First-failure policy on Solis: the plan run consumes the tick's failed
+    measurement, no register is written (resident program untouched), and the
+    blocked action line names the concrete integrity reason."""
+    monkeypatch.setattr(sources, "predict_home_load", _fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="on",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+    )
+    failed = _failed_soc()
+    with caplog.at_level("WARNING"):
+        plan = await run_once(s, soc=failed)
+
+    # The plan carries the exact tick measurement (no independent reread).
+    assert plan.soc is failed
+    assert any("[BLOCKED]" in r.message and "not charging to" in r.message
+               for r in caplog.records)
+    assert any("over the 600s maximum" in r.message for r in caplog.records)
+    # No service call left the process: the resident program is untouched
+    # (only reads and sensor publishes happened).
+    for call in respx.calls:
+        assert not call.request.url.path.startswith("/api/services/")
+
+
+@respx.mock
+async def test_run_once_failed_soc_blocks_alphaess_programming(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """First-failure policy on AlphaESS: any failed integrity observation
+    blocks new charge programming (no fallback, no service call)."""
+    monkeypatch.setattr(sources, "predict_home_load", _fake_load)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="on",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        inverter="alphaess", alphaess_serial="SN1",
+    )
+    with caplog.at_level("INFO"):
+        plan = await run_once(s, soc=_failed_soc())
+
+    assert not plan.soc.ok
+    assert any("[BLOCKED]" in r.message and "not charge to" in r.message
+               for r in caplog.records)
+    for call in respx.calls:
+        assert not call.request.url.path.startswith("/api/services/")
+
+
+@respx.mock
+async def test_loop_blocked_plan_rate_never_becomes_guard_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plan blocked on an untrusted SoC was sized from soc_now == 0 (likely
+    max current): its rate must not become the supply guard's restore target.
+    The guard adopts the live setpoint instead — reductions only."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50"], [stale])
+
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> ChargePlan:
+        # A plan computed from the tick's failed measurement: blocked at the
+        # charger gate, but still a plan object (existence != applied).
+        failed = soc if soc is not None and not soc.ok else _failed_soc()
+        return replace(
+            _plan(ChargeIntent(
+                target_soc_pct=90.0, soc=failed,
+                window_start=time(23, 30), window_end=time(5, 30),
+            )),
+            soc=failed,  # compute_plan carries the same measurement at both levels
+        )
+
+    guard_targets: list[float | None] = []
+
+    async def capture_guard_tick(
+        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+    ) -> float:
+        guard_targets.append(target_w)
+        # Like the real guard_tick: adopt (echo) the live setpoint when no
+        # trusted target exists, so later ticks keep it as the ceiling.
+        return target_w if target_w is not None else 2040.0
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    planned_calls: list[object] = []
+
+    async def fake_planned_rate_w(_s: Settings, _plan: ChargePlan) -> float:
+        planned_calls.append(_plan)
+        return 4000.0
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "guard_tick", capture_guard_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    monkeypatch.setattr(scheduler, "_planned_rate_w", fake_planned_rate_w)
+    stop = _patch_loop(
+        monkeypatch,
+        [datetime(2026, 6, 10, 23, 30), datetime(2026, 6, 10, 23, 45)],
+    )
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="23:30",
+        charge_window_start="23:30", charge_window_end="05:30",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        grid_power_entity="sensor.house_supply_power", v2l_power_entity="",
+    )
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert planned_calls == []  # the blocked plan's rate was never consulted
+    # First in-window tick: no trusted target (None) -> the guard adopts the
+    # live setpoint; the adopted value, not the blocked plan's rate, is the
+    # ceiling the second tick sees.
+    assert guard_targets == [None, 2040.0]
+
+
+def test_a_pending_export_event_always_re_applies(tmp_path) -> None:
+    """The arming boundary is a clock event, not a plan change (#144).
+
+    An Axle event announced a day ahead yields an equal `ExportIntent` on every
+    tick. Comparing plans alone would report "unchanged" right through the tick
+    that would have armed the window, so the event would never be programmed.
+    """
+    from datetime import UTC, datetime, time, timedelta
+    from zoneinfo import ZoneInfo
+
+    from ha_spark.energy.models import ChargeIntent, ExportIntent
+    from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+
+    london = ZoneInfo("Europe/London")
+    observed = datetime.now(UTC)
+    soc = SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=observed,
+        value=60.0,
+        raw_state="60",
+        reported_at=observed,
+        age_s=0.0,
+        max_age_s=600.0,
+    )
+    start = datetime(2026, 9, 15, 18, 30, tzinfo=london)
+    end = start + timedelta(hours=1)
+    export = ExportIntent(
+        event_identity=("export", start, end),
+        window_start=start,
+        window_end=end,
+        planned_export_kw=3.2,
+        dno_export_limit_kw=7.36,
+        selected_slots=(start,),
+        slot_export_kw=(3.2,),
+    )
+    pending = ChargeIntent(77.0, soc, time(23, 30), time(5, 30), export=export)
+
+    assert setpoint_changed(
+        pending,
+        pending,
+    ) is True
+    # Without an event the plan-value comparison still governs.
+    plain = ChargeIntent(77.0, soc, time(23, 30), time(5, 30))
+    assert setpoint_changed(plain, plain) is False
+
+
+class _RecordingDevice:
+    """A device that records every reconcile pass the loop drives."""
+
+    def __init__(self, seen: list[datetime], *, boom: bool = False) -> None:
+        self._seen = seen
+        self._boom = boom
+
+    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+        self._seen.append(now)
+        if self._boom:
+            raise RuntimeError("HA unreachable")
+        return ["[SKIP] set inverter power switch to On (already set)"]
+
+
+async def test_reconcile_tick_does_nothing_before_a_plan_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No picture yet is not evidence that no hold is active.
+
+    Writing ``On`` merely because a plan has not loaded would release a live
+    dispatch across every restart and every hot reload (the precedent is
+    ``guard_tick``, which adopts rather than guesses).
+    """
+    seen: list[datetime] = []
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: _RecordingDevice(seen))
+
+    await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"), None, datetime(2026, 6, 10, 22, 0)
+    )
+
+    assert seen == []
+
+
+async def test_reconcile_tick_drives_the_device_with_the_ticks_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[datetime] = []
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: _RecordingDevice(seen))
+    now = datetime(2026, 6, 10, 22, 1)
+
+    await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"), _plan(), now
+    )
+
+    assert seen == [now]
+
+
+async def test_reconcile_tick_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed pass is logged and retried next minute; it cannot abort the loop."""
+    seen: list[datetime] = []
+    monkeypatch.setattr(
+        scheduler, "inverter_device", lambda *_a: _RecordingDevice(seen, boom=True)
+    )
+
+    await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"), _plan(), datetime(2026, 6, 10, 22, 0)
+    )
+
+    assert seen == [datetime(2026, 6, 10, 22, 0)]
+
+
+async def test_run_forever_reconciles_every_minute_not_every_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reconcile answers the clock, so it cannot ride the half-hourly replan.
+
+    A hold that opens and closes between two slot runs (17:35-17:55) would
+    otherwise never be applied at all, and a failed write would wait out the
+    rest of the dispatch (#143 hole 2).
+    """
+    reconciled: list[datetime] = []
+    plans: list[ChargePlan | None] = []
+
+    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+        return _plan()
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> scheduler.ReconcileResult:
+        plans.append(plan)
+        reconciled.append(now)
+        return scheduler.ReconcileResult(
+            ["[SKIP] set inverter power switch to On (already set)"], trusted_holds
+        )
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    # One slot boundary, then three ticks inside the same slot: only the first
+    # runs the planner, but every one of them reconciles.
+    ticks = [
+        datetime(2026, 6, 10, 22, 0),
+        datetime(2026, 6, 10, 22, 1),
+        datetime(2026, 6, 10, 22, 2),
+        datetime(2026, 6, 10, 22, 3),
+    ]
+    stop = _patch_loop(monkeypatch, ticks)
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    # Every tick inside the slot reconciles; the slot boundary itself does not,
+    # because `run_once` reconciles there with the plan it just computed.
+    assert reconciled == ticks[1:]
+    assert all(plan is not None for plan in plans)
+
+
+async def test_run_forever_does_not_reconcile_twice_on_a_slot_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slot tick must reconcile once, against the plan it just computed.
+
+    Reconciling here as well would use the *stale* plan first: when a dispatch
+    is announced or cancelled between slots, the switch is driven to the old
+    plan's state and then immediately back — two writes and a momentarily wrong
+    whole-inverter enable inside one tick.
+    """
+    reconciled: list[datetime] = []
+
+    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+        return _plan()
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> scheduler.ReconcileResult:
+        reconciled.append(now)
+        return scheduler.ReconcileResult([], trusted_holds)
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    stop = _patch_loop(
+        monkeypatch, [datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 22, 30)]
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert reconciled == []
+
+
+async def test_reconcile_tick_logs_only_what_changed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """1440 identical lines a day would bury the plan and guard activity."""
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: _RecordingDevice([]))
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+    now = datetime(2026, 6, 10, 22, 0)
+
+    with caplog.at_level("INFO", logger="ha_spark.energy.scheduler"):
+        first = await scheduler.reconcile_tick(settings, _plan(), now)
+        repeat = await scheduler.reconcile_tick(settings, _plan(), now, previous=first.lines)
+
+    assert first == repeat
+    assert len(caplog.records) == 1
+
+
+# --- #140/#143 §3: degraded hold data is ignored, not believed ---
+
+_HOLD = (datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 23, 0))
+
+
+def _untrusted_plan() -> ChargePlan:
+    """A plan built from a failed dispatch read: its empty holds mean "unreadable"."""
+    return _plan(replace(_INTENT, holds=(), hold_trusted=False))
+
+
+class _IntentRecordingDevice:
+    def __init__(self) -> None:
+        self.intents: list[ChargeIntent] = []
+
+    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+        self.intents.append(intent)
+        return ["[SKIP] set inverter power switch to Off (already set)"]
+
+
+async def test_an_untrusted_tick_reconciles_against_the_last_trusted_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inside the last trusted hold, a failed read must keep the inverter held ``Off``."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    inside = datetime(2026, 6, 10, 22, 15)
+
+    await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"),
+        _untrusted_plan(),
+        inside,
+        trusted_holds=(_HOLD,),
+    )
+
+    [intent] = device.intents
+    assert intent.holds == (_HOLD,)
+    assert intent.hold_active(inside) is True
+
+
+async def test_a_trusted_hold_still_ends_on_its_own_end_time_while_reads_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No expiry timer and no stuck ``Off``: the known end time releases the hold.
+
+    Past the last known end with reads still failing, the release is the
+    relinquish path's safe state (#143 §5), which writes ``On`` without the
+    reconcile's pre-read.
+    """
+    device = _RelinquishRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+
+    await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"),
+        _untrusted_plan(),
+        datetime(2026, 6, 10, 23, 5),
+        trusted_holds=(_HOLD,),
+    )
+
+    assert device.safe_states == 1
+
+
+async def test_an_untrusted_tick_with_no_trusted_holds_yet_does_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Booting into a failed read is no picture, and no picture never writes ``On``."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+
+    lines = await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"),
+        _untrusted_plan(),
+        datetime(2026, 6, 10, 22, 15),
+        trusted_holds=None,
+    )
+
+    assert device.intents == []
+    assert any("untrusted" in line for line in lines.lines)
+
+
+async def test_a_trusted_tick_reconciles_against_its_own_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    plan = _plan(replace(_INTENT, holds=()))
+
+    await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"),
+        plan,
+        datetime(2026, 6, 10, 22, 15),
+        trusted_holds=(_HOLD,),
+    )
+
+    assert device.intents == [plan.charge_intent]
+
+
+async def test_run_once_reconciles_an_untrusted_plan_against_the_trusted_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The slot tick's own pass is the one a failed read reaches first."""
+    reconciled: list[ChargeIntent] = []
+    current = _untrusted_plan()
+
+    async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
+        return SimpleNamespace(plan=current, inputs=object(), load_source="test")
+
+    class FakeDevice:
+        async def apply(self, intent: ChargeIntent) -> list[str]:
+            return ["[APPLIED] test"]
+
+        async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+            reconciled.append(intent)
+            return []
+
+    async def noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_args: FakeDevice())
+    monkeypatch.setattr(scheduler, "publish_plan", noop)
+    monkeypatch.setattr(scheduler, "_record_forecast", noop)
+    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
+    monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
+
+    await run_once(Settings(), soc=current.soc, trusted_holds=(_HOLD,))
+    await run_once(Settings(), soc=current.soc)
+
+    # With a trusted set it substitutes; without one it does not reconcile at all.
+    assert [intent.holds for intent in reconciled] == [(_HOLD,)]
+
+
+async def test_run_forever_remembers_holds_only_from_trusted_plans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted = _plan(replace(_INTENT, holds=(_HOLD,)))
+    plans = iter([trusted, _untrusted_plan()])
+    run_once_saw: list[object] = []
+    reconcile_saw: list[object] = []
+
+    async def fake_run_once(_s: Settings, **kw: object) -> ChargePlan:
+        run_once_saw.append(kw.get("trusted_holds"))
+        return next(plans)
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> scheduler.ReconcileResult:
+        reconcile_saw.append(trusted_holds)
+        return scheduler.ReconcileResult([], trusted_holds)
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    stop = _patch_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 22, 0),  # trusted plan
+            datetime(2026, 6, 10, 22, 1),
+            datetime(2026, 6, 10, 22, 30),  # untrusted plan
+            datetime(2026, 6, 10, 22, 31),
+        ],
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert run_once_saw == [None, (_HOLD,)]
+    assert reconcile_saw == [(_HOLD,), (_HOLD,)]
+
+
+async def test_run_forever_forgets_trusted_holds_on_hot_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reload may change the dispatch source; the old picture is not evidence."""
+    captured: list[AppState] = []
+    reconcile_saw: list[object] = []
+
+    class _CapturingState(AppState):
+        def __init__(self, **kw: object) -> None:
+            super().__init__(**kw)  # type: ignore[arg-type]
+            captured.append(self)
+
+    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+        return _plan(replace(_INTENT, holds=(_HOLD,)))
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> scheduler.ReconcileResult:
+        reconcile_saw.append(trusted_holds)
+        captured[0].settings = Settings(
+            ha_url="http://ha.test", ha_token="t", plan_run_time="22:00"
+        )
+        return scheduler.ReconcileResult([], trusted_holds)
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "AppState", _CapturingState)
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    stop = _patch_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 22, 0),
+            datetime(2026, 6, 10, 22, 1),  # reconciles, then the options are rewritten
+            datetime(2026, 6, 10, 22, 2),
+        ],
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert reconcile_saw == [(_HOLD,), None]
+
+
+# --- #140/#143 §4: the per-minute pass tracks Dave's poll on the HA-entity path ---
+
+_DISPATCH_URL = "http://ha.test/api/states/binary_sensor.dispatch"
+
+
+def _dispatch_state(state: str, dispatches: list[dict[str, str]] | None = None) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "entity_id": "binary_sensor.dispatch",
+            "state": state,
+            "attributes": {"planned_dispatches": dispatches or []},
+        },
+    )
+
+
+def _dispatch_settings(**kw: object) -> Settings:
+    base: dict[str, object] = dict(
+        ha_url="http://ha.test", ha_token="t", dispatch_entity="binary_sensor.dispatch"
+    )
+    base.update(kw)
+    return Settings(**base)  # type: ignore[arg-type]
+
+
+@respx.mock
+async def test_a_dispatch_published_mid_slot_is_honoured_on_the_next_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Published *and* started inside one slot: the next minute holds, without a replan."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    respx.get(_DISPATCH_URL).mock(
+        return_value=_dispatch_state(
+            "on", [{"start": "2026-06-10T22:00:00", "end": "2026-06-10T23:00:00"}]
+        )
+    )
+    inside = datetime(2026, 6, 10, 22, 15)
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(), _plan(replace(_INTENT, holds=())), inside, trusted_holds=()
+    )
+
+    [intent] = device.intents
+    assert intent.hold_active(inside) is True
+    assert intent.hold_trusted is True
+    assert result.trusted_holds == (_HOLD,)
+
+
+@respx.mock
+async def test_a_fresh_overnight_dispatch_is_not_a_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Holds are controlled windows, not raw dispatches: switching the inverter
+    ``Off`` during the cheap overnight charge would waste it."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    respx.get(_DISPATCH_URL).mock(
+        return_value=_dispatch_state(
+            "on", [{"start": "2026-06-11T01:00:00", "end": "2026-06-11T02:00:00"}]
+        )
+    )
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(), _plan(), datetime(2026, 6, 11, 1, 15), trusted_holds=()
+    )
+
+    [intent] = device.intents
+    assert intent.holds == ()
+    assert result.trusted_holds == ()
+
+
+@pytest.mark.parametrize(
+    "response", [httpx.Response(404), _dispatch_state("unavailable")], ids=["missing", "down"]
+)
+async def test_an_unreadable_dispatch_entity_per_minute_falls_back_to_the_trusted_holds(
+    monkeypatch: pytest.MonkeyPatch, response: httpx.Response
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    inside = datetime(2026, 6, 10, 22, 15)
+
+    with respx.mock:
+        respx.get(_DISPATCH_URL).mock(return_value=response)
+        result = await scheduler.reconcile_tick(
+            _dispatch_settings(), _plan(replace(_INTENT, holds=())), inside, trusted_holds=(_HOLD,)
+        )
+
+    [intent] = device.intents
+    assert intent.hold_active(inside) is True
+    assert result.trusted_holds == (_HOLD,)
+
+
+@respx.mock
+async def test_the_octopus_path_never_polls_dispatches_per_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-minute Kraken polling would be 30x the rate Dave's own cap allows."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    route = respx.get(_DISPATCH_URL).mock(return_value=_dispatch_state("off"))
+    octopus = respx.route(url__startswith="http://octo.test").mock(
+        return_value=httpx.Response(500)
+    )
+    plan = _plan(replace(_INTENT, holds=(_HOLD,)))
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(
+            tariff_provider="octopus_intelligent",
+            octopus_api_url="http://octo.test/v1",
+            octopus_api_key="sk_test",
+            octopus_account_number="A-1234ABCD",
+        ),
+        plan,
+        datetime(2026, 6, 10, 22, 15),
+        trusted_holds=(_HOLD,),
+    )
+
+    assert not route.called
+    assert not octopus.called
+    assert device.intents == [plan.charge_intent]
+    assert result.trusted_holds == (_HOLD,)
+
+
+@respx.mock
+async def test_an_unset_dispatch_entity_is_not_read_per_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    any_get = respx.route(method="GET").mock(return_value=httpx.Response(404))
+    plan = _plan()
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(dispatch_entity=""), plan, datetime(2026, 6, 10, 22, 15)
+    )
+
+    assert not any_get.called
+    assert device.intents == [plan.charge_intent]
+    assert result.trusted_holds is None
+
+
+async def test_run_forever_keeps_the_holds_a_per_minute_read_trusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reconcile_saw: list[object] = []
+
+    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+        return _plan()
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> scheduler.ReconcileResult:
+        reconcile_saw.append(trusted_holds)
+        return scheduler.ReconcileResult([], (_HOLD,))
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    stop = _patch_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 22, 0),
+            datetime(2026, 6, 10, 22, 1),  # the fresh read sees a dispatch
+            datetime(2026, 6, 10, 22, 2),
+        ],
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert reconcile_saw == [(), (_HOLD,)]
+
+
+async def test_a_dispatch_entity_down_for_hours_logs_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A renamed or removed entity must not put 1440 warnings a day into the log."""
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: _IntentRecordingDevice())
+    now = datetime(2026, 6, 10, 22, 15)
+
+    with respx.mock, caplog.at_level("INFO"):
+        respx.get(_DISPATCH_URL).mock(return_value=httpx.Response(404))
+        first = await scheduler.reconcile_tick(
+            _dispatch_settings(), _plan(), now, trusted_holds=(_HOLD,)
+        )
+        await scheduler.reconcile_tick(
+            _dispatch_settings(), _plan(), now, previous=first.lines, trusted_holds=(_HOLD,)
+        )
+
+    about_dispatch = [
+        r for r in caplog.records
+        if r.name.startswith("ha_spark") and "dispatch" in r.getMessage()
+    ]
+    assert len(about_dispatch) == 1
+
+
+# --- #143 §5: relinquishing control writes the safe state, once ---
+
+
+class _RelinquishRecordingDevice:
+    def __init__(self) -> None:
+        self.reconciled: list[ChargeIntent] = []
+        self.safe_states = 0
+
+    def planned_rate_w(self, intent: ChargeIntent) -> float:
+        return 0.0
+
+    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+        self.reconciled.append(intent)
+        return ["[WARNING] set inverter power switch to On refused: state unreadable"]
+
+    async def write_safe_state(self) -> list[str]:
+        self.safe_states += 1
+        return ["[APPLIED] set inverter power switch to On (relinquishing control)"]
+
+
+async def test_untrusted_reads_inside_a_known_hold_never_relinquish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _RelinquishRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+
+    result = await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"),
+        _untrusted_plan(),
+        datetime(2026, 6, 10, 22, 15),
+        trusted_holds=(_HOLD,),
+    )
+
+    assert device.safe_states == 0
+    assert result.trusted_holds == (_HOLD,)
+
+
+async def test_untrusted_past_every_known_hold_end_relinquishes_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    device = _RelinquishRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+    later_hold = (datetime(2026, 6, 10, 21, 0), datetime(2026, 6, 10, 21, 30))
+
+    with caplog.at_level("WARNING", logger="ha_spark.energy.scheduler"):
+        first = await scheduler.reconcile_tick(
+            settings,
+            _untrusted_plan(),
+            datetime(2026, 6, 10, 23, 0),  # exactly the last known end
+            trusted_holds=(later_hold, _HOLD),
+        )
+    second = await scheduler.reconcile_tick(
+        settings,
+        _untrusted_plan(),
+        datetime(2026, 6, 10, 23, 1),
+        previous=first.lines,
+        trusted_holds=first.trusted_holds,
+    )
+
+    assert device.safe_states == 1
+    assert first.trusted_holds == ()
+    assert any("relinquishing control" in r.getMessage() for r in caplog.records)
+    # Once relinquished there is nothing left to steer; the next pass is a plain one.
+    assert second.trusted_holds == ()
+    assert len(device.reconciled) == 1
+
+
+async def test_untrusted_with_no_known_holds_never_relinquishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _RelinquishRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+
+    for trusted in (None, ()):
+        await scheduler.reconcile_tick(
+            settings, _untrusted_plan(), datetime(2026, 6, 10, 23, 5), trusted_holds=trusted
+        )
+
+    assert device.safe_states == 0
+
+
+async def test_a_trusted_tick_past_every_hold_end_never_relinquishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _RelinquishRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+
+    result = await scheduler.reconcile_tick(
+        Settings(ha_url="http://ha.test", ha_token="t"),
+        _plan(replace(_INTENT, holds=(_HOLD,))),
+        datetime(2026, 6, 10, 23, 5),
+        trusted_holds=(_HOLD,),
+    )
+
+    assert device.safe_states == 0
+    assert len(device.reconciled) == 1
+    assert result.trusted_holds == (_HOLD,)
+
+
+async def _run_forever_until_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    device: _RelinquishRecordingDevice,
+    *,
+    plan: ChargePlan | None,
+    shutdown_at: datetime = datetime(2026, 6, 10, 23, 5),
+) -> None:
+    """One slot tick, then a cancel (as SIGTERM delivers it) with ``shutdown_at`` left
+    on the clock for the ``finally``."""
+
+    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+        if plan is None:
+            raise RuntimeError("no plan")
+        return plan
+
+    async def cancelled_sample_signals(_s: Settings, _now: datetime) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "sample_signals", cancelled_sample_signals)
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    _patch_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0), shutdown_at])
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(asyncio.CancelledError):
+        await run_forever(s, poll_seconds=0)
+
+
+async def test_run_forever_writes_the_safe_state_once_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _RelinquishRecordingDevice()
+    await _run_forever_until_cancelled(
+        monkeypatch, device, plan=_plan(replace(_INTENT, holds=(_HOLD,)))
+    )
+
+    assert device.safe_states == 1
+
+
+async def test_run_forever_without_a_plan_has_nothing_to_relinquish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _RelinquishRecordingDevice()
+    await _run_forever_until_cancelled(monkeypatch, device, plan=None)
+
+    assert device.safe_states == 0
+
+
+async def test_shutdown_inside_a_known_hold_leaves_the_hold_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart mid-dispatch must not drain the battery into the car (#143 §1).
+
+    Same rule as the per-minute relinquish: only past every known hold end. The
+    next process picks the hold up within a minute.
+    """
+    device = _RelinquishRecordingDevice()
+    await _run_forever_until_cancelled(
+        monkeypatch,
+        device,
+        plan=_plan(replace(_INTENT, holds=(_HOLD,))),
+        shutdown_at=datetime(2026, 6, 10, 22, 20),
+    )
+
+    assert device.safe_states == 0
+
+
+async def test_a_relinquish_is_reported_so_the_loop_can_reapply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _RelinquishRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+
+    fired = await scheduler.reconcile_tick(
+        settings, _untrusted_plan(), datetime(2026, 6, 10, 23, 5), trusted_holds=(_HOLD,)
+    )
+    plain = await scheduler.reconcile_tick(
+        settings, _untrusted_plan(), datetime(2026, 6, 10, 22, 15), trusted_holds=(_HOLD,)
+    )
+
+    assert fired.relinquished is True
+    assert plain.relinquished is False
+
+
+async def test_run_forever_reapplies_the_plan_after_a_relinquish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The safe state overwrote Slot 1; an unchanged plan must not skip restoring it."""
+    previous_seen: list[object] = []
+    relinquish_at = datetime(2026, 6, 10, 22, 1)
+
+    async def fake_run_once(_s: Settings, **kw: object) -> ChargePlan:
+        previous_seen.append(kw.get("previous_plan"))
+        return _plan()
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> scheduler.ReconcileResult:
+        return scheduler.ReconcileResult([], trusted_holds, relinquished=now == relinquish_at)
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: _RelinquishRecordingDevice())
+    stop = _patch_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 22, 0),
+            relinquish_at,
+            datetime(2026, 6, 10, 22, 30),  # forced re-apply
+            datetime(2026, 6, 10, 23, 0),  # back to the ordinary diff
+        ],
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert previous_seen[0] is None
+    assert previous_seen[1] is None
+    assert previous_seen[2] is not None

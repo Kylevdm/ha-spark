@@ -153,6 +153,62 @@ dropped tariff schedule), #92 (backtest tariff contract), and #93
   partner integration contract applies. This is beyond map #128's one-event
   prototype destination. Trigger: ha-spark reaches v1.0.0.
 
+### Axle export loose ends (from #51, 2026-09-14)
+
+Raised while verifying
+[Event delivery: planner exports during an Axle slot via reservations](https://github.com/Kylevdm/ha-spark/issues/51)
+against its acceptance criteria before closing it. Neither blocked that ticket:
+both concern unattended operation, which is explicitly beyond map #128's
+one-supervised-event destination.
+
+- **The persisted export event's identity is write-only.** `_persist_export_state`
+  saves the accepted event identity and verified end
+  (`ha_spark/devices/inverters/solis.py:681`). *Updated 2026-09-14 (#140):* the
+  record now has production readers, but only of its **verified end**. The
+  untrusted-holds export guard keeps a resident window whose recorded end is
+  still ahead (`solis.py:665-667`, #143 §3), and the relinquish safe state keeps
+  the discharge half on the same rule, refusing a blind Slot 1 write while such
+  an event is live (`solis.py:571-573`, #143 §5). The identity (`event_id`) is
+  still read by nothing. Restart-safe cleanup still works without it: the first
+  authorized `apply` with no fresh event zeros slot 1's discharge half and
+  read-back verifies, not gated on grid-charge permission (`solis.py:273`).
+  Remaining decision: whether the identity earns its place — comparing a
+  resident window against the *last accepted event* rather than "a verified end
+  is still ahead" is what would let ha-spark tell its own leftover schedule from
+  a human's manual one — or reduce the record to the end time. Trigger:
+  unattended event delivery, where a wrong resident window is not caught by a
+  supervising human.
+- **No scheduler test exercises a day-of Axle event.** #51's own test list asks
+  for "next-replan pickup of a day-of event"; the behaviour falls out of
+  `should_run`'s half-hourly slot logic (`ha_spark/energy/scheduler.py:87`) plus
+  the export value in `setpoint_changed`, each tested separately, but nothing
+  tests the composition — the exact path a paid event arrives on. Trigger: the
+  supervised proof (#134) is the live test; write the unit test if that proof
+  surfaces a pickup problem, or before unattended delivery.
+  **Raised in priority by #144 (2026-09-14):** the day-early arming guard makes
+  the day-of tick the *only* tick on which an export window is programmed, so
+  this untested composition is now the whole delivery path rather than one
+  route into it.
+
+### Register write endurance (from #140 step 5, 2026-09-14)
+
+- **Back off re-writes the inverter keeps rejecting.** Every Solis write is
+  read-first, so broken *reads* cost no register writes (and since #143 §5 the
+  relinquish path's one blind write is the only exception). But when reads work
+  and show a persistent mismatch — the inverter or overlay accepts the service
+  call yet never takes the value — each pass writes again: the per-minute power
+  switch reconcile (`ha_spark/devices/inverters/solis.py:472-512`) reaches
+  1,440 writes a day, and `apply`'s window and current writes
+  (`solis.py:233`, `:401`, `:428`) 48. An owner away for two weeks would see
+  ~20,000 writes to a register with finite EEPROM endurance
+  (research #109). Want: a bounded backoff (e.g. doubling 1→60 min) on
+  repeated confirmed mismatches, plus a surfaced warning so the fault is noticed.
+  It needs remembered failure state, which the reconcile deliberately does not
+  hold today (it remembers nothing, so restarts converge), so decide where that
+  state lives. Out of #140 step 5's scope, which only changed the relinquish
+  path. Trigger: a read-back mismatch observed persisting across passes in the
+  add-on log, or before unattended operation.
+
 ### Release and installation observability (2026-09-12)
 
 - **Show the running ha-spark build version in `ha-spark health`.** The doctor

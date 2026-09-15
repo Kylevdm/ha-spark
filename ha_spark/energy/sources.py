@@ -7,6 +7,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ha_spark.config import Settings
+from ha_spark.energy.axle import AxleApiError, read_axle_event
 from ha_spark.energy.forecast import load_timezone, predict_home_load
 from ha_spark.energy.models import (
     SLOTS_PER_DAY,
@@ -21,9 +22,11 @@ from ha_spark.energy.octopus import (
     fetch_planned_dispatches,
     fetch_standard_unit_rates,
 )
-from ha_spark.energy.soc_integrity import check_soc
+from ha_spark.energy.soc_integrity import SocMeasurement
+from ha_spark.energy.soc_monitor import observe_soc
 from ha_spark.energy.solar import distribute_solar
 from ha_spark.energy.tariff import (
+    AxleTariffProvider,
     DynamicTariffProvider,
     FixedTariffProvider,
     OctopusIntelligentProvider,
@@ -186,6 +189,10 @@ def build_config(
         min_soc=settings.min_soc,
         target_cap=settings.target_soc_cap,
         max_current_a=settings.max_charge_current_a,
+        battery_discharge_ceiling_kw=settings.battery_discharge_ceiling_kw,
+        dno_export_limit_kw=settings.dno_export_limit_kw,
+        supply_max_current_a=settings.supply_max_current_a,
+        supply_voltage_v=settings.supply_voltage_v,
         solar_haircut_k=settings.solar_haircut_k,
         window_start=parse_time(settings.charge_window_start),
         window_end=parse_time(settings.charge_window_end),
@@ -209,13 +216,52 @@ def build_schedule(
         return DynamicTariffProvider(fallback=fixed).schedule(inputs, cfg)
     if settings.tariff_provider == "octopus_intelligent":
         return OctopusIntelligentProvider(fallback=fixed).schedule(inputs, cfg)
+    if settings.tariff_provider == "axle":
+        return AxleTariffProvider(
+            fallback=fixed, event_rate_gbp_kwh=settings.axle_event_rate_gbp_kwh
+        ).schedule(inputs, cfg)
     return fixed.schedule(inputs, cfg)
 
 
-async def gather_inputs(
+async def read_dispatches(
     settings: Settings, rest: HomeAssistantRest
+) -> tuple[tuple[DispatchSlot, ...], bool]:
+    """Read the HA dispatch entity: ``(dispatches, trusted)`` (#143 §3).
+
+    The one definition of hold trust on the HA-entity path, shared by
+    :func:`gather_inputs` and the per-minute reconcile. Untrusted only when
+    ``dispatch_entity`` is set and the read failed or reports ``unavailable``/
+    ``unknown``: then an empty result means "unreadable", not "no dispatch". An
+    unset entity is a household with no dispatch source — no holds, not
+    unreadable ones, and no read. Every provider folds dispatches into holds, so
+    distrusting it would refuse every export for ever.
+
+    A failure is logged at debug only: the per-minute caller would otherwise put
+    1440 identical warnings a day into the add-on log, so each caller reports an
+    untrusted result at its own cadence.
+    """
+    if not settings.dispatch_entity:
+        return (), True
+    try:
+        dispatch = await rest.get_state(settings.dispatch_entity)
+    except Exception as exc:  # noqa: BLE001 - a missing entity must not crash the plan
+        log.debug("Could not read %s (%s)", settings.dispatch_entity, exc)
+        return (), False
+    if str(dispatch.state).lower() in ("unavailable", "unknown"):
+        return (), False
+    return _parse_dispatches(dispatch.attributes.get("planned_dispatches")), True
+
+
+async def gather_inputs(
+    settings: Settings, rest: HomeAssistantRest, *, soc: SocMeasurement | None = None
 ) -> tuple[PlannerInputs, PlannerConfig, str]:
-    """Read live HA state and build (inputs, config, load-forecast source)."""
+    """Read live HA state and build (inputs, config, load-forecast source).
+
+    ``soc`` is the daemon tick's already-checked measurement: when supplied
+    it is used as-is, so the plan is sized from the exact observation the
+    loop made (no independent reread). Otherwise one observation is made
+    here through the same shared :func:`observe_soc` path.
+    """
 
     async def state(entity_id: str) -> EntityState | None:
         try:
@@ -224,14 +270,7 @@ async def gather_inputs(
             log.warning("Could not read %s (%s)", entity_id, exc)
             return None
 
-    soc = await state(settings.soc_entity)
-    # One checked observation per gather; every downstream consumer reads its
-    # value from this exact measurement rather than re-reading the sensor.
-    soc_measurement = check_soc(
-        soc,
-        observed_at=datetime.now(UTC),
-        max_age=timedelta(minutes=settings.soc_max_report_age_minutes),
-    )
+    soc_measurement = soc if soc is not None else await observe_soc(settings, rest)
     if not soc_measurement.ok:
         log.warning("SoC measurement failed integrity check: %s", soc_measurement.reason)
     voltage = await state(settings.battery_voltage_entity)
@@ -241,7 +280,18 @@ async def gather_inputs(
 
     voltage_v = _to_float(voltage.state if voltage else None, settings.battery_voltage_v)
 
+    flexibility_event = None
+    flexibility_event_trusted = True
+    if settings.tariff_provider == "axle":
+        try:
+            flexibility_event = await read_axle_event(settings, rest)
+        except AxleApiError as exc:
+            log.warning("Could not read Axle event: %s", exc)
+            flexibility_event_trusted = False
+
     dispatches: tuple[DispatchSlot, ...]
+    # Whether an empty `dispatches` means "none" or "unreadable" (#143 §3).
+    dispatches_trusted = True
     if settings.tariff_provider == "octopus_intelligent":
         # Octopus Intelligent dispatches come straight from the Octopus API —
         # no HA sensor read (avoids a pointless call + the sensor-shaped
@@ -251,11 +301,11 @@ async def gather_inputs(
         except OctopusApiError as exc:
             log.warning("Could not read Octopus planned dispatches (%s)", exc)
             dispatches = ()
+            dispatches_trusted = False
     else:
-        dispatch = await state(settings.dispatch_entity)
-        dispatches = _parse_dispatches(
-            dispatch.attributes.get("planned_dispatches") if dispatch else None
-        )
+        dispatches, dispatches_trusted = await read_dispatches(settings, rest)
+        if not dispatches_trusted:
+            log.warning("Dispatch entity %s unreadable; holds untrusted", settings.dispatch_entity)
     ev_charging = bool(ev_status and str(ev_status.state).lower() in _EV_ACTIVE)
 
     dynamic_prices: tuple[PricePoint, ...] = ()
@@ -325,6 +375,9 @@ async def gather_inputs(
         solar_tomorrow_kwh=solar_kwh,
         predicted_home_load_kwh=forecast.total_kwh,
         dispatches=dispatches,
+        dispatches_trusted=dispatches_trusted,
+        flexibility_event=flexibility_event,
+        flexibility_event_trusted=flexibility_event_trusted,
         ev_charging=ev_charging,
         ha_template_needed=_opt_float(ha_needed.state) if ha_needed else None,
         load_slots=load_slots,

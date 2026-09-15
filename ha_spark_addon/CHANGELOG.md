@@ -2,6 +2,101 @@
 
 ## Unreleased
 
+## 0.17.0
+
+- Supervised Axle lifecycle notices (#133): the generic `notify_service` option
+  sends deduplicated accepted, verified-start, verified-cleanup, and terminal
+  abort notices through Home Assistant, with no Telegram-specific credential or
+  claim that a notice proves a hardware write. The operator runbook covers
+  enablement, observation, abort, cleanup, restart recovery, and return to
+  simulate.
+- Per-minute hold reconcile (#140): hold reconciliation now runs through its
+  own `reconcile_holds`/`reconcile_tick` seam, independently of the half-hourly
+  replan. Holds that start and end between replans, failed switch writes, and
+  external switch changes now converge within a minute.
+- Hold trust (#140): the asymmetric pre-read may close a hold when state is
+  unreadable, but never opens one. Degraded dispatch reads are ignored rather
+  than believed, new export windows are refused while holds are untrusted, and
+  the dispatch entity is re-read each minute on the Home Assistant entity path
+  only.
+- Relinquish safe state (#140): when ha-spark relinquishes control, including
+  on clean shutdown, Solis is returned to `On`, the configured cheap charge
+  window (default `23:30`-`05:30`), and an empty discharge window
+  (`00:00`-`00:00`).
+- Plan diff purity (#140): `setpoint_changed` is again a pure plan diff; hold
+  edges belong to the per-minute reconcile seam.
+- Power-switch write behaviour (#140): `select.solisac_power_switch` is a
+  `solax_modbus` select whose Home Assistant state is set optimistically on
+  write. The per-minute pre-read therefore sees a successful write at once,
+  keeping steady-state register writes at zero. A rejected write is retried
+  once per minute by design. Native register 43007 is #146.
+
+- Slot energy reservations (#47): slot plans carry a buffered, capped
+  reach-next-cheap-slot reservation, and the required charge and its report
+  explanation trace to it. The reservation is a floor on the overnight buy, not
+  the whole obligation — a short daytime dispatch cannot refill the battery for
+  the evening, so the buffered horizon deficit still stands alongside it.
+- Axle flexibility events as a tariff overlay (#48): a new `axle` tariff
+  provider accepts only a fresh, explicit export window from Axle's documented
+  Home Assistant event route or a configured Home Assistant mirror, and overlays
+  the configured event rate into per-slot export prices. Planning and control
+  authority are unchanged — Axle supplies event facts and prices, never
+  setpoints. New `axle_api_key`, `axle_api_url`, `axle_event_entity`, and
+  `axle_event_rate_gbp_kwh` options; `axle_api_key` is marked `password`.
+  `updated_at` is treated as Axle's change timestamp, not a freshness
+  heartbeat, so a normally-published event is not rejected on every poll.
+- Supervised Axle export delivery (#51): the planner calculates the maximum
+  export available under a new `dno_export_limit_kw` after protecting house
+  load and the post-event reservation, selects only complete half-hour slots it
+  can fund, and emits an inverter-agnostic export intent that is part of the
+  scheduler's setpoint comparison. The Solis driver programs Slot 1 timed
+  discharge at the measured 62.5 A ceiling, in inverter-local wall-clock time,
+  and requires the power switch to be `On` — it never turns it on itself. Every
+  write keeps the authority gate, fresh finite in-range SoC check, read-back
+  verification, and per-action failure isolation. New
+  `battery_discharge_ceiling_kw` and `dno_export_limit_kw` options.
+  **Prototype status:** export has not yet been actuated on hardware; the
+  supervised paid-event proof is #134.
+- Full power-switch ownership (#140): ha-spark now drives both edges of the
+  Solis whole-inverter enable through a declarative reconcile — `Off` while a
+  dispatch hold is active, `On` otherwise — instead of only ever writing `Off`.
+  Desired state is a pure function of the clock and the plan's holds, so nothing
+  is remembered and a restart mid-hold converges on the next tick. This fixes
+  two defects: once the incumbent Home Assistant automations are disabled at
+  cutover nothing else ever sent `On`, and the old loop wrote `Off` immediately
+  for a hold hours in the future. A hold boundary now counts as a changed
+  command, so the reconcile is not skipped as an unchanged setpoint, and it is
+  exempt from the SoC-unreadable guard because it commands no SoC-derived
+  magnitude — charge programming stays blocked. It settles before anything else
+  reads the switch, so a hold ending does not refuse an export event against a
+  state the same tick is correcting. A hold that *overlaps* an export window
+  refuses the whole event with an explicit reason; a hold elsewhere in the day
+  leaves it alone.
+- No day-early export (#144): the Solis Slot 1 discharge registers hold a clock
+  face and no date, while the planner offers an event as soon as it enters the
+  24 h horizon. Programming tomorrow's 18:30 event at noon today would have
+  discharged the battery at 18:30 *today* — intentional export outside a paid
+  window, costing a peak-rate refill and earning nothing. The driver now refuses
+  a window whose clock face would next come round before its own event, and says
+  so. It also refuses while an earlier day's window is still open on the clock:
+  tomorrow's 18:30-19:30 programmed at 18:31 today would put the inverter inside
+  it at once and export unpaid until 19:30. The refusal is a deferral, not an
+  abort: the event is re-offered every tick and arms itself once the next time
+  its window opens is the event's own, so nothing is remembered. An event already under way stays armed, so a day-of pickup still
+  delivers the remainder. A pending export event now always counts as a changed
+  setpoint: arming is a function of the clock, not the plan, and an event
+  announced a day ahead yields an identical intent every tick — so the
+  unchanged-setpoint skip would have suppressed the very tick that arms the
+  window, missing the event outright. An event inside a fall-back night's
+  repeated hour is refused rather than armed, because the register holds a clock
+  face that comes round twice and fires on the first.
+- Half-hourly replanning (#46): the daemon recomputes the current plan on each
+  local half-hour slot, including after startup during the day. It skips the
+  inverter call when the commanded target, window, and holds are unchanged, so
+  fresh SoC observations do not cause repeated device writes.
+- Proactive-mode handoff warning (#104): changing `proactive_mode` from `off` or
+  `simulate` to `on` logs a reminder to disable pre-existing automations or
+  manual schedules that write the same devices before proceeding.
 - Checked SoC measurements (#113): the Boolean `soc_valid` contract is
   replaced by one immutable checked measurement produced from a single
   Home Assistant observation. It records the observed value or read
@@ -19,6 +114,22 @@
   concrete integrity reason: the plan-status sensor publishes
   `soc_status`/`soc_reason` in place of `soc_valid`, and a `[BLOCKED]`
   line quotes the reason.
+- SoC integrity monitoring (#114): the daemon observes the configured
+  `soc_entity` once per minute in every operating state, and that one
+  checked measurement is reused by planning, device application,
+  publication, and supply-guard work — one observation can increment
+  the failure count at most once. The first failed observation enters
+  **pending failure**: the resident program is left untouched, new
+  SoC-based programming and charge-rate increases are blocked for both
+  supported inverter types, while valid supply-guard reductions remain
+  available. Consecutive failures are counted and persisted across
+  restarts; any passing observation resets the count. New
+  `soc_failure_threshold` option (default `3`) sets how many consecutive
+  failures reach the fallback-entry threshold (fallback programming
+  itself lands with #115). Monitoring state is visible as the new
+  `sensor.ha_spark_soc_integrity` (operating state, failure count,
+  threshold, integrity reason and evidence), in the daemon log, and in
+  the plan report's untrusted-SoC line.
 - V2L observe + tally + notify (#123): when `v2l_power_entity` is set, the
   daemon reads the car's V2L discharge power (W) each tick, integrates it
   into the kWh delivered this session, values it against

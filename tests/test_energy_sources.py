@@ -13,7 +13,7 @@ from ha_spark.config import Settings
 from ha_spark.energy import sources
 from ha_spark.energy.models import LoadForecast
 from ha_spark.energy.soc_integrity import SocStatus
-from ha_spark.energy.sources import build_schedule, gather_inputs, pre_window_drain
+from ha_spark.energy.sources import build_config, build_schedule, gather_inputs, pre_window_drain
 from ha_spark.energy.tariff import fixed_schedule
 from ha_spark.ha.rest import HomeAssistantRest
 
@@ -47,6 +47,23 @@ def _settings() -> Settings:
         ev_status_entity="sensor.ev",
         ha_template_charge_needed_entity="sensor.tmpl",
     )
+
+
+def test_build_config_threads_export_limits_to_the_pure_planner() -> None:
+    cfg = build_config(
+        Settings(
+            battery_discharge_ceiling_kw=3.2,
+            dno_export_limit_kw=7.36,
+            supply_max_current_a=60.0,
+            supply_voltage_v=230.0,
+        ),
+        voltage_v=51.0,
+    )
+
+    assert cfg.battery_discharge_ceiling_kw == 3.2
+    assert cfg.dno_export_limit_kw == 7.36
+    assert cfg.supply_max_current_a == 60.0
+    assert cfg.supply_voltage_v == 230.0
 
 
 @respx.mock
@@ -109,6 +126,67 @@ async def test_gather_inputs_tolerates_missing_entities(monkeypatch: pytest.Monk
     assert inputs.soc.status is SocStatus.READ_FAILED
     assert cfg.voltage_v == s.battery_voltage_v  # fell back to config default
     assert inputs.dispatches == ()
+
+
+@respx.mock
+async def test_gather_inputs_reads_axle_event_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    now = datetime.now(UTC)
+    event = {
+        "start_time": (now + timedelta(hours=1)).isoformat(),
+        "end_time": (now + timedelta(hours=2)).isoformat(),
+        "import_export": "export",
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    respx.get("http://axle.test/vpp/home-assistant/event").mock(
+        return_value=httpx.Response(200, json=event)
+    )
+    respx.route(method="GET", url__startswith=BASE).mock(return_value=httpx.Response(404))
+
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        tariff_provider="axle",
+        axle_api_url="http://axle.test",
+        axle_api_key="secret-token",
+    )
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, _, _ = await gather_inputs(s, rest)
+
+    assert inputs.flexibility_event is not None
+    assert inputs.flexibility_event.direction == "export"
+    assert inputs.flexibility_event_trusted is True
+
+
+@respx.mock
+async def test_gather_inputs_degrades_on_malformed_axle_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.get("http://axle.test/vpp/home-assistant/event").mock(
+        return_value=httpx.Response(200, json={"start_time": "not-a-timestamp"})
+    )
+    respx.route(method="GET", url__startswith=BASE).mock(return_value=httpx.Response(404))
+
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        tariff_provider="axle",
+        axle_api_url="http://axle.test",
+        axle_api_key="secret-token",
+    )
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, cfg, _ = await gather_inputs(s, rest)
+
+    assert inputs.flexibility_event is None
+    assert inputs.flexibility_event_trusted is False
+    assert build_schedule(s, inputs, cfg).export_prices == ()
 
 
 def test_pre_window_drain_daily_fallback() -> None:
@@ -577,3 +655,117 @@ async def test_gather_inputs_rejects_soc_without_last_reported(
 
     assert inputs.soc.status is SocStatus.REPORT_TIME_UNUSABLE
     assert inputs.soc_now == 0.0
+
+
+# --- #140/#143 §3: hold trust — `()` must stop meaning both "none" and "unreadable" ---
+
+
+async def _gather_with_dispatch(
+    monkeypatch: pytest.MonkeyPatch, dispatch: httpx.Response, **kw: Any
+) -> Any:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    with respx.mock:
+        respx.get(f"{BASE}/states/binary_sensor.dispatch").mock(return_value=dispatch)
+        respx.route(method="GET").mock(return_value=httpx.Response(404))
+        s = _settings().model_copy(update=kw)
+        async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+            inputs, _cfg, _src = await gather_inputs(s, rest)
+    return inputs
+
+
+async def test_a_readable_dispatch_entity_with_no_dispatches_is_trusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = await _gather_with_dispatch(
+        monkeypatch,
+        _state("binary_sensor.dispatch", "off", {"planned_dispatches": []}),
+    )
+
+    assert inputs.dispatches == ()
+    assert inputs.dispatches_trusted is True
+
+
+async def test_a_missing_dispatch_entity_is_untrusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = await _gather_with_dispatch(monkeypatch, httpx.Response(404))
+
+    assert inputs.dispatches == ()
+    assert inputs.dispatches_trusted is False
+
+
+@pytest.mark.parametrize("unreadable", ["unavailable", "unknown"])
+async def test_an_unavailable_dispatch_entity_is_untrusted(
+    monkeypatch: pytest.MonkeyPatch, unreadable: str
+) -> None:
+    inputs = await _gather_with_dispatch(
+        monkeypatch, _state("binary_sensor.dispatch", unreadable)
+    )
+
+    assert inputs.dispatches_trusted is False
+
+
+async def test_no_dispatch_entity_configured_is_trusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A household with no dispatch source has no holds, not unreadable ones.
+
+    Every tariff provider folds dispatches into holds, so treating the unset
+    entity as untrusted would refuse every Axle export for ever.
+    """
+    inputs = await _gather_with_dispatch(monkeypatch, httpx.Response(404), dispatch_entity="")
+
+    assert inputs.dispatches_trusted is True
+
+
+@respx.mock
+async def test_a_failed_octopus_dispatch_fetch_is_untrusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET", url__startswith="http://ha.test").mock(
+        return_value=httpx.Response(404)
+    )
+    respx.route(url__startswith="http://octo.test").mock(return_value=httpx.Response(401))
+
+    s = _octopus_settings()
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, _cfg, _src = await gather_inputs(s, rest)
+
+    assert inputs.dispatches == ()
+    assert inputs.dispatches_trusted is False
+
+
+@respx.mock
+async def test_read_dispatches_parses_a_readable_entity_as_trusted() -> None:
+    """The one definition of trust `gather_inputs` and the per-minute reconcile share."""
+    respx.get(f"{BASE}/states/binary_sensor.dispatch").mock(
+        return_value=_state(
+            "binary_sensor.dispatch",
+            "on",
+            {"planned_dispatches": [{"start": "2026-06-10T22:00:00+01:00",
+                                     "end": "2026-06-10T23:00:00+01:00"}]},
+        )
+    )
+    s = _settings()
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        dispatches, trusted = await sources.read_dispatches(s, rest)
+
+    assert [d.start.hour for d in dispatches] == [22]
+    assert trusted is True
+
+
+@respx.mock
+async def test_read_dispatches_makes_no_read_for_an_unset_entity() -> None:
+    any_get = respx.route(method="GET").mock(return_value=httpx.Response(404))
+    s = _settings().model_copy(update={"dispatch_entity": ""})
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        assert await sources.read_dispatches(s, rest) == ((), True)
+
+    assert not any_get.called
