@@ -6,6 +6,7 @@ import json
 from datetime import UTC, datetime, time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from ha_spark.api.server import AppState, build_app
@@ -99,6 +100,32 @@ def test_get_config_returns_options(tmp_path: Path) -> None:
     assert "min_soc" in resp.json()
 
 
+@pytest.mark.parametrize("previous_mode", ["off", "simulate"])
+def test_proactive_mode_on_transition_warns_about_conflicting_automation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, previous_mode: str
+) -> None:
+    state = _state(tmp_path, proactive_mode=previous_mode)
+
+    with caplog.at_level("WARNING"):
+        state.apply_options({"proactive_mode": "on"})
+
+    assert any(
+        "disable any pre-existing automations or manual schedules" in record.message
+        for record in caplog.records
+    )
+
+
+def test_proactive_mode_reload_without_transition_does_not_warn(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    state = _state(tmp_path, proactive_mode="on")
+
+    with caplog.at_level("WARNING"):
+        state.apply_options({"proactive_mode": "on"})
+
+    assert not any("pre-existing automations" in record.message for record in caplog.records)
+
+
 def test_config_roundtrip_persists_and_reloads(tmp_path: Path) -> None:
     state = _state(tmp_path, min_soc=20.0)
     with _client(state) as client:
@@ -122,16 +149,23 @@ def test_post_config_rejects_non_object(tmp_path: Path) -> None:
 
 def test_get_config_redacts_secrets(tmp_path: Path) -> None:
     """Set secrets must never leave the process in cleartext (CLAUDE.md top rule)."""
-    state = _state(tmp_path, octopus_api_key="SECRET_OCTO", agent_api_token="SECRET_AGENT")
+    state = _state(
+        tmp_path,
+        octopus_api_key="SECRET_OCTO",
+        axle_api_key="SECRET_AXLE",
+        agent_api_token="SECRET_AGENT",
+    )
     with _client(state) as client:
         resp = client.get("/api/config")
     assert resp.status_code == 200
     # Raw response text carries neither secret.
     assert "SECRET_OCTO" not in resp.text
+    assert "SECRET_AXLE" not in resp.text
     assert "SECRET_AGENT" not in resp.text
     body = resp.json()
     # Keys are still present (response shape preserved) but redacted.
     assert body["octopus_api_key"] == "***"
+    assert body["axle_api_key"] == "***"
     assert body["agent_api_token"] == "***"
 
 

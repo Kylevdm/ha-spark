@@ -1,9 +1,9 @@
 # ha-spark
 
-Local-first battery charge planner for Home Assistant. Once a day (at
-`plan_run_time`, default 22:00 local) it forecasts tomorrow's household load
-and solar yield, sizes the overnight cheap-rate charge, and sets the
-inverter's timed charge current when `proactive_mode` is `on`.
+Local-first battery charge planner for Home Assistant. Every local half-hour it
+recomputes tomorrow's household load and solar yield, sizes the overnight
+cheap-rate charge, and sets the inverter's timed charge current when
+`proactive_mode` is `on`.
 
 ## Installation
 
@@ -25,6 +25,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 |---|---|
 | `soc_entity` | Battery state of charge (%) |
 | `soc_max_report_age_minutes` | How old Home Assistant's `last_reported` for `soc_entity` may be before the SoC is treated as stale and real charge writes are blocked (default `10.0`) |
+| `soc_failure_threshold` | Consecutive failed SoC observations before the fallback-entry threshold is reached (default `3`). The first failure already blocks new SoC-based programming and charge-rate increases |
 | `battery_voltage_entity` | Battery voltage (V) |
 | `solar_tomorrow_entity` | Solcast "forecast tomorrow" sensor (with `detailedForecast` attribute) |
 | `octopus_rate_entity` | Octopus current electricity rate sensor |
@@ -43,6 +44,16 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
 | `outdoor_weather_entity` | Weather entity with a `temperature` attribute (default `weather.home`) for signal recording |
 | `v2l_power_entity` | Optional V2L discharge-power sensor (W); enables the V2L tally (see "V2L" below) |
+
+### Power-switch holds
+
+On the Solis path, ha-spark re-reads dispatch state and reconciles
+`inverter_power_switch_entity` every minute, separately from the half-hourly
+plan. It turns the switch `Off` during an active dispatch hold and `On`
+otherwise. When ha-spark relinquishes control, including during a clean
+shutdown, it writes a safe state: `On`, the configured cheap charge window
+(default `23:30`-`05:30`), and an empty discharge window (`00:00`-`00:00`). If
+dispatch state cannot be trusted, ha-spark will not open a new export window.
 
 ### Derived base load (ADR-0001, optional)
 
@@ -135,7 +146,8 @@ always produces).
   `solar_percentile`, `expected_load_kwh`: forecast/sizing knobs; the
   defaults are sensible.
 - `charge_window_start` / `charge_window_end`: your cheap-rate window.
-- `plan_run_time`: local HH:MM at which the daily plan runs.
+- `plan_run_time`: retained for compatibility; the daemon recomputes the plan
+  every local half-hour slot.
 
 ### Supply guard (optional)
 
@@ -305,6 +317,28 @@ Dispatch and cheap-window handling is otherwise identical to `fixed`. Requires
 failure falls back to the fixed rates/dispatches. `ha-spark health` reports
 the live provider status; the API key is never logged or echoed.
 
+`axle` adds the supervised Axle export-event source. Set `axle_api_key` to the
+static token from Axle's Home Assistant account page. `axle_event_entity` may
+hold the Home Assistant mirror entity for fallback when the direct request
+fails. Set `axle_event_rate_gbp_kwh` to the paid export rate because Axle's
+Home Assistant event response does not include a rate. The provider accepts
+only explicit, fresh export windows. Import events and malformed or stale
+responses produce no export slots. The API key is a password and is never
+written to logs or reports.
+
+Set `notify_service` to the Home Assistant `notify.<service>` target for the
+human-present export lifecycle notices. ha-spark sends one notice when an event
+is accepted, after a verified export start, after verified cleanup, and for a
+terminal abort. Notices are deduplicated by event identity and lifecycle
+transition, and never count as proof that a hardware write succeeded. Leave it
+blank to disable them. The supervised procedure is in
+`docs/runbooks/supervised-axle-export.md`.
+
+For paid export, `battery_discharge_ceiling_kw` is the conservative battery
+output used by the planner, while `dno_export_limit_kw` is the installation's
+grid-export limit (Kyle's is 7.36 kW). Both caps are independent of the Solis
+prototype's fixed 62.5 A timed-discharge command.
+
 ### Octopus API (optional)
 
 `octopus_api_key`, `octopus_mpan`, `octopus_meter_serial` enable
@@ -415,7 +449,7 @@ remains the sole decider; nothing here changes that.
      component stats repair history), so a manual rerun is only needed
      once.
 4. `ha-spark plan`: print tonight's plan without applying it.
-5. Leave the add-on running; it executes the plan daily at `plan_run_time`.
+5. Leave the add-on running; it recomputes the plan every local half-hour.
    When the simulated decisions look right, set `proactive_mode: on`.
 
 ## Data

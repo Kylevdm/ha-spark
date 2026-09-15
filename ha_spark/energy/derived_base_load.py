@@ -532,7 +532,7 @@ async def rerive_trailing_window(
     Returns ``None`` when grid import is unconfigured (caller logs and
     continues — the no-grid-import skip path stays intact). When the
     component fetch or derivation fails, the caller catches and logs;
-    this helper is best-effort and must never block the daily plan.
+    this helper is best-effort and must never block the scheduled plan.
     """
     grid_spec = specs.get("grid_import")
     if grid_spec is None or not grid_spec.entity_id:

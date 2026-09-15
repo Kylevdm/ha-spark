@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import os
+import signal
 from pathlib import Path
 
 import httpx
@@ -654,3 +657,47 @@ async def test_run_forever_handles_keyboard_interrupt(monkeypatch: pytest.Monkey
     settings = Settings(ha_url="http://ha.test", ha_token="t")
 
     assert await _cmd_run(settings, once=False) == 0
+
+
+async def test_sigterm_unwinds_run_forever_so_its_finally_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The add-on stops with SIGTERM; without a handler ``finally`` never runs (#143 §5)."""
+    unwound: list[bool] = []
+
+    async def fake_run_forever(_s: Settings) -> None:
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.sleep(10)
+        finally:
+            unwound.append(True)
+
+    monkeypatch.setattr(cli, "run_forever", fake_run_forever)
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+
+    assert await asyncio.wait_for(_cmd_run(settings, once=False), timeout=5) == 0
+    assert unwound == [True]
+
+
+async def test_a_second_sigterm_does_not_abort_the_shutdown_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """uvicorn re-raises the SIGTERM it captured once its server stops, inside the
+    loop's ``finally``; a second cancel there would cut the safe-state write short."""
+    completed: list[bool] = []
+
+    async def fake_run_forever(_s: Settings) -> None:
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.sleep(10)
+        finally:
+            signal.raise_signal(signal.SIGTERM)
+            for _ in range(5):
+                await asyncio.sleep(0)
+            completed.append(True)
+
+    monkeypatch.setattr(cli, "run_forever", fake_run_forever)
+    settings = Settings(ha_url="http://ha.test", ha_token="t")
+
+    assert await asyncio.wait_for(_cmd_run(settings, once=False), timeout=5) == 0
+    assert completed == [True]

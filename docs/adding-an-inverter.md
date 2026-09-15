@@ -65,13 +65,20 @@ voltage.
 `ha_spark/energy/models.py`:
 
 ```python
-ChargeIntent(target_soc_pct, soc_now, window_start, window_end, holds)
+ChargeIntent(target_soc_pct, soc, window_start, window_end, holds, export=None)
 ```
 
 `holds` is a list of `(start, end)` dispatch windows during which the driver
 should stop discharge (e.g. Octopus Intelligent dispatch slots). Drivers
 realize the intent however their hardware/integration needs to; the planner
 never reaches past the `Device` interface into entity IDs or services.
+
+When `export` is present, it is an accepted Axle paid-export command. An
+adapter that supports export must realize its complete window with the same
+authority, simulation, finite-SoC, write-if-changed, and read-back safeguards
+as charging. An adapter without export support must refuse it explicitly and
+leave the resident export schedule unchanged; it must not silently treat the
+command as an ordinary charge-only intent.
 
 ## Control authority and the actuation gate
 

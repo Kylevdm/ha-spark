@@ -5,6 +5,7 @@ No settable rate -> the supply guard stays dormant for this inverter.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
@@ -41,6 +42,14 @@ class AlphaESSDevice:
 
     async def read_charge_rate(self) -> float:
         return 0.0
+
+    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+        """No hold surface: AlphaESS exposes no whole-inverter enable to drive."""
+        return []
+
+    async def write_safe_state(self) -> list[str]:
+        """No hold surface, so nothing is left steered when ha-spark lets go."""
+        return []
 
     async def apply(self, intent: ChargeIntent) -> list[str]:
         stop_soc = round(intent.target_soc_pct)

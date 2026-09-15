@@ -1,6 +1,10 @@
 """Solis inverter driver: native timed-slot charge control over a thin HA
 ``modbus:`` overlay (the ``solis_control`` hub stood up in #90), plus the
-power-switch stop-discharge hold (unchanged, ADR-0003 rule 2).
+declarative power-switch reconcile (ADR-0003 rule 2, #140): ha-spark owns both
+edges of the whole-inverter enable, driving it to ``Off`` while a dispatch hold
+is active and ``On`` otherwise. That reconcile is ``reconcile_holds``, a seam of
+its own rather than a step of ``apply`` (#143) — it answers to the clock, not to
+a plan diff, so it runs every minute while ``apply`` stays half-hourly.
 
 Control surface (decided in #82, validated by live-fire #83, register map from
 #100/#80 — **no tier-A source; cross-checked live 2026-09-08**): the timed-slot
@@ -14,6 +18,12 @@ step**: writing the 8-register window block *is* the commit (see
 ``docs/solis-control-modbus-overlay.yaml`` and RUN-83-log). The charge-current
 register (43141) is a standalone single-register write that applies on write.
 
+Slot windows carry a clock face and no date, so an export window is only
+programmed once that clock face next comes round *at* its own event (#144).
+Until then the event is deferred and re-offered each tick; without this, an
+Axle event with a day's notice would discharge the battery a day early, outside
+the paid window.
+
 PROACTIVE_MODE + control authority (via ``effective_mode``) gate side effects:
 ``simulate``/``observe`` -> log intended writes only; ``on`` -> real
 ``call_service``; ``off`` -> compute only. Each write isolates its own failure
@@ -24,11 +34,21 @@ inverter's work mode (bit 5); the live rate-tier throttle is not so gated.
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, time, timedelta
 from typing import TYPE_CHECKING, TypeVar
+from zoneinfo import ZoneInfo
 
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
 from ha_spark.devices.registry import register
+from ha_spark.energy.export_notifications import (
+    ExportNotificationStore,
+    make_notice,
+    parse_event_id,
+    send_once,
+)
+from ha_spark.energy.export_store import ExportEventStore
 from ha_spark.energy.models import ChargeIntent, window_hours
 from ha_spark.logging import get_logger
 
@@ -43,6 +63,7 @@ log = get_logger(__name__)
 # 2026-09-08. The window block matches solax-modbus's WRITE_MULTI for the
 # "update charge/discharge times" button (plugin_solis.py). ---
 _CHARGE_CURRENT_REG = 43141  # DC amps x10 (raw 600 == 60.0 A)
+_DISCHARGE_CURRENT_REG = 43142  # DC amps x10 (raw 625 == 62.5 A)
 # WRITE_MULTIPLE base per slot; 8 consecutive registers, in this order:
 #   charge start h/m, charge end h/m, discharge start h/m, discharge end h/m.
 _SLOT_BLOCK_REG = {1: 43143, 2: 43153, 3: 43163}
@@ -68,6 +89,8 @@ _READ_BACK_DELAY_SECONDS = 0.1
 # Work-mode bitfield: bit 5 (mask 32) == grid charging permitted. A forced grid
 # charge is refused by firmware when this is unset, so assert it, never write it.
 _GRID_CHARGE_BIT = 1 << 5
+_EXPORT_CURRENT_A = 62.5
+_EXPORT_CURRENT_RAW = 625
 T = TypeVar("T")
 
 
@@ -98,6 +121,21 @@ class SolisDevice:
 
     async def apply(self, intent: ChargeIntent) -> list[str]:
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        # load_timezone, not ZoneInfo: a minimal container without tzdata (or a
+        # typo'd option) must degrade to UTC, not raise before the reconcile and
+        # the SoC guard have run and cost the daemon every device write.
+        # Imported here for the same reason as the TYPE_CHECKING block above:
+        # forecast imports config, which imports devices.base at runtime.
+        from ha_spark.energy.forecast import load_timezone
+
+        tz = load_timezone(self._settings.timezone)
+        now = datetime.now(tz)
+        # The power-switch reconcile is not here: it is `reconcile_holds`, its own
+        # per-minute seam (#143). Every caller makes one pass before it applies,
+        # so the switch has already settled by the time `_require_power_switch_on`
+        # reads it — otherwise export would be refused on the very tick a hold
+        # ends, against a state already being corrected.
+        lines: list[str] = []
         # SoC-unreadable guard: soc_now==0 from a dead sensor would size a max charge.
         if mode == "on" and not intent.soc.ok:
             line = (
@@ -105,8 +143,62 @@ class SolisDevice:
                 f"{intent.target_soc_pct:.0f}%"
             )
             log.warning(line)
+            lines.append(line)
+            return lines
+        raw_export = getattr(intent, "export", None)
+        export_store = ExportEventStore(self._settings.db_path)
+        previous_export_record = None
+        if mode == "on" and raw_export is None and export_store.exists:
+            async with export_store:
+                previous_export_record = await export_store.load()
+        export_error: str | None = None
+        if (
+            mode == "on"
+            and raw_export is None
+            and not getattr(intent, "export_trusted", True)
+            and await self._has_live_verified_export(now)
+        ):
+            line = "[SKIP] Axle event read untrusted; preserving the verified export window"
+            log.warning(line)
             return [line]
-        lines: list[str] = []
+        export = _export_window(intent, tz)
+        export_ready = export is not None
+        # Slot 1's verified discharge half, kept when an untrusted hold read
+        # refuses a new window (#143 §3).
+        kept_discharge: list[int] | None = None
+        if raw_export is not None and export is None:
+            export_ready = False
+            export_error = "malformed export window"
+            lines.append(f"[BLOCKED] export refused: {export_error}")
+        elif export_ready:
+            assert export is not None
+            export_error = _validate_export(intent, export)
+            if export_error is None:
+                export_error = _export_not_yet_armed(export, now)
+            if export_error is None and intent.hold_overlaps(*export):
+                # Hold beats export on overlap: the reconcile will hold the
+                # inverter `Off` inside the event, so refuse the whole window
+                # rather than program a discharge that is cut mid-slot. Tested
+                # against the window, not the clock: a morning dispatch must not
+                # refuse an evening event, and an evening dispatch must refuse it
+                # even when the plan is computed hours earlier.
+                export_error = "a dispatch hold overlaps the export window"
+            if export_error is None and not intent.hold_trusted:
+                export_error, kept_discharge = await self._untrusted_holds_export(
+                    export, mode, now
+                )
+            if mode == "on" and export_error is None:
+                export_error = await self._require_power_switch_on()
+            if export_error is not None:
+                export_ready = False
+                lines.append(f"[BLOCKED] export refused: {export_error}")
+            else:
+                discharge_ok, discharge_line = await self._write_discharge_current_result()
+                lines.append(discharge_line)
+                export_ready = discharge_ok
+                if not discharge_ok:
+                    export_error = "discharge current was not confirmed"
+                    lines.append("[BLOCKED] export refused: discharge current was not confirmed")
         # Grid-charge gate for the whole forced-charge program: read the work
         # mode once. A real write is refused when bit 5 is unset (firmware would
         # ignore the force anyway). Non-"on" modes don't read/gate.
@@ -125,29 +217,34 @@ class SolisDevice:
         if deactivation_line is not None:
             lines.append(deactivation_line)
         lines.append(current_line)
-        if current_ok:
-            lines.append(await self._write_charge_window(intent, None))
-        else:
-            desc = (
-                f"set charge window {fmt_hhmm(intent.window_start)}-"
-                f"{fmt_hhmm(intent.window_end)} for the "
-                f"{window_hours(intent.window_start, intent.window_end):.1f} h window"
-            )
-            reason = blocked or "planned current was not confirmed"
-            suffix = "" if blocked else "; window unchanged"
-            line = f"[BLOCKED] {desc}: {reason}{suffix}"
-            log.warning(line)
-            lines.append(line)
+        window_block = None if current_ok else (blocked or "planned current was not confirmed")
+        window_line = await self._write_charge_window(
+            intent,
+            window_block,
+            export_window=export if export_ready else None,
+            kept_discharge=kept_discharge,
+        )
+        lines.append(window_line)
+        window_verified = window_line.startswith(("[APPLIED]", "[SKIP]"))
+        if mode == "on" and raw_export is not None and export_ready and not window_verified:
+            export_ready = False
+            export_error = "timed export window was not confirmed"
         # Zero-guard the slots the planner does not drive so a stale manual
         # window (charge 2/3, any discharge) can't actuate behind the plan.
         for slot in (2, 3):
             lines.append(await self._zero_guard_slot(slot))
-        for start, end in intent.holds:
-            lines.append(
-                await self._stop_discharge(
-                    f"turn inverter off (stop discharge) during dispatch "
-                    f"{start:%H:%M}-{end:%H:%M}"
-                )
+        if mode in ("on", "simulate"):
+            if raw_export is not None or export_store.exists:
+                await self._persist_export_state(raw_export, export, export_ready, window_line)
+            await self._notify_export_lifecycle(
+                raw_export,
+                export,
+                export_ready,
+                export_error,
+                window_line,
+                now,
+                previous_export_record,
+                mode,
             )
         return lines
 
@@ -169,31 +266,79 @@ class SolisDevice:
 
     # --- internal writes (PROACTIVE_MODE-gated, failure-isolated, read-back verified) ---
 
-    async def _write_charge_window(self, intent: ChargeIntent, blocked: str | None) -> str:
+    async def _write_charge_window(
+        self,
+        intent: ChargeIntent,
+        blocked: str | None,
+        *,
+        export_window: tuple[datetime, datetime] | None = None,
+        kept_discharge: list[int] | None = None,
+    ) -> str:
         """Program charge slot 1's window block, write-if-changed, read-back verified.
 
-        Writing the 8-register block at 43143 (discharge half held at 0) *is* the
-        commit — there is no separate commit step."""
+        Writing the 8-register block at 43143, including its optional discharge
+        half, is the commit. There is no separate commit step."""
         desc = (
             f"set charge window {fmt_hhmm(intent.window_start)}-{fmt_hhmm(intent.window_end)} "
             f"for the {window_hours(intent.window_start, intent.window_end):.1f} h window"
         )
+        if export_window is not None:
+            export_start, export_end = export_window
+            desc += (
+                f" and export {export_start:%H:%M}-{export_end:%H:%M}"
+                f" at {_EXPORT_CURRENT_A:g} A"
+            )
+        elif kept_discharge is not None:
+            desc += " and keep the verified export window"
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         if mode == "simulate":
             log.info("[SIMULATE] would %s", desc)
             return f"[SIMULATE] would {desc}"
         if mode in ("off", "observe"):
             return f"[{mode.upper()}] computed: {desc}"
-        if blocked:
-            log.warning("[BLOCKED] %s: %s", desc, blocked)
+        keeps_discharge = export_window is not None or kept_discharge is not None
+        if blocked and not keeps_discharge:
+            # Grid-charge permission is not a prerequisite for clearing a
+            # resident discharge schedule. Inspect the block first so an
+            # ordinary blocked charge request still reports BLOCKED when no
+            # export window is resident. A failed inspection fails closed.
+            try:
+                existing = await self._read_slot_block(1)
+            except Exception:
+                return f"[BLOCKED] {desc}: {blocked}"
+            if any(existing[4:]):
+                return await self._clear_discharge_window(desc)
             return f"[BLOCKED] {desc}: {blocked}"
-        want_block = [
-            intent.window_start.hour,
-            intent.window_start.minute,
-            intent.window_end.hour,
-            intent.window_end.minute,
-            0, 0, 0, 0,  # discharge half of slot 1: always zeroed here
-        ]
+        zero_charge = keeps_discharge and solis_current_a(intent, self._settings) <= 0
+        if blocked and keeps_discharge and not zero_charge:
+            # An export write must not be gated by the charge-only work-mode
+            # bit. Preserve the resident charge half and replace the discharge
+            # half in one atomic Slot 1 block.
+            try:
+                existing = await self._read_slot_block(1)
+            except Exception as exc:  # noqa: BLE001 - fail closed
+                return f"[FAILED] {desc}: slot 1 state unreadable: {exc!r}"
+            charge_values = existing[:4]
+        elif zero_charge:
+            charge_values = [0, 0, 0, 0]
+        else:
+            charge_values = [
+                intent.window_start.hour,
+                intent.window_start.minute,
+                intent.window_end.hour,
+                intent.window_end.minute,
+            ]
+        discharge_values = (
+            [
+                export_window[0].hour,
+                export_window[0].minute,
+                export_window[1].hour,
+                export_window[1].minute,
+            ]
+            if export_window is not None
+            else kept_discharge or [0, 0, 0, 0]
+        )
+        want_block = [*charge_values, *discharge_values]
         try:
             wrote = await self._apply_slot_block(1, want_block)
             mismatch = await self._verify_slot_block(1, want_block, refresh=wrote)
@@ -204,6 +349,27 @@ class SolisDevice:
             log.warning("[WARNING] %s, but %s", desc, mismatch)
             return f"[WARNING] {desc}, but {mismatch}"
         return f"[APPLIED] {desc}" if wrote else f"[SKIP] {desc} (already set)"
+
+    async def _clear_discharge_window(self, desc: str) -> str:
+        """Clear only Slot 1's discharge half, preserving any charge schedule."""
+        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        safe_desc = desc.replace("set charge window", "set timed charge schedule")
+        clear_desc = f"clear timed export window ({safe_desc})"
+        if mode == "simulate":
+            return f"[SIMULATE] would {clear_desc}"
+        if mode in ("off", "observe"):
+            return f"[{mode.upper()}] computed: {clear_desc}"
+        try:
+            existing = await self._read_slot_block(1)
+            want = existing[:4] + [0, 0, 0, 0]
+            wrote = await self._apply_slot_block(1, want)
+            mismatch = await self._verify_slot_block(1, want, refresh=wrote)
+        except Exception as exc:  # noqa: BLE001 - cleanup is failure-isolated
+            log.error("[FAILED] %s: %r", clear_desc, exc)
+            return f"[FAILED] {clear_desc}: {exc!r}"
+        if mismatch:
+            return f"[WARNING] {clear_desc}, but {mismatch}"
+        return f"[APPLIED] {clear_desc}" if wrote else f"[SKIP] {clear_desc} (already clear)"
 
     async def _write_charge_current_result(
         self, intent: ChargeIntent, blocked: str | None
@@ -314,7 +480,34 @@ class SolisDevice:
             return False, f"[WARNING] {desc}, but {mismatch}"
         return True, f"[APPLIED] {desc}"
 
-    async def _stop_discharge(self, desc: str) -> str:
+    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+        """Converge the whole-inverter enable on the state the clock implies (#140).
+
+        Desired state is a pure function of ``now`` and ``intent.holds``: ``Off``
+        while a hold is active, ``On`` otherwise. Nothing is remembered, so a
+        restart or a crash mid-hold converges on the next tick, and ha-spark owns
+        both edges rather than only ever subtracting (ADR-0003).
+
+        Read-first, and deliberately cheap enough for the per-minute cadence it
+        is driven at (#143): steady state is one *cached* ``GET`` of the select
+        and zero register writes. The read hits HA's state machine, not modbus,
+        and the read-back does not call ``homeassistant.update_entity``, so
+        nothing here forces an inverter poll. The register is written only at a
+        genuine hold edge, to correct an external change, or to retry a failure.
+
+        It is exempt from the SoC guard in ``apply``: it commands no SoC-derived
+        magnitude, and freezing the inverter ``Off`` on an unrelated dead sensor
+        is exactly the failure it exists to remove.
+
+        It must never read export state. If the switch is ``On`` during a paid
+        export that is because no hold is active, not because export asked —
+        ``_require_power_switch_on`` stays a read-only refusal.
+        """
+        return [await self._reconcile_power_switch(intent, now)]
+
+    async def _reconcile_power_switch(self, intent: ChargeIntent, now: datetime) -> str:
+        wanted = "Off" if intent.hold_active(now) else "On"
+        desc = f"set inverter power switch to {wanted}"
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         if mode == "simulate":
             return f"[SIMULATE] would {desc}"
@@ -324,13 +517,336 @@ class SolisDevice:
         if not entity:
             return "[SKIP] no power_switch entity configured; discharge left as-is"
         try:
-            await self._rest.call_service(
-                "select", "select_option", {"entity_id": entity, "option": "Off"}
-            )
-            mismatch = await self._read_back_option(entity, "Off")
-        except Exception as exc:  # noqa: BLE001
+            # The pre-read suppresses a redundant write, and on a failure it
+            # decides asymmetrically (#143): unreadable evidence may *close* a
+            # hold, never open one. Falling through to `Off` keeps a flaky GET
+            # on the tick a dispatch opens from dropping the hold; falling
+            # through to `On` at the per-minute cadence would instead be up to
+            # 60 blind, unverifiable releases an hour through an HA outage, each
+            # one freeing a battery ha-spark can no longer see to discharge.
+            try:
+                if (await self._rest.get_state(entity)).state.strip().lower() == wanted.lower():
+                    return f"[SKIP] {desc} (already set)"
+            except Exception as exc:  # noqa: BLE001 - direction decides
+                if wanted == "On":
+                    # Not a benign skip: while the reads stay broken the inverter
+                    # is left disabled, the house entirely on grid import. This
+                    # direction is still the safe one, but it is unbounded here
+                    # on purpose — the bound is the relinquish path (#143 §5),
+                    # which writes the safe state once ha-spark is past every
+                    # known hold end and still has no picture.
+                    log.warning("Power-switch unreadable (%r); not releasing a hold", exc)
+                    return (
+                        f"[WARNING] {desc} refused: state unreadable ({exc!r}); "
+                        "a hold is never released blind"
+                    )
+                log.warning("Power-switch pre-read failed (%r); writing %s anyway", exc, wanted)
+            mismatch = await self._select_option(entity, wanted)
+        except Exception as exc:  # noqa: BLE001 - isolate this action's failure
+            log.error("[FAILED] %s: %r", desc, exc)
             return f"[FAILED] {desc}: {exc!r}"
         return f"[WARNING] {desc}, but {mismatch}" if mismatch else f"[APPLIED] {desc}"
+
+    async def write_safe_state(self) -> list[str]:
+        """Leave the inverter self-managing when ha-spark stops steering (#143 §5).
+
+        Inverter ``On``, Slot 1 charging across the configured cheap window, and
+        a discharge window that is zeroed unless it is a verified export still
+        running. The scheduler decides *when* (past every known hold end with no
+        trusted picture, or a clean shutdown) and fires it once; this only writes.
+        It is the designated bound on the reconcile's refused blind release, so an
+        unreadable switch is written ``On`` here rather than refused. Retries are
+        not this method's: they belong to the read-first reconcile and ``apply``,
+        which never write blind, so broken reads cannot cost the inverter a
+        register write a minute. Each action is gated and isolated like every
+        other write; it never touches the charge or discharge current.
+        """
+        return [await self._write_safe_power_switch(), await self._write_safe_slot_block()]
+
+    async def _write_safe_power_switch(self) -> str:
+        desc = "set inverter power switch to On (relinquishing control)"
+        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        if mode == "simulate":
+            return f"[SIMULATE] would {desc}"
+        if mode in ("off", "observe"):
+            return f"[{mode.upper()}] computed: {desc}"
+        entity = self._config.entities.get("power_switch", "")
+        if not entity:
+            return "[SKIP] no power_switch entity configured; discharge left as-is"
+        try:
+            try:
+                if (await self._rest.get_state(entity)).state.strip().lower() == "on":
+                    return f"[SKIP] {desc} (already set)"
+            except Exception as exc:  # noqa: BLE001 - unreadable is written, not refused
+                log.warning("Power-switch pre-read failed (%r); writing On anyway", exc)
+            mismatch = await self._select_option(entity, "On")
+        except Exception as exc:  # noqa: BLE001 - isolate this action's failure
+            log.error("[FAILED] %s: %r", desc, exc)
+            return f"[FAILED] {desc}: {exc!r}"
+        return f"[WARNING] {desc}, but {mismatch}" if mismatch else f"[APPLIED] {desc}"
+
+    async def _write_safe_slot_block(self) -> str:
+        # Imported here for the same import-cycle reason as in `apply`.
+        from ha_spark.energy.sources import parse_time
+
+        try:
+            start = parse_time(self._settings.charge_window_start)
+            end = parse_time(self._settings.charge_window_end)
+        except ValueError as exc:
+            line = f"[FAILED] set charge window (relinquishing control): {exc!r}"
+            log.error(line)
+            return line
+        charge = [start.hour, start.minute, end.hour, end.minute]
+        desc = f"set charge window {fmt_hhmm(start)}-{fmt_hhmm(end)} (relinquishing control)"
+        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        if mode == "simulate":
+            return f"[SIMULATE] would {desc}"
+        if mode in ("off", "observe"):
+            return f"[{mode.upper()}] computed: {desc}"
+        try:
+            async with ExportEventStore(self._settings.db_path) as store:
+                record = await store.load()
+            export_live = record is not None and record[1] > datetime.now(UTC)
+            try:
+                resident: list[int] | None = await self._read_slot_block(1)
+            except Exception as exc:  # noqa: BLE001 - decided below
+                log.warning("Slot 1 pre-read failed (%r)", exc)
+                resident = None
+            if resident is None:
+                if export_live:
+                    # A blind block write cannot carry a window it cannot see:
+                    # it would zero a paid export mid-event.
+                    line = f"[BLOCKED] {desc}: slot 1 unreadable while a verified export is live"
+                    log.warning(line)
+                    return line
+                discharge = [0, 0, 0, 0]
+            else:
+                # Same keep rule as #143 §3: only a window ha-spark verified and
+                # recorded, whose end is still ahead. Anything else is zeroed.
+                kept = resident[4:]
+                discharge = kept if export_live and any(kept) else [0, 0, 0, 0]
+            want = [*charge, *discharge]
+            if resident == want:
+                return f"[SKIP] {desc} (already set)"
+            await self._write_register(_SLOT_BLOCK_REG[1], want)
+            mismatch = await self._verify_slot_block(1, want, refresh=True)
+        except Exception as exc:  # noqa: BLE001 - isolate this action's failure
+            log.error("[FAILED] %s: %r", desc, exc)
+            return f"[FAILED] {desc}: {exc!r}"
+        return f"[WARNING] {desc}, but {mismatch}" if mismatch else f"[APPLIED] {desc}"
+
+    async def _select_option(self, entity: str, option: str) -> str | None:
+        """Write a select option and confirm it; returns the read-back mismatch."""
+        await self._rest.call_service(
+            "select", "select_option", {"entity_id": entity, "option": option}
+        )
+        return await self._read_back_option(entity, option)
+
+    async def _write_discharge_current_result(self) -> tuple[bool, str]:
+        """Set and verify the fixed full-rate command used for paid export."""
+        desc = f"set timed discharge current to {_EXPORT_CURRENT_A:g} A for export"
+        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        if mode == "simulate":
+            return True, f"[SIMULATE] would {desc}"
+        if mode in ("off", "observe"):
+            return True, f"[{mode.upper()}] computed: {desc}"
+        try:
+            wrote = await self._apply_discharge_current(_EXPORT_CURRENT_RAW)
+            mismatch = await self._verify_discharge_current(
+                _EXPORT_CURRENT_A, refresh=wrote
+            )
+        except Exception as exc:  # noqa: BLE001 - isolate export action
+            log.error("[FAILED] %s: %r", desc, exc)
+            return False, f"[FAILED] {desc}: {exc!r}"
+        if mismatch:
+            log.warning("[WARNING] %s, but %s", desc, mismatch)
+            return False, f"[WARNING] {desc}, but {mismatch}"
+        return True, f"[APPLIED] {desc}" if wrote else f"[SKIP] {desc} (already set)"
+
+    async def _untrusted_holds_export(
+        self, export: tuple[datetime, datetime], mode: str, now: datetime
+    ) -> tuple[str | None, list[int] | None]:
+        """Refuse a *new* export window while hold data is untrusted (#143 §3).
+
+        Returns the refusal (``None`` to proceed) and the Slot 1 discharge half
+        to keep in place of the refused window.
+
+        A failed dispatch read leaves the holds empty, so ``hold_overlaps``
+        would admit a window across a dispatch ha-spark can no longer see, and
+        the reconcile would then drive the switch ``Off`` mid-event and kill the
+        export half-delivered. Same class of refusal as #132's underfunded
+        event, and the next tick retries.
+
+        An already-programmed window is left alone. When it is this very window,
+        re-applying it is a write-if-changed no-op. When it differs — a trusted
+        plan trimmed the event around a dispatch, and with the holds gone the
+        planner now offers the whole event — refusing must not zero it, or the
+        paid window is cleared on every tick the read stays down. Only a window
+        ha-spark verified and recorded, and whose end is still ahead, is kept:
+        anything else resident stays subject to the usual guard. It is captured
+        here, before the charge-current step can deactivate Slot 1. Outside
+        ``on`` nothing is resident, and an unreadable slot fails closed.
+        """
+        refusal = "hold data untrusted; not programming a new export window"
+        if mode != "on":
+            return refusal, None
+        try:
+            resident = (await self._read_slot_block(1))[4:]
+        except Exception:  # noqa: BLE001 - fail closed
+            return refusal, None
+        start, end = export
+        if resident == [start.hour, start.minute, end.hour, end.minute]:
+            return None, None
+        if any(resident):
+            async with ExportEventStore(self._settings.db_path) as store:
+                record = await store.load()
+            if record is not None and record[1] > now.astimezone(UTC):
+                return f"{refusal}; keeping the verified window already in Slot 1", resident
+        return refusal, None
+
+    async def _require_power_switch_on(self) -> str | None:
+        entity = self._config.entities.get("power_switch", "")
+        if not entity:
+            return "power_switch entity is not configured"
+        try:
+            state = await self._rest.get_state(entity)
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            return f"power_switch state unreadable: {exc!r}"
+        return None if state.state.strip().lower() == "on" else f"power_switch is {state.state!r}"
+
+    async def _persist_export_state(
+        self,
+        raw_export: object,
+        export: tuple[datetime, datetime] | None,
+        export_ready: bool,
+        window_line: str,
+    ) -> None:
+        """Record only a fully verified event; clear state for cancellation/failure."""
+        try:
+            async with ExportEventStore(self._settings.db_path) as store:
+                if (
+                    export is not None
+                    and export_ready
+                    and window_line.startswith(("[APPLIED]", "[SKIP]"))
+                ):
+                    start, end = export
+                    await store.save(_export_identity(raw_export, start, end), end)
+                elif export is None and window_line.startswith(("[APPLIED]", "[SKIP]")):
+                    await store.clear()
+        except Exception as exc:  # noqa: BLE001 - persistence cannot undo HA writes
+            log.error("Export event state persistence failed: %r", exc)
+
+    async def _notify_export_lifecycle(
+        self,
+        raw_export: object,
+        export: tuple[datetime, datetime] | None,
+        export_ready: bool,
+        export_error: str | None,
+        window_line: str,
+        now: datetime,
+        previous_record: tuple[str, datetime] | None,
+        mode: str,
+    ) -> None:
+        """Notify only verified export transitions; notification is never a gate."""
+        service = self._settings.notify_service
+        if not service:
+            return
+        store = ExportNotificationStore(self._settings.db_path)
+        if mode != "on":
+            context = _export_notification_context(raw_export, export)
+            if context is None or not export_ready or export_error is not None:
+                return
+            event_id, start, end, planned_kw, dno_limit_kw = context
+            await send_once(
+                store,
+                self._rest,
+                service,
+                make_notice(
+                    "accepted",
+                    event_id,
+                    start,
+                    end,
+                    planned_export_kw=planned_kw,
+                    dno_export_limit_kw=dno_limit_kw,
+                ),
+            )
+            return
+        if raw_export is None:
+            if previous_record is None or not window_line.startswith(("[APPLIED]", "[SKIP]")):
+                return
+            parsed = parse_event_id(previous_record[0])
+            if parsed is None:
+                return
+            _, start, end = parsed
+            await send_once(
+                store,
+                self._rest,
+                service,
+                make_notice("cleanup", previous_record[0], start, end),
+            )
+            return
+
+        context = _export_notification_context(raw_export, export)
+        if context is None:
+            return
+        event_id, start, end, planned_kw, dno_limit_kw = context
+        if export_ready and window_line.startswith(("[APPLIED]", "[SKIP]")):
+            await send_once(
+                store,
+                self._rest,
+                service,
+                make_notice(
+                    "accepted",
+                    event_id,
+                    start,
+                    end,
+                    planned_export_kw=planned_kw,
+                    dno_export_limit_kw=dno_limit_kw,
+                ),
+            )
+            if now.astimezone(UTC) >= start.astimezone(UTC):
+                await send_once(
+                    store,
+                    self._rest,
+                    service,
+                    make_notice("started", event_id, start, end),
+                )
+            return
+        if export_error is None or any(
+            retryable in export_error
+            for retryable in ("not yet armed", "hold data untrusted")
+        ):
+            return
+        safe_state = (
+            "no export window remains programmed"
+            if window_line.startswith(("[APPLIED]", "[SKIP]"))
+            else "the Solis export state was not verified; remain in simulate and inspect it"
+        )
+        await send_once(
+            store,
+            self._rest,
+            service,
+            make_notice(
+                "aborted",
+                event_id,
+                start,
+                end,
+                reason=export_error,
+                safe_state=safe_state,
+            ),
+        )
+
+    async def _has_live_verified_export(self, now: datetime) -> bool:
+        """Return whether the last verified Axle export is still in progress.
+
+        A failed Axle read is not a cancellation. Keep the whole apply pass
+        away from Slot 1 while the durable record says a verified event has not
+        ended; otherwise the ordinary no-export path would clear a paid event
+        during a transient provider failure (#148).
+        """
+        async with ExportEventStore(self._settings.db_path) as store:
+            record = await store.load()
+        return record is not None and record[1] > now.astimezone(UTC)
 
     # --- modbus helpers ---
 
@@ -358,6 +874,13 @@ class SolisDevice:
         await self._write_register(_CHARGE_CURRENT_REG, want_raw)
         return True
 
+    async def _apply_discharge_current(self, want_raw: int) -> bool:
+        """Write the fixed export current only when its read-back differs."""
+        if abs(await self._read_discharge_current_a() - _EXPORT_CURRENT_A) <= 0.5:
+            return False
+        await self._write_register(_DISCHARGE_CURRENT_REG, want_raw)
+        return True
+
     async def _read_slot_block(self, slot: int) -> list[int]:
         # Parse strictly (not via the tolerant _to_float): an unreadable slot
         # register must raise so the caller degrades to [FAILED]/read-back
@@ -371,6 +894,10 @@ class SolisDevice:
 
     async def _read_current_a(self) -> float:
         state = await self._rest.get_state(self._sensor("timed_charge_current"))
+        return float(state.state)
+
+    async def _read_discharge_current_a(self) -> float:
+        state = await self._rest.get_state(self._sensor("timed_discharge_current"))
         return float(state.state)
 
     async def _verify_slot_block(
@@ -392,6 +919,16 @@ class SolisDevice:
             lambda got: abs(got - amps) <= 0.5,
             lambda got: f"read back {got:g} A (wanted {amps:g} A)",
             refresh_entities=(self._sensor("timed_charge_current"),) if refresh else None,
+        )
+
+    async def _verify_discharge_current(
+        self, amps: float, *, refresh: bool = False
+    ) -> str | None:
+        return await self._verify_read_back(
+            self._read_discharge_current_a,
+            lambda got: abs(got - amps) <= 0.5,
+            lambda got: f"read back discharge {got:g} A (wanted {amps:g} A)",
+            refresh_entities=(self._sensor("timed_discharge_current"),) if refresh else None,
         )
 
     async def _verify_read_back(
@@ -443,11 +980,220 @@ class SolisDevice:
         return None
 
     async def _read_back_option(self, entity: str, wanted: str) -> str | None:
-        try:
-            got = str((await self._rest.get_state(entity)).state)
-        except Exception as exc:  # noqa: BLE001
-            return f"read-back failed: {exc!r}"
-        return None if got.lower() == wanted.lower() else f"read back {got!r} (wanted {wanted!r})"
+        """Confirm a select took the option, retrying the same bounded few times
+        as every other read-back here.
+
+        HA's state machine is asynchronous with respect to the overlay, so the
+        first read after a write can still carry the old option. Without the
+        retry the reconcile reports a mismatch it would have seen settle, and —
+        because it remembers nothing and now runs every minute — writes the
+        register again on the next pass, and the one after that. The bound stays
+        finite so a permanently stale overlay can never hold the caller."""
+        got = ""
+        for attempt in range(_READ_BACK_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(_READ_BACK_DELAY_SECONDS)
+            try:
+                got = str((await self._rest.get_state(entity)).state)
+            except Exception as exc:  # noqa: BLE001
+                return f"read-back failed: {exc!r}"
+            if got.lower() == wanted.lower():
+                return None
+        return f"read back {got!r} (wanted {wanted!r})"
+
+
+def _export_window(intent: ChargeIntent, tz: ZoneInfo) -> tuple[datetime, datetime] | None:
+    """Read the optional planner export value without coupling to its model type.
+
+    Resolved to ``tz`` — the household clock the inverter runs on. The Slot 1
+    window registers hold local wall-clock time, and the charge half of that
+    same block is written from ``intent.window_start``, a local ``time``. Both
+    halves must share one basis or a BST event is programmed an hour early.
+    """
+    value = getattr(intent, "export", None)
+    if value is None:
+        return None
+    get = (
+        value.get
+        if isinstance(value, dict)
+        else lambda name, default=None: getattr(value, name, default)
+    )
+    start = get("window_start", get("start", get("selected_start")))
+    end = get("window_end", get("end", get("selected_end")))
+    if not isinstance(start, datetime) or not isinstance(end, datetime):
+        return None
+    if start.tzinfo is None or end.tzinfo is None:
+        return None
+    return start.astimezone(tz), end.astimezone(tz)
+
+
+def _validate_export(intent: ChargeIntent, export: tuple[datetime, datetime]) -> str | None:
+    """Fail closed on malformed export values and untrusted SoC observations."""
+    start, end = export
+    value = getattr(intent, "export", None)
+    get = (
+        value.get
+        if isinstance(value, dict)
+        else lambda name, default=None: getattr(value, name, default)
+    )
+    planned_kw = get("planned_export_kw")
+    dno_kw = get("dno_export_limit_kw")
+    if not isinstance(planned_kw, (int, float)) or not math.isfinite(float(planned_kw)):
+        return "planned export power is not finite"
+    if float(planned_kw) <= 0:
+        return "planned export power is not positive"
+    if dno_kw is not None and (
+        not isinstance(dno_kw, (int, float))
+        or not math.isfinite(float(dno_kw))
+        or float(dno_kw) <= 0
+    ):
+        return "DNO export limit is invalid"
+    if end <= start or end <= datetime.now(UTC):
+        return "export window is stale or empty"
+    soc = intent.soc.soc_now
+    if not intent.soc.ok or not math.isfinite(soc) or not 0 <= soc <= 100:
+        return intent.soc.reason if not intent.soc.ok else "SoC is outside 0-100%"
+    return None
+
+
+def _next_wall_clock_occurrence(wall: datetime, now: datetime) -> datetime:
+    """First moment at or after ``now`` showing ``wall``'s clock face.
+
+    Recombines a date with the time of day rather than adding a ``timedelta``,
+    so a DST boundary in between moves the UTC offset and leaves the clock face
+    alone — which is what the Slot 1 registers actually hold.
+
+    Comparisons are made on the absolute instant (``astimezone(UTC)``), never
+    between two same-zone aware datetimes: Python compares those by clock face
+    and ignores ``fold``, which would make the two distinct 01:30s of a
+    fall-back night look identical. ``fold`` is then forced to 0 on the
+    candidate — ``datetime.time()`` carries it through, so it has to be cleared
+    deliberately — making this the *first* 01:30 of such a night, which is
+    exactly the one the register fires on.
+    """
+    face = wall.time().replace(fold=0)
+    today = datetime.combine(now.date(), face, tzinfo=now.tzinfo)
+    if today.astimezone(UTC) >= now.astimezone(UTC):
+        return today
+    return datetime.combine(now.date() + timedelta(days=1), face, tzinfo=now.tzinfo)
+
+
+def _clock_window_open(t: time, start: time, end: time) -> bool:
+    """True when clock time ``t`` is inside ``[start, end)``, which may wrap midnight."""
+    if start < end:
+        return start <= t < end
+    if start > end:
+        return t >= start or t < end
+    return False
+
+
+def _export_not_yet_armed(export: tuple[datetime, datetime], now: datetime) -> str | None:
+    """Refuse a window whose clock face would come round before its own event.
+
+    The Slot 1 discharge registers carry a time of day and no date, while the
+    planner's 24 h horizon offers an event as soon as it enters the horizon.
+    Programming tomorrow's 18:30 event at noon today would discharge the battery
+    at 18:30 *today* — intentional export outside a paid window, which costs a
+    peak-rate refill and earns nothing.
+
+    This is a deferral, not a terminal abort: the event is re-offered on every
+    tick and arms itself once the next time its window opens is the event's own,
+    so no scheduling state is needed. A window already under way stays armed, so a
+    day-of pickup still delivers the remainder instead of waiting a day.
+
+    Passing the start's clock face is not enough: until the clock also leaves
+    the window, programming it puts the inverter inside it at once. Tuesday's
+    18:30-19:30 programmed at Monday 18:31 would export unpaid until Monday
+    19:30, so an earlier day's still-open window is refused too.
+
+    An event inside a fall-back night's repeated hour is refused outright rather
+    than armed: its clock face comes round twice, the register fires on the
+    first, and the event may mean the second. Refusing loses one event an hour
+    before the clocks go back; arming could export an hour early, unpaid.
+    """
+    start, end = export
+    if now.astimezone(UTC) >= start.astimezone(UTC):
+        return None
+    if _clock_window_open(now.time(), start.time(), end.time()):
+        return (
+            f"the {start:%H:%M}-{end:%H:%M} window is already open on the clock at "
+            f"{now:%a %d %b %H:%M}, before the event starts {start:%a %d %b %H:%M}; "
+            "not yet armed"
+        )
+    occurrence = _next_wall_clock_occurrence(start, now)
+    if occurrence.astimezone(UTC) == start.astimezone(UTC):
+        return None
+    return (
+        f"the {start:%H:%M} window would next fire {occurrence:%a %d %b %H:%M}, "
+        f"before the event starts {start:%a %d %b %H:%M}; not yet armed"
+    )
+
+
+def _export_identity(value: object, start: datetime, end: datetime) -> str:
+    """Return the original Axle identity, not a shortened selected window."""
+    identity = (
+        value.get("event_identity")
+        if isinstance(value, dict)
+        else getattr(value, "event_identity", None)
+    )
+    if isinstance(identity, tuple) and len(identity) == 3:
+        direction, event_start, event_end = identity
+        if (
+            isinstance(direction, str)
+            and isinstance(event_start, datetime)
+            and isinstance(event_end, datetime)
+        ):
+            return (
+                f"{direction}|{event_start.astimezone(UTC).isoformat()}|"
+                f"{event_end.astimezone(UTC).isoformat()}"
+            )
+    # Compatibility for a third-party adapter that has not yet supplied the
+    # resolved identity; planner-owned ExportIntent always does.
+    return f"export|{start.astimezone(UTC).isoformat()}|{end.astimezone(UTC).isoformat()}"
+
+
+def _export_notification_context(
+    value: object, resolved: tuple[datetime, datetime] | None
+) -> tuple[str, datetime, datetime, float | None, float | None] | None:
+    """Extract notification-safe identity and planning details from an export value."""
+    get = (
+        value.get
+        if isinstance(value, dict)
+        else lambda name, default=None: getattr(value, name, default)
+    )
+    identity = get("event_identity")
+    if isinstance(identity, tuple) and len(identity) == 3:
+        direction, start, end = identity
+        if (
+            isinstance(direction, str)
+            and isinstance(start, datetime)
+            and isinstance(end, datetime)
+            and start.tzinfo is not None
+            and end.tzinfo is not None
+        ):
+            return (
+                _export_identity(value, start, end),
+                start,
+                end,
+                _finite_number(get("planned_export_kw")),
+                _finite_number(get("dno_export_limit_kw")),
+            )
+    if resolved is None:
+        return None
+    start, end = resolved
+    return (
+        _export_identity(value, start, end),
+        start,
+        end,
+        _finite_number(get("planned_export_kw")),
+        _finite_number(get("dno_export_limit_kw")),
+    )
+
+
+def _finite_number(value: object) -> float | None:
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return None
 
 
 def solis_current_a(intent: ChargeIntent, settings: Settings) -> float:

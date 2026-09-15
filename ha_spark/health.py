@@ -18,6 +18,7 @@ from pathlib import Path
 import aiosqlite
 
 from ha_spark.config import Settings
+from ha_spark.energy.axle import AxleApiError, read_axle_event
 from ha_spark.energy.forecast import intervals_from_hourly_stats, load_timezone
 from ha_spark.energy.octopus import (
     OctopusApiError,
@@ -256,12 +257,36 @@ async def _check_octopus_intelligent_tariff(settings: Settings) -> CheckResult:
     )
 
 
+async def _check_axle_tariff(settings: Settings) -> CheckResult:
+    """Confirm that the Axle event source can be read without exposing its token."""
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            event = await read_axle_event(settings, rest)
+    except AxleApiError as exc:
+        return CheckResult(
+            "Tariff provider",
+            Status.WARN,
+            f"Axle event source unavailable: {exc}; plans keep the base schedule",
+        )
+    if event is None:
+        return CheckResult("Tariff provider", Status.OK, "Axle has no upcoming export event")
+    return CheckResult(
+        "Tariff provider",
+        Status.OK,
+        f"Axle export event {event.start.isoformat()} to {event.end.isoformat()}",
+    )
+
+
 async def check_tariff_provider(settings: Settings) -> CheckResult:
     """Confirm the configured tariff provider reads end-to-end (`fixed` needs no live read)."""
     if settings.tariff_provider == "dynamic":
         return await _check_dynamic_tariff(settings)
     if settings.tariff_provider == "octopus_intelligent":
         return await _check_octopus_intelligent_tariff(settings)
+    if settings.tariff_provider == "axle":
+        return await _check_axle_tariff(settings)
     return CheckResult("Tariff provider", Status.OK, "fixed (no live source)")
 
 

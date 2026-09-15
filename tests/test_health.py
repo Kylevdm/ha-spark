@@ -184,6 +184,52 @@ async def test_check_tariff_provider_octopus_intelligent_auth_failure_warns() ->
     assert "sk_test" not in res.detail
 
 
+@respx.mock
+async def test_check_tariff_provider_axle_reports_event() -> None:
+    respx.get("http://axle.test/vpp/home-assistant/event").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "start_time": "2026-09-12T17:00:00+00:00",
+                "end_time": "2026-09-12T18:00:00+00:00",
+                "import_export": "export",
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+        )
+    )
+    res = await check_tariff_provider(
+        Settings(
+            ha_url=HA,
+            ha_token="tok",
+            tariff_provider="axle",
+            axle_api_url="http://axle.test",
+            axle_api_key="secret-token",
+        )
+    )
+
+    assert res.status is Status.OK
+    assert "export event" in res.detail
+
+
+@respx.mock
+async def test_check_tariff_provider_axle_failure_warns_without_secret() -> None:
+    respx.get("http://axle.test/vpp/home-assistant/event").mock(
+        return_value=httpx.Response(401)
+    )
+    res = await check_tariff_provider(
+        Settings(
+            ha_url=HA,
+            ha_token="tok",
+            tariff_provider="axle",
+            axle_api_url="http://axle.test",
+            axle_api_key="secret-token",
+        )
+    )
+
+    assert res.status is Status.WARN
+    assert "secret-token" not in res.detail
+
+
 # --- Ollama check ---
 
 

@@ -96,3 +96,15 @@ confidence-qualified learned estimate as an input to its own planner, thereby
 changing future plans. Learning never reconfigures a BMS, inverter, or another
 system ha-spark does not own; those systems' measurements remain evidence, not
 configuration targets.
+
+**Supply current limit** — the site's maximum AC current in either the import
+or export direction. It is distinct from the inverter's DC battery-current
+ceiling and from any stricter DNO export limit.
+
+**Export ceiling** — the maximum grid-export power for a slot after applying
+the relevant site or DNO limit and the power available from the battery and
+solar generation after serving house load.
+
+**Export priority** — during a paid flexibility event, export revenue outranks
+discretionary battery charging. It does not outrank house supply or the
+reservation needed to protect the household after the event.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, time
 
-from ha_spark.energy.models import ChargeIntent, ChargePlan
+from ha_spark.energy.models import ChargeIntent, ChargePlan, ExportIntent, ExportSkip, Reservation
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 
@@ -87,3 +87,52 @@ def test_report_names_the_concrete_integrity_reason() -> None:
 
 def test_report_does_not_flag_a_trusted_soc() -> None:
     assert "untrusted" not in format_plan(_plan(), "test")
+
+
+def test_report_renders_reservation_reason() -> None:
+    reservation = Reservation(
+        name="reach-next-cheap-slot",
+        target_slot=48,
+        energy_kwh=8.64,
+        obligation_kind="reach-next-cheap-slot",
+        reason="Reserving 8.64 kWh through the planning horizon because no cheap slot appears.",
+    )
+    out = format_plan(_plan(reservations=(reservation,)), "slot profile")
+
+    assert "Reservations:" in out
+    assert reservation.reason in out
+
+
+def test_report_explains_selected_and_skipped_paid_export_slots() -> None:
+    start = datetime(2026, 6, 9, 17, 0, tzinfo=UTC)
+    export = ExportIntent(
+        event_identity=("export", start, start.replace(hour=18)),
+        window_start=start,
+        window_end=start.replace(hour=18),
+        planned_export_kw=3.2,
+        dno_export_limit_kw=7.36,
+        selected_slots=(start, start.replace(minute=30)),
+        slot_export_kw=(3.2, 3.2),
+    )
+    intent = ChargeIntent(
+        target_soc_pct=69, soc=_soc(69), window_start=time(23, 30), window_end=time(5, 30),
+        export=export,
+    )
+
+    out = format_plan(
+        _plan(
+            charge_intent=intent,
+            export_skips=(
+                ExportSkip(
+                    start.replace(hour=16, minute=30),
+                    "Skipped paid slot: it overlaps an Octopus dispatch hold.",
+                ),
+            ),
+        ),
+        "test",
+    )
+
+    assert "Paid export" in out
+    assert "17:00-18:00" in out
+    assert "3.20 kW" in out
+    assert "Skipped paid slot" in out
