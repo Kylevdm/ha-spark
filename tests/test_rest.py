@@ -1,9 +1,10 @@
 import json
 
 import httpx
+import pytest
 import respx
 
-from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.ha.rest import HomeAssistantRest, HomeAssistantRestError
 
 BASE = "http://ha.test/api"
 
@@ -65,3 +66,34 @@ async def test_set_state_posts_state_and_attributes() -> None:
         "state": "90",
         "attributes": {"unit_of_measurement": "%"},
     }
+
+
+@pytest.mark.parametrize("failure", ["transport", "status", "malformed"])
+@respx.mock
+async def test_rest_failures_never_expose_the_auth_token(failure: str, caplog) -> None:
+    secret = "ha-auth-token-sentinel"
+    route = respx.get(f"{BASE}/states/sensor.secret_probe")
+    if failure == "transport":
+        route.mock(side_effect=httpx.ConnectError(f"transport failed: {secret}"))
+    elif failure == "status":
+        route.mock(return_value=httpx.Response(503, text=f"upstream failed: {secret}"))
+    else:
+        route.mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "entity_id": secret,
+                    "state": "on",
+                    "attributes": "not-an-object",
+                },
+            )
+        )
+
+    with caplog.at_level("WARNING"):
+        async with HomeAssistantRest(BASE, secret) as rest:
+            with pytest.raises(HomeAssistantRestError) as caught:
+                await rest.get_state("sensor.secret_probe")
+
+    assert secret not in caplog.text
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)

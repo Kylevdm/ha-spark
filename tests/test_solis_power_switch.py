@@ -516,6 +516,48 @@ class _FailingSwitchWriteRest(FakeRest):
         return await super().call_service(domain, service, data)
 
 
+class _SecretSwitchReadRest(FakeRest):
+    def __init__(self, secret: str) -> None:
+        super().__init__(switch="On")
+        self._secret = secret
+
+    async def get_state(self, entity_id: str) -> EntityState:
+        if entity_id == _SWITCH:
+            raise RuntimeError(f"HA request failed with {self._secret}")
+        return await super().get_state(entity_id)
+
+
+class _SecretWriteRest(FakeRest):
+    def __init__(self, secret: str) -> None:
+        super().__init__(switch="Off")
+        self._secret = secret
+
+    async def call_service(
+        self, domain: str, service: str, data: dict[str, object] | None = None
+    ) -> list[EntityState]:
+        raise RuntimeError(f"HA request failed with {self._secret}")
+
+
+@pytest.mark.asyncio
+async def test_power_switch_read_failure_never_echoes_the_auth_token(tmp_path, caplog) -> None:
+    secret = "ha-auth-token-sentinel"
+    with caplog.at_level("WARNING"):
+        lines = await _reconcile(_device(_SecretSwitchReadRest(secret), tmp_path), _intent())
+
+    assert secret not in caplog.text
+    assert secret not in "\n".join(lines)
+
+
+@pytest.mark.asyncio
+async def test_safe_state_write_failure_never_echoes_the_auth_token(tmp_path, caplog) -> None:
+    secret = "ha-auth-token-sentinel"
+    with caplog.at_level("WARNING"):
+        lines = await _device(_SecretWriteRest(secret), tmp_path).write_safe_state()
+
+    assert secret not in caplog.text
+    assert secret not in "\n".join(lines)
+
+
 @pytest.mark.asyncio
 async def test_safe_state_switches_on_and_writes_the_default_window(tmp_path) -> None:
     rest = FakeRest(switch="Off")

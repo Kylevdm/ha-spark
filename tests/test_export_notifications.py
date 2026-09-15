@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import httpx
+import pytest
+
 from ha_spark.energy.export_notifications import (
     ExportNotificationStore,
     make_notice,
@@ -88,3 +91,43 @@ async def test_notice_contract_covers_abort_and_cleanup_safe_state() -> None:
     assert "no export window was programmed" in aborted.message
     assert cleaned.title == "Axle export cleanup verified"
     assert "cleared and read back" in cleaned.message
+
+
+class _FailingRest:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    async def call_service(
+        self, domain: str, service: str, data: dict[str, object] | None = None
+    ) -> list[object]:
+        raise self._error
+
+
+@pytest.mark.parametrize("failure", ["transport", "status", "malformed"])
+async def test_notification_failures_never_log_the_api_key(failure: str, caplog, tmp_path) -> None:
+    secret = "axle-api-key-sentinel"
+    if failure == "transport":
+        error = httpx.ConnectError(f"transport failed: {secret}")
+    elif failure == "status":
+        request = httpx.Request("POST", "http://ha.test/api/services/notify/mobile")
+        response = httpx.Response(503, request=request, text=f"upstream failed: {secret}")
+        error = httpx.HTTPStatusError(
+            f"status failed: {secret}", request=request, response=response
+        )
+    else:
+        error = ValueError(f"malformed notification payload: {secret}")
+
+    start, end = _window()
+    notice = make_notice(
+        "accepted",
+        "export|2026-09-15T18:00:00+00:00|2026-09-15T19:00:00+00:00",
+        start,
+        end,
+    )
+    store = ExportNotificationStore(str(tmp_path / "events.db"))
+
+    with caplog.at_level("WARNING"):
+        sent = await send_once(store, _FailingRest(error), "mobile_app_phone", notice)
+
+    assert sent is False
+    assert secret not in caplog.text

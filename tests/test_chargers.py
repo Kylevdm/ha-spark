@@ -17,7 +17,7 @@ from ha_spark.devices.inverters.alphaess import AlphaESSDevice
 from ha_spark.devices.inverters.solis import SolisDevice, solis_current_a
 from ha_spark.energy.models import ChargeIntent
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
-from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.ha.rest import HomeAssistantRest, HomeAssistantRestError
 
 
 def _settings(**overrides: object) -> Settings:
@@ -644,7 +644,7 @@ async def test_read_charge_rate_raises_on_unreadable_sensor() -> None:
         return_value=httpx.Response(500)
     )
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(HomeAssistantRestError):
             await _solis_device(s, rest).read_charge_rate()
 
 

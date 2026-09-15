@@ -14,7 +14,7 @@ log = get_logger(__name__)
 
 
 class HomeAssistantRestError(RuntimeError):
-    """Raised when the Home Assistant REST API returns an error."""
+    """Raised when a Home Assistant REST request or response cannot be trusted."""
 
 
 class HomeAssistantRest:
@@ -51,47 +51,70 @@ class HomeAssistantRest:
         await self._client.aclose()
 
     async def _get(self, path: str) -> Any:
-        resp = await self._client.get(path)
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = await self._client.get(path)
+            resp.raise_for_status()
+            return resp.json()
+        except (httpx.HTTPError, TypeError, ValueError):
+            raise HomeAssistantRestError("Home Assistant REST request failed") from None
+
+    async def _post(self, path: str, data: dict[str, Any]) -> httpx.Response:
+        try:
+            resp = await self._client.post(path, json=data)
+            resp.raise_for_status()
+            return resp
+        except (httpx.HTTPError, TypeError, ValueError):
+            raise HomeAssistantRestError("Home Assistant REST request failed") from None
 
     async def get_states(self) -> list[EntityState]:
         """Return the current state of every entity."""
         data = await self._get("/states")
-        return [EntityState.model_validate(item) for item in data]
+        try:
+            return [EntityState.model_validate(item) for item in data]
+        except (TypeError, ValueError):
+            raise HomeAssistantRestError("Home Assistant REST response was invalid") from None
 
     async def get_state(self, entity_id: str) -> EntityState:
         """Return the current state of a single entity."""
         data = await self._get(f"/states/{entity_id}")
-        return EntityState.model_validate(data)
+        try:
+            return EntityState.model_validate(data)
+        except (TypeError, ValueError):
+            raise HomeAssistantRestError("Home Assistant REST response was invalid") from None
 
     async def get_config(self) -> dict[str, Any]:
         """Return the Home Assistant configuration (version, location, etc.)."""
         data = await self._get("/config")
-        return dict(data)
+        try:
+            return dict(data)
+        except (TypeError, ValueError):
+            raise HomeAssistantRestError("Home Assistant REST response was invalid") from None
 
     async def get_services(self) -> list[dict[str, Any]]:
         """Return the catalog of available services, grouped by domain."""
         data = await self._get("/services")
-        return list(data)
+        try:
+            return list(data)
+        except (TypeError, ValueError):
+            raise HomeAssistantRestError("Home Assistant REST response was invalid") from None
 
     async def set_state(
         self, entity_id: str, state: str, attributes: dict[str, Any] | None = None
     ) -> None:
         """Set an entity's state, creating it if it doesn't exist yet."""
-        resp = await self._client.post(
-            f"/states/{entity_id}",
-            json={"state": state, "attributes": attributes or {}},
+        await self._post(
+            f"/states/{entity_id}", {"state": state, "attributes": attributes or {}}
         )
-        resp.raise_for_status()
 
     async def call_service(
         self, domain: str, service: str, data: dict[str, Any] | None = None
     ) -> list[EntityState]:
         """Call a service and return the list of states changed as a result."""
-        log.info("call_service %s.%s data=%s", domain, service, data)
-        resp = await self._client.post(f"/services/{domain}/{service}", json=data or {})
-        resp.raise_for_status()
-        changed = resp.json()
-        # HA returns a list of changed states (may be empty).
-        return [EntityState.model_validate(item) for item in changed]
+        log.info("call_service %s.%s", domain, service)
+        resp = await self._post(f"/services/{domain}/{service}", data or {})
+        try:
+            changed = resp.json()
+            # HA returns a list of changed states (may be empty).
+            return [EntityState.model_validate(item) for item in changed]
+        except (TypeError, ValueError):
+            raise HomeAssistantRestError("Home Assistant REST response was invalid") from None
