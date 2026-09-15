@@ -592,8 +592,8 @@ class SolisDevice:
         try:
             start = parse_time(self._settings.charge_window_start)
             end = parse_time(self._settings.charge_window_end)
-        except ValueError as exc:
-            line = f"[FAILED] set charge window (relinquishing control): {exc!r}"
+        except ValueError:
+            line = "[FAILED] set charge window (relinquishing control)"
             log.error(line)
             return line
         charge = [start.hour, start.minute, end.hour, end.minute]

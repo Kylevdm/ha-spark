@@ -559,6 +559,16 @@ async def test_safe_state_write_failure_never_echoes_the_auth_token(tmp_path, ca
 
 
 @pytest.mark.asyncio
+async def test_invalid_safe_state_window_never_echoes_the_auth_token(tmp_path, caplog) -> None:
+    secret = "ha-auth-token-sentinel"
+    with caplog.at_level("INFO"):
+        lines = await _device(FakeRest(), tmp_path, charge_window_start=secret).write_safe_state()
+
+    assert secret not in caplog.text
+    assert secret not in "\n".join(lines)
+
+
+@pytest.mark.asyncio
 async def test_safe_state_switches_on_and_writes_the_default_window(tmp_path) -> None:
     rest = FakeRest(switch="Off")
     lines = await _device(rest, tmp_path).write_safe_state()
