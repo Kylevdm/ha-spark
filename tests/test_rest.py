@@ -89,7 +89,7 @@ async def test_rest_failures_never_expose_the_auth_token(failure: str, caplog) -
             )
         )
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("INFO"):
         async with HomeAssistantRest(BASE, secret) as rest:
             with pytest.raises(HomeAssistantRestError) as caught:
                 await rest.get_state("sensor.secret_probe")
