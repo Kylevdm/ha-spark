@@ -13,7 +13,7 @@ from ha_spark.logging import get_logger
 log = get_logger(__name__)
 
 
-class HomeAssistantRestError(RuntimeError):
+class HomeAssistantRestError(httpx.HTTPError):
     """Raised when a Home Assistant REST request or response cannot be trusted."""
 
 

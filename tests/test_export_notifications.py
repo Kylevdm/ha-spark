@@ -145,3 +145,35 @@ async def test_notification_failures_never_log_the_api_key(failure: str, caplog,
     assert sent is False
     assert auth_token not in caplog.text
     assert axle_api_key not in caplog.text
+
+
+class _FailingRest:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    async def call_service(
+        self, domain: str, service: str, data: dict[str, object] | None = None
+    ) -> list[object]:
+        raise self._error
+
+
+async def test_notification_failure_never_formats_an_exception_traceback(caplog, tmp_path) -> None:
+    secret = "axle-api-key-sentinel"
+    start, end = _window()
+    notice = make_notice(
+        "accepted",
+        "export|2026-09-15T18:00:00+00:00|2026-09-15T19:00:00+00:00",
+        start,
+        end,
+    )
+
+    with caplog.at_level("INFO"):
+        sent = await send_once(
+            ExportNotificationStore(str(tmp_path / "events.db")),
+            _FailingRest(RuntimeError(f"notification failed: {secret}")),
+            "mobile_app_phone",
+            notice,
+        )
+
+    assert sent is False
+    assert secret not in caplog.text
