@@ -152,6 +152,7 @@ class SolisDevice:
             async with export_store:
                 previous_export_record = await export_store.load()
         export_error: str | None = None
+        preserve_resident_export = False
         if (
             mode == "on"
             and raw_export is None
@@ -175,6 +176,10 @@ class SolisDevice:
             export_error = _validate_export(intent, export)
             if export_error is None:
                 export_error = _export_not_yet_armed(export, now)
+                if export_error is not None and mode == "on":
+                    preserve_resident_export = await self._has_matching_live_verified_export(
+                        raw_export, export, now
+                    )
             if export_error is None and intent.hold_overlaps(*export):
                 # Hold beats export on overlap: the reconcile will hold the
                 # inverter `Off` inside the event, so refuse the whole window
@@ -208,7 +213,11 @@ class SolisDevice:
         # attempting the current transition. This leaves a failed transition
         # safe at zero rather than continuing an old, higher-rate window.
         deactivation_line: str | None = None
-        if mode == "on" and blocked is None:
+        preserve_line = "[SKIP] preserving the verified export window while it is not yet armed"
+        if preserve_resident_export:
+            current_ok = True
+            current_line = preserve_line
+        elif mode == "on" and blocked is None:
             current_ok, current_line, deactivation_line = await self._prepare_slot_one_current(
                 intent
             )
@@ -218,12 +227,15 @@ class SolisDevice:
             lines.append(deactivation_line)
         lines.append(current_line)
         window_block = None if current_ok else (blocked or "planned current was not confirmed")
-        window_line = await self._write_charge_window(
-            intent,
-            window_block,
-            export_window=export if export_ready else None,
-            kept_discharge=kept_discharge,
-        )
+        if preserve_resident_export:
+            window_line = preserve_line
+        else:
+            window_line = await self._write_charge_window(
+                intent,
+                window_block,
+                export_window=export if export_ready else None,
+                kept_discharge=kept_discharge,
+            )
         lines.append(window_line)
         window_verified = window_line.startswith(("[APPLIED]", "[SKIP]"))
         if mode == "on" and raw_export is not None and export_ready and not window_verified:
@@ -847,6 +859,28 @@ class SolisDevice:
         async with ExportEventStore(self._settings.db_path) as store:
             record = await store.load()
         return record is not None and record[1] > now.astimezone(UTC)
+
+    async def _has_matching_live_verified_export(
+        self,
+        raw_export: object,
+        export: tuple[datetime, datetime],
+        now: datetime,
+    ) -> bool:
+        """Return whether the refused event is already verified and resident in Slot 1."""
+        start, end = export
+        async with ExportEventStore(self._settings.db_path) as store:
+            record = await store.load()
+        if (
+            record is None
+            or record[0] != _export_identity(raw_export, start, end)
+            or record[1] <= now.astimezone(UTC)
+        ):
+            return False
+        try:
+            resident = await self._read_slot_block(1)
+        except Exception:  # noqa: BLE001 - fail closed around a resident write
+            return False
+        return resident[4:] == [start.hour, start.minute, end.hour, end.minute]
 
     # --- modbus helpers ---
 
