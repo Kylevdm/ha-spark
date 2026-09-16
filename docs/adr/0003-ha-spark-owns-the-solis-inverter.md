@@ -3,7 +3,9 @@
 Status: Accepted (2026-09-06); premise corrected 2026-09-07 (see "The
 overnight charge is inverter-resident"); control surface corrected 2026-09-08
 (see "The driven control surface is the timed-slot registers, not RC");
-reconciled with the implemented driver 2026-09-09 (see the runbook)
+reconciled with the implemented driver 2026-09-09 (see the runbook);
+power-switch lifecycle completed 2026-09-15 (see "The power-switch lifecycle
+is closed")
 
 ## Context
 
@@ -110,7 +112,7 @@ incumbent's behaviour is decomposed and each rule assigned a disposition:
 | # | Incumbent rule | Disposition |
 |---|---|---|
 | 1 | Fixed overnight grid-charge, 23:30 → 05:30 at 60 A — **inverter-resident, not automation-driven** (see above) | **Replace** with planner-chosen dynamic charging, driven through the *same* timed-slot registers the incumbent schedule occupies (#84's driver + #46's replan cadence, write-if-changed). Same outcome — cheap grid charge — with amount and timing chosen by the planner instead of a fixed window. **No separate disarm step**: cutover's first replan simply overwrites Slot 1 with ha-spark's own computed values ([#100](https://github.com/Kylevdm/ha-spark/issues/100)); disabling the mirror automations alone would not have stopped the old schedule, but taking over the registers it lived in does. |
-| 2 | Discharge-off during Octopus dispatch slots | **Keep** — already implemented: the planner emits dispatch `holds`. |
+| 2 | Discharge-off during Octopus dispatch slots | **Keep** — implemented: the planner emits dispatch `holds`, and since #140 the per-minute `reconcile_holds` pass owns both edges of the switch rather than only ever writing `Off`. |
 | 3 | Discharge-off while the car charges | **Demoted, 2026-09-08 (map owner): not a cutover precondition.** The owner's supplier already controls EV charge timing, so ha-spark forcing a discharge-off floor is redundant control, not a safety gap. What's actually wanted is *awareness*, not a hold — most plausibly smart-charging visibility via the Octopus integration/API — which is unscoped and parked in map #78's fog rather than tracked on #84. The richer "charge the battery based on what the car is doing, weighing grid carbon" ambition remains a separate feature (#98). |
 | 4 | 05:30 "if dispatch still active, stay Off" boundary | **Drop** — an artefact of the fixed-window design that dissolves under dynamic planning plus rule 2. |
 
@@ -125,9 +127,43 @@ sensors. It zero-guards slots 2/3 and Slot 1's discharge half, writes only
 when values differ, and isolates failures per action; current confirmation
 is a prerequisite for activating Slot 1. Real charge writes still require
 `proactive_mode = on`, `control = ha_spark`, and a valid SoC. This completes
-the charge control surface — not the whole power-switch lifecycle (the
-driver writes `Off` for holds but not `On` back) and not commanded export
-(#57).
+the charge control surface, but not commanded export (#57).
+
+### The power-switch lifecycle is closed
+
+Superseding this ADR's earlier statement that the driver "writes `Off` for
+holds but not `On` back": as of
+[#140](https://github.com/Kylevdm/ha-spark/issues/140) (decided in
+[#143](https://github.com/Kylevdm/ha-spark/issues/143), merged 2026-09-15),
+ha-spark owns **both** edges of `select.solisac_power_switch`, so the takeover
+this ADR decided is implemented rather than pending.
+
+The mechanism is a declarative reconcile, `reconcile_holds`, on its own
+per-minute cadence in `run_forever` — deliberately *not* part of `apply`,
+because a hold boundary follows the clock and cannot wait for a plan field to
+change. Desired state is a pure function of `now` and the holds: `Off` while a
+hold is active, `On` otherwise. Nothing is remembered, so a restart or a crash
+mid-hold converges on the next tick, and a foreign write or a failed write
+converges the same way within a minute. Steady state is one *cached* `GET` of
+the select and zero register writes.
+
+Two properties matter for takeover safety:
+
+- **Untrusted hold data is ignored, not believed.** Trust is threaded onto the
+  intent alongside the SoC measurement; an untrusted tick evaluates the clock
+  against the last *trusted* hold set, and a failed pre-read may close a hold
+  but never open one.
+- **The reconcile is exempt from `apply`'s SoC guard.** It commands no
+  SoC-derived magnitude, and freezing the inverter `Off` on an unrelated dead
+  sensor is the failure it exists to remove. A refused *force* is safe; a
+  refused *release* is not, and the gates are asymmetric on purpose.
+
+When ha-spark stops steering — past every known hold end with no trusted
+picture, plus a best-effort clean-shutdown pass — `write_safe_state` leaves the
+inverter self-managing: power switch `On`, Slot 1 charging across the configured
+cheap window, discharge half zeroed unless a verified export is still running.
+It is never fired on an ordinary degraded tick, where defaulting to `On` would
+release a live hold.
 
 ## Cutover runbook
 
@@ -138,11 +174,17 @@ scope and stays with the operator.
 1. Run ha-spark in `proactive_mode = simulate`. Watch its intended
    power-switch / timed-slot actions against the live incumbent until the
    behaviour ledger above checks out (rules 1–2 satisfied, rule 4 confirmed
-   irrelevant; rule 3 is demoted and not a validation gate). **Full takeover
-   remains pending:** the driver turns the power switch `Off` for holds but
-   does not restore `On` — resolve and verify that lifecycle before retiring
-   the incumbent for unattended operation; #84's charge implementation does
-   not supply it.
+   irrelevant; rule 3 is demoted and not a validation gate). The power-switch
+   lifecycle is **no longer the blocker here** — #140 closed it (see above).
+   What still stands between a supervised run and retiring the incumbent for
+   *unattended* operation is narrower: an inverter-resident Slot 1 program
+   outlives ha-spark, and nothing clears it if ha-spark never comes back
+   ([#110](https://github.com/Kylevdm/ha-spark/issues/110)), which matters most
+   for a resident *export* window, since the register holds a date-less
+   wall-clock face that repeats daily. Supervised commissioning is
+   [#131](https://github.com/Kylevdm/ha-spark/issues/131); it returns
+   `proactive_mode` to `simulate` and does not itself establish unattended
+   readiness.
 2. Install the [native overlay](../solis-control-modbus-overlay.yaml)
    manually if not already present. Confirm Modbus TCP (`type: tcp`), gateway
    multi-host mode, storage-type caching OFF, and healthy overlay reads; the
@@ -213,12 +255,29 @@ The four incumbent automations, for the rollback record:
   RTC-drift caveats. The overlay YAML is a one-time manual HA-config step
   (`docs/solis-control-modbus-overlay.yaml`); auto-provisioning it from the
   add-on is an open follow-up, not part of #84.
-- The current `solis.py` `power_switch = Off` write during `holds` is harmless
-  while `simulate` holds, but it is **not** the full lifecycle takeover
-  requires (it never writes `On`, and its stop-discharge is dispatch-only).
-  Completing that is #84's work, tracked there. The rule-3 car-charging
-  discharge floor is **not** part of it — demoted 2026-09-08, see the ledger
-  above.
+- **Superseded 2026-09-15 by #140:** this bullet previously recorded that
+  `solis.py` only ever wrote `power_switch = Off` and so fell short of the full
+  lifecycle takeover, with completion tracked on #84. ha-spark now owns both
+  edges through `reconcile_holds` (see "The power-switch lifecycle is closed").
+  One limitation in the original wording does survive: the stop-discharge is
+  still **dispatch-only**. On Intelligent Octopus Go a dispatch *is* Octopus
+  charging the car, so holds are driven from dispatches deliberately — the
+  uncovered case is car charging Octopus did not dispatch (a manual/boost
+  charge, or eco+ surplus diversion), tracked as
+  [#141](https://github.com/Kylevdm/ha-spark/issues/141). The rule-3
+  car-charging discharge floor is **not** part of it — demoted 2026-09-08, see
+  the ledger above.
+- **The hold mechanism is a coarse whole-inverter enable, and that does not
+  generalise.** `select.solisac_power_switch` is the only surface that stops
+  self-consumption discharge — zeroing the timed discharge slots does not — so
+  #140 holds by disabling the inverter outright. On this household that is free
+  of side effects: the Solis S5 is battery-only (AC-coupled) with PV on a
+  separate Growatt inverter, so a hold never touches solar harvest; the only
+  cost is forgoing *storing* surplus for the hold window. On a hybrid inverter,
+  or any unit whose coarse enable also gates PV, the same hold would cut solar
+  outright. Tracked for the approved-inverter list as
+  [#142](https://github.com/Kylevdm/ha-spark/issues/142); this ADR scopes one
+  device and does not decide it.
 - Carbon-aware, EV-coupled battery charging — "green now vs dirtier later" — is
   a genuinely new optimization objective (cost and carbon can conflict) and is
   spun out as **#98**, sequenced after #84. It does not block this decision or
