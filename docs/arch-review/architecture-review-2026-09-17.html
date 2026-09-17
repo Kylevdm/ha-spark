@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Architecture review — ha-spark — 2026-09-17</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose", flowchart: { htmlLabels: true, curve: "basis" } });
+    </script>
+    <style>
+      .seam { border-top: 2px dashed #64748b; }
+      .deep { background: linear-gradient(135deg, #0f172a, #1e293b); color: #f1f5f9; }
+      .schem { font-size: 0.68rem; letter-spacing: 0.08em; text-transform: uppercase; }
+      .ladder li { font-size: 0.62rem; line-height: 1.1rem; }
+      .mermaid { font-size: 13px; }
+      .mermaid svg { max-height: 340px; width: 100%; }
+      .strip { height: 1.35rem; display: flex; align-items: center; padding-left: .5rem; font-size: .66rem; letter-spacing: .06em; text-transform: uppercase; }
+    </style>
+  </head>
+  <body class="bg-stone-50 text-slate-900 font-sans">
+    <main class="max-w-5xl mx-auto px-6 py-12 space-y-14">
+
+      <!-- ───────────────── header ───────────────── -->
+      <header class="space-y-4">
+        <p class="schem text-slate-500">Architecture review · deepening opportunities</p>
+        <h1 class="font-serif text-4xl tracking-tight">ha-spark <span class="text-slate-400 font-sans text-2xl align-middle">· 2026-09-17</span></h1>
+        <p class="text-slate-600 max-w-3xl">Scope: the hot spots of the last month of commits — the Solis driver (23 touches), the scheduler (17), config (8), and the models (8). Second review; the first was 2026-08-18. Candidates 1–3 of that review shipped as #91, #92, #93. Three of its entries are carried in <code class="font-mono text-xs">docs/fog.md</code> and re-verified here; two are worse.</p>
+        <div class="flex flex-wrap gap-x-6 gap-y-2 text-xs text-slate-600 pt-2">
+          <span class="inline-flex items-center gap-2"><span class="w-5 h-3 border border-slate-500 bg-white inline-block"></span>module</span>
+          <span class="inline-flex items-center gap-2"><span class="w-5 h-3 deep inline-block border-2 border-slate-900"></span>deep module</span>
+          <span class="inline-flex items-center gap-2"><span class="w-5 border-t-2 border-dashed border-slate-500 inline-block"></span>seam</span>
+          <span class="inline-flex items-center gap-2"><span class="w-5 border-t-2 border-red-600 inline-block"></span>leak</span>
+          <span class="inline-flex items-center gap-2"><span class="px-1.5 rounded bg-emerald-100 text-emerald-800">Strong</span><span class="px-1.5 rounded bg-amber-100 text-amber-800">Worth exploring</span><span class="px-1.5 rounded bg-slate-200 text-slate-700">Speculative</span></span>
+        </div>
+      </header>
+
+      <!-- ───────────────── since last review ───────────────── -->
+      <section class="rounded-lg border border-slate-200 bg-white p-5 text-sm grid md:grid-cols-3 gap-4">
+        <div>
+          <p class="schem text-emerald-700 mb-1">Shipped since 2026-08-18</p>
+          <ul class="text-slate-700 space-y-0.5">
+            <li>#91 plan pipeline module (<code class="font-mono text-xs">plan_run.current_plan</code>)</li>
+            <li>#92 backtest costed on the tariff schedule</li>
+            <li>#93 agent-surface gating at request time</li>
+          </ul>
+        </div>
+        <div>
+          <p class="schem text-amber-700 mb-1">Carried in fog, re-verified today</p>
+          <ul class="text-slate-700 space-y-0.5">
+            <li>(a) device seam leaks per-device config — <b>still true</b> → card 5</li>
+            <li>(b) habits orchestrator / CLI copy — <b>still true, wider</b> → card 6</li>
+            <li>(c) <code class="font-mono text-xs">run_forever</code> has no seams — <b>worse</b>: 87 → 173 lines → card 2</li>
+          </ul>
+        </div>
+        <div>
+          <p class="schem text-slate-500 mb-1">New this review</p>
+          <ul class="text-slate-700 space-y-0.5">
+            <li>Verified register write copied 8× → card 1</li>
+            <li>Hold trust threaded by hand across 5 modules → card 3</li>
+            <li>Export delivery lives in one driver → card 4</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- ───────────────── candidates ───────────────── -->
+      <section id="candidates" class="space-y-12">
+
+        <!-- ═══════════ 1 ═══════════ -->
+        <article id="c1" class="rounded-xl border border-slate-200 bg-white p-7 space-y-6 shadow-sm">
+          <div class="space-y-2">
+            <h2 class="font-serif text-2xl">1 · The verified register write is the deep module hiding inside the Solis driver</h2>
+            <div class="flex flex-wrap gap-2 text-xs">
+              <span class="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 font-medium">Strong</span>
+              <span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700">local-substitutable</span>
+              <span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700">no seam moves — one file</span>
+            </div>
+          </div>
+          <p class="font-mono text-sm text-slate-600">ha_spark/devices/inverters/solis.py:269-664, 934-1002 · tests/test_solis_export.py:76-152 · tests/test_solis_power_switch.py:84-132, 327-616 · tests/test_chargers.py:132-160</p>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <!-- before -->
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-3 space-y-2">
+              <p class="schem text-slate-500">Before · 8 copies of one ladder</p>
+              <div class="grid grid-cols-4 gap-1.5">
+                <div class="border border-slate-400 bg-white rounded p-1.5"><p class="schem text-[.58rem] font-semibold truncate">_write_charge_window</p><ul class="ladder text-slate-500 list-none"><li>mode gate</li><li>read</li><li>write-if-≠</li><li>refresh · ×3</li><li>classify</li></ul></div>
+                <div class="border border-slate-400 bg-white rounded p-1.5"><p class="schem text-[.58rem] font-semibold truncate">_clear_discharge</p><ul class="ladder text-slate-500 list-none"><li>mode gate</li><li>read</li><li>write-if-≠</li><li>refresh · ×3</li><li>classify</li></ul></div>
+                <div class="border border-slate-400 bg-white rounded p-1.5"><p class="schem text-[.58rem] font-semibold truncate">_zero_slot</p><ul class="ladder text-slate-500 list-none"><li>mode gate</li><li>read</li><li>write-if-≠</li><li>refresh · ×3</li><li>classify</li></ul></div>
+                <div class="border border-slate-400 bg-white rounded p-1.5"><p class="schem text-[.58rem] font-semibold truncate">_set_current_result</p><ul class="ladder text-slate-500 list-none"><li>mode gate</li><li>read</li><li>write-if-≠</li><li>refresh · ×3</li><li>classify</li></ul></div>
+                <div class="border border-slate-400 bg-white rounded p-1.5"><p class="schem text-[.58rem] font-semibold truncate">_reconcile_switch</p><ul class="ladder text-slate-500 list-none"><li>mode gate</li><li>read</li><li>write-if-≠</li><li>×3 (own loop)</li><li>classify</li></ul></div>
+                <div class="border border-slate-400 bg-white rounded p-1.5"><p class="schem text-[.58rem] font-semibold truncate">_safe_power_switch</p><ul class="ladder text-slate-500 list-none"><li>mode gate</li><li>read</li><li>write-if-≠</li><li>×3 (own loop)</li><li>classify</li></ul></div>
+                <div class="border border-slate-400 bg-white rounded p-1.5"><p class="schem text-[.58rem] font-semibold truncate">_safe_slot_block</p><ul class="ladder text-slate-500 list-none"><li>mode gate</li><li>read</li><li>write-if-≠</li><li>refresh · ×3</li><li>classify</li></ul></div>
+                <div class="border border-slate-400 bg-white rounded p-1.5"><p class="schem text-[.58rem] font-semibold truncate">_discharge_current</p><ul class="ladder text-slate-500 list-none"><li>mode gate</li><li>read</li><li>write-if-≠</li><li>refresh · ×3</li><li>classify</li></ul></div>
+              </div>
+              <div class="seam pt-2 text-[.66rem] text-slate-500 flex justify-between">
+                <span>HA REST (get_state · modbus.write_register · select_option)</span>
+                <span class="text-red-600">tests: 2 FakeRest + 6 subclasses re-derive the register map</span>
+              </div>
+            </div>
+            <!-- after -->
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-3 space-y-2">
+              <p class="schem text-slate-500">After · one deep module, eight one-line callers</p>
+              <div class="flex flex-wrap gap-1">
+                <span class="schem text-[.55rem] border border-slate-300 bg-white rounded px-1">charge window</span><span class="schem text-[.55rem] border border-slate-300 bg-white rounded px-1">clear discharge</span><span class="schem text-[.55rem] border border-slate-300 bg-white rounded px-1">zero slot</span><span class="schem text-[.55rem] border border-slate-300 bg-white rounded px-1">current</span><span class="schem text-[.55rem] border border-slate-300 bg-white rounded px-1">power switch</span><span class="schem text-[.55rem] border border-slate-300 bg-white rounded px-1">safe switch</span><span class="schem text-[.55rem] border border-slate-300 bg-white rounded px-1">safe block</span><span class="schem text-[.55rem] border border-slate-300 bg-white rounded px-1">export current</span>
+              </div>
+              <div class="text-center text-slate-400 text-xs leading-none">↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓</div>
+              <div class="deep rounded-lg border-2 border-slate-900 p-3">
+                <p class="schem font-semibold">verified write</p>
+                <p class="text-[.66rem] text-slate-300">mode gate · read-first · write-if-changed · refresh · bounded read-back · outcome line · <span class="text-amber-300">remembered mismatch → backoff (fog: register endurance)</span></p>
+                <div class="grid grid-cols-3 gap-1 mt-2 opacity-60">
+                  <div class="border border-slate-500 rounded px-1 schem text-[.55rem]">_verify_read_back</div>
+                  <div class="border border-slate-500 rounded px-1 schem text-[.55rem]">_read_back_option</div>
+                  <div class="border border-slate-500 rounded px-1 schem text-[.55rem]">classify</div>
+                </div>
+              </div>
+              <div class="seam pt-2">
+                <p class="schem text-[.6rem] text-slate-500">internal seam · register bank (slot block · current · select · work mode)</p>
+                <div class="grid grid-cols-2 gap-2 mt-1">
+                  <div class="border border-slate-400 bg-white rounded p-1.5 schem text-[.58rem]">adapter: HA modbus overlay</div>
+                  <div class="border border-slate-400 bg-white rounded p-1.5 schem text-[.58rem]">adapter: in-memory bank (tests)</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid md:grid-cols-3 gap-6 text-sm">
+            <div>
+              <p class="schem text-slate-500 mb-1">Problem</p>
+              <p>The gate-read-write-verify-classify ladder is copied eight times, with two separate bounded read-back loops beneath it (<code class="font-mono text-xs">_verify_read_back</code> :934, <code class="font-mono text-xs">_read_back_option</code> :982); every recent fix (#144, #148, #150, #151) edited several copies, and the fog's write-endurance backoff has nowhere to keep per-register state.</p>
+            </div>
+            <div>
+              <p class="schem text-slate-500 mb-1">Solution</p>
+              <p>One verified-write module owns the ladder and the outcome vocabulary; the register bank (block, current, select, work-mode bit) sits behind an internal seam with two adapters, the HA overlay and an in-memory bank the three Solis test files share.</p>
+            </div>
+            <div>
+              <p class="schem text-slate-500 mb-1">Wins</p>
+              <ul class="list-disc pl-4 space-y-0.5">
+                <li>locality: backoff lands in one place</li>
+                <li>interface shrinks: 8 ladders → 1</li>
+                <li>tests: one fake bank, not 8 fakes</li>
+                <li>register map owned once, not 3×</li>
+                <li>secret-free errors (#151) enforced once</li>
+              </ul>
+            </div>
+          </div>
+          <p class="text-xs text-slate-500">Deletion test: delete the ladder and it reappears at all eight sites — it earns its keep, but is spread rather than concentrated. 100 driver tests already cross the public interface (<code class="font-mono">apply</code>, <code class="font-mono">reconcile_holds</code>, <code class="font-mono">write_safe_state</code>) with zero private calls, so they survive the deepening unchanged.</p>
+        </article>
+
+        <!-- ═══════════ 2 ═══════════ -->
+        <article id="c2" class="rounded-xl border border-slate-200 bg-white p-7 space-y-6 shadow-sm">
+          <div class="space-y-2">
+            <h2 class="font-serif text-2xl">2 · The daemon tick has no seam — and the loop doubled since August</h2>
+            <div class="flex flex-wrap gap-2 text-xs">
+              <span class="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 font-medium">Strong</span>
+              <span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700">in-process</span>
+              <span class="px-2 py-0.5 rounded bg-amber-100 text-amber-800">carried from 2026-08-18 · fog (c)</span>
+              <span class="px-2 py-0.5 rounded bg-red-100 text-red-800">open bug #147 lives here</span>
+            </div>
+          </div>
+          <p class="font-mono text-sm text-slate-600">ha_spark/energy/scheduler.py:528-701 (run_forever), 373-477 (reconcile_tick), 506-525 · ha_spark/energy/supply_guard.py:61 · tests/test_scheduler.py</p>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <!-- before: cross-section -->
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-3">
+              <p class="schem text-slate-500 mb-2">Before · one band, eleven concerns, nine locals</p>
+              <div class="flex gap-2">
+                <div class="flex-1 border-l-4 border-slate-700 bg-white rounded-r divide-y divide-slate-100">
+                  <div class="strip">ingress uvicorn lifecycle</div>
+                  <div class="strip">agent-port uvicorn lifecycle</div>
+                  <div class="strip">guard config recheck <span class="text-red-600 ml-1">opens a REST client to ask a no-I/O question</span></div>
+                  <div class="strip">republish last states</div>
+                  <div class="strip">hot-reload detection + resets</div>
+                  <div class="strip">SoC observation</div>
+                  <div class="strip">hold reconcile <span class="text-red-600 ml-1">skipped while replan keeps failing (#147)</span></div>
+                  <div class="strip">replan + reapply bookkeeping</div>
+                  <div class="strip">supply guard</div>
+                  <div class="strip">signal sampling · V2L tick</div>
+                  <div class="strip">shutdown relinquish <span class="text-red-600 ml-1">own copy of the hold-end rule</span></div>
+                </div>
+                <div class="w-28 text-[.6rem] text-slate-500 font-mono leading-4">
+                  <p class="schem text-slate-400 mb-1">mutable locals</p>
+                  last_run_slot<br>last_plan<br>last_reconcile_lines<br>last_trusted_holds<br>reapply<br>last_settings<br>target_w<br>last_signal_at<br>monitor
+                </div>
+              </div>
+              <p class="text-[.66rem] text-red-600 mt-2">tests patch 8 module attributes per iteration · 109 <code>setattr</code> in the file · <code>inverter_device</code> patched 23× · 10 REST clients and 7 devices constructed inside the module</p>
+            </div>
+            <!-- after -->
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-3">
+              <p class="schem text-slate-500 mb-2">After · thin loop, deep tick</p>
+              <div class="space-y-1.5">
+                <div class="border border-slate-400 bg-white rounded p-2 schem">run_forever · servers · sleep · shutdown hand-off</div>
+                <div class="text-center text-slate-400 text-xs leading-none">↓ rest · device · now injected once per tick</div>
+                <div class="deep rounded-lg border-2 border-slate-900 p-3">
+                  <p class="schem font-semibold">daemon tick · state in, state out</p>
+                  <p class="text-[.66rem] text-slate-300">ordering rules live here: observe SoC → reconcile <i>or</i> replan → guard → sample → v2l · hot-reload resets · relinquish-once</p>
+                  <div class="grid grid-cols-5 gap-1 mt-2 opacity-60">
+                    <div class="border border-slate-500 rounded px-1 schem text-[.55rem]">soc</div>
+                    <div class="border border-slate-500 rounded px-1 schem text-[.55rem]">reconcile</div>
+                    <div class="border border-slate-500 rounded px-1 schem text-[.55rem]">replan</div>
+                    <div class="border border-slate-500 rounded px-1 schem text-[.55rem]">guard</div>
+                    <div class="border border-slate-500 rounded px-1 schem text-[.55rem]">signals</div>
+                  </div>
+                </div>
+                <div class="seam pt-1.5 grid grid-cols-2 gap-2">
+                  <div class="border border-slate-400 bg-white rounded p-1.5 schem text-[.58rem]">adapter: HomeAssistantRest + real device</div>
+                  <div class="border border-slate-400 bg-white rounded p-1.5 schem text-[.58rem]">adapter: fake rest + fake device (tests)</div>
+                </div>
+                <p class="text-[.66rem] text-slate-500">capabilities answered from the registry class — no client, no instance</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid md:grid-cols-3 gap-6 text-sm">
+            <div>
+              <p class="schem text-slate-500 mb-1">Problem</p>
+              <p>Every tick function takes <code class="font-mono text-xs">settings</code> and builds its own client and device (:172, :223, :276, :326, :435, :492, :514, :522, :568, :693), so the loop's only test seam is the module namespace; the ordering rules (#143's reconcile-before-replan, relinquish-once, hot-reload resets) are unreachable from any interface, which is how #147 slipped in.</p>
+            </div>
+            <div>
+              <p class="schem text-slate-500 mb-1">Solution</p>
+              <p>Extract the loop body as a tick over an explicit daemon state, with the client and device accepted as dependencies; <code class="font-mono text-xs">run_forever</code> keeps servers, sleep and shutdown. Split capability lookup from device construction so no client is opened to ask a pure question.</p>
+            </div>
+            <div>
+              <p class="schem text-slate-500 mb-1">Wins</p>
+              <ul class="list-disc pl-4 space-y-0.5">
+                <li>tests hit one interface: tick(state, now)</li>
+                <li>locality: ordering rules in one body</li>
+                <li>#147 becomes a one-function test</li>
+                <li>delete 8-attr monkeypatch setups</li>
+                <li>one client per tick, not five</li>
+              </ul>
+            </div>
+          </div>
+          <div class="rounded border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">ADR-0003 is preserved: the reconcile keeps its own per-minute cadence and stays outside <code class="font-mono">apply</code>. Only the loop's shape changes, not the seam the ADR decided.</div>
+        </article>
+
+        <!-- ═══════════ 3 ═══════════ -->
+        <article id="c3" class="rounded-xl border border-slate-200 bg-white p-7 space-y-6 shadow-sm">
+          <div class="space-y-2">
+            <h2 class="font-serif text-2xl">3 · Hold trust has no home — the last-trusted picture is threaded by hand</h2>
+            <div class="flex flex-wrap gap-2 text-xs">
+              <span class="px-2 py-0.5 rounded bg-amber-100 text-amber-800 font-medium">Worth exploring</span>
+              <span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700">in-process</span>
+              <span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700">pairs with card 2</span>
+            </div>
+          </div>
+          <p class="font-mono text-sm text-slate-600">scheduler.py:345-361, 440-464, 574-586, 641-642, 685-687 · sources.py read_dispatches · tariff.py _controlled_windows · cli.py:153-162 · models.py ChargeIntent.hold_trusted</p>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded-lg border border-slate-200 bg-white p-3">
+              <p class="schem text-slate-500 mb-1">Before · five modules pass <code>trusted_holds</code> around</p>
+              <pre class="mermaid">
+flowchart LR
+  RF[run_forever<br/><small>last_trusted_holds</small>]
+  RT[reconcile_tick<br/><small>param + return</small>]
+  RO[run_once<br/><small>param</small>]
+  HRI[hold_reconcile_intent]
+  RD[sources.read_dispatches]
+  CW[tariff._controlled_windows]
+  SD[shutdown finally<br/><small>hold-end rule, copy 2</small>]
+  CLI[cli._cmd_plan<br/><small>passes None</small>]
+  DEV[Device.reconcile_holds]
+  RF -->|trusted_holds| RT
+  RT -->|trusted_holds| RF
+  RF -->|trusted_holds| RO
+  RT --> RD
+  RT -.->|private import| CW
+  RT --> HRI
+  RO --> HRI
+  CLI --> HRI
+  HRI --> DEV
+  RF --> SD
+  RT -->|hold-end rule, copy 1| DEV
+  classDef leak stroke:#dc2626,stroke-width:2px;
+  class CW,SD leak
+  linkStyle 4 stroke:#dc2626,stroke-width:2px;
+              </pre>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-white p-3">
+              <p class="schem text-slate-500 mb-1">After · one owner, three askers</p>
+              <pre class="mermaid">
+flowchart LR
+  RT[reconcile tick]
+  RO[run_once / CLI]
+  SD[shutdown]
+  HP[<b>hold picture</b><br/><small>observe(dispatch read) · observe(plan)<br/>intent_for(now) · may_relinquish(now)</small>]
+  DEV[Device.reconcile_holds]
+  RT -->|observe · intent_for| HP
+  RO -->|intent_for| HP
+  SD -->|may_relinquish| HP
+  HP --> DEV
+  classDef deep fill:#0f172a,color:#f1f5f9,stroke:#0f172a,stroke-width:2px;
+  class HP deep
+              </pre>
+            </div>
+          </div>
+
+          <div class="grid md:grid-cols-3 gap-6 text-sm">
+            <div>
+              <p class="schem text-slate-500 mb-1">Problem</p>
+              <p>The rule "past every known hold end and still untrusted" is written twice (:453-457 and :685-687); the scheduler imports two private names from the tariff module to fold dispatches into holds; and the fog's untested day-of Flexibility event pickup is untested because the composition has no interface to test.</p>
+            </div>
+            <div>
+              <p class="schem text-slate-500 mb-1">Solution</p>
+              <p>One module owns the last-trusted hold set: it is fed every dispatch read and every plan, and answers "which intent may the reconcile act on now" and "may ha-spark relinquish now". The scheduler, shutdown and CLI ask it; nobody else holds the state.</p>
+            </div>
+            <div>
+              <p class="schem text-slate-500 mb-1">Wins</p>
+              <ul class="list-disc pl-4 space-y-0.5">
+                <li>locality: relinquish rule exists once</li>
+                <li>day-of event pickup testable</li>
+                <li>tariff privates stop leaking</li>
+                <li>reconcile_tick loses 3 of 5 params</li>
+              </ul>
+            </div>
+          </div>
+          <p class="text-xs text-slate-500">Vocabulary note: "hold" and "hold trust" carry real decisions (#143 §3–§5) but are not in <code class="font-mono">CONTEXT.md</code>. Naming this module would add the term.</p>
+        </article>
+
+        <!-- ═══════════ 4 ═══════════ -->
+        <article id="c4" class="rounded-xl border border-slate-200 bg-white p-7 space-y-6 shadow-sm">
+          <div class="space-y-2">
+            <h2 class="font-serif text-2xl">4 · Flexibility-event export delivery is device-agnostic but lives inside the Solis driver</h2>
+            <div class="flex flex-wrap gap-2 text-xs">
+              <span class="px-2 py-0.5 rounded bg-amber-100 text-amber-800 font-medium">Worth exploring</span>
+              <span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700">local-substitutable</span>
+              <span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700">one adapter today → seam is hypothetical</span>
+            </div>
+          </div>
+          <p class="font-mono text-sm text-slate-600">solis.py:148-249, 645-849, 1005-1196 · energy/export_store.py · energy/export_notifications.py · scheduler.py:119-131 · docs/adding-an-inverter.md</p>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded-lg border border-slate-200 bg-white p-3">
+              <p class="schem text-slate-500 mb-1">Before · the driver owns validate, arm, persist, notify</p>
+              <pre class="mermaid">
+flowchart TB
+  A[SolisDevice.apply<br/><small>129 lines</small>]
+  V[_validate_export<br/>_export_window<br/>_export_identity]
+  N[_export_not_yet_armed<br/><small>Solis clock rule</small>]
+  R[register writes<br/><small>discharge current · slot 1</small>]
+  ES[(ExportEventStore<br/><small>constructed 5×</small>)]
+  NS[(ExportNotificationStore)]
+  SO[send_once → HA notify]
+  NL[_notify_export_lifecycle<br/><small>100 lines</small>]
+  SC[scheduler.setpoint_changed<br/><small>getattr export ×3</small>]
+  A --> V --> N --> R
+  A -.-> ES
+  A --> NL --> NS
+  NL --> SO
+  SC -.-> A
+  classDef leak stroke:#dc2626,stroke-width:2px;
+  class ES,NS,SO,NL leak
+              </pre>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-white p-3">
+              <p class="schem text-slate-500 mb-1">After · delivery at the plan-apply seam, mechanics in the driver</p>
+              <pre class="mermaid">
+flowchart TB
+  P[plan apply]
+  ED[<b>export delivery</b><br/><small>validate ExportIntent · verified record · four notices<br/>"is a verified export still live?"</small>]
+  D[Device<br/><small>program / clear export window</small>]
+  S[SolisDevice<br/><small>slot 1 · discharge current · wall-clock arming</small>]
+  ST[(one store, passed in)]
+  P --> ED --> D
+  D --- S
+  ED --- ST
+  classDef deep fill:#0f172a,color:#f1f5f9,stroke:#0f172a,stroke-width:2px;
+  class ED deep
+              </pre>
+            </div>
+          </div>
+
+          <div class="grid md:grid-cols-3 gap-6 text-sm">
+            <div>
+              <p class="schem text-slate-500 mb-1">Problem</p>
+              <p>About 450 of the driver's 1245 lines are export delivery; the driver is the only importer of both export stores and opens the event store five times per apply; <code class="font-mono text-xs">ExportIntent</code> is a frozen dataclass with one constructor, yet the driver and scheduler read it by <code class="font-mono text-xs">getattr</code> seven times as if it might not exist. A second export-capable adapter would copy private methods.</p>
+            </div>
+            <div>
+              <p class="schem text-slate-500 mb-1">Solution</p>
+              <p>Move validation, the verified-event record and the four operator notices to an export-delivery module at the plan-apply seam; the driver keeps register mechanics and its date-less wall-clock arming rule. The reconcile still never reads export state (ADR-0003).</p>
+            </div>
+            <div>
+              <p class="schem text-slate-500 mb-1">Wins</p>
+              <ul class="list-disc pl-4 space-y-0.5">
+                <li>locality: verify → record → notify in one place</li>
+                <li>driver interface shrinks by ~450 lines</li>
+                <li>fog's "write-only identity" decided once</li>
+                <li>delivery rules tested with a fake device</li>
+              </ul>
+            </div>
+          </div>
+          <div class="rounded border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">Seam discipline: only Solis exports today, so the device-side seam is hypothetical until a second adapter (#136 discharge validation, #142 finer holds) arrives. The locality gain — one store, no duck-typing — stands on its own without the seam.</div>
+        </article>
+
+        <!-- ═══════════ 5 ═══════════ -->
+        <article id="c5" class="rounded-xl border border-slate-200 bg-white p-7 space-y-6 shadow-sm">
+          <div class="space-y-2">
+            <h2 class="font-serif text-2xl">5 · The Device seam still leaks per-device config through flat Settings</h2>
+            <div class="flex flex-wrap gap-2 text-xs">
+              <span class="px-2 py-0.5 rounded bg-amber-100 text-amber-800 font-medium">Worth exploring</span>
+              <span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700">in-process</span>
+              <span class="px-2 py-0.5 rounded bg-amber-100 text-amber-800">carried from 2026-08-18 · fog (a)</span>
+              <span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700">trigger approaching: #49 V2L rectifier driver</span>
+            </div>
+          </div>
+          <p class="font-mono text-sm text-slate-600">solis.py:108-118, 251-265, 590-599, 1199-1211 · alphaess.py:76 · config.py DeviceConfig, _synthesize_devices · scheduler.py:559, 603</p>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <!-- mass diagram before -->
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-3">
+              <p class="schem text-slate-500 mb-2">Before · interface as wide as the settings bag</p>
+              <div class="flex items-end gap-3 h-64">
+                <div class="flex flex-col justify-end w-28">
+                  <div class="border border-slate-500 bg-white rounded-t p-1 schem text-[.58rem] h-10">DeviceConfig<br/>control · 2 entities</div>
+                  <div class="bg-slate-200 rounded-b p-1 schem text-[.55rem] text-slate-500 h-6">driver, type</div>
+                  <p class="schem text-[.55rem] text-slate-400 mt-1">the declared interface</p>
+                </div>
+                <div class="flex flex-col justify-end flex-1">
+                  <div class="border-2 border-red-600 bg-red-50 rounded p-2 text-[.62rem] font-mono leading-4 h-56 overflow-hidden">
+                    <p class="schem text-red-700 mb-1">read straight off Settings inside the driver</p>
+                    solis_control_hub<br/>solis_modbus_slave<br/>battery_voltage_v<br/>battery_capacity_kwh<br/>charge_efficiency<br/>max_charge_current_a<br/>proactive_mode<br/>timezone<br/>db_path<br/>notify_service<br/>charge_window_start<br/>charge_window_end<br/>alphaess_serial
+                  </div>
+                  <p class="schem text-[.55rem] text-red-600 mt-1">the real interface · two devices of one driver unrepresentable</p>
+                </div>
+              </div>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-3">
+              <p class="schem text-slate-500 mb-2">After · knobs travel with the device</p>
+              <div class="flex items-end gap-3 h-64">
+                <div class="flex flex-col justify-end w-40">
+                  <div class="deep border-2 border-slate-900 rounded p-2 h-56">
+                    <p class="schem font-semibold">DeviceConfig</p>
+                    <p class="text-[.62rem] text-slate-300 font-mono leading-4">driver · type · control<br/>entities{…}<br/>hub · slave · serial<br/>voltage · capacity<br/>efficiency · max current</p>
+                    <p class="text-[.6rem] text-slate-400 mt-2">flat keys feed synthesis only</p>
+                  </div>
+                </div>
+                <div class="flex-1 flex flex-col justify-end gap-2">
+                  <div class="border border-slate-400 bg-white rounded p-2 schem text-[.58rem]">SolisDevice(config, rest)</div>
+                  <div class="border border-slate-400 bg-white rounded p-2 schem text-[.58rem]">AlphaESSDevice(config, rest)</div>
+                  <div class="border border-dashed border-slate-400 bg-white rounded p-2 schem text-[.58rem] text-slate-500">#49 rectifier(config, rest)</div>
+                  <p class="text-[.6rem] text-slate-500">process-wide knobs (mode, tz, db, notify) stay on Settings</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid md:grid-cols-3 gap-6 text-sm">
+            <div>
+              <p class="schem text-slate-500 mb-1">Problem</p>
+              <p>Unchanged since August: <code class="font-mono text-xs">DeviceConfig</code> carries control and two entity ids, drivers read thirteen other fields off <code class="font-mono text-xs">Settings</code>, and the loop still keys guard reconfiguration off <code class="font-mono text-xs">settings.inverter</code>. The fog's trigger — the first non-inverter device — is now a ready-for-agent ticket (#49).</p>
+            </div>
+            <div>
+              <p class="schem text-slate-500 mb-1">Solution</p>
+              <p>Per-device knobs move into <code class="font-mono text-xs">DeviceConfig</code>; the flat keys feed synthesis only. Drivers stop reading <code class="font-mono text-xs">Settings</code> except through the mode gate. Rides along: delete the <code class="font-mono text-xs">chargers.py</code> shim and both <code class="font-mono text-xs">supports_live_rate</code> attributes.</p>
+            </div>
+            <div>
+              <p class="schem text-slate-500 mb-1">Wins</p>
+              <ul class="list-disc pl-4 space-y-0.5">
+                <li>leverage: one config shape, N drivers</li>
+                <li>two devices of one driver representable</li>
+                <li>driver tests build one config, not Settings</li>
+                <li>delete 2 dead attrs + 1 shim</li>
+              </ul>
+            </div>
+          </div>
+        </article>
+
+        <!-- ═══════════ 6 ═══════════ -->
+        <article id="c6" class="rounded-xl border border-slate-200 bg-white p-7 space-y-6 shadow-sm">
+          <div class="space-y-2">
+            <h2 class="font-serif text-2xl">6 · The CLI re-implements two daemon paths by hand</h2>
+            <div class="flex flex-wrap gap-2 text-xs">
+              <span class="px-2 py-0.5 rounded bg-amber-100 text-amber-800 font-medium">Worth exploring</span>
+              <span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700">in-process</span>
+              <span class="px-2 py-0.5 rounded bg-amber-100 text-amber-800">carried from 2026-08-18 · fog (b), wider</span>
+              <span class="px-2 py-0.5 rounded bg-slate-100 text-slate-700">small · cheap</span>
+            </div>
+          </div>
+          <p class="font-mono text-sm text-slate-600">cli.py:149-162 vs scheduler.py:180-205 · cli.py:471-527 vs orchestrator.py:64-100</p>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-3">
+              <p class="schem text-slate-500 mb-2">Before · the same six lines, twice</p>
+              <div class="grid grid-cols-2 gap-2 text-[.62rem] font-mono">
+                <div class="border border-slate-400 bg-white rounded p-2 space-y-0.5">
+                  <p class="schem text-[.55rem] text-slate-500 font-sans">scheduler.run_once</p>
+                  <p class="bg-red-50">device = inverter_device(…)</p>
+                  <p class="bg-red-50">ri = hold_reconcile_intent(intent, trusted)</p>
+                  <p class="bg-red-50">lines = reconcile_holds(ri, now) or [UNTRUSTED]</p>
+                  <p>if setpoint unchanged: [SKIP]</p>
+                  <p class="bg-red-50">lines += device.apply(intent)</p>
+                  <p>publish_plan · record · orchestrate · rerive</p>
+                </div>
+                <div class="border border-slate-400 bg-white rounded p-2 space-y-0.5">
+                  <p class="schem text-[.55rem] text-slate-500 font-sans">cli._cmd_plan --apply</p>
+                  <p class="bg-red-50">device = inverter_device(…)</p>
+                  <p class="bg-red-50">ri = hold_reconcile_intent(intent, None)</p>
+                  <p class="bg-red-50">lines = reconcile_holds(ri, now) or [UNTRUSTED]</p>
+                  <p class="text-slate-400">(no skip — silent judgment call)</p>
+                  <p class="bg-red-50">lines += device.apply(intent)</p>
+                  <p>print</p>
+                </div>
+              </div>
+              <p class="text-[.66rem] text-slate-500 mt-2">Same again for habits: <code>_cmd_learn_factors</code> copies <code>_gather_context</code> without its statistics-fetch try/except.</p>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-3">
+              <p class="schem text-slate-500 mb-2">After · one body, two callers</p>
+              <div class="space-y-2">
+                <div class="grid grid-cols-2 gap-2">
+                  <div class="border border-slate-400 bg-white rounded p-1.5 schem text-[.58rem]">daemon run_once</div>
+                  <div class="border border-slate-400 bg-white rounded p-1.5 schem text-[.58rem]">cli plan --apply</div>
+                </div>
+                <div class="text-center text-slate-400 text-xs leading-none">↓ ↓</div>
+                <div class="deep rounded-lg border-2 border-slate-900 p-3">
+                  <p class="schem font-semibold">apply plan to device</p>
+                  <p class="text-[.66rem] text-slate-300">reconcile first (#143) · skip-if-unchanged is a named option · action lines out</p>
+                </div>
+                <div class="deep rounded-lg border-2 border-slate-900 p-3 mt-3">
+                  <p class="schem font-semibold">habit predictions for tomorrow</p>
+                  <p class="text-[.66rem] text-slate-300">one gather, one try/except · used by orchestrate and learn-factors</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid md:grid-cols-3 gap-6 text-sm">
+            <div>
+              <p class="schem text-slate-500 mb-1">Problem</p>
+              <p>Both copies fail the deletion test as pass-throughs: delete either and call the shared body and nothing is lost. The CLI copy has already drifted (no skip, no error isolation).</p>
+            </div>
+            <div>
+              <p class="schem text-slate-500 mb-1">Solution</p>
+              <p>One apply-to-device function with the skip as an explicit option; one habit-predictions function replacing both the orchestrator's private gather and the CLI inline copy.</p>
+            </div>
+            <div>
+              <p class="schem text-slate-500 mb-1">Wins</p>
+              <ul class="list-disc pl-4 space-y-0.5">
+                <li>locality: #143 ordering in one place</li>
+                <li>CLI and daemon cannot drift</li>
+                <li>delete ~60 lines of copy</li>
+              </ul>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <!-- ───────────────── looked at, left alone ───────────────── -->
+      <section class="rounded-lg border border-slate-200 bg-white p-6 text-sm space-y-2">
+        <p class="schem text-slate-500">Looked at, left alone</p>
+        <ul class="list-disc pl-5 text-slate-700 space-y-1">
+          <li><b>Pure clock helpers in the driver</b> (<code class="font-mono text-xs">_next_wall_clock_occurrence</code>, <code class="font-mono text-xs">_clock_window_open</code>, <code class="font-mono text-xs">_export_not_yet_armed</code>): small interface, real depth, tested directly. Deep as they stand.</li>
+          <li><b>ChargeIntent / ChargePlan construction</b>: exactly one construction site each (planner.py). Trust flags travel as fields, not parameters. No friction.</li>
+          <li><b>Plan pipeline</b> (<code class="font-mono text-xs">plan_run.current_plan</code>): #91 did its job; four callers share one entry. <code class="font-mono text-xs">gather_inputs</code> and <code class="font-mono text-xs">compute_plan</code> are large but concentrated, each with one caller path.</li>
+          <li><b>Tariff config validators</b> (four near-identical <code class="font-mono text-xs">validate_*_tariff</code> functions): boilerplate, but ten lines each and test-enforced against the add-on schema. Not worth a card.</li>
+          <li><b>The reconcile seam itself</b> (ADR-0003, #143): the split between <code class="font-mono text-xs">apply</code> and <code class="font-mono text-xs">reconcile_holds</code> is a real, argued seam. Nothing here reopens it.</li>
+        </ul>
+      </section>
+
+      <!-- ───────────────── top recommendation ───────────────── -->
+      <section id="top-recommendation" class="rounded-xl border-2 border-emerald-600 bg-emerald-50 p-8 space-y-3">
+        <p class="schem text-emerald-700">Top recommendation</p>
+        <h2 class="font-serif text-3xl"><a href="#c1" class="underline decoration-emerald-400 underline-offset-4">1 · The verified register write</a></h2>
+        <p class="text-slate-800 max-w-3xl">It is the most-touched file in the repo, every fix of the last two weeks edited several of the eight copies, and the fog's next Solis need — backing off writes the inverter keeps rejecting — has no home until this module exists. It moves no seam and changes no caller; the 100 existing driver tests already cross the public interface and would carry the refactor unchanged, which makes it the safest deepening to land before supervised commissioning (#131, #134).</p>
+        <p class="text-sm text-slate-600">Next after that: card 2 — #147 is an open bug that a tick seam would have caught, and cards 3 and 5 both get cheaper once the loop has one.</p>
+      </section>
+
+      <footer class="text-xs text-slate-400 pt-4">Generated 2026-09-17 · vocabulary from <code>/codebase-design</code> · domain terms from <code>CONTEXT.md</code> · prior review: <code>docs/arch-review/architecture-review-2026-08-18.html</code></footer>
+    </main>
+  </body>
+</html>
