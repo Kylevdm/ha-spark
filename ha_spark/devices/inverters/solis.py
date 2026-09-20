@@ -152,6 +152,7 @@ class SolisDevice:
             async with export_store:
                 previous_export_record = await export_store.load()
         export_error: str | None = None
+        preserve_resident_export = False
         if (
             mode == "on"
             and raw_export is None
@@ -175,6 +176,10 @@ class SolisDevice:
             export_error = _validate_export(intent, export)
             if export_error is None:
                 export_error = _export_not_yet_armed(export, now)
+                if export_error is not None and mode == "on":
+                    preserve_resident_export = await self._has_matching_live_verified_export(
+                        raw_export, export, now
+                    )
             if export_error is None and intent.hold_overlaps(*export):
                 # Hold beats export on overlap: the reconcile will hold the
                 # inverter `Off` inside the event, so refuse the whole window
@@ -208,7 +213,11 @@ class SolisDevice:
         # attempting the current transition. This leaves a failed transition
         # safe at zero rather than continuing an old, higher-rate window.
         deactivation_line: str | None = None
-        if mode == "on" and blocked is None:
+        preserve_line = "[SKIP] preserving the verified export window while it is not yet armed"
+        if preserve_resident_export:
+            current_ok = True
+            current_line = preserve_line
+        elif mode == "on" and blocked is None:
             current_ok, current_line, deactivation_line = await self._prepare_slot_one_current(
                 intent
             )
@@ -218,12 +227,15 @@ class SolisDevice:
             lines.append(deactivation_line)
         lines.append(current_line)
         window_block = None if current_ok else (blocked or "planned current was not confirmed")
-        window_line = await self._write_charge_window(
-            intent,
-            window_block,
-            export_window=export if export_ready else None,
-            kept_discharge=kept_discharge,
-        )
+        if preserve_resident_export:
+            window_line = preserve_line
+        else:
+            window_line = await self._write_charge_window(
+                intent,
+                window_block,
+                export_window=export if export_ready else None,
+                kept_discharge=kept_discharge,
+            )
         lines.append(window_line)
         window_verified = window_line.startswith(("[APPLIED]", "[SKIP]"))
         if mode == "on" and raw_export is not None and export_ready and not window_verified:
@@ -316,8 +328,8 @@ class SolisDevice:
             # half in one atomic Slot 1 block.
             try:
                 existing = await self._read_slot_block(1)
-            except Exception as exc:  # noqa: BLE001 - fail closed
-                return f"[FAILED] {desc}: slot 1 state unreadable: {exc!r}"
+            except Exception:  # noqa: BLE001 - fail closed
+                return f"[FAILED] {desc}: slot 1 state unreadable"
             charge_values = existing[:4]
         elif zero_charge:
             charge_values = [0, 0, 0, 0]
@@ -342,9 +354,9 @@ class SolisDevice:
         try:
             wrote = await self._apply_slot_block(1, want_block)
             mismatch = await self._verify_slot_block(1, want_block, refresh=wrote)
-        except Exception as exc:  # noqa: BLE001 - isolate per action
-            log.error("[FAILED] %s: %r", desc, exc)
-            return f"[FAILED] {desc}: {exc!r}"
+        except Exception:  # noqa: BLE001 - isolate per action
+            log.error("[FAILED] %s", desc)
+            return f"[FAILED] {desc}"
         if mismatch:
             log.warning("[WARNING] %s, but %s", desc, mismatch)
             return f"[WARNING] {desc}, but {mismatch}"
@@ -364,9 +376,9 @@ class SolisDevice:
             want = existing[:4] + [0, 0, 0, 0]
             wrote = await self._apply_slot_block(1, want)
             mismatch = await self._verify_slot_block(1, want, refresh=wrote)
-        except Exception as exc:  # noqa: BLE001 - cleanup is failure-isolated
-            log.error("[FAILED] %s: %r", clear_desc, exc)
-            return f"[FAILED] {clear_desc}: {exc!r}"
+        except Exception:  # noqa: BLE001 - cleanup is failure-isolated
+            log.error("[FAILED] %s", clear_desc)
+            return f"[FAILED] {clear_desc}"
         if mismatch:
             return f"[WARNING] {clear_desc}, but {mismatch}"
         return f"[APPLIED] {clear_desc}" if wrote else f"[SKIP] {clear_desc} (already clear)"
@@ -400,8 +412,8 @@ class SolisDevice:
         zeros = [0] * len(_WINDOW_FIELDS)
         try:
             active = await self._read_slot_block(1) != zeros
-        except Exception as exc:  # noqa: BLE001 - do not guess at an active window
-            line = f"[FAILED] {current_desc}: slot 1 state unreadable: {exc!r}"
+        except Exception:  # noqa: BLE001 - do not guess at an active window
+            line = f"[FAILED] {current_desc}: slot 1 state unreadable"
             log.error(line)
             return False, line, None
         if not active:
@@ -448,9 +460,9 @@ class SolisDevice:
                 return True, f"[SKIP] slot {slot} already zeroed"
             await self._write_register(_SLOT_BLOCK_REG[slot], zeros)
             mismatch = await self._verify_slot_block(slot, zeros, refresh=True)
-        except Exception as exc:  # noqa: BLE001
-            log.error("[FAILED] %s: %r", desc, exc)
-            return False, f"[FAILED] {desc}: {exc!r}"
+        except Exception:  # noqa: BLE001
+            log.error("[FAILED] %s", desc)
+            return False, f"[FAILED] {desc}"
         if mismatch:
             return False, f"[WARNING] {desc}, but {mismatch}"
         return True, f"[APPLIED] {desc}"
@@ -472,9 +484,9 @@ class SolisDevice:
         try:
             wrote = await self._apply_current(round(amps * _CURRENT_SCALE), amps)
             mismatch = await self._verify_current(amps, refresh=wrote)
-        except Exception as exc:  # noqa: BLE001 - isolate per write
-            log.error("[FAILED] %s: %r", desc, exc)
-            return False, f"[FAILED] {desc}: {exc!r}"
+        except Exception:  # noqa: BLE001 - isolate per write
+            log.error("[FAILED] %s", desc)
+            return False, f"[FAILED] {desc}"
         if mismatch:
             log.warning("[WARNING] %s, but %s", desc, mismatch)
             return False, f"[WARNING] {desc}, but {mismatch}"
@@ -527,7 +539,7 @@ class SolisDevice:
             try:
                 if (await self._rest.get_state(entity)).state.strip().lower() == wanted.lower():
                     return f"[SKIP] {desc} (already set)"
-            except Exception as exc:  # noqa: BLE001 - direction decides
+            except Exception:  # noqa: BLE001 - direction decides
                 if wanted == "On":
                     # Not a benign skip: while the reads stay broken the inverter
                     # is left disabled, the house entirely on grid import. This
@@ -535,16 +547,16 @@ class SolisDevice:
                     # on purpose — the bound is the relinquish path (#143 §5),
                     # which writes the safe state once ha-spark is past every
                     # known hold end and still has no picture.
-                    log.warning("Power-switch unreadable (%r); not releasing a hold", exc)
+                    log.warning("Power-switch unreadable; not releasing a hold")
                     return (
-                        f"[WARNING] {desc} refused: state unreadable ({exc!r}); "
+                        f"[WARNING] {desc} refused: state unreadable; "
                         "a hold is never released blind"
                     )
-                log.warning("Power-switch pre-read failed (%r); writing %s anyway", exc, wanted)
+                log.warning("Power-switch pre-read failed; writing %s anyway", wanted)
             mismatch = await self._select_option(entity, wanted)
-        except Exception as exc:  # noqa: BLE001 - isolate this action's failure
-            log.error("[FAILED] %s: %r", desc, exc)
-            return f"[FAILED] {desc}: {exc!r}"
+        except Exception:  # noqa: BLE001 - isolate this action's failure
+            log.error("[FAILED] %s", desc)
+            return f"[FAILED] {desc}"
         return f"[WARNING] {desc}, but {mismatch}" if mismatch else f"[APPLIED] {desc}"
 
     async def write_safe_state(self) -> list[str]:
@@ -577,12 +589,12 @@ class SolisDevice:
             try:
                 if (await self._rest.get_state(entity)).state.strip().lower() == "on":
                     return f"[SKIP] {desc} (already set)"
-            except Exception as exc:  # noqa: BLE001 - unreadable is written, not refused
-                log.warning("Power-switch pre-read failed (%r); writing On anyway", exc)
+            except Exception:  # noqa: BLE001 - unreadable is written, not refused
+                log.warning("Power-switch pre-read failed; writing On anyway")
             mismatch = await self._select_option(entity, "On")
-        except Exception as exc:  # noqa: BLE001 - isolate this action's failure
-            log.error("[FAILED] %s: %r", desc, exc)
-            return f"[FAILED] {desc}: {exc!r}"
+        except Exception:  # noqa: BLE001 - isolate this action's failure
+            log.error("[FAILED] %s", desc)
+            return f"[FAILED] {desc}"
         return f"[WARNING] {desc}, but {mismatch}" if mismatch else f"[APPLIED] {desc}"
 
     async def _write_safe_slot_block(self) -> str:
@@ -592,8 +604,8 @@ class SolisDevice:
         try:
             start = parse_time(self._settings.charge_window_start)
             end = parse_time(self._settings.charge_window_end)
-        except ValueError as exc:
-            line = f"[FAILED] set charge window (relinquishing control): {exc!r}"
+        except ValueError:
+            line = "[FAILED] set charge window (relinquishing control)"
             log.error(line)
             return line
         charge = [start.hour, start.minute, end.hour, end.minute]
@@ -609,8 +621,8 @@ class SolisDevice:
             export_live = record is not None and record[1] > datetime.now(UTC)
             try:
                 resident: list[int] | None = await self._read_slot_block(1)
-            except Exception as exc:  # noqa: BLE001 - decided below
-                log.warning("Slot 1 pre-read failed (%r)", exc)
+            except Exception:  # noqa: BLE001 - decided below
+                log.warning("Slot 1 pre-read failed")
                 resident = None
             if resident is None:
                 if export_live:
@@ -630,9 +642,9 @@ class SolisDevice:
                 return f"[SKIP] {desc} (already set)"
             await self._write_register(_SLOT_BLOCK_REG[1], want)
             mismatch = await self._verify_slot_block(1, want, refresh=True)
-        except Exception as exc:  # noqa: BLE001 - isolate this action's failure
-            log.error("[FAILED] %s: %r", desc, exc)
-            return f"[FAILED] {desc}: {exc!r}"
+        except Exception:  # noqa: BLE001 - isolate this action's failure
+            log.error("[FAILED] %s", desc)
+            return f"[FAILED] {desc}"
         return f"[WARNING] {desc}, but {mismatch}" if mismatch else f"[APPLIED] {desc}"
 
     async def _select_option(self, entity: str, option: str) -> str | None:
@@ -655,9 +667,9 @@ class SolisDevice:
             mismatch = await self._verify_discharge_current(
                 _EXPORT_CURRENT_A, refresh=wrote
             )
-        except Exception as exc:  # noqa: BLE001 - isolate export action
-            log.error("[FAILED] %s: %r", desc, exc)
-            return False, f"[FAILED] {desc}: {exc!r}"
+        except Exception:  # noqa: BLE001 - isolate export action
+            log.error("[FAILED] %s", desc)
+            return False, f"[FAILED] {desc}"
         if mismatch:
             log.warning("[WARNING] %s, but %s", desc, mismatch)
             return False, f"[WARNING] {desc}, but {mismatch}"
@@ -710,8 +722,8 @@ class SolisDevice:
             return "power_switch entity is not configured"
         try:
             state = await self._rest.get_state(entity)
-        except Exception as exc:  # noqa: BLE001 - fail closed
-            return f"power_switch state unreadable: {exc!r}"
+        except Exception:  # noqa: BLE001 - fail closed
+            return "power_switch state unreadable"
         return None if state.state.strip().lower() == "on" else f"power_switch is {state.state!r}"
 
     async def _persist_export_state(
@@ -733,8 +745,8 @@ class SolisDevice:
                     await store.save(_export_identity(raw_export, start, end), end)
                 elif export is None and window_line.startswith(("[APPLIED]", "[SKIP]")):
                     await store.clear()
-        except Exception as exc:  # noqa: BLE001 - persistence cannot undo HA writes
-            log.error("Export event state persistence failed: %r", exc)
+        except Exception:  # noqa: BLE001 - persistence cannot undo HA writes
+            log.error("Export event state persistence failed")
 
     async def _notify_export_lifecycle(
         self,
@@ -848,6 +860,28 @@ class SolisDevice:
             record = await store.load()
         return record is not None and record[1] > now.astimezone(UTC)
 
+    async def _has_matching_live_verified_export(
+        self,
+        raw_export: object,
+        export: tuple[datetime, datetime],
+        now: datetime,
+    ) -> bool:
+        """Return whether the refused event is already verified and resident in Slot 1."""
+        start, end = export
+        async with ExportEventStore(self._settings.db_path) as store:
+            record = await store.load()
+        if (
+            record is None
+            or record[0] != _export_identity(raw_export, start, end)
+            or record[1] <= now.astimezone(UTC)
+        ):
+            return False
+        try:
+            resident = await self._read_slot_block(1)
+        except Exception:  # noqa: BLE001 - fail closed around a resident write
+            return False
+        return resident[4:] == [start.hour, start.minute, end.hour, end.minute]
+
     # --- modbus helpers ---
 
     def _sensor(self, field: str) -> str:
@@ -943,8 +977,8 @@ class SolisDevice:
         if refresh_entities is not None:
             try:
                 await self._refresh_entities(refresh_entities)
-            except Exception as exc:  # noqa: BLE001 - verification must degrade safely
-                return f"read-back refresh failed: {exc!r}"
+            except Exception:  # noqa: BLE001 - verification must degrade safely
+                return "read-back refresh failed"
         mismatch: str | None = None
         last_exc: Exception | None = None
         for attempt in range(_READ_BACK_ATTEMPTS):
@@ -960,7 +994,7 @@ class SolisDevice:
             if attempt + 1 < _READ_BACK_ATTEMPTS:
                 await asyncio.sleep(_READ_BACK_DELAY_SECONDS)
         if last_exc is not None:
-            return f"read-back failed: {last_exc!r}"
+            return "read-back failed"
         return mismatch or "read-back failed"
 
     async def _refresh_entities(self, entity_ids: tuple[str, ...]) -> None:
@@ -973,8 +1007,8 @@ class SolisDevice:
         try:
             state = await self._rest.get_state(self._sensor("work_mode_bitfield"))
             bitfield = int(float(state.state))
-        except Exception as exc:  # noqa: BLE001
-            return f"work mode unreadable: {exc!r}"
+        except Exception:  # noqa: BLE001
+            return "work mode unreadable"
         if not bitfield & _GRID_CHARGE_BIT:
             return f"grid charging not permitted (work mode bitfield {bitfield}, bit 5 unset)"
         return None
@@ -995,8 +1029,8 @@ class SolisDevice:
                 await asyncio.sleep(_READ_BACK_DELAY_SECONDS)
             try:
                 got = str((await self._rest.get_state(entity)).state)
-            except Exception as exc:  # noqa: BLE001
-                return f"read-back failed: {exc!r}"
+            except Exception:  # noqa: BLE001
+                return "read-back failed"
             if got.lower() == wanted.lower():
                 return None
         return f"read back {got!r} (wanted {wanted!r})"

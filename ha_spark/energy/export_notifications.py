@@ -144,10 +144,10 @@ async def send_once(
             "notify", service, {"title": notice.title, "message": notice.message}
         )
     except Exception:  # noqa: BLE001 - notification failure must not affect control
-        log.warning("Axle export notification failed (%s)", notice.transition, exc_info=True)
+        log.warning("Axle export notification failed (%s)", notice.transition)
         return False
     try:
         await store.mark_sent(notice.event_id, notice.transition)
     except Exception:  # noqa: BLE001 - control has succeeded; dedupe can retry next pass
-        log.warning("Persisting Axle export notification state failed", exc_info=True)
+        log.warning("Persisting Axle export notification state failed")
     return True

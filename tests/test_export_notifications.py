@@ -4,11 +4,18 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import httpx
+import pytest
+import respx
+
 from ha_spark.energy.export_notifications import (
     ExportNotificationStore,
     make_notice,
     send_once,
 )
+from ha_spark.ha.rest import HomeAssistantRest
+
+HA = "http://ha.test/api"
 
 
 class FakeRest:
@@ -88,3 +95,85 @@ async def test_notice_contract_covers_abort_and_cleanup_safe_state() -> None:
     assert "no export window was programmed" in aborted.message
     assert cleaned.title == "Axle export cleanup verified"
     assert "cleared and read back" in cleaned.message
+
+
+@pytest.mark.parametrize("failure", ["transport", "status", "malformed"])
+@respx.mock
+async def test_notification_failures_never_log_the_api_key(failure: str, caplog, tmp_path) -> None:
+    auth_token = "ha-auth-token-sentinel"
+    axle_api_key = "axle-api-key-sentinel"
+    route = respx.post(f"{HA}/services/notify/mobile_app_phone")
+    if failure == "transport":
+        route.mock(
+            side_effect=httpx.ConnectError(
+                f"transport failed: {auth_token} {axle_api_key}"
+            )
+        )
+    elif failure == "status":
+        route.mock(
+            return_value=httpx.Response(
+                503, text=f"upstream failed: {auth_token} {axle_api_key}"
+            )
+        )
+    else:
+        route.mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        "entity_id": "sensor.notification",
+                        "state": "on",
+                        "attributes": axle_api_key,
+                    }
+                ],
+            )
+        )
+
+    start, end = _window()
+    notice = make_notice(
+        "accepted",
+        "export|2026-09-15T18:00:00+00:00|2026-09-15T19:00:00+00:00",
+        start,
+        end,
+    )
+    store = ExportNotificationStore(str(tmp_path / "events.db"))
+
+    with caplog.at_level("INFO"):
+        async with HomeAssistantRest(HA, auth_token) as rest:
+            sent = await send_once(store, rest, "mobile_app_phone", notice)
+
+    assert sent is False
+    assert auth_token not in caplog.text
+    assert axle_api_key not in caplog.text
+
+
+class _FailingRest:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    async def call_service(
+        self, domain: str, service: str, data: dict[str, object] | None = None
+    ) -> list[object]:
+        raise self._error
+
+
+async def test_notification_failure_never_formats_an_exception_traceback(caplog, tmp_path) -> None:
+    secret = "axle-api-key-sentinel"
+    start, end = _window()
+    notice = make_notice(
+        "accepted",
+        "export|2026-09-15T18:00:00+00:00|2026-09-15T19:00:00+00:00",
+        start,
+        end,
+    )
+
+    with caplog.at_level("INFO"):
+        sent = await send_once(
+            ExportNotificationStore(str(tmp_path / "events.db")),
+            _FailingRest(RuntimeError(f"notification failed: {secret}")),
+            "mobile_app_phone",
+            notice,
+        )
+
+    assert sent is False
+    assert secret not in caplog.text
