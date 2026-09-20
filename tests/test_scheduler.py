@@ -2190,3 +2190,157 @@ async def test_run_forever_reapplies_the_plan_after_a_relinquish(
     assert previous_seen[0] is None
     assert previous_seen[1] is None
     assert previous_seen[2] is not None
+
+
+# --- #147: a failing replan must not starve the per-minute reconcile ---
+
+
+async def test_run_forever_reconciles_every_tick_while_the_replan_keeps_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing replan must not starve the clock seam.
+
+    ``last_run_slot`` only advances on a successful run, so while ``run_once``
+    keeps raising *every* later tick is a replan tick. Without a fallback pass
+    neither path reconciles, and a dispatch hold that ends meanwhile leaves the
+    inverter power switch ``Off`` — the house on grid import — for as long as
+    the failures last (#147).
+    """
+    reconciled: list[datetime] = []
+
+    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+        raise RuntimeError("HA unreachable")
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> scheduler.ReconcileResult:
+        reconciled.append(now)
+        return scheduler.ReconcileResult([], trusted_holds)
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    ticks = [
+        datetime(2026, 6, 10, 22, 30),  # the replan raises
+        datetime(2026, 6, 10, 22, 31),  # still a replan tick: the slot never completed
+        datetime(2026, 6, 10, 22, 32),
+    ]
+    stop = _patch_loop(monkeypatch, ticks)
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert reconciled == ticks
+
+
+async def test_a_failed_replans_fallback_pass_uses_the_last_plan_and_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback pass steers by the last good plan and its trusted holds.
+
+    ``last_plan`` still carries the hold's known end time, so the clock is
+    served even though a fresh plan could not be computed.
+    """
+    trusted = _plan(replace(_INTENT, holds=(_HOLD,)))
+    outcomes: list[ChargePlan | Exception] = [trusted, RuntimeError("HA unreachable")]
+    reconciled: list[tuple[ChargePlan | None, object]] = []
+
+    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> scheduler.ReconcileResult:
+        reconciled.append((plan, trusted_holds))
+        return scheduler.ReconcileResult([], trusted_holds)
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    stop = _patch_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 22, 0),  # the replan succeeds; `run_once` reconciles
+            datetime(2026, 6, 10, 22, 30),  # the replan raises; the fallback pass runs
+        ],
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert reconciled == [(trusted, (_HOLD,))]
+
+
+async def test_run_forever_reapplies_when_a_fallback_pass_relinquishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relinquish is a relinquish whichever pass made it.
+
+    The safe state overwrote Slot 1, so the next replan to succeed must apply
+    even an unchanged setpoint (#143 §5) — the fallback pass cannot drop that.
+    """
+    previous_seen: list[object] = []
+    fail_at = datetime(2026, 6, 10, 22, 30)
+    outcomes: list[ChargePlan | Exception] = [
+        _plan(), RuntimeError("HA unreachable"), _plan()
+    ]
+
+    async def fake_run_once(_s: Settings, **kw: object) -> ChargePlan:
+        previous_seen.append(kw.get("previous_plan"))
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    async def fake_reconcile_tick(
+        _s: Settings,
+        plan: ChargePlan | None,
+        now: datetime,
+        *,
+        previous: list[str] | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> scheduler.ReconcileResult:
+        return scheduler.ReconcileResult([], trusted_holds, relinquished=now == fail_at)
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "reconcile_tick", fake_reconcile_tick)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    stop = _patch_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 22, 0),  # succeeds
+            fail_at,  # raises; the fallback pass relinquishes
+            datetime(2026, 6, 10, 23, 0),  # forced re-apply
+        ],
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert previous_seen[0] is None
+    assert previous_seen[2] is None

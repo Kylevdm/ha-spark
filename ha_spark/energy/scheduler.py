@@ -16,7 +16,10 @@ a read-first pass that converges the whole-inverter enable on what the clock and
 the dispatch holds imply. On the HA-entity path it re-reads the dispatch entity
 each minute; the Octopus API path reuses the last plan's holds. It is deliberately independent of
 `setpoint_changed` — a hold boundary is a clock event, not a plan change, and
-dispatch bounds need not land on a half-hour.
+dispatch bounds need not land on a half-hour. A tick that replans reconciles
+inside `run_once` instead, against the plan it just computed; a replan that
+raises falls back to the per-minute pass against the last plan, so a failing
+replan never starves the clock (#147).
 
 Every tick also makes exactly one checked SoC observation (`soc_monitor_tick`,
 #114): the daemon loop is the sole SoC observation cadence, and that one
@@ -609,23 +612,13 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             # Sole SoC observation cadence (#114): one checked measurement per
             # minute in every operating state, reused by everything below.
             measurement = await soc_monitor_tick(settings, monitor)
-            # The clock cadence (#143), independent of `setpoint_changed`: the
-            # power switch converges within a minute, not at the next plan
-            # change. Only on ticks that do not replan — `run_once` makes its own
-            # pass with the freshly computed plan, and reconciling here first
-            # would drive the switch to the *stale* plan's state and then
-            # immediately back, two writes and a momentarily wrong whole-inverter
-            # enable whenever a dispatch is announced or cancelled between slots.
-            if not should_run(now, last_run_slot):
-                reconciled = await reconcile_tick(
-                    settings,
-                    last_plan,
-                    now,
-                    previous=last_reconcile_lines,
-                    trusted_holds=last_trusted_holds,
-                )
-                last_reconcile_lines, last_trusted_holds = reconciled[:2]
-                reapply = reapply or reconciled.relinquished
+            # Set once `run_once` has *returned*, because it makes its own
+            # reconcile pass with the plan it just computed. A run that raises
+            # after that pass (`apply` or `publish_plan`) therefore falls back
+            # below as well: one extra read-first pass against `last_plan`,
+            # which is what every tick in that failure window steers by anyway,
+            # so it costs a duplicate read rather than new stale exposure.
+            replanned = False
             if should_run(now, last_run_slot):
                 try:
                     plan = await run_once(
@@ -634,6 +627,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         previous_plan=None if reapply else last_plan,
                         trusted_holds=last_trusted_holds,
                     )
+                    replanned = True
                     state.set_plan(plan)
                     last_run_slot = _slot_start(now)
                     last_plan = plan
@@ -651,6 +645,29 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         target_w = None
                 except Exception:
                     log.exception("Scheduled plan run failed; will retry next tick")
+            # The clock cadence (#143), independent of `setpoint_changed`: the
+            # power switch converges within a minute, not at the next plan
+            # change. Skipped when `run_once` returned, having made its own pass
+            # with the freshly computed plan; reconciling as well would drive the
+            # switch to the *stale* plan's state and then immediately back, two
+            # writes and a momentarily wrong whole-inverter enable whenever a
+            # dispatch is announced or cancelled between slots. A replan that
+            # raised made no such pass, and `last_run_slot` does not advance
+            # until one succeeds, so every later tick is a replan tick too:
+            # without this fallback nothing would reconcile for as long as the
+            # failures last, and a hold ending meanwhile would leave the switch
+            # `Off` — the house on grid import — though `last_plan` still holds
+            # its known end time (#147).
+            if not replanned:
+                reconciled = await reconcile_tick(
+                    settings,
+                    last_plan,
+                    now,
+                    previous=last_reconcile_lines,
+                    trusted_holds=last_trusted_holds,
+                )
+                last_reconcile_lines, last_trusted_holds = reconciled[:2]
+                reapply = reapply or reconciled.relinquished
             if guard_enabled and in_window(now.time(), window_start, window_end):
                 try:
                     target_w = await guard_tick(settings, target_w, soc=measurement)
