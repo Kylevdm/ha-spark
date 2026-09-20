@@ -585,6 +585,56 @@ async def test_a_day_early_refusal_leaves_no_event_record_to_clean_up(tmp_path) 
 
 
 @pytest.mark.asyncio
+async def test_a_day_early_refusal_preserves_same_verified_resident_export(tmp_path) -> None:
+    """A deferred retry must not clear the verified event it finds in Slot 1."""
+    rest = FakeRest()
+    now = datetime.now(_LONDON).replace(second=0, microsecond=0)
+    start = (now + timedelta(hours=1)).replace(second=0, microsecond=0) + timedelta(days=1)
+    end = start + timedelta(hours=2)
+    export = ExportIntent(
+        event_identity=("export", start, end),
+        window_start=start,
+        window_end=end,
+        planned_export_kw=3.2,
+        dno_export_limit_kw=7.36,
+        selected_slots=(start,),
+        slot_export_kw=(3.2,),
+    )
+    resident = [23, 30, 5, 30, start.hour, start.minute, end.hour, end.minute]
+    await rest.call_service("modbus", "write_register", {"address": 43142, "value": 625})
+    await rest.call_service("modbus", "write_register", {"address": 43143, "value": resident})
+    event_id = f"export|{start.astimezone(UTC).isoformat()}|{end.astimezone(UTC).isoformat()}"
+    async with ExportEventStore(str(tmp_path / "events.db")) as store:
+        await store.save(event_id, end)
+    rest.calls.clear()
+
+    lines = await _device(rest, tmp_path).apply(_intent(export))
+
+    assert any("export refused" in line and "not yet armed" in line for line in lines)
+    slot_writes = [
+        call for call in rest.calls
+        if call[0:2] == ("modbus", "write_register") and call[2]["address"] == 43143
+    ]
+    assert slot_writes == []
+    assert _discharge_writes(rest) == []
+    assert [
+        rest.states[f"sensor.solis_control_{field}"]
+        for field in (
+            "timed_charge_start_hours",
+            "timed_charge_start_minutes",
+            "timed_charge_end_hours",
+            "timed_charge_end_minutes",
+            "timed_discharge_start_hours",
+            "timed_discharge_start_minutes",
+            "timed_discharge_end_hours",
+            "timed_discharge_end_minutes",
+        )
+    ] == [str(value) for value in resident]
+    async with ExportEventStore(str(tmp_path / "events.db")) as store:
+        assert await store.load() == (event_id, end.astimezone(UTC))
+
+
+@pytest.mark.asyncio
 async def test_an_event_already_under_way_is_still_armed_for_its_remainder(tmp_path) -> None:
     """A day-of pickup mid-event must deliver the rest, not defer for 24 hours."""
     rest = FakeRest()
