@@ -13,11 +13,13 @@ deterministic offline fallback when Ollama is unreachable. Packaged as a
 Home Assistant add-on: no cloud service, no subscription, no data leaving
 your network.
 
-> Status: shipped through add-on v0.15.0. Deterministic planner, device-driver
+> Status: shipped through add-on v0.17.0. Deterministic planner, device-driver
 > core with per-device control authority, multi-supplier tariffs (fixed,
 > dynamic, Octopus Intelligent), native Solis timed-slot actuation with guard
-> rails, simulate mode + savings backtest, onboarding wizard, NL copilot, and
-> an optional agent surface.
+> rails, derived base load, half-hourly replanning with slot reservations,
+> Axle flexibility events with supervised export delivery (not yet proven on
+> hardware), simulate mode + savings backtest, onboarding wizard, NL copilot,
+> and an optional agent surface.
 > [`ha_spark_addon/CHANGELOG.md`](ha_spark_addon/CHANGELOG.md) is the shipped
 > record; the GitHub
 > [milestones](https://github.com/Kylevdm/ha-spark/milestones) are the live

@@ -220,3 +220,25 @@ one-supervised-event destination.
   add-on release mechanism so operators can verify which code is running during
   upgrades and supervised control trials. Trigger: before the next add-on
   migration or real-control trial.
+
+### Pre-wayfinder parked work (from #61 and #62, 2026-09-28)
+
+Moved here when the pre-wayfinder tracker issues were retired; the issues are
+closed and point back to this section. Multi-inverter sites, also listed in
+#62, is not here: the post-v1 roadmap map (#67) owns it.
+
+- **EV charger drivers (former Phase 9, #61).** Formally deferred from the
+  competitive MVP: the EV stays `supplier` authority (observed and planned
+  around via the `octopus_intelligent` tariff provider), and ha-spark never
+  actuates the EV charger. Related: carbon-aware EV-coupled charging (#98)
+  only reads EV state. Trigger: v1.0.0 ships and an owner wants ha-spark to
+  drive the charger.
+- **Heat-pump active coordination and hot-water tank.** Beyond Phase 11's
+  observe-and-model scope (#58). Trigger: Phase 11 ships.
+- **Solcast bias correction.** Trigger: none yet.
+- **EV-dispatch propensity prediction.** Trigger: none yet.
+- **More vendor presets/drivers.** Trigger: a user with an unsupported
+  inverter or charger asks for one.
+- **Two-way Telegram chat** (inbound messages into the ask/copilot pipeline).
+  Sequenced after the outbound phone digest. Trigger: the morning digest
+  (#50) ships.
