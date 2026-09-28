@@ -108,3 +108,17 @@ solar generation after serving house load.
 **Export priority** — during a paid flexibility event, export revenue outranks
 discretionary battery charging. It does not outrank house supply or the
 reservation needed to protect the household after the event.
+
+**Household clock** — the one wall-clock time zone every local time in
+ha-spark means: tariff slots, the local day, and every time written to an
+inverter. It is the configured zone, asserted by the owner; Home Assistant's
+zone and the inverter clock are *checked against* it, never substituted for
+it. (Decision: #155, 2026-09-28.)
+_Avoid_: system time, HA time, local time (unqualified)
+
+**Inverter clock** — the inverter's own real-time clock, a bare wall-clock
+reading with no zone. Inverter-resident windows fire on it, so it must agree
+with the household clock before one is trusted. It drifts, and it cannot be
+relied on to change hour when the clocks change.
+(Decision: #155, 2026-09-28.)
+_Avoid_: RTC (in prose), inverter time
