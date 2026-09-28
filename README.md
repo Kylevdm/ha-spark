@@ -23,6 +23,24 @@ your network.
 > [milestones](https://github.com/Kylevdm/ha-spark/milestones) are the live
 > tracker; [`CONTEXT.md`](CONTEXT.md) is the domain glossary.
 
+## Destination
+
+**v1.0.0 is the competitive MVP, validated on real hardware.** A zero-export
+house (battery, solar, a V2L car, Axle flexibility events) runs on autopilot:
+
+- base load derived from component statistics, not a battery-polluted sensor;
+- the plan recomputed every half-hourly tariff slot;
+- battery energy held back by named, backward-computed reservations;
+- Axle export events delivered automatically, the anchor feature;
+- the car refilling the house battery over V2L when that beats the grid;
+- a morning plan digest on your phone, and a readiness signal that recommends
+  when to switch on real control (the switch stays yours).
+
+Each step ships as a `0.x` minor release, `0.15.0` through `0.18.0`, tracked
+by its [milestone](https://github.com/Kylevdm/ha-spark/milestones); then
+`1.0.0` once the [release gate](docs/releasing.md#v100-release-gate) passes on
+the real Solis.
+
 ## Design rules
 
 1. **A deterministic planner decides; an LLM only explains.** Battery
