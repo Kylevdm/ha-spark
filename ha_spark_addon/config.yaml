@@ -100,6 +100,7 @@ options:
   inverter: solis
   solis_control_hub: "solis_control"
   solis_modbus_slave: 1
+  inverter_clock_tolerance_minutes: 5.0
   alphaess_serial: ""
   devices: []
   outdoor_weather_entity: weather.home
@@ -197,6 +198,7 @@ schema:
   inverter: list(solis|alphaess)
   solis_control_hub: str?
   solis_modbus_slave: int
+  inverter_clock_tolerance_minutes: float(0.1,)
   alphaess_serial: str?
   devices:
     - id: str

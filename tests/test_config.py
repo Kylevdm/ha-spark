@@ -199,6 +199,16 @@ def test_export_planner_limits_are_configurable_across_addon_surfaces() -> None:
     assert "dno_export_limit_kw" in _OPTION_KEYS
 
 
+def test_inverter_clock_tolerance_defaults_to_five_minutes() -> None:
+    assert Settings().inverter_clock_tolerance_minutes == 5.0
+    assert "inverter_clock_tolerance_minutes" in _OPTION_KEYS
+
+
+def test_inverter_clock_tolerance_must_be_positive() -> None:
+    with pytest.raises(ValidationError):
+        Settings(inverter_clock_tolerance_minutes=0)
+
+
 def test_devices_synthesized_from_flat_keys_when_absent() -> None:
     s = Settings(
         supervisor_token="sup",
