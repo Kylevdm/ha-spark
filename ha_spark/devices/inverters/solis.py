@@ -43,7 +43,15 @@ from typing import TYPE_CHECKING, TypeVar
 from zoneinfo import ZoneInfo
 
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
-from ha_spark.devices.inverters.solis_clock import CLOCK_FIELD, clock_refusal
+from ha_spark.devices.inverters.solis_clock import (
+    CLOCK_FIELD,
+    CLOCK_SYNC_REG,
+    STALE_AFTER,
+    clock_error,
+    clock_refusal,
+    clock_registers,
+    describe_error,
+)
 from ha_spark.devices.registry import register
 from ha_spark.energy.export_notifications import (
     ExportNotificationStore,
@@ -57,6 +65,7 @@ from ha_spark.logging import get_logger
 
 if TYPE_CHECKING:  # avoid an import cycle: config imports devices.base at runtime
     from ha_spark.config import DeviceConfig, Settings
+    from ha_spark.ha.models import EntityState
     from ha_spark.ha.rest import HomeAssistantRest
 
 log = get_logger(__name__)
@@ -94,6 +103,9 @@ _READ_BACK_DELAY_SECONDS = 0.1
 _GRID_CHARGE_BIT = 1 << 5
 _EXPORT_CURRENT_A = 62.5
 _EXPORT_CURRENT_RAW = 625
+# A sync is confirmed only when the read-back is this close to the household
+# clock: the write truncates to whole seconds and a poll adds a little latency.
+_CLOCK_SYNC_READ_BACK = timedelta(seconds=10)
 T = TypeVar("T")
 
 
@@ -743,6 +755,67 @@ class SolisDevice:
             state = None
         tolerance = timedelta(minutes=self._settings.inverter_clock_tolerance_minutes)
         return clock_refusal(state, now, tz, tolerance)
+
+    async def sync_clock(self) -> tuple[bool, list[str]]:
+        """Set the inverter clock from the household clock and confirm it (#161).
+
+        Operator-run (``python -m ha_spark solis sync-clock``); ha-spark never
+        calls this on its own. Writes the six-register block at 43000 whatever
+        the error beforehand, then refreshes the clock sensor and reads it back.
+        Returns whether the sync was confirmed and lines reporting the error
+        before and after. Outside ``on`` nothing is written and it is not a
+        success, so the runbook step cannot pass by accident in ``simulate``.
+        """
+        from ha_spark.energy.forecast import load_timezone  # import cycle, see apply
+
+        tz = load_timezone(self._settings.timezone)
+        desc = f"sync inverter clock to {self._settings.timezone}"
+        entity = self._sensor(CLOCK_FIELD)
+        try:
+            before = clock_error(await self._rest.get_state(entity), tz)
+        except Exception:  # noqa: BLE001 - reported, and synced regardless
+            before = None
+        zone = self._settings.timezone
+        before_text = "unreadable" if before is None else f"{describe_error(before)} {zone}"
+        lines = [f"inverter clock before: {before_text}"]
+        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        if mode != "on":
+            lines.append(f"[{mode.upper()}] would {desc}; not written (mode is {mode})")
+            return False, lines
+
+        def confirmed(state: EntityState) -> bool:
+            error = clock_error(state, tz)
+            return (
+                error is not None
+                and state.last_updated is not None
+                and datetime.now(UTC) - state.last_updated <= STALE_AFTER
+                and abs(error) <= _CLOCK_SYNC_READ_BACK
+            )
+
+        def describe(state: EntityState) -> str:
+            error = clock_error(state, tz)
+            return "read back unreadable" if error is None else f"read back {describe_error(error)}"
+
+        try:
+            await self._write_register(CLOCK_SYNC_REG, clock_registers(datetime.now(UTC), tz))
+            mismatch = await self._verify_read_back(
+                lambda: self._rest.get_state(entity),
+                confirmed,
+                describe,
+                refresh_entities=(entity,),
+            )
+            after = clock_error(await self._rest.get_state(entity), tz)
+        except Exception:  # noqa: BLE001 - isolate this action's failure
+            log.error("[FAILED] %s", desc)
+            lines.append(f"[FAILED] {desc}")
+            return False, lines
+        if mismatch:
+            log.warning("[WARNING] %s, but %s", desc, mismatch)
+            lines.append(f"[WARNING] {desc}, but {mismatch}")
+            return False, lines
+        now_error = describe_error(after) if after is not None else "unreadable"
+        lines.append(f"[APPLIED] {desc} (now {now_error})")
+        return True, lines
 
     async def _require_power_switch_on(self) -> str | None:
         entity = self._config.entities.get("power_switch", "")
