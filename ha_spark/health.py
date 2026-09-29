@@ -18,6 +18,14 @@ from pathlib import Path
 import aiosqlite
 
 from ha_spark.config import Settings
+from ha_spark.devices.inverters.solis_clock import (
+    CLOCK_FIELD,
+    FAIL_AT,
+    UNREADABLE,
+    clock_error,
+    clock_refusal,
+    describe_error,
+)
 from ha_spark.energy.axle import AxleApiError, read_axle_event
 from ha_spark.energy.forecast import intervals_from_hourly_stats, load_timezone
 from ha_spark.energy.octopus import (
@@ -120,6 +128,61 @@ async def check_sqlite(settings: Settings) -> CheckResult:
         return CheckResult("SQLite", Status.OK, f"writable @ {settings.db_path}")
     except Exception as exc:  # noqa: BLE001
         return CheckResult("SQLite", Status.FAIL, f"{settings.db_path}: {exc!r}")
+
+
+async def check_ha_timezone(settings: Settings) -> CheckResult:
+    """Compare HA's ``time_zone`` with the household clock (the ``timezone`` option).
+
+    A mismatch only warns (#155): Axle times always carry an offset, so it
+    touches times without one (Octopus dispatches) and the local day.
+    """
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            config = await rest.get_config()
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("Household clock", Status.WARN, f"HA time_zone unreadable: {exc!r}")
+    ha_zone = config.get("time_zone")
+    if ha_zone == settings.timezone:
+        return CheckResult("Household clock", Status.OK, f"{settings.timezone} (HA agrees)")
+    return CheckResult(
+        "Household clock",
+        Status.WARN,
+        f"HA time_zone is {ha_zone!r} but ha-spark timezone is {settings.timezone!r}; "
+        "times without an offset and the local day may be misread",
+    )
+
+
+async def check_inverter_clock(settings: Settings) -> CheckResult:
+    """Compare the Solis inverter clock with the household clock (#161)."""
+    entity = f"sensor.{settings.solis_control_hub}_{CLOCK_FIELD}"
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            state = await rest.get_state(entity)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(
+            "Inverter clock",
+            Status.WARN,
+            f"{entity}: {exc!r}; add the clock sensor from "
+            "docs/solis-control-modbus-overlay.yaml; export windows are refused until it reads",
+        )
+    tz = load_timezone(settings.timezone)
+    tolerance = timedelta(minutes=settings.inverter_clock_tolerance_minutes)
+    error = clock_error(state, tz)
+    refusal = clock_refusal(state, datetime.now(UTC), tz, tolerance)
+    if error is None or refusal == UNREADABLE:
+        return CheckResult(
+            "Inverter clock", Status.WARN, f"{entity} {UNREADABLE}; export windows are refused"
+        )
+    if refusal is None:
+        return CheckResult(
+            "Inverter clock", Status.OK, f"{describe_error(error)} of {settings.timezone}"
+        )
+    status = Status.FAIL if abs(error) >= FAIL_AT else Status.WARN
+    return CheckResult("Inverter clock", status, f"{refusal}; export windows are refused")
 
 
 _REQUIRED_ENTITY_FIELDS = (
@@ -300,7 +363,10 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_load_history(settings),
         check_supply_guard(settings),
         check_tariff_provider(settings),
+        check_ha_timezone(settings),
     )
+    if settings.inverter == "solis":
+        results.append(await check_inverter_clock(settings))
     return [*results, check_entity_config(settings)]
 
 
