@@ -39,6 +39,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `inverter` | Which inverter ha-spark controls: `solis` (default) or `alphaess` |
 | `solis_control_hub` | Name of the thin HA `modbus:` overlay hub ha-spark drives the Solis timed-slot registers through (default `solis_control`; see `docs/solis-control-modbus-overlay.yaml`) |
 | `solis_modbus_slave` | Modbus slave/unit id on that hub (default `1`) |
+| `inverter_clock_tolerance_minutes` | How far the Solis inverter clock may drift from the household clock (`timezone`) before ha-spark refuses to arm an export window and `health` warns (default `5`). Fix drift with `python -m ha_spark solis sync-clock` |
 | `alphaess_serial` | AlphaESS system serial (only needed when `inverter: alphaess`) |
 | `person_entities` | Optional comma-separated `person`/`device_tracker` entity ids for occupancy signal recording |
 | `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
