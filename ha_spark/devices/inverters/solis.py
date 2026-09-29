@@ -22,7 +22,9 @@ Slot windows carry a clock face and no date, so an export window is only
 programmed once that clock face next comes round *at* its own event (#144).
 Until then the event is deferred and re-offered each tick; without this, an
 Axle event with a day's notice would discharge the battery a day early, outside
-the paid window.
+the paid window. The inverter fires that face on its *own* clock, so arming also
+requires a fresh inverter-clock reading that agrees with the household clock
+(#161).
 
 PROACTIVE_MODE + control authority (via ``effective_mode``) gate side effects:
 ``simulate``/``observe`` -> log intended writes only; ``on`` -> real
@@ -41,6 +43,7 @@ from typing import TYPE_CHECKING, TypeVar
 from zoneinfo import ZoneInfo
 
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
+from ha_spark.devices.inverters.solis_clock import CLOCK_FIELD, clock_refusal
 from ha_spark.devices.registry import register
 from ha_spark.energy.export_notifications import (
     ExportNotificationStore,
@@ -180,6 +183,8 @@ class SolisDevice:
                     preserve_resident_export = await self._has_matching_live_verified_export(
                         raw_export, export, now
                     )
+            if export_error is None and mode == "on":
+                export_error = await self._clock_refusal(raw_export, export, now, tz)
             if export_error is None and intent.hold_overlaps(*export):
                 # Hold beats export on overlap: the reconcile will hold the
                 # inverter `Off` inside the event, so refuse the whole window
@@ -716,6 +721,29 @@ class SolisDevice:
                 return f"{refusal}; keeping the verified window already in Slot 1", resident
         return refusal, None
 
+    async def _clock_refusal(
+        self,
+        raw_export: object,
+        export: tuple[datetime, datetime],
+        now: datetime,
+        tz: ZoneInfo,
+    ) -> str | None:
+        """Refuse to *arm* an export window on a clock ha-spark cannot vouch for (#161).
+
+        Gates arming only. A window already verified and resident passed this
+        check when it was armed, and a clock cannot drift minutes within one
+        event, so a stale or unreadable blip mid-event must not clear a paid
+        export (the same reasoning as #148). The runbook's abort covers the rest.
+        """
+        if await self._has_matching_live_verified_export(raw_export, export, now):
+            return None
+        try:
+            state = await self._rest.get_state(self._sensor(CLOCK_FIELD))
+        except Exception:  # noqa: BLE001 - unreadable is refused below
+            state = None
+        tolerance = timedelta(minutes=self._settings.inverter_clock_tolerance_minutes)
+        return clock_refusal(state, now, tz, tolerance)
+
     async def _require_power_switch_on(self) -> str | None:
         entity = self._config.entities.get("power_switch", "")
         if not entity:
@@ -823,6 +851,15 @@ class SolisDevice:
                     service,
                     make_notice("started", event_id, start, end),
                 )
+            return
+        if export_error is not None and "inverter clock" in export_error:
+            # Retryable, not an abort: a sync before the event lets it arm.
+            await send_once(
+                store,
+                self._rest,
+                service,
+                make_notice("clock", event_id, start, end, reason=export_error),
+            )
             return
         if export_error is None or any(
             retryable in export_error
