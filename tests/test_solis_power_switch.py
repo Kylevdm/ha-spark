@@ -103,6 +103,16 @@ class FakeRest:
                 self.states[f"sensor.solis_control_{field}{suffix}"] = "0"
 
     async def get_state(self, entity_id: str) -> EntityState:
+        if entity_id == "sensor.solis_control_inverter_clock":
+            # A fresh inverter clock on the household clock, so export may arm (#161).
+            read_at = datetime.now(UTC)
+            face = read_at.astimezone(ZoneInfo("Europe/London"))
+            return EntityState(
+                entity_id=entity_id,
+                state=f"{face.year % 100},{face.month},{face.day},"
+                f"{face.hour},{face.minute},{face.second}",
+                last_updated=read_at,
+            )
         return EntityState(entity_id=entity_id, state=self.states[entity_id], attributes={})
 
     async def call_service(

@@ -422,13 +422,18 @@ async def test_check_ha_timezone_warns_when_unreadable() -> None:
     assert res.status is Status.WARN
 
 
+# One whole-second instant for both the reading's face and its `last_updated`,
+# as the inverter clock has no sub-second field.
+_READ_AT = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=5)
+
+
 def _clock_state(value: str, age: timedelta = timedelta(seconds=5)) -> httpx.Response:
     return httpx.Response(
         200,
         json={
             "entity_id": "sensor.solis_control_inverter_clock",
             "state": value,
-            "last_updated": (datetime.now(UTC) - age).isoformat(),
+            "last_updated": (_READ_AT - age + timedelta(seconds=5)).isoformat(),
         },
     )
 
@@ -436,8 +441,7 @@ def _clock_state(value: str, age: timedelta = timedelta(seconds=5)) -> httpx.Res
 def _clock_face(offset: timedelta) -> str:
     from zoneinfo import ZoneInfo
 
-    face = (datetime.now(UTC) - timedelta(seconds=5)).astimezone(ZoneInfo("Europe/London"))
-    face += offset
+    face = _READ_AT.astimezone(ZoneInfo("Europe/London")) + offset
     return f"{face.year % 100},{face.month},{face.day},{face.hour},{face.minute},{face.second}"
 
 
