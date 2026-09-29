@@ -20,6 +20,7 @@ import yaml
 from ha_spark.config import ConfigError, Settings, load_settings
 from ha_spark.dashboard import build_dashboard
 from ha_spark.devices import inverter_device
+from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.energy import habits
 from ha_spark.energy.backtest import backtest_cost, format_backtest
 from ha_spark.energy.context import KINDS, ContextStore
@@ -133,6 +134,25 @@ async def _cmd_health(settings: Settings) -> int:
     results = await run_health(settings)
     print(format_report(results))
     return exit_code(results)
+
+
+async def _cmd_solis_sync_clock(settings: Settings) -> int:
+    """Set the Solis inverter clock from the household clock and read it back (#161).
+
+    Exit 0 = synced and confirmed, 1 = not written or not confirmed (including
+    any mode but ``on``), 2 = not a Solis install.
+    """
+    if settings.inverter != "solis":
+        print(f"sync-clock is Solis-only; inverter is {settings.inverter}", file=sys.stderr)
+        return 2
+    config = next(d for d in settings.devices if d.type == "inverter")
+    async with HomeAssistantRest(
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+    ) as rest:
+        ok, lines = await SolisDevice(config, settings, rest).sync_clock()
+    for line in lines:
+        print(line)
+    return 0 if ok else 1
 
 
 async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
@@ -612,6 +632,7 @@ examples:
   ha-spark context add away --from 2026-07-01 --to 2026-07-14   record a holiday
   ha-spark context list                    show stored context facts
   ha-spark context remove 3                delete a context fact by id
+  ha-spark solis sync-clock                set the inverter clock from the household clock
 """
 
 
@@ -854,6 +875,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_ctx_rm = ctx_sub.add_parser("remove", help="Remove a context fact by id")
     p_ctx_rm.add_argument("id", type=int, metavar="ID", help="The fact id (see `context list`)")
 
+    p_solis = sub.add_parser(
+        "solis",
+        help="Solis inverter operations (e.g. sync-clock)",
+        description="Operator-run Solis inverter operations.",
+    )
+    solis_sub = p_solis.add_subparsers(dest="solis_command", required=True, metavar="ACTION")
+    solis_sub.add_parser(
+        "sync-clock",
+        help="Set the inverter clock from the household clock and read it back",
+        description="Write the household clock (the `timezone` option) to the Solis "
+        "clock registers (holding 43000) through the solis_control modbus hub, then "
+        "read it back. Writes only when proactive_mode is on and ha-spark has control. "
+        "Exit 0 = synced and confirmed, 1 = not written or not confirmed, 2 = not Solis.",
+    )
+
     p_bt = sub.add_parser(
         "backtest",
         help="Rate stored grid import under the configured two-rate tariff",
@@ -952,6 +988,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "context":
         return asyncio.run(_cmd_context(settings, args))
+
+    if args.command == "solis":
+        return asyncio.run(_cmd_solis_sync_clock(settings))
 
     parser.error(f"unknown command: {args.command}")
     return 2  # pragma: no cover - argparse exits first
