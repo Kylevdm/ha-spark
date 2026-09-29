@@ -10,7 +10,9 @@
   (default 5), when its reading is over 60 s old, or when it is unreadable. It
   sends a deduplicated, retryable "Axle export held: inverter clock" notice.
   The check gates arming only: an export window that is already verified and
-  resident is not re-checked. The charge path is unchanged.
+  recorded is not re-checked. `simulate` takes the same decision, so a
+  rehearsal shows the refusal. The option is bounded below the 30-minute
+  `health` failure threshold. The charge path is unchanged.
 - Overlay (#161): add the `Solis Control Inverter Clock` sensor from
   `docs/solis-control-modbus-overlay.yaml`. It reads input registers
   33022–33027 in one transaction. Export is refused until it reads.

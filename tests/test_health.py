@@ -498,3 +498,11 @@ async def test_check_inverter_clock_warns_when_the_entity_is_missing() -> None:
 
 def test_inverter_clock_failure_is_not_critical() -> None:
     assert exit_code([_r("Inverter clock", Status.FAIL)]) == 2
+
+
+@respx.mock
+async def test_check_inverter_clock_fails_at_thirty_minutes_whatever_the_tolerance() -> None:
+    respx.get(CLOCK).mock(return_value=_clock_state(_clock_face(timedelta(minutes=30))))
+    settings = Settings(ha_url=HA, ha_token="tok", inverter_clock_tolerance_minutes=29.9)
+    res = await check_inverter_clock(settings)
+    assert res.status is Status.FAIL

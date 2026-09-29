@@ -465,7 +465,8 @@ class Settings(BaseSettings):
     solis_modbus_slave: int = Field(default=1)
     # How far the inverter clock may disagree with the household clock before
     # an export window is refused and `health` warns (#155/#161).
-    inverter_clock_tolerance_minutes: float = Field(default=5.0, gt=0)
+    # Below health's 30-minute failure threshold, so a failure is always refused.
+    inverter_clock_tolerance_minutes: float = Field(default=5.0, ge=0.1, lt=30)
     # AlphaESS system serial for the alphaess.setbatterycharge service call.
     alphaess_serial: str = Field(default="")
 

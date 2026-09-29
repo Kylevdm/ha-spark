@@ -287,3 +287,8 @@ def test_soc_failure_threshold_is_configurable_across_surfaces() -> None:
 def test_soc_failure_threshold_must_be_at_least_one(bad: int) -> None:
     with pytest.raises(ValidationError):
         Settings(ha_url="http://x", ha_token="t", soc_failure_threshold=bad)
+
+
+def test_inverter_clock_tolerance_stays_below_the_health_failure_threshold() -> None:
+    with pytest.raises(ValidationError):
+        Settings(inverter_clock_tolerance_minutes=31)
