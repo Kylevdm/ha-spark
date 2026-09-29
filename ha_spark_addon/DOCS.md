@@ -335,6 +335,16 @@ transition, and never count as proof that a hardware write succeeded. Leave it
 blank to disable them. The supervised procedure is in
 `docs/runbooks/supervised-axle-export.md`.
 
+On the Solis, an export window fires on the inverter's own clock. ha-spark
+refuses to arm one unless `sensor.<solis_control_hub>_inverter_clock` (add it
+from `docs/solis-control-modbus-overlay.yaml`) is under 60 s old and within
+`inverter_clock_tolerance_minutes` of the household clock (`timezone`). In that
+case it sends an "Axle export held: inverter clock" notice and retries each pass.
+`ha-spark health` reports the error (a warning above the tolerance, a failure at
+30 minutes or more). `ha-spark solis sync-clock` sets the inverter clock from
+the household clock and reads it back. It writes only when `proactive_mode` is
+`on`, and ha-spark never runs it on its own.
+
 For paid export, `battery_discharge_ceiling_kw` is the conservative battery
 output used by the planner, while `dno_export_limit_kw` is the installation's
 grid-export limit (Kyle's is 7.36 kW). Both caps are independent of the Solis

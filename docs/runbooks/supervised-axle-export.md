@@ -17,15 +17,13 @@ automation or enter an event window by hand.
       overlay is healthy.
 - [ ] The incumbent automations that write the Solis power switch or timed
       discharge window are disabled for this run.
-- [ ] The four clocks agree before real control is enabled. Confirm that the
-      configured `timezone` matches Home Assistant's timezone, the add-on
-      container's UTC clock matches a trusted UTC source, and the Solis RTC
-      shows the same local date, hour, and minute. Record any seconds offset
-      and its direction. Do not continue if any comparison has an unexplained
-      offset, or if the known offset can cross a Slot 1 minute or date
-      boundary. Slot 1 stores a date-less local wall-clock window, so a
-      timezone or clock mismatch can arm it on the wrong day or at the wrong
-      time.
+- [ ] Clock check steps 1–3 pass in `simulate`; the sync (steps 4–5) runs
+      right after real control is enabled, before the window arms (see
+      [Clock check](#clock-check)). The configured `timezone` is the
+      **household clock**; everything else is checked against it. Slot 1
+      stores a date-less local wall-clock window that the inverter fires on
+      its own clock, so a clock mismatch can arm it on the wrong day or at the
+      wrong time.
 - [ ] SoC is fresh, finite, and in the configured 0–100% range.
 - [ ] No dispatch hold overlaps the planned export window.
 - [ ] The event came from a fresh explicit Axle API/HA source. Never type an
@@ -35,26 +33,46 @@ automation or enter an event window by hand.
 - [ ] Record a baseline timestamp, SoC, battery power, solar power, house load,
       grid power, inverter power switch, work mode, and the Solis Slot 1 window.
 
-Record the clock check before proceeding. Use UTC for the record timestamp and
-write down the exact timezone and clock readings. The Solis RTC reading must
-come from the supported local inverter interface, not an inferred event time.
+### Clock check
+
+Steps 1–3 run while still in `simulate`. Steps 4–5 run shortly before the
+event, right after real control is enabled (the sync writes only when
+`proactive_mode` is `on`) and before the export window arms.
+
+1. **First native read only:** in Home Assistant, briefly enable the disabled
+   `sensor.solisac_rtc` entity. Confirm `sensor.solis_control_inverter_clock`
+   (`yy,mm,dd,hh,mi,ss`) shows the same date and time, then disable
+   `sensor.solisac_rtc` again. The register map's only source is solax-modbus
+   `plugin_solis.py`, so this cross-checks it once.
+2. Confirm the add-on container's UTC clock matches a trusted UTC source.
+3. Run `python -m ha_spark health`. `Household clock` must be ✓: HA's
+   `time_zone` equals the configured `timezone`. Record the `Inverter clock`
+   line; this is the error **before** the sync.
+4. Run `python -m ha_spark solis sync-clock`. It must exit 0 and end with
+   `[APPLIED] sync inverter clock to <timezone> (now … )`. Record the error
+   **before** and **after** from its output. Exit 1 means nothing was
+   confirmed: do not continue.
+5. Run `health` again. `Inverter clock` must be ✓.
+
+ha-spark itself refuses to arm the export window if the inverter clock is off
+by more than `inverter_clock_tolerance_minutes` (default 5), if its reading is
+over 60 s old, or if it is unreadable. It then sends an "Axle export held:
+inverter clock" notice and retries each pass. Syncing clears the refusal.
+
+Record the clock check before proceeding. Use UTC for the record timestamp.
 
 | Check | Result |
 | --- | --- |
 | Checked at (UTC) | |
-| Configured `timezone` | |
-| Home Assistant timezone | |
-| Add-on container UTC | |
-| Solis RTC and timezone basis | |
-| Largest unexplained offset | |
+| Configured `timezone` / HA `time_zone` | |
+| Add-on container UTC vs trusted source | |
+| `solisac_rtc` cross-check (first read only) | |
+| Inverter clock error before sync | |
+| Inverter clock error after sync | |
 | Operator / outcome | |
 
-The largest unexplained offset must be zero before the event. A known offset
-must be recorded with its direction and remain within the same date and minute
-as the reference clock. Keep the record with the event evidence for #134. A
-failed or incomplete clock check is an abort condition. Leave
-`proactive_mode` at `simulate` and do not enable real control until the check
-passes.
+Keep the record with the event evidence for #134. A failed or incomplete clock
+check is an abort condition. Return `proactive_mode` to `simulate`.
 
 The accepted-event notice is the preparation prompt. It includes the event
 window, planned export, DNO limit, and the requirement to keep a person present.
@@ -65,11 +83,13 @@ Repeated polls of the same identity do not repeat it.
 
 1. Confirm the accepted notice and the planner output identify the same event.
 2. Set `proactive_mode` to `on` through the normal add-on configuration surface.
-3. Confirm the control authority is still `ha_spark`, the power switch is `On`,
+3. Run [Clock check](#clock-check) steps 4–5 (sync, then `health`) and fill
+   in the record. If the sync is not confirmed, return to `simulate`.
+4. Confirm the control authority is still `ha_spark`, the power switch is `On`,
    and the fresh SoC guard passes.
-4. Watch the log for the verified Solis timed-discharge current and Slot 1
+5. Watch the log for the verified Solis timed-discharge current and Slot 1
    window. The start notice is sent only after those writes have read back.
-5. At the event start, record the timestamp and the first battery/grid response.
+6. At the event start, record the timestamp and the first battery/grid response.
    Confirm the direction is export and that grid export remains below the DNO
    limit. Capture the command, read-back, battery power, solar power, house
    load, grid power, SoC, and event identity.
@@ -88,7 +108,9 @@ Stop the run and leave the installation in the safe state if any of these occur:
 - battery, solar, house-load, or grid telemetry cannot confirm the expected
   direction or the export limit is approached;
 - any incumbent automation or manual writer changes the same control surface;
-- export continues outside the paid event window.
+- export continues outside the paid event window;
+- the export visibly starts more than `inverter_clock_tolerance_minutes` away
+  from the event start (the inverter clock is not where the sync left it).
 
 An unreadable Axle read is not a cancellation: ha-spark preserves a still-live
 verified export rather than clearing it blindly. Do not override that protection
