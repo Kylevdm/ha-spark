@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+## 0.18.0
+
+- Inverter-clock gate (#161): the Solis driver refuses to arm an export
+  window when the inverter clock disagrees with the household clock
+  (`timezone`) by more than the new `inverter_clock_tolerance_minutes` option
+  (default 5), when its reading is over 60 s old, or when it is unreadable. It
+  sends a deduplicated, retryable "Axle export held: inverter clock" notice.
+  The check gates arming only: an export window that is already verified and
+  resident is not re-checked. The charge path is unchanged.
+- Overlay (#161): add the `Solis Control Inverter Clock` sensor from
+  `docs/solis-control-modbus-overlay.yaml`. It reads input registers
+  33022–33027 in one transaction. Export is refused until it reads.
+- `health` (#161): new `Household clock` check (warns when HA's `time_zone`
+  differs from `timezone`) and `Inverter clock` check (warns above the
+  tolerance, fails at 30 minutes or more).
+- `ha-spark solis sync-clock` (#161): operator-run. It writes the household
+  clock to holding register 43000 and confirms the read-back. It writes only
+  when `proactive_mode` is `on` with control authority, and otherwise exits 1.
+- Runbook: the supervised Axle export clock check now uses `health` and
+  `sync-clock`, records the error before and after, and aborts if the export
+  starts more than the tolerance away from the event.
+
 ## 0.17.0
 
 - Supervised Axle lifecycle notices (#133): the generic `notify_service` option
