@@ -198,7 +198,7 @@ schema:
   inverter: list(solis|alphaess)
   solis_control_hub: str?
   solis_modbus_slave: int
-  inverter_clock_tolerance_minutes: float(0.1,)
+  inverter_clock_tolerance_minutes: float(0.1,29.9)
   alphaess_serial: str?
   devices:
     - id: str

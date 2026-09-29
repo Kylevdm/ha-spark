@@ -142,14 +142,14 @@ async def _cmd_solis_sync_clock(settings: Settings) -> int:
     Exit 0 = synced and confirmed, 1 = not written or not confirmed (including
     any mode but ``on``), 2 = not a Solis install.
     """
-    if settings.inverter != "solis":
-        print(f"sync-clock is Solis-only; inverter is {settings.inverter}", file=sys.stderr)
-        return 2
-    config = next(d for d in settings.devices if d.type == "inverter")
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        ok, lines = await SolisDevice(config, settings, rest).sync_clock()
+        device = inverter_device(settings, rest)
+        if not isinstance(device, SolisDevice):
+            print(f"sync-clock is Solis-only; inverter is {settings.inverter}", file=sys.stderr)
+            return 2
+        ok, lines = await device.sync_clock()
     for line in lines:
         print(line)
     return 0 if ok else 1

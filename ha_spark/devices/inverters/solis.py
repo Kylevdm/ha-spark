@@ -44,9 +44,9 @@ from zoneinfo import ZoneInfo
 
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
 from ha_spark.devices.inverters.solis_clock import (
-    CLOCK_FIELD,
     CLOCK_SYNC_REG,
     STALE_AFTER,
+    clock_entity,
     clock_error,
     clock_refusal,
     clock_registers,
@@ -195,8 +195,6 @@ class SolisDevice:
                     preserve_resident_export = await self._has_matching_live_verified_export(
                         raw_export, export, now
                     )
-            if export_error is None and mode == "on":
-                export_error = await self._clock_refusal(raw_export, export, now, tz)
             if export_error is None and intent.hold_overlaps(*export):
                 # Hold beats export on overlap: the reconcile will hold the
                 # inverter `Off` inside the event, so refuse the whole window
@@ -209,6 +207,10 @@ class SolisDevice:
                 export_error, kept_discharge = await self._untrusted_holds_export(
                     export, mode, now
                 )
+            # After the hold checks, so a terminal refusal is never reported
+            # as the retryable clock hold. A read, so `simulate` takes it too.
+            if export_error is None and mode in ("on", "simulate"):
+                export_error = await self._clock_refusal(raw_export, export, now, tz)
             if mode == "on" and export_error is None:
                 export_error = await self._require_power_switch_on()
             if export_error is not None:
@@ -742,15 +744,26 @@ class SolisDevice:
     ) -> str | None:
         """Refuse to *arm* an export window on a clock ha-spark cannot vouch for (#161).
 
-        Gates arming only. A window already verified and resident passed this
+        Gates arming only. A window already verified and recorded passed this
         check when it was armed, and a clock cannot drift minutes within one
         event, so a stale or unreadable blip mid-event must not clear a paid
         export (the same reasoning as #148). The runbook's abort covers the rest.
+        Judged on the durable record alone, not a Slot 1 read: that read shares
+        the hub with the clock sensor, so both can fail on the same blip.
         """
-        if await self._has_matching_live_verified_export(raw_export, export, now):
-            return None
+        start, end = export
+        store = ExportEventStore(self._settings.db_path)
+        if store.exists:
+            async with store:
+                record = await store.load()
+            if (
+                record is not None
+                and record[0] == _export_identity(raw_export, start, end)
+                and record[1] > now.astimezone(UTC)
+            ):
+                return None
         try:
-            state = await self._rest.get_state(self._sensor(CLOCK_FIELD))
+            state = await self._rest.get_state(clock_entity(self._hub))
         except Exception:  # noqa: BLE001 - unreadable is refused below
             state = None
         tolerance = timedelta(minutes=self._settings.inverter_clock_tolerance_minutes)
@@ -770,7 +783,7 @@ class SolisDevice:
 
         tz = load_timezone(self._settings.timezone)
         desc = f"sync inverter clock to {self._settings.timezone}"
-        entity = self._sensor(CLOCK_FIELD)
+        entity = clock_entity(self._hub)
         try:
             before = clock_error(await self._rest.get_state(entity), tz)
         except Exception:  # noqa: BLE001 - reported, and synced regardless
@@ -783,14 +796,19 @@ class SolisDevice:
             lines.append(f"[{mode.upper()}] would {desc}; not written (mode is {mode})")
             return False, lines
 
+        after: list[timedelta] = []  # the confirming reading, kept for the report
+
         def confirmed(state: EntityState) -> bool:
             error = clock_error(state, tz)
-            return (
+            ok = (
                 error is not None
                 and state.last_updated is not None
                 and datetime.now(UTC) - state.last_updated <= STALE_AFTER
                 and abs(error) <= _CLOCK_SYNC_READ_BACK
             )
+            if ok and error is not None:
+                after.append(error)
+            return ok
 
         def describe(state: EntityState) -> str:
             error = clock_error(state, tz)
@@ -804,7 +822,6 @@ class SolisDevice:
                 describe,
                 refresh_entities=(entity,),
             )
-            after = clock_error(await self._rest.get_state(entity), tz)
         except Exception:  # noqa: BLE001 - isolate this action's failure
             log.error("[FAILED] %s", desc)
             lines.append(f"[FAILED] {desc}")
@@ -813,8 +830,7 @@ class SolisDevice:
             log.warning("[WARNING] %s, but %s", desc, mismatch)
             lines.append(f"[WARNING] {desc}, but {mismatch}")
             return False, lines
-        now_error = describe_error(after) if after is not None else "unreadable"
-        lines.append(f"[APPLIED] {desc} (now {now_error})")
+        lines.append(f"[APPLIED] {desc} (now {describe_error(after[-1])})")
         return True, lines
 
     async def _require_power_switch_on(self) -> str | None:

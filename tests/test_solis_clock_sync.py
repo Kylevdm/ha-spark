@@ -134,3 +134,24 @@ async def test_sync_never_writes_unless_proactive_mode_is_on(mode: str) -> None:
     assert not ok
     assert _writes(rest) == []
     assert "not written" in lines[-1]
+
+
+async def test_a_confirmed_sync_is_not_undone_by_a_later_read_failure() -> None:
+    """Only the first read after the write succeeds; that read is the confirmation."""
+    rest = ClockRest()
+    reads_after_write = 0
+    original_get = rest.get_state
+
+    async def get_state(entity_id: str) -> EntityState:
+        nonlocal reads_after_write
+        if _writes(rest):
+            reads_after_write += 1
+            if reads_after_write > 1:
+                raise RuntimeError("HA blip")
+        return await original_get(entity_id)
+
+    rest.get_state = get_state  # type: ignore[method-assign]
+    ok, lines = await _device(rest).sync_clock()
+
+    assert ok
+    assert lines[-1].startswith("[APPLIED]")

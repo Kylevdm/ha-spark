@@ -883,8 +883,8 @@ async def test_a_clock_refusal_notifies_once_and_is_not_an_abort(tmp_path) -> No
 
 
 @pytest.mark.asyncio
-async def test_simulate_does_not_read_the_clock(tmp_path) -> None:
-    """Same precedent as the power-switch check: `on` gates on live hardware state."""
+async def test_simulate_takes_the_same_clock_decision(tmp_path) -> None:
+    """A read, not a write: the rehearsal must refuse what `on` would refuse."""
     rest = FakeRest()
     rest.clock_state = "unavailable"
     settings = Settings(
@@ -896,4 +896,53 @@ async def test_simulate_does_not_read_the_clock(tmp_path) -> None:
         _intent(_export())
     )
 
+    assert any("export refused: inverter clock unreadable" in line for line in lines)
+    assert not any(call[0] in {"modbus", "select"} for call in rest.calls)
+
+
+class _SlotReadFailsOnce(FakeRest):
+    """The first Slot 1 read after arming fails, as on a REST or modbus blip."""
+
+    fail_next_slot_read = False
+
+    async def get_state(self, entity_id: str) -> EntityState:
+        if self.fail_next_slot_read and entity_id.startswith(
+            "sensor.solis_control_timed_discharge_start_hours"
+        ) and not entity_id.endswith(("_2", "_3")):
+            self.fail_next_slot_read = False
+            raise RuntimeError("blip")
+        return await super().get_state(entity_id)
+
+
+@pytest.mark.asyncio
+async def test_a_slot_read_blip_with_a_bad_clock_never_clears_a_verified_export(
+    tmp_path,
+) -> None:
+    rest = _SlotReadFailsOnce()
+    device = _device(rest, tmp_path)
+    export = _export()
+    await device.apply(_intent(export))
+
+    rest.clock_state = "unavailable"
+    rest.fail_next_slot_read = True
+    lines = await device.apply(_intent(export))
+
+    assert not any("inverter clock" in line for line in lines)
+    assert rest.states["sensor.solis_control_timed_discharge_start_hours"] == str(
+        export.window_start.hour
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_overlapping_hold_is_reported_before_the_clock(tmp_path) -> None:
+    """A terminal refusal must not be masked by the retryable clock notice."""
+    rest = FakeRest()
+    rest.clock_offset = timedelta(hours=-1)
+    export = _export()
+    intent = replace(
+        _intent(export), holds=((export.window_start, export.window_start + timedelta(hours=1)),)
+    )
+    lines = await _device(rest, tmp_path).apply(intent)
+
+    assert any("a dispatch hold overlaps the export window" in line for line in lines)
     assert not any("inverter clock" in line for line in lines)

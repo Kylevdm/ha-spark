@@ -23,13 +23,17 @@ from datetime import datetime, timedelta, tzinfo
 
 from ha_spark.ha.models import EntityState
 
-CLOCK_FIELD = "inverter_clock"
 CLOCK_SYNC_REG = 43000
 # A reading older than this cannot vouch for the clock now (#155 decision 4).
 STALE_AFTER = timedelta(seconds=60)
 # A missed daylight-saving change, or worse: `health` fails rather than warns.
 FAIL_AT = timedelta(minutes=30)
 UNREADABLE = "inverter clock unreadable"
+
+
+def clock_entity(hub: str) -> str:
+    """The overlay's clock sensor on the ``solis_control`` hub named ``hub``."""
+    return f"sensor.{hub}_inverter_clock"
 
 
 def clock_error(state: EntityState, household: tzinfo) -> timedelta | None:
@@ -40,7 +44,8 @@ def clock_error(state: EntityState, household: tzinfo) -> timedelta | None:
     ``None`` when the reading is unreadable: any field missing, non-integer or
     out of range, or no ``last_updated`` to date it.
     """
-    if state.last_updated is None:
+    # A naive timestamp cannot be placed on any clock (and would raise below).
+    if state.last_updated is None or state.last_updated.tzinfo is None:
         return None
     fields = state.state.split(",")
     if len(fields) != 6:

@@ -19,9 +19,9 @@ import aiosqlite
 
 from ha_spark.config import Settings
 from ha_spark.devices.inverters.solis_clock import (
-    CLOCK_FIELD,
     FAIL_AT,
     UNREADABLE,
+    clock_entity,
     clock_error,
     clock_refusal,
     describe_error,
@@ -156,7 +156,7 @@ async def check_ha_timezone(settings: Settings) -> CheckResult:
 
 async def check_inverter_clock(settings: Settings) -> CheckResult:
     """Compare the Solis inverter clock with the household clock (#161)."""
-    entity = f"sensor.{settings.solis_control_hub}_{CLOCK_FIELD}"
+    entity = clock_entity(settings.solis_control_hub)
     try:
         async with HomeAssistantRest(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
@@ -173,7 +173,7 @@ async def check_inverter_clock(settings: Settings) -> CheckResult:
     tolerance = timedelta(minutes=settings.inverter_clock_tolerance_minutes)
     error = clock_error(state, tz)
     refusal = clock_refusal(state, datetime.now(UTC), tz, tolerance)
-    if error is None or refusal == UNREADABLE:
+    if error is None:
         return CheckResult(
             "Inverter clock", Status.WARN, f"{entity} {UNREADABLE}; export windows are refused"
         )
@@ -364,9 +364,8 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_supply_guard(settings),
         check_tariff_provider(settings),
         check_ha_timezone(settings),
+        *([check_inverter_clock(settings)] if settings.inverter == "solis" else []),
     )
-    if settings.inverter == "solis":
-        results.append(await check_inverter_clock(settings))
     return [*results, check_entity_config(settings)]
 
 

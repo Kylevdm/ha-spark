@@ -106,3 +106,9 @@ def test_sync_registers_round_the_seconds_down() -> None:
         3,
         7,
     ]
+
+
+def test_a_naive_last_updated_is_unreadable_not_a_crash() -> None:
+    naive = _clock("26,9,28,14,3,0", last_updated=READ_AT.replace(tzinfo=None))
+    assert clock_error(naive, LONDON) is None
+    assert clock_refusal(naive, READ_AT, LONDON, TOLERANCE) == "inverter clock unreadable"
