@@ -2369,7 +2369,7 @@ async def test_run_forever_syncs_the_inverter_clock_at_a_clock_change_when_opted
 
     async def record_run(self: DstClockSync, _s: Settings, _rest: object, now: datetime) -> None:
         runs.append(now)
-        self.pending_since = None
+        self.handled = self.due(now)
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
         return None

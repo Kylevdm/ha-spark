@@ -709,12 +709,14 @@ async def test_a_second_sigterm_does_not_abort_the_shutdown_work(
 # --- solis sync-clock (#161) ---
 
 
-@pytest.mark.parametrize(("ok", "code"), [(True, 0), (False, 1)])
+@pytest.mark.parametrize(
+    ("outcome", "code"), [("synced", 0), ("failed", 1), ("not_written", 1)]
+)
 async def test_solis_sync_clock_prints_lines_and_exits_on_the_result(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], ok: bool, code: int
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], outcome: str, code: int
 ) -> None:
-    async def fake_sync(self: object) -> tuple[bool, list[str]]:
-        return ok, ["inverter clock before: 60 min behind Europe/London", "[APPLIED] synced"]
+    async def fake_sync(self: object) -> tuple[str, list[str]]:
+        return outcome, ["inverter clock before: 60 min behind Europe/London", "[APPLIED] synced"]
 
     monkeypatch.setattr(cli.SolisDevice, "sync_clock", fake_sync)
     assert await cli._cmd_solis_sync_clock(Settings(ha_url="http://ha", ha_token="t")) == code

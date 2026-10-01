@@ -39,7 +39,7 @@ import asyncio
 import math
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, time, timedelta
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 from zoneinfo import ZoneInfo
 
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
@@ -107,6 +107,7 @@ _EXPORT_CURRENT_RAW = 625
 # clock: the write truncates to whole seconds and a poll adds a little latency.
 _CLOCK_SYNC_READ_BACK = timedelta(seconds=10)
 T = TypeVar("T")
+ClockSyncOutcome = Literal["synced", "failed", "not_written"]
 
 
 @register("solis")
@@ -769,15 +770,17 @@ class SolisDevice:
         tolerance = timedelta(minutes=self._settings.inverter_clock_tolerance_minutes)
         return clock_refusal(state, now, tz, tolerance)
 
-    async def sync_clock(self) -> tuple[bool, list[str]]:
+    async def sync_clock(self) -> tuple[ClockSyncOutcome, list[str]]:
         """Set the inverter clock from the household clock and confirm it (#161).
 
-        Operator-run (``python -m ha_spark solis sync-clock``); ha-spark never
-        calls this on its own. Writes the six-register block at 43000 whatever
-        the error beforehand, then refreshes the clock sensor and reads it back.
-        Returns whether the sync was confirmed and lines reporting the error
-        before and after. Outside ``on`` nothing is written and it is not a
-        success, so the runbook step cannot pass by accident in ``simulate``.
+        Run by the operator (``python -m ha_spark solis sync-clock``) and, when
+        ``inverter_clock_dst_sync`` is on, by the daemon at a daylight-saving
+        change; never to correct drift. Writes the six-register block at 43000
+        whatever the error beforehand, then refreshes the clock sensor and reads
+        it back. Returns ``synced``, ``failed``, or ``not_written`` (outside
+        ``on``: this is the one place the write is gated) with lines reporting
+        the error before and after. ``not_written`` is not a success, so the
+        runbook step cannot pass by accident in ``simulate``.
         """
         from ha_spark.energy.forecast import load_timezone  # import cycle, see apply
 
@@ -794,7 +797,7 @@ class SolisDevice:
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         if mode != "on":
             lines.append(f"[{mode.upper()}] would {desc}; not written (mode is {mode})")
-            return False, lines
+            return "not_written", lines
 
         after: list[timedelta] = []  # the confirming reading, kept for the report
 
@@ -825,13 +828,13 @@ class SolisDevice:
         except Exception:  # noqa: BLE001 - isolate this action's failure
             log.error("[FAILED] %s", desc)
             lines.append(f"[FAILED] {desc}")
-            return False, lines
+            return "failed", lines
         if mismatch:
             log.warning("[WARNING] %s, but %s", desc, mismatch)
             lines.append(f"[WARNING] {desc}, but {mismatch}")
-            return False, lines
+            return "failed", lines
         lines.append(f"[APPLIED] {desc} (now {describe_error(after[-1])})")
-        return True, lines
+        return "synced", lines
 
     async def _require_power_switch_on(self) -> str | None:
         entity = self._config.entities.get("power_switch", "")

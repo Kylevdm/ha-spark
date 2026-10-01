@@ -8,83 +8,110 @@ as ``python -m ha_spark solis sync-clock``. Both UK clock changes fall inside
 the charge window, so syncing at once keeps the stored window on the local-time
 tariff for the rest of that night.
 
+The change is found from the zone rules alone (:func:`last_clock_change`), not
+from an offset remembered between passes. So a restart across the change still
+syncs, a ``timezone`` hot-reload is never mistaken for a change, and a stale
+memory can never fire weeks later. The only state is which change has already
+been handled. The six-hour lookback bounds the whole episode: a failing sync
+retries every pass until then (one notification after 30 minutes), and a switch
+from ``simulate`` to ``on`` inside it still syncs.
+
 Daylight saving only, never drift: nothing here reads the clock error to decide
 whether to sync, and it syncs whatever the error beforehand. Every write
-invariant applies through ``SolisDevice.sync_clock``. Outside ``on`` (or without
-control authority) it logs "would sync" once and writes nothing. A failed sync
-retries on every pass, with one notification if it is still failing after 30
-minutes.
-
-The last offset is held in memory. A process that is down across the change
-starts with the new offset, sees no change, and does not sync; ``health`` and
-the export arming gate still catch the error.
+invariant applies through ``SolisDevice.sync_clock``, the one place the write
+is gated.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from ha_spark.config import Settings
 from ha_spark.devices import inverter_device
-from ha_spark.devices.base import effective_mode
 from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
 
+LOOKBACK = timedelta(hours=6)
 _NOTIFY_FAILURE_AFTER = timedelta(minutes=30)
+
+
+def last_clock_change(now: datetime, lookback: timedelta = LOOKBACK) -> datetime | None:
+    """The UTC instant ``now``'s zone last changed offset, if within ``lookback``.
+
+    Found by bisection over whole UTC seconds, so every pass inside the lookback
+    returns the identical instant. Assumes at most one change per lookback.
+    """
+    tz = now.tzinfo
+    end = int(now.astimezone(UTC).timestamp())
+    start = end - int(lookback.total_seconds())
+
+    def offset(second: int) -> timedelta | None:
+        return datetime.fromtimestamp(second, UTC).astimezone(tz).utcoffset()
+
+    if offset(start) == offset(end):
+        return None
+    lo, hi = start, end  # offset(lo) is the old one, offset(hi) the new
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if offset(mid) == offset(start):
+            lo = mid
+        else:
+            hi = mid
+    return datetime.fromtimestamp(hi, UTC)
 
 
 @dataclass
 class DstClockSync:
-    """Notices a household-zone offset change and drives the sync it calls for."""
+    """Drives the sync each clock change calls for, once."""
 
-    offset: timedelta | None = None
-    pending_since: datetime | None = None
-    failure_notified: bool = False
+    handled: datetime | None = None
+    simulated: datetime | None = None
+    failure_notified: datetime | None = None
 
-    def observe(self, now: datetime) -> bool:
-        """Record ``now``'s UTC offset; True while a sync is due."""
-        offset = now.utcoffset()
-        if self.offset is not None and offset != self.offset:
-            self.pending_since = now
-            self.failure_notified = False
-        self.offset = offset
-        return self.pending_since is not None
+    def due(self, now: datetime) -> datetime | None:
+        """The clock change still awaiting a sync, or ``None``."""
+        change = last_clock_change(now)
+        return change if change is not None and change != self.handled else None
 
     async def run(self, settings: Settings, rest: HomeAssistantRest, now: datetime) -> None:
         """One attempt at the due sync. Raises only what the caller isolates."""
-        if self.pending_since is None:
+        change = self.due(now)
+        if change is None:
             return
         device = inverter_device(settings, rest)
         if not isinstance(device, SolisDevice):
-            self.pending_since = None
+            self.handled = change
             return
-        config = next(d for d in settings.devices if d.type == "inverter")
-        mode = effective_mode(config.control, settings.proactive_mode)
-        ok, lines = await device.sync_clock()
+        outcome, lines = await device.sync_clock()
+        if outcome == "not_written":
+            # Not handled: switching to `on` inside the lookback still syncs.
+            if self.simulated != change:
+                self.simulated = change
+                for line in lines:
+                    log.info("Clock change: %s", line)
+            return
         for line in lines:
             log.info("Clock change: %s", line)
-        if mode != "on":
-            self.pending_since = None
-            return
-        if ok:
-            self.pending_since = None
+        if outcome == "synced":
+            self.handled = change
             await _notify(
                 settings, rest, "Inverter clock synced at the clock change", "\n".join(lines)
             )
             return
-        if not self.failure_notified and now - self.pending_since >= _NOTIFY_FAILURE_AFTER:
-            self.failure_notified = True
+        if self.failure_notified != change and now - change >= _NOTIFY_FAILURE_AFTER:
+            self.failure_notified = change
             await _notify(
                 settings,
                 rest,
                 "Inverter clock sync failing",
                 "The inverter clock has not been synced since the clock change at "
-                f"{self.pending_since:%H:%M %Z}; ha-spark retries every minute and export "
-                "windows are refused until the clock agrees.\n" + "\n".join(lines),
+                f"{change.astimezone(now.tzinfo):%H:%M %Z}; ha-spark retries every minute "
+                f"for {LOOKBACK.total_seconds() / 3600:g} h and export windows are refused "
+                "until the clock agrees.\n" + "\n".join(lines),
             )
 
 
