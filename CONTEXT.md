@@ -122,3 +122,12 @@ with the household clock before one is trusted. It drifts, and it cannot be
 relied on to change hour when the clocks change.
 (Decision: #155, 2026-09-28.)
 _Avoid_: RTC (in prose), inverter time
+
+**Stale schedule** — an inverter-resident window still firing after ha-spark
+has stopped supervising it: crashed, powered off, or uninstalled, rather than
+restarted. A stale *charge* window is a benign fallback, because the house
+keeps charging cheaply. A stale *export* window is the costly case: it repeats
+every day and, on a zero-export site, gives energy away unpaid.
+(Decision: #110, 2026-10-01.)
+_Avoid_: orphaned force (that is the in-memory RC keep-alive's failure, not a
+resident window's)
