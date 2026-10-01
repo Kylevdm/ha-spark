@@ -39,6 +39,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `inverter` | Which inverter ha-spark controls: `solis` (default) or `alphaess` |
 | `solis_control_hub` | Name of the thin HA `modbus:` overlay hub ha-spark drives the Solis timed-slot registers through (default `solis_control`; see `docs/solis-control-modbus-overlay.yaml`) |
 | `solis_modbus_slave` | Modbus slave/unit id on that hub (default `1`) |
+| `inverter_clock_tolerance_minutes` | How far the Solis inverter clock may drift from the household clock (`timezone`) before ha-spark refuses to arm an export window and `health` warns (default `5`). Fix drift with `python -m ha_spark solis sync-clock` |
 | `alphaess_serial` | AlphaESS system serial (only needed when `inverter: alphaess`) |
 | `person_entities` | Optional comma-separated `person`/`device_tracker` entity ids for occupancy signal recording |
 | `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
@@ -333,6 +334,16 @@ terminal abort. Notices are deduplicated by event identity and lifecycle
 transition, and never count as proof that a hardware write succeeded. Leave it
 blank to disable them. The supervised procedure is in
 `docs/runbooks/supervised-axle-export.md`.
+
+On the Solis, an export window fires on the inverter's own clock. ha-spark
+refuses to arm one unless `sensor.<solis_control_hub>_inverter_clock` (add it
+from `docs/solis-control-modbus-overlay.yaml`) is under 60 s old and within
+`inverter_clock_tolerance_minutes` of the household clock (`timezone`). In that
+case it sends an "Axle export held: inverter clock" notice and retries each pass.
+`ha-spark health` reports the error (a warning above the tolerance, a failure at
+30 minutes or more). `ha-spark solis sync-clock` sets the inverter clock from
+the household clock and reads it back. It writes only when `proactive_mode` is
+`on`, and ha-spark never runs it on its own.
 
 For paid export, `battery_discharge_ceiling_kw` is the conservative battery
 output used by the planner, while `dno_export_limit_kw` is the installation's

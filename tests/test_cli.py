@@ -97,7 +97,7 @@ def test_help_mentions_every_command_and_flags() -> None:
     for command in (
         "states", "health", "onboard", "plan", "ask", "run",
         "backfill-load", "import-csv", "pull-consumption", "backtest", "forecast-eval",
-        "context", "learn-factors", "generate-dashboard",
+        "context", "learn-factors", "generate-dashboard", "solis",
     ):
         assert command in top
     assert "examples:" in top
@@ -113,6 +113,9 @@ def test_help_mentions_every_command_and_flags() -> None:
     assert args.kind == "away" and args.start == "2026-07-01" and args.end == "2026-07-14"
     args = parser.parse_args(["context", "remove", "3"])
     assert args.context_command == "remove" and args.id == 3
+    args = parser.parse_args(["solis", "sync-clock"])
+    assert args.command == "solis" and args.solis_command == "sync-clock"
+    assert "sync-clock" in top
     args = parser.parse_args(["plan", "--apply"])
     assert args.apply is True
     args = parser.parse_args(["ask", "what's", "the", "plan"])
@@ -701,3 +704,27 @@ async def test_a_second_sigterm_does_not_abort_the_shutdown_work(
 
     assert await asyncio.wait_for(_cmd_run(settings, once=False), timeout=5) == 0
     assert completed == [True]
+
+
+# --- solis sync-clock (#161) ---
+
+
+@pytest.mark.parametrize(("ok", "code"), [(True, 0), (False, 1)])
+async def test_solis_sync_clock_prints_lines_and_exits_on_the_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], ok: bool, code: int
+) -> None:
+    async def fake_sync(self: object) -> tuple[bool, list[str]]:
+        return ok, ["inverter clock before: 60 min behind Europe/London", "[APPLIED] synced"]
+
+    monkeypatch.setattr(cli.SolisDevice, "sync_clock", fake_sync)
+    assert await cli._cmd_solis_sync_clock(Settings(ha_url="http://ha", ha_token="t")) == code
+    out = capsys.readouterr().out
+    assert "60 min behind" in out and "[APPLIED] synced" in out
+
+
+async def test_solis_sync_clock_refuses_another_inverter(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = Settings(ha_url="http://ha", ha_token="t", inverter="alphaess")
+    assert await cli._cmd_solis_sync_clock(settings) == 2
+    assert "inverter is alphaess" in capsys.readouterr().err

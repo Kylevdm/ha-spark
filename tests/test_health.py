@@ -20,7 +20,9 @@ from ha_spark.health import (
     Status,
     check_entity_config,
     check_ha_rest,
+    check_ha_timezone,
     check_ha_websocket,
+    check_inverter_clock,
     check_load_history,
     check_ollama,
     check_sqlite,
@@ -386,4 +388,121 @@ async def test_ws_probe_auth_reject() -> None:
 async def test_check_ha_websocket_unreachable_fails() -> None:
     # Nothing is listening on port 1 → probe errors → check reports FAIL.
     res = await check_ha_websocket(Settings(ha_url="http://127.0.0.1:1", ha_token="tok"))
+    assert res.status is Status.FAIL
+
+
+# --- household clock and inverter clock (#161) ---
+
+CLOCK = f"{HA}/api/states/sensor.solis_control_inverter_clock"
+
+
+@respx.mock
+async def test_check_ha_timezone_ok_when_it_matches_the_household_clock() -> None:
+    respx.get(f"{HA}/api/config").mock(
+        return_value=httpx.Response(200, json={"time_zone": "Europe/London"})
+    )
+    res = await check_ha_timezone(Settings(ha_url=HA, ha_token="tok"))
+    assert res.status is Status.OK
+
+
+@respx.mock
+async def test_check_ha_timezone_warns_on_a_mismatch() -> None:
+    respx.get(f"{HA}/api/config").mock(
+        return_value=httpx.Response(200, json={"time_zone": "UTC"})
+    )
+    res = await check_ha_timezone(Settings(ha_url=HA, ha_token="tok"))
+    assert res.status is Status.WARN
+    assert "UTC" in res.detail and "Europe/London" in res.detail
+
+
+@respx.mock
+async def test_check_ha_timezone_warns_when_unreadable() -> None:
+    respx.get(f"{HA}/api/config").mock(side_effect=httpx.ConnectError("boom"))
+    res = await check_ha_timezone(Settings(ha_url=HA, ha_token="tok"))
+    assert res.status is Status.WARN
+
+
+# One whole-second instant for both the reading's face and its `last_updated`,
+# as the inverter clock has no sub-second field.
+_READ_AT = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=5)
+
+
+def _clock_state(value: str, age: timedelta = timedelta(seconds=5)) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "entity_id": "sensor.solis_control_inverter_clock",
+            "state": value,
+            "last_updated": (_READ_AT - age + timedelta(seconds=5)).isoformat(),
+        },
+    )
+
+
+def _clock_face(offset: timedelta) -> str:
+    from zoneinfo import ZoneInfo
+
+    face = _READ_AT.astimezone(ZoneInfo("Europe/London")) + offset
+    return f"{face.year % 100},{face.month},{face.day},{face.hour},{face.minute},{face.second}"
+
+
+@respx.mock
+async def test_check_inverter_clock_ok_within_tolerance() -> None:
+    respx.get(CLOCK).mock(return_value=_clock_state(_clock_face(timedelta(seconds=35))))
+    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok"))
+    assert res.status is Status.OK
+    assert "35 s ahead" in res.detail
+
+
+@respx.mock
+async def test_check_inverter_clock_warns_above_tolerance() -> None:
+    respx.get(CLOCK).mock(return_value=_clock_state(_clock_face(timedelta(minutes=-6))))
+    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok"))
+    assert res.status is Status.WARN
+    assert "6 min behind" in res.detail
+    assert "sync-clock" in res.detail
+
+
+@respx.mock
+async def test_check_inverter_clock_fails_at_thirty_minutes() -> None:
+    respx.get(CLOCK).mock(return_value=_clock_state(_clock_face(timedelta(hours=-1))))
+    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok"))
+    assert res.status is Status.FAIL
+    assert "60 min behind" in res.detail
+
+
+@respx.mock
+async def test_check_inverter_clock_warns_when_stale() -> None:
+    respx.get(CLOCK).mock(
+        return_value=_clock_state(_clock_face(timedelta(0)), age=timedelta(minutes=5))
+    )
+    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok"))
+    assert res.status is Status.WARN
+    assert "s old" in res.detail
+
+
+@respx.mock
+async def test_check_inverter_clock_warns_when_unreadable() -> None:
+    respx.get(CLOCK).mock(return_value=_clock_state("unavailable"))
+    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok"))
+    assert res.status is Status.WARN
+    assert "unreadable" in res.detail
+
+
+@respx.mock
+async def test_check_inverter_clock_warns_when_the_entity_is_missing() -> None:
+    respx.get(CLOCK).mock(return_value=httpx.Response(404))
+    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok"))
+    assert res.status is Status.WARN
+    assert "overlay" in res.detail
+
+
+def test_inverter_clock_failure_is_not_critical() -> None:
+    assert exit_code([_r("Inverter clock", Status.FAIL)]) == 2
+
+
+@respx.mock
+async def test_check_inverter_clock_fails_at_thirty_minutes_whatever_the_tolerance() -> None:
+    respx.get(CLOCK).mock(return_value=_clock_state(_clock_face(timedelta(minutes=30))))
+    settings = Settings(ha_url=HA, ha_token="tok", inverter_clock_tolerance_minutes=29.9)
+    res = await check_inverter_clock(settings)
     assert res.status is Status.FAIL

@@ -13,7 +13,7 @@ from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
 
-ExportTransition = Literal["accepted", "started", "cleanup", "aborted"]
+ExportTransition = Literal["accepted", "started", "cleanup", "clock", "aborted"]
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,7 @@ def make_notice(
     reason: str | None = None,
     safe_state: str | None = None,
 ) -> ExportNotice:
-    """Build the four notices in the supervised-export operator contract."""
+    """Build the notices in the supervised-export operator contract."""
     window = _window(start, end)
     if transition == "accepted":
         planned = "unknown" if planned_export_kw is None else f"{planned_export_kw:g} kW"
@@ -81,6 +81,13 @@ def make_notice(
         message = (
             f"Verified Axle export cleanup for {window}: the resident timed export "
             "window was cleared and read back."
+        )
+    elif transition == "clock":
+        title = "Axle export held: inverter clock"
+        message = (
+            f"Not arming the Axle export for {window}: {reason or 'inverter clock unchecked'}. "
+            "ha-spark retries every pass and arms once the clock agrees; the event is "
+            "missed if it is not corrected before the event ends."
         )
     else:
         title = "Axle export aborted"
