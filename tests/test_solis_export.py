@@ -73,9 +73,23 @@ def _intent(
     )
 
 
+CLOCK = "sensor.solis_control_inverter_clock"
+
+
+def _clock_face(at: datetime, offset: timedelta = timedelta(0), zone: ZoneInfo = _LONDON) -> str:
+    face = at.astimezone(zone) + offset
+    return f"{face.year % 100},{face.month},{face.day},{face.hour},{face.minute},{face.second}"
+
+
 class FakeRest:
     def __init__(self, *, power: str = "On", work_mode: str = "35") -> None:
         self.calls: list[tuple[str, str, dict[str, object]]] = []
+        # The inverter clock reads the household clock, freshly, unless a test
+        # sets `clock_offset`, `clock_age` or `clock_state`.
+        self.clock_offset = timedelta(0)
+        self.clock_age = timedelta(seconds=5)
+        self.clock_state: str | None = None
+        self.clock_zone = _LONDON
         self.states: dict[str, str] = {
             "select.solisac_power_switch": power,
             "sensor.solis_control_work_mode_bitfield": work_mode,
@@ -99,6 +113,10 @@ class FakeRest:
                 self.states[f"sensor.solis_control_{field}{suffix}"] = "0"
 
     async def get_state(self, entity_id: str) -> EntityState:
+        if entity_id == CLOCK:
+            read_at = datetime.now(UTC) - self.clock_age
+            state = self.clock_state or _clock_face(read_at, self.clock_offset, self.clock_zone)
+            return EntityState(entity_id=entity_id, state=state, last_updated=read_at)
         return EntityState(entity_id=entity_id, state=self.states[entity_id], attributes={})
 
     async def call_service(
@@ -518,6 +536,7 @@ async def test_export_registers_follow_the_configured_timezone(tmp_path) -> None
     """A non-UTC household clock shifts the programmed window, not the identity."""
     rest = FakeRest()
     kolkata = ZoneInfo("Asia/Kolkata")
+    rest.clock_zone = kolkata
     export = _export(tz=ZoneInfo("UTC"))  # a whole UTC hour, so :30 in IST
     device = _device(rest, tmp_path, timezone="Asia/Kolkata")  # UTC+5:30, no DST
 
@@ -762,3 +781,168 @@ def test_an_event_in_the_fall_back_repeated_hour_is_refused_not_armed() -> None:
 
     assert now.astimezone(UTC) < start.astimezone(UTC)  # the event is genuinely ahead
     assert _export_not_yet_armed((start, end), now) is not None
+
+
+# --- inverter clock gate (#161) ---
+
+
+def _export_blocks(rest: FakeRest) -> list[list[int]]:
+    return [
+        call[2]["value"]  # type: ignore[misc]
+        for call in rest.calls
+        if call[0:2] == ("modbus", "write_register")
+        and call[2]["address"] == 43143
+        and call[2]["value"][4:] != [0, 0, 0, 0]  # type: ignore[index]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_export_is_armed_on_a_clock_within_tolerance(tmp_path) -> None:
+    rest = FakeRest()
+    rest.clock_offset = timedelta(minutes=4)
+    await _device(rest, tmp_path).apply(_intent(_export()))
+
+    assert len(_export_blocks(rest)) == 1
+
+
+@pytest.mark.asyncio
+async def test_export_is_refused_on_a_clock_outside_tolerance(tmp_path) -> None:
+    rest = FakeRest()
+    rest.clock_offset = timedelta(hours=-1)
+    lines = await _device(rest, tmp_path).apply(_intent(_export()))
+
+    assert _export_blocks(rest) == []
+    assert any(
+        line.startswith("[BLOCKED] export refused: inverter clock is 60 min behind")
+        for line in lines
+    )
+
+
+@pytest.mark.asyncio
+async def test_export_is_refused_on_a_stale_clock_reading(tmp_path) -> None:
+    rest = FakeRest()
+    rest.clock_age = timedelta(seconds=90)
+    lines = await _device(rest, tmp_path).apply(_intent(_export()))
+
+    assert _export_blocks(rest) == []
+    assert any("inverter clock reading is 90 s old" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_export_is_refused_on_an_unreadable_clock(tmp_path) -> None:
+    rest = FakeRest()
+    rest.clock_state = "unavailable"
+    lines = await _device(rest, tmp_path).apply(_intent(_export()))
+
+    assert _export_blocks(rest) == []
+    assert any("export refused: inverter clock unreadable" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_a_bad_clock_leaves_the_charge_path_unchanged(tmp_path) -> None:
+    rest = FakeRest()
+    rest.clock_offset = timedelta(hours=-1)
+    lines = await _device(rest, tmp_path).apply(_intent(_export()))
+
+    assert any(line.startswith("[APPLIED] set charge window 23:30-05:30") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_the_clock_gates_arming_only_not_a_verified_resident_window(tmp_path) -> None:
+    """A stale or unreadable blip mid-event must not clear a paid export (#161)."""
+    rest = FakeRest()
+    device = _device(rest, tmp_path)
+    export = _export()
+    await device.apply(_intent(export))
+    assert len(_export_blocks(rest)) == 1
+
+    rest.clock_state = "unavailable"
+    rest.calls.clear()
+    lines = await device.apply(_intent(export))
+
+    assert not any("inverter clock" in line for line in lines)
+    assert rest.states["sensor.solis_control_timed_discharge_start_hours"] == str(
+        export.window_start.hour
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_clock_refusal_notifies_once_and_is_not_an_abort(tmp_path) -> None:
+    rest = FakeRest()
+    rest.clock_offset = timedelta(hours=-1)
+    device = _device(rest, tmp_path, notify_service="mobile_app_phone")
+
+    await device.apply(_intent(_export()))
+    await device.apply(_intent(_export()))
+
+    notifications = [call[2] for call in rest.calls if call[0:2] == ("notify", "mobile_app_phone")]
+    assert len(notifications) == 1
+    assert notifications[0]["title"] == "Axle export held: inverter clock"
+    assert "60 min behind" in str(notifications[0]["message"])
+    assert "sync-clock" in str(notifications[0]["message"])
+
+
+@pytest.mark.asyncio
+async def test_simulate_takes_the_same_clock_decision(tmp_path) -> None:
+    """A read, not a write: the rehearsal must refuse what `on` would refuse."""
+    rest = FakeRest()
+    rest.clock_state = "unavailable"
+    settings = Settings(
+        proactive_mode="simulate",
+        db_path=str(tmp_path / "events.db"),
+        inverter_power_switch_entity="select.solisac_power_switch",
+    )
+    lines = await SolisDevice(settings.devices[0], settings, rest).apply(  # type: ignore[arg-type]
+        _intent(_export())
+    )
+
+    assert any("export refused: inverter clock unreadable" in line for line in lines)
+    assert not any(call[0] in {"modbus", "select"} for call in rest.calls)
+
+
+class _SlotReadFailsOnce(FakeRest):
+    """The first Slot 1 read after arming fails, as on a REST or modbus blip."""
+
+    fail_next_slot_read = False
+
+    async def get_state(self, entity_id: str) -> EntityState:
+        if self.fail_next_slot_read and entity_id.startswith(
+            "sensor.solis_control_timed_discharge_start_hours"
+        ) and not entity_id.endswith(("_2", "_3")):
+            self.fail_next_slot_read = False
+            raise RuntimeError("blip")
+        return await super().get_state(entity_id)
+
+
+@pytest.mark.asyncio
+async def test_a_slot_read_blip_with_a_bad_clock_never_clears_a_verified_export(
+    tmp_path,
+) -> None:
+    rest = _SlotReadFailsOnce()
+    device = _device(rest, tmp_path)
+    export = _export()
+    await device.apply(_intent(export))
+
+    rest.clock_state = "unavailable"
+    rest.fail_next_slot_read = True
+    lines = await device.apply(_intent(export))
+
+    assert not any("inverter clock" in line for line in lines)
+    assert rest.states["sensor.solis_control_timed_discharge_start_hours"] == str(
+        export.window_start.hour
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_overlapping_hold_is_reported_before_the_clock(tmp_path) -> None:
+    """A terminal refusal must not be masked by the retryable clock notice."""
+    rest = FakeRest()
+    rest.clock_offset = timedelta(hours=-1)
+    export = _export()
+    intent = replace(
+        _intent(export), holds=((export.window_start, export.window_start + timedelta(hours=1)),)
+    )
+    lines = await _device(rest, tmp_path).apply(intent)
+
+    assert any("a dispatch hold overlaps the export window" in line for line in lines)
+    assert not any("inverter clock" in line for line in lines)

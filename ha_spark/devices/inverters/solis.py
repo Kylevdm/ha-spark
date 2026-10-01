@@ -22,7 +22,9 @@ Slot windows carry a clock face and no date, so an export window is only
 programmed once that clock face next comes round *at* its own event (#144).
 Until then the event is deferred and re-offered each tick; without this, an
 Axle event with a day's notice would discharge the battery a day early, outside
-the paid window.
+the paid window. The inverter fires that face on its *own* clock, so arming also
+requires a fresh inverter-clock reading that agrees with the household clock
+(#161).
 
 PROACTIVE_MODE + control authority (via ``effective_mode``) gate side effects:
 ``simulate``/``observe`` -> log intended writes only; ``on`` -> real
@@ -41,6 +43,15 @@ from typing import TYPE_CHECKING, TypeVar
 from zoneinfo import ZoneInfo
 
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
+from ha_spark.devices.inverters.solis_clock import (
+    CLOCK_SYNC_REG,
+    STALE_AFTER,
+    clock_entity,
+    clock_error,
+    clock_refusal,
+    clock_registers,
+    describe_error,
+)
 from ha_spark.devices.registry import register
 from ha_spark.energy.export_notifications import (
     ExportNotificationStore,
@@ -54,6 +65,7 @@ from ha_spark.logging import get_logger
 
 if TYPE_CHECKING:  # avoid an import cycle: config imports devices.base at runtime
     from ha_spark.config import DeviceConfig, Settings
+    from ha_spark.ha.models import EntityState
     from ha_spark.ha.rest import HomeAssistantRest
 
 log = get_logger(__name__)
@@ -91,6 +103,9 @@ _READ_BACK_DELAY_SECONDS = 0.1
 _GRID_CHARGE_BIT = 1 << 5
 _EXPORT_CURRENT_A = 62.5
 _EXPORT_CURRENT_RAW = 625
+# A sync is confirmed only when the read-back is this close to the household
+# clock: the write truncates to whole seconds and a poll adds a little latency.
+_CLOCK_SYNC_READ_BACK = timedelta(seconds=10)
 T = TypeVar("T")
 
 
@@ -192,6 +207,10 @@ class SolisDevice:
                 export_error, kept_discharge = await self._untrusted_holds_export(
                     export, mode, now
                 )
+            # After the hold checks, so a terminal refusal is never reported
+            # as the retryable clock hold. A read, so `simulate` takes it too.
+            if export_error is None and mode in ("on", "simulate"):
+                export_error = await self._clock_refusal(raw_export, export, now, tz)
             if mode == "on" and export_error is None:
                 export_error = await self._require_power_switch_on()
             if export_error is not None:
@@ -716,6 +735,104 @@ class SolisDevice:
                 return f"{refusal}; keeping the verified window already in Slot 1", resident
         return refusal, None
 
+    async def _clock_refusal(
+        self,
+        raw_export: object,
+        export: tuple[datetime, datetime],
+        now: datetime,
+        tz: ZoneInfo,
+    ) -> str | None:
+        """Refuse to *arm* an export window on a clock ha-spark cannot vouch for (#161).
+
+        Gates arming only. A window already verified and recorded passed this
+        check when it was armed, and a clock cannot drift minutes within one
+        event, so a stale or unreadable blip mid-event must not clear a paid
+        export (the same reasoning as #148). The runbook's abort covers the rest.
+        Judged on the durable record alone, not a Slot 1 read: that read shares
+        the hub with the clock sensor, so both can fail on the same blip.
+        """
+        start, end = export
+        store = ExportEventStore(self._settings.db_path)
+        if store.exists:
+            async with store:
+                record = await store.load()
+            if (
+                record is not None
+                and record[0] == _export_identity(raw_export, start, end)
+                and record[1] > now.astimezone(UTC)
+            ):
+                return None
+        try:
+            state = await self._rest.get_state(clock_entity(self._hub))
+        except Exception:  # noqa: BLE001 - unreadable is refused below
+            state = None
+        tolerance = timedelta(minutes=self._settings.inverter_clock_tolerance_minutes)
+        return clock_refusal(state, now, tz, tolerance)
+
+    async def sync_clock(self) -> tuple[bool, list[str]]:
+        """Set the inverter clock from the household clock and confirm it (#161).
+
+        Operator-run (``python -m ha_spark solis sync-clock``); ha-spark never
+        calls this on its own. Writes the six-register block at 43000 whatever
+        the error beforehand, then refreshes the clock sensor and reads it back.
+        Returns whether the sync was confirmed and lines reporting the error
+        before and after. Outside ``on`` nothing is written and it is not a
+        success, so the runbook step cannot pass by accident in ``simulate``.
+        """
+        from ha_spark.energy.forecast import load_timezone  # import cycle, see apply
+
+        tz = load_timezone(self._settings.timezone)
+        desc = f"sync inverter clock to {self._settings.timezone}"
+        entity = clock_entity(self._hub)
+        try:
+            before = clock_error(await self._rest.get_state(entity), tz)
+        except Exception:  # noqa: BLE001 - reported, and synced regardless
+            before = None
+        zone = self._settings.timezone
+        before_text = "unreadable" if before is None else f"{describe_error(before)} {zone}"
+        lines = [f"inverter clock before: {before_text}"]
+        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        if mode != "on":
+            lines.append(f"[{mode.upper()}] would {desc}; not written (mode is {mode})")
+            return False, lines
+
+        after: list[timedelta] = []  # the confirming reading, kept for the report
+
+        def confirmed(state: EntityState) -> bool:
+            error = clock_error(state, tz)
+            ok = (
+                error is not None
+                and state.last_updated is not None
+                and datetime.now(UTC) - state.last_updated <= STALE_AFTER
+                and abs(error) <= _CLOCK_SYNC_READ_BACK
+            )
+            if ok and error is not None:
+                after.append(error)
+            return ok
+
+        def describe(state: EntityState) -> str:
+            error = clock_error(state, tz)
+            return "read back unreadable" if error is None else f"read back {describe_error(error)}"
+
+        try:
+            await self._write_register(CLOCK_SYNC_REG, clock_registers(datetime.now(UTC), tz))
+            mismatch = await self._verify_read_back(
+                lambda: self._rest.get_state(entity),
+                confirmed,
+                describe,
+                refresh_entities=(entity,),
+            )
+        except Exception:  # noqa: BLE001 - isolate this action's failure
+            log.error("[FAILED] %s", desc)
+            lines.append(f"[FAILED] {desc}")
+            return False, lines
+        if mismatch:
+            log.warning("[WARNING] %s, but %s", desc, mismatch)
+            lines.append(f"[WARNING] {desc}, but {mismatch}")
+            return False, lines
+        lines.append(f"[APPLIED] {desc} (now {describe_error(after[-1])})")
+        return True, lines
+
     async def _require_power_switch_on(self) -> str | None:
         entity = self._config.entities.get("power_switch", "")
         if not entity:
@@ -823,6 +940,15 @@ class SolisDevice:
                     service,
                     make_notice("started", event_id, start, end),
                 )
+            return
+        if export_error is not None and "inverter clock" in export_error:
+            # Retryable, not an abort: a sync before the event lets it arm.
+            await send_once(
+                store,
+                self._rest,
+                service,
+                make_notice("clock", event_id, start, end, reason=export_error),
+            )
             return
         if export_error is None or any(
             retryable in export_error

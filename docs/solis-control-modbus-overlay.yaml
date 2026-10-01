@@ -44,6 +44,23 @@ modbus:
         data_type: uint16
         scan_interval: 5
 
+      # --- Inverter clock (#161): input registers 33022..33027 (yy, mm, dd,
+      # hh, mi, ss) in ONE transaction, so a read can never mix values from
+      # either side of midnight. HA renders the state as "26,9,28,14,3,0".
+      # ha-spark refuses to arm an export window when this clock disagrees with
+      # the household clock, or when the reading is over 60 s old, so keep the
+      # scan_interval well under 60 s. `python -m ha_spark solis sync-clock`
+      # writes holding register 43000 (same six fields) and reads back here.
+      # Register map from solax-modbus plugin_solis.py (`rtc`, `sync_rtc`);
+      # no Solis-published source.
+      - name: Solis Control Inverter Clock
+        address: 33022
+        input_type: input
+        data_type: custom
+        count: 6
+        structure: ">6H"
+        scan_interval: 30
+
       # --- TIMED-SLOT registers ha-spark drives (add these to the #90 hub) ---
       # Charge current: DC amps, register scaled x10 (raw 600 == 60.0 A).
       - name: Solis Control Timed Charge Current
