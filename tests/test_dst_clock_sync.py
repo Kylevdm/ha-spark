@@ -9,20 +9,22 @@ import pytest
 
 from ha_spark.config import Settings
 from ha_spark.devices.base import ControlAuthority
-from ha_spark.energy.dst_clock_sync import DstClockSync
+from ha_spark.energy.dst_clock_sync import DstClockSync, last_clock_change
 from ha_spark.ha.models import EntityState
 
 _LONDON = ZoneInfo("Europe/London")
 # 25 Oct 2026: BST ends at 02:00 BST (01:00 UTC).
-BEFORE = datetime(2026, 10, 25, 0, 59, tzinfo=UTC).astimezone(_LONDON)
-AFTER = datetime(2026, 10, 25, 1, 0, tzinfo=UTC).astimezone(_LONDON)
+CHANGE = datetime(2026, 10, 25, 1, 0, tzinfo=UTC)
 
 
-def _after(minutes: int) -> datetime:
-    """Step in UTC: adding a timedelta to an aware datetime drops `fold`, which
-    would put a fall-back-night 01:01 back on BST. The daemon's `now` is always
-    a fresh `datetime.now(tz)`, so this only matters to the test."""
-    return (AFTER.astimezone(UTC) + timedelta(minutes=minutes)).astimezone(_LONDON)
+def _at(minutes: float) -> datetime:
+    """Household time ``minutes`` after the change, stepped in UTC.
+
+    Adding a timedelta to an aware datetime drops ``fold``, which would put a
+    fall-back-night 01:01 back on BST. The daemon's ``now`` is always a fresh
+    ``datetime.now(tz)``, so this only matters to the test.
+    """
+    return (CHANGE + timedelta(minutes=minutes)).astimezone(_LONDON)
 
 
 class FakeRest:
@@ -66,70 +68,77 @@ def _settings(mode: str = "on") -> Settings:
     )
 
 
-def test_the_first_observation_is_not_a_change() -> None:
-    sync = DstClockSync()
-    assert sync.observe(AFTER) is False
+# --- detection: stateless, from the zone rules alone ---
 
 
-def test_an_unchanged_offset_is_not_a_change() -> None:
-    sync = DstClockSync()
-    sync.observe(BEFORE - timedelta(hours=3))
-    assert sync.observe(BEFORE) is False
+def test_the_change_instant_is_found_to_the_second() -> None:
+    assert last_clock_change(_at(5)) == CHANGE
 
 
-def test_an_offset_change_makes_a_sync_due() -> None:
-    sync = DstClockSync()
-    sync.observe(BEFORE)
-    assert sync.observe(AFTER) is True
+def test_the_spring_change_is_found_too() -> None:
+    spring = datetime(2026, 3, 29, 1, 0, tzinfo=UTC)
+    now = (spring + timedelta(minutes=1)).astimezone(_LONDON)
+    assert last_clock_change(now) == spring
+
+
+def test_no_change_in_the_lookback_is_none() -> None:
+    assert last_clock_change(_at(-1)) is None
+    assert last_clock_change(datetime(2026, 7, 1, 12, 0, tzinfo=_LONDON)) is None
+
+
+def test_the_lookback_is_six_hours() -> None:
+    assert last_clock_change(_at(6 * 60 - 1)) == CHANGE
+    assert last_clock_change(_at(6 * 60)) is None
+
+
+def test_a_fresh_process_after_the_change_still_finds_it() -> None:
+    """A restart across the change must not skip the sync."""
+    assert DstClockSync().due(_at(20)) == CHANGE
+
+
+# --- the sync ---
 
 
 async def test_a_due_sync_writes_reads_back_and_notifies_before_and_after() -> None:
     rest = FakeRest()
     sync = DstClockSync()
-    sync.observe(BEFORE)
-    sync.observe(AFTER)
 
-    await sync.run(_settings(), rest, AFTER)  # type: ignore[arg-type]
+    await sync.run(_settings(), rest, _at(0))  # type: ignore[arg-type]
 
     assert len(rest.writes()) == 1
     (notice,) = rest.notices()
     assert notice["title"] == "Inverter clock synced at the clock change"
     assert "before: 60 min ahead" in str(notice["message"])
     assert "now 0 s ahead" in str(notice["message"])
-    assert sync.observe(_after(1)) is False
+    assert sync.due(_at(1)) is None
 
 
-async def test_a_failing_sync_retries_each_pass_and_notifies_once_after_30_minutes(
+async def test_a_failing_sync_retries_each_pass_notifies_once_and_stops_after_the_lookback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
     rest = FakeRest(takes_write=False)
     sync = DstClockSync()
-    sync.observe(BEFORE)
-    sync.observe(AFTER)
 
-    for minute in range(0, 32):
-        now = _after(minute)
-        assert sync.observe(now) is True
-        await sync.run(_settings(), rest, now)  # type: ignore[arg-type]
+    for minute in range(0, 6 * 60 + 5):
+        await sync.run(_settings(), rest, _at(minute))  # type: ignore[arg-type]
 
-    assert len(rest.writes()) == 32
+    assert len(rest.writes()) == 6 * 60
     (notice,) = rest.notices()
     assert notice["title"] == "Inverter clock sync failing"
     assert "since the clock change" in str(notice["message"])
 
 
-async def test_a_retry_that_succeeds_clears_the_pending_sync() -> None:
+async def test_a_retry_that_succeeds_is_not_repeated() -> None:
     rest = FakeRest(takes_write=False)
     sync = DstClockSync()
-    sync.observe(BEFORE)
-    sync.observe(AFTER)
-    await sync.run(_settings(), rest, AFTER)  # type: ignore[arg-type]
+    await sync.run(_settings(), rest, _at(0))  # type: ignore[arg-type]
 
     rest.takes_write = True
-    await sync.run(_settings(), rest, _after(1))  # type: ignore[arg-type]
+    await sync.run(_settings(), rest, _at(1))  # type: ignore[arg-type]
+    await sync.run(_settings(), rest, _at(2))  # type: ignore[arg-type]
 
-    assert sync.observe(_after(2)) is False
+    assert len(rest.writes()) == 2
     assert [n["title"] for n in rest.notices()] == ["Inverter clock synced at the clock change"]
 
 
@@ -139,16 +148,24 @@ async def test_outside_on_it_logs_would_sync_once_and_writes_nothing(
 ) -> None:
     rest = FakeRest()
     sync = DstClockSync()
-    sync.observe(BEFORE)
-    sync.observe(AFTER)
 
     with caplog.at_level("INFO"):
-        await sync.run(_settings(mode), rest, AFTER)  # type: ignore[arg-type]
+        for minute in range(3):
+            await sync.run(_settings(mode), rest, _at(minute))  # type: ignore[arg-type]
 
     assert rest.writes() == []
     assert rest.notices() == []
-    assert "would sync inverter clock" in caplog.text
-    assert sync.observe(_after(1)) is False
+    assert caplog.text.count("would sync inverter clock") == 1
+
+
+async def test_switching_to_on_within_the_lookback_still_syncs() -> None:
+    rest = FakeRest()
+    sync = DstClockSync()
+    await sync.run(_settings("simulate"), rest, _at(0))  # type: ignore[arg-type]
+
+    await sync.run(_settings("on"), rest, _at(10))  # type: ignore[arg-type]
+
+    assert len(rest.writes()) == 1
 
 
 async def test_without_control_authority_it_never_writes() -> None:
@@ -156,11 +173,8 @@ async def test_without_control_authority_it_never_writes() -> None:
     settings = _settings()
     observe = {"control": ControlAuthority.OBSERVE}
     settings.devices[0] = settings.devices[0].model_copy(update=observe)
-    sync = DstClockSync()
-    sync.observe(BEFORE)
-    sync.observe(AFTER)
 
-    await sync.run(settings, rest, AFTER)  # type: ignore[arg-type]
+    await DstClockSync().run(settings, rest, _at(0))  # type: ignore[arg-type]
 
     assert rest.writes() == []
 

@@ -8,11 +8,13 @@
   `inverter_clock_dst_sync` option (default off), the first per-minute pass
   after the household zone's UTC offset changes runs the same write and
   read-back as `ha-spark solis sync-clock`, whatever the error beforehand. It
-  writes only in `on` with control authority; `simulate` logs "would sync". A
-  failed sync retries each minute and notifies once after 30 minutes. Success
-  notifies with the error before and after. Drift is never corrected
-  automatically. The last offset is held in memory, so a process that is down
-  across the change does not sync; `health` and the export gate still catch it.
+  writes only in `on` with control authority; `simulate` logs "would sync". The
+  change is found from the zone rules within a six-hour lookback, not from
+  memory, so a restart across the change still syncs, a `timezone` change is
+  never mistaken for one, and switching to `on` within the lookback still syncs.
+  A failed sync retries each minute until the lookback ends and notifies once
+  after 30 minutes. Success notifies with the error before and after. Drift is
+  never corrected automatically.
 
 ## 0.18.0
 

@@ -684,7 +684,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                     last_signal_at = now
                 except Exception:
                     log.exception("Signal sampling failed; will retry next tick")
-            if settings.inverter_clock_dst_sync and clock_sync.observe(now):
+            if settings.inverter_clock_dst_sync and clock_sync.due(now) is not None:
                 try:
                     async with HomeAssistantRest(
                         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
