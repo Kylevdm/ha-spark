@@ -28,6 +28,9 @@ first failed observation enters pending failure — new SoC-based programming
 and charge-rate increases are blocked while valid supply-guard reductions
 remain available — and consecutive failures are counted toward the configured
 fallback-entry threshold (`soc_failure_threshold`, default 3).
+
+With `inverter_clock_dst_sync` on, the first tick after the household zone's
+UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
 """
 
 from __future__ import annotations
@@ -59,6 +62,7 @@ from ha_spark.energy.derived_base_load import (
     derive_specs_from_settings,
     rerive_trailing_window,
 )
+from ha_spark.energy.dst_clock_sync import DstClockSync
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, PlannerInputs
@@ -591,6 +595,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     target_w: float | None = None
     last_signal_at: datetime | None = None
     monitor = SocMonitor.load(settings)
+    clock_sync = DstClockSync()
     try:
         while True:
             settings = state.settings  # hot-reloaded by POST /api/config
@@ -679,6 +684,14 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                     last_signal_at = now
                 except Exception:
                     log.exception("Signal sampling failed; will retry next tick")
+            if settings.inverter_clock_dst_sync and clock_sync.due(now) is not None:
+                try:
+                    async with HomeAssistantRest(
+                        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+                    ) as rest:
+                        await clock_sync.run(settings, rest, now)
+                except Exception:
+                    log.exception("Clock-change sync failed; will retry next tick")
             if settings.v2l_power_entity:
                 try:
                     await run_v2l_tick(settings, now)

@@ -40,6 +40,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `solis_control_hub` | Name of the thin HA `modbus:` overlay hub ha-spark drives the Solis timed-slot registers through (default `solis_control`; see `docs/solis-control-modbus-overlay.yaml`) |
 | `solis_modbus_slave` | Modbus slave/unit id on that hub (default `1`) |
 | `inverter_clock_tolerance_minutes` | How far the Solis inverter clock may drift from the household clock (`timezone`) before ha-spark refuses to arm an export window and `health` warns (default `5`). Fix drift with `python -m ha_spark solis sync-clock` |
+| `inverter_clock_dst_sync` | Opt-in (default `false`): on the first pass after a daylight-saving change, sync the Solis inverter clock from the household clock, as `sync-clock` does. Writes only when `proactive_mode` is `on` with control authority; in `simulate` it logs "would sync". Runs any time in the six hours after the change (so a restart, or switching to `on`, still syncs), retrying each minute; notifies via `notify_service` on success, or if still failing after 30 minutes. Never corrects drift |
 | `alphaess_serial` | AlphaESS system serial (only needed when `inverter: alphaess`) |
 | `person_entities` | Optional comma-separated `person`/`device_tracker` entity ids for occupancy signal recording |
 | `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
@@ -343,7 +344,8 @@ case it sends an "Axle export held: inverter clock" notice and retries each pass
 `ha-spark health` reports the error (a warning above the tolerance, a failure at
 30 minutes or more). `ha-spark solis sync-clock` sets the inverter clock from
 the household clock and reads it back. It writes only when `proactive_mode` is
-`on`, and ha-spark never runs it on its own.
+`on`. ha-spark never runs it on its own, except at a daylight-saving change
+when `inverter_clock_dst_sync` is on.
 
 For paid export, `battery_discharge_ceiling_kw` is the conservative battery
 output used by the planner, while `dno_export_limit_kw` is the installation's
