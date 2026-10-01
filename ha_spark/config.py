@@ -126,6 +126,7 @@ _OPTION_KEYS = frozenset(
         "solis_control_hub",
         "solis_modbus_slave",
         "inverter_clock_tolerance_minutes",
+        "inverter_clock_dst_sync",
         "alphaess_serial",
         # Structured device config (Phase 7): list of controllable devices.
         "devices",
@@ -467,6 +468,8 @@ class Settings(BaseSettings):
     # an export window is refused and `health` warns (#155/#161).
     # Below health's 30-minute failure threshold, so a failure is always refused.
     inverter_clock_tolerance_minutes: float = Field(default=5.0, ge=0.1, lt=30)
+    # Opt-in: sync the inverter clock at each daylight-saving change (#161).
+    inverter_clock_dst_sync: bool = Field(default=False)
     # AlphaESS system serial for the alphaess.setbatterycharge service call.
     alphaess_serial: str = Field(default="")
 

@@ -149,10 +149,10 @@ async def _cmd_solis_sync_clock(settings: Settings) -> int:
         if not isinstance(device, SolisDevice):
             print(f"sync-clock is Solis-only; inverter is {settings.inverter}", file=sys.stderr)
             return 2
-        ok, lines = await device.sync_clock()
+        outcome, lines = await device.sync_clock()
     for line in lines:
         print(line)
-    return 0 if ok else 1
+    return 0 if outcome == "synced" else 1
 
 
 async def _cmd_plan(settings: Settings, *, apply: bool) -> int:

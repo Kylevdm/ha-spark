@@ -59,9 +59,9 @@ def _writes(rest: ClockRest) -> list[dict[str, object]]:
 async def test_sync_writes_the_household_clock_to_43000_and_reads_it_back() -> None:
     rest = ClockRest()
 
-    ok, lines = await _device(rest).sync_clock()
+    outcome, lines = await _device(rest).sync_clock()
 
-    assert ok
+    assert outcome == "synced"
     (write,) = _writes(rest)
     assert write["address"] == 43000
     assert write["hub"] == "solis_control"
@@ -79,9 +79,9 @@ async def test_sync_writes_the_household_clock_to_43000_and_reads_it_back() -> N
 async def test_sync_syncs_whatever_the_error_beforehand() -> None:
     rest = ClockRest(offset=timedelta(0))
 
-    ok, lines = await _device(rest).sync_clock()
+    outcome, lines = await _device(rest).sync_clock()
 
-    assert ok
+    assert outcome == "synced"
     assert len(_writes(rest)) == 1
     assert lines[0] == "inverter clock before: 0 s ahead Europe/London"
 
@@ -96,18 +96,18 @@ async def test_sync_reports_an_unreadable_clock_beforehand_and_still_syncs() -> 
         return await ClockRest.call_service(rest, *args, **kwargs)  # type: ignore[arg-type]
 
     rest.call_service = recover  # type: ignore[method-assign]
-    ok, lines = await device.sync_clock()
+    outcome, lines = await device.sync_clock()
 
-    assert ok
+    assert outcome == "synced"
     assert lines[0] == "inverter clock before: unreadable"
 
 
 async def test_sync_fails_when_the_read_back_still_disagrees() -> None:
     rest = ClockRest(takes_write=False)
 
-    ok, lines = await _device(rest).sync_clock()
+    outcome, lines = await _device(rest).sync_clock()
 
-    assert not ok
+    assert outcome == "failed"
     assert lines[-1].startswith("[WARNING] sync inverter clock to Europe/London")
     assert "60 min behind" in lines[-1]
 
@@ -119,9 +119,9 @@ async def test_sync_fails_when_the_write_raises() -> None:
         raise RuntimeError("modbus down")
 
     rest.call_service = boom  # type: ignore[method-assign]
-    ok, lines = await _device(rest).sync_clock()
+    outcome, lines = await _device(rest).sync_clock()
 
-    assert not ok
+    assert outcome == "failed"
     assert lines[-1] == "[FAILED] sync inverter clock to Europe/London"
 
 
@@ -129,9 +129,9 @@ async def test_sync_fails_when_the_write_raises() -> None:
 async def test_sync_never_writes_unless_proactive_mode_is_on(mode: str) -> None:
     rest = ClockRest()
 
-    ok, lines = await _device(rest, mode=mode).sync_clock()
+    outcome, lines = await _device(rest, mode=mode).sync_clock()
 
-    assert not ok
+    assert outcome == "not_written"
     assert _writes(rest) == []
     assert "not written" in lines[-1]
 
@@ -151,7 +151,7 @@ async def test_a_confirmed_sync_is_not_undone_by_a_later_read_failure() -> None:
         return await original_get(entity_id)
 
     rest.get_state = get_state  # type: ignore[method-assign]
-    ok, lines = await _device(rest).sync_clock()
+    outcome, lines = await _device(rest).sync_clock()
 
-    assert ok
+    assert outcome == "synced"
     assert lines[-1].startswith("[APPLIED]")

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.19.0
+
+- Opt-in daylight-saving clock sync (#161): with the new
+  `inverter_clock_dst_sync` option (default off), the first per-minute pass
+  after the household zone's UTC offset changes runs the same write and
+  read-back as `ha-spark solis sync-clock`, whatever the error beforehand. It
+  writes only in `on` with control authority; `simulate` logs "would sync". The
+  change is found from the zone rules within a six-hour lookback, not from
+  memory, so a restart across the change still syncs, a `timezone` change is
+  never mistaken for one, and switching to `on` within the lookback still syncs.
+  A failed sync retries each minute until the lookback ends and notifies once
+  after 30 minutes. Success notifies with the error before and after. Drift is
+  never corrected automatically.
+
 ## 0.18.0
 
 - Inverter-clock gate (#161): the Solis driver refuses to arm an export
