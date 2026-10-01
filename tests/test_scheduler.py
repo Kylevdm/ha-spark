@@ -2344,3 +2344,52 @@ async def test_run_forever_reapplies_when_a_fallback_pass_relinquishes(
 
     assert previous_seen[0] is None
     assert previous_seen[2] is None
+
+
+@pytest.mark.parametrize(("enabled", "expected"), [(True, 1), (False, 0)])
+async def test_run_forever_syncs_the_inverter_clock_at_a_clock_change_when_opted_in(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, expected: int
+) -> None:
+    """#161: the first pass after the household offset changes runs the sync."""
+    from zoneinfo import ZoneInfo
+
+    from ha_spark.energy.dst_clock_sync import DstClockSync
+
+    london = ZoneInfo("Europe/London")
+    runs: list[datetime] = []
+
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ) -> ChargePlan:
+        return _plan()
+
+    async def record_run(self: DstClockSync, _s: Settings, _rest: object, now: datetime) -> None:
+        runs.append(now)
+        self.pending_since = None
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    monkeypatch.setattr(DstClockSync, "run", record_run)
+    stop = _patch_loop(
+        monkeypatch,
+        [
+            datetime(2026, 10, 25, 0, 59, tzinfo=UTC).astimezone(london),  # BST
+            datetime(2026, 10, 25, 1, 0, tzinfo=UTC).astimezone(london),  # GMT
+            datetime(2026, 10, 25, 1, 1, tzinfo=UTC).astimezone(london),
+        ],
+    )
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", inverter_clock_dst_sync=enabled
+    )
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert len(runs) == expected

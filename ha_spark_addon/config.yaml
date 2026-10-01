@@ -1,6 +1,6 @@
 ---
 name: ha-spark
-version: "0.18.0"
+version: "0.19.0"
 slug: ha_spark_addon
 description: Local-first battery charge planner and automation agent for Home Assistant
 url: https://github.com/Kylevdm/ha-spark
@@ -101,6 +101,7 @@ options:
   solis_control_hub: "solis_control"
   solis_modbus_slave: 1
   inverter_clock_tolerance_minutes: 5.0
+  inverter_clock_dst_sync: false
   alphaess_serial: ""
   devices: []
   outdoor_weather_entity: weather.home
@@ -199,6 +200,7 @@ schema:
   solis_control_hub: str?
   solis_modbus_slave: int
   inverter_clock_tolerance_minutes: float(0.1,29.9)
+  inverter_clock_dst_sync: bool
   alphaess_serial: str?
   devices:
     - id: str
