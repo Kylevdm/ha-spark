@@ -148,6 +148,109 @@ def test_fresh_but_unchanged_value_passes() -> None:
     assert m.ok is True
 
 
+# --- source liveness (#169) -------------------------------------------------
+#
+# Integrations may never re-report an unchanged SoC, so an idle battery's SoC
+# stops being reported. A recent report from a sibling entity of the same
+# source proves the source live; a frozen value from a live source is normal.
+
+
+def _source(
+    state: str = "52.1", *, reported: datetime | str | None = NOW
+) -> EntityState:
+    payload: dict[str, object] = {
+        "entity_id": "sensor.battery_voltage",
+        "state": state,
+        "attributes": {},
+    }
+    if reported is not None:
+        payload["last_reported"] = reported
+    return EntityState.model_validate(payload)
+
+
+def _check_with_source(state: EntityState, source: EntityState | None) -> object:
+    return check_soc(state, observed_at=NOW, max_age=MAX_AGE, source=source)
+
+
+def test_unchanged_soc_from_a_live_source_passes() -> None:
+    m = _check_with_source(
+        _state("76", reported=NOW - timedelta(minutes=38)),
+        _source(reported=NOW - timedelta(seconds=3)),
+    )
+    assert m.ok is True
+    assert m.soc_now == 76.0
+    assert m.age_s == pytest.approx(38 * 60)
+    assert m.source_age_s == pytest.approx(3.0)
+    assert "unchanged" in m.reason
+    assert "source live" in m.reason
+
+
+def test_live_source_cannot_vouch_past_the_unchanged_ceiling() -> None:
+    m = _check_with_source(
+        _state("76", reported=NOW - timedelta(hours=12, seconds=1)),
+        _source(reported=NOW),
+    )
+    assert m.status is SocStatus.UNCHANGED_TOO_LONG
+    assert m.soc_now == 0.0
+    assert "despite a live source" in m.reason
+
+
+def test_unchanged_ceiling_boundary_passes() -> None:
+    m = _check_with_source(
+        _state("100", reported=NOW - timedelta(hours=12)), _source(reported=NOW)
+    )
+    assert m.ok is True
+
+
+def test_stale_source_proves_nothing() -> None:
+    m = _check_with_source(
+        _state("76", reported=NOW - timedelta(minutes=11)),
+        _source(reported=NOW - timedelta(minutes=10, seconds=1)),
+    )
+    assert m.status is SocStatus.STALE
+
+
+@pytest.mark.parametrize("raw", ["unavailable", "unknown", ""])
+def test_unavailable_source_proves_nothing(raw: str) -> None:
+    m = _check_with_source(
+        _state("76", reported=NOW - timedelta(minutes=11)), _source(raw)
+    )
+    assert m.status is SocStatus.STALE
+
+
+@pytest.mark.parametrize(
+    "reported", [None, "garbage", "2026-09-09T12:00:00", NOW + timedelta(seconds=1)]
+)
+def test_source_with_unusable_report_time_proves_nothing(
+    reported: datetime | str | None,
+) -> None:
+    m = _check_with_source(
+        _state("76", reported=NOW - timedelta(minutes=11)), _source(reported=reported)
+    )
+    assert m.status is SocStatus.STALE
+
+
+def test_missing_source_keeps_the_own_report_rule() -> None:
+    m = _check_with_source(_state("76", reported=NOW - timedelta(minutes=11)), None)
+    assert m.status is SocStatus.STALE
+    m = _check_with_source(_state("76", reported=NOW - timedelta(minutes=9)), None)
+    assert m.ok is True
+
+
+def test_source_value_is_never_used() -> None:
+    """Only the source's report time counts; a nonsense value still proves life."""
+    m = _check_with_source(
+        _state("76", reported=NOW - timedelta(minutes=30)), _source("0")
+    )
+    assert m.ok is True
+    assert m.soc_now == 76.0
+
+
+def test_live_source_does_not_rescue_a_bad_value() -> None:
+    m = _check_with_source(_state("unavailable"), _source())
+    assert m.status is SocStatus.UNAVAILABLE
+
+
 # --- immutability ----------------------------------------------------------
 
 

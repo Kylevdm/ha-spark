@@ -24,9 +24,9 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | Option | What it must be |
 |---|---|
 | `soc_entity` | Battery state of charge (%) |
-| `soc_max_report_age_minutes` | How old Home Assistant's `last_reported` for `soc_entity` may be before the SoC is treated as stale and real charge writes are blocked (default `10.0`) |
+| `soc_max_report_age_minutes` | How old Home Assistant's `last_reported` for `soc_entity` may be before the SoC is treated as stale and real charge writes are blocked (default `10.0`). Some integrations never re-report an unchanged SoC, so an older SoC also counts as fresh if `battery_voltage_entity` (proof the integration is live) reported within this age, for up to 12 hours. Whether the battery is idle is not checked |
 | `soc_failure_threshold` | Consecutive failed SoC observations before the fallback-entry threshold is reached (default `3`). The first failure already blocks new SoC-based programming and charge-rate increases |
-| `battery_voltage_entity` | Battery voltage (V) |
+| `battery_voltage_entity` | Battery voltage (V). Also the liveness signal for the SoC's source, so use the voltage sensor from the same integration as `soc_entity` |
 | `solar_tomorrow_entity` | Solcast "forecast tomorrow" sensor (with `detailedForecast` attribute) |
 | `octopus_rate_entity` | Octopus current electricity rate sensor |
 | `dispatch_entity` | Octopus Intelligent dispatching binary sensor |

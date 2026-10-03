@@ -7,6 +7,13 @@ immutable :class:`SocMeasurement` recording the value (or read failure), the
 integrity verdict, when it was observed, when Home Assistant last reported it,
 the measured age, and the violated threshold.
 
+SoC freshness (#169): integrations may never re-report an unchanged value, so
+an idle battery's SoC stops being reported while its source is perfectly live.
+An unchanged SoC is therefore also fresh when a sibling entity of the same
+source (the battery voltage) reported recently — a frozen value from a live
+source is normal, a frozen source is not — up to a hard ceiling on how long an
+unchanged value is believed at all.
+
 The measurement is the contract: planning and actuation consume the value from
 this exact object rather than re-reading the sensor, so one read can never
 certify a different read. Operating state built on top of it (failure counting,
@@ -29,6 +36,10 @@ _UNAVAILABLE_STATES = frozenset({"unavailable", "unknown", "none", ""})
 _MIN_SOC_PCT = 0.0
 _MAX_SOC_PCT = 100.0
 
+# How long an unchanged SoC is believed even while its source is live: bounds
+# a stuck SoC register on a live integration. Covers a full summer day at 100%.
+MAX_UNCHANGED = timedelta(hours=12)
+
 
 class SocStatus(StrEnum):
     """Why a checked SoC measurement passed or failed."""
@@ -42,6 +53,7 @@ class SocStatus(StrEnum):
     REPORT_TIME_UNUSABLE = "report_time_unusable"
     REPORT_TIME_FUTURE = "report_time_future"
     STALE = "stale"
+    UNCHANGED_TOO_LONG = "unchanged_too_long"
 
 
 @dataclass(frozen=True)
@@ -61,6 +73,7 @@ class SocMeasurement:
     reported_at: datetime | None = None
     age_s: float | None = None  # observed_at - reported_at; negative when future
     max_age_s: float | None = None  # the threshold this measurement was judged against
+    source_age_s: float | None = None  # sibling report age, when it proved the source live
 
     @property
     def ok(self) -> bool:
@@ -77,6 +90,11 @@ class SocMeasurement:
     @property
     def reason(self) -> str:
         """Operator-visible sentence naming the concrete integrity failure."""
+        if self.status is SocStatus.OK and self.source_age_s is not None:
+            return (
+                f"SoC {self.soc_now:.0f}% unchanged for {self.age_s:.0f}s; "
+                f"source live (reported {self.source_age_s:.0f}s ago)"
+            )
         if self.status is SocStatus.OK:
             return f"SoC {self.soc_now:.0f}% reported {self.age_s:.0f}s ago"
         if self.status is SocStatus.READ_FAILED:
@@ -95,6 +113,11 @@ class SocMeasurement:
             return "SoC last_reported is missing or unusable"
         if self.status is SocStatus.REPORT_TIME_FUTURE:
             return f"SoC last_reported is {abs(self.age_s or 0.0):.0f}s in the future"
+        if self.status is SocStatus.UNCHANGED_TOO_LONG:
+            return (
+                f"SoC unchanged for {self.age_s:.0f}s despite a live source, over the "
+                f"{MAX_UNCHANGED.total_seconds():.0f}s maximum"
+            )
         return (
             f"SoC last reported {self.age_s:.0f}s ago, over the "
             f"{self.max_age_s:.0f}s maximum"
@@ -108,6 +131,7 @@ def check_soc(
     *,
     observed_at: datetime,
     max_age: timedelta,
+    source: EntityState | None = None,
 ) -> SocMeasurement:
     """Check one SoC observation and record the verdict with its evidence.
 
@@ -116,6 +140,11 @@ def check_soc(
     solely on the top-level ``last_reported`` timestamp: ``last_updated`` and
     attribute timestamps are never substituted, because an actively reported
     but unchanged SoC must stay usable.
+
+    ``source`` is a sibling entity of the same source (``None`` when not
+    configured or unreadable). Only its ``last_reported`` counts, never its
+    value: a recent report proves the source live, letting an unchanged SoC
+    pass past ``max_age`` up to :data:`MAX_UNCHANGED`.
     """
     max_age_s = max_age.total_seconds()
     if state is None:
@@ -153,6 +182,24 @@ def check_soc(
     fail = replace(fail, reported_at=reported_at, age_s=age_s)
     if age_s < 0:
         return replace(fail, status=SocStatus.REPORT_TIME_FUTURE)
-    if age_s > max_age_s:
+    if age_s <= max_age_s:
+        return replace(fail, status=SocStatus.OK)
+    source_age_s = _live_source_age_s(source, observed_at=observed_at, max_age_s=max_age_s)
+    if source_age_s is None:
         return replace(fail, status=SocStatus.STALE)
-    return replace(fail, status=SocStatus.OK)
+    if age_s > MAX_UNCHANGED.total_seconds():
+        return replace(fail, status=SocStatus.UNCHANGED_TOO_LONG)
+    return replace(fail, status=SocStatus.OK, source_age_s=source_age_s)
+
+
+def _live_source_age_s(
+    source: EntityState | None, *, observed_at: datetime, max_age_s: float
+) -> float | None:
+    """The sibling's report age when it proves the source live, else ``None``."""
+    if source is None or source.state.strip().lower() in _UNAVAILABLE_STATES:
+        return None
+    reported_at = source.last_reported
+    if reported_at is None or reported_at.tzinfo is None:
+        return None
+    age_s = (observed_at - reported_at).total_seconds()
+    return age_s if 0 <= age_s <= max_age_s else None
