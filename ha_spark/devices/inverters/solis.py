@@ -94,10 +94,11 @@ _SLOT_SUFFIX = {1: "", 2: "_2", 3: "_3"}
 # Current register scale: the overlay sensor decodes raw/10 to amps; encode x10.
 _CURRENT_SCALE = 10.0
 # HA's update_entity service is asynchronous with respect to the Modbus
-# overlay sensors. Retry a small, fixed number of times after each write; the
-# bound is deliberately finite so a stale overlay can never hold the caller.
-_READ_BACK_ATTEMPTS = 3
-_READ_BACK_DELAY_SECONDS = 0.1
+# overlay sensors: on live hardware a landed write took ~5.2 s to appear, the
+# overlay's 5 s scan_interval (#164). Observe for up to ~15 s after each write;
+# the bound is deliberately finite so a stale overlay can never hold the caller.
+_READ_BACK_ATTEMPTS = 16
+_READ_BACK_DELAY_SECONDS = 1.0
 # Work-mode bitfield: bit 5 (mask 32) == grid charging permitted. A forced grid
 # charge is refused by firmware when this is unset, so assert it, never write it.
 _GRID_CHARGE_BIT = 1 << 5
@@ -1143,8 +1144,8 @@ class SolisDevice:
         return None
 
     async def _read_back_option(self, entity: str, wanted: str) -> str | None:
-        """Confirm a select took the option, retrying the same bounded few times
-        as every other read-back here.
+        """Confirm a select took the option, within the same bounded read-back
+        window as every other read-back here.
 
         HA's state machine is asynchronous with respect to the overlay, so the
         first read after a write can still carry the old option. Without the
