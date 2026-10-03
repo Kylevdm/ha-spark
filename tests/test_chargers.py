@@ -459,9 +459,46 @@ async def test_current_verification_refreshes_and_retries_after_delayed_update()
     assert line.startswith("[APPLIED]")
 
 
+def _virtual_clock(monkeypatch: pytest.MonkeyPatch) -> dict[str, float]:
+    """Replace the driver's sleep with one that only advances a virtual clock."""
+    clock = {"t": 0.0}
+
+    async def advance(delay: float) -> None:
+        clock["t"] += delay
+
+    monkeypatch.setattr(solis_driver.asyncio, "sleep", advance)
+    return clock
+
+
+def _settles_after(entity_id: str, clock: dict[str, float], seconds: float, old: str, new: str):
+    """Serve ``old`` until the virtual clock reaches ``seconds``, then ``new``."""
+    return respx.get(f"http://ha.test/api/states/{entity_id}").mock(
+        side_effect=lambda _request: httpx.Response(
+            200, json=_state(entity_id, new if clock["t"] >= seconds else old)
+        )
+    )
+
+
 @respx.mock
-async def test_current_verification_is_bounded_when_overlay_stays_stale() -> None:
-    """A stale overlay produces a bounded warning rather than an infinite poll."""
+async def test_current_write_is_confirmed_when_the_overlay_settles_after_five_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#164: on live hardware the overlay showed a landed write ~5.2 s after it."""
+    clock = _virtual_clock(monkeypatch)
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    _settles_after(_sensor("timed_charge_current"), clock, 5.2, "0.0", "40.0")
+    s = _settings(proactive_mode="on")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        line = await _solis_device(s, rest).set_charge_rate(2040.0)
+    assert line.startswith("[APPLIED]")
+
+
+@respx.mock
+async def test_current_verification_is_bounded_when_overlay_stays_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale overlay produces a warning within ~15 s rather than an infinite poll."""
+    clock = _virtual_clock(monkeypatch)
     write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(200, json=[])
     )
@@ -469,13 +506,14 @@ async def test_current_verification_is_bounded_when_overlay_stays_stale() -> Non
         "http://ha.test/api/services/homeassistant/update_entity"
     ).mock(return_value=httpx.Response(200, json=[]))
     s = _settings(proactive_mode="on")
-    _get_seq(_sensor("timed_charge_current"), ["0.0", "0.0", "0.0", "0.0"])
+    _get(_sensor("timed_charge_current"), "0.0")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         line = await _solis_device(s, rest).set_charge_rate(2040.0)
     assert _write_calls(write, 43141) == [400]
     assert refresh.call_count == 1
     assert line.startswith("[WARNING]")
     assert "read back 0 A" in line
+    assert clock["t"] <= 15.0
 
 
 @respx.mock

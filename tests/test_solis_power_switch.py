@@ -26,6 +26,13 @@ from ha_spark.energy.models import ChargeIntent, ExportIntent
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.ha.models import EntityState
 
+
+@pytest.fixture(autouse=True)
+def _skip_read_back_delays(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep bounded read-back retry tests fast without changing production timing."""
+    monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
+
+
 _LONDON = ZoneInfo("Europe/London")
 _SWITCH = "select.solisac_power_switch"
 
