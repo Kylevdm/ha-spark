@@ -292,3 +292,19 @@ def test_soc_failure_threshold_must_be_at_least_one(bad: int) -> None:
 def test_inverter_clock_tolerance_stays_below_the_health_failure_threshold() -> None:
     with pytest.raises(ValidationError):
         Settings(inverter_clock_tolerance_minutes=31)
+
+
+def test_addon_stop_timeout_lets_a_clean_shutdown_verify_its_safe_state() -> None:
+    """#164: a clean shutdown makes two verified Solis writes (power switch, then
+    Slot 1), each observed for up to the full read-back budget. The Supervisor
+    kills the add-on after `timeout` (default 10 s), so it must cover both."""
+    from ha_spark.devices.inverters import solis
+
+    budget_s = solis._READ_BACK_ATTEMPTS * solis._READ_BACK_DELAY_SECONDS
+    timeouts = [
+        int(line.split(":", 1)[1])
+        for line in ADDON_CONFIG.read_text(encoding="utf-8").splitlines()
+        if line.startswith("timeout:")
+    ]
+    assert timeouts, "config.yaml sets no stop timeout; the Supervisor default is 10 s"
+    assert timeouts[0] >= 2 * budget_s + 10

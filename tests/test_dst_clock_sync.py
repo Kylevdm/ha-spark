@@ -12,6 +12,13 @@ from ha_spark.devices.base import ControlAuthority
 from ha_spark.energy.dst_clock_sync import DstClockSync, last_clock_change
 from ha_spark.ha.models import EntityState
 
+
+@pytest.fixture(autouse=True)
+def _skip_read_back_delays(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep bounded read-back retry tests fast without changing production timing."""
+    monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
+
+
 _LONDON = ZoneInfo("Europe/London")
 # 25 Oct 2026: BST ends at 02:00 BST (01:00 UTC).
 CHANGE = datetime(2026, 10, 25, 1, 0, tzinfo=UTC)
