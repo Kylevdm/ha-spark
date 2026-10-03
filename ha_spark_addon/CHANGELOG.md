@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.19.1
+
+- Solis read-back (#164): the driver now watches the overlay for up to ~15 s
+  after each write, instead of ~0.2 s. On live hardware a write that had
+  landed took ~5.2 s to appear (the overlay's 5 s scan interval). Every verified
+  write was therefore reported as failed, the dependent charge-current and
+  window writes were blocked, and Slot 1 could be left with no charge window.
+  A stale overlay still gives up within ~15 s and warns.
+- Add-on stop timeout raised to 45 s, so a clean shutdown can confirm both of
+  its safe-state writes (power switch `On`, Slot 1) before the Supervisor stops
+  the add-on.
+
 ## 0.19.0
 
 - Opt-in daylight-saving clock sync (#161): with the new

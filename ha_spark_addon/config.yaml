@@ -1,6 +1,6 @@
 ---
 name: ha-spark
-version: "0.19.0"
+version: "0.19.1"
 slug: ha_spark_addon
 description: Local-first battery charge planner and automation agent for Home Assistant
 url: https://github.com/Kylevdm/ha-spark
@@ -8,6 +8,9 @@ arch:
   - aarch64
   - amd64
 init: true
+# Stop grace before the Supervisor kills the add-on (default 10 s). A clean
+# shutdown makes two verified Solis writes of up to ~15 s each (#164).
+timeout: 45
 homeassistant_api: true
 startup: services
 boot: auto
