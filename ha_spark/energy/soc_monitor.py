@@ -69,16 +69,28 @@ async def observe_soc(settings: Settings, rest: HomeAssistantRest) -> SocMeasure
     A failed read (HTTP error, missing entity) is a failed measurement, never
     an exception into the caller. The single observation path shared by the
     daemon loop and ``gather_inputs``, so both judge freshness identically.
+
+    The battery-voltage entity, when configured, is read alongside as the SoC
+    source's liveness signal (#169); a failed read simply provides none.
     """
     state: EntityState | None = None
     try:
         state = await rest.get_state(settings.soc_entity)
     except Exception as exc:  # noqa: BLE001 - a dead sensor is evidence, not a crash
         log.warning("SoC monitor: reading %s failed (%s)", settings.soc_entity, exc)
+    source: EntityState | None = None
+    if settings.battery_voltage_entity:
+        try:
+            source = await rest.get_state(settings.battery_voltage_entity)
+        except Exception as exc:  # noqa: BLE001 - no liveness evidence, not a crash
+            log.debug(
+                "SoC monitor: reading %s failed (%s)", settings.battery_voltage_entity, exc
+            )
     return check_soc(
         state,
         observed_at=datetime.now(UTC),
         max_age=timedelta(minutes=settings.soc_max_report_age_minutes),
+        source=source,
     )
 
 
