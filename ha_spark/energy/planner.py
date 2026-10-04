@@ -37,12 +37,14 @@ the battery holds (doesn't discharge) while cheap grid covers the house.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import NamedTuple
 
 from ha_spark.energy.models import (
     ChargeIntent,
     ChargePlan,
     ExportIntent,
     ExportSkip,
+    FlexibilityEvent,
     PlannerConfig,
     PlannerInputs,
     Reservation,
@@ -135,6 +137,111 @@ def _overlaps(
     return start < window[1] and window[0] < end
 
 
+class _EventSlot(NamedTuple):
+    """One complete paid-event slot offered for export."""
+
+    start: datetime
+    solar_kw: float
+    load_kw: float
+
+
+def _select_export_suffix(
+    slots: list[_EventSlot],
+    available: float,
+    cfg: PlannerConfig,
+    schedule: TariffSchedule,
+) -> tuple[list[tuple[_EventSlot, float]], tuple[ExportSkip, ...]]:
+    """Walk an event's complete slots backwards and keep one fundable suffix.
+
+    ``slots`` is in time order, and ``available`` is the battery energy left for
+    export once house load and the post-event reservation are protected.
+    Returns the selected slots with their export power, then the skips, both
+    in time order.
+    """
+    supply_ceiling_kw = max(0.0, cfg.supply_max_current_a * cfg.supply_voltage_v / 1000.0)
+    selected: list[tuple[_EventSlot, float]] = []
+    skips: list[ExportSkip] = []
+    contiguous = True
+    for slot in reversed(slots):
+        start = slot.start
+        end = start + timedelta(minutes=30)
+        unconstrained_export_kw = max(
+            0.0, cfg.battery_discharge_ceiling_kw + slot.solar_kw - slot.load_kw
+        )
+        export_kw = min(
+            cfg.dno_export_limit_kw,
+            supply_ceiling_kw,
+            unconstrained_export_kw,
+        )
+        held = any(_overlaps(start, end, window) for window in schedule.controlled_windows)
+        # House load is already reserved across the entire event, even for a
+        # skipped slot. Selecting this slot only consumes export energy.
+        energy = export_kw * 0.5
+        if held:
+            contiguous = False
+            skips.append(
+                ExportSkip(start, "Skipped paid slot: it overlaps an Octopus dispatch hold.")
+            )
+        elif unconstrained_export_kw > min(cfg.dno_export_limit_kw, supply_ceiling_kw) + 1e-9:
+            contiguous = False
+            skips.append(
+                ExportSkip(
+                    start,
+                    "Skipped paid slot: the fixed discharge command would exceed "
+                    "the DNO or supply limit.",
+                )
+            )
+        elif export_kw <= 1e-9:
+            contiguous = False
+            skips.append(
+                ExportSkip(
+                    start,
+                    "Skipped paid slot: forecast house load leaves no export capacity.",
+                )
+            )
+        elif not contiguous:
+            skips.append(
+                ExportSkip(
+                    start,
+                    "Skipped paid slot: a later slot is unavailable, so one timed "
+                    "window cannot cover it.",
+                )
+            )
+        elif energy > available + 1e-9:
+            contiguous = False
+            skips.append(
+                ExportSkip(
+                    start,
+                    "Skipped paid slot: funding it would consume reserved house "
+                    "or post-event energy.",
+                )
+            )
+        else:
+            selected.append((slot, export_kw))
+            available -= energy
+    selected.reverse()
+    return selected, tuple(reversed(skips))
+
+
+def _export_intent(
+    event: FlexibilityEvent,
+    cfg: PlannerConfig,
+    window_start: datetime,
+    selected: list[tuple[_EventSlot, float]],
+) -> ExportIntent:
+    starts = tuple(slot.start for slot, _ in selected)
+    powers = tuple(power for _, power in selected)
+    return ExportIntent(
+        event_identity=event.identity,
+        window_start=window_start,
+        window_end=starts[-1] + timedelta(minutes=30),
+        planned_export_kw=min(powers),
+        dno_export_limit_kw=cfg.dno_export_limit_kw,
+        selected_slots=starts,
+        slot_export_kw=powers,
+    )
+
+
 def _event_export_plan(
     inputs: PlannerInputs,
     cfg: PlannerConfig,
@@ -223,105 +330,35 @@ def _event_export_plan(
     event_house_energy = sum(net[i] for i in event_slots)
     house_through_event_energy = pre_event_house_energy + event_house_energy
     available = max(0.0, usable_capacity - post_energy - house_through_event_energy)
-    supply_ceiling_kw = max(0.0, cfg.supply_max_current_a * cfg.supply_voltage_v / 1000.0)
-    selected: list[tuple[int, float, float]] = []
-    skips: list[ExportSkip] = []
-    contiguous = True
-    for i in reversed(event_slots):
-        start = inputs.horizon_start + timedelta(minutes=30 * i)
-        end = start + timedelta(minutes=30)
-        solar_kw = (inputs.solar_slots or (0.0,) * len(net))[i] * cfg.solar_haircut_k * 2
-        load_kw = inputs.load_slots[i] * 2 if inputs.load_slots is not None else 0.0
-        unconstrained_export_kw = max(0.0, cfg.battery_discharge_ceiling_kw + solar_kw - load_kw)
-        export_kw = min(
-            cfg.dno_export_limit_kw,
-            supply_ceiling_kw,
-            unconstrained_export_kw,
+    solar_slots = inputs.solar_slots or (0.0,) * len(net)
+    slots = [
+        _EventSlot(
+            inputs.horizon_start + timedelta(minutes=30 * i),
+            solar_slots[i] * cfg.solar_haircut_k * 2,
+            inputs.load_slots[i] * 2 if inputs.load_slots is not None else 0.0,
         )
-        held = any(_overlaps(start, end, window) for window in schedule.controlled_windows)
-        # House load is already reserved across the entire event above, even
-        # for a skipped slot. Selecting this slot only consumes export energy.
-        energy = export_kw * 0.5
-        if held:
-            contiguous = False
-            skips.append(
-                ExportSkip(start, "Skipped paid slot: it overlaps an Octopus dispatch hold.")
-            )
-        elif unconstrained_export_kw > min(cfg.dno_export_limit_kw, supply_ceiling_kw) + 1e-9:
-            contiguous = False
-            skips.append(
-                ExportSkip(
-                    start,
-                    "Skipped paid slot: the fixed discharge command would exceed "
-                    "the DNO or supply limit.",
-                )
-            )
-        elif export_kw <= 1e-9:
-            contiguous = False
-            skips.append(
-                ExportSkip(
-                    start,
-                    "Skipped paid slot: forecast house load leaves no export capacity.",
-                )
-            )
-        elif not contiguous:
-            skips.append(
-                ExportSkip(
-                    start,
-                    "Skipped paid slot: a later slot is unavailable, so one timed "
-                    "window cannot cover it.",
-                )
-            )
-        elif energy > available + 1e-9:
-            contiguous = False
-            skips.append(
-                ExportSkip(
-                    start,
-                    "Skipped paid slot: funding it would consume reserved house "
-                    "or post-event energy.",
-                )
-            )
-        else:
-            selected.append((i, export_kw, energy))
-            available -= energy
-
+        for i in event_slots
+    ]
+    selected, skips = _select_export_suffix(slots, available, cfg, schedule)
     if not selected:
-        return None, (), tuple(reversed(skips))
+        return None, (), skips
 
-    selected.reverse()
-    first, last = selected[0][0], selected[-1][0]
-    selected_starts = tuple(
-        inputs.horizon_start + timedelta(minutes=30 * i) for i, _, _ in selected
-    )
-    powers = tuple(power for _, power, _ in selected)
-    event_energy = house_through_event_energy + sum(energy for _, _, energy in selected)
-    window_end = inputs.horizon_start + timedelta(minutes=30 * (last + 1))
+    export = _export_intent(event, cfg, selected[0][0].start, selected)
+    event_energy = house_through_event_energy + sum(power * 0.5 for _, power in selected)
     event_reservation = Reservation(
         name="axle-export-event",
-        target_slot=last + 1,
+        target_slot=event_slots[slots.index(selected[-1][0])] + 1,
         energy_kwh=event_energy,
         obligation_kind="axle-export-event",
         reason=(
             f"Reserving {event_energy:.2f} kWh for forecast house load before and during "
             "paid Axle export from "
-            f"{(inputs.horizon_start + timedelta(minutes=30 * first)).strftime('%H:%M')} "
-            f"to {window_end.strftime('%H:%M')}, while protecting house load."
+            f"{export.window_start.strftime('%H:%M')} "
+            f"to {export.window_end.strftime('%H:%M')}, while protecting house load."
         ),
-        target_time=window_end,
+        target_time=export.window_end,
     )
-    return (
-        ExportIntent(
-            event_identity=event.identity,
-            window_start=inputs.horizon_start + timedelta(minutes=30 * first),
-            window_end=window_end,
-            planned_export_kw=min(powers),
-            dno_export_limit_kw=cfg.dno_export_limit_kw,
-            selected_slots=selected_starts,
-            slot_export_kw=powers,
-        ),
-        (event_reservation, post),
-        tuple(reversed(skips)),
-    )
+    return export, (event_reservation, post), skips
 
 
 def compute_plan(
