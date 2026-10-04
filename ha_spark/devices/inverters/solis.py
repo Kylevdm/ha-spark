@@ -154,9 +154,12 @@ class SolisDevice:
         # ends, against a state already being corrected.
         lines: list[str] = []
         # SoC-unreadable guard: soc_now==0 from a dead sensor would size a max charge.
-        if mode == "on" and not intent.soc.ok:
+        # Apply this safety decision in every mode; the write helpers below
+        # suppress side effects while simulate reports the block as a preview.
+        if not intent.soc.ok:
+            prefix = "[SIMULATE] " if mode == "simulate" else ""
             line = (
-                f"[BLOCKED] {intent.soc.reason}; not charging to "
+                f"{prefix}[BLOCKED] {intent.soc.reason}; not charging to "
                 f"{intent.target_soc_pct:.0f}%"
             )
             log.warning(line)
@@ -171,12 +174,16 @@ class SolisDevice:
         export_error: str | None = None
         preserve_resident_export = False
         if (
-            mode == "on"
+            mode in ("on", "simulate")
             and raw_export is None
             and not getattr(intent, "export_trusted", True)
             and await self._has_live_verified_export(now)
         ):
-            line = "[SKIP] Axle event read untrusted; preserving the verified export window"
+            prefix = "[SIMULATE] " if mode == "simulate" else ""
+            line = (
+                f"{prefix}[SKIP] Axle event read untrusted; "
+                "preserving the verified export window"
+            )
             log.warning(line)
             return [line]
         export = _export_window(intent, tz)
@@ -193,7 +200,7 @@ class SolisDevice:
             export_error = _validate_export(intent, export)
             if export_error is None:
                 export_error = _export_not_yet_armed(export, now)
-                if export_error is not None and mode == "on":
+                if export_error is not None and mode in ("on", "simulate"):
                     preserve_resident_export = await self._has_matching_live_verified_export(
                         raw_export, export, now
                     )
@@ -213,11 +220,12 @@ class SolisDevice:
             # as the retryable clock hold. A read, so `simulate` takes it too.
             if export_error is None and mode in ("on", "simulate"):
                 export_error = await self._clock_refusal(raw_export, export, now, tz)
-            if mode == "on" and export_error is None:
+            if mode in ("on", "simulate") and export_error is None:
                 export_error = await self._require_power_switch_on()
             if export_error is not None:
                 export_ready = False
-                lines.append(f"[BLOCKED] export refused: {export_error}")
+                prefix = "[SIMULATE] " if mode == "simulate" else ""
+                lines.append(f"{prefix}[BLOCKED] export refused: {export_error}")
             else:
                 discharge_ok, discharge_line = await self._write_discharge_current_result()
                 lines.append(discharge_line)
@@ -227,14 +235,22 @@ class SolisDevice:
                     lines.append("[BLOCKED] export refused: discharge current was not confirmed")
         # Grid-charge gate for the whole forced-charge program: read the work
         # mode once. A real write is refused when bit 5 is unset (firmware would
-        # ignore the force anyway). Non-"on" modes don't read/gate.
-        blocked = await self._assert_grid_charge_allowed() if mode == "on" else None
+        # ignore the force anyway), and simulate must preview the same decision.
+        blocked = (
+            await self._assert_grid_charge_allowed()
+            if mode in ("on", "simulate")
+            else None
+        )
         # Current is the safety prerequisite for slot 1. If an existing window
         # is active at another current, deactivate it and confirm zero before
         # attempting the current transition. This leaves a failed transition
         # safe at zero rather than continuing an old, higher-rate window.
         deactivation_line: str | None = None
-        preserve_line = "[SKIP] preserving the verified export window while it is not yet armed"
+        preserve_prefix = "[SIMULATE] " if mode == "simulate" else ""
+        preserve_line = (
+            f"{preserve_prefix}[SKIP] preserving the verified export window "
+            "while it is not yet armed"
+        )
         if preserve_resident_export:
             current_ok = True
             current_line = preserve_line
@@ -324,12 +340,41 @@ class SolisDevice:
         elif kept_discharge is not None:
             desc += " and keep the verified export window"
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        keeps_discharge = export_window is not None or kept_discharge is not None
+        zero_charge = keeps_discharge and solis_current_a(intent, self._settings) <= 0
         if mode == "simulate":
+            if blocked:
+                if not keeps_discharge:
+                    line = f"[SIMULATE] [BLOCKED] {desc}: {blocked}"
+                    log.warning(line)
+                    return line
+                if not zero_charge:
+                    try:
+                        await self._read_slot_block(1)
+                    except Exception:  # noqa: BLE001 - match the live fail-closed check
+                        line = f"[SIMULATE] [BLOCKED] {desc}: slot 1 state unreadable"
+                        log.warning(line)
+                        return line
+                charge_action = (
+                    "clear the charge schedule"
+                    if zero_charge
+                    else "preserve the resident charge schedule"
+                )
+                if export_window is not None:
+                    export_start, export_end = export_window
+                    export_action = (
+                        f"set export {export_start:%H:%M}-{export_end:%H:%M}"
+                        f" at {_EXPORT_CURRENT_A:g} A"
+                    )
+                else:
+                    export_action = "keep the verified export window"
+                line = f"[SIMULATE] would {charge_action} and {export_action}"
+                log.info(line)
+                return line
             log.info("[SIMULATE] would %s", desc)
             return f"[SIMULATE] would {desc}"
         if mode in ("off", "observe"):
             return f"[{mode.upper()}] computed: {desc}"
-        keeps_discharge = export_window is not None or kept_discharge is not None
         if blocked and not keeps_discharge:
             # Grid-charge permission is not a prerequisite for clearing a
             # resident discharge schedule. Inspect the block first so an
@@ -342,7 +387,6 @@ class SolisDevice:
             if any(existing[4:]):
                 return await self._clear_discharge_window(desc)
             return f"[BLOCKED] {desc}: {blocked}"
-        zero_charge = keeps_discharge and solis_current_a(intent, self._settings) <= 0
         if blocked and keeps_discharge and not zero_charge:
             # An export write must not be gated by the charge-only work-mode
             # bit. Preserve the resident charge half and replace the discharge
@@ -416,9 +460,11 @@ class SolisDevice:
             f"{charge_hours(intent, self._settings):.1f} h of the window"
         )
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
-        if mode == "on" and blocked:
-            log.warning("[BLOCKED] %s: %s", desc, blocked)
-            return False, f"[BLOCKED] {desc}: {blocked}"
+        if blocked and mode in ("on", "simulate"):
+            prefix = "[SIMULATE] " if mode == "simulate" else ""
+            line = f"{prefix}[BLOCKED] {desc}: {blocked}"
+            log.warning(line)
+            return False, line
         return await self._set_current_result(amps, desc)
 
     async def _prepare_slot_one_current(
@@ -717,11 +763,11 @@ class SolisDevice:
         paid window is cleared on every tick the read stays down. Only a window
         ha-spark verified and recorded, and whose end is still ahead, is kept:
         anything else resident stays subject to the usual guard. It is captured
-        here, before the charge-current step can deactivate Slot 1. Outside
-        ``on`` nothing is resident, and an unreadable slot fails closed.
+        here, before the charge-current step can deactivate Slot 1. Simulate
+        reads the same resident state as ``on`` but suppresses its writes.
         """
         refusal = "hold data untrusted; not programming a new export window"
-        if mode != "on":
+        if mode not in ("on", "simulate"):
             return refusal, None
         try:
             resident = (await self._read_slot_block(1))[4:]

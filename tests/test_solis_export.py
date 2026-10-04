@@ -953,3 +953,55 @@ async def test_an_overlapping_hold_is_reported_before_the_clock(tmp_path) -> Non
 
     assert any("a dispatch hold overlaps the export window" in line for line in lines)
     assert not any("inverter clock" in line for line in lines)
+
+
+def _simulate_device(rest: FakeRest, tmp_path) -> SolisDevice:
+    settings = Settings(
+        proactive_mode="simulate",
+        db_path=str(tmp_path / "events.db"),
+        inverter_power_switch_entity="select.solisac_power_switch",
+    )
+    return SolisDevice(settings.devices[0], settings, rest)  # type: ignore[arg-type]
+
+
+def _writes(rest: FakeRest) -> list[tuple[str, str, dict[str, object]]]:
+    return [call for call in rest.calls if call[0] in {"modbus", "select"}]
+
+
+@pytest.mark.asyncio
+async def test_simulate_blocks_an_untrusted_soc_like_on_mode(tmp_path) -> None:
+    """#175: simulate must not preview a max charge sized from a dead SoC sensor."""
+    rest = FakeRest()
+    bad_soc = replace(_soc(), status=SocStatus.UNAVAILABLE, raw_state="unavailable")
+    intent = ChargeIntent(77.0, bad_soc, time(23, 30), time(5, 30))
+
+    lines = await _simulate_device(rest, tmp_path).apply(intent)
+
+    assert lines[0].startswith("[SIMULATE] [BLOCKED]")
+    assert not any("would" in line for line in lines)
+    assert _writes(rest) == []
+
+
+@pytest.mark.asyncio
+async def test_simulate_blocks_charge_when_grid_charging_is_not_permitted(tmp_path) -> None:
+    """#175: bit 5 unset refuses the real write, so simulate previews the refusal."""
+    rest = FakeRest(work_mode="3")
+
+    lines = await _simulate_device(rest, tmp_path).apply(_intent())
+
+    assert any(
+        line.startswith("[SIMULATE] [BLOCKED]") and "grid charging not permitted" in line
+        for line in lines
+    )
+    assert _writes(rest) == []
+
+
+@pytest.mark.asyncio
+async def test_simulate_refuses_export_when_the_power_switch_is_off(tmp_path) -> None:
+    """#175: an Off power switch refuses a real export, so simulate reports that too."""
+    rest = FakeRest(power="Off")
+
+    lines = await _simulate_device(rest, tmp_path).apply(_intent(_export()))
+
+    assert "[SIMULATE] [BLOCKED] export refused: power_switch is 'Off'" in lines
+    assert _writes(rest) == []
