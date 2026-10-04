@@ -19,6 +19,7 @@ from ha_spark.health import (
     CheckResult,
     Status,
     check_entity_config,
+    check_ev_status,
     check_ha_rest,
     check_ha_timezone,
     check_ha_websocket,
@@ -349,6 +350,31 @@ def test_check_entity_config_ok_when_set() -> None:
         )
     )
     assert res.status is Status.OK
+
+
+@pytest.mark.parametrize("state", ["unknown", "unavailable"])
+@respx.mock
+async def test_check_ev_status_warns_when_unreadable(state: str) -> None:
+    respx.get(f"{HA}/api/states/sensor.ev").mock(
+        return_value=httpx.Response(
+            200, json={"entity_id": "sensor.ev", "state": state, "attributes": {}}
+        )
+    )
+
+    result = await check_ev_status(Settings(ha_url=HA, ha_token="t", ev_status_entity="sensor.ev"))
+
+    assert result.status is Status.WARN
+    assert "unreadable" in result.detail
+
+
+@respx.mock
+async def test_check_ev_status_warns_when_entity_is_missing() -> None:
+    respx.get(f"{HA}/api/states/sensor.ev").mock(return_value=httpx.Response(404))
+
+    result = await check_ev_status(Settings(ha_url=HA, ha_token="t", ev_status_entity="sensor.ev"))
+
+    assert result.status is Status.WARN
+    assert "unreadable" in result.detail
 
 
 # --- WebSocket probe + check ---
