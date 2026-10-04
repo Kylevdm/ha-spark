@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Octopus tariff fallback (#176): with dispatch credentials configured, an empty
+  product or tariff code no longer prevents daemon startup; missing live rates
+  fall back to the fixed schedule, matching the health warning.
 - DNO export default (#193): `dno_export_limit_kw` now defaults to 3.68 kW, the
   G98 fit-and-inform limit (16 A single-phase), instead of 7.36 kW. A site
   without G99 approval could otherwise plan export above its legal limit.
