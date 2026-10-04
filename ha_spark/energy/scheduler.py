@@ -63,6 +63,7 @@ from ha_spark.energy.derived_base_load import (
     derive_specs_from_settings,
     rerive_trailing_window,
 )
+from ha_spark.energy.digest import digest_due, run_digest_tick
 from ha_spark.energy.dst_clock_sync import DstClockSync
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
@@ -850,6 +851,16 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                     await run_v2l_tick(settings, now)
                 except Exception:
                     log.exception("V2L tick failed; will retry next tick")
+            if last_plan is not None and digest_due(settings, now):
+                try:
+                    async with HomeAssistantRest(
+                        settings.ha_rest_url,
+                        settings.auth_token,
+                        timeout=settings.ha_timeout,
+                    ) as digest_rest:
+                        await run_digest_tick(settings, last_plan, now, digest_rest)
+                except Exception:
+                    log.warning("Morning digest tick failed; will retry next tick")
             await asyncio.sleep(poll_seconds)
     finally:
         if serve_task is not None:

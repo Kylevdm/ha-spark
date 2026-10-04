@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Morning plan digest (#50): send the current plan through the shared
+  `notify_service` once per household-clock day after `digest_time` (default
+  `07:00`). Simulate and off modes say what ha-spark would do. A failed notify
+  retries on the next minute tick.
 - Shared notification target (#159): V2L notices now go to `notify_service`,
   the one target for every ha-spark notification. `v2l_notify_service` remains
   as a deprecated fallback when `notify_service` is blank, and ha-spark logs a
