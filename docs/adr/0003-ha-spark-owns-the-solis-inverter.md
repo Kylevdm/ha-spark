@@ -273,7 +273,15 @@ The four incumbent automations, for the rollback record:
   charging the car, so holds are driven from dispatches deliberately — the
   uncovered case is car charging Octopus did not dispatch (a manual/boost
   charge, or eco+ surplus diversion), tracked as
-  [#141](https://github.com/Kylevdm/ha-spark/issues/141). The rule-3
+  [#141](https://github.com/Kylevdm/ha-spark/issues/141). **Superseded
+  2026-10-04 by [#170](https://github.com/Kylevdm/ha-spark/issues/170):** #141
+  closed without evidence either way, but on 2026-10-03 a Zappi boost with no
+  Octopus dispatch drained the battery into the car at about 3.2 kW. Holds now
+  also start whenever the car is actively charging (charging, boosting or
+  delivering), outside the overnight window and whether or not a dispatch
+  explains it. Eco+ diversion is still not covered. An unreadable EV status
+  is ignored rather than believed, and never triggers relinquishing control.
+  The rule-3
   car-charging discharge floor is **not** part of it — demoted 2026-09-08, see
   the ledger above.
 - **The hold mechanism is a coarse whole-inverter enable, and that does not

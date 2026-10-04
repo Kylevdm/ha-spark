@@ -137,3 +137,12 @@ every day and, on a zero-export site, gives energy away unpaid.
 (Decision: #110, 2026-10-01.)
 _Avoid_: orphaned force (that is the in-memory RC keep-alive's failure, not a
 resident window's)
+
+**Hold** — a period, outside the overnight charging window, during which
+ha-spark stops the house battery discharging so it never feeds the car. A
+hold is caused by an Octopus dispatch, or by the car actively charging
+(charging, boosting or delivering; *not* eco+ solar diversion) whether or not
+a dispatch explains it. Hold evidence that can't be read is ignored rather
+than believed, and a hold outranks a flexibility-event export.
+(Decision: #170, 2026-10-04.)
+_Avoid_: dispatch hold (when meaning either cause), pause, block
