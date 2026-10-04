@@ -37,8 +37,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, time, timedelta
 from typing import NamedTuple
 
 import httpx
@@ -78,7 +78,7 @@ from ha_spark.energy.publish import (
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.energy.soc_monitor import SocMonitor, observe_soc
-from ha_spark.energy.sources import parse_time, read_dispatches
+from ha_spark.energy.sources import parse_time, read_dispatches, read_ev_hold_status
 from ha_spark.energy.supply_guard import SupplyGuard
 from ha_spark.energy.tariff import _controlled_windows
 from ha_spark.energy.tariff import _in_overnight_window as in_window
@@ -202,6 +202,7 @@ async def run_once(
     soc: SocMeasurement | None = None,
     previous_plan: ChargePlan | None = None,
     trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ev_hold_state: EvHoldState | None = None,
 ) -> ChargePlan:
     """Compute the charge plan, log it, and apply it per PROACTIVE_MODE.
 
@@ -223,6 +224,16 @@ async def run_once(
         intent = plan.charge_intent
         assert intent is not None  # planner always sets it
         device = inverter_device(settings, rest)
+        ev_hold_state = ev_hold_state or EvHoldState()
+        now = datetime.now(load_timezone(settings.timezone))
+        ev_hold_active = _observe_ev_hold(
+            ev_hold_state,
+            inputs.ev_hold_charging,
+            now,
+            parse_time(settings.charge_window_start),
+            parse_time(settings.charge_window_end),
+        )
+        intent = replace(intent, ev_hold_active=ev_hold_active)
         # One reconcile pass before anything else, on every device-driving
         # caller (#143): an owner that abdicates when invoked from the CLI is
         # not one (ADR-0003), and the switch must have settled before `apply`
@@ -231,9 +242,7 @@ async def run_once(
         # would otherwise leave the clock unserved for a whole slot.
         reconcile_intent = hold_reconcile_intent(intent, trusted_holds)
         lines = (
-            await device.reconcile_holds(
-                reconcile_intent, datetime.now(load_timezone(settings.timezone))
-            )
+            await device.reconcile_holds(reconcile_intent, now)
             if reconcile_intent is not None
             else [UNTRUSTED_HOLDS_LINE]
         )
@@ -380,6 +389,60 @@ UNTRUSTED_HOLDS_LINE = (
     "[SKIP] hold data untrusted and no trusted hold set yet; power switch left as-is"
 )
 UNREADABLE_DISPATCH_LINE = "[SKIP] dispatch entity unreadable; using the last trusted holds"
+UNREADABLE_EV_STATUS_LINE = "[SKIP] EV status unreadable; no EV hold evidence"
+UNTRUSTED_EV_RELINQUISH_LINE = (
+    "[SKIP] dispatch holds ended, but EV status is unreadable; inverter state left unchanged"
+)
+EV_RELEASE_CONFIRMATION_PASSES = 5
+
+
+@dataclass
+class EvHoldState:
+    """Per-process EV hold debounce state shared by plan and minute passes."""
+
+    active: bool = False
+    not_charging_since: datetime | None = None
+
+
+def next_ev_hold_state(
+    previous: EvHoldState,
+    charging: bool | None,
+    now: datetime,
+    window_start: time,
+    window_end: time,
+) -> EvHoldState:
+    """Advance the EV hold after one trusted status read.
+
+    Five one-minute clear reads release the hold. The first clear read starts
+    the run, so the fifth read arrives four minutes later. Missing/untrusted
+    status is no evidence and clears only the EV hold state.
+    """
+    if in_window(now.time(), window_start, window_end) or charging is None:
+        return EvHoldState()
+    if charging:
+        return EvHoldState(active=True)
+    if not previous.active:
+        return EvHoldState()
+    if previous.not_charging_since is None:
+        return EvHoldState(active=True, not_charging_since=now)
+    clear_reads_elapsed = now - previous.not_charging_since
+    if clear_reads_elapsed >= timedelta(minutes=EV_RELEASE_CONFIRMATION_PASSES - 1):
+        return EvHoldState()
+    return EvHoldState(active=True, not_charging_since=previous.not_charging_since)
+
+
+def _observe_ev_hold(
+    state: EvHoldState,
+    charging: bool | None,
+    now: datetime,
+    window_start: time,
+    window_end: time,
+) -> bool:
+    """Update the caller-owned state and return whether the EV hold is active."""
+    next_state = next_ev_hold_state(state, charging, now, window_start, window_end)
+    state.active = next_state.active
+    state.not_charging_since = next_state.not_charging_since
+    return state.active
 
 
 def hold_reconcile_intent(
@@ -397,7 +460,11 @@ def hold_reconcile_intent(
     if intent.hold_trusted:
         return intent
     if trusted_holds is None:
-        return None
+        if not intent.ev_hold_active:
+            return None
+        # EV charging is independent evidence. It may close a hold while the
+        # dispatch picture is absent, but keeps dispatch trust false for export.
+        return replace(intent, holds=())
     return replace(intent, holds=trusted_holds)
 
 
@@ -417,6 +484,7 @@ async def reconcile_tick(
     *,
     previous: list[str] | None = None,
     trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+    ev_hold_state: EvHoldState | None = None,
 ) -> ReconcileResult:
     """One per-minute power-switch reconcile pass. Never raises.
 
@@ -445,8 +513,9 @@ async def reconcile_tick(
     the default ``simulate`` mode a write that never happens — and bury the plan
     and guard activity an operator actually reads it for.
 
-    ``trusted_holds`` is the caller's last trusted hold set, substituted when
-    this plan's hold data is untrusted (see :func:`hold_reconcile_intent`).
+    ``trusted_holds`` is the caller's last trusted dispatch hold set, substituted
+    when dispatch data is untrusted. EV status is read separately and cannot
+    make dispatch data trusted or untrusted.
 
     On the HA-entity dispatch path the pass re-reads the dispatch entity (#143
     §4) — a cached ``GET`` of what BottlecapDave's integration last polled —
@@ -471,6 +540,7 @@ async def reconcile_tick(
     if plan is None or plan.charge_intent is None:
         return ReconcileResult([], trusted_holds)
     relinquished = False
+    ev_hold_state = ev_hold_state or EvHoldState()
     try:
         async with HomeAssistantRest(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
@@ -487,11 +557,34 @@ async def reconcile_tick(
                 else:
                     fresh = replace(fresh, hold_trusted=False)
                     read_lines = [UNREADABLE_DISPATCH_LINE]
+            ev_charging = await read_ev_hold_status(settings, rest)
+            if settings.ev_status_entity and ev_charging is None:
+                read_lines.append(UNREADABLE_EV_STATUS_LINE)
+            ev_hold_active = _observe_ev_hold(
+                ev_hold_state,
+                ev_charging,
+                now,
+                parse_time(settings.charge_window_start),
+                parse_time(settings.charge_window_end),
+            )
+            fresh = replace(fresh, ev_hold_active=ev_hold_active)
             intent = hold_reconcile_intent(fresh, trusted_holds)
             if intent is None:
-                lines = [UNTRUSTED_HOLDS_LINE]
+                lines = read_lines + [UNTRUSTED_HOLDS_LINE]
+            elif (
+                settings.ev_status_entity
+                and ev_charging is None
+                and not fresh.hold_trusted
+                and trusted_holds
+                and now >= max(end for _, end in trusted_holds)
+            ):
+                # An unreadable EV source is not evidence that charging ended.
+                # Leave the switch untouched until the EV read recovers; it must
+                # not turn a prior trusted EV hold into a safe-state relinquish.
+                lines = read_lines + [UNTRUSTED_EV_RELINQUISH_LINE]
             elif (
                 not fresh.hold_trusted
+                and not intent.ev_hold_active
                 and trusted_holds
                 and now >= max(end for _, end in trusted_holds)
             ):
@@ -639,6 +732,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     # read's empty holds mean "unreadable", so the reconcile evaluates the clock
     # against this instead. `None` until a trusted read exists.
     last_trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None
+    ev_hold_state = EvHoldState()
     # Set when a reconcile pass relinquished control (#143 §5): the safe state
     # overwrote Slot 1, so the next replan must apply even an unchanged plan.
     reapply = False
@@ -655,6 +749,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                 last_plan = None
                 last_applied_plan = None
                 last_trusted_holds = None
+                ev_hold_state = EvHoldState()
                 target_w = None
                 last_settings = settings
             tz = load_timezone(settings.timezone)
@@ -684,6 +779,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         soc=measurement,
                         previous_plan=previous_plan,
                         trusted_holds=last_trusted_holds,
+                        ev_hold_state=ev_hold_state,
                     )
                     replanned = True
                     state.set_plan(plan)
@@ -725,6 +821,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                     now,
                     previous=last_reconcile_lines,
                     trusted_holds=last_trusted_holds,
+                    ev_hold_state=ev_hold_state,
                 )
                 last_reconcile_lines, last_trusted_holds = reconciled[:2]
                 reapply = reapply or reconciled.relinquished

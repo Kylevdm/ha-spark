@@ -277,14 +277,20 @@ The four incumbent automations, for the rollback record:
   `solis.py` only ever wrote `power_switch = Off`, falling short of the full
   lifecycle takeover, with completion tracked on #84. ha-spark now owns both
   edges through `reconcile_holds` (see "The power-switch lifecycle is
-  closed"). One limitation from the original wording remains: the
-  stop-discharge is still **dispatch-only**. On Intelligent Octopus Go a
-  dispatch *is* Octopus charging the car, so holds come from dispatches on
-  purpose. The uncovered case is car charging that Octopus didn't dispatch (a
-  manual or boost charge, or eco+ surplus diversion), tracked as
-  [#141](https://github.com/Kylevdm/ha-spark/issues/141) and now followed up
-  in [#170](https://github.com/Kylevdm/ha-spark/issues/170). The rule-3
-  car-charging discharge floor is **not** part of it; it was demoted on
+  closed"). One limitation from the original wording remained: the
+  stop-discharge was **dispatch-only**. On Intelligent Octopus Go a dispatch
+  *is* Octopus charging the car, so holds came from dispatches on purpose. The
+  uncovered case was car charging that Octopus didn't dispatch (a manual or
+  boost charge, or eco+ surplus diversion), tracked as
+  [#141](https://github.com/Kylevdm/ha-spark/issues/141). **Superseded
+  2026-10-04 by [#170](https://github.com/Kylevdm/ha-spark/issues/170):** #141
+  closed without evidence either way, but on 2026-10-03 a Zappi boost with no
+  Octopus dispatch drained the battery into the car at about 3.2 kW. Holds now
+  also start whenever the car is actively charging (charging, boosting or
+  delivering), outside the overnight window and whether or not a dispatch
+  explains it. Eco+ diversion is still not covered. An unreadable EV status is
+  ignored rather than believed, and never triggers relinquishing control. The
+  rule-3 car-charging discharge floor is **not** part of it; it was demoted on
   2026-09-08 (see the ledger above).
 - **The hold mechanism is a coarse whole-inverter enable, and it doesn't
   generalise.** `select.solisac_power_switch` is the only control that stops

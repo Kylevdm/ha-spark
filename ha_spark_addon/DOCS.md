@@ -31,7 +31,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `solar_tomorrow_entity` | Solcast "forecast tomorrow" sensor (with `detailedForecast` attribute) |
 | `octopus_rate_entity` | Octopus current electricity rate sensor |
 | `dispatch_entity` | Octopus Intelligent dispatching binary sensor |
-| `ev_plug_entity` / `ev_status_entity` | EV charger plug/status sensors |
+| `ev_plug_entity` / `ev_status_entity` | EV charger plug/status sensors; `ev_status_entity` also drives the charging hold |
 | `consumption_energy_entity` | Household load energy statistic, excluding battery and EV charging |
 | `grid_power_entity` | Optional whole-house supply power sensor (W); enables the supply guard |
 | `charge_current_entity` | Optional inverter timed-charge current `number` entity for dashboards and telemetry. ha-spark controls the Solis natively (see below) |
@@ -62,13 +62,17 @@ your `configuration.yaml`, so you add the overlay
 On the Solis, ha-spark re-reads the dispatch state and checks
 `inverter_power_switch_entity` every minute, separately from the half-hourly
 plan. It turns the switch `Off` during an active dispatch hold and `On`
-otherwise. With real control enabled, the next minute's check corrects a
-restart, a failed write, or a switch change made outside ha-spark. When
-ha-spark gives up control, including during a clean shutdown, it writes a safe
-state: switch `On`, the configured cheap charge window (default
-`23:30`-`05:30`), and an empty discharge window (`00:00`-`00:00`) unless a
-verified export is still running. If ha-spark can't trust the dispatch state,
-it won't open a new export window.
+otherwise. When `ev_status_entity` is configured, Charging, Boosting and
+Delivering also hold the switch `Off` outside the overnight charge window,
+even without a matching dispatch. Five consecutive clear reads release that
+hold; eco+ Diverting does not start one. Unreadable EV status is ignored for
+the hold and appears as a warning in `ha-spark health`. With real control
+enabled, the next minute's check corrects a restart, a failed write, or a
+switch change made outside ha-spark. When ha-spark gives up control, including
+during a clean shutdown, it writes a safe state: switch `On`, the configured
+cheap charge window (default `23:30`-`05:30`), and an empty discharge window
+(`00:00`-`00:00`) unless a verified export is still running. If ha-spark can't
+trust the dispatch state, it won't open a new export window.
 
 Before setting `proactive_mode: on`, disable any Home Assistant automation or
 manual schedule that writes the same inverter or power switch, and keep them
@@ -352,11 +356,11 @@ a daylight-saving change when `inverter_clock_dst_sync` is on.
 
 For paid export, the planner uses `battery_discharge_ceiling_kw` (default 3.2)
 as a conservative battery output and `dno_export_limit_kw` as your
-installation's grid-export limit. Set `dno_export_limit_kw` to the limit in
-your DNO approval rather than relying on the 7.36 kW default. Both caps are
-separate from the Solis prototype's fixed 62.5 A timed-discharge command. The
-export path is supervised and has not been validated on hardware for
-unattended use. Follow the
+installation's grid-export limit. That defaults to 3.68 kW, the G98
+fit-and-inform limit (16 A single-phase); raise it only to the limit in your
+DNO's G99 approval. Both caps are separate from the Solis prototype's fixed
+62.5 A timed-discharge command. The export path is supervised and has not been
+validated on hardware for unattended use. Follow the
 [`supervised Axle export runbook`](../docs/runbooks/supervised-axle-export.md)
 for every live test.
 

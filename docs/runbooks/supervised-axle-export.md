@@ -26,7 +26,7 @@ automation or enter an event window by hand.
       the wrong time.
 - [ ] SoC is fresh, finite, and in the configured 0 to 100% range.
 - [ ] `dno_export_limit_kw` matches the export limit in the installation's DNO
-      approval, not the 7.36 kW default.
+      approval. The default is the G98 limit, 3.68 kW.
 - [ ] No dispatch hold overlaps the planned export window.
 - [ ] The event came from a fresh explicit Axle API/HA source. Never type an
       inferred start or end time.
