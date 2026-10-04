@@ -53,14 +53,18 @@ def _alpha_device(
     return AlphaESSDevice(config, s, rest)
 
 
-def _soc(value: float) -> SocMeasurement:
-    now = datetime.now(UTC)
+# Noon: outside the 23:30-05:30 window, so sizing spans the full window and
+# does not depend on the wall clock the suite happens to run at (#181).
+_NOON = datetime(2026, 10, 3, 12, 0, tzinfo=UTC)
+
+
+def _soc(value: float, at: datetime = _NOON) -> SocMeasurement:
     return SocMeasurement(
         status=SocStatus.OK,
-        observed_at=now,
+        observed_at=at,
         value=value,
         raw_state=str(value),
-        reported_at=now,
+        reported_at=at,
         age_s=0.0,
         max_age_s=600.0,
     )
@@ -165,17 +169,21 @@ def _write_calls(route: respx.Route, address: int) -> list[object]:
     return out
 
 
-def test_solis_current_matches_legacy_sizing() -> None:
-    # capacity 26.88 kWh, eff 0.90, voltage 51 V, 6.0 h window, max 62.5 A.
-    # needed = (77-50)/100*26.88 = 7.2576 kWh; buy = 7.2576/0.9 = 8.064 kWh;
-    # kwh_per_amp = 6.0*51/1000 = 0.306; amps = 8.064/0.306 = 26.35 A.
-    s = _settings(
+def _sizing_settings() -> Settings:
+    return _settings(
         battery_capacity_kwh=26.88,
         charge_efficiency=0.90,
         battery_voltage_v=51.0,
         max_charge_current_a=62.5,
+        timezone="Europe/London",
     )
-    assert solis_current_a(_intent(), s) == pytest.approx(26.35, abs=0.05)
+
+
+def test_solis_current_matches_legacy_sizing() -> None:
+    # capacity 26.88 kWh, eff 0.90, voltage 51 V, 6.0 h window, max 62.5 A.
+    # needed = (77-50)/100*26.88 = 7.2576 kWh; buy = 7.2576/0.9 = 8.064 kWh;
+    # kwh_per_amp = 6.0*51/1000 = 0.306; amps = 8.064/0.306 = 26.35 A.
+    assert solis_current_a(_intent(), _sizing_settings()) == pytest.approx(26.35, abs=0.05)
 
 
 def test_solis_current_clamps_to_max() -> None:
@@ -186,6 +194,57 @@ def test_solis_current_clamps_to_max() -> None:
         max_charge_current_a=10.0,
     )
     assert solis_current_a(_intent(target_soc=90.0), s) == 10.0
+
+
+def test_solis_current_mid_window_sizes_over_the_time_left() -> None:
+    # 03:30 BST (02:30 UTC), 56% -> 70%: needed 3.7632 kWh, buy 4.1813 kWh over
+    # the 2.0 h left: 4.1813 / (2.0 * 51 / 1000) = 40.99 A, not 13.7 A (#181).
+    at = datetime(2026, 10, 4, 2, 30, tzinfo=UTC)
+    intent = _intent(target_soc=70.0, soc=_soc(56.0, at))
+    assert solis_current_a(intent, _sizing_settings()) == pytest.approx(40.99, abs=0.05)
+
+
+def test_solis_current_before_window_sizes_over_the_full_window() -> None:
+    # 22:00 BST (21:00 UTC) is before the 23:30 start: full 6.0 h, as legacy.
+    at = datetime(2026, 10, 3, 21, 0, tzinfo=UTC)
+    intent = _intent(soc=_soc(50.0, at))
+    assert solis_current_a(intent, _sizing_settings()) == pytest.approx(26.35, abs=0.05)
+
+
+def test_solis_current_at_window_start_sizes_over_the_full_window() -> None:
+    at = datetime(2026, 10, 3, 22, 30, tzinfo=UTC)  # 23:30 BST
+    intent = _intent(soc=_soc(50.0, at))
+    assert solis_current_a(intent, _sizing_settings()) == pytest.approx(26.35, abs=0.05)
+
+
+def test_solis_current_near_window_end_clamps_to_max() -> None:
+    at = datetime(2026, 10, 4, 4, 29, tzinfo=UTC)  # 05:29 BST, 1 min left
+    intent = _intent(target_soc=70.0, soc=_soc(60.0, at))
+    assert solis_current_a(intent, _sizing_settings()) == 62.5
+
+
+def test_solis_current_at_window_end_sizes_the_next_window() -> None:
+    # 05:30 BST: tonight's window is over; the next one is a full 6.0 h.
+    at = datetime(2026, 10, 4, 4, 30, tzinfo=UTC)
+    intent = _intent(soc=_soc(50.0, at))
+    assert solis_current_a(intent, _sizing_settings()) == pytest.approx(26.35, abs=0.05)
+
+
+@respx.mock
+async def test_solis_current_line_names_the_hours_sized_over() -> None:
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    s = _settings(
+        battery_capacity_kwh=26.88,
+        charge_efficiency=0.90,
+        battery_voltage_v=51.0,
+        timezone="Europe/London",
+    )
+    at = datetime(2026, 10, 4, 2, 30, tzinfo=UTC)  # 03:30 BST
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        lines = await _solis_device(s, rest, control="observe").apply(
+            _intent(target_soc=70.0, soc=_soc(56.0, at))
+        )
+    assert any("timed charge current to 41 A over 2.0 h" in line for line in lines), lines
 
 
 def test_solis_capabilities_include_rate() -> None:

@@ -412,8 +412,8 @@ class SolisDevice:
         # DC hardware ceiling); round to the integer register value.
         amps = round(solis_current_a(intent, self._settings))
         desc = (
-            f"set timed charge current to {amps} A for the "
-            f"{window_hours(intent.window_start, intent.window_end):.1f} h window"
+            f"set timed charge current to {amps} A over "
+            f"{charge_hours(intent, self._settings):.1f} h of the window"
         )
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         if mode == "on" and blocked:
@@ -427,8 +427,8 @@ class SolisDevice:
         """Make slot 1 safe before changing its planned charge current."""
         amps = round(solis_current_a(intent, self._settings))
         current_desc = (
-            f"set timed charge current to {amps} A for the "
-            f"{window_hours(intent.window_start, intent.window_end):.1f} h window"
+            f"set timed charge current to {amps} A over "
+            f"{charge_hours(intent, self._settings):.1f} h of the window"
         )
         zeros = [0] * len(_WINDOW_FIELDS)
         try:
@@ -1360,6 +1360,23 @@ def _finite_number(value: object) -> float | None:
     return None
 
 
+def charge_hours(intent: ChargeIntent, settings: Settings) -> float:
+    """Hours the charge current is sized over: what is left of the window when
+    the plan's SoC was observed inside it, else the full window (#181).
+
+    A mid-window replan spreading the remaining energy over the full window
+    undercharges: at 03:30 it programmed 14 A where 41 A was needed.
+    """
+    from ha_spark.energy.forecast import load_timezone  # import cycle, see apply
+
+    full = window_hours(intent.window_start, intent.window_end)
+    local = intent.soc.observed_at.astimezone(load_timezone(settings.timezone))
+    minute = local.hour * 60 + local.minute + local.second / 60
+    start = intent.window_start.hour * 60 + intent.window_start.minute
+    elapsed = (minute - start) % (24 * 60) / 60
+    return full - elapsed if 0 < elapsed < full else full
+
+
 def solis_current_a(intent: ChargeIntent, settings: Settings) -> float:
     """DC charge current (A) for the intent — the legacy planner sizing, inverted."""
     needed_kwh = max(
@@ -1367,9 +1384,7 @@ def solis_current_a(intent: ChargeIntent, settings: Settings) -> float:
     )
     eff = settings.charge_efficiency if settings.charge_efficiency > 0 else 1.0
     purchase = needed_kwh / eff
-    kwh_per_amp = (
-        window_hours(intent.window_start, intent.window_end) * settings.battery_voltage_v / 1000.0
-    )
+    kwh_per_amp = charge_hours(intent, settings) * settings.battery_voltage_v / 1000.0
     if kwh_per_amp <= 0:
         return 0.0
     return min(settings.max_charge_current_a, purchase / kwh_per_amp)
