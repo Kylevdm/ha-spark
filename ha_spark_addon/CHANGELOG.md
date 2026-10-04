@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.19.4
+
+- EV charging holds (#170): when `ev_status_entity` is configured, the
+  per-minute reconcile turns the inverter `Off` while the car is Charging,
+  Boosting or Delivering, even without a matching Octopus dispatch. It releases
+  after five consecutive clear reads. Eco+ Diverting does not start a hold, and
+  EV holds are suppressed during the configured overnight charge window.
+  Unreadable EV status is reported by `health` and does not change dispatch
+  hold trust. Simulate mode reports the same decision without writing.
+
 ## Unreleased
 
 - SoC trust publication (#174): SoC-dependent plan sensors become

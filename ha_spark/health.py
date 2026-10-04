@@ -34,6 +34,7 @@ from ha_spark.energy.octopus import (
     fetch_standard_unit_rates,
 )
 from ha_spark.energy.profile import history_coverage
+from ha_spark.energy.sources import read_ev_hold_status
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.statistics import statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
@@ -183,6 +184,24 @@ async def check_inverter_clock(settings: Settings) -> CheckResult:
         )
     status = Status.FAIL if abs(error) >= FAIL_AT else Status.WARN
     return CheckResult("Inverter clock", status, f"{refusal}; export windows are refused")
+
+
+async def check_ev_status(settings: Settings) -> CheckResult:
+    """Report whether the configured EV status can provide hold evidence."""
+    entity = settings.ev_status_entity
+    if not entity:
+        return CheckResult("EV status", Status.OK, "not configured; EV charging holds disabled")
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            charging = await read_ev_hold_status(settings, rest)
+    except Exception as exc:  # noqa: BLE001 - health reports failures, never raises
+        return CheckResult("EV status", Status.WARN, f"{entity} unreadable: {exc!r}")
+    if charging is None:
+        return CheckResult("EV status", Status.WARN, f"{entity} unreadable")
+    detail = "charging hold active" if charging else "readable; no charging hold"
+    return CheckResult("EV status", Status.OK, f"{entity}: {detail}")
 
 
 _REQUIRED_ENTITY_FIELDS = (
@@ -364,6 +383,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_supply_guard(settings),
         check_tariff_provider(settings),
         check_ha_timezone(settings),
+        *([check_ev_status(settings)] if settings.ev_status_entity else []),
         *([check_inverter_clock(settings)] if settings.inverter == "solis" else []),
     )
     return [*results, check_entity_config(settings)]

@@ -41,6 +41,9 @@ log = get_logger(__name__)
 
 # myenergi zappi states that mean the EV is actively drawing power.
 _EV_ACTIVE = {"charging", "delivering", "boosting", "diverting"}
+# States that stop the house battery discharging while the EV is charging.
+# Eco+ diversion is solar-led and intentionally does not trigger an EV hold.
+_EV_HOLD_ACTIVE = {"charging", "boosting", "delivering"}
 
 
 def _to_float(value: Any, default: float) -> float:
@@ -252,6 +255,34 @@ async def read_dispatches(
     return _parse_dispatches(dispatch.attributes.get("planned_dispatches")), True
 
 
+async def read_ev_status(
+    settings: Settings, rest: HomeAssistantRest
+) -> tuple[EntityState | None, bool]:
+    """Read the configured EV status entity, separating no source from bad data."""
+    if not settings.ev_status_entity:
+        return None, True
+    try:
+        state = await rest.get_state(settings.ev_status_entity)
+    except Exception as exc:  # noqa: BLE001 - EV evidence must not stop reconciliation
+        log.debug("Could not read %s (%s)", settings.ev_status_entity, exc)
+        return None, False
+    if str(state.state).strip().lower() in ("unavailable", "unknown"):
+        return None, False
+    return state, True
+
+
+async def read_ev_hold_status(settings: Settings, rest: HomeAssistantRest) -> bool | None:
+    """Return charging evidence for the hold, or ``None`` when it cannot be read.
+
+    ``None`` means no configured EV source or an unreadable configured entity.
+    The hold intentionally excludes ``diverting`` (eco+ solar diversion).
+    """
+    state, trusted = await read_ev_status(settings, rest)
+    if state is None or not trusted:
+        return None
+    return str(state.state).strip().lower() in _EV_HOLD_ACTIVE
+
+
 async def gather_inputs(
     settings: Settings, rest: HomeAssistantRest, *, soc: SocMeasurement | None = None
 ) -> tuple[PlannerInputs, PlannerConfig, str]:
@@ -277,7 +308,9 @@ async def gather_inputs(
         log.warning("SoC measurement failed integrity check: %s", soc_measurement.reason)
     voltage = await state(settings.battery_voltage_entity)
     solar = await state(settings.solar_tomorrow_entity)
-    ev_status = await state(settings.ev_status_entity)
+    ev_status, ev_status_trusted = await read_ev_status(settings, rest)
+    if settings.ev_status_entity and not ev_status_trusted:
+        log.warning("EV status entity %s unreadable", settings.ev_status_entity)
     ha_needed = await state(settings.ha_template_charge_needed_entity)
 
     voltage_v = _to_float(voltage.state if voltage else None, settings.battery_voltage_v)
@@ -308,7 +341,11 @@ async def gather_inputs(
         dispatches, dispatches_trusted = await read_dispatches(settings, rest)
         if not dispatches_trusted:
             log.warning("Dispatch entity %s unreadable; holds untrusted", settings.dispatch_entity)
-    ev_charging = bool(ev_status and str(ev_status.state).lower() in _EV_ACTIVE)
+    ev_status_value = str(ev_status.state).strip().lower() if ev_status else None
+    ev_charging = ev_status_value in _EV_ACTIVE
+    ev_hold_charging = (
+        ev_status_value in _EV_HOLD_ACTIVE if ev_status_value is not None else None
+    )
 
     dynamic_prices: tuple[PricePoint, ...] = ()
     if settings.tariff_provider == "dynamic" and settings.dynamic_rates_entity:
@@ -381,6 +418,7 @@ async def gather_inputs(
         flexibility_event=flexibility_event,
         flexibility_event_trusted=flexibility_event_trusted,
         ev_charging=ev_charging,
+        ev_hold_charging=ev_hold_charging,
         ha_template_needed=_opt_float(ha_needed.state) if ha_needed else None,
         load_slots=load_slots,
         solar_slots=solar_slots,
