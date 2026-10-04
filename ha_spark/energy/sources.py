@@ -393,7 +393,8 @@ async def gather_inputs(
     tz = load_timezone(settings.timezone)
     window_start = parse_time(settings.charge_window_start)
     window_end = parse_time(settings.charge_window_end)
-    drain = pre_window_drain(forecast, datetime.now(tz), window_start, window_end)
+    now = datetime.now(tz)
+    drain = pre_window_drain(forecast, now, window_start, window_end)
 
     load_slots: tuple[float, ...] | None = None
     solar_slots: tuple[float, ...] | None = None
@@ -423,6 +424,7 @@ async def gather_inputs(
         load_slots=load_slots,
         solar_slots=solar_slots,
         horizon_start=horizon_start,
+        now=now,
         dynamic_prices=dynamic_prices,
     )
     # Dynamic buffer: when the quantile ML forecast drives the plan, replace the
