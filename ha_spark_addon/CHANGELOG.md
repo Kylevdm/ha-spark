@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.19.2
+
+- SoC freshness (#169): an unchanged SoC is no longer treated as stale while
+  its source is live. Integrations (solax-modbus, HA Modbus) never re-report an
+  unchanged value, so an idle or slowly discharging battery's SoC went "stale"
+  after 10 minutes and blocked charge programming (6 of 15 plans on the
+  2026-10-03 commissioning run). A recent report from `battery_voltage_entity`
+  now proves the source live, for up to 12 hours of unchanged SoC. Without it,
+  or when it is unavailable or stale itself, the 10-minute rule applies as
+  before.
+
 ## 0.19.1
 
 - Solis read-back (#164): the driver now watches the overlay for up to ~15 s

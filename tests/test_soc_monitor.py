@@ -217,6 +217,57 @@ async def test_observe_soc_judges_freshness_against_configured_max_age() -> None
     assert m.max_age_s == 300.0
 
 
+def _state_json(entity_id: str, state: str, reported: datetime) -> dict[str, object]:
+    return {
+        "entity_id": entity_id,
+        "state": state,
+        "attributes": {},
+        "last_reported": reported.isoformat(),
+    }
+
+
+@respx.mock
+async def test_observe_soc_accepts_unchanged_soc_while_voltage_reports() -> None:
+    """#169: the battery-voltage entity is the SoC source's liveness signal."""
+    s = _settings(
+        Path("/tmp"), soc_entity="sensor.soc", battery_voltage_entity="sensor.volts"
+    )
+    now = datetime.now(UTC)
+    respx.get("http://ha.test/api/states/sensor.soc").mock(
+        return_value=httpx.Response(
+            200, json=_state_json("sensor.soc", "76", now - timedelta(minutes=38))
+        )
+    )
+    respx.get("http://ha.test/api/states/sensor.volts").mock(
+        return_value=httpx.Response(
+            200, json=_state_json("sensor.volts", "52.1", now - timedelta(seconds=3))
+        )
+    )
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        m = await observe_soc(s, rest)
+    assert m.ok
+    assert m.value == 76.0
+
+
+@respx.mock
+async def test_observe_soc_failed_voltage_read_falls_back_to_own_report() -> None:
+    s = _settings(
+        Path("/tmp"), soc_entity="sensor.soc", battery_voltage_entity="sensor.volts"
+    )
+    now = datetime.now(UTC)
+    respx.get("http://ha.test/api/states/sensor.soc").mock(
+        return_value=httpx.Response(
+            200, json=_state_json("sensor.soc", "76", now - timedelta(minutes=38))
+        )
+    )
+    respx.get("http://ha.test/api/states/sensor.volts").mock(
+        return_value=httpx.Response(500)
+    )
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        m = await observe_soc(s, rest)
+    assert m.status is SocStatus.STALE
+
+
 # --- operator-visible logs ---
 
 
