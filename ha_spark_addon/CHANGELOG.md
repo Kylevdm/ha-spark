@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- SoC trust publication (#174): SoC-dependent plan sensors become
+  `unavailable` when the measurement is untrusted, while independent forecasts
+  remain numeric. Restart replay also masks older cached values with an
+  untrusted plan status.
+
 ## 0.19.3
 
 - Solis charge current mid-window (#181): a replan inside the charge window
