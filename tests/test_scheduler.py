@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta, tzinfo
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2181,6 +2181,12 @@ async def test_ev_hold_does_not_invent_an_alphaess_hold_write() -> None:
 async def test_run_once_applies_the_ev_hold_on_a_replan_tick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            return cls(2026, 6, 10, 12, 0, tzinfo=tz)
+
+    monkeypatch.setattr(scheduler, "datetime", _FrozenDatetime)
     monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
     plan = _plan(replace(_INTENT, holds=()))
 
