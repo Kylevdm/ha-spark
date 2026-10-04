@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Solis simulate safety checks (#175): untrusted SoC, a disallowed or
+  unreadable grid-charge work mode, and an off or unreadable power switch now
+  block simulated actions just as they block real programming, instead of
+  showing actions that cannot be applied safely.
 - Octopus tariff fallback (#176): with dispatch credentials configured, an empty
   product or tariff code no longer prevents daemon startup; missing live rates
   fall back to the fixed schedule, matching the health warning.
