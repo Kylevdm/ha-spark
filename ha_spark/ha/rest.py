@@ -13,6 +13,11 @@ from ha_spark.logging import get_logger
 log = get_logger(__name__)
 
 
+async def notify(rest: HomeAssistantRest, service: str, title: str, message: str) -> None:
+    """Fire an HA notification via notify.<service>."""
+    await rest.call_service("notify", service, {"title": title, "message": message})
+
+
 class HomeAssistantRestError(httpx.HTTPError):
     """Raised when a Home Assistant REST request or response cannot be trusted."""
 
