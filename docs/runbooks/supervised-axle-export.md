@@ -17,25 +17,27 @@ automation or enter an event window by hand.
       overlay is healthy.
 - [ ] The incumbent automations that write the Solis power switch or timed
       discharge window are disabled for this run.
-- [ ] Clock check steps 1–3 pass in `simulate`; the sync (steps 4–5) runs
-      right after real control is enabled, before the window arms (see
+- [ ] Clock check steps 1 to 3 pass in `simulate`. The sync (steps 4 and 5)
+      runs right after real control is enabled, before the window arms (see
       [Clock check](#clock-check)). The configured `timezone` is the
-      **household clock**; everything else is checked against it. Slot 1
-      stores a date-less local wall-clock window that the inverter fires on
-      its own clock, so a clock mismatch can arm it on the wrong day or at the
-      wrong time.
-- [ ] SoC is fresh, finite, and in the configured 0–100% range.
+      **household clock**, and everything else is checked against it. Slot 1
+      stores a local wall-clock window with no date, which the inverter fires
+      on its own clock, so a clock mismatch can arm it on the wrong day or at
+      the wrong time.
+- [ ] SoC is fresh, finite, and in the configured 0 to 100% range.
+- [ ] `dno_export_limit_kw` matches the export limit in the installation's DNO
+      approval, not the 7.36 kW default.
 - [ ] No dispatch hold overlaps the planned export window.
 - [ ] The event came from a fresh explicit Axle API/HA source. Never type an
       inferred start or end time.
 - [ ] `notify_service` names the intended HA `notify.<service>` target. A blank
-      value disables notices; notifications are reminders, not proof of a write.
+      value disables notices. Notifications are reminders, not proof of a write.
 - [ ] Record a baseline timestamp, SoC, battery power, solar power, house load,
       grid power, inverter power switch, work mode, and the Solis Slot 1 window.
 
 ### Clock check
 
-Steps 1–3 run while still in `simulate`. Steps 4–5 run shortly before the
+Steps 1 to 3 run while still in `simulate`. Steps 4 and 5 run shortly before the
 event, right after real control is enabled (the sync writes only when
 `proactive_mode` is `on`) and before the export window arms.
 
@@ -76,14 +78,14 @@ check is an abort condition. Return `proactive_mode` to `simulate`.
 
 The accepted-event notice is the preparation prompt. It includes the event
 window, planned export, DNO limit, and the requirement to keep a person present.
-If the event is changed, the changed identity receives a new accepted notice.
-Repeated polls of the same identity do not repeat it.
+If the event changes, ha-spark sends a new accepted notice for the changed
+event. Repeated polls of the same event do not repeat it.
 
 ## Enable and observe
 
 1. Confirm the accepted notice and the planner output identify the same event.
-2. Set `proactive_mode` to `on` through the normal add-on configuration surface.
-3. Run [Clock check](#clock-check) steps 4–5 (sync, then `health`) and fill
+2. Set `proactive_mode` to `on` on the add-on's **Configuration** tab.
+3. Run [Clock check](#clock-check) steps 4 and 5 (sync, then `health`) and fill
    in the record. If the sync is not confirmed, return to `simulate`.
 4. Confirm the control authority is still `ha_spark`, the power switch is `On`,
    and the fresh SoC guard passes.
@@ -94,8 +96,8 @@ Repeated polls of the same identity do not repeat it.
    limit. Capture the command, read-back, battery power, solar power, house
    load, grid power, SoC, and event identity.
 
-The start notice means the production driver observed a successful read-back; it
-does not replace telemetry confirmation.
+The start notice means the production driver saw a successful read-back. It
+does not replace confirmation from telemetry.
 
 ## Abort ladder
 
@@ -107,7 +109,7 @@ Stop the run and leave the installation in the safe state if any of these occur:
 - a current or Slot 1 write is rejected or does not read back;
 - battery, solar, house-load, or grid telemetry cannot confirm the expected
   direction or the export limit is approached;
-- any incumbent automation or manual writer changes the same control surface;
+- any incumbent automation or manual writer changes the same controls;
 - export continues outside the paid event window;
 - the export visibly starts more than `inverter_clock_tolerance_minutes` away
   from the event start (the inverter clock is not where the sync left it).
@@ -122,7 +124,7 @@ notice is not evidence that cleanup succeeded; verify the Slot 1 read-back.
 
 ## Cleanup and handoff
 
-1. After the event ends, allow the normal provider transition to drive cleanup.
+1. After the event ends, let the normal provider transition run cleanup.
 2. Confirm the cleanup notice arrives only after the resident timed-discharge
    window reads back as `00:00-00:00`.
 3. Record the cleanup timestamp, final Slot 1 values, final SoC, grid power,
@@ -141,9 +143,9 @@ notice is not evidence that cleanup succeeded; verify the Slot 1 read-back.
   record protects the resident window while the Axle read is unavailable, and
   the next trusted plan either continues it or performs verified cleanup.
 - If the process is intentionally stopped after the event, keep writes
-  authorised long enough to verify the safe state. A forced process kill is not
-  guaranteed to run cleanup and requires a human overlay check before real
-  control is enabled again.
+  authorised long enough to verify the safe state. A forced process kill may
+  skip cleanup, so a person must check the overlay before real control is
+  enabled again.
 
 ## Evidence record
 
