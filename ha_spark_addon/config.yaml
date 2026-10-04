@@ -38,7 +38,7 @@ options:
   target_soc_cap: 90.0
   max_charge_current_a: 62.5
   battery_discharge_ceiling_kw: 3.2
-  dno_export_limit_kw: 7.36
+  dno_export_limit_kw: 3.68
   charge_buffer_pct: 20.0
   charge_efficiency: 0.9
   charge_strategy: deficit

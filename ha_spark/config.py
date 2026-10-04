@@ -235,8 +235,17 @@ class OctopusIntelligentTariffConfig(BaseModel):
 
 
 def validate_octopus_intelligent_tariff(settings: Settings) -> None:
-    """When `tariff_provider` is "octopus_intelligent", require API config; else no-op."""
+    """Validate Octopus config, allowing missing rate codes when dispatch auth is set."""
     if settings.tariff_provider != "octopus_intelligent":
+        return
+    # With dispatch authentication configured, missing product/tariff codes
+    # only disable live rate fetching. That fetch reports an OctopusApiError
+    # and the provider uses its fixed schedule, matching the health warning.
+    if (
+        settings.octopus_api_key
+        and settings.octopus_account_number
+        and (not settings.octopus_product_code or not settings.octopus_tariff_code)
+    ):
         return
     try:
         OctopusIntelligentTariffConfig(
@@ -332,8 +341,9 @@ class Settings(BaseSettings):
     # Conservative planning ceiling for battery discharge.  It is distinct
     # from Solis's fixed hardware command and keeps the planner inverter-agnostic.
     battery_discharge_ceiling_kw: float = Field(default=3.2, ge=0)
-    # Installation-specific grid-export cap. Kyle's approved G98 limit is 7.36 kW.
-    dno_export_limit_kw: float = Field(default=7.36, ge=0)
+    # Installation-specific grid-export cap. Defaults to the G98 fit-and-inform
+    # limit (16 A single-phase); raise it only to a G99-approved figure.
+    dno_export_limit_kw: float = Field(default=3.68, ge=0)
     # Safety margin applied to the forecast deficit before sizing the charge.
     charge_buffer_pct: float = Field(default=20.0)
     # Round-trip AC->DC->AC efficiency: the planner buys required/efficiency.
