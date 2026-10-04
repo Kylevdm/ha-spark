@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- DNO export default (#193): `dno_export_limit_kw` now defaults to 3.68 kW, the
+  G98 fit-and-inform limit (16 A single-phase), instead of 7.36 kW. A site
+  without G99 approval could otherwise plan export above its legal limit.
+  Existing installs keep their stored value.
+
 ## 0.19.3
 
 - Solis charge current mid-window (#181): a replan inside the charge window

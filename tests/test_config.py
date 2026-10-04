@@ -199,6 +199,33 @@ def test_export_planner_limits_are_configurable_across_addon_surfaces() -> None:
     assert "dno_export_limit_kw" in _OPTION_KEYS
 
 
+def test_dno_export_limit_defaults_to_g98_minimum_on_every_surface() -> None:
+    """3.68 kW (16 A single-phase) is the G98 fit-and-inform limit; more needs G99."""
+    from datetime import time
+
+    from ha_spark.energy.models import PlannerConfig
+
+    planner = PlannerConfig(
+        capacity_kwh=26.88,
+        voltage_v=51.0,
+        min_soc=20.0,
+        target_cap=90.0,
+        max_current_a=62.5,
+        solar_haircut_k=1.0,
+        window_start=time(23, 30),
+        window_end=time(5, 30),
+    )
+    addon_default = next(
+        line.split(":", 1)[1].strip()
+        for line in ADDON_CONFIG.read_text(encoding="utf-8").splitlines()
+        if line.startswith("  dno_export_limit_kw:")
+    )
+
+    assert Settings().dno_export_limit_kw == 3.68
+    assert planner.dno_export_limit_kw == 3.68
+    assert addon_default == "3.68"
+
+
 def test_inverter_clock_tolerance_defaults_to_five_minutes() -> None:
     assert Settings().inverter_clock_tolerance_minutes == 5.0
     assert "inverter_clock_tolerance_minutes" in _OPTION_KEYS
