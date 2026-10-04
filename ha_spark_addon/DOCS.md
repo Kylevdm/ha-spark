@@ -349,8 +349,9 @@ when `inverter_clock_dst_sync` is on.
 
 For paid export, `battery_discharge_ceiling_kw` is the conservative battery
 output used by the planner, while `dno_export_limit_kw` is the installation's
-grid-export limit (Kyle's is 7.36 kW). Both caps are independent of the Solis
-prototype's fixed 62.5 A timed-discharge command.
+grid-export limit. It defaults to 3.68 kW, the G98 fit-and-inform limit (16 A
+single-phase). Raise it only to the limit in your DNO's G99 approval. Both caps
+are independent of the Solis prototype's fixed 62.5 A timed-discharge command.
 
 ### Octopus API (optional)
 
