@@ -264,6 +264,8 @@ async def gather_inputs(
     """
 
     async def state(entity_id: str) -> EntityState | None:
+        if not entity_id:
+            return None
         try:
             return await rest.get_state(entity_id)
         except Exception as exc:  # noqa: BLE001 - a missing entity must not crash the plan

@@ -147,7 +147,7 @@ class PlannerConfig:
     # Conservative DC battery output ceiling used only for export planning.
     # Solis actuation remains fixed at its separately verified 62.5 A command.
     battery_discharge_ceiling_kw: float = 3.2
-    dno_export_limit_kw: float = 7.36
+    dno_export_limit_kw: float = 3.68
     supply_max_current_a: float = 75.0
     supply_voltage_v: float = 240.0
     rate_offpeak: float = 0.069  # GBP/kWh inside the window / dispatch slots
