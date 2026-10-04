@@ -5,6 +5,13 @@
 - Octopus tariff fallback (#176): with dispatch credentials configured, an empty
   product or tariff code no longer prevents daemon startup; missing live rates
   fall back to the fixed schedule, matching the health warning.
+- DNO export default (#193): `dno_export_limit_kw` now defaults to 3.68 kW, the
+  G98 fit-and-inform limit (16 A single-phase), instead of 7.36 kW. A site
+  without G99 approval could otherwise plan export above its legal limit.
+  Existing installs keep their stored value.
+- Plan input reads (#171): optional Home Assistant entities with an empty ID
+  are skipped without a REST request or warning; configured entities still warn
+  when their read fails.
 
 ## 0.19.3
 
