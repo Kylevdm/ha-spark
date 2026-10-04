@@ -383,3 +383,34 @@ def test_validate_octopus_intelligent_accepts_full_config() -> None:
             octopus_tariff_code="E-1R-INTELLI-VAR-22-10-14-A",
         )
     )  # no raise
+
+
+@pytest.mark.parametrize(
+    ("product_code", "tariff_code"),
+    [("", ""), ("INTELLI-VAR-22-10-14", ""), ("", "E-1R-INTELLI-VAR-22-10-14-A")],
+)
+def test_validate_octopus_intelligent_allows_missing_rate_codes_with_dispatch_auth(
+    product_code: str, tariff_code: str
+) -> None:
+    """#176: missing rate codes only lose live rates; the fixed schedule covers them."""
+    validate_octopus_intelligent_tariff(
+        _settings(
+            tariff_provider="octopus_intelligent",
+            octopus_api_key="sk_test",
+            octopus_account_number="A-1234ABCD",
+            octopus_product_code=product_code,
+            octopus_tariff_code=tariff_code,
+        )
+    )  # no raise
+
+
+def test_validate_octopus_intelligent_still_requires_dispatch_auth() -> None:
+    with pytest.raises(ConfigError):
+        validate_octopus_intelligent_tariff(
+            _settings(
+                tariff_provider="octopus_intelligent",
+                octopus_api_key="sk_test",
+                octopus_product_code="INTELLI-VAR-22-10-14",
+                octopus_tariff_code="E-1R-INTELLI-VAR-22-10-14-A",
+            )
+        )

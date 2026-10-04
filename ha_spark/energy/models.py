@@ -147,7 +147,7 @@ class PlannerConfig:
     # Conservative DC battery output ceiling used only for export planning.
     # Solis actuation remains fixed at its separately verified 62.5 A command.
     battery_discharge_ceiling_kw: float = 3.2
-    dno_export_limit_kw: float = 7.36
+    dno_export_limit_kw: float = 3.68
     supply_max_current_a: float = 75.0
     supply_voltage_v: float = 240.0
     rate_offpeak: float = 0.069  # GBP/kWh inside the window / dispatch slots
@@ -187,6 +187,9 @@ class PlannerInputs:
     # not be cleared (#148).
     flexibility_event_trusted: bool = True
     ev_charging: bool = False
+    # Current evidence for the inverter hold: ``None`` means no configured or
+    # readable EV status source. The pure planner does not forecast this hold.
+    ev_hold_charging: bool | None = None
     ha_template_needed: float | None = None
     # v2 per-slot horizon (48 half-hour slots starting at the charge-window start
     # tonight). When load_slots is None the planner uses the v1 daily balance.
@@ -228,6 +231,9 @@ class ChargeIntent:
     # False means an empty export is an unreadable Axle event, not a
     # cancellation (#148).
     export_trusted: bool = True
+    # A current, per-minute EV hold is separate from dispatch windows because
+    # it has no scheduled end. Dispatch trust remains independent of EV trust.
+    ev_hold_active: bool = False
 
     @property
     def soc_now(self) -> float:
@@ -241,7 +247,9 @@ class ChargeIntent:
         now". ``now`` must be timezone-aware — the household clock the caller
         already resolved.
         """
-        return any(_align(start, now) <= now < _align(end, now) for start, end in self.holds)
+        return self.ev_hold_active or any(
+            _align(start, now) <= now < _align(end, now) for start, end in self.holds
+        )
 
     def hold_overlaps(self, start: datetime, end: datetime) -> bool:
         """True when any hold intersects ``[start, end)``.
@@ -251,7 +259,7 @@ class ChargeIntent:
         not sample the clock, or it both refuses windows a passing hold cannot
         reach and admits windows a later hold will interrupt.
         """
-        return any(
+        return self.ev_hold_active or any(
             _align(hold_start, start) < end and start < _align(hold_end, start)
             for hold_start, hold_end in self.holds
         )
