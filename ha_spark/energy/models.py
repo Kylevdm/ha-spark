@@ -196,6 +196,9 @@ class PlannerInputs:
     load_slots: tuple[float, ...] | None = None
     solar_slots: tuple[float, ...] | None = None
     horizon_start: datetime | None = None
+    # When these inputs were read. Lets the pure planner place an event that
+    # ends before ``horizon_start`` (later today) against the live SoC (#198).
+    now: datetime | None = None
     # Live per-slot import prices from a `dynamic` tariff price sensor, sorted
     # by start; empty when the dynamic provider isn't in use or the read failed.
     dynamic_prices: tuple[PricePoint, ...] = ()

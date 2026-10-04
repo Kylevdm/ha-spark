@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Same-day Axle export events (#198): the planning horizon starts at tonight's
+  charge window, so from local midnight an evening export event earlier the
+  same day fell before it. Every day-of plan skipped it ("it contains no
+  complete slot in the planning horizon"), and the midnight replan cleared any
+  window armed the evening before. The 2026-10-04 event was never armed for
+  this reason. An event that ends before tonight's window is now planned from
+  the live SoC: house load until the event ends, plus the buffered load until
+  the window opens, stays in the battery. Today's solar isn't forecast, so a
+  same-day slot is refused wherever tomorrow's forecast shows daylight, because
+  the DNO limit can't be checked there. Evening events after sunset are
+  unaffected. A replan during the event counts only what is left of the slot
+  in progress and keeps the window's start, so Slot 1 isn't rewritten
+  mid-event. Tonight's charge is sized after the energy the event spends.
+
 ## 0.19.4
 
 - EV charging holds (#170): when `ev_status_entity` is configured, the
