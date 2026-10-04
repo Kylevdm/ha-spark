@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta, tzinfo
 from typing import Any
 
 import httpx
@@ -11,8 +11,9 @@ import respx
 
 from ha_spark.config import Settings
 from ha_spark.energy import sources
-from ha_spark.energy.models import LoadForecast
-from ha_spark.energy.soc_integrity import SocStatus
+from ha_spark.energy.models import FlexibilityEvent, LoadForecast
+from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.sources import build_config, build_schedule, gather_inputs, pre_window_drain
 from ha_spark.energy.tariff import fixed_schedule
 from ha_spark.ha.rest import HomeAssistantRest
@@ -861,3 +862,72 @@ async def test_read_ev_hold_status_treats_a_connection_error_as_no_evidence() ->
     settings = _settings()
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
         assert await sources.read_ev_hold_status(settings, rest) is None
+
+
+def _frozen_clock(frozen: datetime) -> type[datetime]:
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> _Clock:
+            at = frozen.astimezone(tz) if tz is not None else frozen.replace(tzinfo=None)
+            return cls.fromtimestamp(at.timestamp(), at.tzinfo)
+
+    return _Clock
+
+
+@pytest.mark.parametrize(
+    "now",
+    [
+        datetime(2026, 10, 4, 21, 0, tzinfo=UTC),  # the evening before, 22:00 BST
+        datetime(2026, 10, 5, 16, 0, tzinfo=UTC),  # the event day, 17:00 BST
+    ],
+    ids=["evening-before", "event-day"],
+)
+@respx.mock
+async def test_an_evening_axle_event_is_planned_on_its_own_day(
+    monkeypatch: pytest.MonkeyPatch, now: datetime
+) -> None:
+    """From local midnight the horizon starts at tonight's window, after the event (#198)."""
+    event = FlexibilityEvent(
+        start=datetime(2026, 10, 5, 19, 0, tzinfo=UTC),  # 20:00-21:00 BST
+        end=datetime(2026, 10, 5, 20, 0, tzinfo=UTC),
+        direction="export",
+        updated_at=now,
+        rate_gbp_kwh=1.0,
+    )
+
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=12.0, slots=(0.25,) * 48, source="test")
+
+    async def fake_event(_s: Settings, _rest: HomeAssistantRest) -> FlexibilityEvent:
+        return event
+
+    monkeypatch.setattr(sources, "datetime", _frozen_clock(now))
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    monkeypatch.setattr(sources, "read_axle_event", fake_event)
+    respx.route(method="GET", url__startswith=BASE).mock(return_value=httpx.Response(404))
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        tariff_provider="axle",
+        axle_api_url="http://axle.test",
+        axle_api_key="k",
+        latitude=51.5,
+        longitude=-0.1,
+    )
+    soc = SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=now,
+        value=90.0,
+        raw_state="90",
+        reported_at=now,
+        age_s=0.0,
+        max_age_s=600.0,
+    )
+
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, cfg, _ = await gather_inputs(s, rest, soc=soc)
+    plan = compute_plan(inputs, cfg, build_schedule(s, inputs, cfg))
+
+    export = plan.charge_intent.export
+    assert export is not None, [skip.reason for skip in plan.export_skips]
+    assert (export.window_start, export.window_end) == (event.start, event.end)

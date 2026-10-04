@@ -189,6 +189,15 @@ one-supervised-event destination.
   the day-of tick the *only* tick on which an export window is programmed, so
   this untested composition is now the whole delivery path rather than one
   route into it.
+  **Triggered 2026-10-04 (#198):** the composition was broken one layer down.
+  From local midnight the slot horizon starts at *tonight's* charge window, so
+  an evening event fell before it and every day-of plan skipped it. The
+  2026-10-04 event was never armed. #198 adds a same-day planner path and tests
+  `gather_inputs` → `compute_plan` with a pinned clock on the event day
+  (`tests/test_energy_sources.py`). The scheduler half (`should_run` plus
+  `setpoint_changed`) is still tested only in parts. A pending export is always
+  a changed command, so the gap is small. Trigger unchanged: before unattended
+  delivery.
 
 ### Register write endurance (from #140 step 5, 2026-09-14)
 
