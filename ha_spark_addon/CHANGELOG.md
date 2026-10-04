@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Octopus tariff fallback (#176): with dispatch credentials configured, an empty
+  product or tariff code no longer prevents daemon startup; missing live rates
+  fall back to the fixed schedule, matching the health warning.
+
 ## 0.19.3
 
 - Solis charge current mid-window (#181): a replan inside the charge window

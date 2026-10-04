@@ -235,8 +235,17 @@ class OctopusIntelligentTariffConfig(BaseModel):
 
 
 def validate_octopus_intelligent_tariff(settings: Settings) -> None:
-    """When `tariff_provider` is "octopus_intelligent", require API config; else no-op."""
+    """Validate Octopus config, allowing missing rate codes when dispatch auth is set."""
     if settings.tariff_provider != "octopus_intelligent":
+        return
+    # With dispatch authentication configured, missing product/tariff codes
+    # only disable live rate fetching. That fetch reports an OctopusApiError
+    # and the provider uses its fixed schedule, matching the health warning.
+    if (
+        settings.octopus_api_key
+        and settings.octopus_account_number
+        and (not settings.octopus_product_code or not settings.octopus_tariff_code)
+    ):
         return
     try:
         OctopusIntelligentTariffConfig(
