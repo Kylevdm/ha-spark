@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Plan input reads (#171): optional Home Assistant entities with an empty ID
+  are skipped without a REST request or warning; configured entities still warn
+  when their read fails.
+
 ## 0.19.3
 
 - Solis charge current mid-window (#181): a replan inside the charge window

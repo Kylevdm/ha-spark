@@ -110,7 +110,9 @@ async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) 
 
 
 @respx.mock
-async def test_gather_inputs_tolerates_missing_entities(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_gather_inputs_tolerates_missing_entities(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
@@ -126,6 +128,40 @@ async def test_gather_inputs_tolerates_missing_entities(monkeypatch: pytest.Monk
     assert inputs.soc.status is SocStatus.READ_FAILED
     assert cfg.voltage_v == s.battery_voltage_v  # fell back to config default
     assert inputs.dispatches == ()
+    assert any("Could not read sensor.volt" in record.getMessage() for record in caplog.records)
+
+
+@respx.mock
+async def test_gather_inputs_skips_unset_optional_entities(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    blank_entity = respx.get(f"{BASE}/states/").mock(return_value=httpx.Response(404))
+    respx.get(f"{BASE}/states/sensor.soc").mock(return_value=httpx.Response(404))
+
+    s = _settings().model_copy(
+        update={
+            "battery_voltage_entity": "",
+            "solar_tomorrow_entity": "",
+            "ev_status_entity": "",
+            "ha_template_charge_needed_entity": "",
+            "dispatch_entity": "",
+            "latitude": 51.5,
+            "longitude": -0.1,
+        }
+    )
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, cfg, _ = await gather_inputs(s, rest)
+
+    assert blank_entity.called is False
+    assert not any("Could not read  (" in record.getMessage() for record in caplog.records)
+    assert cfg.voltage_v == s.battery_voltage_v
+    assert inputs.solar_tomorrow_kwh == 0.0
+    assert inputs.ev_charging is False
+    assert inputs.ha_template_needed is None
 
 
 @respx.mock
