@@ -395,12 +395,16 @@ async def test_dynamic_plan_parity_between_scheduler_and_agent_plan(
                        "attributes": {"rates": rates}},
         )
     )
+    # A trusted SoC: untrusted readings publish baseline_cost as unavailable (#174).
+    respx.get("http://ha.test/api/states/sensor.soc").mock(
+        return_value=_soc_resp("50", now)
+    )
     respx.route(method="GET").mock(return_value=httpx.Response(404))
     respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
 
     s = Settings(
         ha_url="http://ha.test", ha_token="t", proactive_mode="off",
-        db_path=str(tmp_path / "ledger.db"),
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
         tariff_provider="dynamic", dynamic_rates_entity="sensor.dynamic_rates",
     )
 

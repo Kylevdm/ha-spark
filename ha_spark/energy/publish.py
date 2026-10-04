@@ -25,6 +25,24 @@ from ha_spark.logging import get_logger
 log = get_logger(__name__)
 
 Entity = tuple[str, str, dict[str, Any]]
+_SOC_DERIVED_SENSORS = frozenset(
+    {
+        "sensor.ha_spark_charge_needed_kwh",
+        "sensor.ha_spark_target_soc",
+        "sensor.ha_spark_soc_now",
+        "sensor.ha_spark_deficit_kwh",
+        "sensor.ha_spark_planned_cost",
+        "sensor.ha_spark_baseline_cost",
+    }
+)
+
+
+def _hide_untrusted_soc_values(entities: list[Entity]) -> list[Entity]:
+    """Replace SoC-derived states with ``unavailable`` when their source is untrusted."""
+    return [
+        (entity_id, "unavailable" if entity_id in _SOC_DERIVED_SENSORS else state, attributes)
+        for entity_id, state, attributes in entities
+    ]
 
 
 def _cache_path(settings: Settings) -> Path:
@@ -136,7 +154,7 @@ def plan_to_payload(plan: ChargePlan, settings: Settings) -> list[Entity]:
                 },
             )
         )
-    return entities
+    return entities if plan.soc.ok else _hide_untrusted_soc_values(entities)
 
 
 async def _push(rest: HomeAssistantRest, entities: list[Entity]) -> None:
@@ -226,4 +244,16 @@ async def republish_last(rest: HomeAssistantRest, settings: Settings) -> None:
     except (OSError, ValueError):
         log.warning("Reading cached published states failed", exc_info=True)
         return
+    status_attributes = next(
+        (
+            attributes
+            for entity_id, _, attributes in entities
+            if entity_id == "sensor.ha_spark_plan_status"
+        ),
+        {},
+    )
+    if status_attributes.get("soc_status") != "ok":
+        # Older releases cached placeholder-derived numbers; don't restore them
+        # as readings before the next plan publishes fresh, trusted SoC data.
+        entities = _hide_untrusted_soc_values(entities)
     await _push(rest, [(e[0], e[1], e[2]) for e in entities])
