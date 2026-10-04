@@ -99,12 +99,21 @@ the predecessor being retired.
 
 Takeover is staged, not immediate. Two things gate it:
 
-**Interim posture — no new guard code; the existing simulate gate is the
-guard.** ha-spark stays in `proactive_mode = simulate` (the standing config
-gate — see `config.py` / CLAUDE.md) until cutover. In `simulate` the Solis
-driver logs its intended writes and issues none, so it cannot fight the
-incumbent. This makes the interim ownership boundary true in the running system
-without touching code.
+**Interim posture — simulate suppresses actuation.** ha-spark stays in
+`proactive_mode = simulate` (the standing config gate — see `config.py` /
+CLAUDE.md) until cutover. In `simulate` the Solis driver logs its intended
+writes and issues none, so it cannot fight the incumbent. No takeover-specific
+interlock is needed before cutover. This is an ownership boundary, not a
+promise that simulation ignores safety checks.
+
+**Simulation preserves safety decisions
+([#175](https://github.com/Kylevdm/ha-spark/issues/175), 2026-10-03).** `simulate` uses
+the same decision path as `on` and suppresses side effects only. Safety checks
+that determine whether a charge setpoint is valid therefore still apply in
+simulation: when SoC is untrusted, the Solis driver reports charging as
+blocked instead of previewing a current or window sized from placeholder
+`soc_now = 0`. The simulate gate remains the actuation guard; this check sends
+no hardware write.
 
 **Behaviour ledger — what takeover must honour before it may go `on`.** The
 incumbent's behaviour is decomposed and each rule assigned a disposition:
