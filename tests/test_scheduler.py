@@ -22,6 +22,7 @@ from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, LoadForecast
 from ha_spark.energy.scheduler import (
     SIGNAL_SAMPLE_INTERVAL,
+    charge_current_changed,
     guard_tick,
     run_forever,
     run_once,
@@ -112,6 +113,140 @@ def test_setpoint_change_retries_an_untrusted_axle_event_read() -> None:
     assert setpoint_changed(_INTENT, replace(_INTENT, export_trusted=False)) is True
 
 
+@pytest.mark.parametrize(
+    ("applied_a", "planned_a", "changed"),
+    [
+        (38, 38, False),
+        (38, 39, True),  # any 1 A rise re-applies
+        (38, 38.4, False),  # rounds to the same register value
+        (38, 38.6, True),
+        (38, 34, False),  # a 4 A fall is inside the deadband
+        (38, 33, True),  # a 5 A fall re-applies
+        (38, 33.4, True),  # rounds to 33
+    ],
+)
+def test_charge_current_deadband_is_asymmetric(
+    applied_a: float, planned_a: float, changed: bool
+) -> None:
+    # #173: rise >= 1 A or fall >= 5 A (whole register amps) re-applies.
+    assert charge_current_changed(applied_a, planned_a) is changed
+
+
+class _AmpsDevice:
+    """Fake device whose planned rate is a fixed amps-per-SoC table x voltage."""
+
+    def __init__(self, amps_by_soc: dict[float, float], voltage_v: float) -> None:
+        self.amps_by_soc = amps_by_soc
+        self.voltage_v = voltage_v
+        self.applied: list[ChargeIntent] = []
+
+    def planned_rate_w(self, intent: ChargeIntent) -> float:
+        return self.amps_by_soc[intent.soc_now] * self.voltage_v
+
+    async def apply(self, intent: ChargeIntent) -> list[str]:
+        self.applied.append(intent)
+        return ["[APPLIED] test"]
+
+    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+        return []
+
+
+def _plan_at(soc: float) -> ChargePlan:
+    intent = replace(_INTENT, soc=_soc(soc))
+    return replace(_plan(), soc=intent.soc, charge_intent=intent)
+
+
+def _patch_run_once_io(
+    monkeypatch: pytest.MonkeyPatch, current: ChargePlan, device: object
+) -> None:
+    async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
+        return SimpleNamespace(plan=current, inputs=object(), load_source="test")
+
+    async def noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_args: device)
+    monkeypatch.setattr(scheduler, "publish_plan", noop)
+    monkeypatch.setattr(scheduler, "_record_forecast", noop)
+    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
+    monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
+
+
+@pytest.mark.parametrize(
+    ("current_soc", "planned_a", "applies"),
+    [
+        (34.0, 35.0, False),  # 2026-10-04 00:30: 38 -> 35 A stays inside the deadband
+        (40.0, 33.0, True),  # a 5 A fall re-applies
+        (29.0, 39.0, True),  # a 1 A rise re-applies
+    ],
+)
+async def test_run_once_reapplies_an_unchanged_target_when_the_amps_move(
+    monkeypatch: pytest.MonkeyPatch, current_soc: float, planned_a: float, applies: bool
+) -> None:
+    settings = Settings()
+    device = _AmpsDevice({31.0: 38.0, current_soc: planned_a}, settings.battery_voltage_v)
+    previous, current = _plan_at(31.0), _plan_at(current_soc)
+    _patch_run_once_io(monkeypatch, current, device)
+
+    await run_once(settings, soc=current.soc, previous_plan=previous)
+
+    assert device.applied == ([current.charge_intent] if applies else [])
+
+
+async def test_run_once_ignores_amps_sized_from_an_untrusted_soc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An untrusted SoC sizes from 0% (a huge rise); it must not force a write."""
+    settings = Settings()
+    failed = _failed_soc()
+    current = replace(_plan(), soc=failed, charge_intent=replace(_INTENT, soc=failed))
+    device = _AmpsDevice({31.0: 38.0, 0.0: 62.5}, settings.battery_voltage_v)
+    _patch_run_once_io(monkeypatch, current, device)
+
+    await run_once(settings, soc=failed, previous_plan=_plan_at(31.0))
+
+    assert device.applied == []
+
+
+async def test_run_forever_compares_against_the_last_applied_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skipped plans must not become the baseline, or 4 A falls never add up (#173)."""
+    previous_seen: list[object] = []
+    plans = [_plan_at(31.0), _plan_at(34.0), _plan_at(40.0), _plan_at(42.0)]
+    amps = {31.0: 38.0, 34.0: 35.0, 40.0: 33.0, 42.0: 31.0}
+    queue = list(plans)
+
+    async def fake_run_once(_s: Settings, **kw: object) -> ChargePlan:
+        previous_seen.append(kw.get("previous_plan"))
+        return queue.pop(0)
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    monkeypatch.setattr(
+        scheduler, "inverter_device", lambda *_a: _AmpsDevice(amps, Settings().battery_voltage_v)
+    )
+    stop = _patch_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 23, 0),  # 38 A applied
+            datetime(2026, 6, 10, 23, 30),  # 35 A: skipped
+            datetime(2026, 6, 11, 0, 0),  # 33 A: 5 A below the applied 38 A
+            datetime(2026, 6, 11, 0, 30),  # 31 A: compared with the applied 33 A
+        ],
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="23:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert previous_seen == [None, plans[0], plans[0], plans[2]]
+
+
 @respx.mock
 async def test_run_once_computes_and_applies_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -164,6 +299,9 @@ async def test_run_once_skips_unchanged_command_after_fresh_soc(
         async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
             reconciled.append(intent)
             return ["[SKIP] set inverter power switch to On (already set)"]
+
+        def planned_rate_w(self, intent: ChargeIntent) -> float:
+            return 1000.0  # same command either side of the fresh SoC
 
     async def noop(*_args: object, **_kwargs: object) -> None:
         return None

@@ -36,6 +36,7 @@ UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
@@ -104,6 +105,43 @@ def _slot_start(now: datetime) -> datetime:
 def should_run(now: datetime, last_run_slot: datetime | None) -> bool:
     """True when the current local half-hour slot has not run successfully."""
     return _slot_start(now) != last_run_slot
+
+
+# Asymmetric deadband on the programmed charge current, in whole register amps
+# (#173): any rise re-applies so the night never undercharges, but a reduction
+# must reach 5 A, so SoC drift does not rewrite the inverter every half hour.
+_CURRENT_RAISE_A = 1
+_CURRENT_LOWER_A = 5
+
+
+def charge_current_changed(applied_a: float, planned_a: float) -> bool:
+    """Whether the planned charge current leaves the deadband around the applied one."""
+    delta = round(planned_a) - round(applied_a)
+    return delta >= _CURRENT_RAISE_A or delta <= -_CURRENT_LOWER_A
+
+
+def needs_apply(
+    previous_plan: ChargePlan | None,
+    intent: ChargeIntent,
+    rate_w: Callable[[ChargeIntent], float],
+    voltage_v: float,
+) -> bool:
+    """Whether ``intent`` must be applied, given the last *applied* plan.
+
+    ``previous_plan`` must be the plan last applied, not the last one computed:
+    a skipped plan never reached the inverter, so it cannot be the baseline the
+    current deadband is measured from (#173). ``rate_w`` is the active device's
+    pure ``planned_rate_w``. The amps are compared only when this plan's SoC is
+    trusted: an untrusted plan is sized from 0% and is refused at the gate anyway.
+    """
+    if previous_plan is None or not previous_plan.soc.ok:
+        return True
+    previous = previous_plan.charge_intent
+    if previous is None or setpoint_changed(previous, intent):
+        return True
+    if not intent.soc.ok or voltage_v <= 0:
+        return False
+    return charge_current_changed(rate_w(previous) / voltage_v, rate_w(intent) / voltage_v)
 
 
 def setpoint_changed(
@@ -199,17 +237,12 @@ async def run_once(
             if reconcile_intent is not None
             else [UNTRUSTED_HOLDS_LINE]
         )
-        if (
-            previous_plan is not None
-            and previous_plan.soc.ok
-            and not setpoint_changed(
-                previous_plan.charge_intent,
-                intent,
-            )
-        ):
-            lines.append("[SKIP] charge setpoint unchanged")
-        else:
+        # Lazy: the rate is only consulted when the setpoint itself is unchanged.
+        rate_w = lambda i: device.planned_rate_w(i)  # noqa: E731
+        if needs_apply(previous_plan, intent, rate_w, settings.battery_voltage_v):
             lines.extend(await device.apply(intent))
+        else:
+            lines.append("[SKIP] charge setpoint unchanged")
         for line in lines:
             log.info(line)
         await publish_plan(rest, plan, settings)
@@ -510,6 +543,21 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
         return None
 
 
+async def _applied(
+    settings: Settings, previous_plan: ChargePlan | None, plan: ChargePlan
+) -> bool:
+    """Whether ``run_once`` applied ``plan``: the same ``needs_apply`` decision (no I/O)."""
+    if plan.charge_intent is None:
+        return False
+    async with HomeAssistantRest(
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+    ) as rest:
+        device = inverter_device(settings, rest)
+        return needs_apply(
+            previous_plan, plan.charge_intent, device.planned_rate_w, settings.battery_voltage_v
+        )
+
+
 async def _planned_rate_w(settings: Settings, plan: ChargePlan) -> float | None:
     """The plan's charge rate (W) for the active charger, or None if unset.
 
@@ -580,6 +628,9 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
         log.exception("Republishing last known states failed")
     last_run_slot: datetime | None = None
     last_plan: ChargePlan | None = None
+    # The plan last sent to the device: the baseline `needs_apply` compares
+    # against. `last_plan` is the latest computed plan, applied or skipped.
+    last_applied_plan: ChargePlan | None = None
     # The previous reconcile pass's lines, so a per-minute pass logs only what
     # changed rather than the same line 1440 times a day.
     last_reconcile_lines: list[str] = []
@@ -602,6 +653,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             if settings is not last_settings:
                 # Never reuse a previous plan's command across a hot reload.
                 last_plan = None
+                last_applied_plan = None
                 last_trusted_holds = None
                 target_w = None
                 last_settings = settings
@@ -626,16 +678,19 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             replanned = False
             if should_run(now, last_run_slot):
                 try:
+                    previous_plan = None if reapply else last_applied_plan
                     plan = await run_once(
                         settings,
                         soc=measurement,
-                        previous_plan=None if reapply else last_plan,
+                        previous_plan=previous_plan,
                         trusted_holds=last_trusted_holds,
                     )
                     replanned = True
                     state.set_plan(plan)
                     last_run_slot = _slot_start(now)
                     last_plan = plan
+                    if await _applied(settings, previous_plan, plan):
+                        last_applied_plan = plan
                     reapply = False
                     if plan.charge_intent is not None and plan.charge_intent.hold_trusted:
                         last_trusted_holds = plan.charge_intent.holds

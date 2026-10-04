@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.19.3
+
+- Solis charge current mid-window (#181): a replan inside the charge window
+  now sizes the current over the time left until the window ends, not the full
+  window. On 2026-10-04 the 03:30 replan programmed 14 A where ~41 A was needed
+  for the 2 h left, and the battery stopped at 60% against a 70% plan. The
+  apply line names the hours used (`... 41 A over 2.0 h of the window`); the
+  62.5 A ceiling is unchanged.
+- Charge current deadband (#173): an unchanged target no longer leaves a stale
+  current programmed as SoC moves. The plan re-applies when the current it
+  needs rises by 1 A or more, or falls by 5 A or more, against the last
+  *applied* current, so small reductions don't rewrite the inverter every half
+  hour but can't add up unseen. Amps are compared only for a trusted SoC.
+
 ## 0.19.2
 
 - SoC freshness (#169): an unchanged SoC is no longer treated as stale while
