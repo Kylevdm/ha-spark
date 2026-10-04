@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Solis simulate safety checks (#175): untrusted SoC, a disallowed or
+  unreadable grid-charge work mode, and an off or unreadable power switch now
+  block simulated actions just as they block real programming, instead of
+  showing actions that cannot be applied safely.
+
 ## 0.19.3
 
 - Solis charge current mid-window (#181): a replan inside the charge window
