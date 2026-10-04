@@ -73,6 +73,7 @@ _OPTION_KEYS = frozenset(
         "profile_history_days",
         "timezone",
         "plan_run_time",
+        "digest_time",
         "backfill_source_entity",
         # Derived base-load (ADR-0001): per-component statistic IDs + invert flags.
         # Grid import is required when any of these are set; the others are
@@ -390,6 +391,9 @@ class Settings(BaseSettings):
     # local half-hour slot.
     plan_run_time: str = Field(default="22:00")
 
+    # Time on the household clock for the once-daily current-plan digest.
+    digest_time: str = Field(default="07:00")
+
     # Statistic whose history seeds `ha-spark backfill-load` (a true-load power
     # or energy sensor); the CLI's --from flag overrides it.
     backfill_source_entity: str = Field(default="")
@@ -540,6 +544,17 @@ class Settings(BaseSettings):
     # Optional V2L budget (kWh) standing in for car SoC; 0 disables the
     # predictive plug-in warning.
     v2l_budget_kwh: float = Field(default=0.0)
+
+    @field_validator("digest_time")
+    @classmethod
+    def _validate_digest_time(cls, value: str) -> str:
+        try:
+            if len(value) != 5 or value[2] != ":":
+                raise ValueError
+            time.fromisoformat(value)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("digest_time must be a valid HH:MM time") from exc
+        return value
 
     @field_validator("solar_percentile", mode="before")
     @classmethod

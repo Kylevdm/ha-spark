@@ -47,6 +47,8 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
 | `outdoor_weather_entity` | Weather entity with a `temperature` attribute (default `weather.home`) for signal recording |
 | `v2l_power_entity` | Optional V2L discharge-power sensor (W); enables the V2L tally (see "V2L" below) |
+| `notify_service` | Shared Home Assistant `notify.<service>` target for notifications, including the morning plan digest |
+| `digest_time` | Household-clock time (`HH:MM`, default `07:00`) after which the current plan is sent once per day through `notify_service`; blank `notify_service` disables it |
 
 ### Solis control
 

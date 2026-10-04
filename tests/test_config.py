@@ -66,6 +66,12 @@ def test_single_ollama_tier_defaults() -> None:
     assert s.db_path.endswith(".db")
 
 
+def test_digest_time_defaults_and_rejects_invalid_value() -> None:
+    assert Settings().digest_time == "07:00"
+    with pytest.raises(ValidationError, match="digest_time"):
+        Settings(digest_time="25:90")
+
+
 def test_load_settings_fails_fast_without_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
