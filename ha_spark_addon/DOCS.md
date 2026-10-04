@@ -30,7 +30,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `solar_tomorrow_entity` | Solcast "forecast tomorrow" sensor (with `detailedForecast` attribute) |
 | `octopus_rate_entity` | Octopus current electricity rate sensor |
 | `dispatch_entity` | Octopus Intelligent dispatching binary sensor |
-| `ev_plug_entity` / `ev_status_entity` | EV charger plug/status sensors |
+| `ev_plug_entity` / `ev_status_entity` | EV charger plug/status sensors; `ev_status_entity` also drives the charging hold |
 | `consumption_energy_entity` | True household load energy statistic (excluding battery/EV charging) |
 | `grid_power_entity` | Optional whole-house supply power sensor (W); enables the supply guard |
 | `charge_current_entity` | Optional inverter timed-charge current `number` entity for dashboard/telemetry (Solis control itself is native; see below) |
@@ -52,7 +52,12 @@ Intelligent, myenergi zappi). Point these at your own entities:
 On the Solis path, ha-spark re-reads dispatch state and reconciles
 `inverter_power_switch_entity` every minute, separately from the half-hourly
 plan. It turns the switch `Off` during an active dispatch hold and `On`
-otherwise. When ha-spark relinquishes control, including during a clean
+otherwise. When `ev_status_entity` is configured, Charging, Boosting and
+Delivering also hold the switch `Off` outside the overnight charge window,
+even without a matching dispatch. Five consecutive clear reads release that
+hold; eco+ Diverting does not start one. Unreadable EV status is ignored for
+the hold and appears as a warning in `ha-spark health`. When ha-spark
+relinquishes control, including during a clean
 shutdown, it writes a safe state: `On`, the configured cheap charge window
 (default `23:30`-`05:30`), and an empty discharge window (`00:00`-`00:00`). If
 dispatch state cannot be trusted, ha-spark will not open a new export window.

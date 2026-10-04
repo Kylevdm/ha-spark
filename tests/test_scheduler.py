@@ -160,7 +160,9 @@ def _patch_run_once_io(
     monkeypatch: pytest.MonkeyPatch, current: ChargePlan, device: object
 ) -> None:
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
-        return SimpleNamespace(plan=current, inputs=object(), load_source="test")
+        return SimpleNamespace(
+            plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test"
+        )
 
     async def noop(*_args: object, **_kwargs: object) -> None:
         return None
@@ -289,7 +291,9 @@ async def test_run_once_skips_unchanged_command_after_fresh_soc(
     current = replace(previous, soc=current_intent.soc, charge_intent=current_intent)
 
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
-        return SimpleNamespace(plan=current, inputs=object(), load_source="test")
+        return SimpleNamespace(
+            plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test"
+        )
 
     class FakeDevice:
         async def apply(self, intent: ChargeIntent) -> list[str]:
@@ -332,7 +336,9 @@ async def test_run_once_retries_after_untrusted_previous_plan(
     current = _plan()
 
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
-        return SimpleNamespace(plan=current, inputs=object(), load_source="test")
+        return SimpleNamespace(
+            plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test"
+        )
 
     class FakeDevice:
         async def apply(self, intent: ChargeIntent) -> list[str]:
@@ -431,6 +437,7 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> ChargePlan:
         calls.append("run")
         if len(calls) == 1:
@@ -557,6 +564,7 @@ async def test_run_forever_publishes_plan_to_api_state(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -587,6 +595,7 @@ async def test_run_forever_guard_ticks_only_inside_window(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -633,6 +642,7 @@ async def test_run_forever_no_guard_when_entity_unset(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -666,6 +676,7 @@ async def test_run_forever_no_guard_when_charger_has_no_live_rate(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -701,6 +712,7 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -847,6 +859,7 @@ async def test_run_forever_samples_signals_every_interval(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> ChargePlan:
         return _plan()
 
@@ -1096,6 +1109,7 @@ def _patch_monitor_loop(
             soc: SocMeasurement | None = None,
             previous_plan: ChargePlan | None = None,
             trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+            ev_hold_state: scheduler.EvHoldState | None = None,
         ) -> ChargePlan:
             run_once_socs.append(soc)
             return _plan()
@@ -1106,6 +1120,7 @@ def _patch_monitor_loop(
             soc: SocMeasurement | None = None,
             previous_plan: ChargePlan | None = None,
             trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+            ev_hold_state: scheduler.EvHoldState | None = None,
         ) -> ChargePlan:
             return _plan()
 
@@ -1385,6 +1400,7 @@ async def test_loop_blocked_plan_rate_never_becomes_guard_target(
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> ChargePlan:
         # A plan computed from the tick's failed measurement: blocked at the
         # charger gate, but still a plan object (existence != applied).
@@ -1570,6 +1586,7 @@ async def test_run_forever_reconciles_every_minute_not_every_slot(
         *,
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> scheduler.ReconcileResult:
         plans.append(plan)
         reconciled.append(now)
@@ -1625,6 +1642,7 @@ async def test_run_forever_does_not_reconcile_twice_on_a_slot_boundary(
         *,
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> scheduler.ReconcileResult:
         reconciled.append(now)
         return scheduler.ReconcileResult([], trusted_holds)
@@ -1766,7 +1784,9 @@ async def test_run_once_reconciles_an_untrusted_plan_against_the_trusted_holds(
     current = _untrusted_plan()
 
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
-        return SimpleNamespace(plan=current, inputs=object(), load_source="test")
+        return SimpleNamespace(
+            plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test"
+        )
 
     class FakeDevice:
         async def apply(self, intent: ChargeIntent) -> list[str]:
@@ -1812,6 +1832,7 @@ async def test_run_forever_remembers_holds_only_from_trusted_plans(
         *,
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> scheduler.ReconcileResult:
         reconcile_saw.append(trusted_holds)
         return scheduler.ReconcileResult([], trusted_holds)
@@ -1846,13 +1867,19 @@ async def test_run_forever_forgets_trusted_holds_on_hot_reload(
     """A reload may change the dispatch source; the old picture is not evidence."""
     captured: list[AppState] = []
     reconcile_saw: list[object] = []
+    ev_states: list[scheduler.EvHoldState] = []
 
     class _CapturingState(AppState):
         def __init__(self, **kw: object) -> None:
             super().__init__(**kw)  # type: ignore[arg-type]
             captured.append(self)
 
-    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+    async def fake_run_once(_s: Settings, **kw: object) -> ChargePlan:
+        state = kw["ev_hold_state"]
+        assert isinstance(state, scheduler.EvHoldState)
+        ev_states.append(state)
+        state.active = True
+        state.not_charging_since = datetime(2026, 6, 10, 21, 55)
         return _plan(replace(_INTENT, holds=(_HOLD,)))
 
     async def fake_reconcile_tick(
@@ -1862,8 +1889,17 @@ async def test_run_forever_forgets_trusted_holds_on_hot_reload(
         *,
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> scheduler.ReconcileResult:
         reconcile_saw.append(trusted_holds)
+        assert ev_hold_state is not None
+        ev_states.append(ev_hold_state)
+        if len(reconcile_saw) == 1:
+            assert ev_hold_state.active is True
+            assert ev_hold_state.not_charging_since == datetime(2026, 6, 10, 21, 55)
+        else:
+            assert ev_hold_state.active is False
+            assert ev_hold_state.not_charging_since is None
         captured[0].settings = Settings(
             ha_url="http://ha.test", ha_token="t", plan_run_time="22:00"
         )
@@ -1890,11 +1926,14 @@ async def test_run_forever_forgets_trusted_holds_on_hot_reload(
         await run_forever(s, poll_seconds=0)
 
     assert reconcile_saw == [(_HOLD,), None]
+    assert ev_states[0] is ev_states[1]
+    assert ev_states[2] is not ev_states[1]
 
 
 # --- #140/#143 §4: the per-minute pass tracks Dave's poll on the HA-entity path ---
 
 _DISPATCH_URL = "http://ha.test/api/states/binary_sensor.dispatch"
+_EV_STATUS_URL = "http://ha.test/api/states/sensor.ev"
 
 
 def _dispatch_state(state: str, dispatches: list[dict[str, str]] | None = None) -> httpx.Response:
@@ -1905,6 +1944,13 @@ def _dispatch_state(state: str, dispatches: list[dict[str, str]] | None = None) 
             "state": state,
             "attributes": {"planned_dispatches": dispatches or []},
         },
+    )
+
+
+def _ev_status_state(state: str) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={"entity_id": "sensor.ev", "state": state, "attributes": {}},
     )
 
 
@@ -2033,6 +2079,384 @@ async def test_an_unset_dispatch_entity_is_not_read_per_minute(
     assert result.trusted_holds is None
 
 
+@pytest.mark.parametrize("status", ["Charging", "Boosting", "Delivering"])
+@respx.mock
+async def test_active_ev_status_holds_the_inverter_without_a_dispatch(
+    monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state(status))
+    now = datetime(2026, 6, 10, 22, 15)
+
+    await scheduler.reconcile_tick(
+        _dispatch_settings(dispatch_entity="", ev_status_entity="sensor.ev"),
+        _plan(replace(_INTENT, holds=())),
+        now,
+        ev_hold_state=scheduler.EvHoldState(),
+    )
+
+    [intent] = device.intents
+    assert intent.hold_active(now) is True
+    assert intent.ev_hold_active is True
+
+
+@pytest.mark.parametrize("mode", ["on", "simulate"])
+@respx.mock
+async def test_ev_hold_uses_the_real_solis_switch_path(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Boosting"))
+    switch_url = "http://ha.test/api/states/select.solisac_power_switch"
+    switch_reads = iter(("On", "Off"))
+    respx.get(switch_url).mock(
+        side_effect=lambda _request: httpx.Response(
+            200,
+            json={
+                "entity_id": "select.solisac_power_switch",
+                "state": next(switch_reads),
+                "attributes": {},
+            },
+        )
+    )
+    switch_write = respx.post(
+        "http://ha.test/api/services/select/select_option"
+    ).mock(return_value=httpx.Response(200, json=[]))
+    settings = _dispatch_settings(
+        dispatch_entity="",
+        ev_status_entity="sensor.ev",
+        inverter_power_switch_entity="select.solisac_power_switch",
+        proactive_mode=mode,
+    )
+
+    result = await scheduler.reconcile_tick(
+        settings,
+        _plan(replace(_INTENT, holds=())),
+        datetime(2026, 6, 10, 22, 15),
+        ev_hold_state=scheduler.EvHoldState(),
+    )
+
+    if mode == "on":
+        assert switch_write.called is True
+        assert json.loads(switch_write.calls[0].request.content) == {
+            "entity_id": "select.solisac_power_switch",
+            "option": "Off",
+        }
+    else:
+        assert switch_write.called is False
+        assert any(
+            "[SIMULATE] would set inverter power switch to Off" in line
+            for line in result.lines
+        )
+
+
+@respx.mock
+async def test_ev_hold_does_not_invent_an_alphaess_hold_write() -> None:
+    ev_status = respx.get(_EV_STATUS_URL).mock(
+        return_value=_ev_status_state("Charging")
+    )
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(
+            inverter="alphaess",
+            dispatch_entity="",
+            ev_status_entity="sensor.ev",
+        ),
+        _plan(replace(_INTENT, holds=())),
+        datetime(2026, 6, 10, 22, 15),
+        ev_hold_state=scheduler.EvHoldState(),
+    )
+
+    assert ev_status.called is True
+    assert result.lines == []
+    assert all(call.request.method == "GET" for call in respx.calls)
+
+
+@respx.mock
+async def test_run_once_applies_the_ev_hold_on_a_replan_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
+    plan = _plan(replace(_INTENT, holds=()))
+
+    async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
+        return SimpleNamespace(
+            plan=plan,
+            inputs=SimpleNamespace(ev_hold_charging=True),
+            load_source="test",
+        )
+
+    async def noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
+    monkeypatch.setattr(scheduler, "publish_plan", noop)
+    monkeypatch.setattr(scheduler, "_record_forecast", noop)
+    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
+    monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
+    switch_url = "http://ha.test/api/states/select.solisac_power_switch"
+    switch_reads = iter(("On", "Off"))
+    respx.get(switch_url).mock(
+        side_effect=lambda _request: httpx.Response(
+            200,
+            json={
+                "entity_id": "select.solisac_power_switch",
+                "state": next(switch_reads),
+                "attributes": {},
+            },
+        )
+    )
+    switch_write = respx.post(
+        "http://ha.test/api/services/select/select_option"
+    ).mock(return_value=httpx.Response(200, json=[]))
+    settings = _dispatch_settings(
+        dispatch_entity="",
+        ev_status_entity="sensor.ev",
+        inverter_power_switch_entity="select.solisac_power_switch",
+        proactive_mode="on",
+    )
+
+    await run_once(
+        settings,
+        previous_plan=plan,
+        ev_hold_state=scheduler.EvHoldState(),
+    )
+
+    assert switch_write.called is True
+    assert json.loads(switch_write.calls[0].request.content) == {
+        "entity_id": "select.solisac_power_switch",
+        "option": "Off",
+    }
+
+
+@respx.mock
+async def test_ev_diversion_does_not_start_a_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Diverting"))
+    now = datetime(2026, 6, 10, 22, 15)
+
+    await scheduler.reconcile_tick(
+        _dispatch_settings(dispatch_entity="", ev_status_entity="sensor.ev"),
+        _plan(replace(_INTENT, holds=())),
+        now,
+        ev_hold_state=scheduler.EvHoldState(),
+    )
+
+    [intent] = device.intents
+    assert intent.hold_active(now) is False
+
+
+def test_ev_hold_releases_on_the_fifth_clear_minute() -> None:
+    started = datetime(2026, 6, 10, 22, 0)
+    state = scheduler.EvHoldState()
+    state = scheduler.next_ev_hold_state(state, True, started, time(23, 30), time(5, 30))
+
+    for minute in range(1, 5):
+        state = scheduler.next_ev_hold_state(
+            state, False, started + timedelta(minutes=minute), time(23, 30), time(5, 30)
+        )
+        assert state.active is True
+
+    state = scheduler.next_ev_hold_state(
+        state, False, started + timedelta(minutes=5), time(23, 30), time(5, 30)
+    )
+    assert state.active is False
+
+
+def test_ev_charging_resets_the_clear_run() -> None:
+    started = datetime(2026, 6, 10, 22, 0)
+    state = scheduler.next_ev_hold_state(
+        scheduler.EvHoldState(), True, started, time(23, 30), time(5, 30)
+    )
+    for minute in (1, 2):
+        state = scheduler.next_ev_hold_state(
+            state, False, started + timedelta(minutes=minute), time(23, 30), time(5, 30)
+        )
+    state = scheduler.next_ev_hold_state(
+        state, True, started + timedelta(minutes=3), time(23, 30), time(5, 30)
+    )
+    assert state.not_charging_since is None
+
+    for minute in range(4, 8):
+        state = scheduler.next_ev_hold_state(
+            state, False, started + timedelta(minutes=minute), time(23, 30), time(5, 30)
+        )
+        assert state.active is True
+    state = scheduler.next_ev_hold_state(
+        state, False, started + timedelta(minutes=8), time(23, 30), time(5, 30)
+    )
+    assert state.active is False
+
+
+def test_ev_hold_is_suppressed_inside_the_overnight_charge_window() -> None:
+    state = scheduler.next_ev_hold_state(
+        scheduler.EvHoldState(),
+        True,
+        datetime(2026, 6, 11, 1, 15),
+        time(23, 30),
+        time(5, 30),
+    )
+
+    assert state.active is False
+
+
+@respx.mock
+async def test_trusted_ev_hold_prevents_relinquishing_after_dispatch_hold_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _RelinquishRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    respx.get(_DISPATCH_URL).mock(return_value=httpx.Response(404))
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Boosting"))
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(ev_status_entity="sensor.ev"),
+        _untrusted_plan(),
+        datetime(2026, 6, 10, 23, 15),
+        trusted_holds=(_HOLD,),
+        ev_hold_state=scheduler.EvHoldState(),
+    )
+
+    assert result.relinquished is False
+    assert device.safe_states == 0
+    assert len(device.reconciled) == 1
+    assert device.reconciled[0].ev_hold_active is True
+    assert result.trusted_holds == (_HOLD,)
+
+
+@pytest.mark.parametrize("failure", ["404", "exception", "unavailable", "unknown"])
+@respx.mock
+async def test_untrusted_ev_status_never_relinquishes_after_dispatch_end(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    device = _RelinquishRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    if failure == "exception":
+        respx.get(_EV_STATUS_URL).mock(side_effect=httpx.ConnectError("offline"))
+    elif failure in {"unavailable", "unknown"}:
+        respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state(failure))
+    else:
+        respx.get(_EV_STATUS_URL).mock(return_value=httpx.Response(404))
+    respx.get(_DISPATCH_URL).mock(return_value=httpx.Response(404))
+    now = datetime(2026, 6, 10, 23, 15)
+    ev_state = scheduler.EvHoldState(active=True)
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(ev_status_entity="sensor.ev"),
+        _untrusted_plan(),
+        now,
+        trusted_holds=(_HOLD,),
+        ev_hold_state=ev_state,
+    )
+
+    assert result.trusted_holds == (_HOLD,)
+    assert result.relinquished is False
+    assert device.safe_states == 0
+    assert device.reconciled == []
+    assert ev_state.active is False
+
+
+@respx.mock
+async def test_octopus_tariff_still_reads_ev_status_each_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    dispatch = respx.get(_DISPATCH_URL).mock(return_value=_dispatch_state("off"))
+    ev_status = respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Charging"))
+    now = datetime(2026, 6, 10, 22, 15)
+
+    await scheduler.reconcile_tick(
+        _dispatch_settings(
+            tariff_provider="octopus_intelligent",
+            dispatch_entity="binary_sensor.dispatch",
+            ev_status_entity="sensor.ev",
+        ),
+        _plan(replace(_INTENT, holds=())),
+        now,
+        ev_hold_state=scheduler.EvHoldState(),
+    )
+
+    assert dispatch.called is False
+    assert ev_status.called is True
+    assert device.intents[0].hold_active(now) is True
+
+
+@respx.mock
+async def test_reconcile_does_not_request_an_unset_ev_status_entity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    any_get = respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    await scheduler.reconcile_tick(
+        _dispatch_settings(dispatch_entity="", ev_status_entity=""),
+        _plan(replace(_INTENT, holds=())),
+        datetime(2026, 6, 10, 22, 15),
+        ev_hold_state=scheduler.EvHoldState(),
+    )
+
+    assert not any_get.called
+
+
+async def test_an_ev_status_entity_down_for_hours_logs_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    now = datetime(2026, 6, 10, 22, 15)
+
+    with respx.mock, caplog.at_level("INFO"):
+        respx.get(_EV_STATUS_URL).mock(return_value=httpx.Response(404))
+        first = await scheduler.reconcile_tick(
+            _dispatch_settings(dispatch_entity="", ev_status_entity="sensor.ev"),
+            _plan(replace(_INTENT, holds=())),
+            now,
+            ev_hold_state=scheduler.EvHoldState(),
+        )
+        await scheduler.reconcile_tick(
+            _dispatch_settings(dispatch_entity="", ev_status_entity="sensor.ev"),
+            _plan(replace(_INTENT, holds=())),
+            now + timedelta(minutes=1),
+            previous=first.lines,
+            ev_hold_state=scheduler.EvHoldState(),
+        )
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name.startswith("ha_spark") and "EV status unreadable" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+
+
+@respx.mock
+async def test_an_inactive_ev_status_does_not_cancel_a_dispatch_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Diverting"))
+    now = datetime(2026, 6, 10, 22, 15)
+
+    await scheduler.reconcile_tick(
+        _dispatch_settings(dispatch_entity="", ev_status_entity="sensor.ev"),
+        _plan(replace(_INTENT, holds=(_HOLD,))),
+        now,
+        trusted_holds=(_HOLD,),
+        ev_hold_state=scheduler.EvHoldState(),
+    )
+
+    [intent] = device.intents
+    assert intent.hold_active(now) is True
+    assert intent.holds == (_HOLD,)
+
+
 async def test_run_forever_keeps_the_holds_a_per_minute_read_trusted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2048,6 +2472,7 @@ async def test_run_forever_keeps_the_holds_a_per_minute_read_trusted(
         *,
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> scheduler.ReconcileResult:
         reconcile_saw.append(trusted_holds)
         return scheduler.ReconcileResult([], (_HOLD,))
@@ -2301,6 +2726,7 @@ async def test_run_forever_reapplies_the_plan_after_a_relinquish(
         *,
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> scheduler.ReconcileResult:
         return scheduler.ReconcileResult([], trusted_holds, relinquished=now == relinquish_at)
 
@@ -2356,6 +2782,7 @@ async def test_run_forever_reconciles_every_tick_while_the_replan_keeps_failing(
         *,
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> scheduler.ReconcileResult:
         reconciled.append(now)
         return scheduler.ReconcileResult([], trusted_holds)
@@ -2405,6 +2832,7 @@ async def test_a_failed_replans_fallback_pass_uses_the_last_plan_and_holds(
         *,
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> scheduler.ReconcileResult:
         reconciled.append((plan, trusted_holds))
         return scheduler.ReconcileResult([], trusted_holds)
@@ -2458,6 +2886,7 @@ async def test_run_forever_reapplies_when_a_fallback_pass_relinquishes(
         *,
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> scheduler.ReconcileResult:
         return scheduler.ReconcileResult([], trusted_holds, relinquished=now == fail_at)
 
@@ -2502,6 +2931,7 @@ async def test_run_forever_syncs_the_inverter_clock_at_a_clock_change_when_opted
         soc: SocMeasurement | None = None,
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
     ) -> ChargePlan:
         return _plan()
 
