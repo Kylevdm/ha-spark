@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.19.5
+
 - Same-day Axle export events (#198): the planning horizon starts at tonight's
   charge window, so from local midnight an evening export event earlier the
   same day fell before it. Every day-of plan skipped it ("it contains no
