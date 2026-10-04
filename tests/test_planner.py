@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
@@ -348,6 +349,159 @@ def test_axle_export_overlapping_charge_window_suppresses_discretionary_charge()
     assert plan.charge_intent.target_soc_pct == plan.soc_now
     # 0.5 kWh house load plus 1.1 kWh export at the 2.2 kW safe ceiling.
     assert plan.reservations[0].energy_kwh == pytest.approx(1.6)
+
+
+# --- same-day events: before tonight's horizon start (#198) ---
+
+_SAME_DAY_EVENT = FlexibilityEvent(
+    start=datetime(2026, 6, 8, 19, 0, tzinfo=UTC),
+    end=datetime(2026, 6, 8, 20, 0, tzinfo=UTC),
+    direction="export",
+    updated_at=datetime(2026, 6, 8, 15, 55, tzinfo=UTC),
+    rate_gbp_kwh=1.0,
+)
+
+
+def _same_day_inputs(
+    *,
+    soc_now: float,
+    now: datetime,
+    event: FlexibilityEvent | None = _SAME_DAY_EVENT,
+) -> PlannerInputs:
+    """0.5 kW house load all day; 16:00 to the 23:30 window drains 3.75 kWh."""
+    return PlannerInputs(
+        soc=_soc(soc_now),
+        solar_tomorrow_kwh=0.0,
+        predicted_home_load_kwh=12.0,
+        pre_window_drain_kwh=3.75,
+        load_slots=(0.25,) * 48,
+        solar_slots=(0.0,) * 48,
+        horizon_start=_HORIZON_START,
+        flexibility_event=event,
+        now=now,
+    )
+
+
+def _same_day_cfg() -> PlannerConfig:
+    return cfg(battery_discharge_ceiling_kw=3.2, dno_export_limit_kw=3.68)
+
+
+def test_same_day_export_is_funded_from_the_live_soc() -> None:
+    """An event earlier than tonight's window is planned from the battery as it is now."""
+    plan = _plan(
+        _same_day_inputs(soc_now=60.0, now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC)),
+        _same_day_cfg(),
+    )
+
+    export = plan.charge_intent.export
+    assert export is not None, [skip.reason for skip in plan.export_skips]
+    assert (export.window_start, export.window_end) == (
+        _SAME_DAY_EVENT.start,
+        _SAME_DAY_EVENT.end,
+    )
+    # 3.2 kW battery ceiling - 0.5 kW house load, under the 3.68 kW DNO limit.
+    assert export.slot_export_kw == pytest.approx((2.7, 2.7))
+    assert plan.export_revenue == pytest.approx(2.7)
+
+
+def test_same_day_export_leaves_tonights_charge_to_refill_what_it_spent() -> None:
+    """Tonight's charge is sized after the export, not zeroed by it."""
+    now = datetime(2026, 6, 8, 16, 0, tzinfo=UTC)
+    without = _plan(_same_day_inputs(soc_now=60.0, now=now, event=None), _same_day_cfg())
+    with_export = _plan(_same_day_inputs(soc_now=60.0, now=now), _same_day_cfg())
+
+    assert with_export.charge_intent.export is not None
+    assert without.required_kwh > 0.0
+    # The 2.7 kWh exported is gone from the battery by the time the window opens.
+    assert with_export.required_kwh == pytest.approx(without.required_kwh + 2.7)
+
+
+def test_same_day_export_keeps_the_slot_in_progress() -> None:
+    """A replan during the event must not shorten or clear the running window."""
+    plan = _plan(
+        _same_day_inputs(soc_now=60.0, now=datetime(2026, 6, 8, 19, 0, 30, tzinfo=UTC)),
+        _same_day_cfg(),
+    )
+
+    export = plan.charge_intent.export
+    assert export is not None, [skip.reason for skip in plan.export_skips]
+    assert export.window_start == _SAME_DAY_EVENT.start
+    assert export.window_end == _SAME_DAY_EVENT.end
+
+
+def test_same_day_export_keeps_its_window_once_a_slot_has_finished() -> None:
+    """At 19:30 the window stays 19:00-20:00, so Slot 1 isn't rewritten mid-event."""
+    plan = _plan(
+        _same_day_inputs(soc_now=60.0, now=datetime(2026, 6, 8, 19, 30, 30, tzinfo=UTC)),
+        _same_day_cfg(),
+    )
+
+    export = plan.charge_intent.export
+    assert export is not None, [skip.reason for skip in plan.export_skips]
+    assert (export.window_start, export.window_end) == (
+        _SAME_DAY_EVENT.start,
+        _SAME_DAY_EVENT.end,
+    )
+    # Only the slot still to come is planned and earns revenue.
+    assert export.selected_slots == (datetime(2026, 6, 8, 19, 30, tzinfo=UTC),)
+
+
+def test_same_day_export_counts_only_what_is_left_of_the_slot_in_progress() -> None:
+    """A mid-slot replan doesn't charge the elapsed part again against the live SoC."""
+    # At 19:15 the 2.7 kW export and 0.5 kW house load have already spent
+    # 0.8 kWh of the 19:00 slot. The remaining need is 0.675 + 0.125 (rest of
+    # the 19:00 slot) + 1.35 + 0.25 (19:30) + 1.75 (20:00-23:30) = 4.15 kWh.
+    # Counting the 19:00 slot in full would need 4.95 kWh and drop it.
+    soc = 20.0 + 4.5 / 26.88 * 100.0  # 4.5 kWh usable
+    plan = _plan(
+        _same_day_inputs(soc_now=soc, now=datetime(2026, 6, 8, 19, 15, tzinfo=UTC)),
+        _same_day_cfg(),
+    )
+
+    export = plan.charge_intent.export
+    assert export is not None, [skip.reason for skip in plan.export_skips]
+    assert export.window_start == _SAME_DAY_EVENT.start
+
+
+def test_same_day_export_refuses_a_slot_with_forecast_daylight() -> None:
+    """Today's solar isn't forecast, so a daylight slot can't be checked against the DNO limit."""
+    daylight_at_19_30 = (0.0,) * 40 + (0.5,) + (0.0,) * 7  # horizon slot 40 is 19:30
+    inputs = replace(
+        _same_day_inputs(soc_now=90.0, now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC)),
+        solar_slots=daylight_at_19_30,
+    )
+
+    plan = _plan(inputs, _same_day_cfg())
+
+    assert plan.charge_intent.export is None
+    assert any("daylight" in skip.reason for skip in plan.export_skips)
+
+
+def test_same_day_export_frees_headroom_for_tonights_charge() -> None:
+    """At the cap, a fill-to-cap night still refills what the event exports."""
+    now = datetime(2026, 6, 8, 16, 0, tzinfo=UTC)
+    fill = replace(_same_day_cfg(), strategy="fill")
+    without = _plan(_same_day_inputs(soc_now=90.0, now=now, event=None), fill)
+    with_export = _plan(_same_day_inputs(soc_now=90.0, now=now), fill)
+
+    assert with_export.charge_intent.export is not None
+    assert with_export.required_kwh == pytest.approx(without.required_kwh + 2.7)
+
+
+def test_same_day_export_skips_when_the_live_soc_cannot_fund_it() -> None:
+    """At 30% only 2.69 kWh is usable: less than the 3.75 kWh house load to 23:30."""
+    plan = _plan(
+        _same_day_inputs(soc_now=30.0, now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC)),
+        _same_day_cfg(),
+    )
+
+    assert plan.charge_intent.export is None
+    assert plan.export_skips
+    assert all(
+        "reserved house or post-event energy" in skip.reason
+        or "a later slot is unavailable" in skip.reason
+        for skip in plan.export_skips
+    )
 
 
 def test_axle_export_skips_a_slot_the_fixed_current_would_push_over_the_dno_limit() -> None:

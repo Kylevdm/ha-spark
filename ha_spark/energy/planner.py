@@ -143,6 +143,10 @@ class _EventSlot(NamedTuple):
     start: datetime
     solar_kw: float
     load_kw: float
+    # Hours of the slot left to export: under 0.5 for the slot in progress.
+    hours: float = 0.5
+    # A skip reason that rules the slot out before any other check.
+    refused: str | None = None
 
 
 def _select_export_suffix(
@@ -176,8 +180,11 @@ def _select_export_suffix(
         held = any(_overlaps(start, end, window) for window in schedule.controlled_windows)
         # House load is already reserved across the entire event, even for a
         # skipped slot. Selecting this slot only consumes export energy.
-        energy = export_kw * 0.5
-        if held:
+        energy = export_kw * slot.hours
+        if slot.refused is not None:
+            contiguous = False
+            skips.append(ExportSkip(start, slot.refused))
+        elif held:
             contiguous = False
             skips.append(
                 ExportSkip(start, "Skipped paid slot: it overlaps an Octopus dispatch hold.")
@@ -242,6 +249,87 @@ def _export_intent(
     )
 
 
+_DAYLIGHT_REFUSAL = (
+    "Skipped paid slot: today's solar isn't forecast, so in daylight the fixed "
+    "discharge command can't be checked against the DNO limit."
+)
+
+
+def _same_day_export_plan(
+    inputs: PlannerInputs,
+    cfg: PlannerConfig,
+    schedule: TariffSchedule,
+    event: FlexibilityEvent,
+    horizon_start: datetime,
+    now: datetime,
+    load_slots: tuple[float, ...],
+) -> tuple[ExportIntent | None, tuple[ExportSkip, ...]]:
+    """Plan an export event that ends before tonight's horizon start (#198).
+
+    The horizon begins at tonight's charge window, so an event later today lies
+    before it, after last night's charge. It is funded from the live SoC: house
+    load from now through the event, plus the buffered load from the event end
+    until the window opens, stays in the battery. Only what is left of the slot
+    in progress counts, so a replan during the event keeps exporting.
+
+    Today's solar isn't forecast: the horizon's profile is tomorrow's. Night
+    looks the same on both days whatever the weather, so a slot is refused
+    wherever tomorrow's forecast shows solar, and the rest are checked against
+    the DNO limit with none. Solar never counts towards funding.
+    """
+    n = len(load_slots)
+    solar_slots = inputs.solar_slots or (0.0,) * n
+
+    def in_event(start: datetime) -> bool:
+        return event.start <= start and start + timedelta(minutes=30) <= event.end
+
+    # The horizon repeats one day's profile from the window start, so the slot
+    # k half-hours before it shares its time of day with horizon slot n - k.
+    day = [
+        (horizon_start - timedelta(minutes=30 * k), load_slots[n - k], solar_slots[n - k])
+        for k in range(n, 0, -1)
+    ]
+    # (start, load kWh, solar kWh, hours left) for each slot not yet over.
+    remaining = [
+        (start, load, solar, min(0.5, (start + timedelta(minutes=30) - now).total_seconds() / 3600))
+        for start, load, solar in day
+        if start + timedelta(minutes=30) > now
+    ]
+    slots = [
+        _EventSlot(start, 0.0, load * 2, hours, _DAYLIGHT_REFUSAL if solar > 1e-9 else None)
+        for start, load, solar, hours in remaining
+        if in_event(start)
+    ]
+    if not slots:
+        return None, (
+            ExportSkip(
+                event.start,
+                "Skipped paid event: no complete slot of it is left before tonight's "
+                "charge window.",
+            ),
+        )
+
+    event_end = slots[-1].start + timedelta(minutes=30)
+    through_event = sum(
+        load * hours * 2 for start, load, _, hours in remaining if start < event_end
+    )
+    post_event = sum(load for start, load, _, _ in remaining if start >= event_end)
+    usable_now = max(0.0, cfg.capacity_kwh * (inputs.soc_now - cfg.min_soc) / 100.0)
+    available = max(
+        0.0, usable_now - through_event - post_event * (1.0 + cfg.buffer_pct / 100.0)
+    )
+    selected, skips = _select_export_suffix(slots, available, cfg, schedule)
+    if not selected:
+        return None, skips
+
+    # Once the event is under way, keep the start it was armed with: dropping a
+    # finished slot changes nothing on the inverter but costs a Slot 1 write.
+    window_start = selected[0][0].start
+    if window_start == slots[0].start:
+        window_start = next(start for start, _, _ in day if in_event(start))
+    return _export_intent(event, cfg, window_start, selected), skips
+
+
 def _event_export_plan(
     inputs: PlannerInputs,
     cfg: PlannerConfig,
@@ -257,6 +345,15 @@ def _event_export_plan(
     event = inputs.flexibility_event
     if event is None or event.direction != "export" or inputs.horizon_start is None:
         return None, (), ()
+    if (
+        inputs.now is not None
+        and inputs.load_slots is not None
+        and event.end <= inputs.horizon_start
+    ):
+        export, skips = _same_day_export_plan(
+            inputs, cfg, schedule, event, inputs.horizon_start, inputs.now, inputs.load_slots
+        )
+        return export, (), skips
 
     event_slots: list[int] = []
     for i in range(len(net)):
@@ -436,13 +533,24 @@ def compute_plan(
     buffered_deficit = deficit * (1.0 + cfg.buffer_pct / 100.0)
     # The horizon starts at the window, so load between now and then drains
     # the battery invisibly — size against the usable energy at window start.
-    usable_at_window = usable_now - inputs.pre_window_drain_kwh
+    # A same-day export (#198) also spends battery before the window opens.
+    same_day_export_kwh = (
+        sum(power * 0.5 for power in export.slot_export_kw)
+        if export is not None
+        and inputs.horizon_start is not None
+        and export.window_end <= inputs.horizon_start
+        else 0.0
+    )
+    usable_at_window = usable_now - inputs.pre_window_drain_kwh - same_day_export_kwh
+    # ...and frees the same room under the cap for tonight's charge.
+    headroom += same_day_export_kwh
     reservation_need = sum(reservation.energy_kwh for reservation in reservations)
     export_overlaps_charge = (
         export is not None
         and inputs.horizon_start is not None
         and any(
-            int((start - inputs.horizon_start).total_seconds() // 1800)
+            0
+            <= int((start - inputs.horizon_start).total_seconds() // 1800)
             < int(schedule.window_hours * 2)
             for start in export.selected_slots
         )
@@ -483,7 +591,7 @@ def compute_plan(
             slot = int((start - inputs.horizon_start).total_seconds() // 1800)
             rate = (
                 schedule.export_prices[slot]
-                if slot < len(schedule.export_prices)
+                if 0 <= slot < len(schedule.export_prices)
                 else (inputs.flexibility_event.rate_gbp_kwh if inputs.flexibility_event else 0.0)
             )
             paid_export_revenue += power_kw * 0.5 * rate
