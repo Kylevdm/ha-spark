@@ -103,6 +103,7 @@ async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) 
     assert inputs.solar_tomorrow_kwh == 8.75
     assert inputs.predicted_home_load_kwh == 24.0
     assert inputs.ev_charging is True
+    assert inputs.ev_hold_charging is True
     assert inputs.ha_template_needed == 19.0
     assert len(inputs.dispatches) == 1
     assert inputs.dispatches[0].source == "SMART"
@@ -805,3 +806,58 @@ async def test_read_dispatches_makes_no_read_for_an_unset_entity() -> None:
         assert await sources.read_dispatches(s, rest) == ((), True)
 
     assert not any_get.called
+
+
+@pytest.mark.parametrize(
+    "state", ["Charging", "cHaRgInG", "Boosting", "bOoStInG", "Delivering", "DELIVERING"]
+)
+@respx.mock
+async def test_read_ev_hold_status_recognizes_charging_states(state: str) -> None:
+    respx.get(f"{BASE}/states/sensor.ev").mock(return_value=_state("sensor.ev", state))
+    settings = _settings()
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        assert await sources.read_ev_hold_status(settings, rest) is True
+
+
+@pytest.mark.parametrize("state", ["Diverting", "Idle", "Paused", "off"])
+@respx.mock
+async def test_read_ev_hold_status_ignores_non_charging_states(state: str) -> None:
+    respx.get(f"{BASE}/states/sensor.ev").mock(return_value=_state("sensor.ev", state))
+    settings = _settings()
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        assert await sources.read_ev_hold_status(settings, rest) is False
+
+
+@pytest.mark.parametrize(
+    "response",
+    [httpx.Response(404), _state("sensor.ev", "unavailable"), _state("sensor.ev", "unknown")],
+    ids=["missing", "unavailable", "unknown"],
+)
+@respx.mock
+async def test_read_ev_hold_status_treats_unreadable_state_as_no_evidence(
+    response: httpx.Response,
+) -> None:
+    respx.get(f"{BASE}/states/sensor.ev").mock(return_value=response)
+    settings = _settings()
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        assert await sources.read_ev_hold_status(settings, rest) is None
+
+
+@respx.mock
+async def test_read_ev_hold_status_makes_no_read_when_entity_is_unset() -> None:
+    any_get = respx.route(method="GET").mock(return_value=httpx.Response(404))
+    settings = _settings().model_copy(update={"ev_status_entity": ""})
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        assert await sources.read_ev_hold_status(settings, rest) is None
+
+    assert not any_get.called
+
+
+@respx.mock
+async def test_read_ev_hold_status_treats_a_connection_error_as_no_evidence() -> None:
+    respx.get(f"{BASE}/states/sensor.ev").mock(
+        side_effect=httpx.ConnectError("Home Assistant is unreachable")
+    )
+    settings = _settings()
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        assert await sources.read_ev_hold_status(settings, rest) is None
