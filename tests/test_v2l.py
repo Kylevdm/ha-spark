@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+import pytest
 import respx
 
 from ha_spark.config import Settings
@@ -16,16 +17,60 @@ from ha_spark.energy.v2l import (
     apply_sample,
     integrate,
     load_session,
+    notification_service,
     notifications,
-    notify,
     payload,
     run_v2l_tick,
     save_session,
     savings,
+    warn_deprecated_notify_target,
 )
-from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.ha.rest import HomeAssistantRest, notify
 
 BASE = "http://ha.test/api"
+
+
+def test_notification_target_prefers_shared_service() -> None:
+    settings = Settings(notify_service="mobile_app_phone", v2l_notify_service="mobile_app_car")
+
+    assert notification_service(settings) == "mobile_app_phone"
+
+
+def test_notification_target_falls_back_to_deprecated_service() -> None:
+    assert notification_service(Settings(v2l_notify_service="mobile_app_car")) == "mobile_app_car"
+
+
+def test_notification_target_is_empty_when_both_options_are_blank() -> None:
+    assert notification_service(Settings()) == ""
+
+
+def test_deprecated_notify_target_warns(caplog: pytest.LogCaptureFixture) -> None:
+    settings = Settings(v2l_notify_service="mobile_app_car")
+
+    with caplog.at_level("WARNING", logger="ha_spark.energy.v2l"):
+        warn_deprecated_notify_target(settings)
+
+    assert "v2l_notify_service is deprecated; use notify_service instead" in caplog.text
+
+
+def test_deprecated_notify_target_is_silent_when_shared_target_is_set(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = Settings(notify_service="mobile_app_phone", v2l_notify_service="mobile_app_car")
+
+    with caplog.at_level("WARNING", logger="ha_spark.energy.v2l"):
+        warn_deprecated_notify_target(settings)
+
+    assert caplog.text == ""
+
+
+def test_deprecated_notify_target_is_silent_when_both_options_are_blank(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="ha_spark.energy.v2l"):
+        warn_deprecated_notify_target(Settings())
+
+    assert caplog.text == ""
 
 
 def test_integrate_rectangle() -> None:
@@ -331,6 +376,94 @@ async def test_run_v2l_tick_integrates_publishes_and_notifies(tmp_path: Path) ->
     paths = [c.request.url.path for c in posts.calls]
     assert any(p.endswith("/services/notify/mobile_app_x") for p in paths)
     assert any("sensor.ha_spark_v2l_energy_kwh" in p for p in paths)
+
+
+@respx.mock
+async def test_run_v2l_tick_uses_shared_notify_service(tmp_path: Path) -> None:
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="token",
+        db_path=str(tmp_path / "ha_spark.db"),
+        v2l_power_entity="sensor.car_v2l_power",
+        notify_service="mobile_app_phone",
+        v2l_cutoff_time="01:00",
+    )
+    respx.get(f"{BASE}/states/sensor.car_v2l_power").mock(
+        return_value=httpx.Response(
+            200, json={"entity_id": "sensor.car_v2l_power", "state": "2000", "attributes": {}}
+        )
+    )
+    notify_route = respx.post(f"{BASE}/services/notify/mobile_app_phone").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    save_session(
+        s,
+        V2LSession(
+            day="2026-06-28", active=True, last_sample_ts="2026-06-28T01:01:00"
+        ),
+    )
+
+    await run_v2l_tick(s, datetime(2026, 6, 28, 1, 5, 0))
+
+    assert notify_route.called
+
+
+@respx.mock
+async def test_run_v2l_tick_shared_service_wins_over_deprecated(
+    tmp_path: Path,
+) -> None:
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="token",
+        db_path=str(tmp_path / "ha_spark.db"),
+        v2l_power_entity="sensor.car_v2l_power",
+        notify_service="mobile_app_phone",
+        v2l_notify_service="mobile_app_car",
+        v2l_cutoff_time="01:00",
+    )
+    respx.get(f"{BASE}/states/sensor.car_v2l_power").mock(
+        return_value=httpx.Response(
+            200, json={"entity_id": "sensor.car_v2l_power", "state": "2000", "attributes": {}}
+        )
+    )
+    posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    save_session(
+        s,
+        V2LSession(day="2026-06-28", active=True, last_sample_ts="2026-06-28T01:01:00"),
+    )
+
+    await run_v2l_tick(s, datetime(2026, 6, 28, 1, 5, 0))
+
+    paths = [call.request.url.path for call in posts.calls]
+    assert any(path.endswith("/services/notify/mobile_app_phone") for path in paths)
+    assert not any(path.endswith("/services/notify/mobile_app_car") for path in paths)
+
+
+@respx.mock
+async def test_run_v2l_tick_makes_no_notify_call_when_both_targets_are_blank(
+    tmp_path: Path,
+) -> None:
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="token",
+        db_path=str(tmp_path / "ha_spark.db"),
+        v2l_power_entity="sensor.car_v2l_power",
+        v2l_cutoff_time="01:00",
+    )
+    respx.get(f"{BASE}/states/sensor.car_v2l_power").mock(
+        return_value=httpx.Response(
+            200, json={"entity_id": "sensor.car_v2l_power", "state": "2000", "attributes": {}}
+        )
+    )
+    posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    save_session(
+        s,
+        V2LSession(day="2026-06-28", active=True, last_sample_ts="2026-06-28T01:01:00"),
+    )
+
+    await run_v2l_tick(s, datetime(2026, 6, 28, 1, 5, 0))
+
+    assert not any("/services/notify/" in call.request.url.path for call in posts.calls)
 
 
 @respx.mock

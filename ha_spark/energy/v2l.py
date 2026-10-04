@@ -18,7 +18,7 @@ from typing import Any
 
 from ha_spark.config import Settings
 from ha_spark.energy.sources import _to_float, parse_time
-from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.ha.rest import HomeAssistantRest, notify
 from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
@@ -118,9 +118,20 @@ def _minutes_after(now: time, cutoff: time) -> float:
     return float((now_m - cut_m) % (24 * 60))
 
 
+def notification_service(settings: Settings) -> str:
+    """Resolve the shared notification target with the deprecated V2L fallback."""
+    return settings.notify_service or settings.v2l_notify_service
+
+
+def warn_deprecated_notify_target(settings: Settings) -> None:
+    """Warn when V2L notifications rely on the deprecated service option."""
+    if not settings.notify_service and settings.v2l_notify_service:
+        log.warning("v2l_notify_service is deprecated; use notify_service instead")
+
+
 def notifications(session: V2LSession, now: datetime, settings: Settings) -> list[Notice]:
     """Return the fire-once notices whose trigger holds (empty if notify off)."""
-    if not settings.v2l_notify_service:
+    if not notification_service(settings):
         return []
 
     out: list[Notice] = []
@@ -252,11 +263,6 @@ def save_session(settings: Settings, session: V2LSession) -> None:
         tmp_path.unlink(missing_ok=True)
 
 
-async def notify(rest: HomeAssistantRest, service: str, title: str, message: str) -> None:
-    """Fire an HA notification via notify.<service>."""
-    await rest.call_service("notify", service, {"title": title, "message": message})
-
-
 async def run_v2l_tick(settings: Settings, now: datetime) -> None:
     """One V2L pass: read, integrate, publish sensors, notify, persist.
 
@@ -284,7 +290,7 @@ async def run_v2l_tick(settings: Settings, now: datetime) -> None:
 
         for notice in notifications(session, now, settings):
             try:
-                await notify(rest, settings.v2l_notify_service, notice.title, notice.message)
+                await notify(rest, notification_service(settings), notice.title, notice.message)
                 setattr(session, notice.flag, True)  # flag only on success
             except Exception:  # noqa: BLE001 - a failed send retries next tick
                 log.warning("V2L notify (%s) failed", notice.flag, exc_info=True)

@@ -82,7 +82,7 @@ from ha_spark.energy.sources import parse_time, read_dispatches, read_ev_hold_st
 from ha_spark.energy.supply_guard import SupplyGuard
 from ha_spark.energy.tariff import _controlled_windows
 from ha_spark.energy.tariff import _in_overnight_window as in_window
-from ha_spark.energy.v2l import run_v2l_tick
+from ha_spark.energy.v2l import run_v2l_tick, warn_deprecated_notify_target
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -680,6 +680,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     with this loop: ``POST /api/config`` rewrites the options and the loop picks
     up the reloaded settings on its next tick (hot reload, no restart).
     """
+    warn_deprecated_notify_target(settings)
     state = AppState(settings=settings, options_path=OPTIONS_PATH)
     server = make_server(build_app(state), "0.0.0.0", INGRESS_PORT)  # noqa: S104 - ingress only
     serve_task: asyncio.Task[None] | None = None

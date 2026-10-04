@@ -30,7 +30,7 @@ from datetime import UTC, datetime, timedelta
 from ha_spark.config import Settings
 from ha_spark.devices import inverter_device
 from ha_spark.devices.inverters.solis import SolisDevice
-from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.ha.rest import HomeAssistantRest, notify
 from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
@@ -119,8 +119,6 @@ async def _notify(settings: Settings, rest: HomeAssistantRest, title: str, messa
     if not settings.notify_service:
         return
     try:
-        await rest.call_service(
-            "notify", settings.notify_service, {"title": title, "message": message}
-        )
+        await notify(rest, settings.notify_service, title, message)
     except Exception:  # noqa: BLE001 - a notice is never a gate
         log.warning("Clock-change notification failed")
