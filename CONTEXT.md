@@ -70,6 +70,12 @@ concept and not a control authority; the planner responds to the prices
 and ha-spark's own drivers actuate. (Decision: Q2 of the 2026-07-12
 grilling session.)
 
+**SoC freshness** — whether a reported SoC can be believed *now*. An unchanged
+SoC is fresh while its source is demonstrably live (a sibling reading from the
+same source reported recently) and the value has not been unchanged beyond a
+hard ceiling. A frozen value from a live source is normal; a frozen source is
+not. "Stale" means there is no evidence the source is live.
+
 **Battery calibration** — the evidence-backed revision of planner input
 estimates such as effective capacity and charge efficiency from a household's
 own history. It is repeatable, rather than a one-time commissioning result:
