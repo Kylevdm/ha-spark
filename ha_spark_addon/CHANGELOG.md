@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- SoC trust publication (#174): SoC-dependent plan sensors become
+  `unavailable` when the measurement is untrusted, while independent forecasts
+  remain numeric. Restart replay also masks older cached values with an
+  untrusted plan status.
 - Solis simulate safety checks (#175): untrusted SoC, a disallowed or
   unreadable grid-charge work mode, and an off or unreadable power switch now
   block simulated actions just as they block real programming, instead of

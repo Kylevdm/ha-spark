@@ -130,10 +130,119 @@ async def test_republish_last_replays_cached_payload(tmp_path: Path) -> None:
         await publish_plan(rest, _plan(), settings)
 
     calls_before = len(respx.calls)
+    cached = json.loads((tmp_path / "ha_spark_published.json").read_text(encoding="utf-8"))
+    cached_by_id = {entity_id: state for entity_id, state, _ in cached}
     async with HomeAssistantRest(BASE, "tok") as rest:
         await republish_last(rest, settings)
 
     assert len(respx.calls) - calls_before == 8
+    assert cached_by_id["sensor.ha_spark_soc_now"] == "40"
+    assert cached_by_id["sensor.ha_spark_charge_needed_kwh"] == "9.60"
+    replayed = {
+        call.request.url.path.rsplit("/", 1)[-1]: json.loads(call.request.content)["state"]
+        for call in respx.calls[calls_before:]
+    }
+    assert replayed["sensor.ha_spark_soc_now"] == "40"
+    assert replayed["sensor.ha_spark_charge_needed_kwh"] == "9.60"
+
+
+@respx.mock
+async def test_untrusted_soc_is_published_and_replayed_as_unavailable(tmp_path: Path) -> None:
+    bad = SocMeasurement(
+        status=SocStatus.STALE,
+        observed_at=datetime.now(UTC),
+        value=70.0,
+        raw_state="70",
+        age_s=746.0,
+        max_age_s=600.0,
+    )
+    plan = _plan(soc=bad, planned_cost=8.25, baseline_cost=10.5)
+    settings = Settings(db_path=str(tmp_path / "ha_spark.db"))
+    payload = plan_to_payload(plan, settings)
+    routes = {
+        entity_id: respx.post(f"{BASE}/states/{entity_id}").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        for entity_id, _, _ in payload
+    }
+
+    async with HomeAssistantRest(BASE, "tok") as rest:
+        await publish_plan(rest, plan, settings)
+
+    cache = json.loads((tmp_path / "ha_spark_published.json").read_text(encoding="utf-8"))
+    cached = {entity_id: state for entity_id, state, _ in cache}
+    calls_before_replay = len(respx.calls)
+    async with HomeAssistantRest(BASE, "tok") as rest:
+        await republish_last(rest, settings)
+
+    replayed = {
+        call.request.url.path.rsplit("/", 1)[-1]: json.loads(call.request.content)["state"]
+        for call in respx.calls[calls_before_replay:]
+    }
+    for entity_id in (
+        "sensor.ha_spark_charge_needed_kwh",
+        "sensor.ha_spark_target_soc",
+        "sensor.ha_spark_soc_now",
+        "sensor.ha_spark_deficit_kwh",
+        "sensor.ha_spark_planned_cost",
+        "sensor.ha_spark_baseline_cost",
+    ):
+        assert json.loads(routes[entity_id].calls[0].request.content)["state"] == "unavailable"
+        assert cached[entity_id] == "unavailable"
+        assert replayed[entity_id] == "unavailable"
+    assert cached["sensor.ha_spark_forecast_load_kwh"] == "10.00"
+    assert cached["sensor.ha_spark_solar_forecast_kwh"] == "5.00"
+    assert replayed["sensor.ha_spark_forecast_load_kwh"] == "10.00"
+    assert replayed["sensor.ha_spark_solar_forecast_kwh"] == "5.00"
+
+
+@respx.mock
+async def test_republish_last_hides_untrusted_values_in_an_older_cache(tmp_path: Path) -> None:
+    bad = SocMeasurement(
+        status=SocStatus.STALE,
+        observed_at=datetime.now(UTC),
+        value=70.0,
+        raw_state="70",
+        age_s=746.0,
+        max_age_s=600.0,
+    )
+    settings = Settings(db_path=str(tmp_path / "ha_spark.db"))
+    old_payload = plan_to_payload(_plan(soc=bad, planned_cost=8.25, baseline_cost=10.5), settings)
+    soc_dependent_states = {
+        "sensor.ha_spark_charge_needed_kwh": "24.19",
+        "sensor.ha_spark_target_soc": "90",
+        "sensor.ha_spark_soc_now": "0",
+        "sensor.ha_spark_deficit_kwh": "24.19",
+        "sensor.ha_spark_planned_cost": "8.25",
+        "sensor.ha_spark_baseline_cost": "10.50",
+    }
+    old_payload = [
+        (entity_id, soc_dependent_states.get(entity_id, state), attributes)
+        for entity_id, state, attributes in old_payload
+    ]
+    (tmp_path / "ha_spark_published.json").write_text(
+        json.dumps(old_payload), encoding="utf-8"
+    )
+    routes = {
+        entity_id: respx.post(f"{BASE}/states/{entity_id}").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        for entity_id, _, _ in old_payload
+    }
+
+    async with HomeAssistantRest(BASE, "tok") as rest:
+        await republish_last(rest, settings)
+
+    for entity_id in soc_dependent_states:
+        assert json.loads(routes[entity_id].calls[0].request.content)["state"] == "unavailable"
+    assert (
+        json.loads(routes["sensor.ha_spark_forecast_load_kwh"].calls[0].request.content)["state"]
+        == "10.00"
+    )
+    assert (
+        json.loads(routes["sensor.ha_spark_solar_forecast_kwh"].calls[0].request.content)["state"]
+        == "5.00"
+    )
 
 
 @respx.mock
@@ -149,12 +258,26 @@ def test_plan_status_publishes_soc_status_and_reason() -> None:
         observed_at=datetime.now(UTC),
         max_age_s=600.0,
     )
-    entities = plan_to_payload(_plan(soc=bad), Settings())
-    attrs = {eid: a for eid, _, a in entities}["sensor.ha_spark_plan_status"]
+    entities = plan_to_payload(
+        _plan(soc=bad, planned_cost=8.25, baseline_cost=10.5), Settings()
+    )
+    by_id = {eid: (state, attrs) for eid, state, attrs in entities}
+    attrs = by_id["sensor.ha_spark_plan_status"][1]
 
     assert attrs["soc_status"] == "read_failed"
     assert attrs["soc_reason"] == bad.reason
     assert "soc_valid" not in attrs
+    for entity_id in (
+        "sensor.ha_spark_charge_needed_kwh",
+        "sensor.ha_spark_target_soc",
+        "sensor.ha_spark_soc_now",
+        "sensor.ha_spark_deficit_kwh",
+        "sensor.ha_spark_planned_cost",
+        "sensor.ha_spark_baseline_cost",
+    ):
+        assert by_id[entity_id][0] == "unavailable"
+    assert by_id["sensor.ha_spark_forecast_load_kwh"][0] == "10.00"
+    assert by_id["sensor.ha_spark_solar_forecast_kwh"][0] == "5.00"
 
 
 def test_plan_status_publishes_ok_status_for_a_checked_soc() -> None:
