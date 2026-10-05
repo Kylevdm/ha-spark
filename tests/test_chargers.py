@@ -275,7 +275,7 @@ async def test_apply_writes_window_block_and_current_natively() -> None:
     _mock_native(slot1=[0] * 8, current="0.0")
     _get_seq(_sensor("timed_charge_current"), ["0.0", f"{expected_a}.0"])
     for field, value in zip(_WINDOW_FIELDS, [23, 30, 5, 30, 0, 0, 0, 0], strict=True):
-        _get_seq(_sensor(field), ["0", "0", str(value)])
+        _get_seq(_sensor(field), ["0"] * 8 + [str(value)])
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(intent)
     # One block write to 43143: charge 23:30-05:30, discharge half zeroed.
@@ -362,10 +362,10 @@ async def test_on_applies_and_verifies_read_back() -> None:
     expected_a = round(solis_current_a(intent, s))
     want = [23, 30, 5, 30, 0, 0, 0, 0]
     _mock_refresh()
-    # Each block sensor: initial active-window check and write-if-changed read
-    # show 0; the bounded fresh read-back sees the target.
+    # Each block sensor: the active-window pre-read and its zero confirmation
+    # stay at 0; the write-if-changed read sees 0, then read-back sees target.
     for field, v in zip(_WINDOW_FIELDS, want, strict=True):
-        _get_seq(_sensor(field), ["0", "0", str(v)])
+        _get_seq(_sensor(field), ["0"] * 8 + [str(v)])
     _get_seq(_sensor("timed_charge_current"), ["0.0", f"{expected_a}.0"])
     _get(_sensor("work_mode_bitfield"), "35")
     for slot in (2, 3):
@@ -457,7 +457,7 @@ async def test_apply_leaves_already_active_window_when_current_verification_fail
     # before the current transition; the current read-back then stays stale.
     _mock_native(slot1=[23, 30, 5, 30, 0, 0, 0, 0], current="60.0")
     for field, value in zip(_WINDOW_FIELDS, [23, 30, 5, 30, 0, 0, 0, 0], strict=True):
-        _get_seq(_sensor(field), [str(value), str(value), "0"])
+        _get_seq(_sensor(field), [str(value), str(value), *(["0"] * 6)])
     _get_seq(_sensor("timed_charge_current"), ["60.0"] * 5)
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(_intent(target_soc=90.0))
