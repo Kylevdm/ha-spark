@@ -58,6 +58,7 @@ options:
   profile_history_days: 60
   timezone: Europe/London
   plan_run_time: "22:00"
+  digest_time: "07:00"
   # Derived base-load (ADR-0001): per-component statistic IDs. Grid import is
   # required when any are set; the others contribute zero with a degradation
   # note when unset. The invert flags are explicit — never inferred.
@@ -158,6 +159,7 @@ schema:
   profile_history_days: int
   timezone: str
   plan_run_time: match(^\d{2}:\d{2}$)
+  digest_time: match(^\d{2}:\d{2}$)
   backfill_source_entity: str?
   derive_grid_import_entity: str?
   derive_grid_export_entity: str?
