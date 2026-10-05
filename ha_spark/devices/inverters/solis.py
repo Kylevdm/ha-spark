@@ -567,7 +567,8 @@ class SolisDevice:
                     want, lambda: self._verify_slot_block(slot, want)
                 )
                 if zero_confirmed is not False:
-                    return True, f"[SKIP] slot {slot} already zeroed"
+                    half = " charge half" if keep_discharge else ""
+                    return True, f"[SKIP] slot {slot}{half} already zeroed"
             await self._write_register(_SLOT_BLOCK_REG[slot], want)
             mismatch = await self._verify_slot_block(slot, want, refresh=True)
         except Exception:  # noqa: BLE001
