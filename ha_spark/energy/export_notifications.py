@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.ha.rest import HomeAssistantRest, notify
 from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
@@ -147,9 +147,7 @@ async def send_once(
     if not service or await store.sent(notice.event_id, notice.transition):
         return False
     try:
-        await rest.call_service(
-            "notify", service, {"title": notice.title, "message": notice.message}
-        )
+        await notify(rest, service, notice.title, notice.message)
     except Exception:  # noqa: BLE001 - notification failure must not affect control
         log.warning("Axle export notification failed (%s)", notice.transition)
         return False

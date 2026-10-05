@@ -267,7 +267,7 @@ planner or the drivers.
 | `v2l_peak_rate_gbp` | £/kWh import rate that V2L saves while it runs (default `0.30`). |
 | `v2l_offpeak_rate_gbp` | £/kWh cheap rate used to refill the car later (default `0.07`). |
 | `v2l_cutoff_time` | Local time the cheap window starts. The unplug notification fires at or after it (default `01:00`). |
-| `v2l_notify_service` | HA `notify.<service>` target (e.g. `mobile_app_x`). Empty means no notifications. |
+| `v2l_notify_service` | Deprecated fallback HA `notify.<service>` target, scheduled for removal. `notify_service` takes precedence; this is used only when `notify_service` is blank. |
 | `v2l_budget_kwh` | Optional V2L budget in kWh, used in place of car SoC (the car has no HA integration, so ha-spark can't read its SoC). `0` disables the plug-in warning. |
 
 Published sensors: `sensor.ha_spark_v2l_power_w` (current discharge power),
@@ -335,13 +335,14 @@ only explicit, fresh export windows. Import events and malformed or stale
 responses produce no export slots. The API key is a `password` option, and
 ha-spark never writes it to logs or reports.
 
-Set `notify_service` to the Home Assistant `notify.<service>` target for the
-export lifecycle notices sent to the person supervising. ha-spark sends one
-notice when it accepts an event, one after a verified export start, one after
-verified cleanup, and one for a terminal abort. It deduplicates notices by
-event and lifecycle step. A notice is never proof that a hardware write
-succeeded. Leave `notify_service` blank to turn the notices off. The supervised
-procedure is in `docs/runbooks/supervised-axle-export.md`.
+Set `notify_service` to the single Home Assistant `notify.<service>` target for
+all notifications, including V2L and export lifecycle notices sent to the
+person supervising. ha-spark sends one notice when it accepts an event, one
+after a verified export start, one after verified cleanup, and one for a
+terminal abort. It deduplicates notices by event and lifecycle step. A notice
+is never proof that a hardware write succeeded. Leave both `notify_service` and
+the deprecated `v2l_notify_service` blank to turn the notices off. The
+supervised procedure is in `docs/runbooks/supervised-axle-export.md`.
 
 On the Solis, an export window fires on the inverter's own clock. ha-spark
 refuses to arm one unless `sensor.<solis_control_hub>_inverter_clock` (add it

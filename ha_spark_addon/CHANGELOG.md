@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Shared notification target (#159): V2L notices now go to `notify_service`,
+  the one target for every ha-spark notification. `v2l_notify_service` remains
+  as a deprecated fallback when `notify_service` is blank, and ha-spark logs a
+  warning at startup when it is used. It will be removed in a later release.
+
 ## 0.19.5
 
 - Same-day Axle export events (#198): the planning horizon starts at tonight's
