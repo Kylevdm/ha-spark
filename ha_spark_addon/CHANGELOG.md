@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Solis zero read-back confirmation (#216): zero current and zero slot targets
+  now need matching reads at least five seconds apart before verification or a
+  write skip succeeds. A mismatch resets confirmation; non-zero targets retain
+  first-match behavior.
+
 ## 0.19.6
 
 - Day-ahead Axle events lost funding at midnight (#206): the horizon now starts

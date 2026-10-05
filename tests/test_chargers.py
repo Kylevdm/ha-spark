@@ -274,8 +274,10 @@ async def test_apply_writes_window_block_and_current_natively() -> None:
     # Current is confirmed before the previously inactive slot is written.
     _mock_native(slot1=[0] * 8, current="0.0")
     _get_seq(_sensor("timed_charge_current"), ["0.0", f"{expected_a}.0"])
+    # Eight zeros cover the first slot read, its six-read confirmation and the
+    # later write-if-changed read; the final sample is the written block.
     for field, value in zip(_WINDOW_FIELDS, [23, 30, 5, 30, 0, 0, 0, 0], strict=True):
-        _get_seq(_sensor(field), ["0", "0", str(value)])
+        _get_seq(_sensor(field), ["0"] * 8 + [str(value)])
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(intent)
     # One block write to 43143: charge 23:30-05:30, discharge half zeroed.
@@ -362,10 +364,10 @@ async def test_on_applies_and_verifies_read_back() -> None:
     expected_a = round(solis_current_a(intent, s))
     want = [23, 30, 5, 30, 0, 0, 0, 0]
     _mock_refresh()
-    # Each block sensor: initial active-window check and write-if-changed read
-    # show 0; the bounded fresh read-back sees the target.
+    # Eight zeros cover the first slot read, its six-read confirmation and the
+    # later write-if-changed read; the final sample is the written block.
     for field, v in zip(_WINDOW_FIELDS, want, strict=True):
-        _get_seq(_sensor(field), ["0", "0", str(v)])
+        _get_seq(_sensor(field), ["0"] * 8 + [str(v)])
     _get_seq(_sensor("timed_charge_current"), ["0.0", f"{expected_a}.0"])
     _get(_sensor("work_mode_bitfield"), "35")
     for slot in (2, 3):
@@ -453,11 +455,11 @@ async def test_apply_leaves_already_active_window_when_current_verification_fail
         "http://ha.test/api/services/homeassistant/update_entity"
     ).mock(return_value=httpx.Response(200, json=[]))
     s = _settings(proactive_mode="on", max_charge_current_a=10.0)
-    # Slot 1 is already active at 60 A. It is zeroed and freshly confirmed
-    # before the current transition; the current read-back then stays stale.
+    # Slot 1 is active at 60 A: two active pre-reads precede the write, then six
+    # matching zero reads confirm it before the current transition.
     _mock_native(slot1=[23, 30, 5, 30, 0, 0, 0, 0], current="60.0")
     for field, value in zip(_WINDOW_FIELDS, [23, 30, 5, 30, 0, 0, 0, 0], strict=True):
-        _get_seq(_sensor(field), [str(value), str(value), "0"])
+        _get_seq(_sensor(field), [str(value), str(value), *(["0"] * 6)])
     _get_seq(_sensor("timed_charge_current"), ["60.0"] * 5)
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(_intent(target_soc=90.0))
