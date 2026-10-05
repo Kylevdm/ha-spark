@@ -217,6 +217,11 @@ one-supervised-event destination.
   state lives. Out of #140 step 5's scope, which only changed the relinquish
   path. Trigger: a read-back mismatch observed persisting across passes in the
   add-on log, or before unattended operation.
+- **Write-count telemetry.** Count writes to 43141/43143 in `solis.py`, so
+  the write rate becomes a measured number instead of an estimate. Research
+  #109 closed without confirming whether these registers are flash-backed.
+  Optional in #131, not done there. Trigger: the backoff above is designed, or
+  before unattended operation.
 
 ### Release and installation observability (2026-09-12)
 

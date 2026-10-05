@@ -95,6 +95,12 @@ event. Repeated polls of the same event do not repeat it.
    Confirm the direction is export and that grid export remains below the DNO
    limit. Capture the command, read-back, battery power, solar power, house
    load, grid power, SoC, and event identity.
+7. Within 1–2 minutes of any charge or export starting, confirm the sign of
+   `sensor.solisac_battery_power`: negative while charging, positive while
+   discharging or exporting. This is the second confirmation on top of register
+   read-back ([#131](https://github.com/Kylevdm/ha-spark/issues/131)). The
+   sensor does not see V2L current, which enters the battery through the R48
+   rectifier, so while V2L runs confirm with BMS current and SoC instead.
 
 The start notice means the production driver saw a successful read-back. It
 does not replace confirmation from telemetry.
