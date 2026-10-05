@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.19.6
+
 - Day-ahead Axle events lost funding at midnight (#206): the horizon now starts
   at the charge window already in progress, so the event remains in the next
   plan after midnight. A same-day window before opening anchors to today's
