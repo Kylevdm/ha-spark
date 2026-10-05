@@ -99,7 +99,8 @@ _CURRENT_SCALE = 10.0
 # the bound is deliberately finite so a stale overlay can never hold the caller.
 _READ_BACK_ATTEMPTS = 16
 _READ_BACK_DELAY_SECONDS = 1.0
-# Five one-second read steps match one 5 s Solis overlay scan interval.
+# Five read steps assume _READ_BACK_DELAY_SECONDS stays at 1.0 s, matching the
+# Solis overlay's 5 s scan interval.
 _ZERO_CONFIRM_GAP_READS = 5
 # Work-mode bitfield: bit 5 (mask 32) == grid charging permitted. A forced grid
 # charge is refused by firmware when this is unset, so assert it, never write it.
@@ -111,6 +112,12 @@ _EXPORT_CURRENT_RAW = 625
 _CLOCK_SYNC_READ_BACK = timedelta(seconds=10)
 T = TypeVar("T")
 ClockSyncOutcome = Literal["synced", "failed", "not_written"]
+
+
+def _is_zero_target(target: float | list[int]) -> bool:
+    if isinstance(target, list):
+        return not any(target)
+    return target == 0
 
 
 @register("solis")
@@ -419,8 +426,12 @@ class SolisDevice:
         )
         want_block = [*charge_values, *discharge_values]
         try:
-            wrote = await self._apply_slot_block(1, want_block)
-            mismatch = await self._verify_slot_block(1, want_block, refresh=wrote)
+            wrote, zero_confirmed = await self._apply_slot_block(1, want_block)
+            mismatch = (
+                None
+                if zero_confirmed
+                else await self._verify_slot_block(1, want_block, refresh=wrote)
+            )
         except Exception:  # noqa: BLE001 - isolate per action
             log.error("[FAILED] %s", desc)
             return f"[FAILED] {desc}"
@@ -441,8 +452,12 @@ class SolisDevice:
         try:
             existing = await self._read_slot_block(1)
             want = existing[:4] + [0, 0, 0, 0]
-            wrote = await self._apply_slot_block(1, want)
-            mismatch = await self._verify_slot_block(1, want, refresh=wrote)
+            wrote, zero_confirmed = await self._apply_slot_block(1, want)
+            mismatch = (
+                None
+                if zero_confirmed
+                else await self._verify_slot_block(1, want, refresh=wrote)
+            )
         except Exception:  # noqa: BLE001 - cleanup is failure-isolated
             log.error("[FAILED] %s", clear_desc)
             return f"[FAILED] {clear_desc}"
@@ -482,7 +497,10 @@ class SolisDevice:
         try:
             active = await self._read_slot_block(1) != zeros
             if not active:
-                active = await self._verify_slot_block(1, zeros) is not None
+                zero_confirmed = await self._confirm_zero_target(
+                    zeros, lambda: self._verify_slot_block(1, zeros)
+                )
+                active = zero_confirmed is not True
         except Exception:  # noqa: BLE001 - do not guess at an active window
             line = f"[FAILED] {current_desc}: slot 1 state unreadable"
             log.error(line)
@@ -527,8 +545,12 @@ class SolisDevice:
         zeros = [0] * len(_WINDOW_FIELDS)
         try:
             current = await self._read_slot_block(slot)
-            if current == zeros and await self._verify_slot_block(slot, zeros) is None:
-                return True, f"[SKIP] slot {slot} already zeroed"
+            if current == zeros:
+                zero_confirmed = await self._confirm_zero_target(
+                    zeros, lambda: self._verify_slot_block(slot, zeros)
+                )
+                if zero_confirmed:
+                    return True, f"[SKIP] slot {slot} already zeroed"
             await self._write_register(_SLOT_BLOCK_REG[slot], zeros)
             mismatch = await self._verify_slot_block(slot, zeros, refresh=True)
         except Exception:  # noqa: BLE001
@@ -553,8 +575,12 @@ class SolisDevice:
         if mode in ("off", "observe"):
             return True, f"[{mode.upper()}] computed: {desc}"
         try:
-            wrote = await self._apply_current(round(amps * _CURRENT_SCALE), amps)
-            mismatch = await self._verify_current(amps, refresh=wrote)
+            wrote, zero_confirmed = await self._apply_current(
+                round(amps * _CURRENT_SCALE), amps
+            )
+            mismatch = (
+                None if zero_confirmed else await self._verify_current(amps, refresh=wrote)
+            )
         except Exception:  # noqa: BLE001 - isolate per write
             log.error("[FAILED] %s", desc)
             return False, f"[FAILED] {desc}"
@@ -710,7 +736,10 @@ class SolisDevice:
                 discharge = kept if export_live and any(kept) else [0, 0, 0, 0]
             want = [*charge, *discharge]
             if resident == want:
-                if any(want) or await self._verify_slot_block(1, want) is None:
+                zero_confirmed = await self._confirm_zero_target(
+                    want, lambda: self._verify_slot_block(1, want)
+                )
+                if zero_confirmed is not False:
                     return f"[SKIP] {desc} (already set)"
             await self._write_register(_SLOT_BLOCK_REG[1], want)
             mismatch = await self._verify_slot_block(1, want, refresh=True)
@@ -1075,22 +1104,38 @@ class SolisDevice:
             {"hub": self._hub, "slave": self._slave, "address": address, "value": value},
         )
 
-    async def _apply_slot_block(self, slot: int, want: list[int]) -> bool:
-        """Write the slot's window block only when it differs; return whether written."""
+    async def _apply_slot_block(self, slot: int, want: list[int]) -> tuple[bool, bool]:
+        """Return whether written and whether a zero was already confirmed."""
         if await self._read_slot_block(slot) == want:
-            if any(want) or await self._verify_slot_block(slot, want) is None:
-                return False
+            zero_confirmed = await self._confirm_zero_target(
+                want, lambda: self._verify_slot_block(slot, want)
+            )
+            if zero_confirmed is not False:
+                return False, zero_confirmed is True
         await self._write_register(_SLOT_BLOCK_REG[slot], want)
-        return True
+        return True, False
 
-    async def _apply_current(self, want_raw: int, amps: float) -> bool:
-        """Write the charge-current register only when it differs; return whether written."""
+    async def _apply_current(self, want_raw: int, amps: float) -> tuple[bool, bool]:
+        """Return whether written and whether a zero was already confirmed."""
         current = await self._read_current_a()
         if abs(current - amps) <= 0.5:
-            if amps != 0 or await self._verify_current(amps) is None:
-                return False
+            zero_confirmed = await self._confirm_zero_target(
+                amps, lambda: self._verify_current(amps)
+            )
+            if zero_confirmed is not False:
+                return False, zero_confirmed is True
         await self._write_register(_CHARGE_CURRENT_REG, want_raw)
-        return True
+        return True, False
+
+    async def _confirm_zero_target(
+        self,
+        target: float | list[int],
+        verify: Callable[[], Awaitable[str | None]],
+    ) -> bool | None:
+        """Return None for non-zero targets, else whether the zero was confirmed."""
+        if not _is_zero_target(target):
+            return None
+        return await verify() is None
 
     async def _apply_discharge_current(self, want_raw: int) -> bool:
         """Write the fixed export current only when its read-back differs."""
@@ -1128,7 +1173,7 @@ class SolisDevice:
             lambda: self._read_slot_block(slot),
             lambda got: got == want,
             lambda got: f"read back slot {slot} {got} (wanted {want})",
-            confirm=all(value == 0 for value in want),
+            zero_target=want,
             refresh_entities=entities if refresh else None,
         )
 
@@ -1137,7 +1182,7 @@ class SolisDevice:
             self._read_current_a,
             lambda got: abs(got - amps) <= 0.5,
             lambda got: f"read back {got:g} A (wanted {amps:g} A)",
-            confirm=amps == 0,
+            zero_target=amps,
             refresh_entities=(self._sensor("timed_charge_current"),) if refresh else None,
         )
 
@@ -1148,7 +1193,7 @@ class SolisDevice:
             self._read_discharge_current_a,
             lambda got: abs(got - amps) <= 0.5,
             lambda got: f"read back discharge {got:g} A (wanted {amps:g} A)",
-            confirm=amps == 0,
+            zero_target=amps,
             refresh_entities=(self._sensor("timed_discharge_current"),) if refresh else None,
         )
 
@@ -1158,7 +1203,7 @@ class SolisDevice:
         matches: Callable[[T], bool],
         describe_mismatch: Callable[[T], str],
         *,
-        confirm: bool = False,
+        zero_target: float | list[int] | None = None,
         refresh_entities: tuple[str, ...] | None = None,
     ) -> str | None:
         """Refresh once, then perform a small bounded read-back observation."""
@@ -1170,6 +1215,7 @@ class SolisDevice:
         mismatch: str | None = None
         last_exc: Exception | None = None
         first_match_at: int | None = None
+        confirm_zero = zero_target is not None and _is_zero_target(zero_target)
         for attempt in range(_READ_BACK_ATTEMPTS):
             try:
                 got = await read()
@@ -1180,7 +1226,7 @@ class SolisDevice:
                 last_exc = None
                 mismatch = None if matches(got) else describe_mismatch(got)
                 if mismatch is None:
-                    if not confirm:
+                    if not confirm_zero:
                         return None
                     if first_match_at is None:
                         first_match_at = attempt
