@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, time, timedelta, tzinfo
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -19,6 +20,7 @@ from ha_spark.energy.tariff import fixed_schedule
 from ha_spark.ha.rest import HomeAssistantRest
 
 BASE = "http://ha.test/api"
+_HOUSEHOLD_TZ = ZoneInfo("Europe/London")
 
 
 def _state(
@@ -65,6 +67,108 @@ def test_build_config_threads_export_limits_to_the_pure_planner() -> None:
     assert cfg.dno_export_limit_kw == 7.36
     assert cfg.supply_max_current_a == 60.0
     assert cfg.supply_voltage_v == 230.0
+
+
+@pytest.mark.parametrize(
+    ("now", "window_start", "window_end", "expected_start", "expected_first_slot"),
+    [
+        pytest.param(
+            datetime(2026, 10, 4, 23, 45, tzinfo=_HOUSEHOLD_TZ),
+            time(23, 30),
+            time(5, 30),
+            datetime(2026, 10, 4, 23, 30, tzinfo=_HOUSEHOLD_TZ),
+            47.0,
+            id="overnight-before-midnight-inside-window",
+        ),
+        pytest.param(
+            datetime(2026, 10, 5, 0, 30, tzinfo=_HOUSEHOLD_TZ),
+            time(23, 30),
+            time(5, 30),
+            datetime(2026, 10, 4, 23, 30, tzinfo=_HOUSEHOLD_TZ),
+            47.0,
+            id="overnight-after-midnight-inside-window",
+        ),
+        pytest.param(
+            datetime(2026, 10, 5, 12, 0, tzinfo=_HOUSEHOLD_TZ),
+            time(23, 30),
+            time(5, 30),
+            datetime(2026, 10, 5, 23, 30, tzinfo=_HOUSEHOLD_TZ),
+            47.0,
+            id="overnight-during-day",
+        ),
+        pytest.param(
+            datetime(2026, 10, 5, 1, 0, tzinfo=_HOUSEHOLD_TZ),
+            time(0, 30),
+            time(4, 30),
+            datetime(2026, 10, 5, 0, 30, tzinfo=_HOUSEHOLD_TZ),
+            1.0,
+            id="same-day-window-inside-window",
+        ),
+        pytest.param(
+            datetime(2026, 10, 5, 6, 0, tzinfo=_HOUSEHOLD_TZ),
+            time(0, 30),
+            time(4, 30),
+            datetime(2026, 10, 6, 0, 30, tzinfo=_HOUSEHOLD_TZ),
+            1.0,
+            id="same-day-window-after-window",
+        ),
+        pytest.param(
+            datetime(2026, 10, 5, 5, 30, tzinfo=_HOUSEHOLD_TZ),
+            time(23, 30),
+            time(5, 30),
+            datetime(2026, 10, 5, 23, 30, tzinfo=_HOUSEHOLD_TZ),
+            47.0,
+            id="overnight-window-end-is-exclusive",
+        ),
+        pytest.param(
+            datetime(2026, 10, 5, 4, 30, tzinfo=_HOUSEHOLD_TZ),
+            time(0, 30),
+            time(4, 30),
+            datetime(2026, 10, 6, 0, 30, tzinfo=_HOUSEHOLD_TZ),
+            1.0,
+            id="same-day-window-end-is-exclusive",
+        ),
+        pytest.param(
+            datetime(2026, 10, 5, 23, 30, tzinfo=_HOUSEHOLD_TZ),
+            time(23, 30),
+            time(5, 30),
+            datetime(2026, 10, 5, 23, 30, tzinfo=_HOUSEHOLD_TZ),
+            47.0,
+            id="overnight-window-start-is-inclusive",
+        ),
+        pytest.param(
+            datetime(2026, 10, 5, 0, 30, tzinfo=_HOUSEHOLD_TZ),
+            time(0, 30),
+            time(4, 30),
+            datetime(2026, 10, 5, 0, 30, tzinfo=_HOUSEHOLD_TZ),
+            1.0,
+            id="same-day-window-start-is-inclusive",
+        ),
+        pytest.param(
+            datetime(2026, 10, 5, 0, 10, tzinfo=_HOUSEHOLD_TZ),
+            time(0, 30),
+            time(4, 30),
+            datetime(2026, 10, 5, 0, 30, tzinfo=_HOUSEHOLD_TZ),
+            1.0,
+            id="same-day-window-before-opening-today",
+        ),
+    ],
+)
+def test_slot_horizon_starts_at_the_running_or_next_charge_window(
+    now: datetime,
+    window_start: time,
+    window_end: time,
+    expected_start: datetime,
+    expected_first_slot: float,
+) -> None:
+    day_slots = tuple(float(i) for i in range(48))
+
+    rotated, horizon_start = sources._slot_horizon(
+        day_slots, window_start, window_end, _HOUSEHOLD_TZ, now
+    )
+
+    assert horizon_start == expected_start
+    assert rotated[0] == expected_first_slot
 
 
 @respx.mock

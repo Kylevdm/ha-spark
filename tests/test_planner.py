@@ -252,6 +252,43 @@ def test_axle_export_reserves_a_full_event_and_the_post_event_cheap_slot() -> No
     assert plan.export_revenue == pytest.approx(3.2)
 
 
+def test_axle_export_after_midnight_uses_the_in_progress_window_horizon() -> None:
+    event = FlexibilityEvent(
+        start=datetime(2026, 6, 9, 20, 0, tzinfo=UTC),
+        end=datetime(2026, 6, 9, 21, 0, tzinfo=UTC),
+        direction="export",
+        updated_at=datetime(2026, 6, 9, 0, 0, tzinfo=UTC),
+        rate_gbp_kwh=1.0,
+    )
+    inputs = PlannerInputs(
+        soc=_soc(20.0),
+        solar_tomorrow_kwh=0.0,
+        predicted_home_load_kwh=24.0,
+        load_slots=(0.5,) * 48,
+        solar_slots=(0.0,) * 48,
+        horizon_start=datetime(2026, 6, 8, 23, 30, tzinfo=UTC),
+        flexibility_event=event,
+        now=datetime(2026, 6, 9, 0, 30, tzinfo=UTC),
+    )
+
+    plan = _plan(
+        inputs,
+        cfg(
+            capacity_kwh=40.0,
+            battery_discharge_ceiling_kw=3.2,
+            dno_export_limit_kw=7.36,
+            supply_max_current_a=75.0,
+            supply_voltage_v=240.0,
+        ),
+    )
+
+    export = plan.charge_intent.export
+    assert export is not None, [skip.reason for skip in plan.export_skips]
+    assert (export.window_start, export.window_end) == (event.start, event.end)
+    assert export.planned_export_kw == pytest.approx(2.2)
+    assert plan.target_soc > plan.soc_now
+
+
 def test_axle_export_underfunding_selects_a_contiguous_suffix_of_full_slots() -> None:
     event = FlexibilityEvent(
         start=datetime(2026, 6, 9, 16, 30, tzinfo=UTC),

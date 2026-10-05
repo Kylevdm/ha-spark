@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Day-ahead Axle events lost funding at midnight (#206): the horizon now starts
+  at the charge window already in progress, so the event remains in the next
+  plan after midnight. A same-day window before opening anchors to today's
+  start.
 - Shared notification target (#159): V2L notices now go to `notify_service`,
   the one target for every ha-spark notification. `v2l_notify_service` remains
   as a deprecated fallback when `notify_service` is blank, and ha-spark logs a
