@@ -154,6 +154,78 @@ class FakeRest:
         return []
 
 
+class SequencedCurrentRest(FakeRest):
+    def __init__(self, readings: list[str]) -> None:
+        super().__init__()
+        self.current_readings = readings
+        self.current_reads = 0
+
+    async def get_state(self, entity_id: str) -> EntityState:
+        if entity_id == "sensor.solis_control_timed_charge_current":
+            reading_index = self.current_reads
+            self.current_reads += 1
+            if reading_index < len(self.current_readings):
+                reading = self.current_readings[reading_index]
+                return EntityState(entity_id=entity_id, state=reading, attributes={})
+            if self.current_readings:
+                reading = self.current_readings[-1]
+                return EntityState(entity_id=entity_id, state=reading, attributes={})
+        return await super().get_state(entity_id)
+
+    async def call_service(
+        self, domain: str, service: str, data: dict[str, object] | None = None
+    ) -> list[EntityState]:
+        result = await super().call_service(domain, service, data)
+        if (
+            domain == "modbus"
+            and service == "write_register"
+            and (data or {}).get("address") == 43141
+        ):
+            self.current_readings = []
+            self.current_reads = 0
+        return result
+
+
+_SLOT_FIELDS = (
+    "timed_charge_start_hours",
+    "timed_charge_start_minutes",
+    "timed_charge_end_hours",
+    "timed_charge_end_minutes",
+    "timed_discharge_start_hours",
+    "timed_discharge_start_minutes",
+    "timed_discharge_end_hours",
+    "timed_discharge_end_minutes",
+)
+
+
+class SequencedSlotBlockRest(FakeRest):
+    def __init__(self, readings: list[list[int]]) -> None:
+        super().__init__()
+        self.block_readings = readings
+        self.block_reads = 0
+        self.current_block: list[int] | None = None
+        self._set_slot([1, 0, 2, 0, 3, 0, 4, 0])
+
+    def _set_slot(self, block: list[int]) -> None:
+        for field, value in zip(_SLOT_FIELDS, block, strict=True):
+            self.states[f"sensor.solis_control_{field}"] = str(value)
+
+    async def get_state(self, entity_id: str) -> EntityState:
+        prefix = "sensor.solis_control_"
+        if entity_id.startswith(prefix) and entity_id[len(prefix) :] in _SLOT_FIELDS:
+            if entity_id.endswith("timed_charge_start_hours"):
+                if self.block_reads < len(self.block_readings):
+                    self.current_block = self.block_readings[self.block_reads]
+                else:
+                    self.current_block = None
+                self.block_reads += 1
+            if self.current_block is not None:
+                field = entity_id[len(prefix) :]
+                value = self.current_block[_SLOT_FIELDS.index(field)]
+                return EntityState(entity_id=entity_id, state=str(value), attributes={})
+        return await super().get_state(entity_id)
+
+
 class StaleDischargeReadback(FakeRest):
     async def call_service(
         self, domain: str, service: str, data: dict[str, object] | None = None
@@ -191,6 +263,172 @@ def _device(
         notify_service=notify_service,
     )
     return SolisDevice(settings.devices[0], settings, rest)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_zero_current_readback_rejects_a_transient_zero(tmp_path) -> None:
+    rest = SequencedCurrentRest(["0", "12"])
+
+    mismatch = await _device(rest, tmp_path)._verify_current(0)
+
+    assert mismatch == "read back 12 A (wanted 0 A)"
+
+
+@pytest.mark.asyncio
+async def test_zero_current_readback_resets_after_mismatch_when_budget_is_too_short(
+    tmp_path,
+) -> None:
+    rest = SequencedCurrentRest(["0", *(["12"] * 10), *(["0"] * 5)])
+
+    mismatch = await _device(rest, tmp_path)._verify_current(0)
+
+    assert mismatch is not None
+    assert rest.current_reads == 16
+
+
+@pytest.mark.asyncio
+async def test_zero_current_readback_passes_after_reset_and_full_held_streak(tmp_path) -> None:
+    rest = SequencedCurrentRest(["0", *(["12"] * 5), *(["0"] * 6)])
+
+    mismatch = await _device(rest, tmp_path)._verify_current(0)
+
+    assert mismatch is None
+    assert rest.current_reads == 12
+
+
+@pytest.mark.asyncio
+async def test_zero_current_readback_accepts_a_held_zero(tmp_path) -> None:
+    rest = SequencedCurrentRest(["0"])
+
+    mismatch = await _device(rest, tmp_path)._verify_current(0)
+
+    assert mismatch is None
+    assert rest.current_reads == 6
+
+
+@pytest.mark.asyncio
+async def test_nonzero_current_readback_keeps_first_match(tmp_path) -> None:
+    rest = SequencedCurrentRest(["62.5", "0"])
+
+    mismatch = await _device(rest, tmp_path)._verify_current(62.5)
+
+    assert mismatch is None
+    assert rest.current_reads == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_zero_on_current_preread_does_not_skip_write(tmp_path) -> None:
+    rest = SequencedCurrentRest(["0", "12"])
+
+    _ok, line = await _device(rest, tmp_path)._set_current_result(0, "zero current")
+
+    assert line == "[APPLIED] zero current"
+    assert any(
+        call[0:2] == ("modbus", "write_register") and call[2]["address"] == 43141
+        for call in rest.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_held_zero_current_is_confirmed_once_before_skipping_write(tmp_path) -> None:
+    rest = SequencedCurrentRest(["0"])
+
+    _ok, line = await _device(rest, tmp_path)._set_current_result(0, "zero current")
+
+    assert line == "[APPLIED] zero current"
+    assert rest.current_reads == 7
+    assert not any(call[0] == "modbus" for call in rest.calls)
+
+
+@pytest.mark.asyncio
+async def test_zero_slot_readback_rejects_a_transient_zero(tmp_path) -> None:
+    rest = SequencedSlotBlockRest([[0] * len(_SLOT_FIELDS)])
+
+    mismatch = await _device(rest, tmp_path)._verify_slot_block(1, [0] * len(_SLOT_FIELDS))
+
+    assert mismatch == f"read back slot 1 {[1, 0, 2, 0, 3, 0, 4, 0]} (wanted {[0] * 8})"
+
+
+@pytest.mark.asyncio
+async def test_zero_slot_readback_accepts_a_held_zero(tmp_path) -> None:
+    rest = FakeRest()
+
+    mismatch = await _device(rest, tmp_path)._verify_slot_block(1, [0] * len(_SLOT_FIELDS))
+
+    assert mismatch is None
+
+
+@pytest.mark.asyncio
+async def test_transient_zero_slot_preread_does_not_skip_zeroing_write(tmp_path) -> None:
+    rest = SequencedSlotBlockRest([[0] * len(_SLOT_FIELDS)])
+
+    ok, line = await _device(rest, tmp_path)._zero_slot(1, "zero slot 1")
+
+    assert ok
+    assert line == "[APPLIED] zero slot 1"
+    assert any(
+        call[0:2] == ("modbus", "write_register") and call[2]["address"] == 43143
+        for call in rest.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_held_zero_slot_preread_skips_only_after_confirmation(tmp_path) -> None:
+    rest = SequencedSlotBlockRest([])
+    rest._set_slot([0] * len(_SLOT_FIELDS))
+
+    ok, line = await _device(rest, tmp_path)._zero_slot(1, "zero slot 1")
+
+    assert ok
+    assert line == "[SKIP] slot 1 already zeroed"
+    assert rest.block_reads == 7
+    assert not any(call[0] == "modbus" for call in rest.calls)
+
+
+@pytest.mark.asyncio
+async def test_transient_zero_generic_slot_preread_does_not_skip_write(tmp_path) -> None:
+    rest = SequencedSlotBlockRest([[0] * len(_SLOT_FIELDS)])
+
+    wrote, _zero_confirmed = await _device(rest, tmp_path)._apply_slot_block(
+        1, [0] * len(_SLOT_FIELDS)
+    )
+
+    assert wrote
+    assert any(
+        call[0:2] == ("modbus", "write_register") and call[2]["address"] == 43143
+        for call in rest.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_held_zero_generic_slot_preread_is_confirmed_once(tmp_path) -> None:
+    rest = SequencedSlotBlockRest([])
+    rest._set_slot([0] * len(_SLOT_FIELDS))
+
+    wrote, zero_confirmed = await _device(rest, tmp_path)._apply_slot_block(
+        1, [0] * len(_SLOT_FIELDS)
+    )
+
+    assert not wrote
+    assert zero_confirmed
+    assert rest.block_reads == 7
+    assert not any(call[0] == "modbus" for call in rest.calls)
+
+
+@pytest.mark.asyncio
+async def test_transient_zero_slot_one_preread_still_deactivates_before_current_change(
+    tmp_path,
+) -> None:
+    rest = SequencedSlotBlockRest([[0] * len(_SLOT_FIELDS)])
+
+    _ok, _line, _deactivation = await _device(rest, tmp_path)._prepare_slot_one_current(
+        _intent()
+    )
+
+    assert any(
+        call[0:2] == ("modbus", "write_register") and call[2]["address"] == 43143
+        for call in rest.calls
+    )
 
 
 @pytest.mark.asyncio
