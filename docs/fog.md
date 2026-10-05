@@ -42,6 +42,8 @@ Closed maps whose **Not yet specified** patches are all marked. Record maps with
 
 <!-- - [Map title](map link) — triaged YYYY-MM-DD: 0 ANSWERED, 0 REHOMED, 0 CARRIED. -->
 
+- [Wayfinder: forced charge on the Solis S5 AC-coupled via native HA timed-slot control](https://github.com/Kylevdm/ha-spark/issues/78) — triaged 2026-10-05: 0 ANSWERED, 0 REHOMED, 0 CARRIED. Both patches sat past the destination and moved to **Deferred efforts**: the unattended cutover to *Unattended operation*, and the flash-endurance measurement to *Register write endurance*.
+
 ## Deferred efforts
 
 Wanted work outside every current map's destination and owned by nobody. An idea that never came from a map belongs here too. Group into subject subsections once there are enough entries to scan; other entries then refer to them by name.
@@ -222,6 +224,40 @@ one-supervised-event destination.
   #109 closed without confirming whether these registers are flash-backed.
   Optional in #131, not done there. Trigger: the backoff above is designed, or
   before unattended operation.
+- **Ask Solis/Ginlong support about 43141/43143 endurance.** Ask them which
+  storage medium these registers use on this firmware family, and what its
+  endurance rating is. This is the one route that could settle research #109,
+  which closed unconfirmed. Moved here from map #78's fog when the map closed
+  (2026-10-05). The map ruled it out of scope because its destination was
+  shipped, verified forced charge. Trigger: none yet.
+
+### Unattended operation (from map #78, 2026-10-05)
+
+- **The unattended cutover has no owner.** This is ADR-0003's full takeover:
+  permanently disable the four mirror automations, set `proactive_mode = on` and
+  retire the incumbent. Supervised commissioning
+  ([#131](https://github.com/Kylevdm/ha-spark/issues/131)) proved that the
+  driver's program lands and reads back, and then returned to `simulate`. It did
+  not show that ha-spark can be left running the inverter. Map
+  [#128](https://github.com/Kylevdm/ha-spark/issues/128) rules unattended
+  operation out of scope, and map
+  [#78](https://github.com/Kylevdm/ha-spark/issues/78) closed with it out of
+  scope. What it needs is the union of #128's deferred SoC-integrity work, the
+  *Axle export loose ends* and *Register write endurance* entries above, and
+  [#110](https://github.com/Kylevdm/ha-spark/issues/110)'s export residual. That
+  residual is three preconditions:
+  (1) something that bounds a resident export window while ha-spark is
+  *absent*, either inverter-side (none is known, because the clock face has no
+  date) or an HA-side watchdog or alert;
+  (2) a second off-switch, with post-event cleanup returning the timed discharge
+  current from 62.5 A to 0;
+  (3) visibility of an executing stale schedule, which only something running
+  inside HA can give while ha-spark is down.
+  Trigger: the paid-event proof
+  ([#134](https://github.com/Kylevdm/ha-spark/issues/134)) has run, and its
+  supervised evidence shows which residuals are real. When it fires, it releases
+  the *before unattended* triggers in *Axle export loose ends* and *Register
+  write endurance*.
 
 ### Release and installation observability (2026-09-12)
 
