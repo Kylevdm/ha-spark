@@ -275,6 +275,28 @@ async def test_zero_current_readback_rejects_a_transient_zero(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_zero_current_readback_resets_after_mismatch_when_budget_is_too_short(
+    tmp_path,
+) -> None:
+    rest = SequencedCurrentRest(["0", *(["12"] * 10), *(["0"] * 5)])
+
+    mismatch = await _device(rest, tmp_path)._verify_current(0)
+
+    assert mismatch is not None
+    assert rest.current_reads == 16
+
+
+@pytest.mark.asyncio
+async def test_zero_current_readback_passes_after_reset_and_full_held_streak(tmp_path) -> None:
+    rest = SequencedCurrentRest(["0", *(["12"] * 5), *(["0"] * 6)])
+
+    mismatch = await _device(rest, tmp_path)._verify_current(0)
+
+    assert mismatch is None
+    assert rest.current_reads == 12
+
+
+@pytest.mark.asyncio
 async def test_zero_current_readback_accepts_a_held_zero(tmp_path) -> None:
     rest = SequencedCurrentRest(["0"])
 
@@ -305,6 +327,17 @@ async def test_transient_zero_on_current_preread_does_not_skip_write(tmp_path) -
         call[0:2] == ("modbus", "write_register") and call[2]["address"] == 43141
         for call in rest.calls
     )
+
+
+@pytest.mark.asyncio
+async def test_held_zero_current_is_confirmed_once_before_skipping_write(tmp_path) -> None:
+    rest = SequencedCurrentRest(["0"])
+
+    _ok, line = await _device(rest, tmp_path)._set_current_result(0, "zero current")
+
+    assert line == "[APPLIED] zero current"
+    assert rest.current_reads == 7
+    assert not any(call[0] == "modbus" for call in rest.calls)
 
 
 @pytest.mark.asyncio
@@ -356,13 +389,30 @@ async def test_held_zero_slot_preread_skips_only_after_confirmation(tmp_path) ->
 async def test_transient_zero_generic_slot_preread_does_not_skip_write(tmp_path) -> None:
     rest = SequencedSlotBlockRest([[0] * len(_SLOT_FIELDS)])
 
-    wrote = await _device(rest, tmp_path)._apply_slot_block(1, [0] * len(_SLOT_FIELDS))
+    wrote, _zero_confirmed = await _device(rest, tmp_path)._apply_slot_block(
+        1, [0] * len(_SLOT_FIELDS)
+    )
 
     assert wrote
     assert any(
         call[0:2] == ("modbus", "write_register") and call[2]["address"] == 43143
         for call in rest.calls
     )
+
+
+@pytest.mark.asyncio
+async def test_held_zero_generic_slot_preread_is_confirmed_once(tmp_path) -> None:
+    rest = SequencedSlotBlockRest([])
+    rest._set_slot([0] * len(_SLOT_FIELDS))
+
+    wrote, zero_confirmed = await _device(rest, tmp_path)._apply_slot_block(
+        1, [0] * len(_SLOT_FIELDS)
+    )
+
+    assert not wrote
+    assert zero_confirmed
+    assert rest.block_reads == 7
+    assert not any(call[0] == "modbus" for call in rest.calls)
 
 
 @pytest.mark.asyncio
