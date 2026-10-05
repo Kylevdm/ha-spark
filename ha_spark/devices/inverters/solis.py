@@ -120,6 +120,16 @@ def _is_zero_target(target: float | list[int]) -> bool:
     return target == 0
 
 
+def _discharge_half(
+    export_window: tuple[datetime, datetime] | None, kept_discharge: list[int] | None
+) -> list[int]:
+    """Slot 1's discharge half: the export window, a kept one, or zeros."""
+    if export_window is not None:
+        start, end = export_window
+        return [start.hour, start.minute, end.hour, end.minute]
+    return kept_discharge or [0, 0, 0, 0]
+
+
 @register("solis")
 class SolisDevice:
     """Solis: native timed-slot charge (modbus overlay) + power-switch hold."""
@@ -265,7 +275,7 @@ class SolisDevice:
             current_line = preserve_line
         elif mode == "on" and blocked is None:
             current_ok, current_line, deactivation_line = await self._prepare_slot_one_current(
-                intent
+                intent, _discharge_half(export if export_ready else None, kept_discharge)
             )
         else:
             current_ok, current_line = await self._write_charge_current_result(intent, blocked)
@@ -414,16 +424,7 @@ class SolisDevice:
                 intent.window_end.hour,
                 intent.window_end.minute,
             ]
-        discharge_values = (
-            [
-                export_window[0].hour,
-                export_window[0].minute,
-                export_window[1].hour,
-                export_window[1].minute,
-            ]
-            if export_window is not None
-            else kept_discharge or [0, 0, 0, 0]
-        )
+        discharge_values = _discharge_half(export_window, kept_discharge)
         want_block = [*charge_values, *discharge_values]
         try:
             wrote, zero_confirmed = await self._apply_slot_block(1, want_block)
@@ -485,9 +486,11 @@ class SolisDevice:
         return await self._set_current_result(amps, desc)
 
     async def _prepare_slot_one_current(
-        self, intent: ChargeIntent
+        self, intent: ChargeIntent, planned_discharge: list[int]
     ) -> tuple[bool, str, str | None]:
-        """Make slot 1 safe before changing its planned charge current."""
+        """Make slot 1 safe before changing its planned charge current.
+
+        ``planned_discharge`` is the discharge half this apply will program."""
         amps = round(solis_current_a(intent, self._settings))
         current_desc = (
             f"set timed charge current to {amps} A over "
@@ -495,7 +498,8 @@ class SolisDevice:
         )
         zeros = [0] * len(_WINDOW_FIELDS)
         try:
-            active = await self._read_slot_block(1) != zeros
+            resident = await self._read_slot_block(1)
+            active = resident != zeros
             if not active:
                 zero_confirmed = await self._confirm_zero_target(
                     zeros, lambda: self._verify_slot_block(1, zeros)
@@ -515,8 +519,16 @@ class SolisDevice:
         except Exception:
             needs_deactivation = True
         if needs_deactivation:
+            # Only the charge half needs deactivating (#218): the planned export
+            # window is kept so a mid-event replan doesn't interrupt it. Kept only
+            # on an exact match, so a misread sensor (#178) is never written back.
+            keep_discharge = None
+            desc = "deactivate timed slot 1 window"
+            if any(planned_discharge) and resident[4:] == planned_discharge:
+                keep_discharge = planned_discharge
+                desc = "deactivate timed slot 1 charge window, keeping its export window"
             deactivated, deactivation_line = await self._zero_slot(
-                1, "deactivate timed slot 1 window"
+                1, desc, keep_discharge=keep_discharge
             )
             if not deactivated:
                 line = f"[BLOCKED] {current_desc}: slot 1 was not safely deactivated"
@@ -535,24 +547,29 @@ class SolisDevice:
         _ok, line = await self._zero_slot(slot, desc)
         return line
 
-    async def _zero_slot(self, slot: int, desc: str) -> tuple[bool, str]:
-        """Zero a slot and confirm it, returning whether zero was confirmed."""
+    async def _zero_slot(
+        self, slot: int, desc: str, *, keep_discharge: list[int] | None = None
+    ) -> tuple[bool, str]:
+        """Zero a slot and confirm it, returning whether zero was confirmed.
+
+        ``keep_discharge`` zeroes only the charge half, writing these four
+        registers back as the discharge half in the same atomic block."""
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         if mode == "simulate":
             return True, f"[SIMULATE] would {desc} (if non-zero)"
         if mode in ("off", "observe"):
             return True, f"[{mode.upper()}] computed: {desc} (if non-zero)"
-        zeros = [0] * len(_WINDOW_FIELDS)
+        want = [0] * 4 + (keep_discharge or [0] * 4)
         try:
             current = await self._read_slot_block(slot)
-            if current == zeros:
+            if current == want:
                 zero_confirmed = await self._confirm_zero_target(
-                    zeros, lambda: self._verify_slot_block(slot, zeros)
+                    want, lambda: self._verify_slot_block(slot, want)
                 )
-                if zero_confirmed:
+                if zero_confirmed is not False:
                     return True, f"[SKIP] slot {slot} already zeroed"
-            await self._write_register(_SLOT_BLOCK_REG[slot], zeros)
-            mismatch = await self._verify_slot_block(slot, zeros, refresh=True)
+            await self._write_register(_SLOT_BLOCK_REG[slot], want)
+            mismatch = await self._verify_slot_block(slot, want, refresh=True)
         except Exception:  # noqa: BLE001
             log.error("[FAILED] %s", desc)
             return False, f"[FAILED] {desc}"

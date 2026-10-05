@@ -6,6 +6,12 @@
   now need matching reads at least five seconds apart before verification or a
   write skip succeeds. A mismatch resets confirmation; non-zero targets retain
   first-match behavior.
+- Mid-event replans no longer interrupt a paid Axle export (#218): a charge
+  current change used to zero the whole Slot 1 block, discharge half included,
+  stopping export for 10–15 s at each replan of the 2026-10-05 event. It now
+  zeroes only the charge half and writes the planned export window back in the
+  same block. The export half is kept only when it reads back exactly as
+  planned; otherwise the whole block is zeroed as before.
 
 ## 0.19.6
 

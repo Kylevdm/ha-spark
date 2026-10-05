@@ -237,6 +237,17 @@ class StaleDischargeReadback(FakeRest):
         return await super().call_service(domain, service, data)
 
 
+class StaleChargeCurrentReadback(FakeRest):
+    async def call_service(
+        self, domain: str, service: str, data: dict[str, object] | None = None
+    ) -> list[EntityState]:
+        payload = data or {}
+        if domain == "modbus" and service == "write_register" and payload.get("address") == 43141:
+            self.calls.append((domain, service, payload))
+            return []
+        return await super().call_service(domain, service, data)
+
+
 class FailedCleanupReadback(FakeRest):
     def __init__(self) -> None:
         super().__init__()
@@ -422,7 +433,7 @@ async def test_transient_zero_slot_one_preread_still_deactivates_before_current_
     rest = SequencedSlotBlockRest([[0] * len(_SLOT_FIELDS)])
 
     _ok, _line, _deactivation = await _device(rest, tmp_path)._prepare_slot_one_current(
-        _intent()
+        _intent(), [0, 0, 0, 0]
     )
 
     assert any(
@@ -1243,3 +1254,73 @@ async def test_simulate_refuses_export_when_the_power_switch_is_off(tmp_path) ->
 
     assert "[SIMULATE] [BLOCKED] export refused: power_switch is 'Off'" in lines
     assert _writes(rest) == []
+
+
+def _set_slot_one(rest: FakeRest, block: list[int]) -> None:
+    for field, value in zip(_SLOT_FIELDS, block, strict=True):
+        rest.states[f"sensor.solis_control_{field}"] = str(value)
+
+
+def _block_writes(rest: FakeRest) -> list[list[int]]:
+    return [
+        list(call[2]["value"])  # type: ignore[call-overload]
+        for call in rest.calls
+        if call[0:2] == ("modbus", "write_register") and call[2]["address"] == 43143
+    ]
+
+
+@pytest.mark.asyncio
+async def test_charge_current_change_keeps_a_live_export_window(tmp_path) -> None:
+    """#218: a charge-current change zeroes only the charge half of Slot 1.
+
+    On the 2026-10-05 event every replan zeroed the whole block, discharge half
+    included, and the paid export stopped for 10-15 s until the window rewrite.
+    """
+    rest = FakeRest()
+    export = _export(hours_ahead=-0.5, duration_h=1.0)
+    discharge = [export.window_start.hour, 0, export.window_end.hour, 0]
+    _set_slot_one(rest, [23, 30, 5, 30, *discharge])
+    rest.states["sensor.solis_control_timed_charge_current"] = "1.0"
+    rest.states["sensor.solis_control_timed_discharge_current"] = "62.5"
+
+    lines = await _device(rest, tmp_path).apply(_intent(export))
+
+    writes = _block_writes(rest)
+    assert writes[0] == [0, 0, 0, 0, *discharge]
+    assert all(block[4:] == discharge for block in writes)
+    assert any(line.startswith("[APPLIED] deactivate timed slot 1 charge") for line in lines)
+    assert any(line.startswith("[APPLIED] set timed charge current") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_failed_current_change_leaves_charge_half_zero_and_export_kept(tmp_path) -> None:
+    """The fail-safe still holds: the old charge window is not left active."""
+    rest = StaleChargeCurrentReadback()
+    export = _export(hours_ahead=-0.5, duration_h=1.0)
+    discharge = [export.window_start.hour, 0, export.window_end.hour, 0]
+    _set_slot_one(rest, [23, 30, 5, 30, *discharge])
+    rest.states["sensor.solis_control_timed_charge_current"] = "1.0"
+    rest.states["sensor.solis_control_timed_discharge_current"] = "62.5"
+
+    lines = await _device(rest, tmp_path).apply(_intent(export))
+
+    assert _block_writes(rest) == [[0, 0, 0, 0, *discharge]]
+    assert next(line for line in lines if "timed charge current" in line).startswith("[WARNING]")
+
+
+@pytest.mark.asyncio
+async def test_misread_discharge_half_is_not_kept(tmp_path) -> None:
+    """A resident discharge half that isn't the planned export is zeroed, not kept.
+
+    One overlay sensor misreading 0 (#178) must not be written back as a
+    longer export window.
+    """
+    rest = FakeRest()
+    export = _export(hours_ahead=-0.5, duration_h=1.0)
+    _set_slot_one(rest, [23, 30, 5, 30, export.window_start.hour, 0, 0, 0])
+    rest.states["sensor.solis_control_timed_charge_current"] = "1.0"
+    rest.states["sensor.solis_control_timed_discharge_current"] = "62.5"
+
+    await _device(rest, tmp_path).apply(_intent(export))
+
+    assert _block_writes(rest)[0] == [0] * 8
