@@ -131,18 +131,35 @@ def _parse_detailed_forecast(
 
 
 def _slot_horizon(
-    day_slots: tuple[float, ...], window_start: time, window_end: time, tz: ZoneInfo
+    day_slots: tuple[float, ...],
+    window_start: time,
+    window_end: time,
+    tz: ZoneInfo,
+    now: datetime,
 ) -> tuple[tuple[float, ...], datetime]:
-    """Rotate slot-of-day values so index 0 is the charge-window start tonight.
+    """Rotate slot-of-day values so index 0 is the running or next window start.
 
     The horizon spans two calendar days but uses one day's profile values
     throughout — adjacent days share a day-type often enough that the error in
-    tonight's pre-midnight slots is negligible.
+    the first day's slots is negligible.
     """
     start_idx = window_start.hour * 2 + window_start.minute // 30
     rotated = tuple(day_slots[(start_idx + i) % SLOTS_PER_DAY] for i in range(SLOTS_PER_DAY))
-    tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
-    origin_date = tomorrow - timedelta(days=1) if window_start >= window_end else tomorrow
+
+    now_time = now.time()
+    if window_start >= window_end:
+        in_window = now_time >= window_start or now_time < window_end
+    else:
+        in_window = window_start <= now_time < window_end
+
+    origin_date = now.date()
+    # Only a wrapping window before its start began yesterday; otherwise use today or next start.
+    if in_window:
+        if window_start >= window_end and now_time < window_start:
+            origin_date -= timedelta(days=1)
+    elif now_time >= window_start:
+        origin_date += timedelta(days=1)
+
     horizon_start = datetime.combine(origin_date, window_start, tzinfo=tz)
     return rotated, horizon_start
 
@@ -400,14 +417,16 @@ async def gather_inputs(
     solar_slots: tuple[float, ...] | None = None
     horizon_start: datetime | None = None
     if forecast.slots is not None:
-        load_slots, horizon_start = _slot_horizon(forecast.slots, window_start, window_end, tz)
-        tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
+        load_slots, horizon_start = _slot_horizon(
+            forecast.slots, window_start, window_end, tz, now
+        )
+        tomorrow = (now + timedelta(days=1)).date()
         detailed = _parse_detailed_forecast(
             solar.attributes.get("detailedForecast") if solar else None,
             settings.solar_percentile,
         )
         solar_day = distribute_solar(solar_kwh, detailed, tz, tomorrow)
-        solar_slots, _ = _slot_horizon(solar_day, window_start, window_end, tz)
+        solar_slots, _ = _slot_horizon(solar_day, window_start, window_end, tz, now)
 
     inputs = PlannerInputs(
         soc=soc_measurement,
