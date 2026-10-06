@@ -59,6 +59,8 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
             f"(DNO limit {export.dno_export_limit_kw:.2f} kW; "
             f"{len(export.selected_slots)} complete slots)"
         )
+        if plan.export_funding is not None:
+            lines.append(f"    {plan.export_funding}")
     if plan.export_skips:
         lines.append("  Skipped paid export slots:")
         for skip in plan.export_skips:
