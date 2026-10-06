@@ -3,7 +3,10 @@
 `run_once` computes and applies a single charge plan (the same path as
 `ha-spark plan --apply`). `run_forever` wakes once a minute and calls
 `run_once` once per local half-hour slot. A failed run is retried on the next
-tick because the completed slot is not recorded until the run succeeds.
+tick because the completed slot is not recorded until the run succeeds. An
+unchanged plan is skipped only while it is known resident: a failed or blocked
+apply, or a run that raised, leaves no baseline, so the next replan applies
+again (#168).
 
 When `grid_power_entity` is set, every tick inside the charge window also runs
 the supply guard: throttle the battery's charge-current setpoint while
@@ -177,6 +180,24 @@ def setpoint_changed(
     )
 
 
+class RunResult(NamedTuple):
+    """One ``run_once``: the plan it computed and the plan now resident on the device."""
+
+    plan: ChargePlan
+    # The baseline the next `needs_apply` compares against: `plan` after a clean
+    # apply, the previous baseline after a skip, and `None` after a failed or
+    # blocked apply, which leaves the device state unknown (#168).
+    applied_plan: ChargePlan | None
+
+
+def _apply_failed(lines: list[str]) -> bool:
+    """Whether an apply's lines report a ``[FAILED]`` or ``[BLOCKED]`` action.
+
+    ``[SIMULATE] [BLOCKED]`` does not count: simulate mode writes nothing.
+    """
+    return any(line.startswith(("[FAILED]", "[BLOCKED]")) for line in lines)
+
+
 async def _record_forecast(settings: Settings, plan: ChargePlan, inputs: PlannerInputs,
                             load_source: str) -> None:
     """Log tonight's forecast for tomorrow so `forecast-eval` can score it later."""
@@ -203,7 +224,7 @@ async def run_once(
     previous_plan: ChargePlan | None = None,
     trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ev_hold_state: EvHoldState | None = None,
-) -> ChargePlan:
+) -> RunResult:
     """Compute the charge plan, log it, and apply it per PROACTIVE_MODE.
 
     ``soc`` is the daemon tick's checked measurement, reused as-is so the
@@ -248,8 +269,11 @@ async def run_once(
         )
         # Lazy: the rate is only consulted when the setpoint itself is unchanged.
         rate_w = lambda i: device.planned_rate_w(i)  # noqa: E731
+        applied_plan = previous_plan
         if needs_apply(previous_plan, intent, rate_w, settings.battery_voltage_v):
-            lines.extend(await device.apply(intent))
+            applied = await device.apply(intent)
+            lines.extend(applied)
+            applied_plan = None if _apply_failed(applied) else plan
         else:
             lines.append("[SKIP] charge setpoint unchanged")
         for line in lines:
@@ -258,7 +282,7 @@ async def run_once(
     await _record_forecast(settings, plan, inputs, load_source)
     await _run_orchestrator(settings)
     await _run_derived_rerive(settings)
-    return plan
+    return RunResult(plan, applied_plan)
 
 
 async def _run_orchestrator(settings: Settings) -> None:
@@ -636,21 +660,6 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
         return None
 
 
-async def _applied(
-    settings: Settings, previous_plan: ChargePlan | None, plan: ChargePlan
-) -> bool:
-    """Whether ``run_once`` applied ``plan``: the same ``needs_apply`` decision (no I/O)."""
-    if plan.charge_intent is None:
-        return False
-    async with HomeAssistantRest(
-        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
-    ) as rest:
-        device = inverter_device(settings, rest)
-        return needs_apply(
-            previous_plan, plan.charge_intent, device.planned_rate_w, settings.battery_voltage_v
-        )
-
-
 async def _planned_rate_w(settings: Settings, plan: ChargePlan) -> float | None:
     """The plan's charge rate (W) for the active charger, or None if unset.
 
@@ -722,8 +731,9 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
         log.exception("Republishing last known states failed")
     last_run_slot: datetime | None = None
     last_plan: ChargePlan | None = None
-    # The plan last sent to the device: the baseline `needs_apply` compares
-    # against. `last_plan` is the latest computed plan, applied or skipped.
+    # The plan known resident on the device: the baseline `needs_apply`
+    # compares against, `None` when unknown after a failed apply or run (#168).
+    # `last_plan` is the latest computed plan, applied or skipped.
     last_applied_plan: ChargePlan | None = None
     # The previous reconcile pass's lines, so a per-minute pass logs only what
     # changed rather than the same line 1440 times a day.
@@ -775,7 +785,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             if should_run(now, last_run_slot):
                 try:
                     previous_plan = None if reapply else last_applied_plan
-                    plan = await run_once(
+                    plan, last_applied_plan = await run_once(
                         settings,
                         soc=measurement,
                         previous_plan=previous_plan,
@@ -786,8 +796,6 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                     state.set_plan(plan)
                     last_run_slot = _slot_start(now)
                     last_plan = plan
-                    if await _applied(settings, previous_plan, plan):
-                        last_applied_plan = plan
                     reapply = False
                     if plan.charge_intent is not None and plan.charge_intent.hold_trusted:
                         last_trusted_holds = plan.charge_intent.holds
@@ -801,6 +809,9 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         # a trusted measurement (#116/#117 add the recompute).
                         target_w = None
                 except Exception:
+                    # It may have raised mid-apply: the device state is unknown,
+                    # so the retry must not skip an unchanged plan (#168).
+                    last_applied_plan = None
                     log.exception("Scheduled plan run failed; will retry next tick")
             # The clock cadence (#143), independent of `setpoint_changed`: the
             # power switch converges within a minute, not at the next plan
