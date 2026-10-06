@@ -2280,17 +2280,25 @@ async def test_an_unreadable_dispatch_entity_per_minute_falls_back_to_the_truste
 
 
 @respx.mock
-async def test_the_octopus_path_never_polls_dispatches_per_minute(
+async def test_the_octopus_path_never_polls_kraken_per_minute(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Per-minute Kraken polling would be 30x the rate Dave's own cap allows."""
+    """Per-minute Kraken polling would be 30x the rate Dave's own cap allows.
+
+    The local HA dispatch entity may be read for its live state (#228); Kraken never is.
+    """
     device = _IntentRecordingDevice()
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+
+    async def forbidden_fetch(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("reconcile must not fetch planned dispatches from Kraken")
+
+    monkeypatch.setattr(sources, "fetch_planned_dispatches", forbidden_fetch)
     route = respx.get(_DISPATCH_URL).mock(return_value=_dispatch_state("off"))
     octopus = respx.route(url__startswith="http://octo.test").mock(
         return_value=httpx.Response(500)
     )
-    plan = _plan(replace(_INTENT, holds=(_HOLD,)))
+    plan = _plan(replace(_INTENT, holds=(_HOLD,), unrated_holds=(_HOLD,)))
 
     result = await scheduler.reconcile_tick(
         _dispatch_settings(
@@ -2304,10 +2312,158 @@ async def test_the_octopus_path_never_polls_dispatches_per_minute(
         trusted_holds=(_HOLD,),
     )
 
-    assert not route.called
+    assert route.called
     assert not octopus.called
     assert device.intents == [plan.charge_intent]
     assert result.trusted_holds == (_HOLD,)
+
+
+@respx.mock
+async def test_octopus_rerates_a_dropped_dispatch_when_the_plug_connects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    start = datetime(2026, 10, 3, 14, 0)
+    end = datetime(2026, 10, 3, 15, 0)
+    respx.get(_DISPATCH_URL).mock(return_value=_dispatch_state("off", []))
+    respx.get(_EV_PLUG_URL).mock(return_value=_ev_status_state("EV Connected"))
+    ev_status = respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused"))
+    respx.get(_OCTOPUS_RATE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "entity_id": "sensor.octopus_rate",
+                "state": "0.20",
+                "attributes": {"is_intelligent_adjusted": False},
+            },
+        )
+    )
+    intent = replace(
+        _INTENT,
+        holds=(),
+        hold_trusted=True,
+        unrated_holds=((start, end),),
+    )
+    settings = _dispatch_settings(
+        tariff_provider="octopus_intelligent",
+        ev_plug_entity="sensor.ev_plug",
+        ev_status_entity="sensor.ev",
+        octopus_rate_entity="sensor.octopus_rate",
+    )
+
+    result = await scheduler.reconcile_tick(
+        settings,
+        _plan(intent),
+        datetime(2026, 10, 3, 14, 15),
+        trusted_holds=(),
+    )
+
+    [fresh] = device.intents
+    assert fresh.holds == ((start, end),)
+    assert fresh.hold_active(datetime(2026, 10, 3, 14, 15)) is True
+    assert result.trusted_holds == ((start, end),)
+    assert ev_status.call_count == 1
+
+
+@respx.mock
+async def test_octopus_rerates_a_kept_dispatch_when_the_plug_disconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    start = datetime(2026, 10, 3, 14, 0)
+    end = datetime(2026, 10, 3, 15, 0)
+    respx.get(_DISPATCH_URL).mock(return_value=_dispatch_state("off", []))
+    plug = respx.get(_EV_PLUG_URL).mock(return_value=_ev_status_state("EV Disconnected"))
+    ev_status = respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused"))
+    rate = respx.get(_OCTOPUS_RATE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "entity_id": "sensor.octopus_rate",
+                "state": "0.20",
+                "attributes": {"is_intelligent_adjusted": False},
+            },
+        )
+    )
+    intent = replace(
+        _INTENT,
+        holds=((start, end),),
+        hold_trusted=True,
+        unrated_holds=((start, end),),
+    )
+    settings = _dispatch_settings(
+        tariff_provider="octopus_intelligent",
+        ev_plug_entity="sensor.ev_plug",
+        ev_status_entity="sensor.ev",
+        octopus_rate_entity="sensor.octopus_rate",
+    )
+
+    result = await scheduler.reconcile_tick(
+        settings,
+        _plan(intent),
+        datetime(2026, 10, 3, 14, 15),
+        trusted_holds=((start, end),),
+    )
+
+    [fresh] = device.intents
+    assert fresh.holds == ()
+    assert fresh.hold_active(datetime(2026, 10, 3, 14, 15)) is False
+    assert result.trusted_holds == ()
+    assert ev_status.call_count == 1
+    assert plug.call_count == 1
+    assert rate.call_count == 1
+
+
+@respx.mock
+async def test_octopus_does_not_rerate_an_untrusted_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    plug = respx.get(_EV_PLUG_URL).mock(return_value=_ev_status_state("EV Connected"))
+    rate = respx.get(_OCTOPUS_RATE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "entity_id": "sensor.octopus_rate",
+                "state": "0.20",
+                "attributes": {"is_intelligent_adjusted": False},
+            },
+        )
+    )
+    ev_status = respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused"))
+    start = datetime(2026, 10, 3, 14, 0)
+    end = datetime(2026, 10, 3, 15, 0)
+    plan = _plan(
+        replace(
+            _INTENT,
+            holds=(),
+            hold_trusted=False,
+            unrated_holds=((start, end),),
+        )
+    )
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(
+            tariff_provider="octopus_intelligent",
+            ev_plug_entity="sensor.ev_plug",
+            ev_status_entity="sensor.ev",
+            octopus_rate_entity="sensor.octopus_rate",
+        ),
+        plan,
+        datetime(2026, 10, 3, 14, 15),
+        trusted_holds=(),
+    )
+
+    [fresh] = device.intents
+    assert fresh.holds == ()
+    assert fresh.hold_trusted is False
+    assert result.trusted_holds == ()
+    assert ev_status.call_count == 1
+    assert plug.called is False
+    assert rate.called is False
 
 
 @respx.mock

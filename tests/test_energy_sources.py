@@ -266,6 +266,9 @@ async def test_disconnected_ev_evidence_drops_dispatch_from_every_planner_use(
         inputs, cfg, _src = await gather_inputs(settings, rest)
 
     assert inputs.dispatches == ()
+    assert len(inputs.unrated_dispatches) == 1
+    assert inputs.unrated_dispatches[0].start == paid_start
+    assert inputs.unrated_dispatches[0].end == paid_end
     dropped = [
         record.getMessage()
         for record in caplog.records
@@ -298,6 +301,7 @@ async def test_disconnected_ev_evidence_drops_dispatch_from_every_planner_use(
     plan = compute_plan(planning_inputs, cfg, schedule)
     assert plan.charge_intent is not None
     assert plan.charge_intent.holds == ()
+    assert plan.charge_intent.unrated_holds == ((paid_start, paid_end),)
     assert plan.charge_intent.export is not None
     assert paid_start in plan.charge_intent.export.selected_slots
     assert all("Octopus dispatch hold" not in skip.reason for skip in plan.export_skips)

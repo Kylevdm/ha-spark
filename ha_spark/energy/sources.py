@@ -518,6 +518,7 @@ async def gather_inputs(
     window_start = parse_time(settings.charge_window_start)
     window_end = parse_time(settings.charge_window_end)
     now = datetime.now(tz)
+    unrated_dispatches = dispatches
     dispatches, dropped_dispatches = partition_dispatches(
         dispatches, evidence_read.evidence, now
     )
@@ -567,6 +568,7 @@ async def gather_inputs(
         horizon_start=horizon_start,
         now=now,
         dynamic_prices=dynamic_prices,
+        unrated_dispatches=unrated_dispatches,
     )
     # Dynamic buffer: when the quantile ML forecast drives the plan, replace the
     # fixed margin with the model's own uncertainty, (P90 - P50) / P50.
