@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -12,7 +13,7 @@ import respx
 
 from ha_spark.config import Settings
 from ha_spark.energy import sources
-from ha_spark.energy.models import FlexibilityEvent, LoadForecast
+from ha_spark.energy.models import DispatchSlot, FlexibilityEvent, LoadForecast
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.sources import build_config, build_schedule, gather_inputs, pre_window_drain
@@ -213,6 +214,252 @@ async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) 
     assert len(inputs.dispatches) == 1
     assert inputs.dispatches[0].source == "SMART"
     assert load_source == "test"
+
+
+@respx.mock
+async def test_disconnected_ev_evidence_drops_dispatch_from_every_planner_use(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    now = datetime.now(UTC)
+    horizon = now.replace(hour=23, minute=30, second=0, microsecond=0)
+    if horizon <= now:
+        horizon += timedelta(days=1)
+    paid_start = horizon + timedelta(hours=17)
+    paid_end = paid_start + timedelta(minutes=30)
+    dispatch = {
+        "start": paid_start.isoformat(),
+        "end": paid_end.isoformat(),
+        "charge_in_kwh": -2.0,
+        "source": "SMART",
+    }
+    respx.get(f"{BASE}/states/sensor.soc").mock(
+        return_value=_state("sensor.soc", "80")
+    )
+    respx.get(f"{BASE}/states/binary_sensor.dispatch").mock(
+        return_value=_state(
+            "binary_sensor.dispatch", "off", {"planned_dispatches": [dispatch]}
+        )
+    )
+    respx.get(f"{BASE}/states/sensor.ev_plug").mock(
+        return_value=_state("sensor.ev_plug", " EV Disconnected ")
+    )
+    respx.get(f"{BASE}/states/sensor.ev").mock(return_value=_state("sensor.ev", "Paused"))
+    respx.get(f"{BASE}/states/sensor.rate").mock(
+        return_value=_state("sensor.rate", "0.20", {"is_intelligent_adjusted": False})
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    settings = _settings().model_copy(
+        update={
+            "tariff_provider": "axle",
+            "ev_plug_entity": "sensor.ev_plug",
+            "octopus_rate_entity": "sensor.rate",
+        }
+    )
+    caplog.set_level("INFO", logger="ha_spark.energy.sources")
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        inputs, cfg, _src = await gather_inputs(settings, rest)
+
+    assert inputs.dispatches == ()
+    dropped = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "ha_spark.energy.sources"
+        and "Dropped contradicted dispatch" in record.getMessage()
+    ]
+    assert len(dropped) == 1
+    assert paid_start.isoformat() in dropped[0]
+    assert paid_end.isoformat() in dropped[0]
+    assert "EV plug: EV Disconnected" in dropped[0]
+    event = FlexibilityEvent(
+        start=paid_start,
+        end=paid_end,
+        direction="export",
+        updated_at=now,
+        rate_gbp_kwh=1.0,
+    )
+    planning_inputs = replace(
+        inputs,
+        load_slots=(0.0,) * 48,
+        solar_slots=(0.0,) * 48,
+        horizon_start=horizon,
+        flexibility_event=event,
+    )
+    schedule = build_schedule(settings, planning_inputs, cfg)
+    paid_slot_index = int((paid_start - horizon).total_seconds() // 1800)
+    assert schedule.controlled_windows == ()
+    assert schedule.cheap_fracs[paid_slot_index] == 0.0
+
+    plan = compute_plan(planning_inputs, cfg, schedule)
+    assert plan.charge_intent is not None
+    assert plan.charge_intent.holds == ()
+    assert plan.charge_intent.export is not None
+    assert paid_start in plan.charge_intent.export.selected_slots
+    assert all("Octopus dispatch hold" not in skip.reason for skip in plan.export_skips)
+
+
+@pytest.mark.parametrize(
+    ("dispatch_state", "extra_attributes", "expected_count"),
+    [("on", {}, 1), ("off", {"current_start": "2026-10-03T14:00:00"}, 0)],
+    ids=["entity-on", "off-with-leftover-current-start"],
+)
+@respx.mock
+async def test_live_dispatch_beats_disconnected_plug_in_gather_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    dispatch_state: str,
+    extra_attributes: dict[str, str],
+    expected_count: int,
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    now = datetime.now(UTC)
+    slot = {
+        "start": (now + timedelta(hours=1)).isoformat(),
+        "end": (now + timedelta(hours=2)).isoformat(),
+    }
+    respx.get(f"{BASE}/states/binary_sensor.dispatch").mock(
+        return_value=_state(
+            "binary_sensor.dispatch",
+            dispatch_state,
+            {"planned_dispatches": [slot], **extra_attributes},
+        )
+    )
+    respx.get(f"{BASE}/states/sensor.ev_plug").mock(
+        return_value=_state("sensor.ev_plug", "EV Disconnected")
+    )
+    respx.get(f"{BASE}/states/sensor.ev").mock(return_value=_state("sensor.ev", "Paused"))
+    respx.get(f"{BASE}/states/sensor.rate").mock(
+        return_value=_state("sensor.rate", "0.20", {"is_intelligent_adjusted": False})
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    settings = _settings().model_copy(
+        update={"ev_plug_entity": "sensor.ev_plug", "octopus_rate_entity": "sensor.rate"}
+    )
+
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        inputs, _cfg, _src = await gather_inputs(settings, rest)
+
+    assert len(inputs.dispatches) == expected_count
+    dispatch_reads = [
+        call
+        for call in respx.calls
+        if str(call.request.url).endswith("/states/binary_sensor.dispatch")
+    ]
+    assert len(dispatch_reads) == 1
+
+
+@pytest.mark.parametrize(
+    ("adjusted_value", "expected_count"),
+    [(True, 1), (" TRUE ", 1), (False, 0), ("yes", 0), (1, 0)],
+    ids=["bool-true", "string-true", "bool-false", "other-string", "integer"],
+)
+@respx.mock
+async def test_adjusted_rate_evidence_is_strictly_coerced(
+    monkeypatch: pytest.MonkeyPatch, adjusted_value: object, expected_count: int
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    now = datetime.now(UTC)
+    slot = {
+        "start": (now + timedelta(hours=1)).isoformat(),
+        "end": (now + timedelta(hours=2)).isoformat(),
+    }
+    respx.get(f"{BASE}/states/binary_sensor.dispatch").mock(
+        return_value=_state(
+            "binary_sensor.dispatch", "off", {"planned_dispatches": [slot]}
+        )
+    )
+    respx.get(f"{BASE}/states/sensor.ev_plug").mock(
+        return_value=_state("sensor.ev_plug", "EV Disconnected")
+    )
+    respx.get(f"{BASE}/states/sensor.ev").mock(return_value=_state("sensor.ev", "Paused"))
+    respx.get(f"{BASE}/states/sensor.rate").mock(
+        return_value=_state(
+            "sensor.rate", "0.20", {"is_intelligent_adjusted": adjusted_value}
+        )
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    settings = _settings().model_copy(
+        update={"ev_plug_entity": "sensor.ev_plug", "octopus_rate_entity": "sensor.rate"}
+    )
+
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        inputs, _cfg, _src = await gather_inputs(settings, rest)
+
+    assert len(inputs.dispatches) == expected_count
+
+
+@pytest.mark.parametrize(
+    ("adjusted_value", "expected"),
+    [(True, True), (" true ", True), (False, False), ("yes", False), (1, False), (None, None)],
+    ids=["bool-true", "string-true", "bool-false", "other-string", "integer", "unset"],
+)
+@respx.mock
+async def test_dispatch_evidence_reader_coerces_adjusted_rate(
+    adjusted_value: object, expected: bool | None
+) -> None:
+    respx.get(f"{BASE}/states/sensor.rate").mock(
+        return_value=_state(
+            "sensor.rate", "0.20", {"is_intelligent_adjusted": adjusted_value}
+        )
+    )
+    settings = _settings().model_copy(
+        update={
+            "ev_plug_entity": "",
+            "ev_status_entity": "",
+            "octopus_rate_entity": "sensor.rate",
+        }
+    )
+    slot = DispatchSlot(datetime(2026, 10, 3, 14, 0), datetime(2026, 10, 3, 15, 0))
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        reading = await sources.read_dispatch_evidence(
+            settings, rest, planned_dispatches=(slot,), live_dispatch=False
+        )
+
+    assert reading.evidence.rate_adjusted is expected
+
+
+@respx.mock
+async def test_gather_inputs_skips_plug_and_rate_reads_without_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    plug = respx.get(f"{BASE}/states/sensor.ev_plug").mock(
+        return_value=_state("sensor.ev_plug", "EV Connected")
+    )
+    rate = respx.get(f"{BASE}/states/sensor.rate").mock(
+        return_value=_state("sensor.rate", "0.20", {"is_intelligent_adjusted": False})
+    )
+    ev_status = respx.get(f"{BASE}/states/sensor.ev").mock(
+        return_value=_state("sensor.ev", "Paused")
+    )
+    respx.get(f"{BASE}/states/binary_sensor.dispatch").mock(
+        return_value=_state("binary_sensor.dispatch", "off", {"planned_dispatches": []})
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    settings = _settings().model_copy(
+        update={"ev_plug_entity": "sensor.ev_plug", "octopus_rate_entity": "sensor.rate"}
+    )
+
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        inputs, _cfg, _src = await gather_inputs(settings, rest)
+
+    assert inputs.dispatches == ()
+    assert ev_status.call_count == 1
+    assert plug.called is False
+    assert rate.called is False
 
 
 @respx.mock
@@ -697,6 +944,70 @@ async def test_gather_inputs_octopus_intelligent_fetches_dispatches_and_prices(
     assert [p.price for p in inputs.dynamic_prices] == [0.12]
 
 
+@pytest.mark.parametrize(
+    ("live_state", "expected_count"), [("off", 0), ("on", 1)],
+    ids=["disconnected-without-live-dispatch", "live-dispatch-beats-disconnection"],
+)
+@respx.mock
+async def test_octopus_dispatches_use_configured_ha_live_evidence(
+    monkeypatch: pytest.MonkeyPatch, live_state: str, expected_count: int
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    now = datetime.now(UTC)
+    start = now + timedelta(hours=1)
+    end = start + timedelta(minutes=30)
+    respx.post("http://octo.test/v1/graphql/").mock(
+        side_effect=[
+            httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": "jwt-test"}}}),
+            httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "plannedDispatches": [
+                            {
+                                "startDt": start.isoformat(),
+                                "endDt": end.isoformat(),
+                                "delta": -2.0,
+                                "meta": {"source": "smart-charge"},
+                            }
+                        ]
+                    }
+                },
+            ),
+        ]
+    )
+    respx.get(url__startswith="http://octo.test/v1/products/").mock(
+        return_value=httpx.Response(200, json={"next": None, "results": []})
+    )
+    respx.get(f"{BASE}/states/binary_sensor.dispatch").mock(
+        return_value=_state(
+            "binary_sensor.dispatch", live_state, {"planned_dispatches": "malformed"}
+        )
+    )
+    respx.get(f"{BASE}/states/sensor.ev_plug").mock(
+        return_value=_state("sensor.ev_plug", "EV Disconnected")
+    )
+    respx.get(f"{BASE}/states/sensor.ev").mock(return_value=_state("sensor.ev", "Paused"))
+    respx.get(f"{BASE}/states/sensor.rate").mock(
+        return_value=_state("sensor.rate", "0.20", {"is_intelligent_adjusted": False})
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    settings = _octopus_settings(
+        dispatch_entity="binary_sensor.dispatch",
+        ev_plug_entity="sensor.ev_plug",
+        ev_status_entity="sensor.ev",
+        octopus_rate_entity="sensor.rate",
+    )
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        inputs, _cfg, _src = await gather_inputs(settings, rest)
+
+    assert len(inputs.dispatches) == expected_count
+
+
 @respx.mock
 async def test_gather_inputs_octopus_intelligent_degrades_on_api_failure(
     monkeypatch: pytest.MonkeyPatch,
@@ -720,10 +1031,10 @@ async def test_gather_inputs_octopus_intelligent_degrades_on_api_failure(
     assert build_schedule(s, inputs, cfg) == fixed_schedule(inputs, cfg)
 
 
-async def test_gather_inputs_skips_ha_dispatch_sensor_for_octopus_intelligent(
+async def test_gather_inputs_reads_configured_live_dispatch_for_octopus_intelligent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No `dispatch_entity` HA-sensor fetch at all — dispatches come from the API."""
+    """Kraken supplies plans, while a configured HA entity can confirm live state."""
 
     async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
@@ -737,9 +1048,10 @@ async def test_gather_inputs_skips_ha_dispatch_sensor_for_octopus_intelligent(
         s = _octopus_settings(dispatch_entity="binary_sensor.dispatch")
         async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
             await gather_inputs(s, rest)
-        assert "states/binary_sensor.dispatch" not in {
-            str(c.request.url) for c in respx.calls
-        }
+        assert any(
+            str(c.request.url).endswith("/states/binary_sensor.dispatch")
+            for c in respx.calls
+        )
 
 
 async def _gather_with_soc(

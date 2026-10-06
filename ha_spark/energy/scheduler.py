@@ -66,10 +66,11 @@ from ha_spark.energy.derived_base_load import (
     derive_specs_from_settings,
     rerive_trailing_window,
 )
+from ha_spark.energy.dispatch_evidence import partition_dispatches
 from ha_spark.energy.dst_clock_sync import DstClockSync
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
-from ha_spark.energy.models import ChargeIntent, ChargePlan, PlannerInputs
+from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, PlannerInputs
 from ha_spark.energy.orchestrator import orchestrate
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.publish import (
@@ -81,7 +82,12 @@ from ha_spark.energy.publish import (
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.energy.soc_monitor import SocMonitor, observe_soc
-from ha_spark.energy.sources import parse_time, read_dispatches, read_ev_hold_status
+from ha_spark.energy.sources import (
+    ev_hold_status_from_read,
+    parse_time,
+    read_dispatch_evidence,
+    read_dispatches_and_live,
+)
 from ha_spark.energy.supply_guard import SupplyGuard
 from ha_spark.energy.tariff import _controlled_windows
 from ha_spark.energy.tariff import _in_overnight_window as in_window
@@ -571,17 +577,37 @@ async def reconcile_tick(
         ) as rest:
             fresh = plan.charge_intent
             read_lines: list[str] = []
-            if settings.tariff_provider != "octopus_intelligent" and settings.dispatch_entity:
-                dispatches, trusted = await read_dispatches(settings, rest)
-                if trusted:
-                    trusted_holds = _controlled_windows(
-                        dispatches, fresh.window_start, fresh.window_end
-                    )
-                    fresh = replace(fresh, holds=trusted_holds, hold_trusted=True)
-                else:
+            dispatches: tuple[DispatchSlot, ...] = ()
+            live_dispatch: bool | None = None
+            refresh_dispatches = (
+                settings.tariff_provider != "octopus_intelligent"
+                and bool(settings.dispatch_entity)
+            )
+            dispatch_trusted = True
+            if refresh_dispatches:
+                dispatches, dispatch_trusted, live_dispatch = await read_dispatches_and_live(
+                    settings, rest
+                )
+                if not dispatch_trusted:
                     fresh = replace(fresh, hold_trusted=False)
                     read_lines = [UNREADABLE_DISPATCH_LINE]
-            ev_charging = await read_ev_hold_status(settings, rest)
+            evidence_read = await read_dispatch_evidence(
+                settings,
+                rest,
+                dispatches if dispatch_trusted else (),
+                live_dispatch=live_dispatch,
+            )
+            if refresh_dispatches and dispatch_trusted:
+                dispatches, _dropped = partition_dispatches(
+                    dispatches, evidence_read.evidence, now
+                )
+                trusted_holds = _controlled_windows(
+                    dispatches, fresh.window_start, fresh.window_end
+                )
+                fresh = replace(fresh, holds=trusted_holds, hold_trusted=True)
+            ev_charging = ev_hold_status_from_read(
+                evidence_read.ev_status, evidence_read.ev_status_trusted
+            )
             if settings.ev_status_entity and ev_charging is None:
                 read_lines.append(UNREADABLE_EV_STATUS_LINE)
             ev_hold_active = _observe_ev_hold(

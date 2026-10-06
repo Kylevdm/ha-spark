@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Octopus dispatch evidence (#221): dispatches are rated from an `on` dispatch
+  entity, a true adjusted-rate marker, EV status, and plug state before they
+  affect holds, cheap-slot sizing, or paid Axle slots. Only a readable
+  disconnected plug with no stronger evidence drops a dispatch; unreadable or
+  unrecognised evidence keeps it.
 - Axle funding skips report the SoC needed at the first counted event slot
   (#214). The plan report and HA plan-status sensor include the estimate for
   event house load, skipped and selected export energy, and buffered post-event

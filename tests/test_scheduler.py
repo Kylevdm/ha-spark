@@ -2042,6 +2042,8 @@ async def test_run_forever_forgets_trusted_holds_on_hot_reload(
 
 _DISPATCH_URL = "http://ha.test/api/states/binary_sensor.dispatch"
 _EV_STATUS_URL = "http://ha.test/api/states/sensor.ev"
+_EV_PLUG_URL = "http://ha.test/api/states/sensor.ev_plug"
+_OCTOPUS_RATE_URL = "http://ha.test/api/states/sensor.octopus_rate"
 
 
 def _dispatch_state(state: str, dispatches: list[dict[str, str]] | None = None) -> httpx.Response:
@@ -2068,6 +2070,145 @@ def _dispatch_settings(**kw: object) -> Settings:
     )
     base.update(kw)
     return Settings(**base)  # type: ignore[arg-type]
+
+
+@respx.mock
+async def test_contradicted_dispatch_does_not_hold_during_per_minute_reconcile(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    respx.get(_DISPATCH_URL).mock(
+        return_value=_dispatch_state(
+            "off",
+            [{"start": "2026-10-03T14:00:00", "end": "2026-10-03T15:00:00"}],
+        )
+    )
+    respx.get(_EV_PLUG_URL).mock(return_value=_ev_status_state("EV Disconnected"))
+    ev_status = respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused"))
+    respx.get(_OCTOPUS_RATE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "entity_id": "sensor.octopus_rate",
+                "state": "0.20",
+                "attributes": {"is_intelligent_adjusted": False},
+            },
+        )
+    )
+    now = datetime(2026, 10, 3, 14, 15)
+    settings = _dispatch_settings(
+        ev_plug_entity="sensor.ev_plug",
+        ev_status_entity="sensor.ev",
+        octopus_rate_entity="sensor.octopus_rate",
+    )
+    caplog.set_level("INFO", logger="ha_spark.energy.sources")
+
+    result = await scheduler.reconcile_tick(
+        settings,
+        _plan(replace(_INTENT, holds=(_HOLD,))),
+        now,
+        trusted_holds=(_HOLD,),
+    )
+
+    [intent] = device.intents
+    assert intent.holds == ()
+    assert intent.hold_active(now) is False
+    assert intent.hold_trusted is True
+    assert result.trusted_holds == ()
+    assert ev_status.call_count == 1
+    assert not any("Dropped contradicted dispatch" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("dispatch_state", "plug_state"),
+    [("on", "EV Disconnected"), ("off", "unavailable")],
+    ids=["live-beats-disconnected", "unreadable-plug-keeps-uncorroborated"],
+)
+@respx.mock
+async def test_live_or_uncorroborated_dispatch_keeps_per_minute_hold(
+    monkeypatch: pytest.MonkeyPatch, dispatch_state: str, plug_state: str
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    respx.get(_DISPATCH_URL).mock(
+        return_value=_dispatch_state(
+            dispatch_state,
+            [{"start": "2026-10-03T14:00:00", "end": "2026-10-03T15:00:00"}],
+        )
+    )
+    respx.get(_EV_PLUG_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"entity_id": "sensor.ev_plug", "state": plug_state, "attributes": {}},
+        )
+    )
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused"))
+    respx.get(_OCTOPUS_RATE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "entity_id": "sensor.octopus_rate",
+                "state": "0.20",
+                "attributes": {"is_intelligent_adjusted": False},
+            },
+        )
+    )
+    now = datetime(2026, 10, 3, 14, 15)
+    settings = _dispatch_settings(
+        ev_plug_entity="sensor.ev_plug",
+        ev_status_entity="sensor.ev",
+        octopus_rate_entity="sensor.octopus_rate",
+    )
+
+    result = await scheduler.reconcile_tick(
+        settings,
+        _plan(replace(_INTENT, holds=())),
+        now,
+        trusted_holds=(),
+    )
+
+    [intent] = device.intents
+    assert intent.hold_active(now) is True
+    assert intent.hold_trusted is True
+    assert result.trusted_holds == ((datetime(2026, 10, 3, 14, 0), datetime(2026, 10, 3, 15, 0)),)
+
+
+@respx.mock
+async def test_reconcile_skips_plug_and_rate_reads_without_planned_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    respx.get(_DISPATCH_URL).mock(return_value=_dispatch_state("off", []))
+    ev_status = respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused"))
+    plug = respx.get(_EV_PLUG_URL).mock(return_value=_ev_status_state("EV Connected"))
+    rate = respx.get(_OCTOPUS_RATE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "entity_id": "sensor.octopus_rate",
+                "state": "0.20",
+                "attributes": {"is_intelligent_adjusted": False},
+            },
+        )
+    )
+
+    await scheduler.reconcile_tick(
+        _dispatch_settings(
+            ev_plug_entity="sensor.ev_plug",
+            ev_status_entity="sensor.ev",
+            octopus_rate_entity="sensor.octopus_rate",
+        ),
+        _plan(replace(_INTENT, holds=())),
+        datetime(2026, 10, 3, 14, 15),
+        trusted_holds=(),
+    )
+
+    assert ev_status.call_count == 1
+    assert plug.called is False
+    assert rate.called is False
 
 
 @respx.mock

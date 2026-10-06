@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from ha_spark.config import Settings
 from ha_spark.energy.axle import AxleApiError, read_axle_event
+from ha_spark.energy.dispatch_evidence import (
+    DispatchEvidence,
+    partition_dispatches,
+)
 from ha_spark.energy.forecast import load_timezone, predict_home_load
 from ha_spark.energy.models import (
     SLOTS_PER_DAY,
@@ -260,16 +265,99 @@ async def read_dispatches(
     1440 identical warnings a day into the add-on log, so each caller reports an
     untrusted result at its own cadence.
     """
+    dispatches, trusted, _live = await read_dispatches_and_live(settings, rest)
+    return dispatches, trusted
+
+
+async def read_dispatches_and_live(
+    settings: Settings, rest: HomeAssistantRest
+) -> tuple[tuple[DispatchSlot, ...], bool, bool | None]:
+    """Read planned and live dispatch state from the same HA entity request.
+
+    ``live`` is ``None`` when the source is unset or unreadable, and otherwise
+    is true only while the dispatch entity is ``on``.
+    """
     if not settings.dispatch_entity:
-        return (), True
+        return (), True, None
     try:
         dispatch = await rest.get_state(settings.dispatch_entity)
     except Exception as exc:  # noqa: BLE001 - a missing entity must not crash the plan
         log.debug("Could not read %s (%s)", settings.dispatch_entity, exc)
-        return (), False
-    if str(dispatch.state).lower() in ("unavailable", "unknown"):
-        return (), False
-    return _parse_dispatches(dispatch.attributes.get("planned_dispatches")), True
+        return (), False, None
+    state_value = str(dispatch.state).strip().lower()
+    if state_value in ("unavailable", "unknown"):
+        return (), False, None
+    return (
+        _parse_dispatches(dispatch.attributes.get("planned_dispatches")),
+        True,
+        state_value == "on",
+    )
+
+
+@dataclass(frozen=True)
+class DispatchEvidenceRead:
+    """Evidence snapshot plus EV status read reused by the separate EV hold."""
+
+    evidence: DispatchEvidence
+    ev_status: EntityState | None
+    ev_status_trusted: bool
+
+
+async def _read_evidence_entity(
+    entity_id: str, rest: HomeAssistantRest
+) -> EntityState | None:
+    """Read an optional corroborating entity without making it a plan failure."""
+    if not entity_id:
+        return None
+    try:
+        state = await rest.get_state(entity_id)
+    except Exception as exc:  # noqa: BLE001 - corroboration must never block planning
+        log.debug("Could not read %s (%s)", entity_id, exc)
+        return None
+    if str(state.state).strip().lower() in ("unavailable", "unknown"):
+        return None
+    return state
+
+
+async def read_dispatch_evidence(
+    settings: Settings,
+    rest: HomeAssistantRest,
+    planned_dispatches: tuple[DispatchSlot, ...],
+    *,
+    live_dispatch: bool | None = None,
+) -> DispatchEvidenceRead:
+    """Read the EV status once and plug/rate only when slots need rating.
+
+    Dispatch state is supplied from the same entity GET that returned its
+    planned slots. Failures of plug/rate corroboration degrade to ``None`` and
+    never affect dispatch-source trust. EV status is also returned for the
+    existing active-EV hold, avoiding a second request.
+    """
+    ev_status, ev_status_trusted = await read_ev_status(settings, rest)
+    plug: EntityState | None = None
+    rate: EntityState | None = None
+    if planned_dispatches:
+        plug = await _read_evidence_entity(settings.ev_plug_entity, rest)
+        rate = await _read_evidence_entity(settings.octopus_rate_entity, rest)
+    adjusted = None
+    if rate is not None:
+        raw_adjusted = rate.attributes.get("is_intelligent_adjusted")
+        if raw_adjusted is not None:
+            adjusted = raw_adjusted is True or (
+                isinstance(raw_adjusted, str) and raw_adjusted.strip().lower() == "true"
+            )
+    return DispatchEvidenceRead(
+        evidence=DispatchEvidence(
+            live_dispatch=live_dispatch,
+            rate_adjusted=adjusted,
+            plug_value=plug.state if plug is not None else None,
+            ev_status_value=(
+                ev_status.state if ev_status is not None and ev_status_trusted else None
+            ),
+        ),
+        ev_status=ev_status,
+        ev_status_trusted=ev_status_trusted,
+    )
 
 
 async def read_ev_status(
@@ -295,6 +383,11 @@ async def read_ev_hold_status(settings: Settings, rest: HomeAssistantRest) -> bo
     The hold intentionally excludes ``diverting`` (eco+ solar diversion).
     """
     state, trusted = await read_ev_status(settings, rest)
+    return ev_hold_status_from_read(state, trusted)
+
+
+def ev_hold_status_from_read(state: EntityState | None, trusted: bool) -> bool | None:
+    """Apply the separate active-EV hold rule to one already-read state."""
     if state is None or not trusted:
         return None
     return str(state.state).strip().lower() in _EV_HOLD_ACTIVE
@@ -325,9 +418,6 @@ async def gather_inputs(
         log.warning("SoC measurement failed integrity check: %s", soc_measurement.reason)
     voltage = await state(settings.battery_voltage_entity)
     solar = await state(settings.solar_tomorrow_entity)
-    ev_status, ev_status_trusted = await read_ev_status(settings, rest)
-    if settings.ev_status_entity and not ev_status_trusted:
-        log.warning("EV status entity %s unreadable", settings.ev_status_entity)
     ha_needed = await state(settings.ha_template_charge_needed_entity)
 
     voltage_v = _to_float(voltage.state if voltage else None, settings.battery_voltage_v)
@@ -342,23 +432,40 @@ async def gather_inputs(
             flexibility_event_trusted = False
 
     dispatches: tuple[DispatchSlot, ...]
+    live_dispatch: bool | None = None
     # Whether an empty `dispatches` means "none" or "unreadable" (#143 §3).
     dispatches_trusted = True
     if settings.tariff_provider == "octopus_intelligent":
-        # Octopus Intelligent dispatches come straight from the Octopus API —
-        # no HA sensor read (avoids a pointless call + the sensor-shaped
-        # bolt-on this provider replaces).
+        # Planned dispatches come from Kraken. A configured HA dispatch entity
+        # still contributes live-state evidence, but never replaces Kraken's
+        # planned windows or changes Kraken read trust.
         try:
             dispatches = await fetch_planned_dispatches(settings)
         except OctopusApiError as exc:
             log.warning("Could not read Octopus planned dispatches (%s)", exc)
             dispatches = ()
             dispatches_trusted = False
+        if settings.dispatch_entity:
+            _ha_dispatches, _ha_trusted, live_dispatch = await read_dispatches_and_live(
+                settings, rest
+            )
     else:
-        dispatches, dispatches_trusted = await read_dispatches(settings, rest)
+        dispatches, dispatches_trusted, live_dispatch = await read_dispatches_and_live(
+            settings, rest
+        )
         if not dispatches_trusted:
             log.warning("Dispatch entity %s unreadable; holds untrusted", settings.dispatch_entity)
-    ev_status_value = str(ev_status.state).strip().lower() if ev_status else None
+    evidence_read = await read_dispatch_evidence(
+        settings, rest, dispatches, live_dispatch=live_dispatch
+    )
+    if settings.ev_status_entity and not evidence_read.ev_status_trusted:
+        log.warning("EV status entity %s unreadable", settings.ev_status_entity)
+    ev_status = evidence_read.ev_status
+    ev_status_value = (
+        str(ev_status.state).strip().lower()
+        if ev_status is not None and evidence_read.ev_status_trusted
+        else None
+    )
     ev_charging = ev_status_value in _EV_ACTIVE
     ev_hold_charging = (
         ev_status_value in _EV_HOLD_ACTIVE if ev_status_value is not None else None
@@ -411,6 +518,21 @@ async def gather_inputs(
     window_start = parse_time(settings.charge_window_start)
     window_end = parse_time(settings.charge_window_end)
     now = datetime.now(tz)
+    dispatches, dropped_dispatches = partition_dispatches(
+        dispatches, evidence_read.evidence, now
+    )
+    for dropped in dropped_dispatches:
+        plug_value = (
+            " ".join(evidence_read.evidence.plug_value.split())
+            if evidence_read.evidence.plug_value
+            else ""
+        )
+        log.info(
+            "Dropped contradicted dispatch %s to %s (EV plug: %s)",
+            dropped.start.isoformat(),
+            dropped.end.isoformat(),
+            plug_value or "unreadable",
+        )
     drain = pre_window_drain(forecast, now, window_start, window_end)
 
     load_slots: tuple[float, ...] | None = None
