@@ -31,7 +31,9 @@ PROACTIVE_MODE + control authority (via ``effective_mode``) gate side effects:
 ``call_service``; ``off`` -> compute only. Each write isolates its own failure
 and reads back to confirm the device took it. The forced-charge program (window
 + current) additionally refuses when grid charging is not permitted by the
-inverter's work mode (bit 5); the live rate-tier throttle is not so gated.
+inverter's work mode (bit 5); the live rate-tier throttle is not so gated. The
+SoC fallback uses the same forced-charge sequence with an explicitly configured
+current ceiling and the configured cheap-rate window.
 """
 from __future__ import annotations
 
@@ -39,7 +41,7 @@ import asyncio
 import math
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, time, timedelta
-from typing import TYPE_CHECKING, Literal, TypeVar
+from typing import TYPE_CHECKING, Literal, NamedTuple, TypeVar
 from zoneinfo import ZoneInfo
 
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
@@ -61,6 +63,7 @@ from ha_spark.energy.export_notifications import (
 )
 from ha_spark.energy.export_store import ExportEventStore
 from ha_spark.energy.models import ChargeIntent, window_hours
+from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.logging import get_logger
 
 if TYPE_CHECKING:  # avoid an import cycle: config imports devices.base at runtime
@@ -93,6 +96,7 @@ _WINDOW_FIELDS = (
 _SLOT_SUFFIX = {1: "", 2: "_2", 3: "_3"}
 # Current register scale: the overlay sensor decodes raw/10 to amps; encode x10.
 _CURRENT_SCALE = 10.0
+_MAX_CHARGE_CURRENT_A = 62.5
 # HA's update_entity service is asynchronous with respect to the Modbus
 # overlay sensors: on live hardware a landed write took ~5.2 s to appear, the
 # overlay's 5 s scan_interval (#164). Observe for up to ~15 s after each write;
@@ -114,6 +118,15 @@ T = TypeVar("T")
 ClockSyncOutcome = Literal["synced", "failed", "not_written"]
 
 
+class _ApplyResult(NamedTuple):
+    """Action lines and read-back verdicts from one forced-charge apply pass."""
+
+    lines: list[str]
+    current_ok: bool
+    window_verified: bool
+    cleanup_ok: bool
+
+
 def _is_zero_target(target: float | list[int]) -> bool:
     if isinstance(target, list):
         return not any(target)
@@ -128,6 +141,19 @@ def _discharge_half(
         start, end = export_window
         return [start.hour, start.minute, end.hour, end.minute]
     return kept_discharge or [0, 0, 0, 0]
+
+
+def fallback_charge_current_a(settings: Settings) -> int | None:
+    """Configured fallback current after normal Solis and register limits."""
+    configured = settings.solis_fallback_current_a
+    if configured is None:
+        return None
+    configured_max = settings.max_charge_current_a
+    if not math.isfinite(configured) or not math.isfinite(configured_max) or configured_max <= 0:
+        return 0
+    return math.floor(
+        min(configured, configured_max, _MAX_CHARGE_CURRENT_A) + 1e-9
+    )
 
 
 @register("solis")
@@ -155,7 +181,55 @@ class SolisDevice:
 
     # --- apply: the forced-charge sequence ---
 
+    async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+        """Apply the configured cheap-window fallback using the normal Solis gates.
+
+        The SoC reading is carried for timing and diagnostics only. The plan
+        target, plan window, and any planned export cannot affect this request.
+        """
+        current_a = fallback_charge_current_a(self._settings)
+        if current_a is None:
+            return ["[BLOCKED] Solis fallback current is not configured"]
+        if current_a < 1:
+            return ["[FAILED] Solis fallback current is below 1 A after configured limits"]
+
+        intent = ChargeIntent(
+            target_soc_pct=0.0,
+            soc=soc,
+            window_start=time.fromisoformat(self._settings.charge_window_start),
+            window_end=time.fromisoformat(self._settings.charge_window_end),
+        )
+        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        description = (
+            f"Solis fallback at {current_a} A in "
+            f"{fmt_hhmm(intent.window_start)}-{fmt_hhmm(intent.window_end)}"
+        )
+        if mode == "simulate":
+            return [f"[SIMULATE] {description} would be programmed (not written)"]
+        if mode != "on":
+            return [f"[SKIP] {description} not written (mode {mode})"]
+
+        result = await self._apply(intent, current_a)
+        if result.current_ok and result.window_verified and result.cleanup_ok:
+            result.lines.append(f"[FALLBACK] {description} read-back verified")
+        else:
+            detail = next(
+                (
+                    line
+                    for line in result.lines
+                    if line.startswith(("[FAILED]", "[WARNING]", "[BLOCKED]"))
+                ),
+                "real read-back verification was not completed",
+            )
+            result.lines.append(f"[FAILED] {description} unconfirmed: {detail}")
+        return result.lines
+
     async def apply(self, intent: ChargeIntent) -> list[str]:
+        return (await self._apply(intent, None)).lines
+
+    async def _apply(
+        self, intent: ChargeIntent, fallback_current_a: float | None
+    ) -> _ApplyResult:
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         # load_timezone, not ZoneInfo: a minimal container without tzdata (or a
         # typo'd option) must degrade to UTC, not raise before the reconcile and
@@ -175,7 +249,7 @@ class SolisDevice:
         # SoC-unreadable guard: soc_now==0 from a dead sensor would size a max charge.
         # Apply this safety decision in every mode; the write helpers below
         # suppress side effects while simulate reports the block as a preview.
-        if not intent.soc.ok:
+        if not intent.soc.ok and fallback_current_a is None:
             prefix = "[SIMULATE] " if mode == "simulate" else ""
             line = (
                 f"{prefix}[BLOCKED] {intent.soc.reason}; not charging to "
@@ -183,11 +257,17 @@ class SolisDevice:
             )
             log.warning(line)
             lines.append(line)
-            return lines
+            return _ApplyResult(lines, False, False, False)
+        current_a = (
+            solis_current_a(intent, self._settings)
+            if fallback_current_a is None
+            else fallback_current_a
+        )
         raw_export = getattr(intent, "export", None)
         export_store = ExportEventStore(self._settings.db_path)
         previous_export_record = None
-        if mode == "on" and raw_export is None and export_store.exists:
+        is_fallback = fallback_current_a is not None
+        if mode == "on" and raw_export is None and export_store.exists and not is_fallback:
             async with export_store:
                 previous_export_record = await export_store.load()
         export_error: str | None = None
@@ -204,12 +284,26 @@ class SolisDevice:
                 "preserving the verified export window"
             )
             log.warning(line)
-            return [line]
+            return _ApplyResult([line], False, False, False)
         export = _export_window(intent, tz)
         export_ready = export is not None
         # Slot 1's verified discharge half, kept when an untrusted hold read
         # refuses a new window (#143 §3).
         kept_discharge: list[int] | None = None
+        if (
+            is_fallback
+            and mode in ("on", "simulate")
+            and export_store.exists
+            and await self._has_live_verified_export(now)
+        ):
+            try:
+                resident = await self._read_slot_block(1)
+            except Exception:  # noqa: BLE001 - never clobber an unreadable live export
+                line = "[BLOCKED] Solis fallback held: live verified export slot 1 is unreadable"
+                log.info(line)
+                return _ApplyResult([line], False, False, False)
+            if any(resident[4:]):
+                kept_discharge = resident[4:]
         if raw_export is not None and export is None:
             export_ready = False
             export_error = "malformed export window"
@@ -275,10 +369,15 @@ class SolisDevice:
             current_line = preserve_line
         elif mode == "on" and blocked is None:
             current_ok, current_line, deactivation_line = await self._prepare_slot_one_current(
-                intent, _discharge_half(export if export_ready else None, kept_discharge)
+                intent,
+                _discharge_half(export if export_ready else None, kept_discharge),
+                current_a=current_a,
+                fallback=is_fallback,
             )
         else:
-            current_ok, current_line = await self._write_charge_current_result(intent, blocked)
+            current_ok, current_line = await self._write_charge_current_result(
+                intent, blocked, current_a=current_a, fallback=is_fallback
+            )
         if deactivation_line is not None:
             lines.append(deactivation_line)
         lines.append(current_line)
@@ -291,6 +390,7 @@ class SolisDevice:
                 window_block,
                 export_window=export if export_ready else None,
                 kept_discharge=kept_discharge,
+                charge_current_a=current_a,
             )
         lines.append(window_line)
         window_verified = window_line.startswith(("[APPLIED]", "[SKIP]"))
@@ -299,9 +399,12 @@ class SolisDevice:
             export_error = "timed export window was not confirmed"
         # Zero-guard the slots the planner does not drive so a stale manual
         # window (charge 2/3, any discharge) can't actuate behind the plan.
+        cleanup_ok = True
         for slot in (2, 3):
-            lines.append(await self._zero_guard_slot(slot))
-        if mode in ("on", "simulate"):
+            slot_ok, slot_line = await self._zero_guard_slot(slot)
+            lines.append(slot_line)
+            cleanup_ok = cleanup_ok and slot_ok
+        if mode in ("on", "simulate") and not is_fallback:
             if raw_export is not None or export_store.exists:
                 await self._persist_export_state(raw_export, export, export_ready, window_line)
             await self._notify_export_lifecycle(
@@ -314,7 +417,7 @@ class SolisDevice:
                 previous_export_record,
                 mode,
             )
-        return lines
+        return _ApplyResult(lines, current_ok, window_verified, cleanup_ok)
 
     async def set_charge_rate(self, watts: float) -> str:
         amps = (
@@ -341,6 +444,7 @@ class SolisDevice:
         *,
         export_window: tuple[datetime, datetime] | None = None,
         kept_discharge: list[int] | None = None,
+        charge_current_a: float | None = None,
     ) -> str:
         """Program charge slot 1's window block, write-if-changed, read-back verified.
 
@@ -360,7 +464,12 @@ class SolisDevice:
             desc += " and keep the verified export window"
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         keeps_discharge = export_window is not None or kept_discharge is not None
-        zero_charge = keeps_discharge and solis_current_a(intent, self._settings) <= 0
+        current_a = (
+            solis_current_a(intent, self._settings)
+            if charge_current_a is None
+            else charge_current_a
+        )
+        zero_charge = keeps_discharge and current_a <= 0
         if mode == "simulate":
             if blocked:
                 if not keeps_discharge:
@@ -467,15 +576,21 @@ class SolisDevice:
         return f"[APPLIED] {clear_desc}" if wrote else f"[SKIP] {clear_desc} (already clear)"
 
     async def _write_charge_current_result(
-        self, intent: ChargeIntent, blocked: str | None
+        self,
+        intent: ChargeIntent,
+        blocked: str | None,
+        *,
+        current_a: float | None = None,
+        fallback: bool = False,
     ) -> tuple[bool, str]:
         """Write and freshly verify the planned current, returning success separately."""
         # solis_current_a already clamps to max_charge_current_a (<= the 62.5 A
         # DC hardware ceiling); round to the integer register value.
-        amps = round(solis_current_a(intent, self._settings))
-        desc = (
-            f"set timed charge current to {amps} A over "
-            f"{charge_hours(intent, self._settings):.1f} h of the window"
+        amps = round(
+            solis_current_a(intent, self._settings) if current_a is None else current_a
+        )
+        desc = _charge_current_description(
+            intent, self._settings, amps, fallback=fallback
         )
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         if blocked and mode in ("on", "simulate"):
@@ -486,15 +601,21 @@ class SolisDevice:
         return await self._set_current_result(amps, desc)
 
     async def _prepare_slot_one_current(
-        self, intent: ChargeIntent, planned_discharge: list[int]
+        self,
+        intent: ChargeIntent,
+        planned_discharge: list[int],
+        *,
+        current_a: float | None = None,
+        fallback: bool = False,
     ) -> tuple[bool, str, str | None]:
         """Make slot 1 safe before changing its planned charge current.
 
         ``planned_discharge`` is the discharge half this apply will program."""
-        amps = round(solis_current_a(intent, self._settings))
-        current_desc = (
-            f"set timed charge current to {amps} A over "
-            f"{charge_hours(intent, self._settings):.1f} h of the window"
+        amps = round(
+            solis_current_a(intent, self._settings) if current_a is None else current_a
+        )
+        current_desc = _charge_current_description(
+            intent, self._settings, amps, fallback=fallback
         )
         zeros = [0] * len(_WINDOW_FIELDS)
         try:
@@ -540,12 +661,11 @@ class SolisDevice:
         ok, line = await self._set_current_result(amps, current_desc)
         return ok, line, None
 
-    async def _zero_guard_slot(self, slot: int) -> str:
+    async def _zero_guard_slot(self, slot: int) -> tuple[bool, str]:
         """Zero a non-driven slot's window block, but only if it is non-zero
         (register endurance: steady state costs zero writes)."""
         desc = f"zero timed slot {slot} window"
-        _ok, line = await self._zero_slot(slot, desc)
-        return line
+        return await self._zero_slot(slot, desc)
 
     async def _zero_slot(
         self, slot: int, desc: str, *, keep_discharge: list[int] | None = None
@@ -1489,6 +1609,20 @@ def _finite_number(value: object) -> float | None:
     if isinstance(value, (int, float)) and math.isfinite(float(value)):
         return float(value)
     return None
+
+
+def _charge_current_description(
+    intent: ChargeIntent, settings: Settings, amps: int, *, fallback: bool
+) -> str:
+    if fallback:
+        return (
+            f"set timed charge current to {amps} A for configured window "
+            f"{fmt_hhmm(intent.window_start)}-{fmt_hhmm(intent.window_end)}"
+        )
+    return (
+        f"set timed charge current to {amps} A over "
+        f"{charge_hours(intent, settings):.1f} h of the window"
+    )
 
 
 def charge_hours(intent: ChargeIntent, settings: Settings) -> float:
