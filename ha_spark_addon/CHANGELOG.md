@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Octopus hold re-rating (#228): the per-minute reconcile re-rates planned
+  daytime dispatch holds from local HA evidence, so a plug change updates the
+  inverter hold within a minute. It uses the plan's dispatch windows and never
+  fetches planned dispatches from Kraken between plans.
 - Octopus dispatch evidence (#221): dispatches are rated from an `on` dispatch
   entity, a true adjusted-rate marker, EV status, and plug state before they
   affect holds, cheap-slot sizing, or paid Axle slots. Only a readable
