@@ -128,6 +128,8 @@ def test_report_explains_selected_and_skipped_paid_export_slots() -> None:
                     "Skipped paid slot: it overlaps an Octopus dispatch hold.",
                 ),
             ),
+            export_funding="Funded 0.60 kWh from the post-event reserve: "
+            "£1.00 event vs £0.33 buy-back.",
         ),
         "test",
     )
@@ -136,3 +138,4 @@ def test_report_explains_selected_and_skipped_paid_export_slots() -> None:
     assert "17:00-18:00" in out
     assert "3.20 kW" in out
     assert "Skipped paid slot" in out
+    assert "£1.00 event vs £0.33 buy-back" in out

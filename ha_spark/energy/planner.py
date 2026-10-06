@@ -36,6 +36,7 @@ the battery holds (doesn't discharge) while cheap grid covers the house.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import NamedTuple
 
@@ -149,23 +150,50 @@ class _EventSlot(NamedTuple):
     refused: str | None = None
 
 
+class _Reserve(NamedTuple):
+    """The post-event reservation an event may spend when buying it back pays (#207)."""
+
+    # What the battery holds of the reservation, above ``min_soc``.
+    energy: float
+    event_rate: float
+    efficiency: float
+    # The worst import price over the slots a shortfall of this many kWh lands in.
+    price_for: Callable[[float], float]
+
+    def buy_back(self, shortfall: float) -> float:
+        """GBP/kWh to buy ``shortfall`` back, after round-trip losses."""
+        return self.price_for(shortfall) / self.efficiency
+
+    def funds(self, shortfall: float) -> bool:
+        return shortfall <= self.energy + 1e-9 and self.event_rate > self.buy_back(shortfall)
+
+    def funding(self, spent: float) -> str:
+        return (
+            f"Funded {spent:.2f} kWh from the post-event reserve: "
+            f"£{self.event_rate:.2f} event vs £{self.buy_back(spent):.2f} buy-back."
+        )
+
+
 def _select_export_suffix(
     slots: list[_EventSlot],
     available: float,
     cfg: PlannerConfig,
     schedule: TariffSchedule,
-) -> tuple[list[tuple[_EventSlot, float]], tuple[ExportSkip, ...]]:
+    reserve: _Reserve | None = None,
+) -> tuple[list[tuple[_EventSlot, float]], tuple[ExportSkip, ...], float]:
     """Walk an event's complete slots backwards and keep one fundable suffix.
 
     ``slots`` is in time order, and ``available`` is the battery energy left for
-    export once house load and the post-event reservation are protected.
-    Returns the selected slots with their export power, then the skips, both
-    in time order.
+    export once house load and the post-event reservation are protected. A slot
+    ``available`` can't fund may spend the ``reserve`` when buying it back costs
+    less than the event pays. Returns the selected slots with their export
+    power, then the skips, both in time order, then the reserve spent.
     """
     supply_ceiling_kw = max(0.0, cfg.supply_max_current_a * cfg.supply_voltage_v / 1000.0)
     selected: list[tuple[_EventSlot, float]] = []
     skips: list[ExportSkip] = []
     contiguous = True
+    spent = 0.0
     for slot in reversed(slots):
         start = slot.start
         end = start + timedelta(minutes=30)
@@ -214,7 +242,9 @@ def _select_export_suffix(
                     "window cannot cover it.",
                 )
             )
-        elif energy > available + 1e-9:
+        elif energy > available + 1e-9 and not (
+            reserve is not None and reserve.funds(spent + energy - available)
+        ):
             contiguous = False
             skips.append(
                 ExportSkip(
@@ -225,9 +255,11 @@ def _select_export_suffix(
             )
         else:
             selected.append((slot, export_kw))
-            available -= energy
+            drawn = min(energy, available)
+            available -= drawn
+            spent += energy - drawn
     selected.reverse()
-    return selected, tuple(reversed(skips))
+    return selected, tuple(reversed(skips)), spent
 
 
 def _export_intent(
@@ -263,7 +295,7 @@ def _same_day_export_plan(
     horizon_start: datetime,
     now: datetime,
     load_slots: tuple[float, ...],
-) -> tuple[ExportIntent | None, tuple[ExportSkip, ...]]:
+) -> tuple[ExportIntent | None, tuple[ExportSkip, ...], str | None]:
     """Plan an export event that ends before tonight's horizon start (#198).
 
     The horizon begins at tonight's charge window, so an event later today lies
@@ -276,6 +308,9 @@ def _same_day_export_plan(
     looks the same on both days whatever the weather, so a slot is refused
     wherever tomorrow's forecast shows solar, and the rest are checked against
     the DNO limit with none. Solar never counts towards funding.
+
+    Today's prices aren't in the schedule either, so buying back a spent
+    post-event reserve is priced at the standard rate.
     """
     n = len(load_slots)
     solar_slots = inputs.solar_slots or (0.0,) * n
@@ -307,7 +342,7 @@ def _same_day_export_plan(
                 "Skipped paid event: no complete slot of it is left before tonight's "
                 "charge window.",
             ),
-        )
+        ), None
 
     event_end = slots[-1].start + timedelta(minutes=30)
     through_event = sum(
@@ -315,19 +350,25 @@ def _same_day_export_plan(
     )
     post_event = sum(load for start, load, _, _ in remaining if start >= event_end)
     usable_now = max(0.0, cfg.capacity_kwh * (inputs.soc_now - cfg.min_soc) / 100.0)
-    available = max(
-        0.0, usable_now - through_event - post_event * (1.0 + cfg.buffer_pct / 100.0)
+    post_energy = post_event * (1.0 + cfg.buffer_pct / 100.0)
+    available = max(0.0, usable_now - through_event - post_energy)
+    reserve = _Reserve(
+        energy=min(post_energy, max(0.0, usable_now - through_event)),
+        event_rate=event.rate_gbp_kwh,
+        efficiency=cfg.charge_efficiency if cfg.charge_efficiency > 0 else 1.0,
+        price_for=lambda _shortfall: schedule.standard_rate,
     )
-    selected, skips = _select_export_suffix(slots, available, cfg, schedule)
+    selected, skips, spent = _select_export_suffix(slots, available, cfg, schedule, reserve)
     if not selected:
-        return None, skips
+        return None, skips, None
 
     # Once the event is under way, keep the start it was armed with: dropping a
     # finished slot changes nothing on the inverter but costs a Slot 1 write.
     window_start = selected[0][0].start
     if window_start == slots[0].start:
         window_start = next(start for start, _, _ in day if in_event(start))
-    return _export_intent(event, cfg, window_start, selected), skips
+    funding = reserve.funding(spent) if spent > 1e-9 else None
+    return _export_intent(event, cfg, window_start, selected), skips, funding
 
 
 def _event_export_plan(
@@ -335,25 +376,28 @@ def _event_export_plan(
     cfg: PlannerConfig,
     schedule: TariffSchedule,
     net: list[float],
-) -> tuple[ExportIntent | None, tuple[Reservation, ...], tuple[ExportSkip, ...]]:
+) -> tuple[ExportIntent | None, tuple[Reservation, ...], tuple[ExportSkip, ...], str | None]:
     """Reserve and select one contiguous, fully fundable Axle export suffix.
 
     Work backwards from the event end.  That preserves the energy needed from
     the event end to the next cheap slot before admitting an export slot, and a
     suffix maps directly to an inverter's single timed-discharge window.
+
+    The post-event reservation funds a slot only when buying the shortfall back
+    costs less than the event pays (#207); the last value then says so.
     """
     event = inputs.flexibility_event
     if event is None or event.direction != "export" or inputs.horizon_start is None:
-        return None, (), ()
+        return None, (), (), None
     if (
         inputs.now is not None
         and inputs.load_slots is not None
         and event.end <= inputs.horizon_start
     ):
-        export, skips = _same_day_export_plan(
+        export, skips, funding = _same_day_export_plan(
             inputs, cfg, schedule, event, inputs.horizon_start, inputs.now, inputs.load_slots
         )
-        return export, (), skips
+        return export, (), skips, funding
 
     event_slots: list[int] = []
     for i in range(len(net)):
@@ -367,7 +411,7 @@ def _event_export_plan(
                 event.start,
                 "Skipped paid event: it contains no complete slot in the planning horizon.",
             ),
-        )
+        ), None
 
     # If any event slot overlaps the physical timed-charge window, export
     # outranks discretionary charging. Only energy already in the battery may
@@ -380,9 +424,9 @@ def _event_export_plan(
             0.0, cfg.capacity_kwh * (inputs.soc_now - cfg.min_soc) / 100.0
         )
 
-    # The named post-event reservation is computed first and never spent to
-    # deliver an event.  Like the existing reservation, it carries the planner
-    # safety buffer.
+    # The named post-event reservation is computed first and spent to deliver
+    # an event only when buying it back pays (#207).  Like the existing
+    # reservation, it carries the planner safety buffer.
     after_event = event_slots[-1] + 1
     target_slot = next(
         (i for i in range(after_event, len(net)) if schedule.cheap_fracs[i] > 1e-9),
@@ -395,23 +439,20 @@ def _event_export_plan(
         post_need * (1.0 + cfg.buffer_pct / 100.0),
         usable_capacity,
     )
-    target_time = inputs.horizon_start + timedelta(minutes=30 * target_slot)
-    post = Reservation(
-        name="reach-next-cheap-slot",
-        target_slot=target_slot,
-        energy_kwh=post_energy,
-        obligation_kind="reach-next-cheap-slot",
-        reason=(
-            f"Reserving {post_energy:.2f} kWh after the Axle event to cover forecast house "
-            f"load until the {target_time.strftime('%H:%M')} cheap slot."
-            if target_slot < len(net)
-            else (
-                f"Reserving {post_energy:.2f} kWh after the Axle event through "
-                "the planning horizon."
-            )
-        ),
-        target_time=target_time,
-    )
+
+    def shortfall_price(shortfall: float) -> float:
+        # The battery serves the slots after the event in order and runs dry at
+        # the end of the stretch, so a shortfall is bought in its last slots.
+        worst = 0.0
+        for i in reversed(range(after_event, target_slot)):
+            need = (1.0 - schedule.cheap_fracs[i]) * net[i]
+            if need <= 1e-9:
+                continue
+            worst = max(worst, schedule.prices[i])
+            shortfall -= need
+            if shortfall <= 1e-9:
+                break
+        return worst
 
     # House energy from the end of overnight cheap coverage through the event
     # is also a concrete obligation. Without it, a plan can look funded on
@@ -427,6 +468,12 @@ def _event_export_plan(
     event_house_energy = sum(net[i] for i in event_slots)
     house_through_event_energy = pre_event_house_energy + event_house_energy
     available = max(0.0, usable_capacity - post_energy - house_through_event_energy)
+    reserve = _Reserve(
+        energy=min(post_energy, max(0.0, usable_capacity - house_through_event_energy)),
+        event_rate=event.rate_gbp_kwh,
+        efficiency=cfg.charge_efficiency if cfg.charge_efficiency > 0 else 1.0,
+        price_for=shortfall_price,
+    )
     solar_slots = inputs.solar_slots or (0.0,) * len(net)
     slots = [
         _EventSlot(
@@ -436,9 +483,31 @@ def _event_export_plan(
         )
         for i in event_slots
     ]
-    selected, skips = _select_export_suffix(slots, available, cfg, schedule)
+    selected, skips, spent = _select_export_suffix(slots, available, cfg, schedule, reserve)
     if not selected:
-        return None, (), skips
+        return None, (), skips, None
+
+    post_energy -= spent
+    target_time = inputs.horizon_start + timedelta(minutes=30 * target_slot)
+    reason = (
+        f"Reserving {post_energy:.2f} kWh after the Axle event to cover forecast house "
+        f"load until the {target_time.strftime('%H:%M')} cheap slot."
+        if target_slot < len(net)
+        else (
+            f"Reserving {post_energy:.2f} kWh after the Axle event through "
+            "the planning horizon."
+        )
+    )
+    if spent > 1e-9:
+        reason += f" The other {spent:.2f} kWh funds the paid export and is bought back."
+    post = Reservation(
+        name="reach-next-cheap-slot",
+        target_slot=target_slot,
+        energy_kwh=post_energy,
+        obligation_kind="reach-next-cheap-slot",
+        reason=reason,
+        target_time=target_time,
+    )
 
     export = _export_intent(event, cfg, selected[0][0].start, selected)
     event_energy = house_through_event_energy + sum(power * 0.5 for _, power in selected)
@@ -455,7 +524,8 @@ def _event_export_plan(
         ),
         target_time=export.window_end,
     )
-    return export, (event_reservation, post), skips
+    funding = reserve.funding(spent) if spent > 1e-9 else None
+    return export, (event_reservation, post), skips, funding
 
 
 def compute_plan(
@@ -485,6 +555,7 @@ def compute_plan(
     reservations: tuple[Reservation, ...] = ()
     export: ExportIntent | None = None
     export_skips: tuple[ExportSkip, ...] = ()
+    export_funding: str | None = None
     if inputs.load_slots is not None:
         # --- v2 per-slot horizon: cost against the schedule's per-slot prices ---
         model = "slots"
@@ -510,7 +581,9 @@ def compute_plan(
             max(0.0, solar * cfg.solar_haircut_k - load)
             for load, solar in zip(inputs.load_slots, solar_slots, strict=False)
         )
-        export, event_reservations, export_skips = _event_export_plan(inputs, cfg, schedule, net)
+        export, event_reservations, export_skips, export_funding = _event_export_plan(
+            inputs, cfg, schedule, net
+        )
         reservations = event_reservations or (_slot_reservation(inputs, cfg, schedule, net),)
     else:
         # --- v1 daily balance ---
@@ -655,4 +728,5 @@ def compute_plan(
         ),
         reservations=reservations,
         export_skips=export_skips,
+        export_funding=export_funding,
     )
