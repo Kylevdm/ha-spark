@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Solis recovery after sustained passing SoC checks (#117): after the configured
+  stability interval and a newer Home Assistant report, ha-spark plans from the
+  qualifying checked measurement and remaining cheap-rate window. The confirmed
+  fallback stays effective until normal programming is read-back verified;
+  failed recovery leaves hardware unconfirmed and retries each minute. The
+  stability duration defaults to 10 minutes.
 - Verified Solis SoC fallback (#115): after `soc_failure_threshold` consecutive
   failed observations, the optional `solis_fallback_current_a` programs only the
   configured cheap-rate window through the normal gated, transition-safe Solis

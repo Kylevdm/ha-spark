@@ -68,6 +68,28 @@ def test_plan_to_payload_maps_core_sensors() -> None:
     assert "sensor.ha_spark_planned_cost" not in by_id
 
 
+def test_plan_status_distinguishes_effective_program_during_recovery() -> None:
+    by_id = {
+        eid: (state, attrs)
+        for eid, state, attrs in plan_to_payload(
+            _plan(), Settings(), effective_program="fallback"
+        )
+    }
+    assert by_id["sensor.ha_spark_plan_status"][1]["effective_program"] == "fallback"
+
+
+def test_plan_status_publishes_current_run_action_lines() -> None:
+    actions = ["[APPLIED] plan", "[RECOVERED] Solis normal program read-back verified"]
+    by_id = {
+        eid: (state, attrs)
+        for eid, state, attrs in plan_to_payload(
+            _plan(), Settings(), action_lines=actions
+        )
+    }
+
+    assert by_id["sensor.ha_spark_plan_status"][1]["action_lines"] == actions
+
+
 @respx.mock
 async def test_publish_plan_pushes_required_entities(tmp_path: Path) -> None:
     for route in [
@@ -384,3 +406,69 @@ async def test_publish_soc_integrity_reports_fallback_confirmation_not_request()
     assert body["attributes"]["fallback_confirmed"] is True
     assert body["attributes"]["fallback_action"] == "[FALLBACK] Solis fallback verified"
     assert body["attributes"]["fallback_actions"] == ["[FALLBACK] Solis fallback verified"]
+
+
+@respx.mock
+async def test_publish_soc_integrity_exposes_recovery_progress_and_verified_transition() -> None:
+    from ha_spark.energy.soc_monitor import (
+        EffectiveProgram,
+        RecoveryOutcome,
+        RecoveryState,
+        SocMonitor,
+    )
+
+    push = respx.post(f"{BASE}/states/sensor.ha_spark_soc_integrity").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    started = datetime(2026, 10, 6, 20, tzinfo=UTC)
+    monitor = SocMonitor(recovery_stable_minutes=10)
+    failed = SocMeasurement(
+        status=SocStatus.STALE,
+        observed_at=started,
+        value=30.0,
+        raw_state="30",
+        reported_at=started - timedelta(hours=1),
+        age_s=3600.0,
+        max_age_s=600.0,
+    )
+    monitor.record(failed, failure_threshold=1)
+    assert monitor.request_fallback() is not None
+    monitor.complete_fallback(action_line="[FALLBACK] test verified")
+    baseline = SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=started + timedelta(minutes=1),
+        value=40.0,
+        raw_state="40",
+        reported_at=started + timedelta(minutes=1),
+        age_s=0.0,
+        max_age_s=600.0,
+    )
+    monitor.record(baseline, failure_threshold=1)
+    qualifying = SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=started + timedelta(minutes=11),
+        value=55.0,
+        raw_state="55",
+        reported_at=started + timedelta(minutes=2),
+        age_s=540.0,
+        max_age_s=600.0,
+    )
+    progress = monitor.record(qualifying, failure_threshold=1)
+    assert progress.recovery_state == "qualified"
+    completed = monitor.complete_recovery(RecoveryOutcome.RECOVERED_VERIFIED)
+
+    async with HomeAssistantRest(BASE, "t") as rest:
+        await publish_soc_integrity(rest, completed, Settings())
+
+    body = json.loads(push.calls[0].request.content)
+    attrs = body["attributes"]
+    assert body["state"] == "normal"
+    assert attrs["recovery_state"] == "recovered"
+    assert attrs["recovery_stable_minutes"] == 10
+    assert attrs["recovery_action"] == (
+        "[RECOVERED] Solis recovery: normal program read-back verified"
+    )
+    assert attrs["recovery_actions"] == [attrs["recovery_action"]]
+    assert attrs["recovery_hardware_verified"] is True
+    assert attrs["effective_program"] == EffectiveProgram.NORMAL
+    assert attrs["recovery_state"] == RecoveryState.RECOVERED

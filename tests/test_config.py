@@ -308,6 +308,22 @@ def test_soc_failure_threshold_must_be_at_least_one(bad: int) -> None:
         Settings(ha_url="http://x", ha_token="t", soc_failure_threshold=bad)
 
 
+def test_soc_recovery_stability_duration_defaults_to_ten_and_is_configurable() -> None:
+    assert Settings().soc_recovery_stable_minutes == 10
+    assert "soc_recovery_stable_minutes" in _OPTION_KEYS
+    assert (
+        Settings(ha_url="http://x", ha_token="t", soc_recovery_stable_minutes=15)
+        .soc_recovery_stable_minutes
+        == 15
+    )
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_soc_recovery_stability_duration_must_be_positive(bad: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(ha_url="http://x", ha_token="t", soc_recovery_stable_minutes=bad)
+
+
 def test_solis_fallback_current_is_optional_and_configured_across_surfaces() -> None:
     assert Settings(ha_url="http://x", ha_token="t").solis_fallback_current_a is None
     assert "solis_fallback_current_a" in _OPTION_KEYS

@@ -912,6 +912,51 @@ async def test_verified_fallback_write_if_changed_avoids_register_churn(tmp_path
     assert _register_writes(rest) == writes_after_first
 
 
+@pytest.mark.asyncio
+async def test_apply_with_result_reports_current_window_and_cleanup_verdicts(tmp_path) -> None:
+    rest = FakeRest(switch="On")
+    result = await _device(rest, tmp_path).apply_with_result(_intent())
+
+    assert result.current_ok is True
+    assert result.window_verified is True
+    assert result.cleanup_ok is True
+
+
+@pytest.mark.asyncio
+async def test_apply_with_result_exposes_failed_current_read_back(tmp_path) -> None:
+    class StaleCurrentRest(FakeRest):
+        current_write_attempted = False
+
+        async def call_service(
+            self, domain: str, service: str, data: dict[str, object] | None = None
+        ) -> list[EntityState]:
+            result = await super().call_service(domain, service, data)
+            if (
+                domain == "modbus"
+                and service == "write_register"
+                and data is not None
+                and data.get("address") == 43141
+            ):
+                self.current_write_attempted = True
+            return result
+
+        async def get_state(self, entity_id: str) -> EntityState:
+            if (
+                entity_id == "sensor.solis_control_timed_charge_current"
+                and self.current_write_attempted
+            ):
+                return EntityState(entity_id=entity_id, state="0", attributes={})
+            return await super().get_state(entity_id)
+
+    rest = StaleCurrentRest(switch="On")
+    result = await _device(rest, tmp_path).apply_with_result(_intent())
+
+    assert result.current_ok is False
+    assert result.window_verified is False
+    assert result.cleanup_ok is True
+    assert any(line.startswith(("[WARNING]", "[BLOCKED]")) for line in result.lines)
+
+
 @pytest.mark.parametrize(
     ("mode", "control"),
     [("on", ControlAuthority.SUPPLIER)],
