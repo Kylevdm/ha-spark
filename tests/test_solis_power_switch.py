@@ -743,3 +743,222 @@ async def test_unreadable_slot_with_no_live_export_is_written_once_blind(tmp_pat
     await _device(rest, tmp_path).write_safe_state()
 
     assert _register_writes(rest) == [(43143, _SAFE_BLOCK)]
+
+
+@pytest.mark.asyncio
+async def test_fallback_writes_only_the_configured_window_and_limited_current(tmp_path) -> None:
+    rest = FakeRest(switch="On")
+    failed_soc = replace(_soc(), status=SocStatus.STALE)
+    device = _device(
+        rest,
+        tmp_path,
+        charge_window_start="01:15",
+        charge_window_end="04:30",
+        max_charge_current_a="35",
+        solis_fallback_current_a="45",
+    )
+
+    lines = await device.apply_fallback(failed_soc)
+
+    assert _register_writes(rest) == [
+        (43141, 350),
+        (43143, [1, 15, 4, 30, 0, 0, 0, 0]),
+    ]
+    assert any(
+        "set timed charge current to 35 A for configured window 01:15-04:30" in line
+        for line in lines
+    )
+    assert any(line.startswith("[FALLBACK]") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_fallback_without_configuration_leaves_resident_program_untouched(tmp_path) -> None:
+    rest = FakeRest(switch="On")
+    failed_soc = replace(_soc(), status=SocStatus.STALE)
+
+    lines = await _device(rest, tmp_path).apply_fallback(failed_soc)
+
+    assert _register_writes(rest) == []
+    assert not any(line.startswith("[FALLBACK]") for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("mode", "control", "expected_prefix"),
+    [
+        ("simulate", None, "[SIMULATE] Solis fallback"),
+        ("off", None, "[SKIP]"),
+        ("on", ControlAuthority.SUPPLIER, "[SKIP]"),
+    ],
+)
+async def test_fallback_without_write_authority_is_preview_or_skip(
+    tmp_path, mode: str, control: ControlAuthority | None, expected_prefix: str
+) -> None:
+    rest = FakeRest(switch="On")
+    device = _device(
+        rest,
+        tmp_path,
+        mode=mode,
+        control=control,
+        solis_fallback_current_a="45",
+    )
+
+    lines = await device.apply_fallback(replace(_soc(), status=SocStatus.STALE))
+
+    assert any(line.startswith(expected_prefix) for line in lines)
+    assert not any(line.startswith(("[FAILED]", "[FALLBACK]")) for line in lines)
+    if mode == "simulate":
+        assert "[FALLBACK]" not in lines[0]
+        assert "would be programmed (not written)" in lines[0]
+    assert _register_writes(rest) == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_preserves_live_verified_export_and_skips_its_lifecycle(tmp_path) -> None:
+    rest = FakeRest(switch="On")
+    resident_export = [16, 0, 19, 0]
+    _set_slot_one(rest, [23, 30, 5, 30, *resident_export])
+    await _record_export(tmp_path, ends_in=timedelta(hours=1))
+    async with ExportEventStore(str(tmp_path / "events.db")) as store:
+        previous_record = await store.load()
+    device = _device(
+        rest,
+        tmp_path,
+        solis_fallback_current_a="45",
+        notify_service="notify.mobile_app",
+    )
+
+    lines = await device.apply_fallback(replace(_soc(), status=SocStatus.STALE))
+
+    assert _register_writes(rest)[-1] == (43143, [23, 30, 5, 30, *resident_export])
+    assert not any(domain == "notify" for domain, _service, _payload in rest.calls)
+    async with ExportEventStore(str(tmp_path / "events.db")) as store:
+        assert await store.load() == previous_record
+    assert any(line.startswith("[FALLBACK]") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_active_fallback_reapply_does_not_size_current_from_a_passing_soc(tmp_path) -> None:
+    rest = FakeRest(switch="On")
+    device = _device(rest, tmp_path, solis_fallback_current_a="45")
+
+    lines = await device.apply_fallback(_soc(value=10.0))
+
+    assert _register_writes(rest)[0] == (43141, 450)
+    assert any(line.startswith("[FALLBACK]") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_fallback_read_back_failure_is_failed_not_confirmed(tmp_path) -> None:
+    class StaleWindowRest(FakeRest):
+        async def call_service(
+            self, domain: str, service: str, data: dict[str, object] | None = None
+        ) -> list[EntityState]:
+            if domain == "modbus" and service == "write_register" and data is not None:
+                if data.get("address") == 43143:
+                    self.calls.append((domain, service, data))
+                    return []
+            return await super().call_service(domain, service, data)
+
+    rest = StaleWindowRest(switch="On")
+    failed_soc = replace(_soc(), status=SocStatus.STALE)
+    device = _device(rest, tmp_path, solis_fallback_current_a="45")
+
+    lines = await device.apply_fallback(failed_soc)
+
+    assert _register_writes(rest)[-1][0] == 43143
+    assert any(line.startswith("[FAILED]") for line in lines)
+    assert not any(line.startswith("[FALLBACK]") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_fallback_is_unconfirmed_if_a_stale_extra_slot_cannot_be_cleared(tmp_path) -> None:
+    class StaleSecondSlotRest(FakeRest):
+        async def call_service(
+            self, domain: str, service: str, data: dict[str, object] | None = None
+        ) -> list[EntityState]:
+            if domain == "modbus" and service == "write_register" and data is not None:
+                if data.get("address") == 43153:
+                    self.calls.append((domain, service, data))
+                    return []
+            return await super().call_service(domain, service, data)
+
+    rest = StaleSecondSlotRest(switch="On")
+    _set_slot_one(rest, [0, 0, 0, 0, 0, 0, 0, 0])
+    for field, value in zip(_BLOCK_FIELDS, [1, 0, 2, 0, 0, 0, 0, 0], strict=True):
+        rest.states[f"sensor.solis_control_{field}_2"] = str(value)
+    failed_soc = replace(_soc(), status=SocStatus.STALE)
+
+    lines = await _device(rest, tmp_path, solis_fallback_current_a="45").apply_fallback(
+        failed_soc
+    )
+
+    assert any(line.startswith("[WARNING]") for line in lines)
+    assert any(line.startswith("[FAILED]") for line in lines)
+    assert not any(line.startswith("[FALLBACK]") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_verified_fallback_write_if_changed_avoids_register_churn(tmp_path) -> None:
+    rest = FakeRest(switch="On")
+    failed_soc = replace(_soc(), status=SocStatus.STALE)
+    device = _device(rest, tmp_path, solis_fallback_current_a="45")
+
+    first = await device.apply_fallback(failed_soc)
+    writes_after_first = _register_writes(rest)
+    second = await device.apply_fallback(failed_soc)
+
+    assert any(line.startswith("[FALLBACK]") for line in first)
+    assert any(line.startswith("[FALLBACK]") for line in second)
+    assert _register_writes(rest) == writes_after_first
+
+
+@pytest.mark.parametrize(
+    ("mode", "control"),
+    [("on", ControlAuthority.SUPPLIER)],
+)
+async def test_fallback_keeps_proactive_mode_and_control_ownership_gates(
+    tmp_path, mode: str, control: ControlAuthority | None
+) -> None:
+    rest = FakeRest(switch="On")
+    failed_soc = replace(_soc(), status=SocStatus.STALE)
+    device = _device(
+        rest,
+        tmp_path,
+        mode=mode,
+        control=control,
+        solis_fallback_current_a="45",
+    )
+
+    lines = await device.apply_fallback(failed_soc)
+
+    assert _register_writes(rest) == []
+    assert any(line.startswith("[SKIP]") for line in lines)
+    assert not any(line.startswith("[FALLBACK]") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_fallback_preserves_grid_charge_permission_gate(tmp_path) -> None:
+    rest = FakeRest(switch="On")
+    rest.states["sensor.solis_control_work_mode_bitfield"] = "3"
+    failed_soc = replace(_soc(), status=SocStatus.STALE)
+    device = _device(rest, tmp_path, solis_fallback_current_a="45")
+
+    lines = await device.apply_fallback(failed_soc)
+
+    assert _register_writes(rest) == []
+    assert any(line.startswith("[FAILED]") for line in lines)
+    assert not any(line.startswith("[FALLBACK]") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_fallback_deactivates_active_window_before_current_transition(tmp_path) -> None:
+    rest = FakeRest(switch="On")
+    _set_slot_one(rest, [22, 0, 23, 0, 0, 0, 0, 0])
+    rest.states["sensor.solis_control_timed_charge_current"] = "30"
+    failed_soc = replace(_soc(), status=SocStatus.STALE)
+    device = _device(rest, tmp_path, solis_fallback_current_a="45")
+
+    lines = await device.apply_fallback(failed_soc)
+
+    assert [address for address, _ in _register_writes(rest)] == [43143, 43141, 43143]
+    assert any(line.startswith("[FALLBACK]") for line in lines)

@@ -87,6 +87,13 @@ reported recently) and the value has not stayed unchanged past a hard
 ceiling. A frozen value from a live source is normal; a frozen source is not.
 "Stale" means there is no evidence the source is live.
 
+**Solis fallback**:
+The explicitly configured charge-current ceiling and cheap-rate window kept in
+use after sustained SoC-integrity failures. A request is not proof that the
+inverter accepted it; fallback is confirmed only by matching hardware read-back.
+It remains in place until the separate recovery policy changes it. AlphaESS has
+no fallback program.
+
 **Battery calibration**:
 Revising planner input estimates, such as effective capacity and charge
 efficiency, from evidence in a household's own history. It is repeatable

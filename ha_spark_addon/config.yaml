@@ -137,6 +137,7 @@ schema:
   min_soc: float(0,100)
   target_soc_cap: float(0,100)
   max_charge_current_a: float
+  solis_fallback_current_a: float(1,62.5)?
   battery_discharge_ceiling_kw: float(0,)
   dno_export_limit_kw: float(0,)
   charge_buffer_pct: float
