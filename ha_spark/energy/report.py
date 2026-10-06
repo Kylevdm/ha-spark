@@ -63,6 +63,16 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
             lines.append(f"    {plan.export_funding}")
     if plan.export_skips:
         lines.append("  Skipped paid export slots:")
+        if plan.export_soc_needed_pct is not None and plan.export_soc_needed_at is not None:
+            suffix = (
+                " — more than a full battery can fund"
+                if plan.export_soc_needed_pct > 100.0
+                else ""
+            )
+            lines.append(
+                f"    Event needs {plan.export_soc_needed_pct:.0f}% SoC at "
+                f"{_fmt(plan.export_soc_needed_at.time())} (now {plan.soc_now:.0f}%){suffix}"
+            )
         for skip in plan.export_skips:
             lines.append(f"    {_fmt(skip.start.time())}  — {skip.reason}")
     deficit = f"{plan.deficit_kwh:.2f} kWh"
