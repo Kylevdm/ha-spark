@@ -343,6 +343,9 @@ class ChargePlan:
     export_skips: tuple[ExportSkip, ...] = ()
     # Says so when the post-event reserve funds paid export (#207).
     export_funding: str | None = None
+    # Event-start SoC that would fund a skipped-for-funding export suffix.
+    export_soc_needed_pct: float | None = None
+    export_soc_needed_at: datetime | None = None
 
     @property
     def soc_now(self) -> float:
