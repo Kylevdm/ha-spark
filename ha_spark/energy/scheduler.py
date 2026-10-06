@@ -17,12 +17,13 @@ inert (and there is nothing else ha-spark can shed), so the guard stays quiet.
 Every tick also reconciles the inverter's hold state (`reconcile_tick`, #143):
 a read-first pass that converges the whole-inverter enable on what the clock and
 the dispatch holds imply. On the HA-entity path it re-reads the dispatch entity
-each minute; the Octopus API path reuses the last plan's holds. It is deliberately independent of
-`setpoint_changed` — a hold boundary is a clock event, not a plan change, and
-dispatch bounds need not land on a half-hour. A tick that replans reconciles
-inside `run_once` instead, against the plan it just computed; a replan that
-raises falls back to the per-minute pass against the last plan, so a failing
-replan never starves the clock (#147).
+each minute; the Octopus API path re-rates the last plan's dispatch windows
+from local evidence without fetching plans from Kraken. It is deliberately
+independent of `setpoint_changed` — a hold boundary is a clock event, not a
+plan change, and dispatch bounds need not land on a half-hour. A tick that
+replans reconciles inside `run_once` against its new plan; if replan raises,
+the per-minute pass uses the last plan so a failure never starves the clock
+(#147).
 
 Every tick also makes exactly one checked SoC observation (`soc_monitor_tick`,
 #114): the daemon loop is the sole SoC observation cadence, and that one
@@ -554,8 +555,10 @@ async def reconcile_tick(
     ``_controlled_windows`` the planner uses, so an overnight dispatch stays
     cheap charge coverage, never a hold. A trusted read replaces the returned
     trusted set; a failed one falls back to it. The ``octopus_intelligent``
-    path keeps the last plan's holds: per-minute Kraken polling would be 30x
-    the current rate against an API whose own client caps refreshes.
+    path re-rates the last plan's original daytime dispatch windows each minute
+    from fresh local evidence. It reads the HA dispatch entity only for its live
+    state, never for planned windows; an untrusted plan keeps the existing
+    last-trusted-holds behavior.
 
     Relinquishing control (#143 §5): once the clock is past every known hold end
     and the hold data is *still* untrusted, ha-spark has no picture left to steer
@@ -583,6 +586,9 @@ async def reconcile_tick(
                 settings.tariff_provider != "octopus_intelligent"
                 and bool(settings.dispatch_entity)
             )
+            rerate_octopus_dispatches = (
+                settings.tariff_provider == "octopus_intelligent" and fresh.hold_trusted
+            )
             dispatch_trusted = True
             if refresh_dispatches:
                 dispatches, dispatch_trusted, live_dispatch = await read_dispatches_and_live(
@@ -591,13 +597,26 @@ async def reconcile_tick(
                 if not dispatch_trusted:
                     fresh = replace(fresh, hold_trusted=False)
                     read_lines = [UNREADABLE_DISPATCH_LINE]
+            elif rerate_octopus_dispatches:
+                # Live state only matters when there is a window to rate.
+                if settings.dispatch_entity and fresh.unrated_holds:
+                    _entity_dispatches, _entity_trusted, live_dispatch = (
+                        await read_dispatches_and_live(settings, rest)
+                    )
+                dispatches = tuple(
+                    DispatchSlot(start=start, end=end)
+                    for start, end in fresh.unrated_holds
+                )
+            should_rate_dispatches = (refresh_dispatches and dispatch_trusted) or (
+                rerate_octopus_dispatches
+            )
             evidence_read = await read_dispatch_evidence(
                 settings,
                 rest,
-                dispatches if dispatch_trusted else (),
+                dispatches if should_rate_dispatches else (),
                 live_dispatch=live_dispatch,
             )
-            if refresh_dispatches and dispatch_trusted:
+            if should_rate_dispatches:
                 dispatches, _dropped = partition_dispatches(
                     dispatches, evidence_read.evidence, now
                 )
