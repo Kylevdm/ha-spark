@@ -12,6 +12,12 @@
   zeroes only the charge half and writes the planned export window back in the
   same block. The export half is kept only when it reads back exactly as
   planned; otherwise the whole block is zeroed as before.
+- A failed or blocked apply is now retried (#168): an apply that reported a
+  `[FAILED]` or `[BLOCKED]` action still counted as applied, so the next
+  half-hourly replan skipped an unchanged plan. On 2026-10-03 that left Slot 1
+  zeroed with no charge window. Such an apply, or a replan that raised, now
+  leaves no baseline, so the next replan applies again. Simulate mode is
+  unaffected.
 
 ## 0.19.6
 

@@ -115,7 +115,7 @@ async def run_plan(settings: Settings) -> PlanResult:
     # local import: avoids api.server <-> scheduler <-> tools import cycle (see Task 7)
     from ha_spark.energy.scheduler import run_once
 
-    plan = await run_once(settings)
+    plan = (await run_once(settings)).plan
     entities = [
         {"entity_id": eid, "state": value, "attributes": attrs}
         for eid, value, attrs in plan_to_payload(plan, settings)
