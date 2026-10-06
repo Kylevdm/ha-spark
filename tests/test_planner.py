@@ -441,6 +441,26 @@ def test_same_day_export_is_funded_from_the_live_soc() -> None:
     assert plan.export_revenue == pytest.approx(2.7)
 
 
+def test_same_day_export_reports_soc_needed_for_the_funded_suffix() -> None:
+    event = replace(_SAME_DAY_EVENT, rate_gbp_kwh=0.20)
+    plan = _plan(
+        _same_day_inputs(
+            soc_now=43.0,
+            now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC),
+            event=event,
+        ),
+        replace(_same_day_cfg(), buffer_pct=20.0),
+    )
+
+    export = plan.charge_intent.export
+    assert export is not None
+    assert export.selected_slots == (event.start + timedelta(minutes=30),)
+    assert "funding it would consume" in plan.export_skips[0].reason
+    # Event house 0.50 + both exports 2.70 + buffered post-event load 2.10 kWh.
+    assert plan.export_soc_needed_pct == pytest.approx(20.0 + 5.3 / 26.88 * 100.0)
+    assert plan.export_soc_needed_at == event.start
+
+
 def test_same_day_export_leaves_tonights_charge_to_refill_what_it_spent() -> None:
     """Tonight's charge is sized after the export, not zeroed by it."""
     now = datetime(2026, 6, 8, 16, 0, tzinfo=UTC)
@@ -606,6 +626,82 @@ def test_axle_export_keeps_the_post_event_reserve_when_buying_it_back_costs_more
     assert plan.export_funding is None
 
 
+def test_axle_export_reports_soc_needed_for_the_funded_suffix() -> None:
+    """At event start, include both export slots and the buffered post-event load."""
+    event = FlexibilityEvent(
+        start=datetime(2026, 6, 9, 17, 0, tzinfo=UTC),
+        end=datetime(2026, 6, 9, 18, 0, tzinfo=UTC),
+        direction="export",
+        updated_at=datetime(2026, 6, 9, 16, 0, tzinfo=UTC),
+        rate_gbp_kwh=0.30,
+    )
+    inputs = PlannerInputs(
+        soc=_soc(56.0),
+        solar_tomorrow_kwh=0.0,
+        predicted_home_load_kwh=24.0,
+        load_slots=(0.5,) * 48,
+        solar_slots=(0.0,) * 48,
+        horizon_start=_HORIZON_START,
+        flexibility_event=event,
+    )
+    config = cfg(
+        capacity_kwh=28.0,
+        target_cap=96.0,
+        buffer_pct=20.0,
+        battery_discharge_ceiling_kw=3.2,
+        dno_export_limit_kw=7.36,
+        supply_max_current_a=75.0,
+    )
+
+    plan = _plan(inputs, config)
+
+    export = plan.charge_intent.export
+    assert export is not None
+    assert export.selected_slots == (event.start + timedelta(minutes=30),)
+    assert "funding it would consume" in plan.export_skips[0].reason
+    assert plan.export_soc_needed_pct == pytest.approx(55.0)
+    assert plan.export_soc_needed_at == event.start
+
+
+def test_axle_export_counts_earlier_slots_made_unavailable_by_a_funding_skip() -> None:
+    event = FlexibilityEvent(
+        start=datetime(2026, 6, 9, 17, 0, tzinfo=UTC),
+        end=datetime(2026, 6, 9, 18, 30, tzinfo=UTC),
+        direction="export",
+        updated_at=datetime(2026, 6, 9, 16, 0, tzinfo=UTC),
+        rate_gbp_kwh=0.30,
+    )
+    inputs = PlannerInputs(
+        soc=_soc(56.0),
+        solar_tomorrow_kwh=0.0,
+        predicted_home_load_kwh=12.0,
+        load_slots=(0.25,) * 48,
+        solar_slots=(0.0,) * 48,
+        horizon_start=_HORIZON_START,
+        flexibility_event=event,
+    )
+    config = cfg(
+        capacity_kwh=28.0,
+        target_cap=60.0,
+        buffer_pct=20.0,
+        battery_discharge_ceiling_kw=3.2,
+        dno_export_limit_kw=7.36,
+        supply_max_current_a=75.0,
+    )
+
+    plan = _plan(inputs, config)
+
+    export = plan.charge_intent.export
+    assert export is not None
+    assert export.selected_slots == (event.end - timedelta(minutes=30),)
+    assert "a later slot is unavailable" in plan.export_skips[0].reason
+    assert "funding it would consume" in plan.export_skips[1].reason
+    # All three event slots are recoverable with more SoC: 0.75 house, 4.05 export,
+    # and 3.00 buffered post-event kWh.
+    assert plan.export_soc_needed_pct == pytest.approx(20.0 + 7.8 / 28.0 * 100.0)
+    assert plan.export_soc_needed_at == event.start
+
+
 @pytest.mark.parametrize(
     ("dear_slot", "funded"),
     [
@@ -673,6 +769,82 @@ def test_axle_export_skips_a_slot_the_fixed_current_would_push_over_the_dno_limi
 
     assert plan.charge_intent.export is None
     assert "fixed discharge command would exceed the DNO" in plan.export_skips[0].reason
+    assert plan.export_soc_needed_pct is None
+    assert plan.export_soc_needed_at is None
+
+
+def test_axle_soc_needed_excludes_a_dno_refusal_before_the_funded_suffix() -> None:
+    event = FlexibilityEvent(
+        start=datetime(2026, 6, 9, 17, 0, tzinfo=UTC),
+        end=datetime(2026, 6, 9, 19, 0, tzinfo=UTC),
+        direction="export",
+        updated_at=datetime(2026, 6, 9, 16, 0, tzinfo=UTC),
+        rate_gbp_kwh=0.30,
+    )
+    loads = [0.5] * 48
+    loads[35] = 0.0  # 17:00 would exceed the DNO ceiling at the fixed discharge current.
+    inputs = PlannerInputs(
+        soc=_soc(56.0),
+        solar_tomorrow_kwh=0.0,
+        predicted_home_load_kwh=sum(loads),
+        load_slots=tuple(loads),
+        solar_slots=(0.0,) * 48,
+        horizon_start=_HORIZON_START,
+        flexibility_event=event,
+    )
+    config = cfg(
+        capacity_kwh=28.0,
+        target_cap=94.0,
+        battery_discharge_ceiling_kw=3.2,
+        dno_export_limit_kw=2.5,
+        supply_max_current_a=75.0,
+    )
+
+    plan = _plan(inputs, config)
+
+    export = plan.charge_intent.export
+    assert export is not None
+    assert export.selected_slots == (
+        event.start + timedelta(hours=1),
+        event.start + timedelta(hours=1, minutes=30),
+    )
+    assert "DNO or supply limit" in plan.export_skips[0].reason
+    assert "funding it would consume" in plan.export_skips[1].reason
+    # Count only 17:30 onward: 1.50 house, 3.30 export, and 4.50 post-event kWh.
+    assert plan.export_soc_needed_pct == pytest.approx(20.0 + 9.3 / 28.0 * 100.0)
+    assert plan.export_soc_needed_at == event.start + timedelta(minutes=30)
+
+
+def test_axle_export_reports_when_more_than_a_full_battery_is_needed() -> None:
+    event = FlexibilityEvent(
+        start=_HORIZON_START + timedelta(hours=23),
+        end=_HORIZON_START + timedelta(days=1),
+        direction="export",
+        updated_at=_HORIZON_START + timedelta(hours=22),
+        rate_gbp_kwh=0.30,
+    )
+    inputs = PlannerInputs(
+        soc=_soc(50.0),
+        solar_tomorrow_kwh=0.0,
+        predicted_home_load_kwh=12.0,
+        load_slots=(0.25,) * 48,
+        solar_slots=(0.0,) * 48,
+        horizon_start=_HORIZON_START,
+        flexibility_event=event,
+    )
+    config = cfg(
+        capacity_kwh=1.5,
+        battery_discharge_ceiling_kw=3.2,
+        dno_export_limit_kw=3.68,
+    )
+
+    plan = _plan(inputs, config)
+
+    assert plan.charge_intent.export is None
+    assert "funding it would consume" in plan.export_skips[-1].reason
+    assert plan.export_soc_needed_pct == pytest.approx(20.0 + 3.2 / 1.5 * 100.0)
+    assert plan.export_soc_needed_pct > 100.0
+    assert plan.export_soc_needed_at == event.start
 
 
 def test_axle_export_skips_a_slot_the_fixed_current_would_push_over_the_supply_limit() -> None:
