@@ -139,13 +139,15 @@ class _AmpsDevice:
         self.amps_by_soc = amps_by_soc
         self.voltage_v = voltage_v
         self.applied: list[ChargeIntent] = []
+        # Lines each apply returns, in order; then "[APPLIED] test".
+        self.results: list[list[str]] = []
 
     def planned_rate_w(self, intent: ChargeIntent) -> float:
         return self.amps_by_soc[intent.soc_now] * self.voltage_v
 
     async def apply(self, intent: ChargeIntent) -> list[str]:
         self.applied.append(intent)
-        return ["[APPLIED] test"]
+        return self.results.pop(0) if self.results else ["[APPLIED] test"]
 
     async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
         return []
@@ -157,11 +159,18 @@ def _plan_at(soc: float) -> ChargePlan:
 
 
 def _patch_run_once_io(
-    monkeypatch: pytest.MonkeyPatch, current: ChargePlan, device: object
+    monkeypatch: pytest.MonkeyPatch,
+    current: ChargePlan | list[ChargePlan | Exception],
+    device: object,
 ) -> None:
+    """Stub ``run_once``'s I/O. A list is computed in order; an exception there raises."""
+
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
+        plan = current.pop(0) if isinstance(current, list) else current
+        if isinstance(plan, Exception):
+            raise plan
         return SimpleNamespace(
-            plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test"
+            plan=plan, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test"
         )
 
     async def noop(*_args: object, **_kwargs: object) -> None:
@@ -211,29 +220,60 @@ async def test_run_once_ignores_amps_sized_from_an_untrusted_soc(
     assert device.applied == []
 
 
-async def test_run_forever_compares_against_the_last_applied_plan(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("lines", "resident"),
+    [
+        (["[APPLIED] set charge window"], True),
+        (["[SIMULATE] [BLOCKED] set charge window: SoC unavailable"], True),
+        (["[APPLIED] deactivate slot 1", "[FAILED] set charge window"], False),
+        (["[BLOCKED] set charge window: SoC unavailable"], False),
+    ],
+)
+async def test_run_once_reports_whether_the_apply_left_the_plan_resident(
+    monkeypatch: pytest.MonkeyPatch, lines: list[str], resident: bool
 ) -> None:
-    """Skipped plans must not become the baseline, or 4 A falls never add up (#173)."""
-    previous_seen: list[object] = []
-    plans = [_plan_at(31.0), _plan_at(34.0), _plan_at(40.0), _plan_at(42.0)]
-    amps = {31.0: 38.0, 34.0: 35.0, 40.0: 33.0, 42.0: 31.0}
-    queue = list(plans)
+    """A failed or blocked apply leaves the device unknown: no baseline (#168)."""
+    settings = Settings()
+    device = _AmpsDevice({31.0: 38.0}, settings.battery_voltage_v)
+    device.results = [lines]
+    current = _plan_at(31.0)
+    _patch_run_once_io(monkeypatch, current, device)
 
-    async def fake_run_once(_s: Settings, **kw: object) -> ChargePlan:
-        previous_seen.append(kw.get("previous_plan"))
-        return queue.pop(0)
+    result = await run_once(settings, soc=current.soc, previous_plan=None)
+
+    assert result.plan is current
+    assert result.applied_plan is (current if resident else None)
+
+
+def _run_forever_through(
+    monkeypatch: pytest.MonkeyPatch,
+    plans: list[ChargePlan | Exception],
+    device: _AmpsDevice,
+    ticks: list[datetime],
+) -> type[Exception]:
+    """Drive the real ``run_once`` inside ``run_forever``, one tick per entry in ``ticks``."""
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
         return None
 
-    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    _patch_run_once_io(monkeypatch, plans, device)
     monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
-    monkeypatch.setattr(
-        scheduler, "inverter_device", lambda *_a: _AmpsDevice(amps, Settings().battery_voltage_v)
+    # The loop and the real `run_once` each read the clock once per replan.
+    return _patch_loop(monkeypatch, [t for tick in ticks for t in (tick, tick)])
+
+
+async def test_run_forever_compares_against_the_last_applied_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skipped plans must not become the baseline, or 4 A falls never add up (#173)."""
+    plans = [_plan_at(31.0), _plan_at(34.0), _plan_at(40.0), _plan_at(42.0)]
+    device = _AmpsDevice(
+        {31.0: 38.0, 34.0: 35.0, 40.0: 33.0, 42.0: 31.0}, Settings().battery_voltage_v
     )
-    stop = _patch_loop(
+    stop = _run_forever_through(
         monkeypatch,
+        list(plans),
+        device,
         [
             datetime(2026, 6, 10, 23, 0),  # 38 A applied
             datetime(2026, 6, 10, 23, 30),  # 35 A: skipped
@@ -246,7 +286,56 @@ async def test_run_forever_compares_against_the_last_applied_plan(
     with pytest.raises(stop):
         await run_forever(s, poll_seconds=0)
 
-    assert previous_seen == [None, plans[0], plans[0], plans[2]]
+    assert device.applied == [plans[0].charge_intent, plans[2].charge_intent]
+
+
+async def test_run_forever_retries_an_unchanged_plan_after_a_failed_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2026-10-03: a falsely failed apply left Slot 1 zeroed and the next slot skipped (#168)."""
+    plan = _plan_at(31.0)
+    device = _AmpsDevice({31.0: 12.0}, Settings().battery_voltage_v)
+    device.results = [["[APPLIED] deactivate slot 1", "[FAILED] set charge window"]]
+    stop = _run_forever_through(
+        monkeypatch,
+        [plan, plan, plan],
+        device,
+        [
+            datetime(2026, 10, 3, 12, 30),  # apply fails part-way
+            datetime(2026, 10, 3, 13, 0),  # same plan: retried, lands
+            datetime(2026, 10, 3, 13, 30),  # same plan, now resident: skipped
+        ],
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert device.applied == [plan.charge_intent, plan.charge_intent]
+
+
+async def test_run_forever_reapplies_after_a_replan_that_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replan that raises may have stopped mid-write: forget the baseline (#168)."""
+    plan = _plan_at(31.0)
+    device = _AmpsDevice({31.0: 12.0}, Settings().battery_voltage_v)
+    stop = _run_forever_through(
+        monkeypatch,
+        [plan, RuntimeError("boom"), plan],
+        device,
+        [
+            datetime(2026, 10, 3, 12, 30),  # applied
+            datetime(2026, 10, 3, 13, 0),  # replan raises
+            datetime(2026, 10, 3, 13, 1),  # same plan: re-applied, not skipped
+        ],
+    )
+
+    s = Settings(ha_url="http://ha.test", ha_token="t")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert device.applied == [plan.charge_intent, plan.charge_intent]
 
 
 @respx.mock
@@ -265,7 +354,7 @@ async def test_run_once_computes_and_applies_plan(
     )
 
     with caplog.at_level("INFO"):
-        plan = await run_once(s)
+        plan = (await run_once(s)).plan
 
     assert plan.charge_intent.target_soc_pct >= 0
     assert any("Charge plan" in r.message for r in caplog.records)
@@ -319,7 +408,8 @@ async def test_run_once_skips_unchanged_command_after_fresh_soc(
 
     result = await run_once(Settings(), soc=current.soc, previous_plan=previous)
 
-    assert result is current
+    assert result.plan is current
+    assert result.applied_plan is previous
     assert applied == []
     # A skipped setpoint must still serve the clock (#143): the reconcile is a
     # separate seam, so a slot with no plan change still converges the switch.
@@ -414,7 +504,7 @@ async def test_dynamic_plan_parity_between_scheduler_and_agent_plan(
         tariff_provider="dynamic", dynamic_rates_entity="sensor.dynamic_rates",
     )
 
-    plan = await run_once(s)
+    plan = (await run_once(s)).plan
     # The dynamic schedule actually flowed through the daemon's plan.
     assert plan.model == "slots"
     assert plan.slot_prices == tuple(0.99 for _ in range(48))
@@ -442,11 +532,12 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
-    ) -> ChargePlan:
+    ) -> scheduler.RunResult:
         calls.append("run")
         if len(calls) == 1:
             raise RuntimeError("boom")
-        return _plan()
+        plan = _plan()
+        return scheduler.RunResult(plan, plan)
 
     class _StopLoop(Exception):
         pass
@@ -569,8 +660,9 @@ async def test_run_forever_publishes_plan_to_api_state(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
-    ) -> ChargePlan:
-        return _plan()
+    ) -> scheduler.RunResult:
+        plan = _plan()
+        return scheduler.RunResult(plan, plan)
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
         return None
@@ -600,8 +692,9 @@ async def test_run_forever_guard_ticks_only_inside_window(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
-    ) -> ChargePlan:
-        return _plan()
+    ) -> scheduler.RunResult:
+        plan = _plan()
+        return scheduler.RunResult(plan, plan)
 
     async def fake_guard_tick(
         _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
@@ -647,8 +740,9 @@ async def test_run_forever_no_guard_when_entity_unset(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
-    ) -> ChargePlan:
-        return _plan()
+    ) -> scheduler.RunResult:
+        plan = _plan()
+        return scheduler.RunResult(plan, plan)
 
     async def fail_guard_tick(
         _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
@@ -681,8 +775,9 @@ async def test_run_forever_no_guard_when_charger_has_no_live_rate(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
-    ) -> ChargePlan:
-        return _plan()
+    ) -> scheduler.RunResult:
+        plan = _plan()
+        return scheduler.RunResult(plan, plan)
 
     async def fail_guard_tick(
         _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
@@ -717,8 +812,9 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
-    ) -> ChargePlan:
-        return _plan()
+    ) -> scheduler.RunResult:
+        plan = _plan()
+        return scheduler.RunResult(plan, plan)
 
     async def boom_guard_tick(
         _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
@@ -864,8 +960,9 @@ async def test_run_forever_samples_signals_every_interval(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
-    ) -> ChargePlan:
-        return _plan()
+    ) -> scheduler.RunResult:
+        plan = _plan()
+        return scheduler.RunResult(plan, plan)
 
     async def fake_sample_signals(_s: Settings, now: datetime) -> None:
         sampled.append(now)
@@ -1114,9 +1211,10 @@ def _patch_monitor_loop(
             previous_plan: ChargePlan | None = None,
             trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
             ev_hold_state: scheduler.EvHoldState | None = None,
-        ) -> ChargePlan:
+        ) -> scheduler.RunResult:
             run_once_socs.append(soc)
-            return _plan()
+            plan = _plan()
+            return scheduler.RunResult(plan, plan)
     else:
         async def fake_run_once(
             _s: Settings,
@@ -1125,8 +1223,9 @@ def _patch_monitor_loop(
             previous_plan: ChargePlan | None = None,
             trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
             ev_hold_state: scheduler.EvHoldState | None = None,
-        ) -> ChargePlan:
-            return _plan()
+        ) -> scheduler.RunResult:
+            plan = _plan()
+            return scheduler.RunResult(plan, plan)
 
     if guard_socs is not None:
         async def fake_guard_tick(
@@ -1349,7 +1448,7 @@ async def test_run_once_failed_soc_leaves_solis_resident_program_untouched(
     )
     failed = _failed_soc()
     with caplog.at_level("WARNING"):
-        plan = await run_once(s, soc=failed)
+        plan = (await run_once(s, soc=failed)).plan
 
     # The plan carries the exact tick measurement (no independent reread).
     assert plan.soc is failed
@@ -1378,7 +1477,7 @@ async def test_run_once_failed_soc_blocks_alphaess_programming(
         inverter="alphaess", alphaess_serial="SN1",
     )
     with caplog.at_level("INFO"):
-        plan = await run_once(s, soc=_failed_soc())
+        plan = (await run_once(s, soc=_failed_soc())).plan
 
     assert not plan.soc.ok
     assert any("[BLOCKED]" in r.message and "not charge to" in r.message
@@ -1405,17 +1504,18 @@ async def test_loop_blocked_plan_rate_never_becomes_guard_target(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
-    ) -> ChargePlan:
+    ) -> scheduler.RunResult:
         # A plan computed from the tick's failed measurement: blocked at the
         # charger gate, but still a plan object (existence != applied).
         failed = soc if soc is not None and not soc.ok else _failed_soc()
-        return replace(
+        plan = replace(
             _plan(ChargeIntent(
                 target_soc_pct=90.0, soc=failed,
                 window_start=time(23, 30), window_end=time(5, 30),
             )),
             soc=failed,  # compute_plan carries the same measurement at both levels
         )
+        return scheduler.RunResult(plan, None)
 
     guard_targets: list[float | None] = []
 
@@ -1580,8 +1680,9 @@ async def test_run_forever_reconciles_every_minute_not_every_slot(
     reconciled: list[datetime] = []
     plans: list[ChargePlan | None] = []
 
-    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
-        return _plan()
+    async def fake_run_once(_s: Settings, **_kw: object) -> scheduler.RunResult:
+        plan = _plan()
+        return scheduler.RunResult(plan, plan)
 
     async def fake_reconcile_tick(
         _s: Settings,
@@ -1636,8 +1737,9 @@ async def test_run_forever_does_not_reconcile_twice_on_a_slot_boundary(
     """
     reconciled: list[datetime] = []
 
-    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
-        return _plan()
+    async def fake_run_once(_s: Settings, **_kw: object) -> scheduler.RunResult:
+        plan = _plan()
+        return scheduler.RunResult(plan, plan)
 
     async def fake_reconcile_tick(
         _s: Settings,
@@ -1825,9 +1927,10 @@ async def test_run_forever_remembers_holds_only_from_trusted_plans(
     run_once_saw: list[object] = []
     reconcile_saw: list[object] = []
 
-    async def fake_run_once(_s: Settings, **kw: object) -> ChargePlan:
+    async def fake_run_once(_s: Settings, **kw: object) -> scheduler.RunResult:
         run_once_saw.append(kw.get("trusted_holds"))
-        return next(plans)
+        plan = next(plans)
+        return scheduler.RunResult(plan, plan)
 
     async def fake_reconcile_tick(
         _s: Settings,
@@ -1878,13 +1981,14 @@ async def test_run_forever_forgets_trusted_holds_on_hot_reload(
             super().__init__(**kw)  # type: ignore[arg-type]
             captured.append(self)
 
-    async def fake_run_once(_s: Settings, **kw: object) -> ChargePlan:
+    async def fake_run_once(_s: Settings, **kw: object) -> scheduler.RunResult:
         state = kw["ev_hold_state"]
         assert isinstance(state, scheduler.EvHoldState)
         ev_states.append(state)
         state.active = True
         state.not_charging_since = datetime(2026, 6, 10, 21, 55)
-        return _plan(replace(_INTENT, holds=(_HOLD,)))
+        plan = _plan(replace(_INTENT, holds=(_HOLD,)))
+        return scheduler.RunResult(plan, plan)
 
     async def fake_reconcile_tick(
         _s: Settings,
@@ -2472,8 +2576,9 @@ async def test_run_forever_keeps_the_holds_a_per_minute_read_trusted(
 ) -> None:
     reconcile_saw: list[object] = []
 
-    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
-        return _plan()
+    async def fake_run_once(_s: Settings, **_kw: object) -> scheduler.RunResult:
+        plan = _plan()
+        return scheduler.RunResult(plan, plan)
 
     async def fake_reconcile_tick(
         _s: Settings,
@@ -2643,10 +2748,10 @@ async def _run_forever_until_cancelled(
     """One slot tick, then a cancel (as SIGTERM delivers it) with ``shutdown_at`` left
     on the clock for the ``finally``."""
 
-    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+    async def fake_run_once(_s: Settings, **_kw: object) -> scheduler.RunResult:
         if plan is None:
             raise RuntimeError("no plan")
-        return plan
+        return scheduler.RunResult(plan, plan)
 
     async def cancelled_sample_signals(_s: Settings, _now: datetime) -> None:
         raise asyncio.CancelledError
@@ -2725,9 +2830,10 @@ async def test_run_forever_reapplies_the_plan_after_a_relinquish(
     previous_seen: list[object] = []
     relinquish_at = datetime(2026, 6, 10, 22, 1)
 
-    async def fake_run_once(_s: Settings, **kw: object) -> ChargePlan:
+    async def fake_run_once(_s: Settings, **kw: object) -> scheduler.RunResult:
         previous_seen.append(kw.get("previous_plan"))
-        return _plan()
+        plan = _plan()
+        return scheduler.RunResult(plan, plan)
 
     async def fake_reconcile_tick(
         _s: Settings,
@@ -2782,7 +2888,7 @@ async def test_run_forever_reconciles_every_tick_while_the_replan_keeps_failing(
     """
     reconciled: list[datetime] = []
 
-    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+    async def fake_run_once(_s: Settings, **_kw: object) -> scheduler.RunResult:
         raise RuntimeError("HA unreachable")
 
     async def fake_reconcile_tick(
@@ -2829,11 +2935,11 @@ async def test_a_failed_replans_fallback_pass_uses_the_last_plan_and_holds(
     outcomes: list[ChargePlan | Exception] = [trusted, RuntimeError("HA unreachable")]
     reconciled: list[tuple[ChargePlan | None, object]] = []
 
-    async def fake_run_once(_s: Settings, **_kw: object) -> ChargePlan:
+    async def fake_run_once(_s: Settings, **_kw: object) -> scheduler.RunResult:
         outcome = outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
-        return outcome
+        return scheduler.RunResult(outcome, outcome)
 
     async def fake_reconcile_tick(
         _s: Settings,
@@ -2882,12 +2988,12 @@ async def test_run_forever_reapplies_when_a_fallback_pass_relinquishes(
         _plan(), RuntimeError("HA unreachable"), _plan()
     ]
 
-    async def fake_run_once(_s: Settings, **kw: object) -> ChargePlan:
+    async def fake_run_once(_s: Settings, **kw: object) -> scheduler.RunResult:
         previous_seen.append(kw.get("previous_plan"))
         outcome = outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
-        return outcome
+        return scheduler.RunResult(outcome, outcome)
 
     async def fake_reconcile_tick(
         _s: Settings,
@@ -2942,8 +3048,9 @@ async def test_run_forever_syncs_the_inverter_clock_at_a_clock_change_when_opted
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
-    ) -> ChargePlan:
-        return _plan()
+    ) -> scheduler.RunResult:
+        plan = _plan()
+        return scheduler.RunResult(plan, plan)
 
     async def record_run(self: DstClockSync, _s: Settings, _rest: object, now: datetime) -> None:
         runs.append(now)
