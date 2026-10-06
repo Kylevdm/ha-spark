@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Axle funding skips report the SoC needed at the first counted event slot
+  (#214). The plan report and HA plan-status sensor include the estimate for
+  event house load, skipped and selected export energy, and buffered post-event
+  reserve. DNO, hold, daylight, and no-capacity refusals are excluded. Estimates
+  above 100% say that more than a full battery is needed.
 - Solis zero read-back confirmation (#216): zero current and zero slot targets
   now need matching reads at least five seconds apart before verification or a
   write skip succeeds. A mismatch resets confirmation; non-zero targets retain

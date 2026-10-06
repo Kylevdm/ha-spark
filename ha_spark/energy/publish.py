@@ -55,6 +55,17 @@ def plan_to_payload(plan: ChargePlan, settings: Settings) -> list[Entity]:
     Shared source of truth: the daemon pushes these via REST, and the add-on
     HTTP API serves the same list so the companion integration mirrors them.
     """
+    plan_status_attributes: dict[str, Any] = {
+        "friendly_name": "ha-spark plan status",
+        "strategy": plan.strategy,
+        "proactive_mode": settings.proactive_mode,
+        "soc_status": plan.soc.status.value,
+        "soc_reason": plan.soc.reason,
+    }
+    if plan.export_soc_needed_pct is not None and plan.export_soc_needed_at is not None:
+        plan_status_attributes["export_soc_needed_pct"] = round(plan.export_soc_needed_pct)
+        plan_status_attributes["export_soc_needed_at"] = plan.export_soc_needed_at.isoformat()
+
     entities: list[Entity] = [
         (
             "sensor.ha_spark_charge_needed_kwh",
@@ -113,13 +124,7 @@ def plan_to_payload(plan: ChargePlan, settings: Settings) -> list[Entity]:
         (
             "sensor.ha_spark_plan_status",
             plan.model,
-            {
-                "friendly_name": "ha-spark plan status",
-                "strategy": plan.strategy,
-                "proactive_mode": settings.proactive_mode,
-                "soc_status": plan.soc.status.value,
-                "soc_reason": plan.soc.reason,
-            },
+            plan_status_attributes,
         ),
         (
             "sensor.ha_spark_last_run",

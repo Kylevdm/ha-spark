@@ -287,6 +287,24 @@ def test_plan_status_publishes_ok_status_for_a_checked_soc() -> None:
     assert attrs["soc_status"] == "ok"
 
 
+def test_plan_status_publishes_event_soc_needed_only_when_present() -> None:
+    needed_at = datetime(2026, 10, 5, 20, 0, tzinfo=UTC)
+    attrs = {
+        eid: attributes
+        for eid, _, attributes in plan_to_payload(
+            _plan(export_soc_needed_pct=61.2, export_soc_needed_at=needed_at), Settings()
+        )
+    }["sensor.ha_spark_plan_status"]
+    without_need = {
+        eid: attributes for eid, _, attributes in plan_to_payload(_plan(), Settings())
+    }["sensor.ha_spark_plan_status"]
+
+    assert attrs["export_soc_needed_pct"] == 61
+    assert attrs["export_soc_needed_at"] == needed_at.isoformat()
+    assert "export_soc_needed_pct" not in without_need
+    assert "export_soc_needed_at" not in without_need
+
+
 @respx.mock
 async def test_publish_soc_integrity_exposes_pending_state_and_evidence() -> None:
     """The per-minute monitor sensor carries the pending state, the failure

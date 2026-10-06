@@ -139,3 +139,40 @@ def test_report_explains_selected_and_skipped_paid_export_slots() -> None:
     assert "3.20 kW" in out
     assert "Skipped paid slot" in out
     assert "£1.00 event vs £0.33 buy-back" in out
+
+
+def test_report_shows_soc_needed_at_the_start_of_a_funding_skip() -> None:
+    start = datetime(2026, 6, 9, 20, 0, tzinfo=UTC)
+    out = format_plan(
+        _plan(
+            soc=_soc(56),
+            export_skips=(
+                ExportSkip(start, "Skipped paid slot: funding it would consume reserve."),
+            ),
+            export_soc_needed_pct=61.2,
+            export_soc_needed_at=start,
+        ),
+        "test",
+    )
+
+    assert "Event needs 61% SoC at 20:00 (now 56%)" in out
+
+
+def test_report_explains_when_a_full_battery_cannot_fund_the_event() -> None:
+    start = datetime(2026, 6, 9, 20, 0, tzinfo=UTC)
+    out = format_plan(
+        _plan(
+            soc=_soc(56),
+            export_skips=(
+                ExportSkip(start, "Skipped paid slot: funding it would consume reserve."),
+            ),
+            export_soc_needed_pct=111.6,
+            export_soc_needed_at=start,
+        ),
+        "test",
+    )
+
+    assert (
+        "Event needs 112% SoC at 20:00 (now 56%) — more than a full battery can fund"
+        in out
+    )
