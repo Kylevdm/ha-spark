@@ -16,7 +16,7 @@ import respx
 from ha_spark.api.server import AppState
 from ha_spark.config import DeviceConfig, Settings
 from ha_spark.devices import Capability, inverter_device
-from ha_spark.devices.inverters.solis import SolisDevice
+from ha_spark.devices.inverters.solis import SolisDevice, _ApplyResult, solis_current_a
 from ha_spark.energy import scheduler, sources
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
@@ -1337,6 +1337,141 @@ def _patch_monitor_loop(
     return _patch_loop(monkeypatch, ticks)
 
 
+def _recovery_measurement(
+    observed_at: datetime, reported_at: datetime, *, value: float = 50.0, ok: bool = True
+) -> SocMeasurement:
+    return SocMeasurement(
+        status=SocStatus.OK if ok else SocStatus.STALE,
+        observed_at=observed_at,
+        value=value,
+        raw_state=str(value),
+        reported_at=reported_at,
+        age_s=(observed_at - reported_at).total_seconds(),
+        max_age_s=600.0,
+    )
+
+
+def _patch_recovery_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    ticks: list[datetime],
+    measurements: list[SocMeasurement],
+    recovery_results: list[bool],
+    *,
+    recovery_calls: list[dict[str, object]],
+    monitor_snapshots: list[object],
+    outcome_snapshots: list[object],
+    guard_calls: list[tuple[bool, bool]],
+    published_actions: list[list[str]],
+) -> type[Exception]:
+    """Drive a recovery run with checked observations and explicit apply verdicts."""
+    pending = list(measurements)
+
+    async def fake_soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasurement:
+        measurement = pending.pop(0)
+        snapshot = monitor.record(
+            measurement, failure_threshold=settings.soc_failure_threshold
+        )
+        if snapshot.state.value == "fallback_threshold":
+            assert monitor.request_fallback() is not None
+            monitor.complete_fallback(action_line="[FALLBACK] test read-back verified")
+        monitor_snapshots.append(monitor.last_snapshot)
+        return measurement
+
+    async def fake_run_once(
+        _settings: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
+        recovery_attempt: bool = False,
+        fallback_confirmed: bool = False,
+    ) -> scheduler.RunResult:
+        intent = replace(_INTENT, soc=soc or _INTENT.soc)
+        plan = replace(_plan(intent), soc=intent.soc, charge_intent=intent)
+        if recovery_attempt:
+            recovery_calls.append(
+                {
+                    "soc": soc,
+                    "previous_plan": previous_plan,
+                    "fallback_active": fallback_active,
+                    "fallback_confirmed": fallback_confirmed,
+                    "plan_soc": plan.soc,
+                    "intent_soc": plan.charge_intent.soc if plan.charge_intent else None,
+                }
+            )
+            success = recovery_results.pop(0)
+            return scheduler.RunResult(
+                plan, plan if success else None, success, ("[APPLIED] test recovery",)
+            )
+        return scheduler.RunResult(plan, None if fallback_active else plan)
+
+    async def fake_guard_tick(
+        _settings: Settings,
+        target_w: float | None,
+        *,
+        soc: SocMeasurement | None = None,
+        fallback_active: bool = False,
+        fallback_confirmed: bool = False,
+    ) -> float:
+        guard_calls.append((fallback_active, fallback_confirmed))
+        return target_w or 0.0
+
+    async def fake_publish_outcome(_settings: Settings, monitor: SocMonitor) -> None:
+        outcome_snapshots.append(monitor.last_snapshot)
+
+    async def fake_planned_rate(_settings: Settings, _plan: ChargePlan) -> float:
+        return 1000.0
+
+    async def fake_live_rate(_settings: Settings) -> bool:
+        return True
+
+    async def noop_sample_signals(_settings: Settings, _now: datetime) -> None:
+        return None
+
+    async def noop_republish(_rest: object, _settings: Settings) -> None:
+        return None
+
+    async def capture_publish_plan(
+        _rest: object,
+        _plan: ChargePlan,
+        _settings: Settings,
+        *,
+        effective_program: str | None = None,
+        action_lines: list[str] | None = None,
+        recovery_state: str | None = None,
+        recovery_elapsed_seconds: int | None = None,
+        recovery_stable_minutes: int | None = None,
+    ) -> None:
+        published_actions.append(action_lines or [])
+
+    async def noop_reconcile(
+        _settings: Settings,
+        _plan: ChargePlan | None,
+        _now: datetime,
+        **_kwargs: object,
+    ) -> scheduler.ReconcileResult:
+        return scheduler.ReconcileResult([], None)
+
+    class SafeStateOnlyDevice:
+        async def write_safe_state(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(scheduler, "soc_monitor_tick", fake_soc_monitor_tick)
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "guard_tick", fake_guard_tick)
+    monkeypatch.setattr(scheduler, "_publish_soc_snapshot", fake_publish_outcome)
+    monkeypatch.setattr(scheduler, "_planned_rate_w", fake_planned_rate)
+    monkeypatch.setattr(scheduler, "_charger_supports_live_rate", fake_live_rate)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    monkeypatch.setattr(scheduler, "republish_last", noop_republish)
+    monkeypatch.setattr(scheduler, "publish_plan", capture_publish_plan)
+    monkeypatch.setattr(scheduler, "reconcile_tick", noop_reconcile)
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_args: SafeStateOnlyDevice())
+    return _patch_loop(monkeypatch, ticks)
+
+
 @respx.mock
 async def test_loop_isolated_soc_failure_then_pass_resets_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1373,6 +1508,264 @@ async def test_loop_isolated_soc_failure_then_pass_resets_count(
         "consecutive_failures": 0,
         "fallback_status": "normal",
     }
+
+
+async def test_recovery_apply_retries_next_minute_and_publishes_truthful_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    start = datetime(2026, 10, 6, 20, tzinfo=UTC)
+    measurements = [
+        _recovery_measurement(start, start - timedelta(hours=1), ok=False),
+        _recovery_measurement(start + timedelta(minutes=1), start + timedelta(minutes=1), value=45),
+        _recovery_measurement(start + timedelta(minutes=2), start + timedelta(minutes=1), value=61),
+        _recovery_measurement(start + timedelta(minutes=3), start + timedelta(minutes=2), value=31),
+        _recovery_measurement(start + timedelta(minutes=4), start + timedelta(minutes=3), value=75),
+    ]
+    recovery_calls: list[dict[str, object]] = []
+    monitor_snapshots: list[object] = []
+    outcome_snapshots: list[object] = []
+    guard_calls: list[tuple[bool, bool]] = []
+    published_actions: list[list[str]] = []
+    stop = _patch_recovery_loop(
+        monkeypatch,
+        [start + timedelta(minutes=minute) for minute in range(5)],
+        measurements,
+        [False, True],
+        recovery_calls=recovery_calls,
+        monitor_snapshots=monitor_snapshots,
+        outcome_snapshots=outcome_snapshots,
+        guard_calls=guard_calls,
+        published_actions=published_actions,
+    )
+    settings = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        proactive_mode="on",
+        timezone="UTC",
+        db_path=str(tmp_path / "ledger.db"),
+        soc_entity="sensor.soc",
+        soc_failure_threshold=1,
+        soc_recovery_stable_minutes=2,
+        solis_fallback_current_a=42.0,
+        grid_power_entity="sensor.grid",
+        charge_window_start="19:00",
+        charge_window_end="23:00",
+        v2l_power_entity="",
+    )
+
+    with caplog.at_level("INFO"), pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert len(recovery_calls) == 2
+    qualifying_measurement = measurements[3]
+    assert recovery_calls[0]["soc"] is qualifying_measurement
+    assert recovery_calls[0]["plan_soc"] is qualifying_measurement
+    assert recovery_calls[0]["intent_soc"] is qualifying_measurement
+    assert recovery_calls[0]["previous_plan"] is None
+    assert recovery_calls[0]["fallback_active"] is True
+    assert recovery_calls[1]["soc"] is measurements[4]
+    assert recovery_calls[1]["previous_plan"] is None
+
+    before_recovery = monitor_snapshots[2]
+    assert before_recovery.state.value == "fallback_verified"
+    assert before_recovery.fallback_confirmed is True
+    assert before_recovery.effective_program == "fallback"
+    failed, recovered = outcome_snapshots
+    assert failed.state.value == "fallback_failed"
+    assert failed.fallback_confirmed is False
+    assert failed.effective_program == "unknown"
+    assert failed.recovery_state == "qualified"
+    assert failed.recovery_action.startswith("[FAILED]")
+    assert recovered.state.value == "normal"
+    assert recovered.consecutive_failures == 0
+    assert recovered.recovery_state == "recovered"
+    assert recovered.recovery_hardware_verified is True
+    assert recovered.effective_program == "normal"
+    assert recovered.recovery_action.startswith("[RECOVERED]")
+    assert any(line.startswith("[FAILED] Solis recovery") for line in published_actions[-2])
+    assert any(line.startswith("[RECOVERED] Solis recovery") for line in published_actions[-1])
+    assert "[RECOVERED] Solis recovery: normal program read-back verified" in caplog.text
+    assert guard_calls[3] == (True, False)
+    assert guard_calls[4] == (False, False)
+
+
+async def test_simulated_recovery_returns_to_normal_without_hardware_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    start = datetime(2026, 10, 6, 20, tzinfo=UTC)
+    measurements = [
+        _recovery_measurement(start, start - timedelta(hours=1), ok=False),
+        _recovery_measurement(start + timedelta(minutes=1), start + timedelta(minutes=1)),
+        _recovery_measurement(start + timedelta(minutes=2), start + timedelta(minutes=2)),
+    ]
+    recovery_calls: list[dict[str, object]] = []
+    monitor_snapshots: list[object] = []
+    outcome_snapshots: list[object] = []
+    guard_calls: list[tuple[bool, bool]] = []
+    published_actions: list[list[str]] = []
+    stop = _patch_recovery_loop(
+        monkeypatch,
+        [start + timedelta(minutes=minute) for minute in range(3)],
+        measurements,
+        [True],
+        recovery_calls=recovery_calls,
+        monitor_snapshots=monitor_snapshots,
+        outcome_snapshots=outcome_snapshots,
+        guard_calls=guard_calls,
+        published_actions=published_actions,
+    )
+    settings = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        timezone="UTC",
+        proactive_mode="simulate",
+        db_path=str(tmp_path / "ledger.db"),
+        soc_entity="sensor.soc",
+        soc_failure_threshold=1,
+        soc_recovery_stable_minutes=1,
+        solis_fallback_current_a=42.0,
+        charge_window_start="19:00",
+        charge_window_end="23:00",
+        v2l_power_entity="",
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert len(recovery_calls) == 1
+    recovered = outcome_snapshots[0]
+    assert recovered.state.value == "normal"
+    assert recovered.recovery_state == "recovered"
+    assert recovered.recovery_hardware_verified is False
+    assert recovered.effective_program == "fallback"
+    assert "without hardware write or read-back" in recovered.recovery_action
+
+
+@pytest.mark.parametrize(
+    ("timezone", "observed_at", "window_start", "window_end", "window_verified"),
+    [
+        ("Europe/London", datetime(2026, 10, 6, 2, 30, tzinfo=UTC), "23:30", "05:30", True),
+        ("UTC", datetime(2026, 10, 6, 3, 0, tzinfo=UTC), "01:00", "05:00", False),
+    ],
+)
+@pytest.mark.parametrize("post_apply_failure", [None, "forecast", "orchestrator", "derived"])
+async def test_recovery_run_once_uses_qualifying_measurement_and_remaining_window(
+    monkeypatch: pytest.MonkeyPatch,
+    timezone: str,
+    observed_at: datetime,
+    window_start: str,
+    window_end: str,
+    window_verified: bool,
+    post_apply_failure: str | None,
+) -> None:
+    settings = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        timezone=timezone,
+        proactive_mode="on",
+        charge_window_start=window_start,
+        charge_window_end=window_end,
+        battery_capacity_kwh=26.88,
+        battery_voltage_v=51.0,
+        charge_efficiency=0.90,
+        max_charge_current_a=62.5,
+    )
+    measurement = _recovery_measurement(
+        observed_at, observed_at, value=56.0
+    )
+    intent = replace(
+        _INTENT,
+        target_soc_pct=70.0,
+        soc=measurement,
+        window_start=time.fromisoformat(window_start),
+        window_end=time.fromisoformat(window_end),
+    )
+    plan = replace(_plan(intent), soc=measurement, charge_intent=intent)
+    captured: list[tuple[SocMeasurement, float]] = []
+    published_programs: list[str | None] = []
+
+    class RecoverySolis(SolisDevice):
+        async def reconcile_holds(
+            self, *_args: object, **_kwargs: object
+        ) -> list[str]:
+            return []
+
+        async def apply_with_result(self, applied_intent: ChargeIntent) -> _ApplyResult:
+            captured.append((applied_intent.soc, solis_current_a(applied_intent, settings)))
+            return _ApplyResult(
+                ["[APPLIED] action text does not establish read-back"],
+                True,
+                window_verified,
+                True,
+            )
+
+    async def fake_current_plan(
+        _settings: Settings, _rest: object, *, soc: SocMeasurement | None
+    ) -> object:
+        assert soc is measurement
+        return SimpleNamespace(
+            plan=plan,
+            inputs=SimpleNamespace(ev_hold_charging=None),
+            load_source="test",
+        )
+
+    async def noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def fail_after_apply(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("post-apply work failed")
+
+    async def capture_publish(
+        _rest: object,
+        _plan: ChargePlan,
+        _settings: Settings,
+        *,
+        effective_program: str | None = None,
+        action_lines: list[str] | None = None,
+    ) -> None:
+        published_programs.append(effective_program)
+
+    monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda _settings, rest: _fake_solis_device(RecoverySolis, settings, rest),
+    )
+    monkeypatch.setattr(scheduler, "publish_plan", capture_publish)
+    monkeypatch.setattr(
+        scheduler,
+        "_record_forecast",
+        fail_after_apply if post_apply_failure == "forecast" else noop,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_run_orchestrator",
+        fail_after_apply if post_apply_failure == "orchestrator" else noop,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_run_derived_rerive",
+        fail_after_apply if post_apply_failure == "derived" else noop,
+    )
+
+    result = await run_once(
+        settings,
+        soc=measurement,
+        previous_plan=None,
+        fallback_active=True,
+        recovery_attempt=True,
+        fallback_confirmed=True,
+    )
+
+    assert result.plan.soc is measurement
+    assert result.applied_plan is (result.plan if window_verified else None)
+    assert result.recovery_success is window_verified
+    if window_verified:
+        assert result.applied_plan is result.plan
+    assert captured == [(measurement, pytest.approx(40.99, abs=0.05))]
+    assert published_programs == ["normal" if window_verified else "unknown"]
 
 
 @respx.mock

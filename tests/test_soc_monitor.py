@@ -14,6 +14,9 @@ from ha_spark.config import Settings
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus, check_soc
 from ha_spark.energy.soc_monitor import (
     MONITOR_FILE,
+    EffectiveProgram,
+    RecoveryOutcome,
+    RecoveryState,
     SocMonitor,
     SocOperatingState,
     observe_soc,
@@ -35,6 +38,20 @@ def _measurement(ok: bool, *, value: float = 30.0) -> SocMeasurement:
     )
 
 
+def _recovery_measurement(
+    observed_at: datetime, reported_at: datetime | None, *, value: float = 30.0, ok: bool = True
+) -> SocMeasurement:
+    return SocMeasurement(
+        status=SocStatus.OK if ok else SocStatus.STALE,
+        observed_at=observed_at,
+        value=value,
+        raw_state=str(value),
+        reported_at=reported_at,
+        age_s=(observed_at - reported_at).total_seconds() if reported_at else None,
+        max_age_s=600.0,
+    )
+
+
 def _entity(state: str, *, reported_at: datetime) -> object:
     from ha_spark.ha.models import EntityState
 
@@ -53,6 +70,15 @@ def _settings(tmp_path: Path, **kw: object) -> Settings:
         db_path=str(tmp_path / "ledger.db"),
         **kw,
     )
+
+
+def _fallback_monitor(stable_minutes: int = 2) -> SocMonitor:
+    monitor = SocMonitor(recovery_stable_minutes=stable_minutes)
+    failed = _recovery_measurement(datetime(2026, 10, 6, 20, tzinfo=UTC), None, ok=False)
+    monitor.record(failed, failure_threshold=1)
+    assert monitor.request_fallback() is not None
+    monitor.complete_fallback(action_line="[FALLBACK] verified")
+    return monitor
 
 
 # --- state transitions ---
@@ -92,6 +118,172 @@ def test_custom_threshold_behaves_equivalently(tmp_path: Path) -> None:
     first = m.record(_measurement(ok=False), failure_threshold=1)
     assert first.state is SocOperatingState.FALLBACK_THRESHOLD
     assert first.consecutive_failures == 1
+
+
+def test_recovery_waits_for_stable_time_and_new_report_but_allows_soc_movement() -> None:
+    monitor = _fallback_monitor(stable_minutes=2)
+    started = datetime(2026, 10, 6, 20, tzinfo=UTC)
+
+    first = monitor.record(
+        _recovery_measurement(started, started, value=40), failure_threshold=1
+    )
+    cached = monitor.record(
+        _recovery_measurement(started + timedelta(minutes=1), started, value=63),
+        failure_threshold=1,
+    )
+
+    assert first.recovery_state == "stabilizing"
+    assert cached.recovery_state == "stabilizing"
+    assert not monitor.recovery_qualified
+    assert cached.recovery_elapsed_seconds == 60
+
+    qualified = monitor.record(
+        _recovery_measurement(
+            started + timedelta(minutes=2), started + timedelta(minutes=1), value=28
+        ),
+        failure_threshold=1,
+    )
+    assert qualified.recovery_state == "qualified"
+    assert qualified.recovery_elapsed_seconds == 120
+    assert monitor.recovery_qualified
+
+
+def test_recovery_does_not_qualify_from_a_cached_report_alone() -> None:
+    monitor = _fallback_monitor(stable_minutes=2)
+    started = datetime(2026, 10, 6, 20, tzinfo=UTC)
+
+    for minute in range(13):
+        snapshot = monitor.record(
+            _recovery_measurement(
+                started + timedelta(minutes=minute), started, value=25 + minute
+            ),
+            failure_threshold=1,
+        )
+
+    assert snapshot.recovery_elapsed_seconds == 720
+    assert snapshot.recovery_state == "stabilizing"
+    assert not monitor.recovery_qualified
+
+
+def test_recovery_failure_resets_the_continuous_passing_interval() -> None:
+    monitor = _fallback_monitor(stable_minutes=2)
+    started = datetime(2026, 10, 6, 20, tzinfo=UTC)
+    monitor.record(_recovery_measurement(started, started), failure_threshold=1)
+    monitor.record(
+        _recovery_measurement(
+            started + timedelta(minutes=1), started + timedelta(minutes=1)
+        ),
+        failure_threshold=1,
+    )
+
+    failed = monitor.record(
+        _recovery_measurement(
+            started + timedelta(minutes=2), started + timedelta(minutes=2), ok=False
+        ),
+        failure_threshold=1,
+    )
+    assert failed.recovery_state == "waiting"
+    assert failed.recovery_elapsed_seconds == 0
+    assert not monitor.recovery_qualified
+
+    monitor.record(
+        _recovery_measurement(
+            started + timedelta(minutes=3), started + timedelta(minutes=3)
+        ),
+        failure_threshold=1,
+    )
+    qualified = monitor.record(
+        _recovery_measurement(
+            started + timedelta(minutes=5), started + timedelta(minutes=4)
+        ),
+        failure_threshold=1,
+    )
+    assert qualified.recovery_state == "qualified"
+    assert monitor.recovery_qualified
+
+
+def test_recovery_report_regression_restarts_the_interval() -> None:
+    monitor = _fallback_monitor(stable_minutes=2)
+    started = datetime(2026, 10, 6, 20, tzinfo=UTC)
+    monitor.record(_recovery_measurement(started, started), failure_threshold=1)
+    monitor.record(
+        _recovery_measurement(
+            started + timedelta(minutes=1), started + timedelta(minutes=1)
+        ),
+        failure_threshold=1,
+    )
+
+    regressed = monitor.record(
+        _recovery_measurement(
+            started + timedelta(minutes=2), started - timedelta(minutes=1)
+        ),
+        failure_threshold=1,
+    )
+    assert regressed.recovery_state == "stabilizing"
+    assert regressed.recovery_elapsed_seconds == 0
+    assert not monitor.recovery_qualified
+
+    monitor.record(
+        _recovery_measurement(started + timedelta(minutes=3), started),
+        failure_threshold=1,
+    )
+    qualified = monitor.record(
+        _recovery_measurement(
+            started + timedelta(minutes=4), started + timedelta(minutes=1)
+        ),
+        failure_threshold=1,
+    )
+    assert qualified.recovery_state == "qualified"
+
+
+def test_recovery_duration_comes_from_settings_and_progress_is_not_persisted(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, soc_recovery_stable_minutes=3)
+    monitor = SocMonitor.load(settings)
+    failed = _recovery_measurement(datetime(2026, 10, 6, 19, tzinfo=UTC), None, ok=False)
+    monitor.record(failed, failure_threshold=1)
+    assert monitor.request_fallback() is not None
+    monitor.complete_fallback(action_line="[FALLBACK] verified")
+    started = datetime(2026, 10, 6, 20, tzinfo=UTC)
+    for minute in range(3):
+        snapshot = monitor.record(
+            _recovery_measurement(started + timedelta(minutes=minute), started),
+            failure_threshold=1,
+        )
+    assert snapshot.recovery_stable_minutes == 3
+    assert snapshot.recovery_state == "stabilizing"
+
+    restored = SocMonitor.load(settings)
+    assert not restored.recovery_qualified
+    first_after_load = restored.record(
+        _recovery_measurement(started + timedelta(minutes=4), started + timedelta(minutes=4)),
+        failure_threshold=1,
+    )
+    assert first_after_load.recovery_elapsed_seconds == 0
+    assert first_after_load.recovery_state == "stabilizing"
+
+
+def test_prewrite_recovery_failure_conservatively_downgrades_verified_fallback() -> None:
+    monitor = _fallback_monitor()
+    started = datetime(2026, 10, 6, 20, tzinfo=UTC)
+    monitor.record(_recovery_measurement(started, started), failure_threshold=1)
+    monitor.record(
+        _recovery_measurement(started + timedelta(minutes=2), started + timedelta(minutes=1)),
+        failure_threshold=1,
+    )
+    assert monitor.fallback_confirmed
+
+    failed = monitor.complete_recovery(RecoveryOutcome.FAILED)
+
+    # A BLOCKED gate can fail before any write. The apply verdict has no
+    # write-progress proof, so recovery must conservatively treat hardware as unknown.
+    assert failed.state is SocOperatingState.FALLBACK_FAILED
+    assert failed.fallback_confirmed is False
+    assert failed.effective_program is EffectiveProgram.UNKNOWN
+    assert failed.recovery_action is not None
+    assert failed.recovery_action.startswith("[FAILED]")
+    assert failed.recovery_state is RecoveryState.QUALIFIED
 
 
 def test_fallback_confirmation_persists_and_pass_does_not_clear_active_fallback(
