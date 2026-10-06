@@ -202,6 +202,9 @@ class PlannerInputs:
     # Live per-slot import prices from a `dynamic` tariff price sensor, sorted
     # by start; empty when the dynamic provider isn't in use or the read failed.
     dynamic_prices: tuple[PricePoint, ...] = ()
+    # Original dispatches before evidence rating. The planner prices and sizes
+    # only `dispatches`, but carries these for local per-minute hold re-rating.
+    unrated_dispatches: tuple[DispatchSlot, ...] = ()
 
     @property
     def soc_now(self) -> float:
@@ -237,6 +240,10 @@ class ChargeIntent:
     # A current, per-minute EV hold is separate from dispatch windows because
     # it has no scheduled end. Dispatch trust remains independent of EV trust.
     ev_hold_active: bool = False
+    # Daytime windows from the plan's original dispatch read, before the
+    # evidence ladder filtered them. Reconcile uses these only for local
+    # re-rating; `holds` remains the rated set used by this plan.
+    unrated_holds: tuple[tuple[datetime, datetime], ...] = ()
 
     @property
     def soc_now(self) -> float:

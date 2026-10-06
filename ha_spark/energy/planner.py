@@ -50,7 +50,7 @@ from ha_spark.energy.models import (
     PlannerInputs,
     Reservation,
 )
-from ha_spark.energy.tariff import TariffSchedule
+from ha_spark.energy.tariff import TariffSchedule, _controlled_windows
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -775,6 +775,13 @@ def compute_plan(
         export=export,
         hold_trusted=inputs.dispatches_trusted,
         export_trusted=inputs.flexibility_event_trusted,
+        # Inputs built outside gather_inputs (backtest, tests) set no unrated list;
+        # their dispatches were never rated, so they are the unrated set.
+        unrated_holds=_controlled_windows(
+            inputs.unrated_dispatches or inputs.dispatches,
+            cfg.window_start,
+            cfg.window_end,
+        ),
     )
 
     return ChargePlan(
