@@ -341,6 +341,8 @@ class ChargePlan:
     # Skips are part of the plan rather than silently becoming lower-current
     # delivery: every accepted export slot is always a complete half-hour.
     export_skips: tuple[ExportSkip, ...] = ()
+    # Says so when the post-event reserve funds paid export (#207).
+    export_funding: str | None = None
 
     @property
     def soc_now(self) -> float:

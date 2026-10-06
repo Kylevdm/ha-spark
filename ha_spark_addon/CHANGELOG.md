@@ -18,6 +18,13 @@
   zeroed with no charge window. Such an apply, or a replan that raised, now
   leaves no baseline, so the next replan applies again. Simulate mode is
   unaffected.
+- An Axle event can spend the post-event reserve when that pays (#207): a slot
+  the battery can't otherwise fund may use the energy reserved for house load
+  after the event, when the event rate beats the worst import price where the
+  shortfall would be bought back, divided by round-trip efficiency. House load
+  before and during the event, `min_soc` and every actuation invariant stay
+  protected. The plan reports the trade, e.g. "£1.00 event vs £0.33 buy-back".
+  A same-day event prices the buy-back at the standard rate.
 
 ## 0.19.6
 

@@ -541,6 +541,121 @@ def test_same_day_export_skips_when_the_live_soc_cannot_fund_it() -> None:
     )
 
 
+# --- funding an event from the post-event reserve (#207) ---
+
+
+def _reserve_trade_plan(*, rate: float, prices: dict[int, float] | None = None) -> Any:
+    """A 17:00-18:00 event 0.6 kWh short of funding its 17:00 slot.
+
+    1 kW house load all day. At the 90% cap 19.6 kWh is usable: 12.5 kWh of house
+    load through the event, 5.5 kWh reserved 18:00-23:30, and 1.6 kWh for two
+    2.2 kW export slots that need 2.2 kWh. Import is £0.30 at 90% round trip.
+    """
+    event = FlexibilityEvent(
+        start=datetime(2026, 6, 9, 17, 0, tzinfo=UTC),
+        end=datetime(2026, 6, 9, 18, 0, tzinfo=UTC),
+        direction="export",
+        updated_at=datetime(2026, 6, 9, 16, 0, tzinfo=UTC),
+        rate_gbp_kwh=rate,
+    )
+    inputs = PlannerInputs(
+        soc=_soc(20.0), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+        load_slots=(0.5,) * 48, solar_slots=(0.0,) * 48,
+        horizon_start=_HORIZON_START, flexibility_event=event,
+    )
+    config = cfg(
+        capacity_kwh=28.0, battery_discharge_ceiling_kw=3.2, dno_export_limit_kw=7.36,
+        supply_max_current_a=75.0, supply_voltage_v=240.0, charge_efficiency=0.9,
+    )
+    schedule = fixed_schedule(inputs, config)
+    if prices:
+        schedule = replace(
+            schedule,
+            prices=tuple(prices.get(i, p) for i, p in enumerate(schedule.prices)),
+        )
+    return compute_plan(inputs, config, schedule)
+
+
+def test_axle_export_spends_the_post_event_reserve_when_buying_it_back_costs_less() -> None:
+    """£1.00 event vs £0.30 / 0.9 = £0.33 buy-back: the 17:00 slot is worth funding."""
+    plan = _reserve_trade_plan(rate=1.0)
+
+    export = plan.charge_intent.export
+    assert export is not None, [skip.reason for skip in plan.export_skips]
+    assert export.selected_slots == (
+        datetime(2026, 6, 9, 17, 0, tzinfo=UTC),
+        datetime(2026, 6, 9, 17, 30, tzinfo=UTC),
+    )
+    assert plan.export_skips == ()
+    _, post_event_reservation = plan.reservations
+    # 0.6 kWh of the 5.5 kWh reserve now goes to export.
+    assert post_event_reservation.energy_kwh == pytest.approx(4.9)
+    assert plan.export_funding is not None
+    assert "post-event reserve: £1.00 event vs £0.33 buy-back" in plan.export_funding
+
+
+def test_axle_export_keeps_the_post_event_reserve_when_buying_it_back_costs_more() -> None:
+    """£0.30 event vs £0.33 buy-back: the reserve stays put and the slot is skipped."""
+    plan = _reserve_trade_plan(rate=0.30)
+
+    export = plan.charge_intent.export
+    assert export is not None
+    assert export.selected_slots == (datetime(2026, 6, 9, 17, 30, tzinfo=UTC),)
+    assert "reserved house or post-event energy" in plan.export_skips[0].reason
+    assert plan.reservations[1].energy_kwh == pytest.approx(5.5)
+    assert plan.export_funding is None
+
+
+@pytest.mark.parametrize(
+    ("dear_slot", "funded"),
+    [
+        (37, True),  # 18:00: the battery still covers it, so its price is never paid
+        (46, False),  # 22:30: the 0.6 kWh shortfall lands in the last two slots
+    ],
+)
+def test_axle_export_prices_the_buy_back_where_the_shortfall_lands(
+    dear_slot: int, funded: bool
+) -> None:
+    """The battery runs dry at the end of the stretch, so only the tail is bought back."""
+    plan = _reserve_trade_plan(rate=1.0, prices={dear_slot: 2.0})
+
+    export = plan.charge_intent.export
+    assert export is not None
+    assert (len(export.selected_slots) == 2) is funded
+
+
+def test_same_day_export_spends_the_post_event_reserve_at_the_standard_rate() -> None:
+    """Before the horizon there are no slot prices, so buy-back is the standard rate."""
+    # 5.6 kWh usable: 2.0 kWh of house load to 20:00, 1.75 kWh reserved to the
+    # 23:30 window, then 1.85 kWh for two 1.35 kWh slots. 0.85 kWh is short.
+    soc = 20.0 + 5.6 / 26.88 * 100.0
+    plan = _plan(
+        _same_day_inputs(soc_now=soc, now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC)),
+        _same_day_cfg(),
+    )
+
+    export = plan.charge_intent.export
+    assert export is not None, [skip.reason for skip in plan.export_skips]
+    assert len(export.selected_slots) == 2
+    assert plan.export_funding is not None
+    assert "£1.00 event vs £0.30 buy-back" in plan.export_funding
+
+
+def test_same_day_export_never_spends_more_than_the_post_event_reserve() -> None:
+    """The reserve is the only extra: house load before and during the event stays put."""
+    # 4.5 kWh usable leaves 0.75 kWh after house load and the reserve: the
+    # 1.75 kWh reserve can fund one 1.35 kWh slot but not both (2.7 > 2.5).
+    soc = 20.0 + 4.5 / 26.88 * 100.0
+    plan = _plan(
+        _same_day_inputs(soc_now=soc, now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC)),
+        _same_day_cfg(),
+    )
+
+    export = plan.charge_intent.export
+    assert export is not None, [skip.reason for skip in plan.export_skips]
+    assert export.selected_slots == (datetime(2026, 6, 8, 19, 30, tzinfo=UTC),)
+
+
 def test_axle_export_skips_a_slot_the_fixed_current_would_push_over_the_dno_limit() -> None:
     event = FlexibilityEvent(
         start=datetime(2026, 6, 9, 17, 0, tzinfo=UTC),
