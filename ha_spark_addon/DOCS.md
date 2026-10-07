@@ -259,7 +259,7 @@ never write to hardware.
 V2L is a manual physical adapter with no control API, so ha-spark only reads
 it. When `v2l_power_entity` is set, each daemon tick reads the car's V2L
 discharge power (W), adds it to the kWh delivered this session, values that
-energy at the configured rates less round-trip losses, publishes
+energy at the configured rates less conversion losses, publishes
 `sensor.ha_spark_v2l_*`, and sends HA notifications. V2L doesn't change the
 planner or the drivers.
 
@@ -271,12 +271,17 @@ planner or the drivers.
 | `v2l_offpeak_rate_gbp` | £/kWh cheap rate used to refill the car later (default `0.07`). |
 | `v2l_cutoff_time` | Local time the cheap window starts. The unplug notification fires at or after it (default `01:00`). |
 | `v2l_notify_service` | Deprecated fallback HA `notify.<service>` target, scheduled for removal. `notify_service` takes precedence; this is used only when `notify_service` is blank. |
-| `v2l_budget_kwh` | Optional V2L budget in kWh, used in place of car SoC (the car has no HA integration, so ha-spark can't read its SoC). `0` disables the plug-in warning. |
+| `v2l_budget_kwh` | Optional V2L budget in kWh, used in place of car SoC (the car has no HA integration, so ha-spark can't read its SoC). `0` disables the plug-in warning. A top-up request never asks for more than this. |
+| `v2l_rectifier_efficiency` | Rectifier efficiency from the car's AC output into the house battery (default `0.94`). |
+| `v2l_charge_kw` | DC rate the rectifier charges the house battery at (default `2.15`, the measured rate at its 10 A AC input limit). Sets the "start V2L by" time. |
+| `v2l_soc_tolerance_pct` | How many SoC points below the overnight plan's expected path, on an Axle event day, count as the plan having been wrong (default `5`). |
 
 Published sensors: `sensor.ha_spark_v2l_power_w` (current discharge power),
 `sensor.ha_spark_v2l_energy_kwh` (session total), and
 `sensor.ha_spark_v2l_net_saving_gbp` (avoided peak import minus the cheap-rate
-refill cost, which can be negative). The session tally survives restarts and
+refill cost, which can be negative). Only part of the car's AC output offsets
+import: it passes the rectifier into the house battery and then the battery's
+discharge leg, taken as the square root of `charge_efficiency`. The session tally survives restarts and
 resets at the start of a new day once the car is idle.
 
 ha-spark sends up to three notifications per session, each at most once:
@@ -285,6 +290,22 @@ ha-spark sends up to three notifications per session, each at most once:
   powering the house from the car no longer saves money;
 - a reminder to plug the car in to recharge when V2L stops;
 - a warning when you are about to reach `v2l_budget_kwh`.
+
+**Top-up request for an underfunded Axle event.** ha-spark asks you to start
+V2L when a paid export slot would still be skipped for funding, even after
+spending the post-event reserve. It asks only when the charge window can't fix
+the gap, which means one of these:
+
+- the overnight charge was capped by `max_charge_current_a` for the window;
+- on the event day, live SoC is more than `v2l_soc_tolerance_pct` points below
+  what the last overnight plan expected for that time.
+
+It also asks only when V2L energy costs less than the event pays:
+`v2l_offpeak_rate_gbp` divided by `v2l_round_trip_efficiency`, the rectifier
+and the battery's discharge leg. The notification gives the shortfall, the car
+energy to draw, and the time to start V2L by. It goes out whether or not the
+car is plugged in. You start V2L yourself. The request repeats only when the
+shortfall grows by 0.5 kWh or more.
 
 `ha-spark v2l` prints the live tally. None of this writes to hardware. The
 planner reads live SoC at plan time, so it already sees the effect of V2L.

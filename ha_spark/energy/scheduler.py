@@ -100,7 +100,7 @@ from ha_spark.energy.sources import (
 from ha_spark.energy.supply_guard import SupplyGuard
 from ha_spark.energy.tariff import _controlled_windows
 from ha_spark.energy.tariff import _in_overnight_window as in_window
-from ha_spark.energy.v2l import run_v2l_tick, warn_deprecated_notify_target
+from ha_spark.energy.v2l import run_v2l_tick, run_v2l_topup, warn_deprecated_notify_target
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -301,6 +301,11 @@ async def run_once(
         for line in lines:
             log.info(line)
         await publish_plan(rest, plan, settings)
+        if settings.v2l_power_entity:
+            try:
+                await run_v2l_topup(settings, rest, plan, inputs.flexibility_event, now)
+            except Exception:  # noqa: BLE001 - a request never breaks a plan run
+                log.warning("V2L top-up request failed", exc_info=True)
     await _record_forecast(settings, plan, inputs, load_source)
     await _run_orchestrator(settings)
     await _run_derived_rerive(settings)

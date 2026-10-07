@@ -51,7 +51,7 @@ from ha_spark.energy.scheduler import (
 )
 from ha_spark.energy.sources import _to_float
 from ha_spark.energy.store import ConsumptionStore
-from ha_spark.energy.v2l import load_session, savings
+from ha_spark.energy.v2l import delivered_fraction, load_session, savings
 from ha_spark.ha.models import StateChangedEvent
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.state_cache import StateCache
@@ -83,6 +83,7 @@ async def _cmd_v2l(settings: Settings) -> int:
         settings.v2l_peak_rate_gbp,
         settings.v2l_offpeak_rate_gbp,
         settings.v2l_round_trip_efficiency,
+        delivered_fraction(settings),
     )
     print(f"V2L power now:  {power_w:.0f} W")
     print(f"Session energy: {session.kwh_delivered:.2f} kWh (peak {session.peak_power_w:.0f} W)")

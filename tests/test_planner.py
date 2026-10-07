@@ -46,6 +46,11 @@ def _plan(inp: PlannerInputs, cfg: PlannerConfig) -> Any:
     return compute_plan(inp, cfg, fixed_schedule(inp, cfg))
 
 
+# A charge current the window can fill any test battery with, for tests about
+# event funding rather than the 62.5 A ceiling (#208).
+_FILLS_THE_BATTERY_A = 200.0
+
+
 def cfg(**kw: Any) -> PlannerConfig:
     base: dict[str, Any] = dict(
         capacity_kwh=26.88,
@@ -228,6 +233,7 @@ def test_axle_export_reserves_a_full_event_and_the_post_event_cheap_slot() -> No
             dno_export_limit_kw=7.36,
             supply_max_current_a=75.0,
             supply_voltage_v=240.0,
+            max_current_a=_FILLS_THE_BATTERY_A,
         ),
     )
 
@@ -279,6 +285,7 @@ def test_axle_export_after_midnight_uses_the_in_progress_window_horizon() -> Non
             dno_export_limit_kw=7.36,
             supply_max_current_a=75.0,
             supply_voltage_v=240.0,
+            max_current_a=_FILLS_THE_BATTERY_A,
         ),
     )
 
@@ -586,6 +593,7 @@ def _reserve_trade_plan(*, rate: float, prices: dict[int, float] | None = None) 
     config = cfg(
         capacity_kwh=28.0, battery_discharge_ceiling_kw=3.2, dno_export_limit_kw=7.36,
         supply_max_current_a=75.0, supply_voltage_v=240.0, charge_efficiency=0.9,
+        max_current_a=_FILLS_THE_BATTERY_A,
     )
     schedule = fixed_schedule(inputs, config)
     if prices:
@@ -1083,3 +1091,88 @@ def test_dispatch_ev_kwh_sums_magnitudes() -> None:
 def test_dispatch_ev_kwh_none_without_dispatches() -> None:
     inp = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
     assert _plan(inp, cfg()).dispatch_ev_kwh is None
+
+
+# --- the charge window's current ceiling and the expected SoC path (#208) ---
+
+
+def _rate_capped_plan(soc: float = 20.0, **kw: Any) -> Any:
+    """A 17:00-18:00 event the charge window can't fund at 62.5 A.
+
+    40 kWh at 20%: 28 kWh fills to the 90% cap, but 6 h x 62.5 A x 51 V adds
+    only 19.125 kWh. 1 kW house load all day, no solar.
+    """
+    event = FlexibilityEvent(
+        start=datetime(2026, 6, 9, 17, 0, tzinfo=UTC),
+        end=datetime(2026, 6, 9, 18, 0, tzinfo=UTC),
+        direction="export",
+        updated_at=datetime(2026, 6, 9, 16, 0, tzinfo=UTC),
+        rate_gbp_kwh=0.30,
+    )
+    inputs = PlannerInputs(
+        soc=_soc(soc), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+        load_slots=(0.5,) * 48, solar_slots=(0.0,) * 48,
+        horizon_start=_HORIZON_START, flexibility_event=event, **kw,
+    )
+    return _plan(
+        inputs,
+        cfg(capacity_kwh=40.0, battery_discharge_ceiling_kw=3.2, dno_export_limit_kw=7.36),
+    )
+
+
+def test_axle_export_is_funded_only_from_what_the_charge_window_can_add() -> None:
+    plan = _rate_capped_plan()
+
+    # 19.125 kWh reachable less 12.5 kWh of house load to the event end and
+    # 5.5 kWh reserved after it leaves 1.125 kWh: one 1.1 kWh slot, not two.
+    export = plan.charge_intent.export
+    assert export is not None
+    assert export.selected_slots == (datetime(2026, 6, 9, 17, 30, tzinfo=UTC),)
+    assert plan.overnight_charge_capped is True
+    assert plan.required_kwh <= 19.125 + 1e-9
+
+
+def test_overnight_charge_is_capped_at_what_the_window_can_add() -> None:
+    inp = PlannerInputs(soc=_soc(20.0), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=40.0)
+
+    plan = _plan(inp, cfg(capacity_kwh=40.0))
+
+    # 40 kWh deficit, 28 kWh of headroom, but 6 h x 62.5 A x 51 V = 19.125 kWh.
+    assert plan.required_kwh == pytest.approx(19.125)
+
+
+def test_inside_the_window_only_the_rest_of_it_counts() -> None:
+    plan = _rate_capped_plan(now=_HORIZON_START + timedelta(hours=3))
+
+    # Three hours left: 9.5625 kWh can't fund either slot.
+    assert plan.required_kwh == pytest.approx(9.5625)
+    assert plan.charge_intent.export is None
+    assert plan.overnight_charge_capped is True
+
+
+def test_a_full_battery_within_reach_is_not_capped() -> None:
+    # From 50%, 12 kWh usable plus 19.125 kWh more passes the 28 kWh cap.
+    plan = _rate_capped_plan(soc=50.0)
+
+    assert plan.overnight_charge_capped is False
+
+
+def test_plan_carries_the_expected_soc_path_from_the_window_end() -> None:
+    plan = _rate_capped_plan()
+
+    window_end = _HORIZON_START + timedelta(hours=6)
+    assert plan.soc_path[0] == (window_end, pytest.approx(plan.target_soc))
+    by_time = dict(plan.soc_path)
+    # 1 kW of house load drains 1.25 points a half hour of a 40 kWh battery.
+    assert by_time[window_end + timedelta(minutes=30)] == pytest.approx(plan.target_soc - 1.25)
+    # The 17:30 export slot also drains 1.1 kWh of export: 4 points in all.
+    at_1730 = by_time[datetime(2026, 6, 9, 17, 30, tzinfo=UTC)]
+    at_1800 = by_time[datetime(2026, 6, 9, 18, 0, tzinfo=UTC)]
+    assert at_1730 - at_1800 == pytest.approx(1.25 + 2.75)
+    assert len(plan.soc_path) == 48 - 12
+
+
+def test_daily_model_has_no_soc_path() -> None:
+    inp = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
+
+    assert _plan(inp, cfg()).soc_path == ()
