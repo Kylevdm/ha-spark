@@ -225,7 +225,15 @@ class SolisDevice:
         return result.lines
 
     async def apply(self, intent: ChargeIntent) -> list[str]:
-        return (await self._apply(intent, None)).lines
+        return (await self.apply_with_result(intent)).lines
+
+    async def apply_with_result(self, intent: ChargeIntent) -> _ApplyResult:
+        """Apply a normal plan and return its read-back verdict for recovery.
+
+        ``apply`` retains its public action-list contract; the scheduler uses
+        this seam only when deciding whether fallback recovery may complete.
+        """
+        return await self._apply(intent, None)
 
     async def _apply(
         self, intent: ChargeIntent, fallback_current_a: float | None
