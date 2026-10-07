@@ -91,8 +91,11 @@ ceiling. A frozen value from a live source is normal; a frozen source is not.
 The explicitly configured charge-current ceiling and cheap-rate window kept in
 use after sustained SoC-integrity failures. A request is not proof that the
 inverter accepted it; fallback is confirmed only by matching hardware read-back.
-It remains in place until the separate recovery policy changes it. AlphaESS has
-no fallback program.
+It remains in place until recovery: SoC integrity has passed continuously for
+the recovery duration with an advancing report time, and a fresh plan from the
+current SoC and the remaining cheap-rate window has been applied and read back.
+Recovery being *ready* does not end the fallback; only that verified apply
+does. AlphaESS has no fallback program.
 
 **Battery calibration**:
 Revising planner input estimates, such as effective capacity and charge
