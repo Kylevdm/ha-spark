@@ -157,6 +157,9 @@ _OPTION_KEYS = frozenset(
         "v2l_cutoff_time",
         "v2l_notify_service",
         "v2l_budget_kwh",
+        "v2l_rectifier_efficiency",
+        "v2l_charge_kw",
+        "v2l_soc_tolerance_pct",
     }
 )
 
@@ -548,6 +551,13 @@ class Settings(BaseSettings):
     # Optional V2L budget (kWh) standing in for car SoC; 0 disables the
     # predictive plug-in warning.
     v2l_budget_kwh: float = Field(default=0.0)
+    # Rectifier AC->DC efficiency from the car into the house battery, and the
+    # DC rate it charges at (measured: 10 A AC input limit) (#208).
+    v2l_rectifier_efficiency: float = Field(default=0.94, gt=0, le=1)
+    v2l_charge_kw: float = Field(default=2.15, gt=0)
+    # Points below the overnight plan's expected SoC on an Axle event day that
+    # count as a miscalculation worth a V2L top-up request (#208).
+    v2l_soc_tolerance_pct: float = Field(default=5.0, ge=0)
 
     @field_validator("solar_percentile", mode="before")
     @classmethod

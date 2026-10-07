@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- V2L top-up request (#208): when a paid Axle slot stays unfunded after the
+  post-event-reserve trade, ha-spark sends a notification through
+  `notify_service`: "short by X kWh, start V2L by HH:MM". It is sent only when
+  the overnight charge was capped by the current ceiling, or when on the event
+  day live SoC is more than `v2l_soc_tolerance_pct` (default 5) points below
+  the overnight plan's path. It is also sent only when V2L energy costs less
+  than the event pays. The request is sized at `v2l_charge_kw` (default 2.15
+  kW DC) through `v2l_rectifier_efficiency` (default 0.94), never above
+  `v2l_budget_kwh`, and repeats only if the shortfall grows by 0.5 kWh. It
+  needs `v2l_power_entity`. ha-spark never actuates V2L.
+- The planner now caps the overnight charge at what the window can add at
+  `max_charge_current_a`. A day-ahead Axle event is funded only from that, so
+  a slot the battery can't reach is skipped the evening before instead of
+  failing on the day. Plans also carry the expected SoC path from the window
+  end.
+- `sensor.ha_spark_v2l_net_saving_gbp` and `ha-spark v2l` now count only the
+  car energy that reaches the house: rectifier and battery discharge losses
+  apply, so reported savings fall.
+
 ## 0.20.0
 
 - Solis fallback recovery (#117): an active fallback ends after
