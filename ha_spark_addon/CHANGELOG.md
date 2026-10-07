@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.21.0
+
 - V2L top-up request (#208): when a paid Axle slot stays unfunded after the
   post-event-reserve trade, ha-spark sends a notification through
   `notify_service`: "short by X kWh, start V2L by HH:MM". It is sent only when
