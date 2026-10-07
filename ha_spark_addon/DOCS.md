@@ -26,7 +26,8 @@ Intelligent, myenergi zappi). Point these at your own entities:
 |---|---|
 | `soc_entity` | Battery state of charge (%) |
 | `soc_max_report_age_minutes` | How old Home Assistant's `last_reported` for `soc_entity` may be before ha-spark treats the SoC as stale and blocks real charge writes (default `10.0`). Some integrations never re-report an unchanged SoC, so an older SoC still counts as fresh if `battery_voltage_entity` reported within this age, which shows the integration is live. That exception lasts up to 12 hours. ha-spark does not check whether the battery is idle |
-| `soc_failure_threshold` | How many consecutive failed SoC observations count as a sustained failure (default `3`). ha-spark logs a warning when the count is reached; automatic fallback programming at that point is planned ([#115](https://github.com/Kylevdm/ha-spark/issues/115)). The first failure already blocks new SoC-based programming and charge-rate increases, and one good observation resets the count |
+| `soc_failure_threshold` | How many consecutive failed SoC observations trigger the configured Solis fallback (default `3`). Before fallback entry, one good observation resets the count. Once fallback is requested, verified, or unconfirmed, a passing observation leaves it in place for the later recovery policy |
+| `solis_fallback_current_a` | Optional fallback-current ceiling in amps. When set, a sustained SoC failure programs only the configured `charge_window_start`–`charge_window_end` and this current, capped by `max_charge_current_a` and the Solis 62.5 A register limit. It is disabled when blank; there is no implicit current default. Only a successful Solis read-back is reported as verified |
 | `battery_voltage_entity` | Battery voltage (V). ha-spark also uses it to tell whether the SoC's source is live, so pick the voltage sensor from the same integration as `soc_entity` |
 | `solar_tomorrow_entity` | Solcast "forecast tomorrow" sensor (with `detailedForecast` attribute) |
 | `octopus_rate_entity` | Octopus current electricity rate sensor |
@@ -151,7 +152,8 @@ always produces.
   switch where applicable). Run in `simulate` for a few nights and check the
   log before switching to `on`.
 - `battery_capacity_kwh`, `battery_voltage_v`, `min_soc`, `target_soc_cap`,
-  `max_charge_current_a`: the battery and inverter model.
+  `max_charge_current_a`, `solis_fallback_current_a`: the battery and inverter
+  model. The fallback current is optional and has no default.
 - `charge_strategy`: `deficit` buys only the forecast shortfall; `fill`
   charges to `target_soc_cap` every night, which pays once the export rate is
   higher than the off-peak rate.

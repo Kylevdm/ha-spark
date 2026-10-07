@@ -16,12 +16,17 @@ the fuse ceiling is ``limit_a * supply_voltage_v``.
 The guard only ever moves the setpoint within ``[0, target]``; with no target
 above zero it cannot start a charge. Disabled while ``grid_power_entity`` is
 empty, and dormant for inverters without a settable charge rate.
+
+An unconfirmed SoC fallback follows the pending-failure rule and blocks
+increases while allowing valid reductions. A read-back-confirmed fallback
+allows restoration only up to its configured current ceiling.
 """
 
 from __future__ import annotations
 
 from ha_spark.config import Settings
 from ha_spark.devices import inverter_device
+from ha_spark.devices.inverters.solis import fallback_charge_current_a
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
@@ -61,14 +66,19 @@ class SupplyGuard:
         self._charger = inverter_device(settings, rest)
 
     async def tick(
-        self, target_w: float, *, soc: SocMeasurement | None = None
+        self,
+        target_w: float,
+        *,
+        soc: SocMeasurement | None = None,
+        fallback_active: bool = False,
+        fallback_confirmed: bool = False,
     ) -> str | None:
         """One guard pass; returns the action line if a resize was applied.
 
-        ``soc`` is the daemon tick's checked measurement. While it failed
-        (pending SoC failure, #114) the target is capped at the live setpoint:
-        an untrusted reading must not *increase* grid charging, while a valid
-        supply-guard measurement may still reduce it.
+        ``soc`` is the daemon tick's checked measurement. A failed measurement
+        caps the target at the live setpoint unless a fallback was confirmed.
+        An unconfirmed fallback also caps increases; the supply-guard reading
+        may still reduce the setpoint in either state.
         """
         s = self._settings
         try:
@@ -78,7 +88,19 @@ class SupplyGuard:
             log.warning("Supply guard: read failed (%s); skipping", exc)
             return None
 
-        if soc is not None and not soc.ok:
+        if fallback_active:
+            fallback_a = fallback_charge_current_a(s)
+            if not fallback_confirmed or fallback_a is None:
+                # A persisted/requested/failed fallback is not evidence of the
+                # resident current. Reductions remain valid; increases wait for
+                # a fresh Solis read-back confirmation.
+                target_w = min(target_w, setpoint_w)
+            else:
+                target_w = min(
+                    target_w,
+                    fallback_a * s.battery_voltage_v,
+                )
+        elif soc is not None and not soc.ok:
             target_w = min(target_w, setpoint_w)
 
         wanted_w = throttled_rate_w(

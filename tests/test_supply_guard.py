@@ -244,3 +244,43 @@ async def test_tick_passing_soc_restores_toward_target() -> None:
         line = await SupplyGuard(s, rest).tick(target_w=2040.0, soc=_soc_measurement(True))
     assert line is not None and "set charge current to 40 A (2040 W)" in line
     assert posts.call_count == 0
+
+
+@respx.mock
+async def test_unconfirmed_fallback_blocks_increases_but_keeps_valid_reductions() -> None:
+    posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    settings = _guard_settings(proactive_mode="simulate", solis_fallback_current_a=20.0)
+    _mock_state(settings.grid_power_entity, "3000")
+    _mock_state("sensor.solis_control_timed_charge_current", "5")
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        line = await SupplyGuard(settings, rest).tick(
+            target_w=4080.0, fallback_active=True, fallback_confirmed=False
+        )
+    assert line is None
+    assert posts.call_count == 0
+
+    _mock_state(settings.grid_power_entity, "20000")
+    _mock_state("sensor.solis_control_timed_charge_current", "40")
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        reduction = await SupplyGuard(settings, rest).tick(
+            target_w=4080.0, fallback_active=True, fallback_confirmed=False
+        )
+    assert reduction is not None and "set charge current to 1 A" in reduction
+    assert posts.call_count == 0
+
+
+@respx.mock
+async def test_verified_fallback_caps_guard_restoration_at_its_configured_current() -> None:
+    posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    settings = _guard_settings(proactive_mode="simulate", solis_fallback_current_a=15.0)
+    _mock_state(settings.grid_power_entity, "3000")
+    _mock_state("sensor.solis_control_timed_charge_current", "5")
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        line = await SupplyGuard(settings, rest).tick(
+            target_w=4080.0,
+            soc=_soc_measurement(False),
+            fallback_active=True,
+            fallback_confirmed=True,
+        )
+    assert line is not None and "set charge current to 15 A (765 W)" in line
+    assert posts.call_count == 0

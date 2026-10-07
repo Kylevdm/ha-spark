@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Verified Solis SoC fallback (#115): after `soc_failure_threshold` consecutive
+  failed observations, the optional `solis_fallback_current_a` programs only the
+  configured cheap-rate window through the normal gated, transition-safe Solis
+  path. The fallback is reported as confirmed only after current and window
+  read-backs match; failed attempts retry on the next minute. No configured
+  current means no fallback write. Supply reductions remain available while
+  unconfirmed, and restoration under a verified fallback stays under its current
+  ceiling.
 - Octopus hold re-rating (#228): the per-minute reconcile re-rates planned
   daytime dispatch holds from local HA evidence, so a plug change updates the
   inverter hold within a minute. It uses the plan's dispatch windows and never

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from ha_spark.config import Settings
+from ha_spark.devices.inverters.solis import fallback_charge_current_a
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.orchestrator import Decision
 from ha_spark.energy.soc_monitor import SocMonitorSnapshot
@@ -193,6 +194,9 @@ async def publish_soc_integrity(
     republishes a *fresh* observation, not a stale monitoring verdict.
     """
     m = snapshot.measurement
+    fallback_supported = any(
+        device.type == "inverter" and device.driver == "solis" for device in settings.devices
+    )
     await _push(
         rest,
         [
@@ -213,6 +217,18 @@ async def publish_soc_integrity(
                     "soc_age_s": m.age_s,
                     "soc_max_age_s": m.max_age_s,
                     "proactive_mode": settings.proactive_mode,
+                    "fallback_window_start": settings.charge_window_start,
+                    "fallback_window_end": settings.charge_window_end,
+                    "fallback_supported": fallback_supported,
+                    "fallback_current_configured_a": settings.solis_fallback_current_a,
+                    "fallback_current_ceiling_a": (
+                        fallback_charge_current_a(settings) if fallback_supported else None
+                    ),
+                    "fallback_confirmed": snapshot.fallback_confirmed,
+                    "fallback_action": snapshot.fallback_action,
+                    "fallback_actions": (
+                        [snapshot.fallback_action] if snapshot.fallback_action else []
+                    ),
                 },
             )
         ],

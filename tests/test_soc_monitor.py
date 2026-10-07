@@ -94,6 +94,99 @@ def test_custom_threshold_behaves_equivalently(tmp_path: Path) -> None:
     assert first.consecutive_failures == 1
 
 
+def test_fallback_confirmation_persists_and_pass_does_not_clear_active_fallback(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    monitor = SocMonitor.load(settings)
+    for _ in range(3):
+        monitor.record(_measurement(ok=False), failure_threshold=3)
+
+    requested = monitor.request_fallback()
+    assert requested is not None
+    assert requested.state is SocOperatingState.FALLBACK_REQUESTED
+    monitor.complete_fallback(action_line="[FALLBACK] verified")
+
+    passed = monitor.record(_measurement(ok=True), failure_threshold=3)
+    assert passed.state is SocOperatingState.FALLBACK_VERIFIED
+    assert passed.consecutive_failures == 3
+    assert passed.fallback_confirmed
+    assert passed.fallback_action is None
+
+    restored = SocMonitor.load(settings)
+    restored_snapshot = restored.record(_measurement(ok=False), failure_threshold=3)
+    assert restored_snapshot.state is SocOperatingState.FALLBACK_VERIFIED
+    assert not restored_snapshot.fallback_confirmed
+    retry = restored.request_fallback()
+    assert retry is not None
+    assert retry.state is SocOperatingState.FALLBACK_REQUESTED
+
+
+def test_unconfirmed_fallback_is_retried_and_not_reported_as_verified(
+    tmp_path: Path,
+) -> None:
+    monitor = SocMonitor.load(_settings(tmp_path))
+    for _ in range(3):
+        monitor.record(_measurement(ok=False), failure_threshold=3)
+    assert monitor.request_fallback() is not None
+    monitor.complete_fallback(action_line="[FAILED] read-back mismatch")
+    assert monitor.request_fallback() is None  # one attempt for this observation
+
+    failed = monitor.record(_measurement(ok=False), failure_threshold=3)
+    assert failed.state is SocOperatingState.FALLBACK_FAILED
+    assert not failed.fallback_confirmed
+    retry = monitor.request_fallback()
+    assert retry is not None
+    assert retry.state is SocOperatingState.FALLBACK_REQUESTED
+
+
+def test_fallback_status_requires_a_fallback_confirmation_action(tmp_path: Path) -> None:
+    monitor = SocMonitor.load(_settings(tmp_path))
+    monitor.record(_measurement(ok=False), failure_threshold=1)
+    assert monitor.request_fallback() is not None
+
+    snapshot = monitor.complete_fallback(action_line="[FAILED] current read-back mismatch")
+
+    assert snapshot.state is SocOperatingState.FALLBACK_FAILED
+    assert not snapshot.fallback_confirmed
+    assert snapshot.fallback_action.startswith("[FAILED]")
+
+
+@pytest.mark.parametrize(
+    "action_line",
+    [
+        "[SIMULATE] Solis fallback at 45 A in 23:30-05:30 would be programmed (not written)",
+        "[SKIP] Solis fallback not written (mode off)",
+    ],
+)
+def test_non_actuation_fallback_line_stays_requested_and_unconfirmed(
+    tmp_path: Path, action_line: str
+) -> None:
+    monitor = SocMonitor.load(_settings(tmp_path))
+    monitor.record(_measurement(ok=False), failure_threshold=1)
+    assert monitor.request_fallback() is not None
+
+    snapshot = monitor.complete_fallback(action_line=action_line)
+
+    assert snapshot.state is SocOperatingState.FALLBACK_REQUESTED
+    assert not snapshot.fallback_confirmed
+    assert snapshot.fallback_action == action_line
+
+
+def test_changed_fallback_configuration_invalidates_prior_confirmation(tmp_path: Path) -> None:
+    monitor = SocMonitor.load(_settings(tmp_path))
+    monitor.record(_measurement(ok=False), failure_threshold=1)
+    assert monitor.request_fallback() is not None
+    monitor.complete_fallback(action_line="[FALLBACK] verified")
+
+    monitor.invalidate_fallback_confirmation()
+    snapshot = monitor.record(_measurement(ok=True), failure_threshold=1)
+
+    assert snapshot.state is SocOperatingState.FALLBACK_VERIFIED
+    assert not snapshot.fallback_confirmed
+    assert snapshot.consecutive_failures == 1
+
+
 def test_pass_resets_consecutive_failures(tmp_path: Path) -> None:
     m = SocMonitor.load(_settings(tmp_path))
     m.record(_measurement(ok=False), failure_threshold=3)
@@ -125,7 +218,7 @@ def test_failure_count_is_persisted(tmp_path: Path) -> None:
     for _ in range(2):
         m.record(_measurement(ok=False), failure_threshold=3)
     data = json.loads((tmp_path / MONITOR_FILE).read_text(encoding="utf-8"))
-    assert data == {"consecutive_failures": 2}
+    assert data == {"consecutive_failures": 2, "fallback_status": "pending_failure"}
     # A fresh monitor (e.g. after restart) restores the count.
     assert SocMonitor.load(s).record(_measurement(ok=False), failure_threshold=3) \
         .consecutive_failures == 3
@@ -137,7 +230,8 @@ def test_passing_reset_is_persisted(tmp_path: Path) -> None:
     m.record(_measurement(ok=False), failure_threshold=3)
     m.record(_measurement(ok=True), failure_threshold=3)
     assert json.loads((tmp_path / MONITOR_FILE).read_text(encoding="utf-8")) == {
-        "consecutive_failures": 0
+        "consecutive_failures": 0,
+        "fallback_status": "normal",
     }
 
 

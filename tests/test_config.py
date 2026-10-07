@@ -308,6 +308,23 @@ def test_soc_failure_threshold_must_be_at_least_one(bad: int) -> None:
         Settings(ha_url="http://x", ha_token="t", soc_failure_threshold=bad)
 
 
+def test_solis_fallback_current_is_optional_and_configured_across_surfaces() -> None:
+    assert Settings(ha_url="http://x", ha_token="t").solis_fallback_current_a is None
+    assert "solis_fallback_current_a" in _OPTION_KEYS
+    assert (
+        Settings(
+            ha_url="http://x", ha_token="t", solis_fallback_current_a=45.0
+        ).solis_fallback_current_a
+        == 45.0
+    )
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, 62.6])
+def test_solis_fallback_current_must_fit_device_limits(bad: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(ha_url="http://x", ha_token="t", solis_fallback_current_a=bad)
+
+
 def test_inverter_clock_tolerance_stays_below_the_health_failure_threshold() -> None:
     with pytest.raises(ValidationError):
         Settings(inverter_clock_tolerance_minutes=31)
