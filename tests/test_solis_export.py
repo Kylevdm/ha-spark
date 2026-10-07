@@ -1277,7 +1277,7 @@ async def test_charge_current_change_keeps_a_live_export_window(tmp_path) -> Non
     included, and the paid export stopped for 10-15 s until the window rewrite.
     """
     rest = FakeRest()
-    export = _export(hours_ahead=-0.5, duration_h=1.0)
+    export = _export(hours_ahead=0, duration_h=1.0)
     discharge = [export.window_start.hour, 0, export.window_end.hour, 0]
     _set_slot_one(rest, [23, 30, 5, 30, *discharge])
     rest.states["sensor.solis_control_timed_charge_current"] = "1.0"
@@ -1296,7 +1296,7 @@ async def test_charge_current_change_keeps_a_live_export_window(tmp_path) -> Non
 async def test_failed_current_change_leaves_charge_half_zero_and_export_kept(tmp_path) -> None:
     """The fail-safe still holds: the old charge window is not left active."""
     rest = StaleChargeCurrentReadback()
-    export = _export(hours_ahead=-0.5, duration_h=1.0)
+    export = _export(hours_ahead=0, duration_h=1.0)
     discharge = [export.window_start.hour, 0, export.window_end.hour, 0]
     _set_slot_one(rest, [23, 30, 5, 30, *discharge])
     rest.states["sensor.solis_control_timed_charge_current"] = "1.0"
@@ -1316,7 +1316,7 @@ async def test_misread_discharge_half_is_not_kept(tmp_path) -> None:
     longer export window.
     """
     rest = FakeRest()
-    export = _export(hours_ahead=-0.5, duration_h=1.0)
+    export = _export(hours_ahead=0, duration_h=1.0)
     _set_slot_one(rest, [23, 30, 5, 30, export.window_start.hour, 0, 0, 0])
     rest.states["sensor.solis_control_timed_charge_current"] = "1.0"
     rest.states["sensor.solis_control_timed_discharge_current"] = "62.5"
