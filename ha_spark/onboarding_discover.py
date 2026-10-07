@@ -32,6 +32,8 @@ class Rule:
 # Field rules, ordered roughly as the plan report uses them. Domain is a hard
 # filter; device_class/unit/attribute/keyword hits accumulate a score.
 RULES: tuple[Rule, ...] = (
+    Rule("battery_power_entity", ("sensor",), ("power",), ("W",),
+         ("battery", "power"), optional=True),
     Rule("soc_entity", ("sensor",), ("battery",), ("%",), ("soc", "battery")),
     Rule("battery_voltage_entity", ("sensor",), ("voltage",), ("V",), ("battery", "voltage")),
     Rule(

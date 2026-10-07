@@ -1,6 +1,6 @@
 ---
 name: ha-spark
-version: "0.21.1"
+version: "0.21.2"
 slug: ha_spark_addon
 description: Local-first battery charge planner and automation agent for Home Assistant
 url: https://github.com/Kylevdm/ha-spark
@@ -91,6 +91,7 @@ options:
   soc_failure_threshold: 3
   soc_recovery_minutes: 10
   battery_voltage_entity: ""
+  battery_power_entity: ""
   solar_tomorrow_entity: ""
   octopus_rate_entity: ""
   dispatch_entity: ""
@@ -194,6 +195,7 @@ schema:
   soc_failure_threshold: int
   soc_recovery_minutes: int(1,)
   battery_voltage_entity: str?
+  battery_power_entity: str?
   solar_tomorrow_entity: str?
   octopus_rate_entity: str?
   dispatch_entity: str?

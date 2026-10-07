@@ -338,6 +338,7 @@ def test_check_entity_config_ok_when_set() -> None:
         Settings(
             soc_entity="sensor.a",
             battery_voltage_entity="sensor.b",
+            battery_power_entity="sensor.power",
             solar_tomorrow_entity="sensor.c",
             octopus_rate_entity="sensor.d",
             dispatch_entity="binary_sensor.e",

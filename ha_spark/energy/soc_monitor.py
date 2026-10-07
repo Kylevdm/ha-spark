@@ -31,6 +31,7 @@ loop applies and verifies a fresh normal plan (:meth:`SocMonitor.complete_recove
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -38,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from ha_spark.config import Settings
-from ha_spark.energy.soc_integrity import SocMeasurement, check_soc
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus, check_soc
 from ha_spark.ha.models import EntityState
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
@@ -80,7 +81,9 @@ def monitor_path(settings: Settings) -> Path:
     return Path(settings.db_path).parent / MONITOR_FILE
 
 
-async def observe_soc(settings: Settings, rest: HomeAssistantRest) -> SocMeasurement:
+async def observe_soc(
+    settings: Settings, rest: HomeAssistantRest, *, monitor: SocMonitor | None = None
+) -> SocMeasurement:
     """Make exactly one checked SoC observation from Home Assistant.
 
     A failed read (HTTP error, missing entity) is a failed measurement, never
@@ -100,12 +103,29 @@ async def observe_soc(settings: Settings, rest: HomeAssistantRest) -> SocMeasure
         try:
             source = await rest.get_state(settings.battery_voltage_entity)
         except Exception as exc:  # noqa: BLE001 - no liveness evidence, not a crash
-            log.debug(
-                "SoC monitor: reading %s failed (%s)", settings.battery_voltage_entity, exc
-            )
+            log.debug("SoC monitor: reading %s failed (%s)", settings.battery_voltage_entity, exc)
+    observed_at = datetime.now(UTC)
+    power: float | None = None
+    if monitor is not None and settings.battery_power_entity:
+        try:
+            power_state = await rest.get_state(settings.battery_power_entity)
+            power = float(power_state.state)
+            if not math.isfinite(power):
+                power = None
+        except Exception:  # noqa: BLE001 - missing evidence skips this interval
+            log.debug("SoC monitor: battery power unreadable", exc_info=True)
+    if monitor is not None and settings.battery_power_entity:
+        return monitor.check_observation(
+            state,
+            observed_at=observed_at,
+            source=source,
+            power_w=power,
+            max_age=timedelta(minutes=settings.soc_max_report_age_minutes),
+            battery_capacity_kwh=settings.battery_capacity_kwh,
+        )
     return check_soc(
         state,
-        observed_at=datetime.now(UTC),
+        observed_at=observed_at,
         max_age=timedelta(minutes=settings.soc_max_report_age_minutes),
         source=source,
     )
@@ -142,6 +162,59 @@ class SocMonitor:
         self._recovery_last_report: datetime | None = None
         self._recovery_advanced = False
         self._recovery_ready = False
+        self._energy_baseline: float | None = None
+        self._energy_kwh = 0.0
+        self._power_at: datetime | None = None
+        self._power_w: float | None = None
+        self._rejected_value: float | None = None
+
+    def check_observation(
+        self,
+        state: EntityState | None,
+        *,
+        observed_at: datetime,
+        max_age: timedelta,
+        source: EntityState | None = None,
+        power_w: float | None,
+        battery_capacity_kwh: float,
+    ) -> SocMeasurement:
+        """Integrate absolute power between readable observations; check without persistence."""
+        if power_w is not None and not math.isfinite(power_w):
+            power_w = None
+        if self._power_at is not None and self._power_w is not None and power_w is not None:
+            elapsed = max(0.0, (observed_at - self._power_at).total_seconds())
+            self._energy_kwh += (abs(self._power_w) + abs(power_w)) / 2 * elapsed / 3_600_000
+        self._power_at = observed_at
+        self._power_w = power_w
+        measurement = check_soc(
+            state,
+            observed_at=observed_at,
+            max_age=max_age,
+            source=source,
+            baseline_soc=self._energy_baseline,
+            energy_kwh=self._energy_kwh if power_w is not None else None,
+            battery_capacity_kwh=battery_capacity_kwh,
+        )
+        if (
+            measurement.status is SocStatus.IMPLAUSIBLE
+            and measurement.value != self._energy_baseline
+        ):
+            if measurement.value == self._rejected_value:
+                # Recalibration must still pass every non-energy integrity check.
+                measurement = check_soc(
+                    state, observed_at=observed_at, max_age=max_age, source=source
+                )
+                if measurement.ok:
+                    log.warning(
+                        "SoC integrity: possible BMS recalibration to %s%%", measurement.value
+                    )
+            self._rejected_value = measurement.value if not measurement.ok else None
+        else:
+            self._rejected_value = None
+        if measurement.ok and measurement.value != self._energy_baseline:
+            self._energy_baseline = measurement.value
+            self._energy_kwh = 0.0
+        return measurement
 
     @classmethod
     def load(cls, settings: Settings) -> SocMonitor:

@@ -732,7 +732,7 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
         async with HomeAssistantRest(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
         ) as rest:
-            measurement = await observe_soc(settings, rest)
+            measurement = await observe_soc(settings, rest, monitor=monitor)
             snapshot = monitor.record(
                 measurement,
                 failure_threshold=settings.soc_failure_threshold,

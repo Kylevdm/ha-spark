@@ -104,7 +104,9 @@ rather than a one-time commissioning result: ha-spark may relearn an estimate
 as the battery or its configuration changes.
 
 **BMS measurement integrity**:
-Whether the battery-management system's reported SoC agrees with independent
+A reported SoC is believed only when the energy that flowed through the battery
+since the last believed SoC can explain it. More broadly, whether the
+battery-management system's reported SoC agrees with independent
 evidence such as pack voltage and observed energy flow. A discrepancy is not,
 by itself, evidence of battery degradation or capacity change. It can be a BMS
 setting or calibration problem, as with nominally identical packs that are

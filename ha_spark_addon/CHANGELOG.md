@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.21.2
+
+- SoC integrity now checks jumps and stuck readings against integrated battery
+  power (#244). Configure `battery_power_entity` (W); the Solis preset supplies
+  it. Implausible readings block writes and count toward fallback. Two repeated
+  changed readings can establish a new baseline with a BMS recalibration warning.
+  Missing evidence skips integration; health warns when protection is disabled.
+
 ## 0.21.1
 
 - Security: the ingress HTTP API (port 8099) now answers only Home
