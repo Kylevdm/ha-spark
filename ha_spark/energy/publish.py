@@ -50,7 +50,16 @@ def _cache_path(settings: Settings) -> Path:
     return Path(settings.db_path).parent / "ha_spark_published.json"
 
 
-def plan_to_payload(plan: ChargePlan, settings: Settings) -> list[Entity]:
+def plan_to_payload(
+    plan: ChargePlan,
+    settings: Settings,
+    *,
+    effective_program: str | None = None,
+    action_lines: list[str] | None = None,
+    recovery_state: str | None = None,
+    recovery_elapsed_seconds: int | None = None,
+    recovery_stable_minutes: int | None = None,
+) -> list[Entity]:
     """Map a computed plan to the (entity_id, state, attributes) sensors.
 
     Shared source of truth: the daemon pushes these via REST, and the add-on
@@ -63,6 +72,18 @@ def plan_to_payload(plan: ChargePlan, settings: Settings) -> list[Entity]:
         "soc_status": plan.soc.status.value,
         "soc_reason": plan.soc.reason,
     }
+    if effective_program is not None:
+        # Explicitly distinguish the plan from the program known resident on
+        # hardware while Solis fallback recovery is being applied.
+        plan_status_attributes["effective_program"] = effective_program
+    if action_lines is not None:
+        plan_status_attributes["action_lines"] = action_lines
+    if recovery_state is not None:
+        plan_status_attributes["recovery_state"] = recovery_state
+    if recovery_elapsed_seconds is not None:
+        plan_status_attributes["recovery_elapsed_seconds"] = recovery_elapsed_seconds
+    if recovery_stable_minutes is not None:
+        plan_status_attributes["recovery_stable_minutes"] = recovery_stable_minutes
     if plan.export_soc_needed_pct is not None and plan.export_soc_needed_at is not None:
         plan_status_attributes["export_soc_needed_pct"] = round(plan.export_soc_needed_pct)
         plan_status_attributes["export_soc_needed_at"] = plan.export_soc_needed_at.isoformat()
@@ -171,9 +192,27 @@ async def _push(rest: HomeAssistantRest, entities: list[Entity]) -> None:
             log.warning("Publishing %s failed", entity_id, exc_info=True)
 
 
-async def publish_plan(rest: HomeAssistantRest, plan: ChargePlan, settings: Settings) -> None:
+async def publish_plan(
+    rest: HomeAssistantRest,
+    plan: ChargePlan,
+    settings: Settings,
+    *,
+    effective_program: str | None = None,
+    action_lines: list[str] | None = None,
+    recovery_state: str | None = None,
+    recovery_elapsed_seconds: int | None = None,
+    recovery_stable_minutes: int | None = None,
+) -> None:
     """Push the plan's computed numbers as sensor.ha_spark_* states (best-effort)."""
-    entities = plan_to_payload(plan, settings)
+    entities = plan_to_payload(
+        plan,
+        settings,
+        effective_program=effective_program,
+        action_lines=action_lines,
+        recovery_state=recovery_state,
+        recovery_elapsed_seconds=recovery_elapsed_seconds,
+        recovery_stable_minutes=recovery_stable_minutes,
+    )
     await _push(rest, entities)
     try:
         path = _cache_path(settings)
@@ -229,6 +268,15 @@ async def publish_soc_integrity(
                     "fallback_actions": (
                         [snapshot.fallback_action] if snapshot.fallback_action else []
                     ),
+                    "recovery_state": snapshot.recovery_state,
+                    "recovery_elapsed_seconds": snapshot.recovery_elapsed_seconds,
+                    "recovery_stable_minutes": snapshot.recovery_stable_minutes,
+                    "recovery_action": snapshot.recovery_action,
+                    "recovery_actions": (
+                        [snapshot.recovery_action] if snapshot.recovery_action else []
+                    ),
+                    "recovery_hardware_verified": snapshot.recovery_hardware_verified,
+                    "effective_program": snapshot.effective_program,
                 },
             )
         ],

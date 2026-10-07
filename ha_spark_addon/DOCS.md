@@ -27,6 +27,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `soc_entity` | Battery state of charge (%) |
 | `soc_max_report_age_minutes` | How old Home Assistant's `last_reported` for `soc_entity` may be before ha-spark treats the SoC as stale and blocks real charge writes (default `10.0`). Some integrations never re-report an unchanged SoC, so an older SoC still counts as fresh if `battery_voltage_entity` reported within this age, which shows the integration is live. That exception lasts up to 12 hours. ha-spark does not check whether the battery is idle |
 | `soc_failure_threshold` | How many consecutive failed SoC observations trigger the configured Solis fallback (default `3`). Before fallback entry, one good observation resets the count. Once fallback is requested, verified, or unconfirmed, a passing observation leaves it in place for the later recovery policy |
+| `soc_recovery_stable_minutes` | How many continuously passing one-minute SoC checks are required before Solis fallback recovery can be attempted (default `10`, minimum `1`). Recovery also requires Home Assistant's SoC report timestamp to advance beyond its baseline; failed observations or report-time regression restart the interval |
 | `solis_fallback_current_a` | Optional fallback-current ceiling in amps. When set, a sustained SoC failure programs only the configured `charge_window_start`–`charge_window_end` and this current, capped by `max_charge_current_a` and the Solis 62.5 A register limit. It is disabled when blank; there is no implicit current default. Only a successful Solis read-back is reported as verified |
 | `battery_voltage_entity` | Battery voltage (V). ha-spark also uses it to tell whether the SoC's source is live, so pick the voltage sensor from the same integration as `soc_entity` |
 | `solar_tomorrow_entity` | Solcast "forecast tomorrow" sensor (with `detailedForecast` attribute) |
@@ -48,6 +49,21 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
 | `outdoor_weather_entity` | Weather entity with a `temperature` attribute (default `weather.home`) for signal recording |
 | `v2l_power_entity` | Optional V2L discharge-power sensor (W); enables the V2L tally (see "V2L" below) |
+
+### Published recovery attributes
+
+`sensor.ha_spark_plan_status` publishes `effective_program` (`normal`,
+`fallback`, or `unknown`) to distinguish the computed plan from the program
+known resident on the inverter. Its `action_lines` attribute contains the
+current plan run's actions, including `[FAILED] Solis recovery ...` or
+`[RECOVERED] Solis recovery ...` after a recovery attempt.
+
+`sensor.ha_spark_soc_integrity` publishes `recovery_state` (`waiting`,
+`stabilizing`, `qualified`, or `recovered`), `recovery_elapsed_seconds`, and
+`recovery_stable_minutes`. Its `recovery_action` and
+`recovery_hardware_verified` attributes record the latest recovery transition
+and whether normal programming was read-back verified. A failed recovery marks
+the resident program `unknown` until a retry verifies it.
 
 ### Solis control
 

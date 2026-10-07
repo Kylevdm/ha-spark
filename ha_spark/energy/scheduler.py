@@ -1,4 +1,4 @@
-"""Half-hourly scheduled plan + apply loop.
+"""Half-hourly plan/apply loop with one-minute integrity and recovery control.
 
 `run_once` computes and applies a single charge plan (the same path as
 `ha-spark plan --apply`). `run_forever` wakes once a minute and calls
@@ -34,8 +34,11 @@ remain available — and consecutive failures are counted toward the configured
 fallback-entry threshold (`soc_failure_threshold`, default 3). With an
 explicit `solis_fallback_current_a`, Solis programs only the configured cheap
 window and reports fallback as confirmed after current and window read-backs;
-failed attempts retry on the next minute. The active fallback is left in place
-on a passing observation for the later recovery policy.
+failed attempts retry on the next minute. Passing checks must remain stable for
+`soc_recovery_stable_minutes` and include an advancing HA report timestamp
+before a fresh plan is applied. The fallback remains the effective program
+until the normal apply verifies by read-back. That apply result alone decides
+recovery; best-effort post-apply work cannot overturn it.
 
 With `inverter_clock_dst_sync` on, the first tick after the household zone's
 UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
@@ -47,7 +50,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
-from typing import NamedTuple
+from typing import NamedTuple, TypedDict
 
 import httpx
 import uvicorn
@@ -64,7 +67,7 @@ from ha_spark.api.server import (
     stop_server,
 )
 from ha_spark.config import Settings
-from ha_spark.devices import Capability, inverter_device
+from ha_spark.devices import Capability, effective_mode, inverter_device
 from ha_spark.devices.inverters.solis import SolisDevice, fallback_charge_current_a
 from ha_spark.energy.derived_base_load import (
     BACKFILL_NAME,
@@ -87,7 +90,7 @@ from ha_spark.energy.publish import (
 )
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement
-from ha_spark.energy.soc_monitor import SocMonitor, observe_soc
+from ha_spark.energy.soc_monitor import RecoveryOutcome, SocMonitor, observe_soc
 from ha_spark.energy.sources import (
     ev_hold_status_from_read,
     parse_time,
@@ -110,6 +113,13 @@ SIGNAL_SAMPLE_INTERVAL = timedelta(minutes=30)
 REPLAN_INTERVAL = timedelta(minutes=30)
 
 
+class _RecoveryRunOptions(TypedDict, total=False):
+    """Extra keyword arguments used for the one-minute recovery apply."""
+
+    recovery_attempt: bool
+    fallback_confirmed: bool
+
+
 def _slot_start(now: datetime) -> datetime:
     """Return the local half-hour slot containing ``now``."""
     slot_minutes = int(REPLAN_INTERVAL.total_seconds() // 60)
@@ -120,6 +130,12 @@ def _slot_start(now: datetime) -> datetime:
 def should_run(now: datetime, last_run_slot: datetime | None) -> bool:
     """True when the current local half-hour slot has not run successfully."""
     return _slot_start(now) != last_run_slot
+
+
+def _effective_inverter_mode(settings: Settings) -> str:
+    """Resolve the configured inverter's mode through global and owner gates."""
+    config = next(device for device in settings.devices if device.type == "inverter")
+    return effective_mode(config.control, settings.proactive_mode)
 
 
 # Asymmetric deadband on the programmed charge current, in whole register amps
@@ -200,6 +216,10 @@ class RunResult(NamedTuple):
     # apply, the previous baseline after a skip, and `None` after a failed or
     # blocked apply, which leaves the device state unknown (#168).
     applied_plan: ChargePlan | None
+    # Set only for an explicit Solis recovery apply, from register verdicts.
+    recovery_success: bool | None = None
+    # Action lines emitted by this exact computed/apply pass.
+    action_lines: tuple[str, ...] = ()
 
 
 def _apply_failed(lines: list[str]) -> bool:
@@ -237,6 +257,8 @@ async def run_once(
     trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ev_hold_state: EvHoldState | None = None,
     fallback_active: bool = False,
+    recovery_attempt: bool = False,
+    fallback_confirmed: bool = False,
 ) -> RunResult:
     """Compute the charge plan, log it, and apply it per PROACTIVE_MODE.
 
@@ -248,6 +270,12 @@ async def run_once(
 
     ``trusted_holds`` is the daemon's last trusted hold set, used by the
     reconcile when this plan's hold data is untrusted (#143 §3).
+
+    A recovery attempt always applies a fresh plan, bypassing the fallback hold
+    and previous plan baseline. Its result reports the Solis register verdicts
+    separately from the legacy public action-list interface. Forecast,
+    orchestration and derived-load work after the apply is best-effort and
+    cannot replace that apply verdict.
     """
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
@@ -283,9 +311,25 @@ async def run_once(
         # Lazy: the rate is only consulted when the setpoint itself is unchanged.
         rate_w = lambda i: device.planned_rate_w(i)  # noqa: E731
         applied_plan = previous_plan
+        recovery_success: bool | None = None
         if fallback_active:
-            lines.append("[SKIP] normal programming held while Solis fallback is active")
-            applied_plan = None
+            if recovery_attempt:
+                mode = _effective_inverter_mode(settings)
+                if isinstance(device, SolisDevice):
+                    result = await device.apply_with_result(intent)
+                    lines.extend(result.lines)
+                    recovery_success = mode != "on" or (
+                        result.current_ok and result.window_verified and result.cleanup_ok
+                    )
+                else:
+                    lines.append(
+                        "[FAILED] Solis recovery blocked: inverter factory returned non-Solis"
+                    )
+                    recovery_success = False
+                applied_plan = plan if recovery_success else None
+            else:
+                lines.append("[SKIP] normal programming held while Solis fallback is active")
+                applied_plan = None
         elif needs_apply(previous_plan, intent, rate_w, settings.battery_voltage_v):
             applied = await device.apply(intent)
             lines.extend(applied)
@@ -294,11 +338,31 @@ async def run_once(
             lines.append("[SKIP] charge setpoint unchanged")
         for line in lines:
             log.info(line)
-        await publish_plan(rest, plan, settings)
-    await _record_forecast(settings, plan, inputs, load_source)
-    await _run_orchestrator(settings)
-    await _run_derived_rerive(settings)
-    return RunResult(plan, applied_plan)
+        effective_program: str | None = None
+        if recovery_attempt:
+            if recovery_success:
+                effective_program = (
+                    "normal" if mode == "on" else ("fallback" if fallback_confirmed else "unknown")
+                )
+            else:
+                effective_program = "unknown"
+        await publish_plan(
+            rest,
+            plan,
+            settings,
+            effective_program=effective_program,
+            action_lines=lines,
+        )
+    for label, operation in (
+        ("forecast recording", _record_forecast(settings, plan, inputs, load_source)),
+        ("orchestration", _run_orchestrator(settings)),
+        ("derived-load import", _run_derived_rerive(settings)),
+    ):
+        try:
+            await operation
+        except Exception:
+            log.exception("Post-apply %s failed", label)
+    return RunResult(plan, applied_plan, recovery_success, tuple(lines))
 
 
 async def _run_orchestrator(settings: Settings) -> None:
@@ -732,7 +796,11 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
                 and inverter.driver == "solis"
                 and settings.solis_fallback_current_a is not None
             ):
-                requested = monitor.request_fallback()
+                # Once recovery has qualified, this tick belongs to the fresh
+                # normal-program attempt; do not also retry fallback hardware.
+                requested = (
+                    None if monitor.recovery_qualified else monitor.request_fallback()
+                )
                 if requested is not None:
                     action_lines: list[str]
                     try:
@@ -780,6 +848,57 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
     except Exception:
         log.exception("SoC monitor tick failed; will retry next minute")
         return None
+
+
+async def _publish_soc_snapshot(settings: Settings, monitor: SocMonitor) -> None:
+    """Publish a post-apply recovery verdict without taking another SoC read."""
+    snapshot = monitor.last_snapshot
+    if snapshot is None:
+        return
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            await publish_soc_integrity(rest, snapshot, settings)
+    except Exception:
+        log.exception("Publishing SoC recovery outcome failed")
+
+
+async def _finish_recovery(
+    settings: Settings,
+    monitor: SocMonitor,
+    run_result: RunResult | None,
+) -> tuple[bool, bool]:
+    """Record, report, and publish the recovery verdict from the apply result."""
+    if run_result is None or run_result.recovery_success is not True:
+        outcome = RecoveryOutcome.FAILED
+    elif _effective_inverter_mode(settings) == "on":
+        outcome = RecoveryOutcome.RECOVERED_VERIFIED
+    else:
+        outcome = RecoveryOutcome.RECOVERED_UNVERIFIED
+    snapshot = monitor.complete_recovery(outcome)
+    action_line = snapshot.recovery_action
+    if action_line is not None:
+        (log.info if outcome is not RecoveryOutcome.FAILED else log.warning)(action_line)
+    if run_result is not None and action_line is not None:
+        try:
+            async with HomeAssistantRest(
+                settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+            ) as rest:
+                await publish_plan(
+                    rest,
+                    run_result.plan,
+                    settings,
+                    effective_program=snapshot.effective_program.value,
+                    action_lines=[*run_result.action_lines, action_line],
+                    recovery_state=snapshot.recovery_state.value,
+                    recovery_elapsed_seconds=snapshot.recovery_elapsed_seconds,
+                    recovery_stable_minutes=snapshot.recovery_stable_minutes,
+                )
+        except Exception:
+            log.exception("Publishing Solis recovery action lines failed")
+    await _publish_soc_snapshot(settings, monitor)
+    return monitor.fallback_active, monitor.fallback_confirmed
 
 
 async def _planned_rate_w(settings: Settings, plan: ChargePlan) -> float | None:
@@ -879,6 +998,13 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             settings = state.settings  # hot-reloaded by POST /api/config
             if settings is not last_settings:
                 if (
+                    settings.soc_recovery_stable_minutes
+                    != last_settings.soc_recovery_stable_minutes
+                ):
+                    monitor.configure_recovery_stability(
+                        settings.soc_recovery_stable_minutes
+                    )
+                if (
                     settings.charge_window_start != last_settings.charge_window_start
                     or settings.charge_window_end != last_settings.charge_window_end
                     or fallback_charge_current_a(settings)
@@ -912,6 +1038,12 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                 for device in settings.devices
             )
             fallback_confirmed = solis_fallback_active and monitor.fallback_confirmed
+            recovery_attempt = (
+                measurement is not None
+                and measurement.ok
+                and solis_fallback_active
+                and monitor.recovery_qualified
+            )
             # Set once `run_once` has *returned*, because it makes its own
             # reconcile pass with the plan it just computed. A run that raises
             # after that pass (`apply` or `publish_plan`) therefore falls back
@@ -919,19 +1051,31 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             # which is what every tick in that failure window steers by anyway,
             # so it costs a duplicate read rather than new stale exposure.
             replanned = False
-            if should_run(now, last_run_slot):
+            if should_run(now, last_run_slot) or recovery_attempt:
+                run_result: RunResult | None = None
                 try:
-                    previous_plan = None if reapply else last_applied_plan
-                    plan, last_applied_plan = await run_once(
+                    previous_plan = None if reapply or recovery_attempt else last_applied_plan
+                    recovery_options: _RecoveryRunOptions = {}
+                    if recovery_attempt:
+                        recovery_options = {
+                            "recovery_attempt": True,
+                            "fallback_confirmed": fallback_confirmed,
+                        }
+                    run_result = await run_once(
                         settings,
                         soc=measurement,
                         previous_plan=previous_plan,
                         trusted_holds=last_trusted_holds,
                         ev_hold_state=ev_hold_state,
                         fallback_active=solis_fallback_active,
+                        **recovery_options,
                     )
+                    plan, last_applied_plan = run_result.plan, run_result.applied_plan
                     replanned = True
                     state.set_plan(plan)
+                    # A fresh recovery plan replaces this slot's half-hour
+                    # plan; qualified or failed recovery attempts still retry
+                    # on the minute cadence while fallback remains active.
                     last_run_slot = _slot_start(now)
                     last_plan = plan
                     reapply = False
@@ -947,10 +1091,17 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         # a trusted measurement (#116/#117 add the recompute).
                         target_w = None
                 except Exception:
-                    # It may have raised mid-apply: the device state is unknown,
-                    # so the retry must not skip an unchanged plan (#168).
-                    last_applied_plan = None
+                    # Before run_once returns, a mid-apply failure leaves the
+                    # resident program unknown. Once it returns, recovery state
+                    # is decided from its apply verdict even if later work fails.
+                    last_applied_plan = (
+                        run_result.applied_plan if run_result is not None else None
+                    )
                     log.exception("Scheduled plan run failed; will retry next tick")
+                if recovery_attempt:
+                    solis_fallback_active, fallback_confirmed = await _finish_recovery(
+                        settings, monitor, run_result
+                    )
             # The clock cadence (#143), independent of `setpoint_changed`: the
             # power switch converges within a minute, not at the next plan
             # change. Skipped when `run_once` returned, having made its own pass
