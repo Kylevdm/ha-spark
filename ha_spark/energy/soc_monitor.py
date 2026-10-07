@@ -16,8 +16,16 @@ storage; any passing observation before fallback entry resets the count. The
 configured threshold (default three) requests fallback only when a current is
 configured. A successful Solis read-back confirms it; a failed or unconfirmed
 attempt stays retryable on the next observation. Once requested, verified, or
-failed, a passing observation leaves the fallback state in place for recovery
-(#116/#117). Persisted confirmation is not hardware truth after restart (#118).
+failed, a passing observation leaves the fallback state in place for recovery.
+Persisted confirmation is not hardware truth after restart (#118).
+
+Recovery from an active fallback (#117) needs ``soc_recovery_minutes`` of
+continuously passing observations whose report timestamps never go backwards,
+with at least one report newer than the one seen when recovery began; any
+failure resets progress, while SoC movement is allowed. Recovery progress is
+never persisted: downtime is not healthy evidence. Qualifying only makes
+recovery *ready* — the fallback stays the effective state until the control
+loop applies and verifies a fresh normal plan (:meth:`SocMonitor.complete_recovery`).
 """
 
 from __future__ import annotations
@@ -63,6 +71,9 @@ class SocMonitorSnapshot:
     state: SocOperatingState
     fallback_confirmed: bool = False
     fallback_action: str | None = None
+    recovery_since: datetime | None = None
+    recovery_ready: bool = False
+    recovery_action: str | None = None
 
 
 def monitor_path(settings: Settings) -> Path:
@@ -125,6 +136,12 @@ class SocMonitor:
         self._last: SocMeasurement | None = None
         self._last_snapshot: SocMonitorSnapshot | None = None
         self._fallback_attempt_measurement: SocMeasurement | None = None
+        # Recovery progress (#117), in memory only: a restart starts it over.
+        self._recovery_since: datetime | None = None
+        self._recovery_baseline: datetime | None = None
+        self._recovery_last_report: datetime | None = None
+        self._recovery_advanced = False
+        self._recovery_ready = False
 
     @classmethod
     def load(cls, settings: Settings) -> SocMonitor:
@@ -145,13 +162,17 @@ class SocMonitor:
         return cls(consecutive_failures=count, fallback_status=fallback_status, path=path)
 
     def record(
-        self, measurement: SocMeasurement, *, failure_threshold: int
+        self,
+        measurement: SocMeasurement,
+        *,
+        failure_threshold: int,
+        recovery_duration: timedelta = timedelta(minutes=10),
     ) -> SocMonitorSnapshot:
         """Fold one observation into the running state; counts it exactly once."""
         if measurement is self._last and self._last_snapshot is not None:
             return self._last_snapshot
         if measurement.ok:
-            snapshot = self._record_pass(measurement, failure_threshold)
+            snapshot = self._record_pass(measurement, failure_threshold, recovery_duration)
         else:
             snapshot = self._record_failure(measurement, failure_threshold)
         self._last = measurement
@@ -174,8 +195,17 @@ class SocMonitor:
             self._fallback_confirmed
         )
 
+    @property
+    def recovery_ready(self) -> bool:
+        """Whether an active fallback has met the recovery stability policy."""
+        return self.fallback_active and self._recovery_ready
+
     def request_fallback(self) -> SocMonitorSnapshot | None:
         """Mark one eligible, configured fallback attempt as requested."""
+        if self.recovery_ready:
+            # The control loop is replacing the fallback with a fresh normal
+            # plan; re-programming the fallback the same minute is only churn.
+            return None
         retryable = self._fallback_status in {
             SocOperatingState.FALLBACK_THRESHOLD,
             SocOperatingState.FALLBACK_REQUESTED,
@@ -226,12 +256,81 @@ class SocMonitor:
         self._fallback_confirmed = False
         self._save()
 
+    def complete_recovery(self, *, action_line: str) -> SocMonitorSnapshot:
+        """Leave fallback after the recovered normal program was verified."""
+        log.info(
+            "SoC integrity: recovered from %s after %d consecutive failure(s); "
+            "normal operation",
+            self._fallback_status.value,
+            self._consecutive_failures,
+        )
+        self._consecutive_failures = 0
+        self._fallback_status = SocOperatingState.NORMAL
+        self._fallback_confirmed = False
+        self._reset_recovery()
+        self._save()
+        return self._refresh_last_snapshot(
+            fallback_confirmed=False, recovery_action=action_line
+        )
+
     # --- internals ---
 
+    def _reset_recovery(self) -> None:
+        self._recovery_since = None
+        self._recovery_baseline = None
+        self._recovery_last_report = None
+        self._recovery_advanced = False
+        self._recovery_ready = False
+
+    def _advance_recovery(
+        self, measurement: SocMeasurement, recovery_duration: timedelta
+    ) -> None:
+        """Fold one passing observation into recovery progress (#117)."""
+        reported_at = measurement.reported_at
+        if reported_at is None:  # unreachable for a passing measurement
+            self._reset_recovery()
+            return
+        if (
+            self._recovery_last_report is not None
+            and reported_at < self._recovery_last_report
+        ):
+            log.warning(
+                "SoC integrity: report time went backwards (%s < %s); recovery restarts",
+                reported_at.isoformat(),
+                self._recovery_last_report.isoformat(),
+            )
+            self._reset_recovery()
+        if self._recovery_since is None or self._recovery_baseline is None:
+            self._recovery_since = measurement.observed_at
+            self._recovery_baseline = reported_at
+            log.info(
+                "SoC integrity: passing observation; recovery from %s needs %s of "
+                "stable reports",
+                self._fallback_status.value,
+                recovery_duration,
+            )
+        self._recovery_last_report = reported_at
+        if reported_at > self._recovery_baseline:
+            self._recovery_advanced = True
+        ready = (
+            self._recovery_advanced
+            and measurement.observed_at - self._recovery_since >= recovery_duration
+        )
+        if ready and not self._recovery_ready:
+            log.info(
+                "SoC integrity: stable since %s; recovery ready, computing a fresh plan",
+                self._recovery_since.isoformat(),
+            )
+        self._recovery_ready = ready
+
     def _record_pass(
-        self, measurement: SocMeasurement, failure_threshold: int
+        self,
+        measurement: SocMeasurement,
+        failure_threshold: int,
+        recovery_duration: timedelta,
     ) -> SocMonitorSnapshot:
         if self.fallback_active:
+            self._advance_recovery(measurement, recovery_duration)
             return self._snapshot(measurement, failure_threshold, self._fallback_status)
         if self._consecutive_failures:
             log.info(
@@ -248,6 +347,9 @@ class SocMonitor:
         self, measurement: SocMeasurement, failure_threshold: int
     ) -> SocMonitorSnapshot:
         self._consecutive_failures += 1
+        if self._recovery_since is not None:
+            log.warning("SoC integrity: failure during recovery; recovery progress reset")
+        self._reset_recovery()
         if self.fallback_active:
             state = self._fallback_status
         else:
@@ -287,10 +389,16 @@ class SocMonitor:
             failure_threshold=failure_threshold,
             state=state,
             fallback_confirmed=self.fallback_confirmed,
+            recovery_since=self._recovery_since,
+            recovery_ready=self.recovery_ready,
         )
 
     def _refresh_last_snapshot(
-        self, *, fallback_confirmed: bool, fallback_action: str | None = None
+        self,
+        *,
+        fallback_confirmed: bool,
+        fallback_action: str | None = None,
+        recovery_action: str | None = None,
     ) -> SocMonitorSnapshot:
         if self._last_snapshot is None:
             raise RuntimeError("fallback state has no SoC observation")
@@ -301,6 +409,9 @@ class SocMonitor:
             state=self._fallback_status,
             fallback_confirmed=fallback_confirmed,
             fallback_action=fallback_action,
+            recovery_since=self._recovery_since,
+            recovery_ready=self.recovery_ready,
+            recovery_action=recovery_action,
         )
         self._last_snapshot = snapshot
         return snapshot

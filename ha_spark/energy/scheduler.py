@@ -35,7 +35,10 @@ fallback-entry threshold (`soc_failure_threshold`, default 3). With an
 explicit `solis_fallback_current_a`, Solis programs only the configured cheap
 window and reports fallback as confirmed after current and window read-backs;
 failed attempts retry on the next minute. The active fallback is left in place
-on a passing observation for the later recovery policy.
+on a passing observation until `soc_recovery_minutes` of stable reports make
+recovery ready (#117); each tick then computes a fresh plan from that tick's
+measurement and applies it, leaving fallback only once the apply reads back
+clean. A failed recovered apply keeps the fallback (unconfirmed) and retries.
 
 With `inverter_clock_dst_sync` on, the first tick after the household zone's
 UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
@@ -200,6 +203,8 @@ class RunResult(NamedTuple):
     # apply, the previous baseline after a skip, and `None` after a failed or
     # blocked apply, which leaves the device state unknown (#168).
     applied_plan: ChargePlan | None
+    # The device's `apply` lines; empty when the apply was skipped or held.
+    apply_lines: tuple[str, ...] = ()
 
 
 def _apply_failed(lines: list[str]) -> bool:
@@ -283,13 +288,14 @@ async def run_once(
         # Lazy: the rate is only consulted when the setpoint itself is unchanged.
         rate_w = lambda i: device.planned_rate_w(i)  # noqa: E731
         applied_plan = previous_plan
+        apply_lines: list[str] = []
         if fallback_active:
             lines.append("[SKIP] normal programming held while Solis fallback is active")
             applied_plan = None
         elif needs_apply(previous_plan, intent, rate_w, settings.battery_voltage_v):
-            applied = await device.apply(intent)
-            lines.extend(applied)
-            applied_plan = None if _apply_failed(applied) else plan
+            apply_lines = await device.apply(intent)
+            lines.extend(apply_lines)
+            applied_plan = None if _apply_failed(apply_lines) else plan
         else:
             lines.append("[SKIP] charge setpoint unchanged")
         for line in lines:
@@ -298,7 +304,7 @@ async def run_once(
     await _record_forecast(settings, plan, inputs, load_source)
     await _run_orchestrator(settings)
     await _run_derived_rerive(settings)
-    return RunResult(plan, applied_plan)
+    return RunResult(plan, applied_plan, tuple(apply_lines))
 
 
 async def _run_orchestrator(settings: Settings) -> None:
@@ -722,7 +728,9 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
         ) as rest:
             measurement = await observe_soc(settings, rest)
             snapshot = monitor.record(
-                measurement, failure_threshold=settings.soc_failure_threshold
+                measurement,
+                failure_threshold=settings.soc_failure_threshold,
+                recovery_duration=timedelta(minutes=settings.soc_recovery_minutes),
             )
             inverter = next(
                 (device for device in settings.devices if device.type == "inverter"), None
@@ -780,6 +788,50 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
     except Exception:
         log.exception("SoC monitor tick failed; will retry next minute")
         return None
+
+
+def recovery_verified(apply_lines: tuple[str, ...]) -> bool:
+    """Whether a recovered normal apply may end the fallback (#117).
+
+    Stricter than :func:`_apply_failed`: a ``[WARNING]`` read-back mismatch is
+    not verification either. An empty list means nothing was applied.
+    """
+    return bool(apply_lines) and not any(
+        line.startswith(("[FAILED]", "[BLOCKED]", "[WARNING]")) for line in apply_lines
+    )
+
+
+async def finish_recovery(
+    settings: Settings, monitor: SocMonitor, apply_lines: tuple[str, ...] | None
+) -> None:
+    """Leave fallback after a verified recovered apply, else keep it truthfully.
+
+    ``apply_lines`` is ``None`` when the recovery run raised. A failed apply may
+    have changed the resident program, so a verified fallback loses its
+    confirmation: increases stay blocked until the next minute's retry either
+    verifies the recovered plan or, if recovery is lost, re-programs the fallback.
+    """
+    if apply_lines is not None and recovery_verified(apply_lines):
+        line = next(
+            (line for line in reversed(apply_lines) if line.startswith(("[APPLIED]", "[SKIP]"))),
+            apply_lines[-1],
+        )
+        action = f"[RECOVERED] normal programming resumed: {line}"
+        log.info(action)
+        snapshot = monitor.complete_recovery(action_line=action)
+    else:
+        log.warning(
+            "[FAILED] recovered normal program not verified; fallback kept, retrying next minute"
+        )
+        monitor.invalidate_fallback_confirmation()
+        return
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            await publish_soc_integrity(rest, snapshot, settings)
+    except Exception:
+        log.exception("Publishing the SoC recovery transition failed")
 
 
 async def _planned_rate_w(settings: Settings, plan: ChargePlan) -> float | None:
@@ -912,6 +964,9 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                 for device in settings.devices
             )
             fallback_confirmed = solis_fallback_active and monitor.fallback_confirmed
+            # Recovery (#117): a fresh plan from this tick's measurement, applied
+            # every minute until verified; the fallback stays effective till then.
+            recovering = solis_fallback_active and monitor.recovery_ready
             # Set once `run_once` has *returned*, because it makes its own
             # reconcile pass with the plan it just computed. A run that raises
             # after that pass (`apply` or `publish_plan`) therefore falls back
@@ -919,17 +974,24 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             # which is what every tick in that failure window steers by anyway,
             # so it costs a duplicate read rather than new stale exposure.
             replanned = False
-            if should_run(now, last_run_slot):
+            if recovering or should_run(now, last_run_slot):
                 try:
-                    previous_plan = None if reapply else last_applied_plan
-                    plan, last_applied_plan = await run_once(
+                    # Recovery never compares against a baseline: the resident
+                    # program is the fallback, not any earlier plan.
+                    previous_plan = None if reapply or recovering else last_applied_plan
+                    result = await run_once(
                         settings,
                         soc=measurement,
                         previous_plan=previous_plan,
                         trusted_holds=last_trusted_holds,
                         ev_hold_state=ev_hold_state,
-                        fallback_active=solis_fallback_active,
+                        fallback_active=solis_fallback_active and not recovering,
                     )
+                    plan, last_applied_plan = result.plan, result.applied_plan
+                    if recovering:
+                        await finish_recovery(settings, monitor, result.apply_lines)
+                        solis_fallback_active = monitor.fallback_active
+                        fallback_confirmed = solis_fallback_active and monitor.fallback_confirmed
                     replanned = True
                     state.set_plan(plan)
                     last_run_slot = _slot_start(now)
@@ -944,13 +1006,16 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         # sized from soc_now == 0 and must not become the guard's
                         # restore target. The guard adopts the live setpoint
                         # instead (reductions only) until a plan is computed from
-                        # a trusted measurement (#116/#117 add the recompute).
+                        # a trusted measurement (#117 recomputes on recovery).
                         target_w = None
                 except Exception:
                     # It may have raised mid-apply: the device state is unknown,
                     # so the retry must not skip an unchanged plan (#168).
                     last_applied_plan = None
                     log.exception("Scheduled plan run failed; will retry next tick")
+                    if recovering:
+                        await finish_recovery(settings, monitor, None)
+                        fallback_confirmed = False
             # The clock cadence (#143), independent of `setpoint_changed`: the
             # power switch converges within a minute, not at the next plan
             # change. Skipped when `run_once` returned, having made its own pass

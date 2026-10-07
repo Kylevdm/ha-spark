@@ -229,6 +229,12 @@ async def publish_soc_integrity(
                     "fallback_actions": (
                         [snapshot.fallback_action] if snapshot.fallback_action else []
                     ),
+                    "recovery_minutes": settings.soc_recovery_minutes,
+                    "recovery_since": (
+                        snapshot.recovery_since.isoformat() if snapshot.recovery_since else None
+                    ),
+                    "recovery_ready": snapshot.recovery_ready,
+                    "recovery_action": snapshot.recovery_action,
                 },
             )
         ],
