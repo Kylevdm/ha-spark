@@ -401,3 +401,143 @@ def test_steady_normal_observations_are_not_logged(
         m.record(_measurement(ok=True), failure_threshold=3)
         m.record(_measurement(ok=True), failure_threshold=3)
     assert "SoC integrity" not in caplog.text
+
+
+# --- recovery from an active fallback (#117) ---
+
+_T0 = datetime(2026, 6, 10, 1, 0, tzinfo=UTC)
+_RECOVERY = timedelta(minutes=10)
+
+
+def _pass_at(
+    minute: int, *, reported_minute: int | None = None, value: float = 30.0
+) -> SocMeasurement:
+    """A passing measurement observed ``minute`` minutes after ``_T0``."""
+    observed = _T0 + timedelta(minutes=minute)
+    reported = _T0 + timedelta(minutes=minute if reported_minute is None else reported_minute)
+    return check_soc(
+        _entity(str(value), reported_at=reported),
+        observed_at=observed,
+        max_age=timedelta(minutes=10),
+    )
+
+
+def _in_verified_fallback(tmp_path: Path) -> SocMonitor:
+    monitor = SocMonitor.load(_settings(tmp_path))
+    for _ in range(3):
+        monitor.record(_measurement(ok=False), failure_threshold=3)
+    assert monitor.request_fallback() is not None
+    monitor.complete_fallback(action_line="[FALLBACK] verified")
+    return monitor
+
+
+def _record(monitor: SocMonitor, m: SocMeasurement) -> object:
+    return monitor.record(m, failure_threshold=3, recovery_duration=_RECOVERY)
+
+
+def test_recovery_needs_the_configured_continuous_duration(tmp_path: Path) -> None:
+    monitor = _in_verified_fallback(tmp_path)
+    for minute in range(10):
+        _record(monitor, _pass_at(minute))
+        assert not monitor.recovery_ready
+    snap = monitor.record(_pass_at(10), failure_threshold=3, recovery_duration=_RECOVERY)
+    assert monitor.recovery_ready and snap.recovery_ready
+    assert snap.recovery_since == _T0
+    # Ready is not recovered: the fallback stays the effective state.
+    assert snap.state is SocOperatingState.FALLBACK_VERIFIED
+    assert snap.fallback_confirmed
+
+
+def test_failure_during_recovery_resets_progress(tmp_path: Path) -> None:
+    monitor = _in_verified_fallback(tmp_path)
+    for minute in range(9):
+        _record(monitor, _pass_at(minute))
+    snap = monitor.record(_measurement(ok=False), failure_threshold=3)
+    assert snap.recovery_since is None and not snap.recovery_ready
+    for minute in range(10, 20):
+        _record(monitor, _pass_at(minute))
+        assert not monitor.recovery_ready
+    _record(monitor, _pass_at(20))
+    assert monitor.recovery_ready
+    assert monitor._last_snapshot is not None
+    assert monitor._last_snapshot.recovery_since == _T0 + timedelta(minutes=10)
+
+
+def test_recovery_allows_soc_movement(tmp_path: Path) -> None:
+    monitor = _in_verified_fallback(tmp_path)
+    for minute in range(11):
+        _record(monitor, _pass_at(minute, value=30.0 + minute))
+    assert monitor.recovery_ready
+
+
+def test_recovery_needs_a_report_newer_than_its_baseline(tmp_path: Path) -> None:
+    """One cached state re-read for the whole duration never recovers."""
+    monitor = _in_verified_fallback(tmp_path)
+    short = timedelta(minutes=5)
+    for minute in range(10):  # cached but still within the 10-minute report age
+        monitor.record(
+            _pass_at(minute, reported_minute=0), failure_threshold=3, recovery_duration=short
+        )
+    assert not monitor.recovery_ready
+    monitor.record(_pass_at(10), failure_threshold=3, recovery_duration=short)
+    assert monitor.recovery_ready
+
+
+def test_backwards_report_time_restarts_recovery(tmp_path: Path) -> None:
+    monitor = _in_verified_fallback(tmp_path)
+    for minute in range(10):
+        _record(monitor, _pass_at(minute))
+    _record(monitor, _pass_at(10, reported_minute=5))  # would have been ready
+    assert not monitor.recovery_ready
+    for minute in range(11, 20):
+        _record(monitor, _pass_at(minute))
+    assert not monitor.recovery_ready
+    _record(monitor, _pass_at(20))  # ten minutes after the restart at minute 10
+    assert monitor.recovery_ready
+
+
+def test_complete_recovery_returns_to_normal_and_persists(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    monitor = _in_verified_fallback(tmp_path)
+    for minute in range(11):
+        _record(monitor, _pass_at(minute))
+    snap = monitor.complete_recovery(action_line="[RECOVERED] normal programming resumed")
+    assert snap.state is SocOperatingState.NORMAL
+    assert snap.consecutive_failures == 0
+    assert not snap.fallback_confirmed and not snap.recovery_ready
+    assert snap.recovery_action == "[RECOVERED] normal programming resumed"
+    assert not monitor.fallback_active and not monitor.recovery_ready
+    assert json.loads((tmp_path / MONITOR_FILE).read_text()) == {
+        "consecutive_failures": 0,
+        "fallback_status": "normal",
+    }
+    assert SocMonitor.load(settings).fallback_active is False
+
+
+def test_recovery_ready_suppresses_fallback_reprogramming(tmp_path: Path) -> None:
+    monitor = _in_verified_fallback(tmp_path)
+    for minute in range(11):
+        _record(monitor, _pass_at(minute))
+    monitor.invalidate_fallback_confirmation()
+    assert monitor.request_fallback() is None
+
+
+def test_recovery_progress_is_not_persisted(tmp_path: Path) -> None:
+    """Downtime is not healthy evidence: a restart starts recovery over."""
+    settings = _settings(tmp_path)
+    monitor = _in_verified_fallback(tmp_path)
+    for minute in range(11):
+        _record(monitor, _pass_at(minute))
+    assert monitor.recovery_ready
+    restored = SocMonitor.load(settings)
+    snap = restored.record(_pass_at(12), failure_threshold=3, recovery_duration=_RECOVERY)
+    assert not restored.recovery_ready
+    assert snap.recovery_since == _T0 + timedelta(minutes=12)
+
+
+def test_pending_failure_still_resets_on_one_pass(tmp_path: Path) -> None:
+    """The recovery duration applies to an active fallback only."""
+    monitor = SocMonitor.load(_settings(tmp_path))
+    monitor.record(_measurement(ok=False), failure_threshold=3)
+    snap = monitor.record(_pass_at(0), failure_threshold=3, recovery_duration=_RECOVERY)
+    assert snap.state is SocOperatingState.NORMAL

@@ -88,6 +88,7 @@ options:
   soc_entity: ""
   soc_max_report_age_minutes: 10.0
   soc_failure_threshold: 3
+  soc_recovery_minutes: 10
   battery_voltage_entity: ""
   solar_tomorrow_entity: ""
   octopus_rate_entity: ""
@@ -187,6 +188,7 @@ schema:
   soc_entity: str?
   soc_max_report_age_minutes: float
   soc_failure_threshold: int
+  soc_recovery_minutes: int(1,)
   battery_voltage_entity: str?
   solar_tomorrow_entity: str?
   octopus_rate_entity: str?
