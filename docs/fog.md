@@ -292,3 +292,21 @@ closed and point back to this section. Multi-inverter sites, also listed in
 - **Two-way Telegram chat** (inbound messages into the ask/copilot pipeline).
   Sequenced after the outbound phone digest. Trigger: the morning digest
   (#50) ships.
+
+### BMS integration (from #112/#117, 2026-10-07)
+
+- **Read battery state from the BMS, not only through Home Assistant's
+  inverter entity.** All SoC trust today is about Home Assistant *reporting*:
+  `check_soc` judges freshness on the SoC entity's `last_reported`, with the
+  battery-voltage sibling as a liveness signal (#169)
+  (`ha_spark/energy/soc_integrity.py`). #112 puts proof of a fresh physical
+  BMS measurement, plausible BMS misreporting, and BMS configuration out of
+  scope. Two known costs follow. An idle battery whose integration never
+  re-reports an unchanged SoC can't advance recovery from a Solis fallback,
+  because #117 requires the SoC's own report time to move
+  (`ha_spark/energy/soc_monitor.py`, `_advance_recovery`). And a BMS that
+  reports a wrong but well-formed SoC passes every check. Still unsharp:
+  which BMS data to read (SoC, cell voltages, current limits, alarms), over
+  which path (an existing HA integration, a direct CAN/RS485 link, or the
+  inverter's BMS pass-through registers), and whether it cross-checks the
+  inverter SoC or replaces it. Trigger: none yet.
