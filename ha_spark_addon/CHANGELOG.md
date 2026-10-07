@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.20.0
+
 - Solis fallback recovery (#117): an active fallback ends after
   `soc_recovery_minutes` (default 10) of continuously passing SoC observations
   whose `last_reported` never goes backwards and advances at least once. Any
