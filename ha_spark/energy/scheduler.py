@@ -31,7 +31,11 @@ measurement is reused by planning, device application, and guard work. The
 first failed observation enters pending failure — new SoC-based programming
 and charge-rate increases are blocked while valid supply-guard reductions
 remain available — and consecutive failures are counted toward the configured
-fallback-entry threshold (`soc_failure_threshold`, default 3).
+fallback-entry threshold (`soc_failure_threshold`, default 3). With an
+explicit `solis_fallback_current_a`, Solis programs only the configured cheap
+window and reports fallback as confirmed after current and window read-backs;
+failed attempts retry on the next minute. The active fallback is left in place
+on a passing observation for the later recovery policy.
 
 With `inverter_clock_dst_sync` on, the first tick after the household zone's
 UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
@@ -61,6 +65,7 @@ from ha_spark.api.server import (
 )
 from ha_spark.config import Settings
 from ha_spark.devices import Capability, inverter_device
+from ha_spark.devices.inverters.solis import SolisDevice, fallback_charge_current_a
 from ha_spark.energy.derived_base_load import (
     BACKFILL_NAME,
     BACKFILL_STATISTIC_ID,
@@ -231,6 +236,7 @@ async def run_once(
     previous_plan: ChargePlan | None = None,
     trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ev_hold_state: EvHoldState | None = None,
+    fallback_active: bool = False,
 ) -> RunResult:
     """Compute the charge plan, log it, and apply it per PROACTIVE_MODE.
 
@@ -277,7 +283,10 @@ async def run_once(
         # Lazy: the rate is only consulted when the setpoint itself is unchanged.
         rate_w = lambda i: device.planned_rate_w(i)  # noqa: E731
         applied_plan = previous_plan
-        if needs_apply(previous_plan, intent, rate_w, settings.battery_voltage_v):
+        if fallback_active:
+            lines.append("[SKIP] normal programming held while Solis fallback is active")
+            applied_plan = None
+        elif needs_apply(previous_plan, intent, rate_w, settings.battery_voltage_v):
             applied = await device.apply(intent)
             lines.extend(applied)
             applied_plan = None if _apply_failed(applied) else plan
@@ -393,7 +402,12 @@ async def sample_signals(settings: Settings, now: datetime) -> None:
 
 
 async def guard_tick(
-    settings: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+    settings: Settings,
+    target_w: float | None,
+    *,
+    soc: SocMeasurement | None = None,
+    fallback_active: bool = False,
+    fallback_confirmed: bool = False,
 ) -> float:
     """One supply-guard pass; returns the target charge power (W) used.
 
@@ -401,7 +415,8 @@ async def guard_tick(
     to throttle). A daemon (re)started mid-window has no plan yet; adopt the
     current charge-rate setpoint (W) as the restore target rather than guessing.
     ``soc`` is the tick's checked measurement: while it failed the guard can
-    only reduce (the cap is applied inside ``SupplyGuard.tick``).
+    only reduce. An unconfirmed fallback also blocks increases; a verified one
+    caps restoration at its configured current.
     """
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
@@ -409,10 +424,21 @@ async def guard_tick(
         charger = inverter_device(settings, rest)
         if Capability.CHARGE_RATE not in charger.capabilities:
             return target_w or 0.0
+        if fallback_active and fallback_confirmed:
+            fallback_a = fallback_charge_current_a(settings)
+            if fallback_a is not None:
+                # The fallback setting is the restoration target; a plan made
+                # while SoC was rejected is not authority for this value.
+                target_w = fallback_a * settings.battery_voltage_v
         if target_w is None:
             target_w = await charger.read_charge_rate()
             log.info("Supply guard: adopted current setpoint %.0f W as target", target_w)
-        await SupplyGuard(settings, rest).tick(target_w, soc=soc)
+        await SupplyGuard(settings, rest).tick(
+            target_w,
+            soc=soc,
+            fallback_active=fallback_active,
+            fallback_confirmed=fallback_confirmed,
+        )
     return target_w
 
 
@@ -698,6 +724,57 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
             snapshot = monitor.record(
                 measurement, failure_threshold=settings.soc_failure_threshold
             )
+            inverter = next(
+                (device for device in settings.devices if device.type == "inverter"), None
+            )
+            if (
+                inverter is not None
+                and inverter.driver == "solis"
+                and settings.solis_fallback_current_a is not None
+            ):
+                requested = monitor.request_fallback()
+                if requested is not None:
+                    action_lines: list[str]
+                    try:
+                        device = inverter_device(settings, rest)
+                        if isinstance(device, SolisDevice):
+                            action_lines = await device.apply_fallback(measurement)
+                        else:
+                            log.error(
+                                "Solis fallback skipped: inverter factory returned %s",
+                                type(device).__name__,
+                            )
+                            action_lines = [
+                                "[SKIP] Solis fallback skipped: inverter factory returned "
+                                f"non-Solis device ({type(device).__name__})"
+                            ]
+                    except Exception:
+                        log.exception("Solis fallback attempt failed; will retry next minute")
+                        action_lines = ["[FAILED] Solis fallback attempt raised; unconfirmed"]
+                    action_line = next(
+                        (
+                            line
+                            for line in reversed(action_lines)
+                            if line.startswith(
+                                (
+                                    "[FALLBACK]",
+                                    "[FAILED]",
+                                    "[BLOCKED]",
+                                    "[SIMULATE]",
+                                    "[SKIP]",
+                                    "[OFF]",
+                                    "[OBSERVE]",
+                                )
+                            )
+                        ),
+                        "[FAILED] Solis fallback produced no confirmation action",
+                    )
+                    snapshot = monitor.complete_fallback(action_line=action_line)
+                    for line in action_lines:
+                        if line.startswith("[FAILED]"):
+                            log.warning(line)
+                        else:
+                            log.info(line)
             await publish_soc_integrity(rest, snapshot, settings)
             return measurement
     except Exception:
@@ -801,6 +878,16 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
         while True:
             settings = state.settings  # hot-reloaded by POST /api/config
             if settings is not last_settings:
+                if (
+                    settings.charge_window_start != last_settings.charge_window_start
+                    or settings.charge_window_end != last_settings.charge_window_end
+                    or fallback_charge_current_a(settings)
+                    != fallback_charge_current_a(last_settings)
+                    or settings.devices != last_settings.devices
+                    or settings.solis_control_hub != last_settings.solis_control_hub
+                    or settings.solis_modbus_slave != last_settings.solis_modbus_slave
+                ):
+                    monitor.invalidate_fallback_confirmation()
                 # Never reuse a previous plan's command across a hot reload.
                 last_plan = None
                 last_applied_plan = None
@@ -820,6 +907,11 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             # Sole SoC observation cadence (#114): one checked measurement per
             # minute in every operating state, reused by everything below.
             measurement = await soc_monitor_tick(settings, monitor)
+            solis_fallback_active = monitor.fallback_active and any(
+                device.type == "inverter" and device.driver == "solis"
+                for device in settings.devices
+            )
+            fallback_confirmed = solis_fallback_active and monitor.fallback_confirmed
             # Set once `run_once` has *returned*, because it makes its own
             # reconcile pass with the plan it just computed. A run that raises
             # after that pass (`apply` or `publish_plan`) therefore falls back
@@ -836,6 +928,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         previous_plan=previous_plan,
                         trusted_holds=last_trusted_holds,
                         ev_hold_state=ev_hold_state,
+                        fallback_active=solis_fallback_active,
                     )
                     replanned = True
                     state.set_plan(plan)
@@ -884,7 +977,13 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                 reapply = reapply or reconciled.relinquished
             if guard_enabled and in_window(now.time(), window_start, window_end):
                 try:
-                    target_w = await guard_tick(settings, target_w, soc=measurement)
+                    target_w = await guard_tick(
+                        settings,
+                        target_w,
+                        soc=measurement,
+                        fallback_active=solis_fallback_active,
+                        fallback_confirmed=fallback_confirmed,
+                    )
                 except Exception:
                     log.exception("Supply guard tick failed; will retry next tick")
             if last_signal_at is None or now - last_signal_at >= SIGNAL_SAMPLE_INTERVAL:

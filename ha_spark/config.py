@@ -49,6 +49,7 @@ _OPTION_KEYS = frozenset(
         "min_soc",
         "target_soc_cap",
         "max_charge_current_a",
+        "solis_fallback_current_a",
         "battery_discharge_ceiling_kw",
         "dno_export_limit_kw",
         "charge_buffer_pct",
@@ -338,6 +339,10 @@ class Settings(BaseSettings):
     min_soc: float = Field(default=20.0)
     target_soc_cap: float = Field(default=90.0)
     max_charge_current_a: float = Field(default=62.5)
+    # Optional Solis-only current ceiling used after sustained SoC failures.
+    # None disables fallback programming; the driver also caps it at the
+    # normal configured current and the 62.5 A register limit.
+    solis_fallback_current_a: float | None = Field(default=None, ge=1, le=62.5)
     # Conservative planning ceiling for battery discharge.  It is distinct
     # from Solis's fixed hardware command and keeps the planner inverter-agnostic.
     battery_discharge_ceiling_kw: float = Field(default=3.2, ge=0)
@@ -444,9 +449,8 @@ class Settings(BaseSettings):
     # be before the measurement is judged stale (ha_spark/energy/soc_integrity.py).
     # Untrusted SoC blocks real charge writes, so this is a safety threshold.
     soc_max_report_age_minutes: float = Field(default=10.0, gt=0)
-    # Consecutive failed SoC observations before the fallback-entry threshold is
-    # reached (#114). The first failure already blocks new SoC-based programming
-    # and charge-rate increases; this counts toward fallback entry (#115).
+    # Consecutive failed SoC observations before fallback entry (#115). The first
+    # failure already blocks SoC-based programming and charge-rate increases.
     soc_failure_threshold: int = Field(default=3, ge=1)
     battery_voltage_entity: str = Field(default="")
     solar_tomorrow_entity: str = Field(default="")

@@ -342,5 +342,45 @@ async def test_publish_soc_integrity_exposes_pending_state_and_evidence() -> Non
     assert "over the 600s maximum" in attrs["soc_reason"]
     assert attrs["soc_value"] == 30.0
     assert attrs["soc_age_s"] == 3600.0
+    assert attrs["fallback_window_start"] == "23:30"
+    assert attrs["fallback_window_end"] == "05:30"
+    assert attrs["fallback_current_configured_a"] is None
+    assert attrs["fallback_current_ceiling_a"] is None
+    assert attrs["fallback_confirmed"] is False
+    assert attrs["fallback_actions"] == []
     # A monitoring verdict, not a plan: no plan attribute ever appears.
     assert not any(k.startswith("plan") or k == "model" for k in attrs)
+
+
+@respx.mock
+async def test_publish_soc_integrity_reports_fallback_confirmation_not_request() -> None:
+    from ha_spark.energy.soc_integrity import SocStatus
+    from ha_spark.energy.soc_monitor import SocMonitor
+
+    push = respx.post(f"{BASE}/states/sensor.ha_spark_soc_integrity").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    failed = SocMeasurement(
+        status=SocStatus.STALE,
+        observed_at=datetime.now(UTC),
+        value=30.0,
+        raw_state="30",
+        age_s=3600.0,
+        max_age_s=600.0,
+    )
+    monitor = SocMonitor()
+    monitor.record(failed, failure_threshold=1)
+    assert monitor.request_fallback() is not None
+    snapshot = monitor.complete_fallback(action_line="[FALLBACK] Solis fallback verified")
+    settings = Settings(solis_fallback_current_a=45.0, max_charge_current_a=35.0)
+
+    async with HomeAssistantRest(BASE, "t") as rest:
+        await publish_soc_integrity(rest, snapshot, settings)
+
+    body = json.loads(push.calls[0].request.content)
+    assert body["state"] == "fallback_verified"
+    assert body["attributes"]["fallback_current_configured_a"] == 45.0
+    assert body["attributes"]["fallback_current_ceiling_a"] == 35
+    assert body["attributes"]["fallback_confirmed"] is True
+    assert body["attributes"]["fallback_action"] == "[FALLBACK] Solis fallback verified"
+    assert body["attributes"]["fallback_actions"] == ["[FALLBACK] Solis fallback verified"]

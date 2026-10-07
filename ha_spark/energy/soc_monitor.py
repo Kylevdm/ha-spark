@@ -1,4 +1,4 @@
-"""Per-minute SoC integrity monitoring and the pending-failure policy (#114).
+"""Per-minute SoC integrity monitoring and the Solis fallback policy (#114/#115).
 
 The daemon's one-minute loop is the sole SoC observation cadence: each tick
 makes exactly one checked measurement (:func:`observe_soc`) and reuses it for
@@ -9,14 +9,15 @@ observation identity on top of the loop calling ``record`` once per tick).
 Operating state built from those measurements lives here, outside the pure
 planner: the first failed observation enters **pending failure** — new
 SoC-based programming and charge-rate increases are blocked (the chargers
-refuse writes on a failed intent measurement; the supply guard caps its
-target at the live setpoint) while valid supply-guard reductions remain
-available. Consecutive failures are counted and persisted in local durable
-storage; any passing observation resets the count. The configured threshold
-(default three) marks the fallback-entry point; fallback programming itself
-(#115), recovery (#116/#117), and restart reconciliation (#118) extend this
-module. Until fallback state exists, a passing observation resets the count
-from any state — the reset-before-fallback rule tightens with #115.
+refuse writes on a failed intent measurement; the supply guard caps its target
+at the live setpoint until fallback is verified) while valid supply-guard
+reductions remain available. Consecutive failures are counted and persisted in local durable
+storage; any passing observation before fallback entry resets the count. The
+configured threshold (default three) requests fallback only when a current is
+configured. A successful Solis read-back confirms it; a failed or unconfirmed
+attempt stays retryable on the next observation. Once requested, verified, or
+failed, a passing observation leaves the fallback state in place for recovery
+(#116/#117). Persisted confirmation is not hardware truth after restart (#118).
 """
 
 from __future__ import annotations
@@ -37,16 +38,19 @@ from ha_spark.logging import get_logger
 log = get_logger(__name__)
 
 # Durable state lives next to the ledger DB (same convention as the published-
-# states cache). JSON, not SQLite: one integer, written at most once per tick.
+# states cache). JSON, not SQLite: the count and fallback status are tiny.
 MONITOR_FILE = "ha_spark_soc_monitor.json"
 
 
 class SocOperatingState(StrEnum):
-    """The monitoring state derived from consecutive observation failures."""
+    """The monitoring and fallback state for consecutive SoC failures."""
 
     NORMAL = "normal"
     PENDING_FAILURE = "pending_failure"
     FALLBACK_THRESHOLD = "fallback_threshold"
+    FALLBACK_REQUESTED = "fallback_requested"
+    FALLBACK_VERIFIED = "fallback_verified"
+    FALLBACK_FAILED = "fallback_failed"
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,8 @@ class SocMonitorSnapshot:
     consecutive_failures: int
     failure_threshold: int
     state: SocOperatingState
+    fallback_confirmed: bool = False
+    fallback_action: str | None = None
 
 
 def monitor_path(settings: Settings) -> Path:
@@ -95,7 +101,7 @@ async def observe_soc(settings: Settings, rest: HomeAssistantRest) -> SocMeasure
 
 
 class SocMonitor:
-    """Tracks consecutive SoC observation failures across daemon ticks.
+    """Tracks SoC failures and fallback confirmation across daemon ticks.
 
     ``record`` is called exactly once per one-minute observation by the
     control loop; recording the *same* measurement object again (a consumer
@@ -103,26 +109,40 @@ class SocMonitor:
     internal call structure can never accelerate failure counting.
     """
 
-    def __init__(self, *, consecutive_failures: int = 0, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        consecutive_failures: int = 0,
+        fallback_status: SocOperatingState = SocOperatingState.NORMAL,
+        path: Path | None = None,
+    ) -> None:
         self._consecutive_failures = consecutive_failures
+        self._fallback_status = fallback_status
+        # A read-back from an earlier process is history, not proof of the
+        # current resident program. Only complete_fallback can set this true.
+        self._fallback_confirmed = False
         self._path = path
         self._last: SocMeasurement | None = None
         self._last_snapshot: SocMonitorSnapshot | None = None
+        self._fallback_attempt_measurement: SocMeasurement | None = None
 
     @classmethod
     def load(cls, settings: Settings) -> SocMonitor:
-        """Restore the persisted failure count; degrade to zero on bad state."""
+        """Restore the count and fallback status, not hardware truth."""
         path = monitor_path(settings)
         count = 0
+        fallback_status = SocOperatingState.NORMAL
         try:
             raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
             count = int(raw["consecutive_failures"])
+            fallback_status = SocOperatingState(raw.get("fallback_status", "normal"))
         except (OSError, ValueError, KeyError, TypeError):
             count = 0
+            fallback_status = SocOperatingState.NORMAL
         if count < 0:
             log.warning("SoC monitor: persisted failure count %d invalid; starting at 0", count)
             count = 0
-        return cls(consecutive_failures=count, path=path)
+        return cls(consecutive_failures=count, fallback_status=fallback_status, path=path)
 
     def record(
         self, measurement: SocMeasurement, *, failure_threshold: int
@@ -138,35 +158,106 @@ class SocMonitor:
         self._last_snapshot = snapshot
         return snapshot
 
+    @property
+    def fallback_active(self) -> bool:
+        """Whether fallback entry has begun and normal programming must wait."""
+        return self._fallback_status in {
+            SocOperatingState.FALLBACK_REQUESTED,
+            SocOperatingState.FALLBACK_VERIFIED,
+            SocOperatingState.FALLBACK_FAILED,
+        }
+
+    @property
+    def fallback_confirmed(self) -> bool:
+        """Whether this process verified the currently reported fallback."""
+        return self._fallback_status is SocOperatingState.FALLBACK_VERIFIED and (
+            self._fallback_confirmed
+        )
+
+    def request_fallback(self) -> SocMonitorSnapshot | None:
+        """Mark one eligible, configured fallback attempt as requested."""
+        retryable = self._fallback_status in {
+            SocOperatingState.FALLBACK_THRESHOLD,
+            SocOperatingState.FALLBACK_REQUESTED,
+            SocOperatingState.FALLBACK_FAILED,
+        } or (
+            self._fallback_status is SocOperatingState.FALLBACK_VERIFIED
+            and not self._fallback_confirmed
+        )
+        if (
+            not retryable
+            or self._last_snapshot is None
+            or self._fallback_attempt_measurement is self._last
+        ):
+            return None
+        self._fallback_attempt_measurement = self._last
+        self._fallback_status = SocOperatingState.FALLBACK_REQUESTED
+        self._fallback_confirmed = False
+        self._save()
+        return self._refresh_last_snapshot(fallback_confirmed=False)
+
+    def complete_fallback(self, *, action_line: str) -> SocMonitorSnapshot:
+        """Record the latest Solis read-back verdict and persist its status."""
+        confirmed = action_line.startswith("[FALLBACK]")
+        non_actuation = action_line.startswith(("[SIMULATE]", "[SKIP]", "[OFF]", "[OBSERVE]"))
+        failed = action_line.startswith("[FAILED]")
+        if not confirmed and not failed and not non_actuation:
+            action_line = f"[FAILED] Solis fallback unconfirmed: {action_line}"
+            failed = True
+        self._fallback_status = (
+            SocOperatingState.FALLBACK_VERIFIED
+            if confirmed
+            else SocOperatingState.FALLBACK_FAILED
+            if failed
+            else SocOperatingState.FALLBACK_REQUESTED
+        )
+        self._fallback_confirmed = confirmed
+        snapshot = self._refresh_last_snapshot(
+            fallback_confirmed=confirmed,
+            fallback_action=action_line,
+        )
+        self._save()
+        return snapshot
+
+    def invalidate_fallback_confirmation(self) -> None:
+        """Forget confirmation after a change to the programmed fallback request."""
+        if self._fallback_status is not SocOperatingState.FALLBACK_VERIFIED:
+            return
+        self._fallback_confirmed = False
+        self._save()
+
     # --- internals ---
 
     def _record_pass(
         self, measurement: SocMeasurement, failure_threshold: int
     ) -> SocMonitorSnapshot:
+        if self.fallback_active:
+            return self._snapshot(measurement, failure_threshold, self._fallback_status)
         if self._consecutive_failures:
             log.info(
                 "SoC integrity: recovered after %d consecutive failure(s); normal operation",
                 self._consecutive_failures,
             )
             self._consecutive_failures = 0
+            self._fallback_status = SocOperatingState.NORMAL
+            self._fallback_confirmed = False
             self._save()
-        return SocMonitorSnapshot(
-            measurement=measurement,
-            consecutive_failures=0,
-            failure_threshold=failure_threshold,
-            state=SocOperatingState.NORMAL,
-        )
+        return self._snapshot(measurement, failure_threshold, SocOperatingState.NORMAL)
 
     def _record_failure(
         self, measurement: SocMeasurement, failure_threshold: int
     ) -> SocMonitorSnapshot:
         self._consecutive_failures += 1
+        if self.fallback_active:
+            state = self._fallback_status
+        else:
+            state = (
+                SocOperatingState.FALLBACK_THRESHOLD
+                if self._consecutive_failures >= failure_threshold
+                else SocOperatingState.PENDING_FAILURE
+            )
+            self._fallback_status = state
         self._save()
-        state = (
-            SocOperatingState.FALLBACK_THRESHOLD
-            if self._consecutive_failures >= failure_threshold
-            else SocOperatingState.PENDING_FAILURE
-        )
         if state is SocOperatingState.FALLBACK_THRESHOLD:
             log.warning(
                 "SoC integrity: failure %d/%d — %s; fallback-entry threshold reached",
@@ -182,21 +273,51 @@ class SocMonitor:
                 failure_threshold,
                 measurement.reason,
             )
+        return self._snapshot(measurement, failure_threshold, state)
+
+    def _snapshot(
+        self,
+        measurement: SocMeasurement,
+        failure_threshold: int,
+        state: SocOperatingState,
+    ) -> SocMonitorSnapshot:
         return SocMonitorSnapshot(
             measurement=measurement,
             consecutive_failures=self._consecutive_failures,
             failure_threshold=failure_threshold,
             state=state,
+            fallback_confirmed=self.fallback_confirmed,
         )
 
+    def _refresh_last_snapshot(
+        self, *, fallback_confirmed: bool, fallback_action: str | None = None
+    ) -> SocMonitorSnapshot:
+        if self._last_snapshot is None:
+            raise RuntimeError("fallback state has no SoC observation")
+        snapshot = SocMonitorSnapshot(
+            measurement=self._last_snapshot.measurement,
+            consecutive_failures=self._consecutive_failures,
+            failure_threshold=self._last_snapshot.failure_threshold,
+            state=self._fallback_status,
+            fallback_confirmed=fallback_confirmed,
+            fallback_action=fallback_action,
+        )
+        self._last_snapshot = snapshot
+        return snapshot
+
     def _save(self) -> None:
-        """Persist the failure count (best-effort; never raises into the loop)."""
+        """Persist the failure count and fallback status; never raises into the loop."""
         if self._path is None:
             return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._path.write_text(
-                json.dumps({"consecutive_failures": self._consecutive_failures}),
+                json.dumps(
+                    {
+                        "consecutive_failures": self._consecutive_failures,
+                        "fallback_status": self._fallback_status.value,
+                    }
+                ),
                 encoding="utf-8",
             )
         except OSError:

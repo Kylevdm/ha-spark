@@ -14,8 +14,9 @@ import pytest
 import respx
 
 from ha_spark.api.server import AppState
-from ha_spark.config import Settings
-from ha_spark.devices import inverter_device
+from ha_spark.config import DeviceConfig, Settings
+from ha_spark.devices import Capability, inverter_device
+from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.energy import scheduler, sources
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
@@ -31,6 +32,7 @@ from ha_spark.energy.scheduler import (
     should_run,
 )
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+from ha_spark.energy.soc_monitor import SocMonitor
 from ha_spark.ha.rest import HomeAssistantRest
 
 
@@ -51,6 +53,14 @@ def _soc(value: float) -> SocMeasurement:
 _INTENT = ChargeIntent(
     target_soc_pct=77.0, soc=_soc(30.0), window_start=time(23, 30), window_end=time(5, 30)
 )
+
+
+def _fake_solis_device(
+    device_type: type[SolisDevice], settings: Settings, rest: HomeAssistantRest
+) -> SolisDevice:
+    """Build a subclass test double with the same valid constructor inputs."""
+    config = DeviceConfig(id="test_solis", driver="solis")
+    return device_type(config, settings, rest)
 
 
 def _plan(intent: ChargeIntent = _INTENT) -> ChargePlan:
@@ -218,6 +228,24 @@ async def test_run_once_ignores_amps_sized_from_an_untrusted_soc(
     await run_once(settings, soc=failed, previous_plan=_plan_at(31.0))
 
     assert device.applied == []
+
+
+async def test_run_once_keeps_the_fallback_program_when_monitor_says_active(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = Settings()
+    current = _plan_at(31.0)
+    device = _AmpsDevice({31.0: 38.0}, settings.battery_voltage_v)
+    _patch_run_once_io(monkeypatch, current, device)
+
+    caplog.set_level("INFO")
+    result = await run_once(
+        settings, soc=current.soc, previous_plan=_plan_at(30.0), fallback_active=True
+    )
+
+    assert device.applied == []
+    assert result.applied_plan is None
+    assert "normal programming held while Solis fallback is active" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -532,6 +560,7 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.RunResult:
         calls.append("run")
         if len(calls) == 1:
@@ -660,6 +689,7 @@ async def test_run_forever_publishes_plan_to_api_state(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.RunResult:
         plan = _plan()
         return scheduler.RunResult(plan, plan)
@@ -692,12 +722,16 @@ async def test_run_forever_guard_ticks_only_inside_window(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.RunResult:
         plan = _plan()
         return scheduler.RunResult(plan, plan)
 
     async def fake_guard_tick(
-        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+        _s: Settings, target_w: float | None, *,
+        soc: SocMeasurement | None = None,
+        fallback_active: bool = False,
+        fallback_confirmed: bool = False,
     ) -> float:
         guard_targets.append(target_w)
         assert target_w is not None
@@ -740,12 +774,16 @@ async def test_run_forever_no_guard_when_entity_unset(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.RunResult:
         plan = _plan()
         return scheduler.RunResult(plan, plan)
 
     async def fail_guard_tick(
-        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+        _s: Settings, target_w: float | None, *,
+        soc: SocMeasurement | None = None,
+        fallback_active: bool = False,
+        fallback_confirmed: bool = False,
     ) -> float:
         raise AssertionError("guard must not run when grid_power_entity is empty")
 
@@ -775,12 +813,16 @@ async def test_run_forever_no_guard_when_charger_has_no_live_rate(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.RunResult:
         plan = _plan()
         return scheduler.RunResult(plan, plan)
 
     async def fail_guard_tick(
-        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+        _s: Settings, target_w: float | None, *,
+        soc: SocMeasurement | None = None,
+        fallback_active: bool = False,
+        fallback_confirmed: bool = False,
     ) -> float:
         raise AssertionError("guard must not run for an inverter without a live rate")
 
@@ -812,12 +854,16 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.RunResult:
         plan = _plan()
         return scheduler.RunResult(plan, plan)
 
     async def boom_guard_tick(
-        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+        _s: Settings, target_w: float | None, *,
+        soc: SocMeasurement | None = None,
+        fallback_active: bool = False,
+        fallback_confirmed: bool = False,
     ) -> float:
         attempts.append(datetime.now())
         raise RuntimeError("HA unreachable")
@@ -861,6 +907,36 @@ async def test_guard_tick_adopts_setpoint_as_target_on_restart() -> None:
     # Mid-window restart: no plan target yet -> adopt the live setpoint in watts
     # (30 A * 51 V = 1530 W) via the charger's read_charge_rate.
     assert await guard_tick(s, None) == 30.0 * 51.0
+
+
+@respx.mock
+async def test_guard_tick_uses_configured_fallback_as_restore_target() -> None:
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        proactive_mode="simulate",
+        grid_power_entity="sensor.house_supply_power",
+        battery_voltage_v=51.0,
+        solis_fallback_current_a=15.0,
+    )
+    for entity, state in (
+        (s.grid_power_entity, "3000"),
+        ("sensor.solis_control_timed_charge_current", "5"),
+    ):
+        respx.get(f"http://ha.test/api/states/{entity}").mock(
+            return_value=httpx.Response(
+                200, json={"entity_id": entity, "state": state, "attributes": {}}
+            )
+        )
+
+    target = await guard_tick(
+        s,
+        100.0,
+        fallback_active=True,
+        fallback_confirmed=True,
+    )
+
+    assert target == 15.0 * s.battery_voltage_v
 
 
 @respx.mock
@@ -960,6 +1036,7 @@ async def test_run_forever_samples_signals_every_interval(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.RunResult:
         plan = _plan()
         return scheduler.RunResult(plan, plan)
@@ -1198,6 +1275,7 @@ def _patch_monitor_loop(
     *,
     run_once_socs: list[SocMeasurement | None] | None = None,
     guard_socs: list[SocMeasurement | None] | None = None,
+    fallback_states: list[bool] | None = None,
 ) -> type[Exception]:
     """Patch the loop like ``_patch_loop``, optionally capturing tick SoCs."""
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
@@ -1211,8 +1289,11 @@ def _patch_monitor_loop(
             previous_plan: ChargePlan | None = None,
             trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
             ev_hold_state: scheduler.EvHoldState | None = None,
+            fallback_active: bool = False,
         ) -> scheduler.RunResult:
             run_once_socs.append(soc)
+            if fallback_states is not None:
+                fallback_states.append(fallback_active)
             plan = _plan()
             return scheduler.RunResult(plan, plan)
     else:
@@ -1223,20 +1304,29 @@ def _patch_monitor_loop(
             previous_plan: ChargePlan | None = None,
             trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
             ev_hold_state: scheduler.EvHoldState | None = None,
+            fallback_active: bool = False,
         ) -> scheduler.RunResult:
+            if fallback_states is not None:
+                fallback_states.append(fallback_active)
             plan = _plan()
             return scheduler.RunResult(plan, plan)
 
     if guard_socs is not None:
         async def fake_guard_tick(
-            _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+            _s: Settings, target_w: float | None, *,
+            soc: SocMeasurement | None = None,
+            fallback_active: bool = False,
+            fallback_confirmed: bool = False,
         ) -> float:
             guard_socs.append(soc)
             assert target_w is not None
             return target_w
     else:
         async def fake_guard_tick(
-            _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+            _s: Settings, target_w: float | None, *,
+            soc: SocMeasurement | None = None,
+            fallback_active: bool = False,
+            fallback_confirmed: bool = False,
         ) -> float:
             assert target_w is not None
             return target_w
@@ -1280,7 +1370,8 @@ async def test_loop_isolated_soc_failure_then_pass_resets_count(
     assert published[0][1]["consecutive_failures"] == 1
     assert published[1][1]["consecutive_failures"] == 0
     assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
-        "consecutive_failures": 0
+        "consecutive_failures": 0,
+        "fallback_status": "normal",
     }
 
 
@@ -1288,8 +1379,7 @@ async def test_loop_isolated_soc_failure_then_pass_resets_count(
 async def test_loop_third_consecutive_failure_reaches_fallback_threshold(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The default third consecutive failed observation reaches the fallback-
-    entry threshold (the fallback write itself lands with #115)."""
+    """Without a configured current, threshold entry leaves the program untouched."""
     respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
     stale = datetime.now(UTC) - timedelta(hours=1)
     _soc_get(["50", "50", "50"], [stale, stale, stale])
@@ -1318,10 +1408,399 @@ async def test_loop_third_consecutive_failure_reaches_fallback_threshold(
     ]
     assert published[-1][1]["consecutive_failures"] == 3
     assert published[-1][1]["failure_threshold"] == 3
+    assert published[-1][1]["fallback_current_configured_a"] is None
+    assert published[-1][1]["fallback_confirmed"] is False
     assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
-        "consecutive_failures": 3
+        "consecutive_failures": 3,
+        "fallback_status": "fallback_threshold",
     }
     assert "fallback-entry threshold reached" in caplog.text
+
+
+@respx.mock
+async def test_soc_monitor_tick_skips_fallback_when_factory_returns_non_solis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50"], [stale])
+
+    class OtherDevice:
+        pass
+
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_args: OtherDevice())
+    settings = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        db_path=str(tmp_path / "ledger.db"),
+        soc_entity="sensor.soc",
+        soc_failure_threshold=1,
+        inverter="solis",
+        solis_fallback_current_a=42.0,
+        v2l_power_entity="",
+    )
+
+    with caplog.at_level("ERROR"):
+        await scheduler.soc_monitor_tick(
+            settings, SocMonitor(path=tmp_path / "ha_spark_soc_monitor.json")
+        )
+
+    state, attrs = _integrity_posts()[0]
+    assert state == "fallback_requested"
+    assert attrs["fallback_confirmed"] is False
+    assert attrs["fallback_action"] == (
+        "[SKIP] Solis fallback skipped: inverter factory returned non-Solis device "
+        "(OtherDevice)"
+    )
+    assert "Solis fallback skipped: inverter factory returned OtherDevice" in caplog.text
+
+
+@respx.mock
+async def test_loop_enters_configured_fallback_at_threshold_and_publishes_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50", "50", "50"], [stale, stale, stale])
+    fallback_calls: list[SocMeasurement] = []
+
+    class FallbackDevice(SolisDevice):
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            fallback_calls.append(soc)
+            return ["[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"]
+
+        async def reconcile_holds(self, *_args: object, **_kwargs: object) -> list[str]:
+            return []
+
+        async def write_safe_state(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(FallbackDevice, settings, rest),
+    )
+    settings = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        plan_run_time="22:00",
+        db_path=str(tmp_path / "ledger.db"),
+        soc_entity="sensor.soc",
+        soc_failure_threshold=2,
+        solis_fallback_current_a=42.0,
+        v2l_power_entity="",
+    )
+    fallback_states: list[bool] = []
+    # Preserve the loop harness's run_once stub while capturing its fallback gate.
+    stop = _patch_monitor_loop(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 22, 0),
+            datetime(2026, 6, 10, 22, 1),
+            datetime(2026, 6, 10, 22, 30),
+        ],
+        fallback_states=fallback_states,
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert len(fallback_calls) == 1 and not fallback_calls[0].ok
+    assert fallback_states == [False, True]
+    published = _integrity_posts()
+    assert [state for state, _ in published] == [
+        "pending_failure",
+        "fallback_verified",
+        "fallback_verified",
+    ]
+    state, attrs = published[1]
+    assert state == "fallback_verified"
+    assert attrs["fallback_current_configured_a"] == 42.0
+    assert attrs["fallback_confirmed"] is True
+    assert attrs["fallback_actions"] == [
+        "[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"
+    ]
+    assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
+        "consecutive_failures": 3,
+        "fallback_status": "fallback_verified",
+    }
+
+
+@respx.mock
+async def test_loop_retries_unconfirmed_fallback_once_on_next_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50", "50"], [stale, stale])
+    fallback_calls: list[SocMeasurement] = []
+
+    class RetryingFallbackDevice(SolisDevice):
+        outcomes = [
+            [
+                "[BLOCKED] Solis fallback held: live verified export slot 1 is unreadable"
+            ],
+            ["[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"],
+        ]
+
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            fallback_calls.append(soc)
+            return self.outcomes.pop(0)
+
+        async def reconcile_holds(self, *_args: object, **_kwargs: object) -> list[str]:
+            return []
+
+        async def write_safe_state(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(
+            RetryingFallbackDevice, settings, rest
+        ),
+    )
+    stop = _patch_monitor_loop(
+        monkeypatch,
+        [datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 22, 1)],
+    )
+    settings = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        plan_run_time="22:00",
+        db_path=str(tmp_path / "ledger.db"),
+        soc_entity="sensor.soc",
+        soc_failure_threshold=1,
+        solis_fallback_current_a=42.0,
+        v2l_power_entity="",
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert len(fallback_calls) == 2
+    assert [state for state, _ in _integrity_posts()] == [
+        "fallback_failed",
+        "fallback_verified",
+    ]
+    assert _integrity_posts()[0][1]["fallback_confirmed"] is False
+    first_action = _integrity_posts()[0][1]["fallback_action"]
+    assert first_action.startswith("[FAILED] Solis fallback unconfirmed: [BLOCKED]")
+    assert "live verified export slot 1 is unreadable" in first_action
+    assert _integrity_posts()[1][1]["fallback_confirmed"] is True
+
+
+@respx.mock
+async def test_loop_keeps_simulated_fallback_unconfirmed_without_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50"], [stale])
+
+    class SimulatedFallbackDevice(SolisDevice):
+        async def apply_fallback(self, _soc: SocMeasurement) -> list[str]:
+            return [
+                "[SIMULATE] Solis fallback at 42 A in 23:30-05:30 "
+                "would be programmed (not written)"
+            ]
+
+        def planned_rate_w(self, _intent: object) -> float:
+            return 0.0
+
+        async def reconcile_holds(self, *_args: object, **_kwargs: object) -> list[str]:
+            return []
+
+        async def write_safe_state(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(SimulatedFallbackDevice, settings, rest),
+    )
+    stop = _patch_monitor_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0)])
+    settings = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        plan_run_time="22:00",
+        proactive_mode="simulate",
+        db_path=str(tmp_path / "ledger.db"),
+        soc_entity="sensor.soc",
+        soc_failure_threshold=1,
+        solis_fallback_current_a=42.0,
+        v2l_power_entity="",
+    )
+
+    with caplog.at_level("WARNING"), pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    state, attrs = _integrity_posts()[0]
+    assert state == "fallback_requested"
+    assert attrs["fallback_confirmed"] is False
+    assert attrs["fallback_action"] == (
+        "[SIMULATE] Solis fallback at 42 A in 23:30-05:30 "
+        "would be programmed (not written)"
+    )
+    assert not any(
+        record.levelname == "WARNING"
+        and record.message.startswith(("[FAILED] Solis fallback", "[SIMULATE] Solis fallback"))
+        for record in caplog.records
+    )
+
+
+@respx.mock
+async def test_loop_reconciles_persisted_fallback_even_when_soc_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persisted confirmation is untrusted until this process reads back Solis."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    now = datetime.now(UTC)
+    _soc_get(["55"], [now])
+    monitor_path = tmp_path / "ha_spark_soc_monitor.json"
+    monitor_path.write_text(
+        json.dumps({"consecutive_failures": 2, "fallback_status": "fallback_verified"}),
+        encoding="utf-8",
+    )
+    fallback_calls: list[SocMeasurement] = []
+
+    class ReconcileFallbackDevice(SolisDevice):
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            fallback_calls.append(soc)
+            return ["[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"]
+
+        def planned_rate_w(self, _intent: object) -> float:
+            return 0.0
+
+        async def reconcile_holds(self, *_args: object, **_kwargs: object) -> list[str]:
+            return []
+
+        async def write_safe_state(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(ReconcileFallbackDevice, settings, rest),
+    )
+    stop = _patch_monitor_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0)])
+    settings = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        plan_run_time="22:00",
+        db_path=str(tmp_path / "ledger.db"),
+        soc_entity="sensor.soc",
+        soc_failure_threshold=2,
+        solis_fallback_current_a=42.0,
+        v2l_power_entity="",
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert len(fallback_calls) == 1 and fallback_calls[0].ok
+    assert _integrity_posts()[0][0] == "fallback_verified"
+    assert _integrity_posts()[0][1]["fallback_confirmed"] is True
+
+
+@respx.mock
+async def test_loop_caps_verified_fallback_guard_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50"], [stale])
+    stop = _patch_monitor_loop(monkeypatch, [datetime(2026, 6, 10, 23, 30)])
+    guard_calls: list[tuple[float | None, bool, bool]] = []
+
+    class FallbackDevice(SolisDevice):
+        capabilities = frozenset({Capability.CHARGE_RATE})
+
+        async def apply_fallback(self, _soc: SocMeasurement) -> list[str]:
+            return ["[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"]
+
+        async def reconcile_holds(self, *_args: object, **_kwargs: object) -> list[str]:
+            return []
+
+        async def write_safe_state(self) -> list[str]:
+            return []
+
+        def planned_rate_w(self, _intent: ChargeIntent) -> float:
+            # This is the rejected plan target. Guard restoration must instead
+            # use the explicitly configured fallback ceiling.
+            return 900.0
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(FallbackDevice, settings, rest),
+    )
+
+    async def capture_guard(
+        _settings: Settings,
+        target_w: float | None,
+        *,
+        soc: SocMeasurement | None = None,
+        fallback_active: bool = False,
+        fallback_confirmed: bool = False,
+    ) -> float:
+        guard_calls.append((target_w, fallback_active, fallback_confirmed))
+        return target_w or 0.0
+
+    monkeypatch.setattr(scheduler, "guard_tick", capture_guard)
+    settings = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        plan_run_time="23:30",
+        charge_window_start="23:30",
+        charge_window_end="05:30",
+        db_path=str(tmp_path / "ledger.db"),
+        soc_entity="sensor.soc",
+        soc_failure_threshold=1,
+        solis_fallback_current_a=42.0,
+        grid_power_entity="sensor.house_supply_power",
+        v2l_power_entity="",
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    # The loop forwards plan state unchanged; guard_tick owns fallback target selection.
+    assert guard_calls == [(900.0, True, True)]
+
+
+@respx.mock
+async def test_loop_never_requests_fallback_for_alphaess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50"], [stale])
+    fallback_states: list[bool] = []
+    stop = _patch_monitor_loop(
+        monkeypatch,
+        [datetime(2026, 6, 10, 22, 0)],
+        fallback_states=fallback_states,
+    )
+    settings = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        plan_run_time="22:00",
+        db_path=str(tmp_path / "ledger.db"),
+        soc_entity="sensor.soc",
+        soc_failure_threshold=1,
+        inverter="alphaess",
+        solis_fallback_current_a=42.0,
+        v2l_power_entity="",
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert fallback_states == [False]
+    assert _integrity_posts()[-1][0] == "fallback_threshold"
+    assert _integrity_posts()[-1][1]["fallback_supported"] is False
+    assert not any(call.request.url.path.startswith("/api/services/") for call in respx.calls)
 
 
 @respx.mock
@@ -1384,7 +1863,8 @@ async def test_loop_observes_once_per_tick_and_reuses_the_measurement(
     assert run_socs[0] is not None and not run_socs[0].ok
     # Counted once, not once per consumer.
     assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
-        "consecutive_failures": 1
+        "consecutive_failures": 1,
+        "fallback_status": "pending_failure",
     }
     published = _integrity_posts()
     assert [state for state, _ in published] == ["pending_failure"]
@@ -1504,6 +1984,7 @@ async def test_loop_blocked_plan_rate_never_becomes_guard_target(
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.RunResult:
         # A plan computed from the tick's failed measurement: blocked at the
         # charger gate, but still a plan object (existence != applied).
@@ -1520,7 +2001,10 @@ async def test_loop_blocked_plan_rate_never_becomes_guard_target(
     guard_targets: list[float | None] = []
 
     async def capture_guard_tick(
-        _s: Settings, target_w: float | None, *, soc: SocMeasurement | None = None
+        _s: Settings, target_w: float | None, *,
+        soc: SocMeasurement | None = None,
+        fallback_active: bool = False,
+        fallback_confirmed: bool = False,
     ) -> float:
         guard_targets.append(target_w)
         # Like the real guard_tick: adopt (echo) the live setpoint when no
@@ -1692,6 +2176,7 @@ async def test_run_forever_reconciles_every_minute_not_every_slot(
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.ReconcileResult:
         plans.append(plan)
         reconciled.append(now)
@@ -1749,6 +2234,7 @@ async def test_run_forever_does_not_reconcile_twice_on_a_slot_boundary(
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.ReconcileResult:
         reconciled.append(now)
         return scheduler.ReconcileResult([], trusted_holds)
@@ -1940,6 +2426,7 @@ async def test_run_forever_remembers_holds_only_from_trusted_plans(
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.ReconcileResult:
         reconcile_saw.append(trusted_holds)
         return scheduler.ReconcileResult([], trusted_holds)
@@ -1998,6 +2485,7 @@ async def test_run_forever_forgets_trusted_holds_on_hot_reload(
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.ReconcileResult:
         reconcile_saw.append(trusted_holds)
         assert ev_hold_state is not None
@@ -2885,6 +3373,7 @@ async def test_run_forever_keeps_the_holds_a_per_minute_read_trusted(
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.ReconcileResult:
         reconcile_saw.append(trusted_holds)
         return scheduler.ReconcileResult([], (_HOLD,))
@@ -3140,6 +3629,7 @@ async def test_run_forever_reapplies_the_plan_after_a_relinquish(
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.ReconcileResult:
         return scheduler.ReconcileResult([], trusted_holds, relinquished=now == relinquish_at)
 
@@ -3196,6 +3686,7 @@ async def test_run_forever_reconciles_every_tick_while_the_replan_keeps_failing(
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.ReconcileResult:
         reconciled.append(now)
         return scheduler.ReconcileResult([], trusted_holds)
@@ -3246,6 +3737,7 @@ async def test_a_failed_replans_fallback_pass_uses_the_last_plan_and_holds(
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.ReconcileResult:
         reconciled.append((plan, trusted_holds))
         return scheduler.ReconcileResult([], trusted_holds)
@@ -3300,6 +3792,7 @@ async def test_run_forever_reapplies_when_a_fallback_pass_relinquishes(
         previous: list[str] | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.ReconcileResult:
         return scheduler.ReconcileResult([], trusted_holds, relinquished=now == fail_at)
 
@@ -3345,6 +3838,7 @@ async def test_run_forever_syncs_the_inverter_clock_at_a_clock_change_when_opted
         previous_plan: ChargePlan | None = None,
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
     ) -> scheduler.RunResult:
         plan = _plan()
         return scheduler.RunResult(plan, plan)
