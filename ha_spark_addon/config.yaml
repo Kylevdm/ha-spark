@@ -123,6 +123,9 @@ options:
   v2l_cutoff_time: "01:00"
   v2l_notify_service: ""
   v2l_budget_kwh: 0.0
+  v2l_rectifier_efficiency: 0.94
+  v2l_charge_kw: 2.15
+  v2l_soc_tolerance_pct: 5.0
 schema:
   log_level: list(DEBUG|INFO|WARNING|ERROR)
   proactive_mode: list(off|simulate|on)
@@ -236,3 +239,6 @@ schema:
   v2l_cutoff_time: match(^\d{2}:\d{2}$)
   v2l_notify_service: str?
   v2l_budget_kwh: float
+  v2l_rectifier_efficiency: float(0.01,1)
+  v2l_charge_kw: float(0.01,)
+  v2l_soc_tolerance_pct: float(0,)
