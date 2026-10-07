@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.21.3
+
+- Add direct EV power and separate grid-import evidence to dispatch ratings
+  (#222), including conservative mid-slot release after ten minutes.
+
 ## 0.21.2
 
 - SoC integrity now checks jumps and stuck readings against integrated battery

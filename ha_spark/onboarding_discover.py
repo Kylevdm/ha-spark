@@ -43,6 +43,22 @@ RULES: tuple[Rule, ...] = (
     Rule("octopus_rate_entity", ("sensor",), ("monetary",), (), ("octopus", "rate")),
     Rule("dispatch_entity", ("binary_sensor",), (), (), ("octopus", "dispatch", "intelligent")),
     Rule("ev_plug_entity", ("sensor",), (), (), ("zappi", "plug", "ev")),
+    Rule(
+        "ev_power_entity",
+        ("sensor",),
+        ("power",),
+        ("W", "kW"),
+        ("zappi", "ct", "load"),
+        optional=True,
+    ),
+    Rule(
+        "dispatch_grid_power_entity",
+        ("sensor",),
+        ("power",),
+        ("W", "kW"),
+        ("meter", "active", "power"),
+        optional=True,
+    ),
     Rule("ev_status_entity", ("sensor",), (), (), ("zappi", "status", "ev")),
     Rule(
         "consumption_energy_entity", ("sensor",), ("energy",), ("kWh",),

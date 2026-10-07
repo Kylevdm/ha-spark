@@ -1,6 +1,6 @@
 ---
 name: ha-spark
-version: "0.21.2"
+version: "0.21.3"
 slug: ha_spark_addon
 description: Local-first battery charge planner and automation agent for Home Assistant
 url: https://github.com/Kylevdm/ha-spark
@@ -97,6 +97,9 @@ options:
   dispatch_entity: ""
   ev_plug_entity: ""
   ev_status_entity: ""
+  ev_power_entity: ""
+  dispatch_grid_power_entity: ""
+  dispatch_grid_power_invert: false
   consumption_energy_entity: ""
   supply_max_current_a: 75.0
   supply_voltage_v: 240.0
@@ -201,6 +204,9 @@ schema:
   dispatch_entity: str?
   ev_plug_entity: str?
   ev_status_entity: str?
+  ev_power_entity: str?
+  dispatch_grid_power_entity: str?
+  dispatch_grid_power_invert: bool
   consumption_energy_entity: str?
   grid_power_entity: str?
   supply_max_current_a: float

@@ -4,14 +4,17 @@ Live dispatch state, an adjusted Octopus rate, or the car drawing power during
 the planned slot confirms a dispatch. A connected plug corroborates it. A
 readable disconnected plug contradicts it only when none of those stronger
 signals applies; unset, unreadable, and unrecognised evidence leaves the
-dispatch uncorroborated and therefore retained.
+dispatch uncorroborated and therefore retained. After ten minutes in an active
+slot, two readable power signals showing no car draw can contradict an otherwise
+uncorroborated dispatch.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
+from math import isfinite
 
 from ha_spark.energy.models import DispatchSlot
 
@@ -36,6 +39,9 @@ class DispatchEvidence:
     rate_adjusted: bool | None = None
     plug_value: str | None = None
     ev_status_value: str | None = None
+    car_power_kw: float | None = None
+    grid_import_kw: float | None = None
+    forecast_house_kw: float | None = None
 
 
 _CONNECTED_PLUG_STATES = {"ev connected", "charging", "waiting for ev"}
@@ -80,10 +86,41 @@ def rate_dispatch(
     if status in _DRAWING_EV_STATES and _slot_is_active(slot, now):
         return DispatchRating.CONFIRMED
 
+    def usable(value: float | None) -> bool:
+        return value is not None and isfinite(value)
+
+    car = evidence.car_power_kw
+    grid = evidence.grid_import_kw
+    house = evidence.forecast_house_kw
+    residual = (
+        grid - house
+        if grid is not None and house is not None and usable(grid) and usable(house)
+        else None
+    )
+    active = _slot_is_active(slot, now)
+    if active and (
+        (usable(car) and car is not None and car >= 1.4)
+        or (residual is not None and residual >= 3.0)
+    ):
+        return DispatchRating.CONFIRMED
+
     plug = _normalise(evidence.plug_value)
     if plug in _CONNECTED_PLUG_STATES:
         return DispatchRating.CORROBORATED
     if plug == "ev disconnected":
+        return DispatchRating.CONTRADICTED
+    start, current = slot.start, now
+    if start.utcoffset() is None or current.utcoffset() is None:
+        start, current = start.replace(tzinfo=None), current.replace(tzinfo=None)
+    if (
+        active
+        and current - start >= timedelta(minutes=10)
+        and usable(car)
+        and car is not None
+        and 0 <= car < 1.4
+        and residual is not None
+        and residual < 3.0
+    ):
         return DispatchRating.CONTRADICTED
     return DispatchRating.UNCORROBORATED
 
