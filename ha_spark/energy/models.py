@@ -353,6 +353,13 @@ class ChargePlan:
     # Event-start SoC that would fund a skipped-for-funding export suffix.
     export_soc_needed_pct: float | None = None
     export_soc_needed_at: datetime | None = None
+    # The charge window's current ceiling, not the target cap, limited the
+    # battery energy available to fund the event (#208).
+    overnight_charge_capped: bool = False
+    # Expected SoC at the start of each slot from the charge-window end, if the
+    # plan is followed (slot model only). Lets a later reading show the plan
+    # was wrong (#208).
+    soc_path: tuple[tuple[datetime, float], ...] = ()
 
     @property
     def soc_now(self) -> float:

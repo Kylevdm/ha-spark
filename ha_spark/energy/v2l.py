@@ -1,22 +1,30 @@
 """V2L (Vehicle-to-Load) observe + tally + notify.
 
 ha-spark reads the car's V2L discharge-power sensor (W), integrates it into the
-energy delivered this session, values it against the configured tariff (less a
-round-trip efficiency), publishes sensor.ha_spark_v2l_*, and fires timely HA
+energy delivered this session, values it against the configured tariff (less
+conversion losses), publishes sensor.ha_spark_v2l_*, and fires timely HA
 notifications. V2L is a manual physical adapter with no control API: this is
 read/observe + notify only. The planner and chargers are untouched.
+
+It also asks the owner for a V2L top-up when an Axle export event is
+underfunded and the charge window can't fix it (#208): the overnight charge
+was capped by the current ceiling, or on the event day the SoC is well below
+what the overnight plan expected. The request is a notification only.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
-from dataclasses import asdict, dataclass
-from datetime import datetime, time
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
 from ha_spark.config import Settings
+from ha_spark.energy.forecast import load_timezone
+from ha_spark.energy.models import ChargePlan, FlexibilityEvent
 from ha_spark.energy.sources import _to_float, parse_time
 from ha_spark.ha.rest import HomeAssistantRest, notify
 from ha_spark.logging import get_logger
@@ -29,6 +37,7 @@ _IDLE_W = 50.0  # power below this = V2L idle/stopped
 _DT_CLAMP_S = 300.0  # integration gap ceiling (restart-safe)
 _PLUG_IN_LEAD_MIN = 20.0  # N3 predictive lead time
 _CUTOFF_WINDOW_MIN = 120.0  # N1 fires only within this many minutes after cutoff
+_RESEND_GROWTH_KWH = 0.5  # a top-up request repeats once the shortfall grows this much
 
 Entity = tuple[str, str, dict[str, Any]]
 
@@ -90,14 +99,27 @@ def apply_sample(session: V2LSession, power_w: float, now: datetime) -> V2LSessi
     return session
 
 
-def savings(kwh: float, peak: float, offpeak: float, eff: float) -> tuple[float, float, float]:
+def delivered_fraction(settings: Settings) -> float:
+    """Share of the car's AC output that reaches the house.
+
+    V2L runs through the rectifier into the house battery's DC side, so it
+    loses the rectifier and the battery's discharge leg (taken as the square
+    root of the round trip). It skips the inverter's charge leg.
+    """
+    return settings.v2l_rectifier_efficiency * math.sqrt(max(0.0, settings.charge_efficiency))
+
+
+def savings(
+    kwh: float, peak: float, offpeak: float, eff: float, delivered: float = 1.0
+) -> tuple[float, float, float]:
     """Return ``(avoided, refill_cost, net)`` GBP for ``kwh`` delivered via V2L.
 
-    The V2L sensor reads AC out of the car, so ``kwh`` offsets peak import
-    directly. The losses bite on the refill: putting ``kwh`` back into the car
-    draws ``kwh / eff`` from the grid at the cheap rate. ``net`` may be negative.
+    The V2L sensor reads AC out of the car; only ``kwh * delivered`` of it
+    reaches the house and offsets peak import (see ``delivered_fraction``).
+    Putting ``kwh`` back into the car draws ``kwh / eff`` from the grid at the
+    cheap rate. ``net`` may be negative.
     """
-    avoided = kwh * peak
+    avoided = kwh * delivered * peak
     refill = (kwh / eff) * offpeak if eff > 0 else 0.0
     return avoided, refill, avoided - refill
 
@@ -140,6 +162,7 @@ def notifications(session: V2LSession, now: datetime, settings: Settings) -> lis
         settings.v2l_peak_rate_gbp,
         settings.v2l_offpeak_rate_gbp,
         settings.v2l_round_trip_efficiency,
+        delivered_fraction(settings),
     )
 
     # N1 - unplug at cutoff: still discharging within the post-cutoff window.
@@ -195,6 +218,7 @@ def payload(session: V2LSession, settings: Settings) -> list[Entity]:
         settings.v2l_peak_rate_gbp,
         settings.v2l_offpeak_rate_gbp,
         settings.v2l_round_trip_efficiency,
+        delivered_fraction(settings),
     )
     return [
         (
@@ -261,6 +285,221 @@ def save_session(settings: Settings, session: V2LSession) -> None:
     except OSError:
         log.warning("Caching V2L session failed", exc_info=True)
         tmp_path.unlink(missing_ok=True)
+
+
+# --- V2L top-up request for an underfunded Axle event (#208) ---
+
+
+@dataclass
+class TopUpRecord:
+    """Per-event state for the top-up request, persisted across restarts.
+
+    ``path`` is the expected SoC path of the last plan computed inside the
+    charge window, as ``(iso, pct)`` pairs, and ``capped`` that plan's verdict
+    on the charge-window ceiling. ``last_sent_kwh`` is the shortfall the last
+    request reported.
+    """
+
+    event_id: str
+    path: list[tuple[str, float]] = field(default_factory=list)
+    capped: bool = False
+    last_sent_kwh: float | None = None
+
+
+@dataclass(frozen=True)
+class TopUp:
+    """One V2L top-up request: how much, how soon, and why."""
+
+    shortfall_kwh: float  # battery energy missing at ``needed_at``
+    car_kwh: float  # car AC energy to draw, within the V2L budget
+    needed_at: datetime
+    start_by: datetime
+    budget_capped: bool
+    reason: str
+
+
+def event_id(event: FlexibilityEvent) -> str:
+    """The ``direction|start|end`` identity the export store and notices use."""
+    return (
+        f"{event.direction}|{event.start.astimezone(UTC).isoformat()}|"
+        f"{event.end.astimezone(UTC).isoformat()}"
+    )
+
+
+def _soc_at(path: list[tuple[datetime, float]], when: datetime) -> float | None:
+    """Expected SoC at ``when``, interpolated within a slot; None off the path."""
+    for (start, soc), (next_start, next_soc) in zip(path, path[1:], strict=False):
+        if start <= when < next_start:
+            frac = (when - start) / (next_start - start)
+            return soc + (next_soc - soc) * frac
+    if path and path[-1][0] <= when < path[-1][0] + timedelta(minutes=30):
+        return path[-1][1]
+    return None
+
+
+def topup_request(
+    plan: ChargePlan,
+    event: FlexibilityEvent,
+    record: TopUpRecord,
+    now: datetime,
+    settings: Settings,
+) -> TopUp | None:
+    """The V2L top-up to request for ``event``, or None when none is due.
+
+    Only when a paid slot stays unfunded after the post-event-reserve trade,
+    V2L energy costs less than the event pays, and the charge window can't fix
+    it: it was capped by the current ceiling, or (on the event day) live SoC is
+    more than ``v2l_soc_tolerance_pct`` below the overnight plan's path.
+    """
+    needed_pct, needed_at = plan.export_soc_needed_pct, plan.export_soc_needed_at
+    if needed_pct is None or needed_at is None or not plan.soc.ok:
+        return None
+    delivered = delivered_fraction(settings)
+    car_eff = settings.v2l_round_trip_efficiency
+    if car_eff <= 0 or event.rate_gbp_kwh <= settings.v2l_offpeak_rate_gbp / (car_eff * delivered):
+        return None
+
+    maxed = "overnight charge maxed"
+    offset = 0.0
+    if _soc_at(list(plan.soc_path), needed_at) is not None:
+        # Until the event day's window closes, this plan's own path covers it.
+        if not plan.overnight_charge_capped:
+            return None
+        path, reason = list(plan.soc_path), maxed
+    else:
+        # Afterwards, the overnight plan's path, shifted by how far live SoC
+        # has strayed from it.
+        path = [(datetime.fromisoformat(ts), pct) for ts, pct in record.path]
+        expected_now = _soc_at(path, now)
+        if expected_now is None:
+            return None
+        offset = plan.soc_now - expected_now
+        if record.capped:
+            reason = maxed
+        elif offset < -settings.v2l_soc_tolerance_pct:
+            reason = f"SoC {plan.soc_now:.0f}% is {-offset:.0f} points below plan"
+        else:
+            return None
+    expected = _soc_at(path, needed_at)
+    if expected is None:
+        return None
+
+    shortfall_kwh = (min(needed_pct, 100.0) - (expected + offset)) / 100.0 * plan.capacity_kwh
+    if shortfall_kwh <= 1e-9:
+        return None
+    car_kwh = shortfall_kwh / delivered
+    budget_capped = 0 < settings.v2l_budget_kwh < car_kwh
+    if budget_capped:
+        car_kwh = settings.v2l_budget_kwh
+    hours = car_kwh * settings.v2l_rectifier_efficiency / settings.v2l_charge_kw
+    return TopUp(
+        shortfall_kwh=shortfall_kwh,
+        car_kwh=car_kwh,
+        needed_at=needed_at,
+        start_by=needed_at - timedelta(hours=hours),
+        budget_capped=budget_capped,
+        reason=reason,
+    )
+
+
+def topup_notice(topup: TopUp, event: FlexibilityEvent, now: datetime) -> Notice:
+    """The owner-facing request: shortfall, how much from the car, start time."""
+    tz = now.tzinfo
+    start, end = event.start.astimezone(tz), event.end.astimezone(tz)
+    when = (
+        "now"
+        if topup.start_by <= now
+        else f"by {topup.start_by.astimezone(tz):%H:%M}"
+    )
+    message = (
+        f"Axle export {start:%H:%M}-{end:%H:%M} is short by {topup.shortfall_kwh:.1f} kWh "
+        f"({topup.reason}). Start V2L {when} to draw about {topup.car_kwh:.1f} kWh "
+        f"from the car before {topup.needed_at.astimezone(tz):%H:%M}."
+    )
+    if topup.budget_capped:
+        message += " That is your whole V2L budget, so the event stays partly short."
+    message += " Without it, ha-spark skips the unfunded slots."
+    return Notice("topup", "Start V2L for the Axle event", message)
+
+
+def _in_charge_window(plan: ChargePlan, now: datetime) -> bool:
+    """Whether ``now`` is inside the window this plan's path starts after."""
+    if not plan.soc_path:
+        return False
+    window_end = plan.soc_path[0][0]
+    return window_end - timedelta(hours=plan.window_hours) <= now < window_end
+
+
+def _topup_path(settings: Settings) -> Path:
+    return Path(settings.db_path).parent / "ha_spark_v2l_topup.json"
+
+
+def load_topup(settings: Settings, event: str) -> TopUpRecord:
+    """The persisted record for ``event``, or a fresh one (other event, absent, corrupt)."""
+    try:
+        data = json.loads(_topup_path(settings).read_text(encoding="utf-8"))
+        record = TopUpRecord(
+            event_id=str(data["event_id"]),
+            path=[(str(ts), float(pct)) for ts, pct in data["path"]],
+            capped=bool(data["capped"]),
+            last_sent_kwh=(
+                None if data["last_sent_kwh"] is None else float(data["last_sent_kwh"])
+            ),
+        )
+        for ts, _ in record.path:
+            datetime.fromisoformat(ts)
+    except FileNotFoundError:
+        return TopUpRecord(event_id=event)
+    except (OSError, ValueError, TypeError, KeyError):
+        log.warning("Reading V2L top-up state failed; starting fresh", exc_info=True)
+        return TopUpRecord(event_id=event)
+    return record if record.event_id == event else TopUpRecord(event_id=event)
+
+
+def save_topup(settings: Settings, record: TopUpRecord) -> None:
+    """Persist the record (best-effort, atomic via tmp-file + rename)."""
+    path = _topup_path(settings)
+    tmp_path = path.with_suffix(".json.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.write_text(json.dumps(asdict(record)), encoding="utf-8")
+        os.replace(tmp_path, path)
+    except OSError:
+        log.warning("Caching V2L top-up state failed", exc_info=True)
+        tmp_path.unlink(missing_ok=True)
+
+
+async def run_v2l_topup(
+    settings: Settings,
+    rest: HomeAssistantRest,
+    plan: ChargePlan,
+    event: FlexibilityEvent | None,
+    now: datetime,
+) -> None:
+    """Record the overnight path, then request a V2L top-up if one is due.
+
+    Sends again only once the shortfall has grown by ``_RESEND_GROWTH_KWH``.
+    Best-effort: a failed send retries next plan and never raises.
+    """
+    service = notification_service(settings)
+    if event is None or event.direction != "export" or not service:
+        return
+    record = load_topup(settings, event_id(event))
+    if _in_charge_window(plan, now):
+        record.path = [(ts.isoformat(), pct) for ts, pct in plan.soc_path]
+        record.capped = plan.overnight_charge_capped
+    topup = topup_request(plan, event, record, now, settings)
+    if topup is not None and (
+        record.last_sent_kwh is None
+        or topup.shortfall_kwh >= record.last_sent_kwh + _RESEND_GROWTH_KWH
+    ):
+        notice = topup_notice(topup, event, now.astimezone(load_timezone(settings.timezone)))
+        try:
+            await notify(rest, service, notice.title, notice.message)
+            record.last_sent_kwh = topup.shortfall_kwh
+        except Exception:  # noqa: BLE001 - a failed send retries next plan
+            log.warning("V2L top-up notify failed", exc_info=True)
+    save_topup(settings, record)
 
 
 async def run_v2l_tick(settings: Settings, now: datetime) -> None:

@@ -8,8 +8,12 @@ v1 model (daily energy balance, used when no per-slot forecast is available):
     usable_now      = capacity * (soc_now - min_soc) / 100
     usable_at_window= usable_now - pre_window_drain   (load before the window opens)
     buffered        = deficit * (1 + buffer_pct / 100)
-    required        = clamp(buffered - usable_at_window, 0, headroom_to_cap)
+    required        = clamp(buffered - usable_at_window, 0,
+                            min(headroom_to_cap, window_charge_limit))
     purchase        = required / charge_efficiency   (AC kWh bought)
+
+``window_charge_limit`` is what the charge window can add at ``max_current_a``
+(only the rest of the window once it has started).
 
 ``compute_plan`` turns ``required``/``purchase`` into a ``target_soc`` and emits
 a ``ChargeIntent``; per-inverter charge mechanics (e.g. amps sizing for Solis)
@@ -130,6 +134,19 @@ def _slot_reservation(
         reason=reason,
         target_time=target_time,
     )
+
+
+def _window_charge_limit(inputs: PlannerInputs, cfg: PlannerConfig) -> float:
+    """Battery kWh the charge window can add at ``max_current_a`` (#208).
+
+    Once the window has started only the rest of it counts.
+    """
+    hours = cfg.window_hours
+    if inputs.now is not None and inputs.horizon_start is not None:
+        elapsed = (inputs.now - inputs.horizon_start).total_seconds() / 3600.0
+        if 0.0 <= elapsed < hours:
+            hours -= elapsed
+    return max(0.0, cfg.max_current_a * cfg.voltage_v * hours / 1000.0)
 
 
 def _overlaps(
@@ -439,6 +456,7 @@ def _event_export_plan(
     cfg: PlannerConfig,
     schedule: TariffSchedule,
     net: list[float],
+    charge_limit: float,
 ) -> tuple[
     ExportIntent | None,
     tuple[Reservation, ...],
@@ -446,6 +464,7 @@ def _event_export_plan(
     str | None,
     float | None,
     datetime | None,
+    bool,
 ]:
     """Reserve and select one contiguous, fully fundable Axle export suffix.
 
@@ -454,11 +473,13 @@ def _event_export_plan(
     suffix maps directly to an inverter's single timed-discharge window.
 
     The post-event reservation funds a slot only when buying the shortfall back
-    costs less than the event pays (#207); the last value then says so.
+    costs less than the event pays (#207); the funding value then says so.
+    The last value says whether ``charge_limit`` (what the charge window can
+    add), not the target cap, limited the energy for the event (#208).
     """
     event = inputs.flexibility_event
     if event is None or event.direction != "export" or inputs.horizon_start is None:
-        return None, (), (), None, None, None
+        return None, (), (), None, None, None, False
     if (
         inputs.now is not None
         and inputs.load_slots is not None
@@ -467,7 +488,7 @@ def _event_export_plan(
         export, skips, funding, needed_pct, needed_at = _same_day_export_plan(
             inputs, cfg, schedule, event, inputs.horizon_start, inputs.now, inputs.load_slots
         )
-        return export, (), skips, funding, needed_pct, needed_at
+        return export, (), skips, funding, needed_pct, needed_at, False
 
     event_slots: list[int] = []
     for i in range(len(net)):
@@ -481,7 +502,7 @@ def _event_export_plan(
                 event.start,
                 "Skipped paid event: it contains no complete slot in the planning horizon.",
             ),
-        ), None, None, None
+        ), None, None, None, False
 
     # If any event slot overlaps the physical timed-charge window, export
     # outranks discretionary charging. Only energy already in the battery may
@@ -489,10 +510,24 @@ def _event_export_plan(
     n_charge_slots = int(schedule.window_hours * 2)
     charge_window_conflict = any(i < n_charge_slots for i in event_slots)
     usable_capacity = max(0.0, cfg.capacity_kwh * (cfg.target_cap - cfg.min_soc) / 100.0)
+    charge_capped = False
     if charge_window_conflict:
         usable_capacity = max(
             0.0, cfg.capacity_kwh * (inputs.soc_now - cfg.min_soc) / 100.0
         )
+    else:
+        # The window can't always fill to the cap: 62.5 A for six hours adds
+        # less than a deep battery's headroom.
+        reachable = (
+            max(
+                0.0,
+                cfg.capacity_kwh * (inputs.soc_now - cfg.min_soc) / 100.0
+                - inputs.pre_window_drain_kwh,
+            )
+            + charge_limit
+        )
+        charge_capped = reachable < usable_capacity - 1e-9
+        usable_capacity = min(usable_capacity, reachable)
 
     # The named post-event reservation is computed first and spent to deliver
     # an event only when buying it back pays (#207).  Like the existing
@@ -559,7 +594,7 @@ def _event_export_plan(
         slots, selected, skips, house_energy_by_start, buffered_post_energy, cfg
     )
     if not selected:
-        return None, (), skips, None, needed_pct, needed_at
+        return None, (), skips, None, needed_pct, needed_at, charge_capped
 
     post_energy -= spent
     target_time = inputs.horizon_start + timedelta(minutes=30 * target_slot)
@@ -599,7 +634,49 @@ def _event_export_plan(
         target_time=export.window_end,
     )
     funding = reserve.funding(spent) if spent > 1e-9 else None
-    return export, (event_reservation, post), skips, funding, needed_pct, needed_at
+    return (
+        export,
+        (event_reservation, post),
+        skips,
+        funding,
+        needed_pct,
+        needed_at,
+        charge_capped,
+    )
+
+
+def _soc_path(
+    horizon_start: datetime,
+    net: list[float],
+    schedule: TariffSchedule,
+    export: ExportIntent | None,
+    target_soc: float,
+    cfg: PlannerConfig,
+) -> tuple[tuple[datetime, float], ...]:
+    """Expected SoC at each slot start from the window end, if the plan holds.
+
+    Starts at ``target_soc`` when the window closes, then drains each slot's
+    uncovered house load, or all of it plus the export in a selected export
+    slot. Never below ``min_soc``.
+    """
+    exported = (
+        {start: power * 0.5 for start, power in
+         zip(export.selected_slots, export.slot_export_kw, strict=True)}
+        if export is not None
+        else {}
+    )
+    path: list[tuple[datetime, float]] = []
+    soc = target_soc
+    for i in range(int(schedule.window_hours * 2), len(net)):
+        start = horizon_start + timedelta(minutes=30 * i)
+        path.append((start, soc))
+        drain = (
+            net[i] + exported[start]
+            if start in exported
+            else (1.0 - schedule.cheap_fracs[i]) * net[i]
+        )
+        soc = max(cfg.min_soc, soc - drain / cfg.capacity_kwh * 100.0)
+    return tuple(path)
 
 
 def compute_plan(
@@ -632,6 +709,8 @@ def compute_plan(
     export_funding: str | None = None
     export_soc_needed_pct: float | None = None
     export_soc_needed_at: datetime | None = None
+    overnight_charge_capped = False
+    charge_limit = _window_charge_limit(inputs, cfg)
     if inputs.load_slots is not None:
         # --- v2 per-slot horizon: cost against the schedule's per-slot prices ---
         model = "slots"
@@ -664,7 +743,8 @@ def compute_plan(
             export_funding,
             export_soc_needed_pct,
             export_soc_needed_at,
-        ) = _event_export_plan(inputs, cfg, schedule, net)
+            overnight_charge_capped,
+        ) = _event_export_plan(inputs, cfg, schedule, net, charge_limit)
         reservations = event_reservations or (_slot_reservation(inputs, cfg, schedule, net),)
     else:
         # --- v1 daily balance ---
@@ -716,7 +796,7 @@ def compute_plan(
     elif cfg.strategy == "fill":
         # Fill to the cap regardless of need: optimal once export pays more
         # than off-peak; surplus carries over to later days (not costed here).
-        required = headroom
+        required = min(headroom, charge_limit)
     else:
         # The reservation only reaches the next cheap slot, which assumes that
         # slot can refill the battery. A short daytime dispatch cannot, so it
@@ -726,7 +806,7 @@ def compute_plan(
         required = _clamp(
             obligation - usable_at_window,
             0.0,
-            headroom,
+            min(headroom, charge_limit),
         )
     uncovered = max(0.0, buffered_deficit - usable_at_window - required)
     # The grid supplies required/efficiency AC kWh to store `required` kWh
@@ -764,6 +844,15 @@ def compute_plan(
     target_soc = inputs.soc_now
     if cfg.capacity_kwh > 0:
         target_soc = min(cfg.target_cap, inputs.soc_now + required / cfg.capacity_kwh * 100.0)
+
+    soc_path: tuple[tuple[datetime, float], ...] = ()
+    if (
+        inputs.load_slots is not None
+        and inputs.horizon_start is not None
+        and cfg.capacity_kwh > 0
+        and not export_overlaps_charge
+    ):
+        soc_path = _soc_path(inputs.horizon_start, net, schedule, export, target_soc, cfg)
 
     holds = controlled
     intent = ChargeIntent(
@@ -819,4 +908,6 @@ def compute_plan(
         export_funding=export_funding,
         export_soc_needed_pct=export_soc_needed_pct,
         export_soc_needed_at=export_soc_needed_at,
+        overnight_charge_capped=overnight_charge_capped,
+        soc_path=soc_path,
     )
