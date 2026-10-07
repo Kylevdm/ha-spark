@@ -3917,7 +3917,9 @@ def _patch_recovery_loop(
     )
     measurements = iter([_passing_at(m) for m in minutes])
 
-    async def fake_observe(_s: Settings, _rest: HomeAssistantRest) -> SocMeasurement:
+    async def fake_observe(
+        _s: Settings, _rest: HomeAssistantRest, *, monitor: SocMonitor | None = None
+    ) -> SocMeasurement:
         return next(measurements)
 
     runs: list[dict[str, object]] = []
@@ -4070,7 +4072,9 @@ async def test_loop_failure_during_recovery_restarts_the_stability_wait(
     stale = replace(_passing_at(1), status=SocStatus.STALE)
     measurements = iter([_passing_at(0), stale, _passing_at(2)])
 
-    async def fake_observe(_s: Settings, _rest: HomeAssistantRest) -> SocMeasurement:
+    async def fake_observe(
+        _s: Settings, _rest: HomeAssistantRest, *, monitor: SocMonitor | None = None
+    ) -> SocMeasurement:
         return next(measurements)
 
     monkeypatch.setattr(scheduler, "observe_soc", fake_observe)
