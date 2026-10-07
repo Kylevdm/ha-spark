@@ -3869,3 +3869,215 @@ async def test_run_forever_syncs_the_inverter_clock_at_a_clock_change_when_opted
         await run_forever(s, poll_seconds=0)
 
     assert len(runs) == expected
+
+
+# --- recovery from an active Solis fallback (#117) ---
+
+_REC_T0 = datetime(2026, 6, 10, 1, 0, tzinfo=UTC)
+
+
+def _passing_at(minute: int) -> SocMeasurement:
+    """A passing measurement observed and reported ``minute`` min after 01:00."""
+    at = _REC_T0 + timedelta(minutes=minute)
+    return SocMeasurement(
+        status=SocStatus.OK,
+        observed_at=at,
+        value=40.0 + minute,
+        raw_state=str(40.0 + minute),
+        reported_at=at,
+        age_s=0.0,
+        max_age_s=600.0,
+    )
+
+
+class _RecoveryFallbackDevice(SolisDevice):
+    async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+        return ["[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"]
+
+    async def reconcile_holds(self, *_args: object, **_kwargs: object) -> list[str]:
+        return []
+
+    async def write_safe_state(self) -> list[str]:
+        return []
+
+
+def _patch_recovery_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    minutes: list[int],
+    apply_results: list[list[str] | Exception],
+) -> tuple[type[Exception], list[dict[str, object]], Settings]:
+    """A loop resumed in persisted verified fallback, one passing SoC per tick.
+
+    ``apply_results`` is consumed only by runs that apply (fallback not held).
+    """
+    (tmp_path / "ha_spark_soc_monitor.json").write_text(
+        json.dumps({"consecutive_failures": 3, "fallback_status": "fallback_verified"}),
+        encoding="utf-8",
+    )
+    measurements = iter([_passing_at(m) for m in minutes])
+
+    async def fake_observe(_s: Settings, _rest: HomeAssistantRest) -> SocMeasurement:
+        return next(measurements)
+
+    runs: list[dict[str, object]] = []
+    results = iter(apply_results)
+
+    async def fake_run_once(
+        _s: Settings,
+        *,
+        soc: SocMeasurement | None = None,
+        previous_plan: ChargePlan | None = None,
+        trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
+        ev_hold_state: scheduler.EvHoldState | None = None,
+        fallback_active: bool = False,
+    ) -> scheduler.RunResult:
+        runs.append({"soc": soc, "previous": previous_plan, "held": fallback_active})
+        plan = _plan(replace(_INTENT, soc=soc or _INTENT.soc))
+        if fallback_active:
+            return scheduler.RunResult(plan, None)
+        result = next(results)
+        if isinstance(result, Exception):
+            raise result
+        failed = any(line.startswith(("[FAILED]", "[BLOCKED]")) for line in result)
+        return scheduler.RunResult(plan, None if failed else plan, tuple(result))
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "observe_soc", fake_observe)
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(_RecoveryFallbackDevice, settings, rest),
+    )
+    stop = _patch_loop(monkeypatch, [datetime(2026, 6, 10, 2, m) for m in minutes])
+    settings = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        db_path=str(tmp_path / "ledger.db"),
+        soc_entity="sensor.soc",
+        soc_recovery_minutes=2,
+        solis_fallback_current_a=42.0,
+        v2l_power_entity="",
+    )
+    return stop, runs, settings
+
+
+def _monitor_file(tmp_path: Path) -> object:
+    return json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text())
+
+
+@respx.mock
+async def test_loop_recovers_with_a_fresh_plan_only_after_stable_duration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop, runs, settings = _patch_recovery_loop(
+        tmp_path,
+        monkeypatch,
+        [0, 1, 2, 3],
+        [["[APPLIED] set timed charge current to 20 A over 3.5 h of the window"]],
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    # 02:00 is a slot run held by the fallback; 02:02 is the recovery run; 02:03
+    # is back to normal with no slot due.
+    assert [run["held"] for run in runs] == [True, False]
+    recovery = runs[1]
+    assert recovery["previous"] is None  # never compared against a rejected plan
+    soc = recovery["soc"]
+    assert isinstance(soc, SocMeasurement) and soc.observed_at == _passing_at(2).observed_at
+    states = [state for state, _ in _integrity_posts()]
+    assert states == ["fallback_verified"] * 3 + ["normal", "normal"]
+    _, attrs = _integrity_posts()[3]
+    assert attrs["recovery_action"] == (
+        "[RECOVERED] normal programming resumed: "
+        "[APPLIED] set timed charge current to 20 A over 3.5 h of the window"
+    )
+    assert attrs["consecutive_failures"] == 0
+    assert _integrity_posts()[2][1]["recovery_ready"] is True
+    assert _monitor_file(tmp_path) == {"consecutive_failures": 0, "fallback_status": "normal"}
+
+
+@respx.mock
+async def test_loop_keeps_fallback_until_the_recovered_apply_verifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[FAILED], a [WARNING] mismatch, and a raise all keep fallback and retry."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop, runs, settings = _patch_recovery_loop(
+        tmp_path,
+        monkeypatch,
+        [0, 1, 2, 3, 4, 5, 6],
+        [
+            ["[FAILED] set timed charge current to 20 A"],
+            ["[WARNING] set timed charge current to 20 A, but read back 18 A"],
+            RuntimeError("modbus timeout"),
+            ["[APPLIED] set timed charge current to 21 A over 3.4 h of the window"],
+        ],
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert [run["held"] for run in runs] == [True, False, False, False, False]
+    # Each retry is a fresh plan from that minute's own measurement.
+    socs = [run["soc"] for run in runs[1:]]
+    assert [s.observed_at for s in socs if isinstance(s, SocMeasurement)] == [
+        _passing_at(m).observed_at for m in (2, 3, 4, 5)
+    ]
+    posts = _integrity_posts()
+    states = [state for state, _ in posts]
+    # One post per tick, plus the transition post on the recovering tick (02:05).
+    assert states == ["fallback_verified"] * 6 + ["normal", "normal"]
+    # A failed recovered apply may have changed the program: never confirmed.
+    assert [attrs["fallback_confirmed"] for _, attrs in posts[2:6]] == [True, False, False, False]
+    assert _monitor_file(tmp_path) == {"consecutive_failures": 0, "fallback_status": "normal"}
+
+
+@respx.mock
+async def test_loop_completes_recovery_in_simulate_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulate claims nothing on hardware, so there is no fallback to retain."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop, runs, settings = _patch_recovery_loop(
+        tmp_path,
+        monkeypatch,
+        [0, 1, 2],
+        [["[SIMULATE] would set timed charge current to 20 A"]],
+    )
+    assert settings.proactive_mode == "simulate"
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert [run["held"] for run in runs] == [True, False]
+    assert _monitor_file(tmp_path) == {"consecutive_failures": 0, "fallback_status": "normal"}
+
+
+@respx.mock
+async def test_loop_failure_during_recovery_restarts_the_stability_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop, runs, settings = _patch_recovery_loop(tmp_path, monkeypatch, [0, 1, 2], [])
+    stale = replace(_passing_at(1), status=SocStatus.STALE)
+    measurements = iter([_passing_at(0), stale, _passing_at(2)])
+
+    async def fake_observe(_s: Settings, _rest: HomeAssistantRest) -> SocMeasurement:
+        return next(measurements)
+
+    monkeypatch.setattr(scheduler, "observe_soc", fake_observe)
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert [run["held"] for run in runs] == [True]
+    assert all(state == "fallback_verified" for state, _ in _integrity_posts())
+    assert _integrity_posts()[-1][1]["recovery_ready"] is False

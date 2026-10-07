@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Solis fallback recovery (#117): an active fallback ends after
+  `soc_recovery_minutes` (default 10) of continuously passing SoC observations
+  whose `last_reported` never goes backwards and advances at least once. Any
+  failed observation restarts the wait; SoC movement is allowed. Each minute
+  after that, ha-spark computes a fresh plan from the current SoC and the
+  remaining cheap-rate window and applies it. The fallback stays the reported
+  state until the apply reads back clean; a `[FAILED]`, `[BLOCKED]` or
+  `[WARNING]` result keeps it, marks it unconfirmed so charge-rate increases
+  stay blocked, and retries next minute. The transition is logged as
+  `[RECOVERED]` and published on `sensor.ha_spark_soc_integrity`
+  (`recovery_since`, `recovery_ready`, `recovery_action`). Recovery progress is
+  not persisted, so a restart starts the wait over.
 - Verified Solis SoC fallback (#115): after `soc_failure_threshold` consecutive
   failed observations, the optional `solis_fallback_current_a` programs only the
   configured cheap-rate window through the normal gated, transition-safe Solis
