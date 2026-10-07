@@ -142,3 +142,61 @@ def test_only_contradicted_dispatches_are_dropped() -> None:
     evidence = DispatchEvidence(plug_value="EV Disconnected", ev_status_value="Charging")
 
     assert partition_dispatches(slots, evidence, NOW)[0] == (active,)
+
+
+@pytest.mark.parametrize(
+    ("car", "grid", "house", "rating"),
+    [
+        (1.4, None, None, DispatchRating.CONFIRMED),
+        (None, 4.0, 1.0, DispatchRating.CONFIRMED),
+        (0.0, 3.999, 1.0, DispatchRating.CONTRADICTED),
+        (0.0, None, 1.0, DispatchRating.UNCORROBORATED),
+        (None, 0.0, 1.0, DispatchRating.UNCORROBORATED),
+        (float("nan"), 0.0, 1.0, DispatchRating.UNCORROBORATED),
+        (-1.0, 0.0, 1.0, DispatchRating.UNCORROBORATED),
+        (0.0, float("inf"), 1.0, DispatchRating.UNCORROBORATED),
+    ],
+)
+def test_measured_power_confirms_or_conservatively_releases(
+    car: float | None,
+    grid: float | None,
+    house: float | None,
+    rating: DispatchRating,
+) -> None:
+    evidence = DispatchEvidence(car_power_kw=car, grid_import_kw=grid, forecast_house_kw=house)
+    assert rate_dispatch(SLOT, evidence, NOW) is rating
+
+
+@pytest.mark.parametrize("minutes", [0, 9, 10])
+def test_no_draw_release_waits_ten_minutes(minutes: int) -> None:
+    evidence = DispatchEvidence(car_power_kw=0, grid_import_kw=1, forecast_house_kw=1)
+    now = SLOT.start + timedelta(minutes=minutes)
+    expected = DispatchRating.CONTRADICTED if minutes == 10 else DispatchRating.UNCORROBORATED
+    assert rate_dispatch(SLOT, evidence, now) is expected
+
+
+@pytest.mark.parametrize(
+    "stronger",
+    [
+        {"live_dispatch": True},
+        {"rate_adjusted": True},
+        {"ev_status_value": "Charging"},
+        {"plug_value": "EV Connected"},
+    ],
+)
+def test_no_draw_never_overrides_stronger_evidence(stronger: dict[str, object]) -> None:
+    evidence = DispatchEvidence(car_power_kw=0, grid_import_kw=0, forecast_house_kw=1)
+    from dataclasses import replace
+
+    evidence = replace(evidence, **stronger)
+    assert rate_dispatch(SLOT, evidence, NOW) in (
+        DispatchRating.CONFIRMED,
+        DispatchRating.CORROBORATED,
+    )
+
+
+def test_power_never_rates_a_future_dispatch() -> None:
+    future = DispatchSlot(NOW + timedelta(hours=1), NOW + timedelta(hours=2))
+    assert rate_dispatch(future, DispatchEvidence(car_power_kw=7), NOW) is (
+        DispatchRating.UNCORROBORATED
+    )

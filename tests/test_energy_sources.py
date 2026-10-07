@@ -1351,3 +1351,45 @@ async def test_an_evening_axle_event_is_planned_on_its_own_day(
     export = plan.charge_intent.export
     assert export is not None, [skip.reason for skip in plan.export_skips]
     assert (export.window_start, export.window_end) == (event.start, event.end)
+
+
+@pytest.mark.parametrize(
+    ("value", "unit", "expected"),
+    [
+        ("-4000", "W", 4.0),
+        ("-4", "kW", 4.0),
+        ("nan", "W", None),
+        ("inf", "W", None),
+        ("bad", "W", None),
+        ("4000", "VA", None),
+        ("unavailable", "W", None),
+    ],
+)
+@respx.mock
+async def test_dispatch_grid_evidence_sign_units_and_invalid_values(
+    value: str,
+    unit: str,
+    expected: float | None,
+) -> None:
+    settings = _settings().model_copy(
+        update={
+            "ev_status_entity": "",
+            "ev_plug_entity": "",
+            "octopus_rate_entity": "",
+            "ev_power_entity": "sensor.car",
+            "dispatch_grid_power_entity": "sensor.grid",
+            "dispatch_grid_power_invert": True,
+        }
+    )
+    respx.get(f"{BASE}/states/sensor.grid").mock(
+        return_value=_state("sensor.grid", value, {"unit_of_measurement": unit})
+    )
+    respx.get(f"{BASE}/states/sensor.car").mock(
+        return_value=_state("sensor.car", "1400", {"unit_of_measurement": "W"})
+    )
+    slot = DispatchSlot(datetime(2026, 10, 3, 14), datetime(2026, 10, 3, 15))
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        reading = await sources.read_dispatch_evidence(settings, rest, (slot,))
+    assert reading.evidence.grid_import_kw == expected
+    assert reading.evidence.car_power_kw == 1.4
+    assert settings.grid_power_entity == ""
