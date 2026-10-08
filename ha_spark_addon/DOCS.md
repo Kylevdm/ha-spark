@@ -418,9 +418,13 @@ it recognises.
 ### HTTP API (for companion integrations)
 
 The daemon serves an HTTP API for the companion integration through add-on
-ingress. Home Assistant authenticates every request, and the port is not
-mapped to the host network. Inside the add-on's network it listens on
-`http://localhost:8099`. Endpoints:
+ingress, on port 8099. Home Assistant authenticates every request, and the
+port is not mapped to the host network. The add-on answers only connections
+from Home Assistant's ingress proxy (`172.30.32.2`); requests from any other
+address, including other add-ons on the Supervisor network, get `403`.
+Forwarding headers such as `X-Forwarded-For` are ignored. In standalone/dev
+mode (`ha_url` + `ha_token`) it listens on `http://127.0.0.1:8099` only.
+Endpoints:
 
 - `GET /api/health`: liveness, and when the latest plan was computed
 - `GET /api/plan`: the latest plan, as the same sensor payload the daemon

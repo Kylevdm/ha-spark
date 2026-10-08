@@ -59,6 +59,7 @@ from ha_spark.agent.auth import resolve_token
 from ha_spark.api.server import (
     AGENT_PORT,
     INGRESS_PORT,
+    INGRESS_PROXY_IP,
     OPTIONS_PATH,
     AppState,
     build_app,
@@ -870,7 +871,17 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     """
     warn_deprecated_notify_target(settings)
     state = AppState(settings=settings, options_path=OPTIONS_PATH)
-    server = make_server(build_app(state), "0.0.0.0", INGRESS_PORT)  # noqa: S104 - ingress only
+    # Add-on mode: listen on all interfaces (the ingress proxy connects over the
+    # hassio network) but answer only the proxy's address. Standalone/dev has no
+    # ingress proxy, so bind to loopback and let the OS keep the network out.
+    if settings.is_standalone:
+        server = make_server(build_app(state), "127.0.0.1", INGRESS_PORT)
+    else:
+        server = make_server(
+            build_app(state, ingress_peer=INGRESS_PROXY_IP),
+            "0.0.0.0",  # noqa: S104 - peer-restricted to the ingress proxy
+            INGRESS_PORT,
+        )
     serve_task: asyncio.Task[None] | None = None
     try:
         serve_task = await serve_in_background(server)
