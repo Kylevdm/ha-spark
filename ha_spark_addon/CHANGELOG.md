@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.22.0
+
+- Axle export events now use `export_event_provider: axle`, independently of
+  `tariff_provider` (#177). The default `none` disables Axle reads even with
+  a configured API key. Fixed, dynamic, and Octopus Intelligent tariffs keep
+  their import prices and dispatch holds while Axle adds event export prices.
+  Health reports the two providers separately.
+- **Upgrade order:** if using `tariff_provider: axle`, switch it to `fixed`
+  (or `octopus_intelligent`, with its required credentials) **before updating**.
+  Then update and set `export_event_provider: axle`. `axle` is no longer a
+  valid tariff value; leaving it in place makes the Supervisor refuse the
+  configuration after updating. Existing Axle source and rate options remain
+  unchanged.
+
 ## 0.21.1
 
 - Security: the ingress HTTP API (port 8099) now answers only Home

@@ -357,3 +357,18 @@ def test_addon_stop_timeout_lets_a_clean_shutdown_verify_its_safe_state() -> Non
     ]
     assert timeouts, "config.yaml sets no stop timeout; the Supervisor default is 10 s"
     assert timeouts[0] >= 2 * budget_s + 10
+
+
+def test_export_event_provider_is_independent_of_tariff() -> None:
+    from ha_spark.config import validate_axle_tariff
+
+    assert Settings().export_event_provider == "none"
+    validate_axle_tariff(Settings(axle_api_key="unused"))
+    with pytest.raises(ConfigError, match="axle_api_key or axle_event_entity"):
+        validate_axle_tariff(Settings(export_event_provider="axle"))
+    validate_axle_tariff(
+        Settings(tariff_provider="octopus_intelligent", export_event_provider="axle",
+                 axle_event_entity="sensor.axle")
+    )
+    with pytest.raises(ValidationError):
+        Settings(tariff_provider="axle")
