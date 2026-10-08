@@ -541,3 +541,27 @@ def test_pending_failure_still_resets_on_one_pass(tmp_path: Path) -> None:
     monitor.record(_measurement(ok=False), failure_threshold=3)
     snap = monitor.record(_pass_at(0), failure_threshold=3, recovery_duration=_RECOVERY)
     assert snap.state is SocOperatingState.NORMAL
+
+
+@respx.mock
+async def test_observe_soc_uses_power_evidence_and_tolerates_failed_power_read() -> None:
+    settings = _settings(Path('/tmp'), soc_entity='sensor.soc', battery_power_entity='sensor.power')
+    monitor = SocMonitor()
+    reported = datetime.now(UTC).isoformat()
+    soc_route = respx.get('http://ha.test/api/states/sensor.soc')
+    power_route = respx.get('http://ha.test/api/states/sensor.power')
+    soc_route.mock(return_value=httpx.Response(200, json={
+        'entity_id': 'sensor.soc', 'state': '57', 'last_reported': reported,
+    }))
+    power_route.mock(return_value=httpx.Response(200, json={
+        'entity_id': 'sensor.power', 'state': '-920',
+    }))
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        assert (await observe_soc(settings, rest, monitor=monitor)).ok
+        soc_route.mock(return_value=httpx.Response(200, json={
+            'entity_id': 'sensor.soc', 'state': '100', 'last_reported': reported,
+        }))
+        assert (await observe_soc(settings, rest, monitor=monitor)).status is SocStatus.IMPLAUSIBLE
+        power_route.mock(return_value=httpx.Response(500))
+        assert (await observe_soc(settings, rest, monitor=monitor)).ok
+    assert power_route.call_count == 3

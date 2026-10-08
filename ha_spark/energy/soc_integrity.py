@@ -39,12 +39,14 @@ _MAX_SOC_PCT = 100.0
 # How long an unchanged SoC is believed even while its source is live: bounds
 # a stuck SoC register on a live integration. Covers a full summer day at 100%.
 MAX_UNCHANGED = timedelta(hours=12)
+ENERGY_TOLERANCE_PCT = 2.0
 
 
 class SocStatus(StrEnum):
     """Why a checked SoC measurement passed or failed."""
 
     OK = "ok"
+    IMPLAUSIBLE = "implausible"
     READ_FAILED = "read_failed"
     UNAVAILABLE = "unavailable"
     MALFORMED = "malformed"
@@ -75,6 +77,8 @@ class SocMeasurement:
     max_age_s: float | None = None  # the threshold this measurement was judged against
     source_age_s: float | None = None  # sibling report age, when it proved the source live
 
+    energy_reason: str | None = None
+
     @property
     def ok(self) -> bool:
         """True only when every integrity check passed."""
@@ -97,6 +101,8 @@ class SocMeasurement:
             )
         if self.status is SocStatus.OK:
             return f"SoC {self.soc_now:.0f}% reported {self.age_s:.0f}s ago"
+        if self.status is SocStatus.IMPLAUSIBLE:
+            return self.energy_reason or "SoC disagrees with battery energy flow"
         if self.status is SocStatus.READ_FAILED:
             return "SoC read from Home Assistant failed"
         if self.status is SocStatus.UNAVAILABLE:
@@ -106,9 +112,7 @@ class SocMeasurement:
         if self.status is SocStatus.NOT_FINITE:
             return f"SoC state {self.raw_state!r} is not finite"
         if self.status is SocStatus.OUT_OF_RANGE:
-            return (
-                f"SoC {self.value}% outside {_MIN_SOC_PCT:.0f}-{_MAX_SOC_PCT:.0f}%"
-            )
+            return f"SoC {self.value}% outside {_MIN_SOC_PCT:.0f}-{_MAX_SOC_PCT:.0f}%"
         if self.status is SocStatus.REPORT_TIME_UNUSABLE:
             return "SoC last_reported is missing or unusable"
         if self.status is SocStatus.REPORT_TIME_FUTURE:
@@ -119,8 +123,7 @@ class SocMeasurement:
                 f"{MAX_UNCHANGED.total_seconds():.0f}s maximum"
             )
         return (
-            f"SoC last reported {self.age_s:.0f}s ago, over the "
-            f"{self.max_age_s:.0f}s maximum"
+            f"SoC last reported {self.age_s:.0f}s ago, over the {self.max_age_s:.0f}s maximum"
             if self.age_s is not None and self.max_age_s is not None
             else "SoC report is stale"
         )
@@ -132,6 +135,9 @@ def check_soc(
     observed_at: datetime,
     max_age: timedelta,
     source: EntityState | None = None,
+    baseline_soc: float | None = None,
+    energy_kwh: float | None = None,
+    battery_capacity_kwh: float = 0.0,
 ) -> SocMeasurement:
     """Check one SoC observation and record the verdict with its evidence.
 
@@ -182,6 +188,33 @@ def check_soc(
     fail = replace(fail, reported_at=reported_at, age_s=age_s)
     if age_s < 0:
         return replace(fail, status=SocStatus.REPORT_TIME_FUTURE)
+    if (
+        baseline_soc is not None
+        and energy_kwh is not None
+        and math.isfinite(energy_kwh)
+        and energy_kwh >= 0
+        and math.isfinite(battery_capacity_kwh)
+        and battery_capacity_kwh > 0
+    ):
+        delta = abs(value - baseline_soc)
+        explained = energy_kwh / battery_capacity_kwh * 100
+        if delta > explained + ENERGY_TOLERANCE_PCT:
+            return replace(
+                fail,
+                status=SocStatus.IMPLAUSIBLE,
+                energy_reason=(
+                    f"SoC jumped {baseline_soc:g}→{value:g}% with "
+                    f"{energy_kwh:.2f} kWh through the battery"
+                ),
+            )
+        if delta == 0 and explained > ENERGY_TOLERANCE_PCT:
+            return replace(
+                fail,
+                status=SocStatus.IMPLAUSIBLE,
+                energy_reason=(
+                    f"SoC stuck at {value:g}% with {energy_kwh:.2f} kWh through the battery"
+                ),
+            )
     if age_s <= max_age_s:
         return replace(fail, status=SocStatus.OK)
     source_age_s = _live_source_age_s(source, observed_at=observed_at, max_age_s=max_age_s)

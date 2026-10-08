@@ -221,6 +221,8 @@ _REQUIRED_ENTITY_FIELDS = (
 def check_entity_config(settings: Settings) -> CheckResult:
     """Flag required entity fields left blank (ships unconfigured by default)."""
     unset = [f for f in _REQUIRED_ENTITY_FIELDS if not getattr(settings, f)]
+    if not settings.battery_power_entity:
+        unset.append("battery_power_entity (glitch and stuck-SoC protection are off)")
     if not unset:
         return CheckResult("Entity config", Status.OK, "all required entities configured")
     return CheckResult(

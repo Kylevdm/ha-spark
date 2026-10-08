@@ -15,6 +15,7 @@ from __future__ import annotations
 SOLIS: dict[str, str] = {
     "soc_entity": "sensor.solisac_battery_soc",
     "battery_voltage_entity": "sensor.solisac_battery_voltage",
+    "battery_power_entity": "sensor.solisac_battery_power",
     "solar_tomorrow_entity": "sensor.solcast_pv_forecast_forecast_tomorrow",
     "octopus_rate_entity": (
         "sensor.octopus_energy_electricity_22l4386358_2200012282082_current_rate"

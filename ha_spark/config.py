@@ -111,6 +111,7 @@ _OPTION_KEYS = frozenset(
         "soc_failure_threshold",
         "soc_recovery_minutes",
         "battery_voltage_entity",
+        "battery_power_entity",
         "solar_tomorrow_entity",
         "octopus_rate_entity",
         "dispatch_entity",
@@ -460,6 +461,7 @@ class Settings(BaseSettings):
     # Observed at the one-minute cadence; any failure restarts the count.
     soc_recovery_minutes: int = Field(default=10, ge=1)
     battery_voltage_entity: str = Field(default="")
+    battery_power_entity: str = Field(default="")
     solar_tomorrow_entity: str = Field(default="")
     octopus_rate_entity: str = Field(default="")
     dispatch_entity: str = Field(default="")
