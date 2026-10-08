@@ -4081,3 +4081,38 @@ async def test_loop_failure_during_recovery_restarts_the_stability_wait(
     assert [run["held"] for run in runs] == [True]
     assert all(state == "fallback_verified" for state, _ in _integrity_posts())
     assert _integrity_posts()[-1][1]["recovery_ready"] is False
+
+
+@pytest.mark.parametrize(
+    ("settings_kw", "host", "peer"),
+    [
+        ({"supervisor_token": "x"}, "0.0.0.0", "172.30.32.2"),  # add-on: proxy-only
+        ({"ha_url": "http://ha.test", "ha_token": "t"}, "127.0.0.1", None),  # dev: loopback
+    ],
+)
+async def test_run_forever_restricts_the_ingress_listener(
+    monkeypatch: pytest.MonkeyPatch,
+    settings_kw: dict[str, str],
+    host: str,
+    peer: str | None,
+) -> None:
+    """Add-on mode answers only the ingress proxy; standalone binds loopback only."""
+    captured: dict[str, object] = {}
+
+    class _Bound(Exception):
+        pass
+
+    def capture_build_app(_state: object, **kwargs: object) -> object:
+        captured["peer"] = kwargs.get("ingress_peer")
+        return object()
+
+    def capture_make_server(_app: object, bind_host: str, port: int) -> object:
+        captured["host"], captured["port"] = bind_host, port
+        raise _Bound  # stop before the loop touches HA
+
+    monkeypatch.setattr(scheduler, "build_app", capture_build_app)
+    monkeypatch.setattr(scheduler, "make_server", capture_make_server)
+
+    with pytest.raises(_Bound):
+        await run_forever(Settings(**settings_kw), poll_seconds=0)  # type: ignore[arg-type]
+    assert captured == {"peer": peer, "host": host, "port": scheduler.INGRESS_PORT}
