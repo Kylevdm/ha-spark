@@ -66,6 +66,7 @@ _OPTION_KEYS = frozenset(
         "rate_peak_gbp_kwh",
         "rate_export_gbp_kwh",
         "tariff_provider",
+        "export_event_provider",
         "dynamic_rates_entity",
         "dynamic_rates_entity_tomorrow",
         "charge_efficiency",
@@ -282,8 +283,8 @@ class AxleTariffConfig(BaseModel):
 
 
 def validate_axle_tariff(settings: Settings) -> None:
-    """When ``tariff_provider`` is ``axle``, require one event source."""
-    if settings.tariff_provider != "axle":
+    """When ``export_event_provider`` is ``axle``, require one event source."""
+    if settings.export_event_provider != "axle":
         return
     try:
         AxleTariffConfig(
@@ -385,9 +386,10 @@ class Settings(BaseSettings):
     # Tariff provider: "fixed" costs against rate_offpeak/rate_peak + the charge
     # window above; "dynamic" costs each slot at its live price from an HA
     # half-hourly price sensor (falls back to fixed on a missing/bad read).
-    tariff_provider: Literal["fixed", "dynamic", "octopus_intelligent", "axle"] = Field(
+    tariff_provider: Literal["fixed", "dynamic", "octopus_intelligent"] = Field(
         default="fixed"
     )
+    export_event_provider: Literal["none", "axle"] = "none"
     dynamic_rates_entity: str = Field(default="")
     # Optional: a second entity for tomorrow's rates (many integrations publish
     # today/tomorrow as separate entities). Blank is fine — slots past today's

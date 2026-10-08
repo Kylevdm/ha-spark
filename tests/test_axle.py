@@ -140,7 +140,7 @@ def test_axle_tariff_provider_marks_only_event_slots_for_export() -> None:
 
 def test_axle_settings_expose_the_source_contract() -> None:
     settings = Settings(
-        tariff_provider="axle",
+        export_event_provider="axle",
         axle_api_key="secret-token",
         axle_event_rate_gbp_kwh=1.25,
     )
@@ -151,12 +151,12 @@ def test_axle_settings_expose_the_source_contract() -> None:
 
 def test_validate_axle_requires_direct_or_ha_source() -> None:
     with pytest.raises(ConfigError, match="axle_api_key or axle_event_entity"):
-        validate_axle_tariff(Settings(tariff_provider="axle"))
+        validate_axle_tariff(Settings(export_event_provider="axle"))
 
 
 def test_validate_axle_accepts_the_ha_mirror_without_api_credentials() -> None:
     validate_axle_tariff(
-        Settings(tariff_provider="axle", axle_event_entity="sensor.axle_event")
+        Settings(export_event_provider="axle", axle_event_entity="sensor.axle_event")
     )
 
 
@@ -197,7 +197,7 @@ async def test_axle_http_event_flows_through_build_schedule() -> None:
         return_value=httpx.Response(200, json=_payload())
     )
     settings = Settings(
-        tariff_provider="axle",
+        export_event_provider="axle",
         axle_api_url=AXLE,
         axle_api_key="secret-token",
         axle_event_rate_gbp_kwh=1.25,

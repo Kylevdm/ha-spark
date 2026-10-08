@@ -256,7 +256,7 @@ async def test_disconnected_ev_evidence_drops_dispatch_from_every_planner_use(
 
     settings = _settings().model_copy(
         update={
-            "tariff_provider": "axle",
+            "export_event_provider": "axle",
             "ev_plug_entity": "sensor.ev_plug",
             "octopus_rate_entity": "sensor.rate",
         }
@@ -542,7 +542,7 @@ async def test_gather_inputs_reads_axle_event_source(monkeypatch: pytest.MonkeyP
     s = Settings(
         ha_url="http://ha.test",
         ha_token="t",
-        tariff_provider="axle",
+        export_event_provider="axle",
         axle_api_url="http://axle.test",
         axle_api_key="secret-token",
     )
@@ -570,7 +570,7 @@ async def test_gather_inputs_degrades_on_malformed_axle_event(
     s = Settings(
         ha_url="http://ha.test",
         ha_token="t",
-        tariff_provider="axle",
+        export_event_provider="axle",
         axle_api_url="http://axle.test",
         axle_api_key="secret-token",
     )
@@ -1328,7 +1328,7 @@ async def test_an_evening_axle_event_is_planned_on_its_own_day(
     s = Settings(
         ha_url="http://ha.test",
         ha_token="t",
-        tariff_provider="axle",
+        export_event_provider="axle",
         axle_api_url="http://axle.test",
         axle_api_key="k",
         latitude=51.5,
@@ -1393,3 +1393,105 @@ async def test_dispatch_grid_evidence_sign_units_and_invalid_values(
     assert reading.evidence.grid_import_kw == expected
     assert reading.evidence.car_power_kw == 1.4
     assert settings.grid_power_entity == ""
+
+
+@pytest.mark.parametrize("tariff", ["fixed", "dynamic", "octopus_intelligent"])
+@respx.mock
+async def test_axle_overlay_preserves_tariff_and_plans_export(
+    tariff: str, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    async def empty_statistics(*args: object, **kwargs: object) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr("ha_spark.energy.forecast.statistics_during_period", empty_statistics)
+    start = (datetime.now(UTC) + timedelta(days=1)).replace(
+        hour=12, minute=0, second=0, microsecond=0
+    )
+    dispatch_start = start + timedelta(hours=1)
+    event_start = start + timedelta(hours=2)
+    event_end = start + timedelta(hours=3)
+    rates = [{"start": start.isoformat(), "end": (start + timedelta(hours=4)).isoformat(),
+              "value_inc_vat": 0.22}]
+    respx.get(f"{BASE}/states/sensor.soc").mock(return_value=_state("sensor.soc", "90"))
+    respx.get(f"{BASE}/states/event.rates").mock(
+        return_value=_state("event.rates", "on", {"rates": rates})
+    )
+    respx.route(method="GET", url__startswith=BASE).mock(return_value=httpx.Response(404))
+    respx.get("http://axle.test/vpp/home-assistant/event").mock(
+        return_value=httpx.Response(200, json={
+            "start_time": event_start.isoformat(), "end_time": event_end.isoformat(),
+            "import_export": "export", "updated_at": datetime.now(UTC).isoformat(),
+        })
+    )
+    if tariff == "octopus_intelligent":
+        respx.post("http://octo.test/v1/graphql/").mock(side_effect=[
+            httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": "jwt-test"}}}),
+            httpx.Response(200, json={"data": {"plannedDispatches": [{
+                "startDt": dispatch_start.isoformat(),
+                "endDt": (dispatch_start + timedelta(minutes=30)).isoformat(),
+                "delta": -2.0, "meta": {"source": "smart-charge"},
+            }]}}),
+        ])
+        respx.get(url__startswith="http://octo.test/v1/products/").mock(
+            return_value=httpx.Response(200, json={"next": None, "results": [{
+                "valid_from": start.isoformat(),
+                "valid_to": (start + timedelta(hours=4)).isoformat(), "value_inc_vat": 0.22,
+            }]})
+        )
+    settings = _octopus_settings(
+        tariff_provider=tariff, export_event_provider="axle", dynamic_rates_entity="event.rates",
+        axle_api_url="http://axle.test", axle_api_key="test-key", axle_event_rate_gbp_kwh=1.25,
+        soc_entity="sensor.soc", rate_export_gbp_kwh=0.05, db_path=str(tmp_path / "test.db"),
+        load_model="median",
+    )
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        inputs, cfg, _ = await gather_inputs(settings, rest)
+    inputs = replace(inputs, horizon_start=start, load_slots=(0.0,) * 8, solar_slots=(0.0,) * 8)
+    schedule = build_schedule(settings, inputs, cfg)
+    assert schedule.export_prices == (0.05, 0.05, 0.05, 0.05, 1.25, 1.25, 0.05, 0.05)
+    if tariff != "fixed":
+        assert schedule.prices[4] == 0.22
+    if tariff == "octopus_intelligent":
+        assert schedule.cheap_fracs[2] == 1.0
+        assert len(inputs.dispatches) == 1
+    plan = compute_plan(inputs, cfg, schedule)
+    assert plan.charge_intent is not None
+    assert plan.charge_intent.export is not None
+    assert event_start in plan.charge_intent.export.selected_slots
+    if tariff == "octopus_intelligent":
+        assert plan.charge_intent.hold_overlaps(
+            dispatch_start, dispatch_start + timedelta(minutes=30)
+        )
+
+
+@pytest.mark.parametrize("tariff", ["fixed", "dynamic", "octopus_intelligent"])
+@respx.mock
+async def test_disabled_export_provider_never_reads_axle(
+    tariff: str, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    async def empty_statistics(*args: object, **kwargs: object) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr("ha_spark.energy.forecast.statistics_during_period", empty_statistics)
+    axle = respx.get("http://axle.test/vpp/home-assistant/event").mock(
+        return_value=httpx.Response(500)
+    )
+    mirror = respx.get(f"{BASE}/states/sensor.axle").mock(return_value=httpx.Response(500))
+    respx.route(method="GET", url__startswith=BASE).mock(return_value=httpx.Response(404))
+    if tariff == "octopus_intelligent":
+        respx.post("http://octo.test/v1/graphql/").mock(return_value=httpx.Response(401))
+        respx.get(url__startswith="http://octo.test/v1/products/").mock(
+            return_value=httpx.Response(401)
+        )
+    settings = _octopus_settings(
+        tariff_provider=tariff, axle_api_key="unused", axle_api_url="http://axle.test",
+        axle_event_entity="sensor.axle", db_path=str(tmp_path / "test.db"),
+        load_model="median",
+    )
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        inputs, cfg, _ = await gather_inputs(settings, rest)
+    assert not axle.called
+    assert not mirror.called
+    assert inputs.flexibility_event is None
+    assert inputs.flexibility_event_trusted
+    assert build_schedule(settings, inputs, cfg).export_prices == ()
