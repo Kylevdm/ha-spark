@@ -20,6 +20,7 @@ from ha_spark.health import (
     Status,
     check_entity_config,
     check_ev_status,
+    check_export_event_provider,
     check_ha_rest,
     check_ha_timezone,
     check_ha_websocket,
@@ -188,7 +189,7 @@ async def test_check_tariff_provider_octopus_intelligent_auth_failure_warns() ->
 
 
 @respx.mock
-async def test_check_tariff_provider_axle_reports_event() -> None:
+async def test_check_export_event_provider_axle_reports_event() -> None:
     respx.get("http://axle.test/vpp/home-assistant/event").mock(
         return_value=httpx.Response(
             200,
@@ -200,11 +201,11 @@ async def test_check_tariff_provider_axle_reports_event() -> None:
             },
         )
     )
-    res = await check_tariff_provider(
+    res = await check_export_event_provider(
         Settings(
             ha_url=HA,
             ha_token="tok",
-            tariff_provider="axle",
+            export_event_provider="axle",
             axle_api_url="http://axle.test",
             axle_api_key="secret-token",
         )
@@ -212,18 +213,19 @@ async def test_check_tariff_provider_axle_reports_event() -> None:
 
     assert res.status is Status.OK
     assert "export event" in res.detail
+    assert res.name == "Export event provider"
 
 
 @respx.mock
-async def test_check_tariff_provider_axle_failure_warns_without_secret() -> None:
+async def test_check_export_event_provider_axle_failure_warns_without_secret() -> None:
     respx.get("http://axle.test/vpp/home-assistant/event").mock(
         return_value=httpx.Response(401)
     )
-    res = await check_tariff_provider(
+    res = await check_export_event_provider(
         Settings(
             ha_url=HA,
             ha_token="tok",
-            tariff_provider="axle",
+            export_event_provider="axle",
             axle_api_url="http://axle.test",
             axle_api_key="secret-token",
         )
@@ -533,3 +535,15 @@ async def test_check_inverter_clock_fails_at_thirty_minutes_whatever_the_toleran
     settings = Settings(ha_url=HA, ha_token="tok", inverter_clock_tolerance_minutes=29.9)
     res = await check_inverter_clock(settings)
     assert res.status is Status.FAIL
+
+
+@respx.mock
+async def test_health_reports_tariff_and_disabled_export_source_separately() -> None:
+    settings = Settings(ha_url=HA, ha_token="tok", axle_api_key="unused")
+    tariff = await check_tariff_provider(settings)
+    events = await check_export_event_provider(settings)
+    assert tariff.name == "Tariff provider"
+    assert "fixed" in tariff.detail
+    assert events.name == "Export event provider"
+    assert events.status is Status.OK
+    assert "disabled" in events.detail
