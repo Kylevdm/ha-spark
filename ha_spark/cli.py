@@ -297,6 +297,12 @@ async def _cmd_onboard(
                 continue
             entity_id, origin = resolved
             print(f"{p.config_field}: {entity_id}    # {origin}")
+            if (
+                p.config_field == "dispatch_grid_power_entity"
+                and entity_id == preset.get("dispatch_grid_power_entity")
+            ):
+                invert = preset.get("dispatch_grid_power_invert", "false")
+                print(f"dispatch_grid_power_invert: {invert}")
 
     print()
     result = await check_load_history(settings)

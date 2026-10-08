@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
+from math import isfinite
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -325,6 +326,7 @@ async def read_dispatch_evidence(
     planned_dispatches: tuple[DispatchSlot, ...],
     *,
     live_dispatch: bool | None = None,
+    forecast_house_kw: float | None = None,
 ) -> DispatchEvidenceRead:
     """Read the EV status once and plug/rate only when slots need rating.
 
@@ -339,6 +341,24 @@ async def read_dispatch_evidence(
     if planned_dispatches:
         plug = await _read_evidence_entity(settings.ev_plug_entity, rest)
         rate = await _read_evidence_entity(settings.octopus_rate_entity, rest)
+    car_power: float | None = None
+    grid_power: float | None = None
+    if planned_dispatches:
+
+        async def power(entity: str) -> float | None:
+            reading = await _read_evidence_entity(entity, rest)
+            if reading is None:
+                return None
+            value = _opt_float(reading.state)
+            unit = reading.attributes.get("unit_of_measurement", "W")
+            if value is None or not isfinite(value) or unit not in ("W", "kW"):
+                return None
+            return value / 1000 if unit == "W" else value
+
+        car_power = await power(settings.ev_power_entity)
+        grid_power = await power(settings.dispatch_grid_power_entity)
+        if grid_power is not None and settings.dispatch_grid_power_invert:
+            grid_power = -grid_power
     adjusted = None
     if rate is not None:
         raw_adjusted = rate.attributes.get("is_intelligent_adjusted")
@@ -350,6 +370,9 @@ async def read_dispatch_evidence(
         evidence=DispatchEvidence(
             live_dispatch=live_dispatch,
             rate_adjusted=adjusted,
+            car_power_kw=car_power,
+            grid_import_kw=grid_power,
+            forecast_house_kw=forecast_house_kw,
             plug_value=plug.state if plug is not None else None,
             ev_status_value=(
                 ev_status.state if ev_status is not None and ev_status_trusted else None
@@ -520,7 +543,7 @@ async def gather_inputs(
     now = datetime.now(tz)
     unrated_dispatches = dispatches
     dispatches, dropped_dispatches = partition_dispatches(
-        dispatches, evidence_read.evidence, now
+        dispatches, replace(evidence_read.evidence, forecast_house_kw=forecast.total_kwh / 24), now
     )
     for dropped in dropped_dispatches:
         plug_value = (
