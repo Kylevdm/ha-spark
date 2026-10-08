@@ -653,6 +653,7 @@ async def reconcile_tick(
                 rest,
                 dispatches if should_rate_dispatches else (),
                 live_dispatch=live_dispatch,
+                forecast_house_kw=plan.load_kwh / 24,
             )
             if should_rate_dispatches:
                 dispatches, _dropped = partition_dispatches(

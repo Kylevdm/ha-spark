@@ -117,6 +117,9 @@ _OPTION_KEYS = frozenset(
         "dispatch_entity",
         "ev_plug_entity",
         "ev_status_entity",
+        "ev_power_entity",
+        "dispatch_grid_power_entity",
+        "dispatch_grid_power_invert",
         "consumption_energy_entity",
         "grid_power_entity",
         "supply_max_current_a",
@@ -467,6 +470,9 @@ class Settings(BaseSettings):
     dispatch_entity: str = Field(default="")
     ev_plug_entity: str = Field(default="")
     ev_status_entity: str = Field(default="")
+    ev_power_entity: str = Field(default="")  # direct car draw, W or kW
+    dispatch_grid_power_entity: str = Field(default="")  # independent import evidence
+    dispatch_grid_power_invert: bool = Field(default=False)
     # True house load excluding battery/EV.
     consumption_energy_entity: str = Field(default="")
     # Live supply guard: throttle battery charging while whole-house AC draw

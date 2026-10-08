@@ -510,3 +510,14 @@ every hardware decision.
 
 The SQLite store lives at `/data/ha_spark.db` and survives restarts and
 updates.
+
+Dispatch power evidence: `ev_power_entity` reads direct car draw (W or kW).
+`dispatch_grid_power_entity` supplies an independent grid-import reading;
+set `dispatch_grid_power_invert: true` for the Solis import-negative meter.
+These options do not enable the supply guard. During an active dispatch,
+car draw ≥1.4 kW or grid import ≥3 kW above forecast house load confirms it.
+After ten minutes, an otherwise uncorroborated dispatch is released only when
+both readable power signals are below those thresholds. Missing or invalid
+power evidence retains it; live dispatch, adjusted rate, charging status and
+a connected plug retain their existing precedence. Planning and the minute reconcile use the daily-average house forecast
+(the latter from the last plan). The Solis preset supplies both sensors and inversion.
