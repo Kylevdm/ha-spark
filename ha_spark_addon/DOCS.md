@@ -350,7 +350,13 @@ If authentication or an API call fails, ha-spark falls back to the fixed rates
 and dispatches. `ha-spark health` reports the live provider status. ha-spark
 never logs or echoes the API key.
 
-`axle` adds the supervised Axle export-event source. Set `axle_api_key` to the
+`export_event_provider` selects an independent export-event source: `none`
+(the default) disables event reads, and `axle` adds supervised Axle export
+events on top of any `tariff_provider` (`fixed`, `dynamic`, or
+`octopus_intelligent`). Import prices and dispatch holds still come from the
+selected tariff; a dispatch hold takes priority over an overlapping export
+window. `ha-spark health` reports the tariff and export-event providers
+separately. Set `axle_api_key` to the
 static token from Axle's Home Assistant account page. `axle_event_entity` can
 name the Home Assistant mirror entity, which ha-spark reads if the direct
 request fails. Set `axle_event_rate_gbp_kwh` to the paid export rate, because
@@ -358,6 +364,14 @@ Axle's Home Assistant event response doesn't include one. The provider accepts
 only explicit, fresh export windows. Import events and malformed or stale
 responses produce no export slots. The API key is a `password` option, and
 ha-spark never writes it to logs or reports.
+
+**Upgrading from `tariff_provider: axle`:** before updating the add-on, switch
+`tariff_provider` to `fixed` (or `octopus_intelligent`, with its required
+credentials). Then update and set `export_event_provider: axle`. The old
+`axle` tariff value has been removed; leaving it in place makes the Supervisor
+refuse the configuration after the update. Existing `axle_api_key`,
+`axle_api_url`, `axle_event_entity`, and `axle_event_rate_gbp_kwh` options are
+unchanged.
 
 Set `notify_service` to the single Home Assistant `notify.<service>` target for
 all notifications, including V2L and export lifecycle notices sent to the
