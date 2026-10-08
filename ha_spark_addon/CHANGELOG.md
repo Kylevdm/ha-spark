@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.21.1
+
+- Security: the ingress HTTP API (port 8099) now answers only Home
+  Assistant's ingress proxy (`172.30.32.2`) and returns `403` to every other
+  peer, so other containers on the Supervisor network can no longer read the
+  plan or change options through `POST /api/config`. The check uses the
+  connection's address, never forwarding headers. In standalone/dev mode the
+  API binds to `127.0.0.1`. The token-protected agent port (8098) is
+  unchanged.
+
 ## 0.21.0
 
 - V2L top-up request (#208): when a paid Axle slot stays unfunded after the
