@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from ha_spark.api.server import AppState, build_app
+from ha_spark.api.server import INGRESS_PROXY_IP, AppState, build_app
 from ha_spark.config import Settings
 from ha_spark.energy.models import ChargeIntent, ChargePlan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
@@ -212,3 +212,40 @@ def test_post_genuine_secret_value_is_stored(tmp_path: Path) -> None:
     assert state.settings.octopus_api_key == "NEW_OCTO"
     persisted = json.loads((tmp_path / "options.json").read_text(encoding="utf-8"))
     assert persisted["octopus_api_key"] == "NEW_OCTO"
+
+
+def _ingress_client(state: AppState, peer: str) -> TestClient:
+    return TestClient(build_app(state, ingress_peer=INGRESS_PROXY_IP), client=(peer, 50000))
+
+
+@pytest.mark.parametrize("peer", ["172.30.32.3", "172.30.33.5", "127.0.0.1"])
+def test_ingress_app_rejects_non_proxy_peers(tmp_path: Path, peer: str) -> None:
+    state = _state(tmp_path, min_soc=20.0)
+    with _ingress_client(state, peer) as client:
+        assert client.get("/api/health").status_code == 403
+        assert client.post("/api/config", json={"min_soc": 30.0}).status_code == 403
+        assert client.post("/mcp/", json={}).status_code == 403
+    assert not (tmp_path / "options.json").exists()
+    assert state.settings.min_soc == 20.0
+
+
+def test_ingress_app_ignores_forwarding_headers(tmp_path: Path) -> None:
+    spoof = {"X-Forwarded-For": INGRESS_PROXY_IP, "X-Real-IP": INGRESS_PROXY_IP}
+    with _ingress_client(_state(tmp_path), "172.30.33.5") as client:
+        assert client.get("/api/health", headers=spoof).status_code == 403
+
+
+def test_ingress_app_serves_the_proxy(tmp_path: Path) -> None:
+    state = _state(tmp_path, min_soc=20.0)
+    with _ingress_client(state, INGRESS_PROXY_IP) as client:
+        assert client.get("/api/health").status_code == 200
+        assert client.post("/api/config", json={"min_soc": 30.0}).status_code == 200
+    assert state.settings.min_soc == 30.0
+
+
+def test_token_port_is_not_peer_restricted(tmp_path: Path) -> None:
+    app = build_app(_state(tmp_path), require_token=True, token="sekret")
+    with TestClient(app, client=("192.0.2.10", 50000)) as client:
+        assert client.get("/api/health").status_code == 401
+        ok = client.get("/api/health", headers={"Authorization": "Bearer sekret"})
+        assert ok.status_code == 200

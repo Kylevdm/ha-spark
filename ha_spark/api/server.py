@@ -5,10 +5,13 @@ daemon pushing states directly: it reads the latest plan (to create entities)
 and reads/writes user options (onboarding + settings). Runs in the daemon's
 event loop (see :mod:`ha_spark.energy.scheduler`).
 
-Auth: in add-on mode the only route in is HA's ingress proxy, which
-authenticates the user and is not mapped to the host network (no ``ports:``),
-so the handlers trust their caller. ``POST /api/config`` is therefore the only
-mutation and is reachable only through that authenticated proxy.
+Auth: the ingress listener is not mapped to the host network, but other
+containers on the Supervisor's internal network can reach it, so the handlers
+do not trust their caller by default. In add-on mode the ingress app is built
+with ``ingress_peer=INGRESS_PROXY_IP`` and answers 403 to any request whose
+socket peer is not HA's ingress proxy (which authenticates the user);
+forwarding headers are ignored. In standalone/dev mode the listener binds to
+loopback only. The published agent port is gated by a bearer token instead.
 """
 
 from __future__ import annotations
@@ -36,8 +39,12 @@ from ha_spark.logging import get_logger
 log = get_logger(__name__)
 
 # Add-on ingress serves on this fixed internal port (must match config.yaml
-# `ingress_port`). Not mapped to the host network, so it isn't externally reachable.
+# `ingress_port`). Not mapped to the host network, but other containers on the
+# Supervisor network can reach it, hence the peer check (see _PeerGate).
 INGRESS_PORT = 8099
+# The Supervisor's ingress proxy address on the internal hassio network. HA's
+# add-on docs: "Only connections from 172.30.32.2 must be allowed."
+INGRESS_PROXY_IP = "172.30.32.2"
 # Optional published port (Task 9): bound only when the user opts in via
 # `agent_surface == "on"` and `agent_expose_port`. Mapped to the host in config.yaml.
 AGENT_PORT = 8098
@@ -275,12 +282,19 @@ def _agent_router(state: AppState) -> APIRouter:
     return router
 
 
-def build_app(state: AppState, *, require_token: bool = False, token: str = "") -> FastAPI:
+def build_app(
+    state: AppState,
+    *,
+    require_token: bool = False,
+    token: str = "",
+    ingress_peer: str | None = None,
+) -> FastAPI:
     """Build the FastAPI app with the API routes bound to ``state``.
 
     ``require_token``/``token`` gate every route (including ``/api/*``) behind
-    bearer auth -- used by the published port (Task 9). The ingress app omits
-    it, since ingress already authenticates the caller.
+    bearer auth -- used by the published port (Task 9). ``ingress_peer``, set
+    for the add-on ingress listener, answers 403 to every request (``/mcp``
+    included) whose socket peer is not that address.
     """
     # Local import: mcp_server does ``from ha_spark.api.server import AppState``,
     # so a module-top import would cycle.
@@ -302,6 +316,8 @@ def build_app(state: AppState, *, require_token: bool = False, token: str = "") 
         gate_bindings=_gate_bindings(agent_router),
     )
     setattr(app.state, STATE_ATTR, state)
+    if ingress_peer is not None:
+        app.add_middleware(_PeerGate, peer=ingress_peer)
 
     if require_token:
 
@@ -379,6 +395,31 @@ def _surface_gated(asgi_app: Any, state: AppState) -> Any:
         await asgi_app(scope, receive, send)
 
     return gated
+
+
+class _PeerGate:
+    """ASGI middleware: only socket peer ``peer`` may make HTTP/WebSocket requests.
+
+    Checks the connection's peer address (``scope["client"]``), never headers
+    such as ``X-Forwarded-For``, which any caller can set. Lifespan passes through.
+    """
+
+    def __init__(self, app: Any, peer: str) -> None:
+        self.app = app
+        self.peer = peer
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] in ("http", "websocket"):
+            client = scope.get("client")
+            if not client or client[0] != self.peer:
+                if scope["type"] == "websocket":
+                    await send({"type": "websocket.close", "code": 1008})
+                else:
+                    await JSONResponse({"error": "forbidden"}, status_code=403)(
+                        scope, receive, send
+                    )
+                return
+        await self.app(scope, receive, send)
 
 
 def _token_gated(asgi_app: Any, token: str) -> Any:

@@ -1,6 +1,6 @@
 ---
 name: ha-spark
-version: "0.21.0"
+version: "0.21.1"
 slug: ha_spark_addon
 description: Local-first battery charge planner and automation agent for Home Assistant
 url: https://github.com/Kylevdm/ha-spark
@@ -15,7 +15,8 @@ homeassistant_api: true
 startup: services
 boot: auto
 # HTTP API for the companion integration, reached through HA's authenticated
-# ingress proxy (not mapped to the host network). Must match api.server.INGRESS_PORT.
+# ingress proxy (not mapped to the host network; the app answers only the proxy's
+# address, 172.30.32.2). Must match api.server.INGRESS_PORT.
 ingress: true
 ingress_port: 8099
 ports:
