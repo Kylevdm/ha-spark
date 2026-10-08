@@ -30,31 +30,24 @@ There is no s6 or bashio, so `run.sh` is plain shell and `config.yaml` sets
 
 ## v1.0.0 release gate
 
-This section moved here from the v1.0.0 release umbrella (#94) so it outlives
-the tracker.
+The v1 programme is now [#247](https://github.com/Kylevdm/ha-spark/issues/247):
+an ingress app, companion HACS integration and UI-owned configuration for new
+households. Compatible #94 requirements remain below. See the individual
+[carry-over dispositions](258-v1-gate-carryover.md).
 
-**Definition.** v1.0.0 is the competitive MVP, validated on real hardware. It
-ships when a zero-export house with a battery, solar, a V2L car, and Axle
-flexibility events runs on autopilot. That means clean base-load forecasting,
-half-hourly replanning, backward-computed reservations, automated Axle event
-delivery, V2L refill, a phone digest, and a readiness signal, all behind the
-existing safety gates and proven on the real Solis. The feature spec is #43.
-
-**Sequence.** The pre-1.0 line continues the `0.x` series. The retired
-`1.0.0-rc1` to `rc4` tags stay in git history, unused (see `CHANGELOG.md`
-`0.14.0`). The original plan gave each Phase 10 milestone its own minor
-release, `0.15.0` to `0.18.0`. Releases have since moved away from that plan:
-`0.15.0` shipped derived base load (10.1), there was no `0.16.0`, `0.17.0`
-shipped half-hourly replanning, reservations, and the supervised Axle prototype
-together, and `0.18.0` and `0.19.x` shipped inverter-clock and Solis
-commissioning work. The milestones, not version numbers, now track what
-remains: the phone digest (10.2), and V2L refill plus the readiness signal
-(10.4). `1.0.0` follows once this gate passes.
+The pre-1.0 line continues `0.x`; retired rc tags remain unused. Historical
+phase-to-version assignments are superseded. #247 owns phase sequencing.
+No unchecked item is claimed as validated.
 
 Before tagging `v1.0.0`, ruff, mypy strict, and pytest must be green, **and**
 every item below must be confirmed on real hardware or live suppliers.
 
-### Safety (must never regress)
+### Safety (automatic control; must never regress)
+
+These gates cover add-on automatic control and its UI/CLI actions. The
+integration warns but remains manually usable without the add-on. #248 and
+#255 must settle the standalone/manual service and override contracts; no
+bypass is granted here.
 
 - [ ] `proactive_mode: simulate` (default) computes a plan, logs `[SIMULATE]`
       action lines, and performs **zero** real writes.
@@ -63,26 +56,32 @@ every item below must be confirmed on real hardware or live suppliers.
 - [ ] A real write happens **only** with `control: ha_spark` **and**
       `proactive_mode: on`, is verified by read-back, and a failed action is
       isolated.
-- [ ] An invalid SoC reading causes no actuation.
+- [ ] Invalid SoC blocks normal SoC-based programming. The narrow configured
+      Solis fallback exception must remain guarded and read-back verified
+      under #112/#119; AlphaESS never receives that fallback.
 - [ ] No secret (`SUPERVISOR_TOKEN`, `HA_TOKEN`, supplier API keys, Axle API
       key) appears in logs, plan output, or the agent surface.
 
 ### Foundation
 
-- [ ] Existing flat (pre-`devices:`) config boots unchanged, and
-      `options.json` is not rewritten.
+- [ ] UI-owned configuration and bootstrap-only Supervisor options follow
+      #253. Validate the reference-household cutover and supported config;
+      general legacy flat-config migration is not required.
 - [ ] A misconfigured `tariff_provider` is rejected **at startup**, naming the
       bad field.
 - [ ] The `fixed`, `dynamic`, and `octopus_intelligent` providers read live
       prices; a runtime price-read failure falls back to `fixed` and still
       produces a plan.
-- [ ] AlphaESS `setbatterycharge` field names verified against the
-      integration's `services.yaml`, **or** the AlphaESS driver marked
-      experimental in `DOCS.md`.
+- [ ] Native AlphaESS local Modbus control is verified on supported hardware
+      against #250, including read-back and failure handling. Native Solis
+      verifies firmware, gateway caching and register semantics (#249/#259).
+      The integration is the sole Modbus client; #248 owns its service contract.
 - [ ] Agent surface: `get_state` reports each device's `control` authority;
       `/agent/*` writes still pass the gate; the LLM cannot reach
       `call_service`; an external non-ingress client is rejected without the
-      bearer token.
+      bearer token. UI mutations use ingress and the same functions/gates as
+      CLI actions. The separate discovery/API channel (#252) is authenticated
+      and version-checked; the unauthenticated port is locked down.
 
 ### MVP
 
@@ -102,9 +101,28 @@ every item below must be confirmed on real hardware or live suppliers.
 - [ ] The readiness signal evaluates simulate history against the measured bar
       and never changes `proactive_mode` itself.
 
+- [ ] The phone digest delivers the compatible MVP summary; #247 owns its
+      sequencing alongside the ingress app.
+
+### New programme validation
+
+- [ ] Onboarding preserves driver/provider suggestions, entity mapping,
+      capability coverage, presets and multi-device onboarding (#247/#257).
+- [ ] Planner and drivers share #241's per-inverter, per-bank and site limits,
+      shared-bank allocation and missing-reading behavior. The full spec
+      defines concrete headroom allowances and near-limit criteria.
+- [ ] The ingress app, integration and UI-owned config satisfy the completed
+      #247 specification, including entity/history cutover and UI/CLI parity.
+      Unresolved full Solis parity and version sequencing are settled there.
+- [ ] #165 validates timely supply-guard reductions without racing apply writes.
+      #128 retains its supervised-event scope; its success alone does not
+      establish unattended readiness.
+
 ### Release mechanics (do last)
 
 - [ ] `ha_spark_addon/config.yaml` set to `1.0.0` **on `master`**, with a
       `CHANGELOG.md` `1.0.0` entry and `DOCS.md` and the schema updated.
-- [ ] Matching `v1.0.0` tag pushed (see the top of this file).
+- [ ] Matching `v1.0.0` tag pushed (see the top of this file), with a GitHub
+      Release for HACS, lockstep add-on/integration versions and a runtime
+      `api_version` handshake per #252.
 - [ ] Supervisor build (`pip install ...@v1.0.0`) succeeds from a clean pull.
