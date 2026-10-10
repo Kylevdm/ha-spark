@@ -178,3 +178,34 @@ a dispatch explains it. Hold evidence that can't be read is ignored rather
 than believed, and a hold outranks a flexibility-event export.
 (Decision: #170, 2026-10-04.)
 _Avoid_: dispatch hold (when meaning either cause), pause, block
+
+**Operating mode**:
+The scope of automatic hardware control authorised by the owner: Observe,
+Protect, or Optimise. Data collection and eligible learning can continue in
+all three modes and during manual control.
+
+**Observe**:
+An operating mode that gathers data, learns from eligible history, and previews
+plans without writing to hardware.
+
+**Protect**:
+An operating mode that prevents the house battery feeding the car while
+ordinary charging schedules remain under manual control. It owns the controls
+needed to apply and release that protection.
+
+**Optimise**:
+An operating mode that authorises the full automatic energy plan, subject to
+control authority and safety checks.
+
+**Temporary manual control**:
+An explicit handover of an inverter's controls to the owner. It expires by
+default and returns to the previous operating mode after current conditions
+have been checked and a fresh plan has been calculated, or uses configured
+fallback when the planner is unavailable. The owner may instead choose to resume
+explicitly. Battery-to-car protection may remain enabled, retaining ownership
+of the controls it needs. Learning may continue during the handover.
+
+**Fallback charging schedule**:
+An owner-configured charging window and conservative limits that can maintain
+charging when automatic planning is unavailable. It does not authorise
+scheduled battery export and remains subordinate to applicable protection.
