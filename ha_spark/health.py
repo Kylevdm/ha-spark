@@ -341,8 +341,10 @@ async def _check_octopus_intelligent_tariff(settings: Settings) -> CheckResult:
     )
 
 
-async def _check_axle_tariff(settings: Settings) -> CheckResult:
+async def check_export_event_provider(settings: Settings) -> CheckResult:
     """Confirm that the Axle event source can be read without exposing its token."""
+    if settings.export_event_provider == "none":
+        return CheckResult("Export event provider", Status.OK, "none (disabled)")
     try:
         async with HomeAssistantRest(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
@@ -350,14 +352,14 @@ async def _check_axle_tariff(settings: Settings) -> CheckResult:
             event = await read_axle_event(settings, rest)
     except AxleApiError as exc:
         return CheckResult(
-            "Tariff provider",
+            "Export event provider",
             Status.WARN,
             f"Axle event source unavailable: {exc}; plans keep the base schedule",
         )
     if event is None:
-        return CheckResult("Tariff provider", Status.OK, "Axle has no upcoming export event")
+        return CheckResult("Export event provider", Status.OK, "Axle has no upcoming export event")
     return CheckResult(
-        "Tariff provider",
+        "Export event provider",
         Status.OK,
         f"Axle export event {event.start.isoformat()} to {event.end.isoformat()}",
     )
@@ -369,8 +371,6 @@ async def check_tariff_provider(settings: Settings) -> CheckResult:
         return await _check_dynamic_tariff(settings)
     if settings.tariff_provider == "octopus_intelligent":
         return await _check_octopus_intelligent_tariff(settings)
-    if settings.tariff_provider == "axle":
-        return await _check_axle_tariff(settings)
     return CheckResult("Tariff provider", Status.OK, "fixed (no live source)")
 
 
@@ -384,6 +384,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_load_history(settings),
         check_supply_guard(settings),
         check_tariff_provider(settings),
+        check_export_event_provider(settings),
         check_ha_timezone(settings),
         *([check_ev_status(settings)] if settings.ev_status_entity else []),
         *([check_inverter_clock(settings)] if settings.inverter == "solis" else []),
