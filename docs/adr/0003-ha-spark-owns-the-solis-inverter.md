@@ -1,6 +1,11 @@
 # ADR-0003: ha-spark is the sole owner of the Solis inverter
 
-Status: Accepted (2026-09-06). Amended since:
+Status: Accepted (2026-09-06). The v1 integration ownership and temporary
+manual-handover architecture is amended by
+[ADR-0005](0005-integration-authority-and-operating-modes.md); this document
+retains the historical hardware evidence and cutover requirements.
+
+Amended since:
 
 - 2026-09-07: premise corrected (see "The overnight charge is
   inverter-resident")
