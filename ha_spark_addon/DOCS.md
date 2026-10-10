@@ -166,6 +166,15 @@ always produces.
 - `plan_run_time`: no longer used, and kept so existing configs still load. The
   daemon recomputes the plan every half-hour slot.
 
+When `proactive_mode` changes to `on`, ha-spark logs a reminder to disable
+pre-existing automations or manual schedules that write the same devices. This
+applies to Supervisor configuration changes followed by a restart as well as
+API changes. A first startup already set to `on` also warns. The last observed
+mode is stored in `/data/proactive_mode.txt`, so restarting with `on` unchanged
+does not repeat the reminder. If that record cannot be read or written, startup
+continues and the reminder may repeat. The reminder does not detect conflicts
+or block real control; disabling competing controllers is the operator's job.
+
 ### Supply guard (optional)
 
 If an EV dispatch overlaps the battery's timed charge, total supply draw can
