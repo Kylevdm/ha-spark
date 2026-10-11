@@ -16,6 +16,13 @@
   configuration after updating. Existing Axle source and rate options remain
   unchanged.
 
+## 0.21.4
+
+- Persist the last observed proactive mode so switching to `on` through the
+  Supervisor logs the conflicting-automation reminder after restart (#197).
+  A first startup already `on` also warns; unchanged `on` restarts stay quiet.
+  API hot reload shares the check, and mode-record failures never block control.
+
 ## 0.21.3
 
 - Add direct EV power and separate grid-import evidence to dispatch ratings
