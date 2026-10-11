@@ -36,6 +36,7 @@ from ha_spark.energy.tariff import (
     DynamicTariffProvider,
     FixedTariffProvider,
     OctopusIntelligentProvider,
+    TariffProvider,
     TariffSchedule,
     _in_overnight_window,
 )
@@ -238,15 +239,16 @@ def build_schedule(
     fixed = FixedTariffProvider(
         cheap_rate=cfg.rate_offpeak, standard_rate=cfg.rate_peak, export_rate=cfg.rate_export
     )
+    provider: TariffProvider = fixed
     if settings.tariff_provider == "dynamic":
-        return DynamicTariffProvider(fallback=fixed).schedule(inputs, cfg)
-    if settings.tariff_provider == "octopus_intelligent":
-        return OctopusIntelligentProvider(fallback=fixed).schedule(inputs, cfg)
-    if settings.tariff_provider == "axle":
-        return AxleTariffProvider(
-            fallback=fixed, event_rate_gbp_kwh=settings.axle_event_rate_gbp_kwh
-        ).schedule(inputs, cfg)
-    return fixed.schedule(inputs, cfg)
+        provider = DynamicTariffProvider(fallback=fixed)
+    elif settings.tariff_provider == "octopus_intelligent":
+        provider = OctopusIntelligentProvider(fallback=fixed)
+    if settings.export_event_provider == "axle":
+        provider = AxleTariffProvider(
+            fallback=provider, event_rate_gbp_kwh=settings.axle_event_rate_gbp_kwh
+        )
+    return provider.schedule(inputs, cfg)
 
 
 async def read_dispatches(
@@ -447,7 +449,7 @@ async def gather_inputs(
 
     flexibility_event = None
     flexibility_event_trusted = True
-    if settings.tariff_provider == "axle":
+    if settings.export_event_provider == "axle":
         try:
             flexibility_event = await read_axle_event(settings, rest)
         except AxleApiError as exc:
