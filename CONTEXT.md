@@ -135,6 +135,26 @@ The site's maximum AC current in either the import or export direction. It is
 distinct from the inverter's DC battery-current ceiling and from any stricter
 DNO export limit.
 
+**Inverter current limit**:
+The maximum DC battery current an individual inverter can charge or discharge,
+with a separate limit for each direction.
+
+**Battery bank**:
+A group of batteries operated as one energy store, with shared state of charge
+and charge/discharge limits. Multiple inverters may connect to the same bank.
+
+**Battery-bank current limit**:
+The maximum combined DC charge or discharge current a bank can accept or
+supply across its connected inverters, with a separate limit for each direction.
+
+**Site export limit**:
+The maximum combined grid-export power permitted at the household's grid
+connection, including battery and solar output after house consumption.
+
+**Charging allocation**:
+The charging power assigned to a bank and divided across its connected
+inverters within device, bank and shared site limits.
+
 **Export ceiling**:
 The maximum grid-export power for a slot, after applying the relevant site or
 DNO limit and the power the battery and solar can supply once house load is
@@ -180,3 +200,38 @@ a dispatch explains it. Hold evidence that can't be read is ignored rather
 than believed, and a hold outranks a flexibility-event export.
 (Decision: #170, 2026-10-04.)
 _Avoid_: dispatch hold (when meaning either cause), pause, block
+
+**Operating mode**:
+The scope of automatic hardware control authorised by the owner: Observe,
+Protect, or Optimise. Data collection and eligible learning can continue in
+all three modes and during manual control.
+
+**Observe**:
+An operating mode that gathers data, learns from eligible history, and previews
+plans without writing to hardware.
+
+**Protect**:
+An operating mode that prevents the house battery feeding the car while
+ordinary charging schedules remain under manual control. It owns the controls
+needed to apply and release that protection.
+
+**Optimise**:
+An operating mode that authorises the full automatic energy plan, subject to
+control authority and safety checks.
+
+**Temporary manual control**:
+An explicit handover of an inverter's controls to the owner. It expires by
+default and returns to the previous operating mode after current conditions
+have been checked and a fresh plan has been calculated, or uses configured
+fallback when the planner is unavailable. The owner may instead choose to resume
+explicitly. Battery-to-car protection may remain enabled, retaining ownership
+of the controls it needs. Learning may continue during the handover.
+
+**Fallback charging schedule**:
+An owner-configured charging window and conservative limits that can maintain
+charging when automatic planning is unavailable. It does not authorise
+scheduled battery export and remains subordinate to applicable protection.
+
+**Agent-editable setting**:
+A household setting the owner has allowed the product agent to request
+changing. That permission does not itself approve a particular change.
