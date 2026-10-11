@@ -1324,3 +1324,33 @@ async def test_misread_discharge_half_is_not_kept(tmp_path) -> None:
     await _device(rest, tmp_path).apply(_intent(export))
 
     assert _block_writes(rest)[0] == [0] * 8
+
+
+@pytest.mark.asyncio
+async def test_octopus_api_dispatch_hold_refuses_an_overlapping_axle_export(tmp_path) -> None:
+    import httpx
+    import respx
+
+    from ha_spark.energy.octopus import fetch_planned_dispatches
+
+    export = _export()
+    settings = Settings(
+        tariff_provider="octopus_intelligent", export_event_provider="axle",
+        octopus_api_url="http://octo.test/v1", octopus_api_key="test-key",
+        octopus_account_number="A-1234ABCD", axle_event_entity="sensor.axle",
+    )
+    with respx.mock:
+        respx.post("http://octo.test/v1/graphql/").mock(side_effect=[
+            httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": "jwt-test"}}}),
+            httpx.Response(200, json={"data": {"plannedDispatches": [{
+                "startDt": export.window_start.isoformat(),
+                "endDt": export.window_end.isoformat(),
+                "delta": -2.0, "meta": {"source": "smart-charge"},
+            }]}}),
+        ])
+        dispatches = await fetch_planned_dispatches(settings)
+    intent = replace(_intent(export), holds=tuple((d.start, d.end) for d in dispatches))
+    rest = FakeRest()
+    lines = await _device(rest, tmp_path).apply(intent)
+    assert any("a dispatch hold overlaps the export window" in line for line in lines)
+    assert rest.states["sensor.solis_control_timed_discharge_current"] == "0"

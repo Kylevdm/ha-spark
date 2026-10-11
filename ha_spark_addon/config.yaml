@@ -53,6 +53,7 @@ options:
   rate_peak_gbp_kwh: 0.30
   rate_export_gbp_kwh: 0.0
   tariff_provider: fixed
+  export_event_provider: none
   dynamic_rates_entity: ""
   dynamic_rates_entity_tomorrow: ""
   profile_min_days: 7
@@ -163,7 +164,8 @@ schema:
   rate_offpeak_gbp_kwh: float
   rate_peak_gbp_kwh: float
   rate_export_gbp_kwh: float
-  tariff_provider: list(fixed|dynamic|octopus_intelligent|axle)
+  tariff_provider: list(fixed|dynamic|octopus_intelligent)
+  export_event_provider: list(none|axle)
   dynamic_rates_entity: str
   dynamic_rates_entity_tomorrow: str
   profile_min_days: int
