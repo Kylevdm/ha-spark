@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.22.0
+
+- Plan reservation-backed V2L house-battery refills when cheaper than the grid
+  (#160), with explicit plugged-in availability and a per-plan energy budget.
+  Add `v2l_max_rate_kw` (3.0) and `v2l_preferred_rate_kw` (1.5), validated at startup.
+
 ## 0.21.3
 
 - Add direct EV power and separate grid-import evidence to dispatch ratings

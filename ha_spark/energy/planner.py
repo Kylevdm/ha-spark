@@ -53,6 +53,7 @@ from ha_spark.energy.models import (
     PlannerConfig,
     PlannerInputs,
     Reservation,
+    V2LRefill,
 )
 from ha_spark.energy.tariff import TariffSchedule, _controlled_windows
 
@@ -652,6 +653,8 @@ def _soc_path(
     export: ExportIntent | None,
     target_soc: float,
     cfg: PlannerConfig,
+    refills: tuple[V2LRefill, ...] = (),
+    solar_surplus: tuple[float, ...] = (),
 ) -> tuple[tuple[datetime, float], ...]:
     """Expected SoC at each slot start from the window end, if the plan holds.
 
@@ -676,7 +679,92 @@ def _soc_path(
             else (1.0 - schedule.cheap_fracs[i]) * net[i]
         )
         soc = max(cfg.min_soc, soc - drain / cfg.capacity_kwh * 100.0)
+        added = sum(action.kwh for action in refills if action.slot == i)
+        added += solar_surplus[i] if solar_surplus else 0.0
+        soc = min(cfg.target_cap, soc + added / cfg.capacity_kwh * 100.0)
     return tuple(path)
+
+
+def _v2l_refills(
+    inputs: PlannerInputs,
+    cfg: PlannerConfig,
+    schedule: TariffSchedule,
+    reservations: tuple[Reservation, ...],
+    initial_energy: float,
+    export: ExportIntent | None,
+) -> tuple[tuple[V2LRefill, ...], bool, float]:
+    """Backfill forecast grid shortfalls with stored car energy, latest slot first.
+
+    Each refill finishes before the load it funds. A forward battery ledger
+    includes solar, exports and earlier refills; headroom across the intervening
+    slots prevents counting energy that would spill before its obligation.
+    """
+    if (inputs.load_slots is None or not reservations or cfg.v2l_budget_kwh <= 0
+            or cfg.v2l_round_trip_efficiency <= 0):
+        return (), False, 0.0
+    price = cfg.v2l_offpeak_rate_gbp / cfg.v2l_round_trip_efficiency
+    rate = max(0.0, min(cfg.v2l_preferred_rate_kw, cfg.v2l_max_rate_kw))
+    capacity = max(0.0, cfg.capacity_kwh * (cfg.target_cap - cfg.min_soc) / 100)
+    first = int(schedule.window_hours * 2)
+    loads = inputs.load_slots
+    n = len(loads)
+    solar = inputs.solar_slots or (0.0,) * n
+    additions = [0.0] * n
+    budget = cfg.v2l_budget_kwh
+    actions: list[V2LRefill] = []
+    saving = 0.0
+    exported = {}
+    if export is not None and inputs.horizon_start is not None:
+        exported = {
+            int((start - inputs.horizon_start).total_seconds() // 1800): power * 0.5
+            for start, power in zip(export.selected_slots, export.slot_export_kw, strict=True)
+        }
+
+    def ledger() -> tuple[list[float], list[float]]:
+        energy = min(capacity, max(0.0, initial_energy))
+        stored = [energy] * n
+        missing = [0.0] * n
+        for slot in range(first, n):
+            net = loads[slot] - solar[slot] * cfg.solar_haircut_k
+            drain = (max(0.0, net) * (1 - schedule.cheap_fracs[slot])
+                     if slot not in exported else max(0.0, net) + exported[slot])
+            missing[slot] = max(0.0, drain - energy)
+            energy = min(capacity, max(0.0, energy - drain) + max(0.0, -net)
+                         + additions[slot])
+            stored[slot] = energy
+        return stored, missing
+
+    for target in range(first, n):
+        reservation = next((r for r in reservations if target < r.target_slot), None)
+        if reservation is None or schedule.prices[target] <= price:
+            continue
+        stored, missing = ledger()
+        need = missing[target]
+        # A refill before an earlier unfunded load would serve that load,
+        # not this reservation shortfall at the price being compared.
+        earliest = next(
+            (i for i in reversed(range(first, target)) if missing[i] > 1e-9), first
+        )
+        for slot in reversed(range(earliest, target)):
+            amount = min(need, budget, rate * 0.5 - additions[slot],
+                         min(capacity - stored[i] for i in range(slot, target)))
+            if amount <= 1e-9:
+                continue
+            if not inputs.car_plugged_in:
+                return (), True, 0.0
+            additions[slot] += amount
+            budget -= amount
+            need -= amount
+            saving += amount * (schedule.prices[target] - price)
+            actions.append(V2LRefill(
+                slot=slot, kwh=amount, rate_kw=rate,
+                reason=(f"Refill the house battery with {amount:.2f} kWh from V2L for "
+                        f"the {reservation.name} reservation."),
+            ))
+            stored, _ = ledger()
+            if need <= 1e-9 or budget <= 1e-9:
+                break
+    return tuple(sorted(actions, key=lambda action: action.slot)), False, saving
 
 
 def compute_plan(
@@ -845,6 +933,11 @@ def compute_plan(
     if cfg.capacity_kwh > 0:
         target_soc = min(cfg.target_cap, inputs.soc_now + required / cfg.capacity_kwh * 100.0)
 
+    refills, v2l_unavailable, v2l_saving = _v2l_refills(
+        inputs, cfg, schedule, reservations, usable_at_window + required, export
+    )
+    planned_cost -= v2l_saving
+
     soc_path: tuple[tuple[datetime, float], ...] = ()
     if (
         inputs.load_slots is not None
@@ -852,7 +945,13 @@ def compute_plan(
         and cfg.capacity_kwh > 0
         and not export_overlaps_charge
     ):
-        soc_path = _soc_path(inputs.horizon_start, net, schedule, export, target_soc, cfg)
+        surplus = tuple(
+            max(0.0, solar * cfg.solar_haircut_k - load)
+            for load, solar in zip(inputs.load_slots, solar_slots, strict=True)
+        ) if refills else ()
+        soc_path = _soc_path(
+            inputs.horizon_start, net, schedule, export, target_soc, cfg, refills, surplus
+        )
 
     holds = controlled
     intent = ChargeIntent(
@@ -904,6 +1003,8 @@ def compute_plan(
             sum(abs(d.charge_in_kwh) for d in inputs.dispatches) if inputs.dispatches else None
         ),
         reservations=reservations,
+        v2l_refills=refills,
+        v2l_wanted_but_unavailable=v2l_unavailable,
         export_skips=export_skips,
         export_funding=export_funding,
         export_soc_needed_pct=export_soc_needed_pct,
