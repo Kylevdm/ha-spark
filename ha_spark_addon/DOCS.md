@@ -266,12 +266,22 @@ never write to hardware.
 
 ### V2L (vehicle-to-load, optional)
 
+The pure slot planner can schedule V2L refills when overnight charge and solar
+leave a named reservation short, and the car's fill price divided by
+`v2l_round_trip_efficiency` is cheaper than grid import for that shortfall.
+Refill kWh and rates describe energy delivered into the house battery. Refills
+finish before the load they fund, respect battery headroom, run at the preferred
+rate (possibly for part of a slot), and share `v2l_budget_kwh` across the plan.
+A zero budget disables planning. The explicit `car_plugged_in` planner input
+defaults to false; an economic, feasible refill then sets
+`v2l_wanted_but_unavailable` instead of scheduling energy. HA plugged-in sensing
+and rectifier actuation are separate work; these actions are plan data only.
+
 V2L is a manual physical adapter with no control API, so ha-spark only reads
 it. When `v2l_power_entity` is set, each daemon tick reads the car's V2L
 discharge power (W), adds it to the kWh delivered this session, values that
 energy at the configured rates less conversion losses, publishes
-`sensor.ha_spark_v2l_*`, and sends HA notifications. V2L doesn't change the
-planner or the drivers.
+`sensor.ha_spark_v2l_*`, and sends HA notifications.
 
 | Option | What it must be |
 |---|---|
@@ -281,7 +291,9 @@ planner or the drivers.
 | `v2l_offpeak_rate_gbp` | £/kWh cheap rate used to refill the car later (default `0.07`). |
 | `v2l_cutoff_time` | Local time the cheap window starts. The unplug notification fires at or after it (default `01:00`). |
 | `v2l_notify_service` | Deprecated fallback HA `notify.<service>` target, scheduled for removal. `notify_service` takes precedence; this is used only when `notify_service` is blank. |
-| `v2l_budget_kwh` | Optional V2L budget in kWh, used in place of car SoC (the car has no HA integration, so ha-spark can't read its SoC). `0` disables the plug-in warning. A top-up request never asks for more than this. |
+| `v2l_budget_kwh` | Optional V2L budget in kWh, used in place of car SoC (the car has no HA integration, so ha-spark can't read its SoC). `0` disables refill planning and the plug-in warning. Planned refills and top-up requests never exceed this. |
+| `v2l_max_rate_kw` | Maximum planned house-battery refill rate (default `3.0` kW). |
+| `v2l_preferred_rate_kw` | Preferred planned refill rate (default `1.5` kW); must be positive and no higher than the maximum. |
 | `v2l_rectifier_efficiency` | Rectifier efficiency from the car's AC output into the house battery (default `0.94`). |
 | `v2l_charge_kw` | DC rate the rectifier charges the house battery at (default `2.15`, the measured rate at its 10 A AC input limit). Sets the "start V2L by" time. |
 | `v2l_soc_tolerance_pct` | How many SoC points below the overnight plan's expected path, on an Axle event day, count as the plan having been wrong (default `5`). |

@@ -229,6 +229,11 @@ def build_config(
         buffer_pct=buffer_pct,
         charge_efficiency=settings.charge_efficiency,
         strategy=settings.charge_strategy,
+        v2l_budget_kwh=settings.v2l_budget_kwh,
+        v2l_round_trip_efficiency=settings.v2l_round_trip_efficiency,
+        v2l_offpeak_rate_gbp=settings.v2l_offpeak_rate_gbp,
+        v2l_max_rate_kw=settings.v2l_max_rate_kw,
+        v2l_preferred_rate_kw=settings.v2l_preferred_rate_kw,
     )
 
 
