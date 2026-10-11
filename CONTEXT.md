@@ -135,6 +135,26 @@ The site's maximum AC current in either the import or export direction. It is
 distinct from the inverter's DC battery-current ceiling and from any stricter
 DNO export limit.
 
+**Inverter current limit**:
+The maximum DC battery current an individual inverter can charge or discharge,
+with a separate limit for each direction.
+
+**Battery bank**:
+A group of batteries operated as one energy store, with shared state of charge
+and charge/discharge limits. Multiple inverters may connect to the same bank.
+
+**Battery-bank current limit**:
+The maximum combined DC charge or discharge current a bank can accept or
+supply across its connected inverters, with a separate limit for each direction.
+
+**Site export limit**:
+The maximum combined grid-export power permitted at the household's grid
+connection, including battery and solar output after house consumption.
+
+**Charging allocation**:
+The charging power assigned to a bank and divided across its connected
+inverters within device, bank and shared site limits.
+
 **Export ceiling**:
 The maximum grid-export power for a slot, after applying the relevant site or
 DNO limit and the power the battery and solar can supply once house load is
@@ -211,3 +231,7 @@ of the controls it needs. Learning may continue during the handover.
 An owner-configured charging window and conservative limits that can maintain
 charging when automatic planning is unavailable. It does not authorise
 scheduled battery export and remains subordinate to applicable protection.
+
+**Agent-editable setting**:
+A household setting the owner has allowed the product agent to request
+changing. That permission does not itself approve a particular change.
