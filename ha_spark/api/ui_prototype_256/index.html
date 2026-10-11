@@ -1,0 +1,679 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ha-spark Ingress Prototype</title>
+<!--
+  PROTOTYPE (#256), throwaway. Three variants of the ingress app shell + plan
+  visual, switchable via ?variant=A|B|C and the floating bar (← → keys too).
+  Data: fixtures.js (synthetic, real compute_plan output), plus fixtures_live.js
+  when present (gitignored). Not production: CDN import + inline script break
+  the decided CSP (script-src 'self'); the real app vendors Preact + htm.
+-->
+<style>
+/* Layout concept: three shells (rail / top tabs / bottom dock) around one plan dataset; system faces only, because the real app ships offline under script/style 'self'. */
+:root {
+  --bg: #f3f6f5; --surface: #ffffff; --sunk: #e9eeec; --fg: #16201d; --muted: #5a6a65; --line: #d5dfdb;
+  --accent: #0e6a76; --accent-fg: #ffffff; --hl: #0e6a7624;
+  --charge: #2c68d0; --hold: #b97c0a; --export: #17905a; --skip: #c2412f; --v2l: #8150c4; --reserve: #66768a;
+  --cheap: #cfe2f6; --peak: #efc7b9; --import: #2a3a36; --ring-idle: #e2e9e6;
+  --good: #17905a; --warn: #b97c0a; --bad: #c2412f;
+  --shadow: 0 6px 24px #0f1a1726;
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-num: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  --dock-h: 0px;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0e1412; --surface: #161f1c; --sunk: #1c2723; --fg: #e4ece9; --muted: #93a39e; --line: #2a3632;
+  --accent: #52c0cc; --accent-fg: #0e1412; --hl: #52c0cc2e;
+  --charge: #6c9ffb; --hold: #eeb13f; --export: #48c78b; --skip: #ff7c6b; --v2l: #b58bef; --reserve: #9aa8ba;
+  --cheap: #1b3953; --peak: #5b2f25; --import: #d6e1dd; --ring-idle: #24302c;
+  --good: #48c78b; --warn: #eeb13f; --bad: #ff7c6b; --shadow: 0 6px 24px #00000080; color-scheme: dark;
+} }
+:root[data-theme="dark"] {
+  --bg: #0e1412; --surface: #161f1c; --sunk: #1c2723; --fg: #e4ece9; --muted: #93a39e; --line: #2a3632;
+  --accent: #52c0cc; --accent-fg: #0e1412; --hl: #52c0cc2e;
+  --charge: #6c9ffb; --hold: #eeb13f; --export: #48c78b; --skip: #ff7c6b; --v2l: #b58bef; --reserve: #9aa8ba;
+  --cheap: #1b3953; --peak: #5b2f25; --import: #d6e1dd; --ring-idle: #24302c;
+  --good: #48c78b; --warn: #eeb13f; --bad: #ff7c6b; --shadow: 0 6px 24px #00000080; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 var(--font-ui); }
+button { font: inherit; color: inherit; }
+button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.num { font-family: var(--font-num); font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+h1, h2, h3 { text-wrap: balance; margin: 0; line-height: 1.2; }
+h1 { font-size: 1.35rem; font-weight: 650; }
+h2 { font-size: 1.05rem; font-weight: 650; }
+.eyebrow { font-size: .72rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+svg text { fill: var(--muted); font: 10px var(--font-num); }
+.empty { padding: 24px; border: 1px dashed var(--line); border-radius: 10px; color: var(--muted); }
+
+/* shared bits */
+.mode { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px; font-size: .78rem; font-weight: 600; border: 1px solid currentColor; white-space: nowrap; }
+.mode::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.mode.simulate { color: var(--warn); } .mode.on { color: var(--good); } .mode.off { color: var(--muted); }
+.chip { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: .72rem; font-weight: 650; color: var(--surface); white-space: nowrap; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: .78rem; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+.legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+.tile { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+.tile b { display: block; font: 600 1.25rem var(--font-num); font-variant-numeric: tabular-nums; }
+.tile small { color: var(--muted); font-size: .76rem; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px; min-width: 0; }
+.stack { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.readout { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: .82rem; min-height: 1.4em; }
+.readout b { font-family: var(--font-num); font-weight: 600; }
+.btn { border: 1px solid var(--line); background: var(--surface); border-radius: 8px; padding: 8px 12px; cursor: pointer; }
+.btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.btn[disabled] { opacity: .55; cursor: not-allowed; }
+.note { font-size: .78rem; color: var(--muted); }
+
+/* ---------- Variant A: rail + lanes ---------- */
+.shellA { display: grid; grid-template-columns: 196px minmax(0, 1fr); min-height: 100vh; }
+.railA { position: sticky; top: 0; height: 100vh; border-right: 1px solid var(--line); background: var(--surface); padding: 16px 10px; display: flex; flex-direction: column; gap: 4px; }
+.railA .brand { font-weight: 750; font-size: 1.05rem; padding: 4px 10px 14px; letter-spacing: -.01em; }
+.railA button { display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; border: 0; background: none; border-radius: 8px; cursor: pointer; text-align: left; color: var(--muted); }
+.railA button[aria-current="page"] { background: var(--hl); color: var(--fg); font-weight: 600; }
+.railA svg { width: 20px; height: 20px; flex: none; }
+.mainA { min-width: 0; padding: 18px 24px 140px; display: flex; flex-direction: column; gap: 16px; }
+.topA { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.topA .grow { flex: 1; }
+.reasonsA { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.reasonsA li button { display: grid; grid-template-columns: 92px 104px minmax(0, 1fr); gap: 10px; align-items: baseline; width: 100%; padding: 9px 8px; border: 0; border-top: 1px solid var(--line); background: none; text-align: left; cursor: pointer; }
+.reasonsA li button[aria-pressed="true"] { background: var(--hl); }
+.reasonsA .when { font: .82rem var(--font-num); color: var(--muted); }
+@media (max-width: 899px) {
+  .shellA { grid-template-columns: minmax(0, 1fr); }
+  .railA { position: fixed; top: auto; bottom: 0; left: 0; right: 0; height: auto; flex-direction: row; padding: 4px 4px calc(4px + env(safe-area-inset-bottom, 0px)); border-right: 0; border-top: 1px solid var(--line); z-index: 20; gap: 0; }
+  .railA .brand { display: none; }
+  .railA button { flex-direction: column; gap: 2px; font-size: .68rem; padding: 6px 2px; text-align: center; }
+  .mainA { padding: 14px 16px 150px; }
+  .reasonsA li button { grid-template-columns: 1fr; gap: 3px; }
+  .shellA + .protobar { --dock-h: 64px; }
+}
+
+/* ---------- Variant B: top tabs + agenda ---------- */
+.topB { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 10; background: var(--bg); border-bottom: 1px solid var(--line); }
+.topB .row { display: flex; align-items: center; gap: 12px; padding: 12px 24px 4px; max-width: 1180px; margin: 0 auto; }
+.topB .brand { font-weight: 750; letter-spacing: -.01em; }
+.topB .grow { flex: 1; }
+.tabsB { display: flex; gap: 2px; overflow-x: auto; padding: 0 16px; max-width: 1180px; margin: 0 auto; scrollbar-width: none; }
+.tabsB button { border: 0; background: none; padding: 9px 10px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; white-space: nowrap; }
+.tabsB button[aria-current="page"] { color: var(--fg); border-bottom-color: var(--accent); font-weight: 600; }
+.mainB { max-width: 1180px; margin: 0 auto; padding: 20px 24px 140px; }
+.planB { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 28px; align-items: start; }
+.planB aside { position: sticky; top: 108px; }
+.headlineB { font-size: 1.3rem; font-weight: 600; line-height: 1.35; max-width: 34ch; text-wrap: balance; }
+.agenda { list-style: none; margin: 0; padding: 0; }
+.ag-row { display: grid; grid-template-columns: 54px 6px minmax(0, 1fr); gap: 12px; }
+.ag-time { font: .82rem var(--font-num); color: var(--muted); padding-top: 10px; display: flex; flex-direction: column; justify-content: space-between; }
+.ag-time span { opacity: .7; padding-bottom: 6px; }
+.ag-bar { border-radius: 3px; margin: 10px 0 0; }
+.ag-body { padding: 8px 0 14px; border-bottom: 1px solid var(--line); min-width: 0; }
+.ag-title { font-weight: 600; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.ag-meta { font: .8rem var(--font-num); color: var(--muted); margin-top: 2px; }
+.ag-reason { margin: 6px 0 0; font-size: .9rem; max-width: 65ch; }
+.ag-reason.reserve { color: var(--muted); font-size: .84rem; }
+@media (max-width: 899px) {
+  .planB { grid-template-columns: minmax(0, 1fr); }
+  .planB aside { position: static; order: -1; }
+  .topB .row, .mainB { padding-left: 16px; padding-right: 16px; }
+  .headlineB { font-size: 1.12rem; }
+}
+
+/* ---------- Variant C: status strip + now/next + dial + dock ---------- */
+.stripC { display: flex; align-items: center; gap: 10px; padding: 10px 24px; border-bottom: 1px solid var(--line); background: var(--surface); }
+.stripC .brand { font-weight: 750; }
+.stripC .grow { flex: 1; }
+.mainC { max-width: 1180px; margin: 0 auto; padding: 18px 24px 170px; }
+.planC { display: grid; grid-template-columns: minmax(0, 360px) minmax(0, 1fr); gap: 20px; align-items: start; }
+.nowC { display: flex; flex-direction: column; gap: 14px; }
+.nowC .big { display: flex; align-items: center; gap: 16px; }
+.nowC .pct { font: 700 3rem/1 var(--font-num); letter-spacing: -.03em; }
+.nextC { border-left: 3px solid var(--charge); padding: 6px 0 6px 12px; }
+.dialWrap { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.reasonsC { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.reasonsC button { width: 100%; text-align: left; display: flex; gap: 8px; align-items: baseline; padding: 8px 10px; border: 1px solid var(--line); background: var(--surface); border-radius: 8px; cursor: pointer; }
+.reasonsC button[aria-pressed="true"] { border-color: var(--accent); background: var(--hl); }
+.reasonsC .txt { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.reasonsC button[aria-pressed="true"] .txt { white-space: normal; }
+.dockC { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(10px + env(safe-area-inset-bottom, 0px)); display: flex; gap: 2px; padding: 5px; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); z-index: 20; max-width: calc(100% - 20px); }
+.dockC button { display: flex; flex-direction: column; align-items: center; gap: 1px; border: 0; background: none; padding: 6px 10px; border-radius: 11px; cursor: pointer; color: var(--muted); font-size: .68rem; }
+.dockC button[aria-current="page"] { background: var(--accent); color: var(--accent-fg); }
+.dockC svg { width: 20px; height: 20px; }
+.shellC + .protobar { --dock-h: 70px; }
+@media (max-width: 899px) {
+  .planC { grid-template-columns: minmax(0, 1fr); }
+  .mainC, .stripC { padding-left: 16px; padding-right: 16px; }
+  .dockC button { padding: 6px 6px; }
+}
+
+/* ---------- stubs ---------- */
+.steps { display: flex; gap: 6px; flex-wrap: wrap; list-style: none; padding: 0; margin: 0; }
+.steps li { padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); font-size: .8rem; color: var(--muted); }
+.steps li.done { color: var(--good); border-color: var(--good); }
+.steps li.cur { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.field { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 9px 0; border-top: 1px solid var(--line); }
+.field:first-of-type { border-top: 0; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; background: none; padding: 5px 10px; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); }
+.bubbles { display: flex; flex-direction: column; gap: 8px; }
+.bubble { max-width: 85%; padding: 8px 12px; border-radius: 12px; background: var(--sunk); }
+.bubble.me { align-self: flex-end; background: var(--accent); color: var(--accent-fg); }
+.bubble pre { margin: 0; white-space: pre-wrap; font: .78rem/1.45 var(--font-num); }
+.chatin { display: flex; gap: 8px; }
+.chatin input { flex: 1; min-width: 0; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.ovr { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+
+/* ---------- prototype chrome (not part of any design) ---------- */
+.protobar { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(12px + var(--dock-h) + env(safe-area-inset-bottom, 0px)); z-index: 50; display: flex; align-items: center; gap: 6px; padding: 5px 6px; background: #111; color: #f4f4f4; border-radius: 999px; box-shadow: 0 8px 28px #0007; font: 12px/1 var(--font-ui); max-width: calc(100% - 16px); }
+.protobar button, .protobar select { background: #2a2a2a; color: #f4f4f4; border: 0; border-radius: 999px; padding: 7px 10px; cursor: pointer; font: inherit; }
+.protobar .lbl { padding: 0 6px; white-space: nowrap; font-weight: 600; }
+.protobar .lbl small { font-weight: 400; opacity: .7; }
+.drawer { position: fixed; right: 12px; bottom: 76px; width: min(560px, calc(100% - 24px)); max-height: 70vh; z-index: 49; background: #111; color: #e8e8e8; border-radius: 12px; box-shadow: 0 8px 28px #0008; display: flex; flex-direction: column; overflow: hidden; }
+.drawer header { display: flex; gap: 6px; padding: 8px; flex-wrap: wrap; align-items: center; }
+.drawer header button { background: #2a2a2a; color: #eee; border: 0; border-radius: 6px; padding: 5px 8px; cursor: pointer; font-size: 12px; }
+.drawer header button[aria-pressed="true"] { background: #f4f4f4; color: #111; }
+.drawer pre { margin: 0; padding: 8px 12px 14px; overflow: auto; font: 11px/1.4 var(--font-num); white-space: pre; }
+@media (max-width: 520px) { .protobar .lbl small { display: none; } }
+@media (prefers-reduced-motion: no-preference) { .railA button, .tabsB button, .dockC button { transition: background .15s, color .15s; } }
+</style>
+
+<div id="app"></div>
+<script src="fixtures.js"></script>
+<script src="fixtures_live.js" onerror="void 0"></script>
+<script type="module">
+import { html, render, useState, useEffect, useRef, useLayoutEffect } from 'https://cdn.jsdelivr.net/npm/htm@3.1.1/preact/standalone.module.js';
+
+const FIX = window.PLAN_FIXTURES || {};
+const DATASETS = Object.keys(FIX);
+const VARIANTS = [
+  { key: 'A', name: 'Lanes', note: 'side rail, chart first' },
+  { key: 'B', name: 'Agenda', note: 'top tabs, reasons first' },
+  { key: 'C', name: 'Clock', note: 'bottom dock, now/next + 24 h dial' },
+];
+const ICON = {
+  plan: 'M3 17l5-6 4 3 6-8 3 3M3 21h18',
+  override: 'M12 3v8M6.3 6.3a8 8 0 1 0 11.4 0',
+  chat: 'M4 5h16v11H9l-5 4z',
+  stats: 'M5 20V11M10 20V5M15 20v-7M20 20V8',
+  settings: 'M4 7h10M18 7h2M4 17h4M12 17h8M14 4v6M8 14v6',
+  onboarding: 'M5 6l2 2 3-3M5 13l2 2 3-3M13 7h6M13 14h6M5 20h14',
+};
+const ROUTES = [
+  { key: 'plan', label: 'Plan' }, { key: 'override', label: 'Override' }, { key: 'chat', label: 'Chat' },
+  { key: 'stats', label: 'Stats' }, { key: 'settings', label: 'Settings' }, { key: 'onboarding', label: 'Setup' },
+];
+const ACT = {
+  charge: { label: 'Charge', c: 'var(--charge)' }, hold: { label: 'Hold', c: 'var(--hold)' },
+  export: { label: 'Export', c: 'var(--export)' }, skip: { label: 'Skipped', c: 'var(--skip)' },
+  v2l: { label: 'V2L refill', c: 'var(--v2l)' }, reserve: { label: 'Reserve', c: 'var(--reserve)' },
+  warning: { label: 'Warning', c: 'var(--bad)' },
+};
+const LANES = ['charge', 'hold', 'export', 'skip', 'v2l'];
+
+/* ---- helpers ---- */
+const TZ = 'Europe/London';
+const SLOT_MS = 1800000;
+const store = {
+  get(k) { try { return localStorage.getItem('proto256.' + k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem('proto256.' + k, v); } catch { /* storage blocked */ } },
+};
+const hm = (ms) => new Date(ms).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: TZ });
+const pence = (gbp) => gbp == null ? '–' : (gbp * 100).toFixed(1) + 'p';
+const money = (v) => v == null ? '–' : (v < 0 ? '−£' : '£') + Math.abs(v).toFixed(2);
+const pct = (v) => v == null ? '–' : Math.round(v) + '%';
+const minutesOfDay = (ms) => { const [h, m] = hm(ms).split(':').map(Number); return h * 60 + m; };
+const dur = (slots) => { const m = slots * 30; return m < 60 ? m + ' min' : (m % 60 ? (m / 60).toFixed(1) : m / 60) + ' h'; };
+const actKey = (s) => s.actions.length ? s.actions.join('+') : (s.cheap_frac > 0 ? 'cheap' : 'battery');
+const SEG_TITLE = {
+  charge: 'Charge from the grid', hold: 'Hold the battery; grid runs the house', export: 'Paid export',
+  skip: 'Export slot skipped', v2l: 'Top up from the car (V2L)', battery: 'House runs on battery and solar',
+  cheap: 'Cheap grid, battery idle',
+};
+const segTitle = (key) => key.split('+').map((k) => SEG_TITLE[k] || k).join(' + ');
+const segColor = (key) => key === 'battery' ? 'var(--line)' : key === 'cheap' ? 'var(--cheap)' : ACT[key.split('+')[0]].c;
+
+function prep(ds) {
+  const d = FIX[ds];
+  const tl = d && d.timeline;
+  if (!tl) return { d, tl: null };
+  const t0 = Date.parse(tl.horizon_start);
+  const n = tl.slots.length;
+  const idx = (iso) => iso == null ? 0 : Math.max(0, Math.min(n, Math.round((Date.parse(iso) - t0) / SLOT_MS)));
+  const lines = tl.lines.map((l, id) => {
+    const i0 = idx(l.start);
+    return { ...l, id, i0, i1: Math.max(i0 + 1, idx(l.end)) };
+  });
+  const at = (i) => t0 + i * SLOT_MS;
+  const now = Date.parse(tl.now);
+  return { d, tl, t0, n, lines, at, now };
+}
+
+function useWidth() {
+  const ref = useRef(null);
+  const [w, setW] = useState(0);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return undefined;
+    setW(el.clientWidth);
+    const ro = new ResizeObserver(([e]) => setW(Math.round(e.contentRect.width)));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return [ref, w];
+}
+
+const Icon = ({ name }) => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d=${ICON[name]} /></svg>`;
+const Mode = ({ mode }) => html`<span class="mode ${mode}" title="proactive_mode">${mode === 'simulate' ? 'Simulate · no device writes' : mode === 'on' ? 'On · controlling devices' : 'Off · compute only'}</span>`;
+const Chip = ({ kind }) => html`<span class="chip" style=${{ background: ACT[kind].c }}>${ACT[kind].label}</span>`;
+const Legend = ({ tl }) => html`<div class="legend">${LANES.filter((a) => tl.slots.some((s) => s.actions.includes(a))).map((a) => html`<span><i style=${{ background: ACT[a].c }}></i>${ACT[a].label}</span>`)}
+  <span><i style=${{ background: 'var(--cheap)' }}></i>Cheap import</span><span><i style=${{ background: 'var(--peak)' }}></i>Peak import</span></div>`;
+
+function SlotReadout({ P, i }) {
+  if (i == null) return html`<div class="readout muted">Tap a half-hour to see its numbers.</div>`;
+  const s = P.tl.slots[i];
+  return html`<div class="readout" aria-live="polite">
+    <span><b>${hm(P.at(i))}–${hm(P.at(i + 1))}</b></span>
+    <span>${s.actions.length ? s.actions.map((a) => ACT[a].label).join(' + ') : SEG_TITLE[actKey(s)]}</span>
+    <span>SoC <b>${s.soc_pct == null ? '–' : s.soc_pct.toFixed(0) + '%'}</b>${s.soc_kind === 'ramp' ? ' (est.)' : ''}</span>
+    <span>import <b>${pence(s.import_price)}</b></span><span>export <b>${pence(s.export_price)}</b></span>
+    <span>load <b>${s.load_kwh.toFixed(2)}</b> · solar <b>${s.solar_kwh.toFixed(2)}</b> kWh</span></div>`;
+}
+
+function Costs({ tl }) {
+  const c = tl.costs;
+  return html`<div class="tiles">
+    <div class="tile"><small>Planned cost</small><b>${money(c.planned)}</b></div>
+    <div class="tile"><small>Without battery</small><b>${money(c.baseline)}</b></div>
+    <div class="tile"><small>Saving</small><b style=${{ color: 'var(--good)' }}>${c.baseline != null && c.planned != null ? money(c.baseline - c.planned) : '–'}</b></div>
+    ${c.export_revenue != null && html`<div class="tile"><small>Export income</small><b>${money(c.export_revenue)}</b></div>`}
+  </div>`;
+}
+
+/* SoC points split into the planner's path (solid) and the prototype's window ramp (dashed). */
+function socPaths(tl, x, y) {
+  const ramp = [], path = [];
+  tl.slots.forEach((s, i) => { if (s.soc_pct != null) (s.soc_kind === 'ramp' ? ramp : path).push([x(i), y(s.soc_pct)]); });
+  if (ramp.length && path.length) ramp.push(path[0]);
+  const line = (pts) => pts.length ? 'M' + pts.map((p) => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' L') : '';
+  return { ramp: line(ramp), path: line(path), pts: path };
+}
+
+/* ---------------- Variant A: lanes ---------------- */
+function LaneChart({ P, sel, setSel, hl }) {
+  const [ref, w] = useWidth();
+  const { tl, n } = P;
+  const W = Math.max(w, 280), L = 36, R = 10;
+  const x = (i) => L + (W - L - R) * i / n;
+  const lanes = LANES.filter((a) => tl.slots.some((s) => s.actions.includes(a)));
+  const H1 = 140, laneH = 11, gap = 14, H3 = 64;
+  const y1 = (v) => 8 + H1 * (1 - v / 100);
+  const top2 = 8 + H1 + gap, top3 = top2 + lanes.length * (laneH + 3) + gap;
+  const maxP = Math.max(...tl.slots.map((s) => Math.max(s.import_price || 0, s.export_price || 0))) * 1.1;
+  const y3 = (v) => top3 + H3 * (1 - v / maxP);
+  const H = top3 + H3 + 22;
+  const soc = socPaths(tl, x, y1);
+  const step = (key) => {
+    let d = `M${x(0)},${y3(tl.slots[0][key])}`;
+    tl.slots.forEach((s, i) => { d += ` H${x(i + 1)}`; if (i + 1 < n) d += ` V${y3(tl.slots[i + 1][key])}`; });
+    return d;
+  };
+  const ticks = [];
+  for (let i = 0; i <= n; i += W < 520 ? 12 : 6) ticks.push(i);
+  return html`<div ref=${ref} style=${{ width: '100%' }}>
+    ${w > 0 && html`<svg width=${W} height=${H} role="img" aria-label="Plan timeline: state of charge, actions and prices per half-hour">
+      ${hl && html`<rect x=${x(hl.i0)} y="0" width=${x(hl.i1) - x(hl.i0)} height=${H - 18} fill="var(--hl)" />`}
+      ${sel != null && html`<rect x=${x(sel)} y="0" width=${x(sel + 1) - x(sel)} height=${H - 18} fill="var(--fg)" opacity="0.08" />`}
+      ${[0, 50, 100].map((v) => html`<line x1=${L} x2=${W - R} y1=${y1(v)} y2=${y1(v)} stroke="var(--line)" /><text x=${L - 4} y=${y1(v) + 3} text-anchor="end">${v}%</text>`)}
+      <line x1=${L} x2=${W - R} y1=${y1(tl.min_soc)} y2=${y1(tl.min_soc)} stroke="var(--skip)" stroke-dasharray="3 3" />
+      <text x=${W - R} y=${y1(tl.min_soc) - 3} text-anchor="end">min ${tl.min_soc}%</text>
+      ${soc.pts.length && html`<path d=${`${soc.path} L${soc.pts.at(-1)[0]},${y1(0)} L${soc.pts[0][0]},${y1(0)} Z`} fill="var(--charge)" opacity="0.12" />`}
+      <path d=${soc.ramp} fill="none" stroke="var(--charge)" stroke-width="2" stroke-dasharray="4 3" />
+      <path d=${soc.path} fill="none" stroke="var(--charge)" stroke-width="2" />
+      <text x=${L + 4} y="18">SoC · dashed = estimated during the charge window</text>
+      ${lanes.map((a, r) => tl.slots.map((s, i) => s.actions.includes(a) && html`<rect x=${x(i) + 0.5} y=${top2 + r * (laneH + 3)} width=${Math.max(1, x(i + 1) - x(i) - 1)} height=${laneH} rx="2" fill=${ACT[a].c} />`))}
+      ${lanes.map((a, r) => html`<text x=${L - 4} y=${top2 + r * (laneH + 3) + 9} text-anchor="end">${ACT[a].label.slice(0, 4)}</text>`)}
+      <line x1=${L} x2=${W - R} y1=${y3(0)} y2=${y3(0)} stroke="var(--line)" />
+      <path d=${step('import_price')} fill="none" stroke="var(--import)" stroke-width="1.5" />
+      <path d=${step('export_price')} fill="none" stroke="var(--export)" stroke-width="1.5" stroke-dasharray="4 2" />
+      <text x=${L - 4} y=${y3(maxP / 1.1) + 3} text-anchor="end">${Math.round(maxP / 1.1 * 100)}p</text>
+      <text x=${L - 4} y=${y3(0) + 3} text-anchor="end">0p</text>
+      <text x=${L + 4} y=${top3 + 8}>import (solid) · export (dashed) per kWh</text>
+      ${ticks.map((i) => html`<text x=${x(i)} y=${H - 6} text-anchor=${i === 0 ? 'start' : i === n ? 'end' : 'middle'}>${hm(P.at(i))}</text>`)}
+      ${tl.slots.map((_, i) => html`<rect x=${x(i)} y="0" width=${x(i + 1) - x(i)} height=${H - 18} fill="transparent" style=${{ cursor: 'pointer' }} onClick=${() => setSel(i)} />`)}
+    </svg>`}
+  </div>`;
+}
+
+function PlanA({ P }) {
+  const [sel, setSel] = useState(null);
+  const [hlId, setHl] = useState(null);
+  const hl = P.lines.find((l) => l.id === hlId);
+  const { tl } = P;
+  return html`<div class="stack">
+    <div class="tiles">
+      <div class="tile"><small>SoC now</small><b>${pct(tl.soc_now)}</b></div>
+      <div class="tile"><small>Charge to</small><b>${pct(tl.target_soc)}</b></div>
+      <div class="tile"><small>Planned cost</small><b>${money(tl.costs.planned)}</b></div>
+      <div class="tile"><small>Without battery</small><b>${money(tl.costs.baseline)}</b></div>
+    </div>
+    <div class="card stack">
+      <${Legend} tl=${tl} />
+      <${SlotReadout} P=${P} i=${sel} />
+      <${LaneChart} P=${P} sel=${sel} setSel=${setSel} hl=${hl} />
+    </div>
+    <div class="card">
+      <h2 style=${{ marginBottom: '6px' }}>Why</h2>
+      <ul class="reasonsA">${P.lines.map((l) => html`<li><button aria-pressed=${hlId === l.id} onClick=${() => setHl(hlId === l.id ? null : l.id)}>
+        <span><${Chip} kind=${l.kind} /></span>
+        <span class="when">${l.start ? hm(Math.max(Date.parse(l.start), P.t0)) + '–' + hm(Date.parse(l.end)) : '—'}</span>
+        <span>${l.text}${l.kwh != null ? html` <span class="muted num">(${l.kwh} kWh)</span>` : ''}</span>
+      </button></li>`)}</ul>
+    </div>
+  </div>`;
+}
+
+function ShellA({ route, go, mode, P, children }) {
+  return html`<div class="shell shellA">
+    <nav class="railA" aria-label="Sections"><div class="brand">ha-spark</div>
+      ${ROUTES.map((r) => html`<button aria-current=${route === r.key ? 'page' : null} onClick=${() => go(r.key)}><${Icon} name=${r.key} />${r.label}</button>`)}
+    </nav>
+    <div class="mainA">
+      <header class="topA"><h1>${ROUTES.find((r) => r.key === route).label}</h1><span class="grow"></span>
+        <${Mode} mode=${mode} />${P.tl && html`<span class="note num">plan ${hm(P.now)}</span>`}</header>
+      ${children}
+    </div>
+  </div>`;
+}
+
+/* ---------------- Variant B: agenda ---------------- */
+function segmentsOf(P) {
+  const out = [];
+  P.tl.slots.forEach((s, i) => {
+    const key = actKey(s), last = out[out.length - 1];
+    if (last && last.key === key && last.price === s.import_price) last.end = i;
+    else out.push({ key, start: i, end: i, price: s.import_price, exp: s.export_price });
+  });
+  return out.map((g) => ({
+    ...g,
+    soc0: P.tl.slots[g.start].soc_pct,
+    soc1: (P.tl.slots[g.end + 1] || P.tl.slots[g.end]).soc_pct,
+    reasons: P.lines.filter((l) => l.kind === 'reserve' ? l.i1 - 1 >= g.start && l.i1 - 1 <= g.end : l.i0 >= g.start && l.i0 <= g.end),
+  }));
+}
+
+function SocSpark({ P, height = 84 }) {
+  const [ref, w] = useWidth();
+  const { tl, n } = P;
+  const W = Math.max(w, 200), L = 30;
+  const x = (i) => L + (W - L - 4) * i / n, y = (v) => 6 + (height - 24) * (1 - v / 100);
+  const soc = socPaths(tl, x, y);
+  return html`<div ref=${ref}>${w > 0 && html`<svg width=${W} height=${height} role="img" aria-label="State of charge over the plan">
+    ${tl.slots.map((s, i) => s.actions.length > 0 && html`<rect x=${x(i)} y=${height - 14} width=${x(i + 1) - x(i)} height="5" fill=${ACT[s.actions[0]].c} />`)}
+    ${[0, 100].map((v) => html`<line x1=${L} x2=${W - 4} y1=${y(v)} y2=${y(v)} stroke="var(--line)" /><text x=${L - 4} y=${y(v) + 3} text-anchor="end">${v}%</text>`)}
+    <path d=${soc.ramp} fill="none" stroke="var(--charge)" stroke-width="2" stroke-dasharray="4 3" />
+    <path d=${soc.path} fill="none" stroke="var(--charge)" stroke-width="2" />
+    ${[0, n / 2, n].map((i) => html`<text x=${x(i)} y=${height - 1} text-anchor=${i === 0 ? 'start' : i === n ? 'end' : 'middle'}>${hm(P.at(i))}</text>`)}
+  </svg>`}</div>`;
+}
+
+function headline(P) {
+  const by = (k) => P.lines.find((l) => l.kind === k);
+  const parts = [];
+  const c = by('charge'), h = by('hold'), e = by('export');
+  if (c) parts.push(`charge ${pct(P.tl.soc_now)} → ${pct(P.tl.target_soc)} overnight`);
+  if (h) parts.push(`hold through the ${hm(Date.parse(h.start))} dispatch`);
+  if (e) parts.push(`export ${hm(Date.parse(e.start))}–${hm(Date.parse(e.end))}`);
+  if (P.lines.some((l) => l.kind === 'skip')) parts.push('skip the slots the battery can’t fund');
+  if (!parts.length) return 'Nothing to do: the battery covers the day.';
+  const s = parts.join(', ').replace(/, ([^,]*)$/, ' and $1');
+  return s[0].toUpperCase() + s.slice(1) + '.';
+}
+
+function PlanB({ P }) {
+  const segs = segmentsOf(P);
+  return html`<div class="planB">
+    <div class="stack">
+      <div><div class="eyebrow">Tonight and tomorrow</div><p class="headlineB">${headline(P)}</p></div>
+      <ol class="agenda">${segs.map((g) => html`<li class="ag-row">
+        <div class="ag-time num">${hm(P.at(g.start))}<span>${hm(P.at(g.end + 1))}</span></div>
+        <div class="ag-bar" style=${{ background: segColor(g.key), minHeight: (g.end - g.start + 1) * 5 + 'px' }}></div>
+        <div class="ag-body">
+          <div class="ag-title">${segTitle(g.key)} <span class="muted num" style=${{ fontWeight: 400, fontSize: '.82rem' }}>${dur(g.end - g.start + 1)}</span></div>
+          <div class="ag-meta">SoC ${pct(g.soc0)} → ${pct(g.soc1)} · import ${pence(g.price)}${g.key.includes('export') || g.key.includes('skip') ? ' · export ' + pence(g.exp) : ''}</div>
+          ${g.reasons.map((l) => html`<p class="ag-reason ${l.kind}">${l.kind === 'reserve' ? html`<b>Keep ${l.kwh} kWh until ${hm(Date.parse(l.end))}.</b> ` : ''}${l.text}</p>`)}
+        </div></li>`)}</ol>
+    </div>
+    <aside class="stack">
+      <div class="card stack"><div class="eyebrow">State of charge</div><${SocSpark} P=${P} height=${130} /><${Legend} tl=${P.tl} /></div>
+      <${Costs} tl=${P.tl} />
+    </aside>
+  </div>`;
+}
+
+function ShellB({ route, go, mode, children }) {
+  return html`<div class="shell shellB">
+    <header class="topB"><div class="row"><span class="brand">ha-spark</span><span class="grow"></span><${Mode} mode=${mode} /></div>
+      <nav class="tabsB" aria-label="Sections">${ROUTES.map((r) => html`<button aria-current=${route === r.key ? 'page' : null} onClick=${() => go(r.key)}>${r.label}</button>`)}</nav>
+    </header>
+    <main class="mainB">${children}</main>
+  </div>`;
+}
+
+/* ---------------- Variant C: now/next + dial ---------------- */
+function Dial({ P, sel, setSel, hl }) {
+  const [ref, w] = useWidth();
+  const { tl, n } = P;
+  const S = Math.min(Math.max(w, 260), 440), c = S / 2, R = c - 24;
+  const ang = (ms) => minutesOfDay(ms) / 1440 * 2 * Math.PI - Math.PI / 2;
+  const pt = (a, r) => [c + r * Math.cos(a), c + r * Math.sin(a)];
+  const arc = (a0, a1, r0, r1) => {
+    const [x0, y0] = pt(a0, r1), [x1, y1] = pt(a1, r1), [x2, y2] = pt(a1, r0), [x3, y3] = pt(a0, r0);
+    return `M${x0},${y0} A${r1},${r1} 0 0 1 ${x1},${y1} L${x2},${y2} A${r0},${r0} 0 0 0 ${x3},${y3} Z`;
+  };
+  const span = 2 * Math.PI / 48;
+  const r0 = R * 0.3, r1 = R - 38, rs = (v) => r0 + (r1 - r0) * v / 100;
+  const prices = tl.slots.map((s) => s.import_price);
+  const lo = Math.min(...prices), hi = Math.max(...prices);
+  const socPts = tl.slots.map((s, i) => s.soc_pct == null ? null : [...pt(ang(P.at(i)) + span / 2, rs(s.soc_pct)), s.soc_kind]);
+  const line = (k) => { const pts = socPts.filter((p, i) => p && (k === 'ramp' ? p[2] === 'ramp' || (i > 0 && socPts[i - 1] && socPts[i - 1][2] === 'ramp') : p[2] !== 'ramp')); return pts.length ? 'M' + pts.map((p) => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' L') : ''; };
+  const nowA = ang(P.now);
+  const s = sel != null ? tl.slots[sel] : null;
+  return html`<div ref=${ref} style=${{ width: '100%', display: 'flex', justifyContent: 'center' }}>${w > 0 && html`
+    <svg width=${S} height=${S} role="img" aria-label="24-hour plan dial">
+      <circle cx=${c} cy=${c} r=${rs(100)} fill="none" stroke="var(--line)" />
+      <circle cx=${c} cy=${c} r=${rs(tl.min_soc)} fill="none" stroke="var(--skip)" stroke-dasharray="3 3" />
+      ${tl.slots.map((sl, i) => {
+        const a0 = ang(P.at(i)), a1 = a0 + span - 0.012, on = hl && i >= hl.i0 && i < hl.i1;
+        const acts = sl.actions;
+        const ring = acts.length === 0 ? html`<path d=${arc(a0, a1, R - 16, R)} fill="var(--ring-idle)" />`
+          : acts.length === 1 ? html`<path d=${arc(a0, a1, R - 16, R)} fill=${ACT[acts[0]].c} />`
+          : html`<path d=${arc(a0, a1, R - 16, R - 8)} fill=${ACT[acts[0]].c} /><path d=${arc(a0, a1, R - 8, R)} fill=${ACT[acts[1]].c} />`;
+        const heat = hi > lo ? (sl.import_price - lo) / (hi - lo) : 0;
+        return html`<g style=${{ cursor: 'pointer' }} onClick=${() => setSel(i)} opacity=${hl && !on ? 0.35 : 1}>${ring}
+          <path d=${arc(a0, a1, R - 30, R - 20)} fill=${heat > 0.5 ? 'var(--peak)' : 'var(--cheap)'} />
+          ${sel === i && html`<path d=${arc(a0, a1, R - 32, R + 2)} fill="none" stroke="var(--fg)" stroke-width="1.5" />`}</g>`;
+      })}
+      <path d=${line('ramp')} fill="none" stroke="var(--charge)" stroke-width="2" stroke-dasharray="4 3" />
+      <path d=${line('path')} fill="none" stroke="var(--charge)" stroke-width="2" />
+      ${[0, 3, 6, 9, 12, 15, 18, 21].map((h) => { const [tx, ty] = pt(h / 24 * 2 * Math.PI - Math.PI / 2, R + 13); return html`<text x=${tx} y=${ty + 3} text-anchor="middle">${String(h).padStart(2, '0')}</text>`; })}
+      <line x1=${c} y1=${c} x2=${pt(nowA, R - 2)[0]} y2=${pt(nowA, R - 2)[1]} stroke="var(--fg)" stroke-width="1.5" />
+      <circle cx=${c} cy=${c} r="3" fill="var(--fg)" />
+      ${s ? html`<text x=${c} y=${c - 14} text-anchor="middle" style=${{ font: '600 13px var(--font-num)', fill: 'var(--fg)' }}>${hm(P.at(sel))}–${hm(P.at(sel + 1))}</text>
+          <text x=${c} y=${c + 4} text-anchor="middle">${s.actions.length ? s.actions.map((a) => ACT[a].label).join(' + ') : 'idle'}</text>
+          <text x=${c} y=${c + 20} text-anchor="middle">SoC ${pct(s.soc_pct)} · ${pence(s.import_price)}</text>`
+        : html`<text x=${c} y=${c + 22} text-anchor="middle">now ${hm(P.now)}</text>`}
+    </svg>`}</div>`;
+}
+
+function PlanC({ P }) {
+  const [sel, setSel] = useState(null);
+  const [hlId, setHl] = useState(null);
+  const { tl } = P;
+  const next = P.lines.filter((l) => l.kind !== 'reserve' && l.start && Date.parse(l.start) >= P.now).sort((a, b) => Date.parse(a.start) - Date.parse(b.start))[0];
+  const inMin = next ? Math.round((Date.parse(next.start) - P.now) / 60000) : 0;
+  return html`<div class="planC">
+    <div class="nowC">
+      <div class="card stack">
+        <div class="big"><span class="pct">${pct(tl.soc_now)}</span><div><div class="eyebrow">Battery now</div><div class="muted num">${(tl.capacity_kwh * tl.soc_now / 100).toFixed(1)} of ${tl.capacity_kwh} kWh</div></div></div>
+        ${next && html`<div class="nextC" style=${{ borderLeftColor: ACT[next.kind].c }}>
+          <div class="eyebrow">Next · ${hm(Date.parse(next.start))} (in ${Math.floor(inMin / 60)} h ${inMin % 60} min)</div>
+          <div>${next.text}</div></div>`}
+      </div>
+      <${Costs} tl=${tl} />
+    </div>
+    <div class="card stack">
+      <div class="dialWrap"><${Dial} P=${P} sel=${sel} setSel=${setSel} hl=${P.lines.find((l) => l.id === hlId)} /><${Legend} tl=${tl} /></div>
+      <ul class="reasonsC">${P.lines.map((l) => html`<li><button aria-pressed=${hlId === l.id} onClick=${() => setHl(hlId === l.id ? null : l.id)}>
+        <${Chip} kind=${l.kind} /><span class="num muted" style=${{ fontSize: '.8rem' }}>${l.start ? hm(Math.max(Date.parse(l.start), P.t0)) : ''}</span><span class="txt">${l.text}</span></button></li>`)}</ul>
+    </div>
+  </div>`;
+}
+
+function ShellC({ route, go, mode, children }) {
+  return html`<div class="shell shellC">
+    <header class="stripC"><span class="brand">ha-spark</span><span class="muted">/ ${ROUTES.find((r) => r.key === route).label}</span><span class="grow"></span><${Mode} mode=${mode} /></header>
+    <main class="mainC">${children}</main>
+    <nav class="dockC" aria-label="Sections">${ROUTES.map((r) => html`<button aria-current=${route === r.key ? 'page' : null} onClick=${() => go(r.key)}><${Icon} name=${r.key} />${r.label}</button>`)}</nav>
+  </div>`;
+}
+
+/* ---------------- shared stub screens (the shell is the question here) ---------------- */
+function Override({ P }) {
+  const [pick, setPick] = useState('1h');
+  return html`<div class="stack">
+    <p class="note">Stub. The override contract belongs to the manual-override decision ticket; nothing here sends a request.</p>
+    <div class="ovr">
+      ${[['Force charge', 'Charge from the grid now, ignoring the plan.', 'var(--charge)'], ['Stop charging', 'Pause any planned or running charge.', 'var(--skip)']].map(([t, d, c]) => html`
+        <div class="card stack" style=${{ borderTop: `3px solid ${c}` }}><h2>${t}</h2><p class="muted" style=${{ margin: 0 }}>${d}</p>
+          <div class="seg">${['30m', '1h', '2h', 'until 05:30'].map((k) => html`<button aria-pressed=${pick === k} onClick=${() => setPick(k)}>${k}</button>`)}</div>
+          <button class="btn primary" disabled>${t} for ${pick}</button></div>`)}
+    </div>
+    <p class="note">Mode is <b>${P.tl ? P.tl.proactive_mode : 'unknown'}</b>: an override runs through the same gate as the planner.</p>
+  </div>`;
+}
+
+function Chat({ P }) {
+  return html`<div class="card stack" style=${{ maxWidth: '760px' }}>
+    <div class="bubbles">
+      <div class="bubble me">Why is it charging to ${pct(P.tl && P.tl.target_soc)} tonight?</div>
+      <div class="bubble"><pre>${P.d.explain.slice(0, 14).join('\n')}</pre></div>
+      <div class="bubble me">Can I skip the export tomorrow?</div>
+      <div class="bubble">I can explain the plan but I can’t change devices. Use Override, or add a context note and I’ll replan.</div>
+    </div>
+    <div class="chatin"><input id="chat-input" placeholder="Ask about the plan" disabled /><button class="btn primary" disabled>Send</button></div>
+    <p class="note">Stub. The transcript reuses the CLI’s plan explanation; streaming and history are open questions.</p>
+  </div>`;
+}
+
+function Stats({ P }) {
+  return html`<div class="stack">${P.tl && html`<${Costs} tl=${P.tl} />`}
+    <div class="empty">Stub. Savings history, forecast accuracy and calibration drift wait on the statistics catalogue.</div></div>`;
+}
+
+function Settings({ P }) {
+  const [mode, setMode] = useState(P.tl ? P.tl.proactive_mode : 'simulate');
+  const tl = P.tl || {};
+  return html`<div class="card" style=${{ maxWidth: '680px' }}>
+    <div class="field"><div><b>Control</b><div class="note">Off computes only; simulate logs intended writes; on drives devices.</div></div>
+      <div class="seg">${['off', 'simulate', 'on'].map((m) => html`<button aria-pressed=${mode === m} onClick=${() => setMode(m)}>${m}</button>`)}</div></div>
+    <div class="field"><span>Battery capacity</span><span class="num">${tl.capacity_kwh} kWh</span></div>
+    <div class="field"><span>Never below</span><span class="num">${tl.min_soc}%</span></div>
+    <div class="field"><span>Charge strategy</span><span class="num">${tl.strategy}</span></div>
+    <div class="field"><span>Charge window</span><span class="num">23:30–05:30</span></div>
+    <p class="note">Stub. Values come from the plan payload; nothing is saved.</p>
+  </div>`;
+}
+
+function Onboarding() {
+  return html`<div class="card stack" style=${{ maxWidth: '720px' }}>
+    <ol class="steps"><li class="done">Inverter</li><li class="cur">Battery</li><li>Tariff</li><li>Forecast</li><li>Big loads</li><li>Review</li></ol>
+    <h2>How big is the battery?</h2>
+    <div class="field"><span>Usable capacity</span><span class="num">20.0 kWh</span></div>
+    <div class="field"><span>Never discharge below</span><span class="num">15%</span></div>
+    <div class="field"><span>Shared with another inverter?</span><span>No</span></div>
+    <div style=${{ display: 'flex', gap: '8px' }}><button class="btn">Back</button><button class="btn primary">Next: tariff</button></div>
+    <p class="note">Stub. The onboarding flow has its own prototype ticket.</p>
+  </div>`;
+}
+
+/* ---------------- prototype chrome ---------------- */
+function readVariant() {
+  try { const v = new URLSearchParams(location.search).get('variant'); if (VARIANTS.some((x) => x.key === v)) return v; } catch { /* no URL access */ }
+  const s = store.get('variant');
+  return VARIANTS.some((x) => x.key === s) ? s : 'A';
+}
+function writeVariant(v) {
+  store.set('variant', v);
+  try { const u = new URL(location.href); u.searchParams.set('variant', v); history.replaceState(null, '', u); } catch { /* sandboxed */ }
+}
+function readRoute() {
+  const m = (location.hash || '').match(/^#\/?([a-z]+)/);
+  return m && ROUTES.some((r) => r.key === m[1]) ? m[1] : 'plan';
+}
+
+function ProtoBar({ variant, setVariant, ds, setDs, drawer, setDrawer }) {
+  const i = VARIANTS.findIndex((v) => v.key === variant);
+  const cur = VARIANTS[i];
+  const step = (d) => setVariant(VARIANTS[(i + d + VARIANTS.length) % VARIANTS.length].key);
+  return html`<div class="protobar" role="toolbar" aria-label="Prototype controls">
+    <button aria-label="Previous variant" onClick=${() => step(-1)}>←</button>
+    <span class="lbl">${cur.key} · ${cur.name} <small>(${cur.note})</small></span>
+    <button aria-label="Next variant" onClick=${() => step(1)}>→</button>
+    <select id="proto-dataset" aria-label="Dataset" value=${ds} onChange=${(e) => setDs(e.target.value)}>${DATASETS.map((k) => html`<option value=${k}>${k}</option>`)}</select>
+    <button aria-pressed=${drawer} aria-label="Show payload" onClick=${() => setDrawer(!drawer)}>{ }</button>
+  </div>`;
+}
+
+function Drawer({ P, variant, route, ds }) {
+  const [tab, setTab] = useState('timeline');
+  const body = tab === 'timeline' ? P.tl : tab === 'api' ? P.d.api_plan : P.d.explain.join('\n');
+  return html`<div class="drawer"><header>
+      <span style=${{ fontSize: '12px', opacity: 0.8, marginRight: '6px' }}>variant ${variant} · #/${route} · ${ds}</span>
+      ${[['timeline', 'timeline (proposed)'], ['api', '/api/plan (today)'], ['explain', 'CLI explain']].map(([k, l]) => html`<button aria-pressed=${tab === k} onClick=${() => setTab(k)}>${l}</button>`)}
+    </header><pre>${typeof body === 'string' ? body : JSON.stringify(body, null, 1)}</pre></div>`;
+}
+
+function App() {
+  const [variant, setV] = useState(readVariant);
+  const [route, setRoute] = useState(readRoute);
+  const [ds, setDsState] = useState(() => { const s = store.get('ds'); return DATASETS.includes(s) ? s : DATASETS[0]; });
+  const [drawer, setDrawer] = useState(false);
+  const setVariant = (v) => { writeVariant(v); setV(v); };
+  const setDs = (k) => { store.set('ds', k); setDsState(k); };
+  const go = (r) => { try { location.hash = '#/' + r; } catch { /* sandboxed */ } setRoute(r); };
+  useEffect(() => {
+    const onHash = () => setRoute(readRoute());
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+  useEffect(() => {
+    const onKey = (e) => {
+      const t = e.target;
+      if (t && (t.closest('input, textarea, select, [contenteditable]'))) return;
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      const i = VARIANTS.findIndex((v) => v.key === variant);
+      setVariant(VARIANTS[(i + (e.key === 'ArrowRight' ? 1 : -1) + VARIANTS.length) % VARIANTS.length].key);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [variant]);
+  if (!DATASETS.length) return html`<div class="empty" style=${{ margin: '24px' }}>No fixtures loaded. Run make_fixture.py next to this file.</div>`;
+  const P = prep(ds);
+  const mode = P.tl ? P.tl.proactive_mode : 'simulate';
+  const PlanV = { A: PlanA, B: PlanB, C: PlanC }[variant];
+  const content = route === 'plan' ? (P.tl ? html`<${PlanV} P=${P} />` : html`<div class="empty">This plan has no per-slot horizon (daily model), so there is no timeline to draw.</div>`)
+    : route === 'override' ? html`<${Override} P=${P} />` : route === 'chat' ? html`<${Chat} P=${P} />`
+    : route === 'stats' ? html`<${Stats} P=${P} />` : route === 'settings' ? html`<${Settings} P=${P} />` : html`<${Onboarding} />`;
+  const Shell = { A: ShellA, B: ShellB, C: ShellC }[variant];
+  return html`<${Shell} key=${variant + ds} route=${route} go=${go} mode=${mode} P=${P}>${content}<//>
+    <${ProtoBar} variant=${variant} setVariant=${setVariant} ds=${ds} setDs=${setDs} drawer=${drawer} setDrawer=${setDrawer} />
+    ${drawer && html`<${Drawer} P=${P} variant=${variant} route=${route} ds=${ds} />`}`;
+}
+
+render(html`<${App} />`, document.getElementById('app'));
+</script>

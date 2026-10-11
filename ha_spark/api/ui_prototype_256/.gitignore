@@ -1,0 +1,5 @@
+# Live household plan and the options it came from: never committed.
+fixtures_live.js
+*.yaml
+*.yml
+options*.json
