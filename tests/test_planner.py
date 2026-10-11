@@ -1176,3 +1176,120 @@ def test_daily_model_has_no_soc_path() -> None:
     inp = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
 
     assert _plan(inp, cfg()).soc_path == ()
+
+
+def test_winter_heavy_day_v2l_refills_house_battery() -> None:
+    """A 30 kWh day (10 base + 20 heat pump) exceeds the 18.8 kWh battery."""
+    inp = PlannerInputs(
+        soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=30,
+        load_slots=(0.0,) * 12 + (30 / 36,) * 36,
+        horizon_start=datetime(2026, 1, 10, 23, 30, tzinfo=UTC),
+        car_plugged_in=True,
+    )
+    plan = _plan(inp, cfg(v2l_budget_kwh=15))
+    assert sum(action.kwh for action in plan.v2l_refills) == pytest.approx(11.184)
+    assert all(action.rate_kw == 1.5 for action in plan.v2l_refills)
+    assert all('reach-next-cheap-slot' in action.reason for action in plan.v2l_refills)
+    assert all(12 <= action.slot < 47 for action in plan.v2l_refills)
+    assert not plan.v2l_wanted_but_unavailable
+
+
+@pytest.mark.parametrize(('budget', 'plugged', 'grid', 'efficiency', 'wanted'), [
+    (0, True, 0.30, 0.85, False),
+    (15, False, 0.30, 0.85, True),
+    (15, True, 0.06, 0.85, False),
+    (15, True, 0.10, 0.50, False),
+])
+def test_v2l_availability_and_loss_adjusted_price(
+    budget: float, plugged: bool, grid: float, efficiency: float, wanted: bool,
+) -> None:
+    inp = PlannerInputs(
+        soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=30,
+        load_slots=(0.0,) * 12 + (30 / 36,) * 36, car_plugged_in=plugged,
+    )
+    plan = _plan(inp, cfg(v2l_budget_kwh=budget, rate_peak=grid,
+                          v2l_round_trip_efficiency=efficiency))
+    assert plan.v2l_refills == ()
+    assert plan.v2l_wanted_but_unavailable is wanted
+
+
+def test_v2l_budget_and_rate_bound_refills() -> None:
+    inp = PlannerInputs(
+        soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=30,
+        load_slots=(0.0,) * 12 + (30 / 36,) * 36, car_plugged_in=True,
+    )
+    plan = _plan(inp, cfg(v2l_budget_kwh=2, v2l_max_rate_kw=1,
+                          v2l_preferred_rate_kw=1.5))
+    assert sum(a.kwh for a in plan.v2l_refills) == pytest.approx(2)
+    assert all(a.rate_kw == 1 for a in plan.v2l_refills)
+    for slot in {a.slot for a in plan.v2l_refills}:
+        assert sum(a.kwh for a in plan.v2l_refills if a.slot == slot) <= 0.5
+
+
+def test_v2l_not_needed_when_solar_surplus_refills_battery() -> None:
+    inp = PlannerInputs(
+        soc=_soc(20), solar_tomorrow_kwh=15, predicted_home_load_kwh=30,
+        load_slots=(0.0,) * 12 + (1.0,) * 12 + (0.0,) * 3 + (1.0,) * 18 + (0.0,) * 3,
+        solar_slots=(0.0,) * 24 + (5.0,) * 3 + (0.0,) * 21,
+        car_plugged_in=True,
+    )
+    assert _plan(inp, cfg(v2l_budget_kwh=15)).v2l_refills == ()
+
+
+def test_v2l_refills_appear_in_expected_soc_path_and_cost() -> None:
+    inp = PlannerInputs(
+        soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=30,
+        load_slots=(0.0,) * 12 + (30 / 36,) * 36, car_plugged_in=True,
+        horizon_start=datetime(2026, 1, 10, 23, 30, tzinfo=UTC),
+    )
+    without = _plan(inp, cfg())
+    with_v2l = _plan(inp, cfg(v2l_budget_kwh=15))
+    assert with_v2l.soc_path[-1][1] > without.soc_path[-1][1]
+    assert with_v2l.planned_cost == pytest.approx(
+        without.planned_cost - 11.184 * (0.30 - 0.07 / 0.85)
+    )
+
+
+def test_v2l_does_not_refill_a_funded_reservation_or_assume_car_is_present() -> None:
+    inp = PlannerInputs(
+        soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=10,
+        load_slots=(0.0,) * 12 + (10 / 36,) * 36,
+    )
+    assert not inp.car_plugged_in
+    assert _plan(inp, cfg(v2l_budget_kwh=15)).v2l_refills == ()
+    assert not _plan(inp, cfg(v2l_budget_kwh=15)).v2l_wanted_but_unavailable
+
+
+def test_v2l_cannot_be_retroactively_stored_for_an_earlier_shortfall() -> None:
+    inp = PlannerInputs(
+        soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=30,
+        load_slots=(0.0,) * 12 + (30.0,) + (0.0,) * 35, car_plugged_in=True,
+    )
+    plan = _plan(inp, cfg(v2l_budget_kwh=15))
+    # Overnight already fills the battery: no headroom before the one heavy slot.
+    assert plan.v2l_refills == ()
+
+
+def test_v2l_prices_the_shortfall_slot_not_the_representative_peak_rate() -> None:
+    inp = PlannerInputs(
+        soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=30,
+        load_slots=(0.0,) * 12 + (30 / 36,) * 36, car_plugged_in=True,
+    )
+    config = cfg(v2l_budget_kwh=15)
+    schedule = fixed_schedule(inp, config)
+    schedule = replace(schedule, prices=(0.01,) * 48)
+    assert compute_plan(inp, config, schedule).v2l_refills == ()
+
+
+def test_v2l_soc_path_starts_after_pre_window_drain() -> None:
+    inp = PlannerInputs(
+        soc=_soc(90), solar_tomorrow_kwh=0, predicted_home_load_kwh=20,
+        pre_window_drain_kwh=5,
+        load_slots=(0.0,) * 12 + (20 / 36,) * 36, car_plugged_in=True,
+        horizon_start=datetime(2026, 1, 10, 23, 30, tzinfo=UTC),
+    )
+    plan = _plan(inp, cfg(v2l_budget_kwh=15))
+    assert sum(action.kwh for action in plan.v2l_refills) == pytest.approx(6.184)
+    assert plan.soc_path[0][1] == pytest.approx(71.3988095238)
+    # At the final slot start only its 20/36 kWh remains above the 20% floor.
+    assert plan.soc_path[-1][1] == pytest.approx(22.0667989418)

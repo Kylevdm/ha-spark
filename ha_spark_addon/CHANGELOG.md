@@ -4,6 +4,9 @@
 
 ## 0.22.0
 
+- Plan reservation-backed V2L house-battery refills when cheaper than the grid
+  (#160), with explicit plugged-in availability and a per-plan energy budget.
+  Add `v2l_max_rate_kw` (3.0) and `v2l_preferred_rate_kw` (1.5), validated at startup.
 - Axle export events now use `export_event_provider: axle`, independently of
   `tariff_provider` (#177). The default `none` disables Axle reads even with
   a configured API key. Fixed, dynamic, and Octopus Intelligent tariffs keep
