@@ -1279,3 +1279,17 @@ def test_v2l_prices_the_shortfall_slot_not_the_representative_peak_rate() -> Non
     schedule = fixed_schedule(inp, config)
     schedule = replace(schedule, prices=(0.01,) * 48)
     assert compute_plan(inp, config, schedule).v2l_refills == ()
+
+
+def test_v2l_soc_path_starts_after_pre_window_drain() -> None:
+    inp = PlannerInputs(
+        soc=_soc(90), solar_tomorrow_kwh=0, predicted_home_load_kwh=20,
+        pre_window_drain_kwh=5,
+        load_slots=(0.0,) * 12 + (20 / 36,) * 36, car_plugged_in=True,
+        horizon_start=datetime(2026, 1, 10, 23, 30, tzinfo=UTC),
+    )
+    plan = _plan(inp, cfg(v2l_budget_kwh=15))
+    assert sum(action.kwh for action in plan.v2l_refills) == pytest.approx(6.184)
+    assert plan.soc_path[0][1] == pytest.approx(71.3988095238)
+    # At the final slot start only its 20/36 kWh remains above the 20% floor.
+    assert plan.soc_path[-1][1] == pytest.approx(22.0667989418)
