@@ -161,6 +161,8 @@ _OPTION_KEYS = frozenset(
         "v2l_cutoff_time",
         "v2l_notify_service",
         "v2l_budget_kwh",
+        "v2l_max_rate_kw",
+        "v2l_preferred_rate_kw",
         "v2l_rectifier_efficiency",
         "v2l_charge_kw",
         "v2l_soc_tolerance_pct",
@@ -559,6 +561,8 @@ class Settings(BaseSettings):
     # Optional V2L budget (kWh) standing in for car SoC; 0 disables the
     # predictive plug-in warning.
     v2l_budget_kwh: float = Field(default=0.0)
+    v2l_max_rate_kw: float = Field(default=3.0, gt=0, allow_inf_nan=False)
+    v2l_preferred_rate_kw: float = Field(default=1.5, gt=0, allow_inf_nan=False)
     # Rectifier AC->DC efficiency from the car into the house battery, and the
     # DC rate it charges at (measured: 10 A AC input limit) (#208).
     v2l_rectifier_efficiency: float = Field(default=0.94, gt=0, le=1)
@@ -575,6 +579,12 @@ class Settings(BaseSettings):
         if isinstance(v, str) and v.strip().isdigit():
             return int(v.strip())
         return v
+
+    @model_validator(mode="after")
+    def _validate_v2l_rates(self) -> Settings:
+        if self.v2l_preferred_rate_kw > self.v2l_max_rate_kw:
+            raise ValueError("v2l_preferred_rate_kw must not exceed v2l_max_rate_kw")
+        return self
 
     @model_validator(mode="after")
     def _synthesize_devices(self) -> Settings:

@@ -157,6 +157,12 @@ class PlannerConfig:
     charge_efficiency: float = 0.90  # round-trip AC->DC->AC; buy required/efficiency
     strategy: str = "deficit"  # "deficit" (buy the shortfall) | "fill" (to target cap)
 
+    v2l_budget_kwh: float = 0.0
+    v2l_round_trip_efficiency: float = 0.85
+    v2l_offpeak_rate_gbp: float = 0.07
+    v2l_max_rate_kw: float = 3.0
+    v2l_preferred_rate_kw: float = 1.5
+
     @property
     def window_hours(self) -> float:
         """Length of the (possibly midnight-wrapping) charge window, in hours."""
@@ -186,6 +192,7 @@ class PlannerInputs:
     # means "unreadable", not "cancelled", so a verified resident export must
     # not be cleared (#148).
     flexibility_event_trusted: bool = True
+    car_plugged_in: bool = False
     ev_charging: bool = False
     # Current evidence for the inverter hold: ``None`` means no configured or
     # readable EV status source. The pure planner does not forecast this hold.
@@ -311,6 +318,20 @@ class Reservation:
 
 
 @dataclass(frozen=True)
+class V2LRefill:
+    """Energy stored in the house battery during a half-hour slot.
+
+    kWh and rate are delivered battery energy; a partial slot keeps the
+    preferred rate and runs for kwh / rate_kw hours.
+    """
+
+    slot: int
+    kwh: float
+    rate_kw: float
+    reason: str
+
+
+@dataclass(frozen=True)
 class ChargePlan:
     """The computed plan: the numbers, plus the ChargeIntent a Charger realizes."""
 
@@ -345,6 +366,8 @@ class ChargePlan:
     # Named battery obligations computed from the slot horizon. The daily model
     # intentionally leaves this empty to preserve its legacy contract.
     reservations: tuple[Reservation, ...] = ()
+    v2l_refills: tuple[V2LRefill, ...] = ()
+    v2l_wanted_but_unavailable: bool = False
     # Skips are part of the plan rather than silently becoming lower-current
     # delivery: every accepted export slot is always a complete half-hour.
     export_skips: tuple[ExportSkip, ...] = ()
