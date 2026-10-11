@@ -267,7 +267,7 @@ def _event_export_prices(
 class AxleTariffProvider:
     """Overlay a validated Axle export event on the existing tariff schedule."""
 
-    fallback: FixedTariffProvider
+    fallback: TariffProvider
     event_rate_gbp_kwh: float | None = None
 
     def schedule(self, inputs: PlannerInputs, cfg: PlannerConfig) -> TariffSchedule:
