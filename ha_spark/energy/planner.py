@@ -949,8 +949,18 @@ def compute_plan(
             max(0.0, solar * cfg.solar_haircut_k - load)
             for load, solar in zip(inputs.load_slots, solar_slots, strict=True)
         ) if refills else ()
+        # The V2L ledger starts with the energy actually left after the
+        # pre-window drain and overnight purchase. Its projection must share
+        # that starting balance, rather than the legacy charge target.
+        path_start_soc = (
+            _clamp(
+                cfg.min_soc + (usable_at_window + required) / cfg.capacity_kwh * 100,
+                cfg.min_soc,
+                cfg.target_cap,
+            ) if refills else target_soc
+        )
         soc_path = _soc_path(
-            inputs.horizon_start, net, schedule, export, target_soc, cfg, refills, surplus
+            inputs.horizon_start, net, schedule, export, path_start_soc, cfg, refills, surplus
         )
 
     holds = controlled
