@@ -273,3 +273,14 @@ _Avoid_: Solis fallback
 **Agent-editable setting**:
 A household setting the owner has allowed the product agent to request
 changing. That permission does not itself approve a particular change.
+
+**Replan request**:
+A request for ha-spark to plan now instead of waiting for the next regular
+planning time. It carries no authority: planning and any resulting change
+happen exactly as the operating mode allows, and the regular schedule
+continues. Requests come from the owner, from the agent, or from saving a
+dated household fact. Requests that arrive close together are combined, and the agent's
+requests are spaced out; the owner's are not. A request counts as the agent's
+whenever the assistant chose to make it, wherever it was asked from.
+(Decision: #269, 2026-10-12.)
+_Avoid_: run plan, force replan, apply now
