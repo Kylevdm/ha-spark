@@ -139,7 +139,20 @@ supply across its connected inverters, with a separate limit for each direction.
 
 **Site export limit**:
 The maximum combined grid-export power permitted at the household's grid
-connection, including battery and solar output after house consumption.
+connection, including battery and solar output after house consumption. It is
+the stricter of the DNO export permission and the export direction of the
+supply current limit, and every consumer (planner, device bound, live checks)
+uses this one value.
+(Decision: #283, 2026-10-12.)
+
+**Device export bound**:
+An export limit held and enforced by the inverter itself, covering its solar
+and battery output together. The owner or installer sets it; ha-spark verifies
+it and never writes it. Scheduled battery export needs a verified bound on
+every export-capable inverter, and those bounds must together stay within the
+site export limit.
+(Decision: #283, 2026-10-12.)
+_Avoid_: EPM (vendor term), export guard
 
 **Charging allocation**:
 The charging power assigned to a bank and divided across its connected
