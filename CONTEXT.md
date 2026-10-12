@@ -270,6 +270,23 @@ back; recovery being *ready* does not end it.
 (Decision: #266, 2026-10-12.)
 _Avoid_: Solis fallback
 
+**Owner**:
+A Home Assistant administrator acting for the household through ha-spark's
+own page or its command line. A household can have several owners, and each
+has the same standing. Only an owner can approve a config proposal, change the
+operating mode or start an override.
+(Decision: #278, 2026-10-12.)
+_Avoid_: HA owner, admin user, the user
+
+**Config proposal**:
+A change to agent-editable settings that the agent has asked for and that
+has not yet been applied. It is fixed once made. Only an owner's approval on
+ha-spark's own page applies it, and approving it applies it at once. It expires
+unapproved after 15 minutes or when the add-on restarts, and a newer proposal
+from the same agent replaces it.
+(Decision: #278, 2026-10-12.)
+_Avoid_: pending change, approval token
+
 **Agent-editable setting**:
 A household setting the owner has allowed the product agent to request
 changing. That permission does not itself approve a particular change.
