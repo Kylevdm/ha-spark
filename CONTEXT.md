@@ -155,6 +155,20 @@ connection, including battery and solar output after house consumption.
 The charging power assigned to a bank and divided across its connected
 inverters within device, bank and shared site limits.
 
+**Supply guard**:
+The safeguard that cuts controlled grid charging quickly when measured site
+import exceeds the supply current limit, and restores it slowly once headroom
+has held. It never raises charging above the requested target, and it applies
+whenever charging is controlled, including temporary manual control.
+(Decision: #165, 2026-10-11.)
+_Avoid_: fuse guard, throttle
+
+**Major load**:
+A household load large enough to use up supply headroom by itself, such as
+the car charger, a heat pump heating or cooling, or an induction hob.
+Onboarding records each one's demand.
+_Avoid_: big load, heavy appliance
+
 **Export ceiling**:
 The maximum grid-export power for a slot, after applying the relevant site or
 DNO limit and the power the battery and solar can supply once house load is
