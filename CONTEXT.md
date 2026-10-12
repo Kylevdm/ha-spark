@@ -210,10 +210,18 @@ resident window's)
 ha-spark stops the house battery discharging so it never feeds the car. A
 hold is caused by an Octopus dispatch, or by the car actively charging
 (charging, boosting or delivering; *not* eco+ solar diversion) whether or not
-a dispatch explains it. Hold evidence that can't be read is ignored rather
-than believed, and a hold outranks a flexibility-event export.
-(Decision: #170, 2026-10-04.)
+a dispatch explains it. Unknown evidence cannot start a hold; a confirmed EV
+hold needs fresh clear evidence or explicit handover to end, while a dispatch
+hold ends at its last trusted end time. A hold outranks fallback charging and
+a flexibility-event export.
+(Decisions: #170, 2026-10-04; #267, 2026-10-12.)
 _Avoid_: dispatch hold (when meaning either cause), pause, block
+
+**Fresh protection evidence**:
+An EV, dispatch, or battery-direction observation whose source has reported
+within its validated age limit. An unchanged cached Home Assistant state alone
+does not establish freshness.
+(Decision: #267, 2026-10-12.)
 
 **Operating mode**:
 The scope of automatic hardware control authorised by the owner: Observe,
