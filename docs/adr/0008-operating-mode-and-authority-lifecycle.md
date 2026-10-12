@@ -1,0 +1,66 @@
+# Operating-mode and authority lifecycle
+
+Status: accepted (2026-10-12), confirmed by the owner in [Operating modes and authority: transitions, persistence, and recovery](https://github.com/Kylevdm/ha-spark/issues/266). This is a v1 planning contract, not implemented behavior. It completes the lifecycle left open by [ADR-0005](0005-integration-authority-and-operating-modes.md), amends ADR-0005 and [ADR-0007](0007-protection-evidence-and-outage-boundary.md) where noted, and uses the stores fixed by [ADR-0006](0006-configuration-ownership-and-agent-edits.md).
+
+## Scope and source of truth
+
+There is one operating mode for the whole site, and temporary manual control hands over the whole site's controls. Every device must be validated for the selected mode; one unvalidated device blocks that mode for the site. Per-bank modes and owner-declared unmanaged devices are out of scope for v1, because a bank shared between a controlled and an uncontrolled inverter puts the planner against flows it cannot command.
+
+The integration's durable runtime store is the only source of truth for the operating mode, the manual session (deadline, return-to mode, protection kept or not), fallback active and its causes, any transition in progress, and the authority epoch. The add-on keeps no copy: it reads this state from the integration and requests every change through one integration authority command. A config save never changes it.
+
+## Legacy gates are retired, not mapped
+
+`proactive_mode` (`off`/`simulate`/`on`) and per-device `ControlAuthority` (`observe`/`ha_spark`/`supplier`) are retired. The household cuts over as a fresh install (ADR-0006), and in v1 the add-on has no write path of its own, so nothing is left to map. Every install starts in Observe; no legacy value, including `on` with `ha_spark`, carries into Protect or Optimise. Today's `off` and `simulate` become Observe, and `supplier` is dropped. The CLAUDE.md actuation invariant is reworded to these modes when this is implemented.
+
+## Transitions
+
+| From → To | Refused unless | Steps |
+|---|---|---|
+| Observe → Protect | every device has a validated hold, release, read-back and freshness contract (ADR-0007) | epoch +1; protection starts evaluating evidence; no charging writes |
+| Observe or Protect → Optimise | the above, a validated fallback schedule, a live add-on session, and a trusted SoC | epoch +1; *activating* until the first fresh plan is fully applied and verified |
+| Optimise → Protect | — | verified handover of charging controls: cancel automatic export, write the fallback schedule as the owner's starting schedule; protection continues |
+| Protect or Optimise → Observe | — | the verified handover agreed in ADR-0005; from Protect it releases only protection-owned controls and never touches the owner's charging |
+| Protect or Optimise → manual | — | hand over every control except protection-owned controls when protection is kept |
+| Observe → manual | not offered | ha-spark owns nothing in Observe |
+
+A refused transition writes nothing. A transition into an active mode keeps its grant when its first apply partly fails: the UI shows *activating* with the failing actions, failures stay isolated and retry on the normal cycle, and nothing rolls back automatically, because a rollback would be a transition the owner did not request. While a transition is in progress, only → Observe or a manual handover may supersede it; any other request is refused as *transition in progress*.
+
+During a manual session, Protect ↔ Optimise changes only the return-to mode and keeps the deadline. → Observe ends the session at once, releasing kept protection through a verified release and leaving the owner's edits alone. Manual control may start while fallback is active; at expiry, the return to Optimise re-applies fallback if any cause remains.
+
+**Amends ADR-0005.** Protect does not depend on the add-on, so losing the add-on in Protect is a warning only: protection continues and nothing new is written. The fallback charging schedule applies only when the current or return-to mode is Optimise. A manual session expiring into Protect returns directly to Protect, the integration resumes protection-owned controls, and the owner's charging edits stay. A validated fallback schedule is therefore required to enter Optimise, not Protect.
+
+## Deadlines and the household clock
+
+"One hour" is 3600 seconds of elapsed time. "Until tomorrow" is the next occurrence of a configurable household-clock time, default 07:00, shown with its date before the owner confirms (at 00:30 that is the same morning). It is resolved once, at handover, to a UTC instant: a nonexistent local time in a spring-forward gap moves to the first valid instant after the gap, and an ambiguous fall-back time takes the first occurrence. The stored instant is never re-resolved, so a later household-zone edit cannot move an agreed deadline. The integration enforces deadlines on Home Assistant's UTC clock, never the inverter clock.
+
+## Liveness
+
+The integration polls the add-on's direct API every 30 seconds with the bearer token from Supervisor discovery. A heartbeat counts only when it carries the add-on session the integration has accepted and a control-loop tick inside the two-minute window. It asserts that the add-on's control loop is running and can reach the integration, not that the plan is good; plan-quality failures use the explicit fallback causes below. Pull was chosen over a push service because every add-on reaches Home Assistant as the same Supervisor user, so a heartbeat service could be faked by any admin, automation, Assist, or other add-on.
+
+Add-on commands remain Home Assistant services. The integration accepts them only from the Supervisor user's context and only with the current session id and authority epoch. This excludes Home Assistant users, automations and Assist; other add-ons are already trusted at Supervisor level and are not defended against. That Supervisor-proxied calls arrive with the Supervisor user's `context.user_id` is unverified and must be confirmed before implementation.
+
+## Stale and racing commands
+
+The authority epoch is a durable counter incremented on every mode change, manual start or end, fallback entry or exit, and new add-on session. Each add-on command carries the epoch it was planned under; a mismatch is rejected as *stale authority* and the add-on replans. Writes are serialised on one queue per bus. A transition waits for an in-flight bus write to finish, never aborting mid-write, then increments the epoch before its own writes, so queued add-on writes behind it are rejected. Owner requests carry the expected epoch too, so two open UIs conflict instead of silently overwriting each other.
+
+## Who may act
+
+Mode transitions and manual handover or resume come from ingress (admin-only), the CLI, or integration services called by a Home Assistant administrator. Calls without a user (automations, scripts) and non-admin calls are refused in v1. If [Agent config approval: who counts as the owner, and where the approval happens](https://github.com/Kylevdm/ha-spark/issues/278) narrows "owner" below any administrator, transitions follow it. The operating mode and manual session are read-only sensors, never `select` or `switch` entities, so dashboards and Assist cannot change them. The integration's own Home Assistant UI can always reach → Observe and manual handover without the add-on; entering Optimise needs the add-on.
+
+Every device-entity write is validated against device, bank and site limits, read back, and logged with its caller context. In Observe any Home Assistant caller, including an automation, may write. In Protect the same applies except protection-owned controls. In Optimise or fallback, ha-spark-owned controls are refused until the owner takes manual control. In a manual session everything except kept-protection controls is open. A refusal is a clear service error naming the current owner and how to take control.
+
+## Fallback
+
+The SoC-integrity fallback and the add-on-unavailable fallback are one fallback charging schedule with two causes: add-on liveness lost, and sustained SoC-integrity failure reported by whichever side detects it. It applies only in Optimise. Fallback active records the set of causes, and every cause must clear.
+
+**Amends ADR-0007.** Invalid SoC blocks any write whose value derives from SoC: plan targets, export, and SoC-dependent holds. The fixed, owner-configured fallback schedule does not derive from SoC, so it remains allowed with an untrusted SoC; the BMS still ends charging at full.
+
+At save, the integration's whole-document options validation rejects a fallback schedule whose per-inverter current exceeds that inverter's limit, whose sum exceeds a bank limit, whose site AC total exceeds the supply current limit, whose window is invalid on the household clock, which enables export, or which uses a control without read-back. A limits edit that would invalidate the saved fallback is rejected too. Fallback plus the largest major load above the supply limit is a warning only, because the supply guard runs live during fallback. Before each apply the schedule is re-checked against current limits; an inverter clock that disagrees with the household clock raises a repair but does not stop the apply, since charging at the wrong time beats not charging.
+
+To leave fallback, add-on liveness needs a new session with five minutes of continuous fresh heartbeats, and SoC integrity needs the existing ten minutes of continuously passing observations with an advancing report time. The add-on then receives the new epoch, plans from current inputs, and sends its commands; fallback clears only when every action verifies. On partial failure the integration re-applies and verifies the fallback schedule, stays in fallback, and retries after five minutes.
+
+## Restart, unknown authority, and removal
+
+On startup the integration loads the authority store, connects the bus and reads device state, reads EV, dispatch and direction evidence with freshness, reconciles holds per ADR-0007, and treats any deadline that expired while Home Assistant was down as expiring now under current conditions. It then allows a two-minute startup grace for the add-on session, because Home Assistant boots the add-on in parallel; during the grace only protection writes. A new add-on session increments the epoch, so the add-on must plan afresh before writing. A missing or corrupt store enters *authority unknown*: no writes of any kind, including releases, a Home Assistant repair, and no change until the owner confirms a mode. It never quietly becomes Observe.
+
+Removing or disabling the integration's config entry while in Protect or Optimise makes one attempt at the → Observe handover: cancel automatic export first, then restore the fallback schedule. It releases holds only when fresh evidence shows the car is not charging; otherwise the hold stays and the removal notice says so, because removal is not evidence that the EV stopped. Any failed step is reported in a persistent notification, never as a clean handover.

@@ -2,6 +2,8 @@
 
 Status: accepted (2026-10-10), confirmed by the owner during the live discussion of
 [ADR: the integration/add-on split and the reversal of the HA-as-transport decision](https://github.com/Kylevdm/ha-spark/issues/248).
+Amended by [ADR-0008](0008-operating-mode-and-authority-lifecycle.md): fallback
+applies only in Optimise, and Protect does not depend on the add-on.
 Detailed lifecycle contracts remain follow-up decisions on the v1 map.
 This is a planning record, not implemented behavior.
 
