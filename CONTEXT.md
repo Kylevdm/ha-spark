@@ -87,16 +87,6 @@ reported recently) and the value has not stayed unchanged past a hard
 ceiling. A frozen value from a live source is normal; a frozen source is not.
 "Stale" means there is no evidence the source is live.
 
-**Solis fallback**:
-The explicitly configured charge-current ceiling and cheap-rate window kept in
-use after sustained SoC-integrity failures. A request is not proof that the
-inverter accepted it; fallback is confirmed only by matching hardware read-back.
-It remains in place until recovery: SoC integrity has passed continuously for
-the recovery duration with an advancing report time, and a fresh plan from the
-current SoC and the remaining cheap-rate window has been applied and read back.
-Recovery being *ready* does not end the fallback; only that verified apply
-does. AlphaESS has no fallback program.
-
 **Battery calibration**:
 Revising planner input estimates, such as effective capacity and charge
 efficiency, from evidence in a household's own history. It is repeatable
@@ -225,8 +215,10 @@ does not establish freshness.
 
 **Operating mode**:
 The scope of automatic hardware control authorised by the owner: Observe,
-Protect, or Optimise. Data collection and eligible learning can continue in
-all three modes and during manual control.
+Protect, or Optimise. There is one operating mode for the whole site, covering
+every inverter and battery bank. Data collection and eligible learning can
+continue in all three modes and during manual control.
+(Decision: #266, 2026-10-12.)
 
 **Observe**:
 An operating mode that gathers data, learns from eligible history, and previews
@@ -235,24 +227,35 @@ plans without writing to hardware.
 **Protect**:
 An operating mode that prevents the house battery feeding the car while
 ordinary charging schedules remain under manual control. It owns the controls
-needed to apply and release that protection.
+needed to apply and release that protection. It does not depend on the
+add-on, so it never uses the fallback charging schedule.
 
 **Optimise**:
 An operating mode that authorises the full automatic energy plan, subject to
 control authority and safety checks.
 
 **Temporary manual control**:
-An explicit handover of an inverter's controls to the owner. It expires by
+An explicit handover of the site's controls to the owner. It expires by
 default and returns to the previous operating mode after current conditions
-have been checked and a fresh plan has been calculated, or uses configured
-fallback when the planner is unavailable. The owner may instead choose to resume
-explicitly. Battery-to-car protection may remain enabled, retaining ownership
-of the controls it needs. Learning may continue during the handover.
+have been checked. A return to Optimise needs a fresh plan, or uses the
+fallback charging schedule when the planner is unavailable; a return to
+Protect leaves the owner's charging edits in place. The owner may instead
+choose to resume explicitly. Battery-to-car protection may remain enabled,
+retaining ownership of the controls it needs. Learning may continue during the
+handover.
+(Decision: #266, 2026-10-12.)
 
 **Fallback charging schedule**:
-An owner-configured charging window and conservative limits that can maintain
-charging when automatic planning is unavailable. It does not authorise
-scheduled battery export and remains subordinate to applicable protection.
+An owner-configured charging window and conservative limits that keep charging
+in Optimise when automatic planning is unavailable or the reported SoC cannot
+be trusted. None of its values depend on SoC, so an untrusted SoC does not
+block it. It does not authorise scheduled battery export and remains
+subordinate to applicable protection. A request is not proof that the inverter
+accepted it; the schedule is in force only once read-back matches. It stays in
+force until every cause has cleared and a fresh plan has been applied and read
+back; recovery being *ready* does not end it.
+(Decision: #266, 2026-10-12.)
+_Avoid_: Solis fallback
 
 **Agent-editable setting**:
 A household setting the owner has allowed the product agent to request
