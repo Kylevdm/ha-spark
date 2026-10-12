@@ -245,6 +245,19 @@ retaining ownership of the controls it needs. Learning may continue during the
 handover.
 (Decision: #266, 2026-10-12.)
 
+**Override**:
+An owner instruction that the plan must obey until it ends: **Charge now**
+(to a target battery level or until a set time, whichever comes first),
+**Don't charge**, or **Keep battery** (no discharge). It exists only in
+Optimise, where ha-spark keeps the controls and plans around it; it is not a
+handover. Every override ends by itself, there is one at a time for the whole
+site, and limits, the supply guard and an applicable hold all outrank it. While
+the battery level is untrusted or the fallback charging schedule is in force,
+it is suspended and its end time keeps running.
+(Decision: #255, 2026-10-12.)
+_Avoid_: hold, pause, force, boost; manual control (that is the whole-site
+handover)
+
 **Fallback charging schedule**:
 An owner-configured charging window and conservative limits that keep charging
 in Optimise when automatic planning is unavailable or the reported SoC cannot
