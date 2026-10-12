@@ -1,0 +1,982 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ha-spark onboarding logic prototype — issue #257</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f7f8;
+      --panel: #fff;
+      --text: #19232b;
+      --muted: #52616c;
+      --line: #d8dfe4;
+      --accent: #087e83;
+      --accent-soft: #dff3f1;
+      --warn: #9a5b00;
+      --warn-soft: #fff1d8;
+      --bad: #a53535;
+      --bad-soft: #fbe7e7;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #11191d;
+        --panel: #1b262b;
+        --text: #edf3f4;
+        --muted: #b2c0c5;
+        --line: #39494f;
+        --accent: #63d1cc;
+        --accent-soft: #173d3d;
+        --warn: #ffca78;
+        --warn-soft: #49351b;
+        --bad: #ff9d9d;
+        --bad-soft: #492627;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, sans-serif; }
+    main { width: min(1100px, 100%); margin: auto; padding: 20px 16px 64px; }
+    h1, h2, h3 { line-height: 1.2; }
+    h1 { margin: 12px 0; font-size: clamp(1.7rem, 4vw, 2.5rem); }
+    h2 { margin: 0 0 14px; font-size: 1.3rem; }
+    h3 { margin: 0 0 8px; font-size: 1rem; }
+    p { margin: 8px 0; }
+    .banner { display: inline-block; padding: 5px 10px; background: var(--accent); color: var(--bg); font-size: .78rem; font-weight: 800; letter-spacing: .07em; }
+    .intro { max-width: 850px; font-size: 1.08rem; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-top: 18px; }
+    .muted, small { color: var(--muted); }
+    .questions { border-left: 4px solid var(--accent); }
+    .questions ul, .plain-list { margin: 8px 0 0; padding-left: 22px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, .9fr); gap: 16px; }
+    .layout > .card { margin-top: 0; }
+    .current { margin-top: 20px; }
+    .steps { list-style: none; padding: 0; margin: 0; }
+    .steps li { display: flex; justify-content: space-between; gap: 10px; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+    .steps li:last-child { border-bottom: 0; }
+    .steps li.current-step { font-weight: 700; }
+    .chip { flex: none; border-radius: 999px; padding: 1px 8px; font-size: .76rem; font-weight: 700; background: var(--line); }
+    .chip.done { background: var(--accent-soft); color: var(--accent); }
+    .chip.failed, .chip.blocked { background: var(--bad-soft); color: var(--bad); }
+    .chip.skipped { background: var(--warn-soft); color: var(--warn); }
+    .chip.in_progress { background: var(--accent-soft); color: var(--accent); }
+    .changed { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+    .save-grid, .mode-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .subcard { border: 1px solid var(--line); border-radius: 9px; padding: 12px; min-width: 0; }
+    .subcard p { margin: 3px 0; }
+    .mode { font-weight: 800; }
+    .mode.ready { color: var(--accent); }
+    .mode.waiting { color: var(--bad); }
+    .detail { font-size: .91rem; }
+    .detail ul { margin: 5px 0 0; padding-left: 19px; }
+    .notice { padding: 9px 11px; border-radius: 8px; margin-top: 10px; background: var(--accent-soft); }
+    .notice.warn { background: var(--warn-soft); color: var(--warn); }
+    .notice.bad { background: var(--bad-soft); color: var(--bad); }
+    .controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .control-group { border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+    button { font: inherit; cursor: pointer; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--panel); padding: 8px 11px; text-align: left; }
+    button:hover, button:focus-visible { border-color: var(--accent); outline-color: var(--accent); }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .buttons { display: flex; flex-wrap: wrap; gap: 7px; }
+    .buttons button { font-size: .88rem; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 7px; margin: 12px 0; }
+    .tabs button[aria-selected="true"] { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 700; }
+    .walk-step { display: flex; align-items: flex-start; gap: 10px; margin: 7px 0; }
+    .walk-step button { min-width: 2.4rem; text-align: center; }
+    .walk-step.completed button { background: var(--accent-soft); color: var(--accent); }
+    .walk-step span { padding-top: 6px; }
+    .tag { display: inline-block; font-size: .72rem; font-weight: 800; letter-spacing: .04em; color: var(--warn); }
+    @media (max-width: 720px) {
+      .layout, .controls { grid-template-columns: 1fr; }
+      .save-grid, .mode-grid { grid-template-columns: 1fr; }
+      main { padding: 14px 12px 48px; }
+      .card { padding: 14px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <div class="banner">PROTOTYPE — throwaway, issue #257</div>
+  <h1>From add-on installed to ready to choose a mode</h1>
+  <p class="intro">How should a new household get from “add-on installed” to “ready to choose an operating mode”? Which steps are blocking, which can be skipped or deferred, what happens when a step fails, and what does the household see at the end?</p>
+  <p class="muted">This models the add-on ingress page. Only a Home Assistant administrator can run onboarding. Saving settings never activates hardware control; every completed path ends in Observe.</p>
+
+  <section class="card questions" aria-labelledby="questions-heading">
+    <h2 id="questions-heading">Open questions</h2>
+    <ul>
+      <li><strong>DECIDED:</strong> Onboarding may finish with capability gaps; it ends in Observe and readiness explains them.</li>
+      <li><strong>DECIDED:</strong> A missing tariff blocks Optimise: the planner cannot price slots.</li>
+      <li><strong>DECIDED:</strong> The fallback charging schedule is offered in onboarding and may be deferred; Optimise needs it validated.</li>
+      <li><strong>DECIDED:</strong> Devices come before tariff and loads.</li>
+    </ul>
+  </section>
+
+  <section class="current" aria-labelledby="current-heading">
+    <h2 id="current-heading">Current state</h2>
+    <div class="layout">
+      <div class="card">
+        <h3>Progress</h3>
+        <p id="summary"></p>
+        <ol id="steps" class="steps"></ol>
+        <div id="event" class="notice" role="status" aria-live="polite"></div>
+      </div>
+      <div class="card">
+        <h3>Household and discovery</h3>
+        <div id="facts" class="detail"></div>
+      </div>
+    </div>
+    <div class="layout" style="margin-top:16px">
+      <div class="card">
+        <h3>Where settings were saved</h3>
+        <div class="save-grid">
+          <div id="integration-save" class="subcard"></div>
+          <div id="addon-save" class="subcard"></div>
+        </div>
+        <h3 style="margin-top:16px">Warnings and repairs</h3>
+        <div id="warnings" class="detail"></div>
+      </div>
+      <div class="card" id="readiness-card">
+        <h3>Readiness to choose a mode</h3>
+        <p class="muted detail">Recommendations shown while onboarding; mode activation is a separate explicit administrator action after finishing.</p>
+        <div id="readiness" class="mode-grid"></div>
+        <div id="advisories" class="detail"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="walk-heading">
+    <h2 id="walk-heading">Guided walkthroughs</h2>
+    <p class="muted">Select a tab to reset to its known starting state. Use its numbered buttons in order; free-play controls remain available.</p>
+    <div id="tabs" class="tabs" role="tablist" aria-label="Walkthrough scenarios"></div>
+    <div id="walkthrough"></div>
+  </section>
+
+  <section class="card" aria-labelledby="free-heading">
+    <h2 id="free-heading">Free play</h2>
+    <p class="muted">Try branches in any order. An action that cannot apply explains why. “Reset to fresh install” clears the prototype.</p>
+    <div id="controls" class="controls"></div>
+  </section>
+</main>
+
+<script>
+/* Pure logic model. No DOM, storage, network, or hardware access. */
+const STEP_NAMES = [
+  "Who is here", "Integration", "Devices", "Topology and limits",
+  "Tariff", "Solar forecast", "EV charger and major loads",
+  "Fallback charging schedule", "Review and save", "Finish"
+];
+
+function initialState(kind = "fresh") {
+  const s = {
+    currentStep: 0,
+    steps: STEP_NAMES.map(() => "not_started"),
+    admin: null,
+    integration: { phase: "not_installed", paired: false, adopted: false, versionSkew: false },
+    devices: [],
+    topology: { banks: [], limitsSet: false, siteImportA: null, siteExportW: null },
+    tariff: { answer: "unanswered", rate: null, dispatch: null },
+    forecast: { answer: "unanswered", solcastKeySet: false, sites: 0 },
+    loads: { answer: "unanswered", ev: null, major: [] },
+    fallback: { status: "not_proposed", reason: null, window: null, chargeA: null },
+    history: { available: 2, needed: 14 },
+    sessionLive: false,
+    trustedSoc: false,
+    saved: { integration: false, addon: false, integrationRevision: 0, addonRevision: 0 },
+    mode: "Observe",
+    warnings: [],
+    lastEvent: "Fresh add-on install. An administrator can start onboarding.",
+    refused: false
+  };
+  if (kind === "standalone") {
+    s.admin = true;
+    s.steps[0] = "done";
+    s.integration = { phase: "standalone", paired: true, adopted: false, versionSkew: false };
+    s.currentStep = 1;
+    s.lastEvent = "Existing standalone integration found. Adopt its devices and settings.";
+  }
+  if (kind === "nonadmin") {
+    s.admin = false;
+    s.steps[0] = "blocked";
+    s.lastEvent = "Read-only: ask a Home Assistant administrator to run onboarding.";
+  }
+  return s;
+}
+
+function copyState(s) { return JSON.parse(JSON.stringify(s)); }
+function note(s, message) { if (!s.warnings.includes(message)) s.warnings.push(message); }
+function clearNote(s, fragment) { s.warnings = s.warnings.filter(x => !x.includes(fragment)); }
+function refuse(previous, message) {
+  const s = copyState(previous);
+  s.lastEvent = "Refused: " + message;
+  s.refused = true;
+  return s;
+}
+function mark(s, index, status = "done") {
+  s.steps[index] = status;
+  if (status === "done" || status === "skipped") {
+    const next = s.steps.findIndex(x => x === "not_started");
+    s.currentStep = next < 0 ? 9 : next;
+  } else {
+    s.currentStep = index;
+  }
+}
+function solis(id) {
+  return {
+    id, type: "Solis", connection: "RS485-to-TCP gateway",
+    bank: null, cache: "unknown", tou: "unknown",
+    hold: false, release: false, readback: false, freshness: false,
+    chargeA: null, dischargeA: null
+  };
+}
+function alpha(id) {
+  return {
+    id, type: "AlphaESS", connection: "Modbus TCP",
+    bank: null, cache: "not_applicable", tou: "not_applicable",
+    hold: false, release: false, readback: false, freshness: false,
+    chargeA: null, dischargeA: null
+  };
+}
+function deviceContractOK(d) {
+  return d.hold && d.release && d.readback && d.freshness &&
+    (d.type !== "Solis" || d.cache === "off");
+}
+function topologyOK(s) {
+  return s.topology.limitsSet && s.devices.length > 0 &&
+    s.devices.every(d => d.bank && d.chargeA > 0 && d.dischargeA > 0) &&
+    s.topology.banks.every(b => b.chargeA > 0 && b.dischargeA > 0) &&
+    s.topology.siteImportA > 0 && s.topology.siteExportW >= 0;
+}
+function answerComplete(s) {
+  return ["done", "skipped"].includes(s.steps[4]) &&
+    ["done", "skipped"].includes(s.steps[5]) &&
+    ["done", "skipped"].includes(s.steps[6]) &&
+    ["done", "skipped"].includes(s.steps[7]);
+}
+function fallbackCheck(s, variant) {
+  if (!topologyOK(s)) return "Set topology and limits first";
+  if (variant === "site") return "Fallback charge exceeds the supply current limit";
+  if (variant === "bank") return "Fallback charge exceeds a battery-bank current limit";
+  if (variant === "export") return "Fallback schedule enables battery export";
+  if (variant === "readback") return "Fallback control has no verified read-back";
+  if (s.devices.some(d => !d.readback || (d.type === "Solis" && d.cache !== "off"))) {
+    return "Fallback control has no trustworthy read-back";
+  }
+  return null;
+}
+function fallbackMajorWarning(s) {
+  const maxLoad = Math.max(0, ...s.loads.major.map(x => x.amps));
+  return maxLoad > 0 && s.fallback.chargeA + maxLoad > s.topology.siteImportA;
+}
+
+function onboarding(previous, action) {
+  if (!action || typeof action.type !== "string") return refuse(previous, "Unknown action");
+  if (action.type === "RESET") return initialState(action.kind || "fresh");
+  if (action.type === "ADMIN_NO") {
+    const s = initialState("nonadmin");
+    return s;
+  }
+  if (previous.admin === false) return refuse(previous, "This page is read-only. Ask a Home Assistant administrator.");
+  const s = copyState(previous);
+  s.refused = false;
+  const needAdmin = action.type !== "ADMIN_YES";
+  if (needAdmin && s.admin !== true) return refuse(previous, "Confirm a Home Assistant administrator first.");
+
+  switch (action.type) {
+    case "ADMIN_YES":
+      s.admin = true;
+      mark(s, 0);
+      s.lastEvent = "Administrator confirmed. Integration setup can begin.";
+      break;
+    case "INTEGRATION_INSTALLED":
+      if (s.integration.phase !== "not_installed") return refuse(previous, "Integration installation is already recorded.");
+      s.integration.phase = "awaiting_restart";
+      mark(s, 1, "in_progress");
+      s.lastEvent = "User installed the companion integration through HACS. Restart Home Assistant next.";
+      break;
+    case "HA_RESTARTED":
+      if (s.integration.phase !== "awaiting_restart") return refuse(previous, "Install through HACS before restarting for discovery.");
+      s.integration.phase = "discovered";
+      s.lastEvent = "Home Assistant restarted and offered the integration through Supervisor discovery.";
+      break;
+    case "INTEGRATION_FOUND":
+      if (s.integration.phase !== "awaiting_restart" && s.integration.phase !== "discovered") {
+        return refuse(previous, "Home Assistant must restart after the HACS install.");
+      }
+      s.integration.phase = "discovered";
+      s.lastEvent = "Integration found by Home Assistant. Accept discovery to pair it.";
+      break;
+    case "PAIR":
+      if (s.integration.phase !== "discovered") return refuse(previous, "Accept discovery only after Home Assistant offers the integration.");
+      s.integration.phase = "paired";
+      s.integration.paired = true;
+      mark(s, 1);
+      s.lastEvent = "Integration paired through Supervisor discovery.";
+      break;
+    case "VERSION_SKEW":
+      if (!s.integration.paired) return refuse(previous, "Pair or adopt the integration first.");
+      s.integration.versionSkew = true;
+      note(s, "Repair warning: integration and add-on api_version differ. Onboarding can continue.");
+      s.lastEvent = "Version mismatch recorded as a repair warning; pairing remains usable.";
+      break;
+    case "ADOPT":
+      if (s.integration.phase !== "standalone") return refuse(previous, "Adoption applies to an already configured standalone integration.");
+      s.integration.adopted = true;
+      s.integration.phase = "paired";
+      s.devices = [solis("inverter_1")];
+      Object.assign(s.devices[0], {
+        bank: "bank_1", cache: "off", tou: "V2", hold: true,
+        release: true, readback: true, freshness: true, chargeA: 32, dischargeA: 32
+      });
+      s.topology = {
+        banks: [{ id: "bank_1", chargeA: 50, dischargeA: 50, inverters: ["inverter_1"] }],
+        limitsSet: true, siteImportA: 80, siteExportW: 0
+      };
+      mark(s, 1);
+      s.steps[2] = "done";
+      s.steps[3] = "done";
+      s.currentStep = 4;
+      s.lastEvent = "Existing standalone devices, bank assignment, and limits adopted. Continue at tariff.";
+      break;
+    case "DISCOVER_SOLIS":
+    case "DISCOVER_ALPHA":
+    case "DISCOVER_TWO":
+      if (!s.integration.paired) return refuse(previous, "Pair or adopt the integration before discovering devices.");
+      s.devices = action.type === "DISCOVER_ALPHA" ? [alpha("inverter_1")] :
+        action.type === "DISCOVER_TWO" ? [solis("inverter_1"), solis("inverter_2")] :
+        [solis("inverter_1")];
+      s.topology = { banks: [], limitsSet: false, siteImportA: null, siteExportW: null };
+      mark(s, 2, "in_progress");
+      s.lastEvent = s.devices.length + " inverter" + (s.devices.length === 1 ? "" : "s") +
+        " found. Probe capabilities, then assign battery banks and limits.";
+      break;
+    case "NONE_FOUND":
+      if (!s.integration.paired) return refuse(previous, "Pair the integration first.");
+      s.devices = [];
+      mark(s, 2, "in_progress");
+      note(s, "No gateway or inverter found. Enter a host manually or retry discovery.");
+      s.lastEvent = "No devices found. Manual host entry is available.";
+      break;
+    case "MANUAL_HOST":
+      if (!s.integration.paired) return refuse(previous, "Pair the integration first.");
+      s.devices = [solis("inverter_1")];
+      clearNote(s, "No gateway");
+      mark(s, 2, "in_progress");
+      s.lastEvent = "Generic Solis gateway host entered manually. Connection and capability probe remain.";
+      break;
+    case "CONNECT_FAIL":
+      if (s.devices.length === 0) return refuse(previous, "Discover or enter a device first.");
+      mark(s, 2, "failed");
+      note(s, "Device connection failed. Check host and gateway, then retry discovery.");
+      s.lastEvent = "Connection failed; no device capability is trusted.";
+      break;
+    case "CACHE_ON":
+    case "CACHE_OFF":
+      if (!s.devices.some(d => d.type === "Solis")) return refuse(previous, "A Solis gateway is needed for a caching check.");
+      s.devices.filter(d => d.type === "Solis").forEach(d => {
+        d.cache = action.type === "CACHE_ON" ? "on" : "off";
+        if (d.cache === "on") d.readback = false;
+      });
+      if (action.type === "CACHE_ON") {
+        note(s, "Gateway caching is on: repeated-read timing indicates cached read-back.");
+        s.lastEvent = "Repeated-read timing detected gateway storage (caching) mode ON.";
+      } else {
+        clearNote(s, "Gateway caching is on");
+        s.lastEvent = "Owner turned gateway storage (caching) mode off. Re-probe read-back.";
+      }
+      break;
+    case "PROBE_OK":
+      if (s.devices.length === 0) return refuse(previous, "Discover or enter a device first.");
+      s.devices.forEach(d => {
+        d.tou = d.type === "Solis" ? "V2 (register 33289)" : "not_applicable";
+        d.hold = true;
+        d.release = true;
+        d.readback = d.type !== "Solis" || d.cache === "off";
+        d.freshness = true;
+      });
+      mark(s, 2);
+      s.lastEvent = "Probe recorded hold, release, read-back, freshness, and detected firmware charge-slot path. No firmware choice was asked.";
+      break;
+    case "PROBE_GAP":
+      if (s.devices.length === 0) return refuse(previous, "Discover or enter a device first.");
+      s.devices.forEach(d => {
+        d.tou = d.type === "Solis" ? "V1 (register 33289)" : "not_applicable";
+        d.hold = false;
+        d.release = true;
+        d.readback = d.type !== "Solis" || d.cache === "off";
+        d.freshness = false;
+      });
+      mark(s, 2);
+      note(s, "Capability gap: hold or fresh protection evidence has not been validated.");
+      s.lastEvent = "Probe completed with capability gaps. Observe remains available.";
+      break;
+    case "REPROBE":
+      if (s.devices.length === 0) return refuse(previous, "No devices to re-probe.");
+      s.devices.forEach(d => {
+        d.hold = true; d.release = true; d.freshness = true;
+        d.readback = d.type !== "Solis" || d.cache === "off";
+        d.tou = d.type === "Solis" ? "V2 (register 33289)" : "not_applicable";
+      });
+      clearNote(s, "Capability gap");
+      s.lastEvent = "Capabilities re-probed. Readiness uses the new evidence.";
+      break;
+    case "LIMITS_ONE":
+    case "LIMITS_SHARED":
+      if (s.devices.length === 0) return refuse(previous, "Discover devices before assigning banks.");
+      if (action.type === "LIMITS_SHARED" && s.devices.length < 2) return refuse(previous, "Discover two inverters first.");
+      s.devices.forEach(d => {
+        d.bank = "bank_1";
+        d.chargeA = 32;
+        d.dischargeA = 32;
+      });
+      s.topology = {
+        banks: [{
+          id: "bank_1", chargeA: action.type === "LIMITS_SHARED" ? 50 : 40,
+          dischargeA: action.type === "LIMITS_SHARED" ? 50 : 40,
+          inverters: s.devices.map(d => d.id)
+        }],
+        limitsSet: true, siteImportA: 80, siteExportW: 0
+      };
+      mark(s, 3);
+      s.lastEvent = "Preset-filled per-inverter, battery-bank, supply current, and site export limits confirmed.";
+      break;
+    case "TARIFF_FOUND":
+      s.tariff = {
+        answer: "confirmed",
+        rate: "sensor.octopus_current_rate",
+        dispatch: "binary_sensor.octopus_dispatch"
+      };
+      mark(s, 4);
+      s.lastEvent = "Octopus Energy rate and dispatch entity proposals confirmed.";
+      break;
+    case "TARIFF_SKIP":
+      s.tariff = { answer: "skipped", rate: null, dispatch: null };
+      mark(s, 4, "skipped");
+      note(s, "Octopus Energy integration absent: the planner cannot price tariff slots.");
+      s.lastEvent = "Tariff skipped. Optimise is unavailable until a tariff is confirmed.";
+      break;
+    case "SOLCAST_SET":
+      s.forecast = { answer: "confirmed", solcastKeySet: true, sites: action.sites === 2 ? 2 : 1 };
+      mark(s, 5);
+      s.lastEvent = "Native Solcast client configured for " + s.forecast.sites +
+        " site(s). API key is recorded only as set.";
+      break;
+    case "SOLCAST_SKIP":
+      s.forecast = { answer: "skipped", solcastKeySet: false, sites: 0 };
+      mark(s, 5, "skipped");
+      s.lastEvent = "Solar forecast skipped. Planning quality may be lower.";
+      break;
+    case "LOADS_EV":
+      s.loads = {
+        answer: "confirmed",
+        ev: {
+          plug: "sensor.ev_charger_plug",
+          status: "sensor.ev_charger_status",
+          power: "sensor.ev_charger_power"
+        },
+        major: [{ name: "Car charger", amps: 32, power: "sensor.ev_charger_power" }]
+      };
+      mark(s, 6);
+      s.lastEvent = "EV plug, status, power, and car-charger demand confirmed.";
+      break;
+    case "LOADS_HEATPUMP":
+      s.loads = {
+        answer: "confirmed",
+        ev: null,
+        major: [
+          { name: "Heat pump heating/cooling", amps: 55, power: "sensor.heat_pump_power" },
+          { name: "Induction hob", amps: 32, power: "sensor.induction_hob_power" }
+        ]
+      };
+      mark(s, 6);
+      s.lastEvent = "Heat pump and induction-hob power proposals and demand confirmed.";
+      break;
+    case "LOADS_NONE":
+      s.loads = { answer: "none", ev: null, major: [] };
+      mark(s, 6);
+      s.lastEvent = "No EV charger or major loads recorded.";
+      break;
+    case "FALLBACK_PROPOSE":
+      if (!topologyOK(s)) return refuse(previous, "Set device, bank, and site limits first.");
+      s.fallback = {
+        status: "proposed", reason: null,
+        window: s.tariff.answer === "confirmed" ? "00:30–04:30" : "01:00–04:00",
+        chargeA: s.devices.length > 1 ? 30 : 20
+      };
+      mark(s, 7, "in_progress");
+      s.lastEvent = "Conservative fallback charging window proposed from limits" +
+        (s.tariff.answer === "confirmed" ? " and Octopus rates." : ". No tariff price is available.");
+      break;
+    case "FALLBACK_VALIDATE": {
+      if (s.fallback.status !== "proposed" && s.fallback.status !== "rejected") {
+        return refuse(previous, "Propose a fallback schedule first.");
+      }
+      const error = fallbackCheck(s, "valid");
+      if (error) {
+        s.fallback.status = "rejected";
+        s.fallback.reason = error;
+        mark(s, 7, "failed");
+        s.lastEvent = "Fallback rejected at save validation: " + error + ".";
+      } else {
+        s.fallback.status = "valid";
+        s.fallback.reason = null;
+        mark(s, 7);
+        if (fallbackMajorWarning(s)) {
+          note(s, "Fallback plus the largest major load may exceed the supply current limit; the supply guard must respond live.");
+        }
+        s.lastEvent = "Fallback schedule validated: charge only, within inverter, bank, and site limits, with read-back.";
+      }
+      break;
+    }
+    case "FALLBACK_REJECT": {
+      if (!topologyOK(s)) return refuse(previous, "Set topology and limits first.");
+      const reason = fallbackCheck(s, action.reason || "site");
+      s.fallback = { status: "rejected", reason, window: "01:00–04:00", chargeA: 90 };
+      mark(s, 7, "failed");
+      s.lastEvent = "Fallback rejected at integration save validation: " + reason + ".";
+      break;
+    }
+    case "FALLBACK_DEFER":
+      s.fallback = { status: "deferred", reason: null, window: null, chargeA: null };
+      mark(s, 7, "skipped");
+      s.lastEvent = "Fallback deferred. Onboarding can finish in Observe; Optimise will remain unavailable.";
+      break;
+    case "SAVE_INTEGRATION":
+      if (!s.integration.paired || !topologyOK(s)) {
+        return refuse(previous, "Pair the integration and confirm topology and limits first.");
+      }
+      if (!answerComplete(s)) return refuse(previous, "Answer or skip tariff, forecast, loads, and fallback before review.");
+      if (s.fallback.status === "rejected") return refuse(previous, "The integration rejects the invalid fallback schedule. Fix or defer it.");
+      s.saved.integration = true;
+      s.saved.integrationRevision++;
+      s.steps[8] = "in_progress";
+      s.currentStep = 8;
+      s.lastEvent = "Integration settings saved first: connections, topology, limits, and " +
+        (s.fallback.status === "valid" ? "validated fallback." : "no fallback yet.");
+      break;
+    case "SAVE_ADDON":
+      if (!s.saved.integration) return refuse(previous, "Integration settings must save first.");
+      s.saved.addon = true;
+      s.saved.addonRevision++;
+      mark(s, 8);
+      s.lastEvent = "Add-on planning, tariff, forecast-consumer, and UI settings saved. Operating mode stayed Observe.";
+      break;
+    case "ADDON_SAVE_FAIL":
+      if (!s.saved.integration || s.saved.addon) return refuse(previous, "Simulate this failure after integration save and before add-on save.");
+      s.steps[8] = "failed";
+      s.currentStep = 8;
+      note(s, "Partial setup: integration settings saved, add-on settings failed. Retry add-on save.");
+      s.lastEvent = "Add-on save failed after integration save. The integration revision remains durable.";
+      break;
+    case "RELOAD":
+      if (!s.saved.integration || s.saved.addon) return refuse(previous, "Reload repair is useful only for a half-saved setup.");
+      s.steps[8] = "in_progress";
+      s.currentStep = 8;
+      s.lastEvent = "Page reloaded. Integration revision was read back; add-on settings are still unsaved. Resume at add-on save.";
+      break;
+    case "FINISH":
+      if (!s.saved.integration || !s.saved.addon) return refuse(previous, "Save both stores before finishing.");
+      s.mode = "Observe";
+      s.sessionLive = true;
+      s.trustedSoc = true;
+      mark(s, 9);
+      s.currentStep = 9;
+      s.lastEvent = "Onboarding complete in Observe. No hardware writes. An administrator may separately choose an operating mode.";
+      break;
+    case "SESSION_LOST":
+      s.sessionLive = false;
+      s.lastEvent = "Add-on session lost. Optimise is unavailable until a live session returns.";
+      break;
+    case "SESSION_RESTORED":
+      s.sessionLive = true;
+      s.lastEvent = "Live add-on session restored.";
+      break;
+    case "SOC_UNTRUSTED":
+      s.trustedSoc = false;
+      s.lastEvent = "SoC is untrusted. Optimise is unavailable; fixed fallback does not depend on SoC.";
+      break;
+    case "SOC_TRUSTED":
+      s.trustedSoc = true;
+      s.lastEvent = "SoC integrity is trusted again.";
+      break;
+    case "HISTORY_READY":
+      s.history.available = s.history.needed;
+      s.lastEvent = "Enough derived base-load history is available for the forecast.";
+      break;
+    default:
+      return refuse(previous, "Unknown action: " + action.type);
+  }
+  return s;
+}
+
+function readiness(s) {
+  const protect = [];
+  const optimise = [];
+  const advisory = [];
+  if (!s.saved.integration) protect.push("Integration settings have not been saved");
+  if (s.devices.length === 0) protect.push("No inverter has been discovered or adopted");
+  for (const d of s.devices) {
+    if (d.type === "Solis" && d.cache === "on") {
+      protect.push("Gateway caching is on — read-back can't be trusted (" + d.id + ")");
+    } else if (d.type === "Solis" && d.cache !== "off") {
+      protect.push("Gateway caching has not been ruled out (" + d.id + ")");
+    }
+    if (!d.hold) protect.push("Hold command is not validated (" + d.id + ")");
+    if (!d.release) protect.push("Hold release is not validated (" + d.id + ")");
+    if (!d.readback) protect.push("Control read-back is not validated (" + d.id + ")");
+    if (!d.freshness) protect.push("Fresh protection evidence contract is not validated (" + d.id + ")");
+  }
+  optimise.push(...protect);
+  if (!s.saved.addon) optimise.push("Add-on settings have not been saved");
+  if (s.fallback.status !== "valid") optimise.push("No validated fallback charging schedule yet");
+  if (!s.sessionLive) optimise.push("No live add-on session");
+  if (!s.trustedSoc) optimise.push("SoC is not trusted");
+  if (s.history.available < s.history.needed) {
+    advisory.push("Derived base-load history: " + s.history.available + " of " +
+      s.history.needed + " days needed for the forecast");
+  }
+  if (s.tariff.answer !== "confirmed") {
+    optimise.push("No tariff confirmed — the planner cannot price slots");
+  }
+  if (s.forecast.answer !== "confirmed") advisory.push("No Solcast forecast configured");
+  if (s.integration.versionSkew) advisory.push("Repair warning: integration/add-on api_version mismatch");
+  if (s.fallback.status === "valid" && fallbackMajorWarning(s)) {
+    advisory.push("Fallback plus the largest major load may exceed the supply current limit");
+  }
+  advisory.push("Whole-Home Assistant outages cannot guarantee active protection; device behavior needs model-specific validation.");
+  return {
+    Protect: { ready: protect.length === 0, unmet: protect, advisory },
+    Optimise: { ready: optimise.length === 0, unmet: optimise, advisory }
+  };
+}
+</script>
+
+<script>
+/* Click-through presentation. The model above does not read or write the page. */
+const scenarios = [
+  {
+    id: "happy", title: "Happy path",
+    description: "One Solis inverter and one battery bank; Octopus, Solcast, and an EV charger. Finish in Observe with both modes ready.",
+    start: "fresh",
+    steps: [
+      ["Administrator opens ingress", [{ type: "ADMIN_YES" }]],
+      ["User installs integration through HACS", [{ type: "INTEGRATION_INSTALLED" }]],
+      ["HA restarts and offers discovery", [{ type: "HA_RESTARTED" }]],
+      ["Accept pairing", [{ type: "PAIR" }]],
+      ["Discover Solis; caching is off; probe", [{ type: "DISCOVER_SOLIS" }, { type: "CACHE_OFF" }, { type: "PROBE_OK" }]],
+      ["Confirm one bank and limits", [{ type: "LIMITS_ONE" }]],
+      ["Confirm Octopus rate and dispatch", [{ type: "TARIFF_FOUND" }]],
+      ["Set Solcast key and one site", [{ type: "SOLCAST_SET", sites: 1 }]],
+      ["Confirm EV and major-load demand", [{ type: "LOADS_EV" }]],
+      ["Propose and validate fallback", [{ type: "FALLBACK_PROPOSE" }, { type: "FALLBACK_VALIDATE" }]],
+      ["Save integration, then add-on", [{ type: "SAVE_INTEGRATION" }, { type: "SAVE_ADDON" }]],
+      ["Finish in Observe", [{ type: "FINISH" }]]
+    ]
+  },
+  {
+    id: "adopt", title: "Adopt standalone",
+    description: "The integration already owns the devices. Adopt its existing Solis inverter, bank, capabilities, and limits; continue directly at tariff.",
+    start: "standalone",
+    steps: [
+      ["Adopt existing integration settings", [{ type: "ADOPT" }]],
+      ["Confirm Octopus", [{ type: "TARIFF_FOUND" }]],
+      ["Skip Solcast", [{ type: "SOLCAST_SKIP" }]],
+      ["Record no major loads", [{ type: "LOADS_NONE" }]],
+      ["Validate fallback", [{ type: "FALLBACK_PROPOSE" }, { type: "FALLBACK_VALIDATE" }]],
+      ["Save both stores", [{ type: "SAVE_INTEGRATION" }, { type: "SAVE_ADDON" }]],
+      ["Finish in Observe", [{ type: "FINISH" }]]
+    ]
+  },
+  {
+    id: "cache", title: "Gateway caching on",
+    description: "Onboarding completes in Observe despite cached read-back. Protect and Optimise remain unavailable until the owner turns caching off and re-probes. Decided: this gap does not block finishing.",
+    start: "fresh",
+    steps: [
+      ["Administrator, install, restart, pair", [{ type: "ADMIN_YES" }, { type: "INTEGRATION_INSTALLED" }, { type: "HA_RESTARTED" }, { type: "PAIR" }]],
+      ["Discover Solis and detect caching ON", [{ type: "DISCOVER_SOLIS" }, { type: "CACHE_ON" }, { type: "PROBE_OK" }]],
+      ["Confirm topology and limits", [{ type: "LIMITS_ONE" }]],
+      ["Confirm tariff; skip forecast and loads", [{ type: "TARIFF_FOUND" }, { type: "SOLCAST_SKIP" }, { type: "LOADS_NONE" }]],
+      ["Defer fallback; save both stores", [{ type: "FALLBACK_DEFER" }, { type: "SAVE_INTEGRATION" }, { type: "SAVE_ADDON" }]],
+      ["Finish in Observe", [{ type: "FINISH" }]],
+      ["Owner turns caching off and re-probes", [{ type: "CACHE_OFF" }, { type: "REPROBE" }]],
+      ["Validate fallback after repair", [{ type: "FALLBACK_PROPOSE" }, { type: "FALLBACK_VALIDATE" }, { type: "SAVE_INTEGRATION" }]]
+    ]
+  },
+  {
+    id: "no_tariff", title: "No Octopus or Solcast",
+    description: "Completes in Observe. Decided: the missing tariff blocks Optimise; Protect stays available. Missing Solcast is advisory.",
+    start: "fresh",
+    steps: [
+      ["Administrator, install, restart, pair", [{ type: "ADMIN_YES" }, { type: "INTEGRATION_INSTALLED" }, { type: "HA_RESTARTED" }, { type: "PAIR" }]],
+      ["Discover, check caching, probe, set limits", [{ type: "DISCOVER_SOLIS" }, { type: "CACHE_OFF" }, { type: "PROBE_OK" }, { type: "LIMITS_ONE" }]],
+      ["Skip Octopus and Solcast", [{ type: "TARIFF_SKIP" }, { type: "SOLCAST_SKIP" }]],
+      ["Record no major loads", [{ type: "LOADS_NONE" }]],
+      ["Validate conservative fallback", [{ type: "FALLBACK_PROPOSE" }, { type: "FALLBACK_VALIDATE" }]],
+      ["Save and finish in Observe", [{ type: "SAVE_INTEGRATION" }, { type: "SAVE_ADDON" }, { type: "FINISH" }]]
+    ]
+  },
+  {
+    id: "shared", title: "Shared bank and heat pump",
+    description: "Two Solis inverters share one battery bank. A large heat pump creates a fallback headroom warning, but the schedule is valid on its own.",
+    start: "fresh",
+    steps: [
+      ["Administrator, install, restart, pair", [{ type: "ADMIN_YES" }, { type: "INTEGRATION_INSTALLED" }, { type: "HA_RESTARTED" }, { type: "PAIR" }]],
+      ["Discover two inverters and probe", [{ type: "DISCOVER_TWO" }, { type: "CACHE_OFF" }, { type: "PROBE_OK" }]],
+      ["Assign both inverters to one bank", [{ type: "LIMITS_SHARED" }]],
+      ["Confirm tariff; skip Solcast", [{ type: "TARIFF_FOUND" }, { type: "SOLCAST_SKIP" }]],
+      ["Confirm heat pump and hob demand", [{ type: "LOADS_HEATPUMP" }]],
+      ["Validate fallback; inspect warning", [{ type: "FALLBACK_PROPOSE" }, { type: "FALLBACK_VALIDATE" }]],
+      ["Save and finish in Observe", [{ type: "SAVE_INTEGRATION" }, { type: "SAVE_ADDON" }, { type: "FINISH" }]]
+    ]
+  },
+  {
+    id: "half", title: "Half-saved repair",
+    description: "Integration save succeeds; add-on save fails. Reload shows exactly what persisted, then resumes without replacing the integration revision.",
+    start: "fresh",
+    steps: [
+      ["Administrator, install, restart, pair", [{ type: "ADMIN_YES" }, { type: "INTEGRATION_INSTALLED" }, { type: "HA_RESTARTED" }, { type: "PAIR" }]],
+      ["Discover, probe, and confirm limits", [{ type: "DISCOVER_SOLIS" }, { type: "CACHE_OFF" }, { type: "PROBE_OK" }, { type: "LIMITS_ONE" }]],
+      ["Confirm tariff; skip optional inputs", [{ type: "TARIFF_FOUND" }, { type: "SOLCAST_SKIP" }, { type: "LOADS_NONE" }]],
+      ["Validate fallback and save integration", [{ type: "FALLBACK_PROPOSE" }, { type: "FALLBACK_VALIDATE" }, { type: "SAVE_INTEGRATION" }]],
+      ["Add-on save fails", [{ type: "ADDON_SAVE_FAIL" }]],
+      ["Reload and resume add-on save", [{ type: "RELOAD" }, { type: "SAVE_ADDON" }]],
+      ["Finish in Observe", [{ type: "FINISH" }]]
+    ]
+  },
+  {
+    id: "nonadmin", title: "Non-admin",
+    description: "A non-administrator sees a read-only request to ask an administrator. All onboarding actions are refused.",
+    start: "nonadmin",
+    steps: [
+      ["Try to discover a device", [{ type: "DISCOVER_SOLIS" }]],
+      ["Try to save settings", [{ type: "SAVE_INTEGRATION" }]]
+    ]
+  }
+];
+
+const groups = [
+  ["Who is here", [
+    ["Administrator opens the page", "ADMIN_YES"],
+    ["Non-admin opens the page", "ADMIN_NO"],
+    ["Reset to fresh install", "RESET"]
+  ]],
+  ["Integration", [
+    ["User installs integration through HACS", "INTEGRATION_INSTALLED"],
+    ["Home Assistant restarted", "HA_RESTARTED"],
+    ["Integration found by HA", "INTEGRATION_FOUND"],
+    ["Accept discovery and pair", "PAIR"],
+    ["Adopt standalone integration", "ADOPT"],
+    ["API version mismatch", "VERSION_SKEW"]
+  ]],
+  ["Devices and capability", [
+    ["Discover one Solis", "DISCOVER_SOLIS"],
+    ["Discover one AlphaESS", "DISCOVER_ALPHA"],
+    ["Discover two Solis", "DISCOVER_TWO"],
+    ["No devices found", "NONE_FOUND"],
+    ["Enter Solis gateway host manually", "MANUAL_HOST"],
+    ["Connection fails", "CONNECT_FAIL"],
+    ["Gateway caching detected ON", "CACHE_ON"],
+    ["Owner turns gateway caching off", "CACHE_OFF"],
+    ["Probe: capabilities validated", "PROBE_OK"],
+    ["Probe: hold or freshness gap", "PROBE_GAP"],
+    ["Re-probe capabilities", "REPROBE"]
+  ]],
+  ["Topology and limits", [
+    ["Confirm one bank and preset limits", "LIMITS_ONE"],
+    ["Confirm shared bank and preset limits", "LIMITS_SHARED"]
+  ]],
+  ["Tariff and solar forecast", [
+    ["Confirm Octopus rate and dispatch", "TARIFF_FOUND"],
+    ["Skip tariff", "TARIFF_SKIP"],
+    ["Set Solcast key, one site", "SOLCAST_SET"],
+    ["Set Solcast key, two sites", "SOLCAST_SET_2"],
+    ["Skip solar forecast", "SOLCAST_SKIP"]
+  ]],
+  ["EV charger and major loads", [
+    ["Confirm EV charger and demand", "LOADS_EV"],
+    ["Confirm heat pump and hob demand", "LOADS_HEATPUMP"],
+    ["No EV charger or major loads", "LOADS_NONE"],
+    ["History reaches needed days", "HISTORY_READY"]
+  ]],
+  ["Fallback charging schedule", [
+    ["Propose conservative schedule", "FALLBACK_PROPOSE"],
+    ["Validate proposed schedule", "FALLBACK_VALIDATE"],
+    ["Fallback breaks site import limit", "FALLBACK_SITE"],
+    ["Fallback breaks bank current limit", "FALLBACK_BANK"],
+    ["Fallback enables export", "FALLBACK_EXPORT"],
+    ["Fallback lacks read-back", "FALLBACK_READBACK"],
+    ["Defer fallback", "FALLBACK_DEFER"]
+  ]],
+  ["Review, save, and finish", [
+    ["Save to integration first", "SAVE_INTEGRATION"],
+    ["Save to add-on", "SAVE_ADDON"],
+    ["Add-on save fails after integration save", "ADDON_SAVE_FAIL"],
+    ["Reload half-saved setup", "RELOAD"],
+    ["Finish in Observe", "FINISH"],
+    ["Add-on session lost", "SESSION_LOST"],
+    ["Add-on session restored", "SESSION_RESTORED"],
+    ["SoC becomes untrusted", "SOC_UNTRUSTED"],
+    ["SoC trusted again", "SOC_TRUSTED"]
+  ]]
+];
+
+let state = initialState();
+let activeScenario = "happy";
+let walkIndex = 0;
+let highlights = { steps: [], keys: [] };
+
+function escapeHTML(value) {
+  return String(value).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[c]);
+}
+function listHTML(items) {
+  return items.length ? "<ul>" + items.map(x => "<li>" + escapeHTML(x) + "</li>").join("") + "</ul>" : "<p>None.</p>";
+}
+function describeDevices(s) {
+  if (!s.devices.length) return "No devices yet.";
+  return s.devices.map(d =>
+    escapeHTML(d.id) + " · " + escapeHTML(d.type) + " · " + escapeHTML(d.connection) +
+    (d.bank ? " · " + escapeHTML(d.bank) : " · bank unassigned") +
+    (d.type === "Solis" ? " · caching " + escapeHTML(d.cache) + " · TOU " + escapeHTML(d.tou) : "") +
+    " · hold/release/read-back/freshness " +
+    [d.hold, d.release, d.readback, d.freshness].map(x => x ? "✓" : "–").join("/")
+  ).join("<br>");
+}
+function render() {
+  const r = readiness(state);
+  document.getElementById("summary").textContent =
+    (state.admin === false ? "Read-only — ask an administrator." :
+      state.steps[9] === "done" ? "Onboarding complete. Operating mode: Observe." :
+      "Operating mode: Observe. Current step: " + STEP_NAMES[state.currentStep] + ".") +
+    " Integration: " + state.integration.phase.replaceAll("_", " ") + ".";
+  document.getElementById("steps").innerHTML = STEP_NAMES.map((name, i) =>
+    '<li class="' + (i === state.currentStep ? "current-step " : "") +
+    (highlights.steps.includes(i) ? "changed" : "") + '"><span>' +
+    (i + 1) + ". " + escapeHTML(name) + '</span><span class="chip ' +
+    state.steps[i] + '">' + state.steps[i].replaceAll("_", " ") + "</span></li>"
+  ).join("");
+  const event = document.getElementById("event");
+  event.textContent = state.lastEvent;
+  event.className = "notice " + (state.refused ? "bad" : state.lastEvent.includes("failed") ||
+    state.lastEvent.includes("rejected") ? "warn" : "");
+
+  const topology = state.topology.limitsSet
+    ? state.topology.banks.map(b => escapeHTML(b.id) + ": " + b.inverters.map(escapeHTML).join(", ") +
+      "; charge/discharge " + b.chargeA + "/" + b.dischargeA + " A").join("<br>") +
+      "<br>Supply current limit " + state.topology.siteImportA + " A; site export limit " +
+      state.topology.siteExportW + " W."
+    : "Not confirmed.";
+  document.getElementById("facts").innerHTML =
+    "<p><strong>Devices:</strong><br>" + describeDevices(state) + "</p>" +
+    "<p><strong>Topology and limits:</strong><br>" + topology + "</p>" +
+    "<p><strong>Tariff:</strong> " + escapeHTML(state.tariff.answer) +
+    (state.tariff.rate ? " · " + escapeHTML(state.tariff.rate) + " · " + escapeHTML(state.tariff.dispatch) : "") + "</p>" +
+    "<p><strong>Solcast:</strong> key " + (state.forecast.solcastKeySet ? "set" : "unset") +
+    "; sites " + state.forecast.sites + "</p>" +
+    "<p><strong>EV:</strong> " + (state.loads.ev ? "plug, status, and power confirmed" : "none confirmed") +
+    "<br><strong>Major loads:</strong> " +
+    (state.loads.major.length ? state.loads.major.map(x => escapeHTML(x.name) + " (" + x.amps + " A)").join(", ") : "none recorded") + "</p>" +
+    "<p><strong>Fallback:</strong> " + escapeHTML(state.fallback.status.replaceAll("_", " ")) +
+    (state.fallback.window ? " · " + escapeHTML(state.fallback.window) + " · " + state.fallback.chargeA + " A" : "") +
+    (state.fallback.reason ? " · " + escapeHTML(state.fallback.reason) : "") + "</p>";
+
+  for (const [id, label, saved, revision, lines] of [
+    ["integration-save", "Saved to integration", state.saved.integration, state.saved.integrationRevision,
+      ["Device connections", "Inverter, battery-bank, and site limits", "Fallback charging schedule"]],
+    ["addon-save", "Saved to add-on", state.saved.addon, state.saved.addonRevision,
+      ["Planning and tariff", "Forecast consumer and UI settings"]]
+  ]) {
+    const el = document.getElementById(id);
+    el.className = "subcard" + (highlights.keys.includes("saved") ? " changed" : "");
+    el.innerHTML = "<strong>" + label + "</strong><p>" +
+      (saved ? "Saved · revision " + revision : "Not saved") + "</p>" +
+      "<small>" + lines.join("; ") + "</small>";
+  }
+  document.getElementById("warnings").innerHTML = listHTML(state.warnings);
+  document.getElementById("readiness").innerHTML = ["Protect", "Optimise"].map(mode => {
+    const x = r[mode];
+    return '<div class="subcard"><div class="mode ' + (x.ready ? "ready" : "waiting") + '">' +
+      mode + ": " + (x.ready ? "Ready to choose" : "Not ready") + "</div>" +
+      (x.unmet.length ? listHTML(x.unmet) : "<p>All mode prerequisites met.</p>") + "</div>";
+  }).join("");
+  document.getElementById("advisories").innerHTML =
+    "<h3 style='margin-top:14px'>Advisory items</h3>" + listHTML(r.Optimise.advisory);
+  document.getElementById("readiness-card").classList.toggle("changed",
+    highlights.keys.some(x => ["devices", "fallback", "saved", "sessionLive", "trustedSoc", "tariff", "forecast", "history"].includes(x)));
+  renderWalkthrough();
+}
+function applyActions(actions) {
+  const before = state;
+  let next = state;
+  for (const action of actions) {
+    next = onboarding(next, action);
+    if (next.refused) break;
+  }
+  state = next;
+  highlights.steps = state.steps.map((x, i) => x !== before.steps[i] ? i : -1).filter(i => i >= 0);
+  highlights.keys = Object.keys(state).filter(k => JSON.stringify(state[k]) !== JSON.stringify(before[k]));
+  render();
+  return !state.refused;
+}
+function actionFor(code) {
+  if (code === "SOLCAST_SET_2") return { type: "SOLCAST_SET", sites: 2 };
+  if (code.startsWith("FALLBACK_") && ["FALLBACK_SITE", "FALLBACK_BANK", "FALLBACK_EXPORT", "FALLBACK_READBACK"].includes(code)) {
+    return { type: "FALLBACK_REJECT", reason: code.split("_")[1].toLowerCase() };
+  }
+  return { type: code };
+}
+function renderControls() {
+  document.getElementById("controls").innerHTML = groups.map(([heading, buttons]) =>
+    '<div class="control-group"><h3>' + escapeHTML(heading) + '</h3><div class="buttons">' +
+    buttons.map(([label, code]) =>
+      '<button type="button" data-action="' + code + '">' + escapeHTML(label) + "</button>"
+    ).join("") + "</div></div>"
+  ).join("");
+}
+function renderTabs() {
+  document.getElementById("tabs").innerHTML = scenarios.map(s =>
+    '<button type="button" role="tab" data-scenario="' + s.id + '" aria-selected="' +
+    (s.id === activeScenario) + '">' + escapeHTML(s.title) + "</button>"
+  ).join("");
+}
+function renderWalkthrough() {
+  const scenario = scenarios.find(x => x.id === activeScenario);
+  renderTabs();
+  document.getElementById("walkthrough").innerHTML =
+    "<p>" + escapeHTML(scenario.description) + "</p>" +
+    (scenario.id === "no_tariff" ? '<p class="tag">Decided: missing tariff blocks Optimise.</p>' : "") +
+    scenario.steps.map(([label], i) =>
+      '<div class="walk-step ' + (i < walkIndex ? "completed" : "") + '">' +
+      '<button type="button" data-walk="' + i + '"' + (i !== walkIndex ? " disabled" : "") +
+      ' aria-label="Run walkthrough step ' + (i + 1) + '">' + (i < walkIndex ? "✓" : i + 1) +
+      "</button><span>" + escapeHTML(label) + "</span></div>"
+    ).join("");
+}
+document.addEventListener("click", event => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  if (button.dataset.scenario) {
+    activeScenario = button.dataset.scenario;
+    state = initialState(scenarios.find(x => x.id === activeScenario).start);
+    walkIndex = 0;
+    highlights = { steps: [], keys: [] };
+    render();
+    return;
+  }
+  if (button.dataset.action) {
+    applyActions([actionFor(button.dataset.action)]);
+    return;
+  }
+  if (button.dataset.walk !== undefined) {
+    const scenario = scenarios.find(x => x.id === activeScenario);
+    const i = Number(button.dataset.walk);
+    if (i !== walkIndex) return;
+    if (applyActions(scenario.steps[i][1])) walkIndex++;
+    renderWalkthrough();
+  }
+});
+renderControls();
+render();
+</script>
+</body>
+</html>
