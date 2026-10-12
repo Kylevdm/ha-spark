@@ -13,7 +13,7 @@ unattended cutover.
 
 | Item | Result | Evidence |
 | --- | --- | --- |
-| Gateway: multi-host on, storage-type caching off | Pass | Owner confirmed, 2026-10-02 |
+| Gateway: multi-host on, storage-type caching off | Pass since 2026-10-12 | The 2026-10-02 owner confirmation was wrong. The gateway's web page has no storage setting, and a timing probe found caching on ([#259](https://github.com/Kylevdm/ha-spark/issues/259#issuecomment-6113907238)). Switched to non-storage in VirCom, then re-probed with no cached answers ([#282](https://github.com/Kylevdm/ha-spark/issues/282#issuecomment-6120003920)) |
 | Driver-issued write at 43143 lands and reads back | Pass | v0.19.1, 2026-10-03 14:30: deactivate, current and window all `[APPLIED]` with read-back ([#164](https://github.com/Kylevdm/ha-spark/issues/164#issuecomment-5969665164)) |
 | Settling delay for the timed-slot registers | Pass | About 5–6 s per value, about 11 s for the 8-register deactivate. Read-back waits up to about 15 s since v0.19.1 ([#164](https://github.com/Kylevdm/ha-spark/issues/164)) |
 | 43141 ×10 scale away from 60 A | Pass | 17 A written as raw 170, read back as 17.0 ([#164](https://github.com/Kylevdm/ha-spark/issues/164)) |
