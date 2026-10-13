@@ -314,3 +314,13 @@ requests are spaced out; the owner's are not. A request counts as the agent's
 whenever the assistant chose to make it, wherever it was asked from.
 (Decision: #269, 2026-10-12.)
 _Avoid_: run plan, force replan, apply now
+
+**Add-on command**:
+A request that ha-spark's add-on makes of the integration with the add-on's
+authority, such as applying the plan or carrying an owner's request from
+ha-spark's own page. The integration acts on it only when the integration
+collected it from the add-on itself, during the current add-on session and
+authority epoch. A Home Assistant service call never counts as one, whoever
+makes it.
+(Decision: #291, 2026-10-13.)
+_Avoid_: add-on service call, Supervisor call
