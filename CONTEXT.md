@@ -139,7 +139,20 @@ supply across its connected inverters, with a separate limit for each direction.
 
 **Site export limit**:
 The maximum combined grid-export power permitted at the household's grid
-connection, including battery and solar output after house consumption.
+connection, including battery and solar output after house consumption. It is
+the stricter of the DNO export permission and the export direction of the
+supply current limit, and every consumer (planner, device bound, live checks)
+uses this one value.
+(Decision: #283, 2026-10-12.)
+
+**Device export bound**:
+An export limit held and enforced by the inverter itself, covering its solar
+and battery output together. The owner or installer sets it; ha-spark verifies
+it and never writes it. Scheduled battery export needs a verified bound on
+every export-capable inverter, and those bounds must together stay within the
+site export limit.
+(Decision: #283, 2026-10-12.)
+_Avoid_: EPM (vendor term), export guard
 
 **Charging allocation**:
 The charging power assigned to a bank and divided across its connected
@@ -270,6 +283,23 @@ back; recovery being *ready* does not end it.
 (Decision: #266, 2026-10-12.)
 _Avoid_: Solis fallback
 
+**Owner**:
+A Home Assistant administrator acting for the household through ha-spark's
+own page or its command line. A household can have several owners, and each
+has the same standing. Only an owner can approve a config proposal, change the
+operating mode or start an override.
+(Decision: #278, 2026-10-12.)
+_Avoid_: HA owner, admin user, the user
+
+**Config proposal**:
+A change to agent-editable settings that the agent has asked for and that
+has not yet been applied. It is fixed once made. Only an owner's approval on
+ha-spark's own page applies it, and approving it applies it at once. It expires
+unapproved after 15 minutes or when the add-on restarts, and a newer proposal
+from the same agent replaces it.
+(Decision: #278, 2026-10-12.)
+_Avoid_: pending change, approval token
+
 **Agent-editable setting**:
 A household setting the owner has allowed the product agent to request
 changing. That permission does not itself approve a particular change.
@@ -284,3 +314,13 @@ requests are spaced out; the owner's are not. A request counts as the agent's
 whenever the assistant chose to make it, wherever it was asked from.
 (Decision: #269, 2026-10-12.)
 _Avoid_: run plan, force replan, apply now
+
+**Add-on command**:
+A request that ha-spark's add-on makes of the integration with the add-on's
+authority, such as applying the plan or carrying an owner's request from
+ha-spark's own page. The integration acts on it only when the integration
+collected it from the add-on itself, during the current add-on session and
+authority epoch. A Home Assistant service call never counts as one, whoever
+makes it.
+(Decision: #291, 2026-10-13.)
+_Avoid_: add-on service call, Supervisor call
