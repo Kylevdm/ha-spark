@@ -331,3 +331,16 @@ owner's chosen region and half-hour. It is display-only: the plan never
 considers it, and it plays no part in readiness. Past values are regional
 estimates, not metered actuals.
 (Decision: #305, 2026-10-14.)
+
+**Setup**:
+The guided process that takes a new household from install to a saved
+configuration, ending in Observe. It is a process, not a place: once finished
+it is gone, except to resume a half-saved run. The owner may choose to run it
+again from Settings.
+(Decision: #306, 2026-10-14.)
+_Avoid_: onboarding screen, setup screen (for post-setup editing)
+
+**Settings**:
+Where the owner changes configuration after Setup. Changing a setting never
+changes the operating mode.
+(Decision: #306, 2026-10-14.)
