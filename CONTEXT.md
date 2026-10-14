@@ -359,3 +359,27 @@ The share of a span's half-hours that have trustworthy measurements (and, for
 cost figures, captured rates). Statistics always state their coverage;
 missing half-hours are left out, never filled from a forecast.
 (Decision: #309, 2026-10-14.)
+
+**Assistant**:
+ha-spark's own chat on its page: an agent that reads the plan and the
+household's state through the same tools as outside agents, and may record
+household facts, ask for a replan or propose a settings change, as far as the
+owner allows. It never changes a device. Each conversation belongs to one Home
+Assistant user.
+(Decision: #310, 2026-10-14.)
+_Avoid_: copilot, bot, chat agent
+
+**Chat provider**:
+The language model service the assistant uses: the owner's own Ollama server,
+or an opt-in third-party service the owner chooses. Only one is used at a time.
+Choosing a third-party service sends the conversation and its context out of
+the house.
+(Decision: #310, 2026-10-14.)
+_Avoid_: LLM tier, cloud tier
+
+**Offline answer**:
+A reply from ha-spark's built-in parser when the chat provider can't answer.
+It is always marked as such, and it never mixes with a part-finished assistant
+reply.
+(Decision: #310, 2026-10-14.)
+_Avoid_: fallback reply

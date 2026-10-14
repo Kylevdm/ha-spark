@@ -13,7 +13,8 @@ Guidance for Claude Code in this repository.
 ## Project
 
 `ha-spark`: local-first energy autopilot for Home Assistant (REST + WebSocket),
-with a single remote Ollama tier + deterministic offline fallback for NL. Ships
+with one owner-chosen chat provider (remote Ollama, or opt-in OpenAI-compatible)
++ deterministic offline fallback for NL. Ships
 as an HA add-on. Plain Python 3.11+ / asyncio, no agent framework. Repo and
 import package: `ha-spark` / `ha_spark` (`github.com/Kylevdm/ha-spark`).
 
@@ -76,8 +77,9 @@ proxy with `SUPERVISOR_TOKEN`; **standalone/dev** needs both `HA_URL` +
 `HA_TOKEN`. Consumers use the derived `auth_token` / `ha_rest_url` /
 `ha_websocket_url`, never the raw fields.
 
-Standing decisions: single remote `OLLAMA_URL` tier
-with deterministic offline fallback; raw `entity_id` addressing, no fuzzy name
+Standing decisions: one owner-chosen chat provider (remote `OLLAMA_URL`, or an
+opt-in OpenAI-compatible `/chat/completions` endpoint, ADR-0010) with
+deterministic offline fallback; raw `entity_id` addressing, no fuzzy name
 matching; `proactive_mode = off|simulate|on` (default `simulate`) gates every
 write, through the same decision path with side effects suppressed.
 
