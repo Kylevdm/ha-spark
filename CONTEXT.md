@@ -324,3 +324,10 @@ authority epoch. A Home Assistant service call never counts as one, whoever
 makes it.
 (Decision: #291, 2026-10-13.)
 _Avoid_: add-on service call, Supervisor call
+
+**Grid carbon intensity**:
+The estimated or forecast carbon emitted per unit of grid electricity for the
+owner's chosen region and half-hour. It is display-only: the plan never
+considers it, and it plays no part in readiness. Past values are regional
+estimates, not metered actuals.
+(Decision: #305, 2026-10-14.)
