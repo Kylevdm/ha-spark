@@ -3,14 +3,17 @@
 Status: accepted (2026-10-10), confirmed by the owner during the live discussion of
 [ADR: the integration/add-on split and the reversal of the HA-as-transport decision](https://github.com/Kylevdm/ha-spark/issues/248).
 Amended by [ADR-0008](0008-operating-mode-and-authority-lifecycle.md): fallback
-applies only in Optimise, and Protect does not depend on the add-on.
+applies only in Optimise, and Protect does not depend on the add-on. Add-on
+commands are fetched by the integration over the authenticated discovery
+channel, not sent as HA services ([ADR-0008, amended by #291](0008-operating-mode-and-authority-lifecycle.md)).
 Detailed lifecycle contracts remain follow-up decisions on the v1 map.
 This is a planning record, not implemented behavior.
 
 The companion integration owns device I/O, entities, command validation,
 device limits, write authority, and read-back verification. The add-on owns
-energy planning, learning, and the ingress UI. The integration exposes services
-for add-on commands and entities for observed results. Without the add-on,
+energy planning, learning, and the ingress UI. The integration fetches add-on
+commands over the authenticated discovery channel and exposes entities for
+observed results. Without the add-on,
 it continues exposing entities and accepting authorised manual changes, with
 an availability warning.
 
@@ -87,7 +90,8 @@ The companion integration is the sole Modbus client for each physical inverter
 bus, with one shared connection for reads, writes, protection, fallback, and
 read-back. Disconnect old integrations, overlay hubs, and direct clients at
 cutover. Multi-client gateway support does not grant concurrent control authority.
-The add-on uses the integration's services/entities, not a direct Modbus connection.
+The add-on uses the integration's command channel and entities, not a direct
+Modbus connection.
 Gateway caching must be disabled, following
 [Research: the full Solis Modbus register map over a Waveshare RS485-to-TCP gateway](https://github.com/Kylevdm/ha-spark/issues/249).
 
@@ -96,8 +100,9 @@ Gateway caching must be disabled, following
 - Supersedes the transport policy in
   [Grilling: multi-inverter driver foundation architecture](https://github.com/Kylevdm/ha-spark/issues/75):
   native device I/O becomes the companion integration's responsibility, rather
-  than an exception requiring a defect in a third-party integration. HA services
-  and entities remain the add-on-to-integration boundary. The shared connection
+  than an exception requiring a defect in a third-party integration. The
+  integration's command channel and HA entities are the add-on-to-integration
+  boundary. The shared connection
   per bus rule remains, with the companion integration as owner.
 - Supersedes the narrow-overlay / do-not-rebuild-integration scope underlying
   [the native Solis charge implementation](https://github.com/Kylevdm/ha-spark/issues/84)
