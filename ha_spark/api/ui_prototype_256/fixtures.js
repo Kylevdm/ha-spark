@@ -71,7 +71,7 @@ window.PLAN_FIXTURES["synthetic"] = {
    },
    {
     "entity_id": "sensor.ha_spark_last_run",
-    "state": "2026-10-11T16:40:03.385507+00:00",
+    "state": "2026-10-14T15:41:24.721193+00:00",
     "attributes": {
      "friendly_name": "ha-spark last run",
      "device_class": "timestamp"
@@ -141,6 +141,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.4,
     "solar_kwh": 0.0,
+    "carbon_gco2": 109,
+    "carbon_index": "low",
     "soc_pct": 29.5,
     "soc_kind": "ramp",
     "actions": [
@@ -154,6 +156,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 85,
+    "carbon_index": "low",
     "soc_pct": 34.6,
     "soc_kind": "ramp",
     "actions": [
@@ -167,6 +171,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 87,
+    "carbon_index": "low",
     "soc_pct": 39.7,
     "soc_kind": "ramp",
     "actions": [
@@ -180,6 +186,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 78,
+    "carbon_index": "low",
     "soc_pct": 44.8,
     "soc_kind": "ramp",
     "actions": [
@@ -193,6 +201,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 63,
+    "carbon_index": "low",
     "soc_pct": 49.8,
     "soc_kind": "ramp",
     "actions": [
@@ -206,6 +216,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 53,
+    "carbon_index": "low",
     "soc_pct": 54.9,
     "soc_kind": "ramp",
     "actions": [
@@ -219,6 +231,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 55,
+    "carbon_index": "low",
     "soc_pct": 60.0,
     "soc_kind": "ramp",
     "actions": [
@@ -232,6 +246,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 67,
+    "carbon_index": "low",
     "soc_pct": 65.1,
     "soc_kind": "ramp",
     "actions": [
@@ -245,6 +261,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 81,
+    "carbon_index": "low",
     "soc_pct": 70.2,
     "soc_kind": "ramp",
     "actions": [
@@ -258,6 +276,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 89,
+    "carbon_index": "low",
     "soc_pct": 75.2,
     "soc_kind": "ramp",
     "actions": [
@@ -271,6 +291,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 85,
+    "carbon_index": "low",
     "soc_pct": 80.3,
     "soc_kind": "ramp",
     "actions": [
@@ -284,6 +306,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 74,
+    "carbon_index": "low",
     "soc_pct": 85.4,
     "soc_kind": "ramp",
     "actions": [
@@ -297,6 +321,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 67,
+    "carbon_index": "low",
     "soc_pct": 90.5,
     "soc_kind": "path",
     "actions": []
@@ -308,6 +334,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.35,
     "solar_kwh": 0.0,
+    "carbon_gco2": 73,
+    "carbon_index": "low",
     "soc_pct": 89.4,
     "soc_kind": "path",
     "actions": []
@@ -319,6 +347,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.35,
     "solar_kwh": 0.0,
+    "carbon_gco2": 92,
+    "carbon_index": "low",
     "soc_pct": 87.7,
     "soc_kind": "path",
     "actions": []
@@ -330,6 +360,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.65,
     "solar_kwh": 0.0,
+    "carbon_gco2": 119,
+    "carbon_index": "low",
     "soc_pct": 85.9,
     "soc_kind": "path",
     "actions": []
@@ -341,6 +373,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.65,
     "solar_kwh": 0.016,
+    "carbon_gco2": 138,
+    "carbon_index": "moderate",
     "soc_pct": 82.7,
     "soc_kind": "path",
     "actions": []
@@ -352,6 +386,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.65,
     "solar_kwh": 0.084,
+    "carbon_gco2": 141,
+    "carbon_index": "moderate",
     "soc_pct": 79.5,
     "soc_kind": "path",
     "actions": []
@@ -363,6 +399,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.65,
     "solar_kwh": 0.177,
+    "carbon_gco2": 126,
+    "carbon_index": "moderate",
     "soc_pct": 76.6,
     "soc_kind": "path",
     "actions": []
@@ -374,6 +412,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.283,
+    "carbon_gco2": 101,
+    "carbon_index": "low",
     "soc_pct": 74.1,
     "soc_kind": "path",
     "actions": []
@@ -385,6 +425,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.394,
+    "carbon_gco2": 80,
+    "carbon_index": "low",
     "soc_pct": 73.4,
     "soc_kind": "path",
     "actions": []
@@ -396,6 +438,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.502,
+    "carbon_gco2": 71,
+    "carbon_index": "low",
     "soc_pct": 73.2,
     "soc_kind": "path",
     "actions": []
@@ -407,6 +451,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.601,
+    "carbon_gco2": 72,
+    "carbon_index": "low",
     "soc_pct": 73.4,
     "soc_kind": "path",
     "actions": []
@@ -418,6 +464,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.684,
+    "carbon_gco2": 74,
+    "carbon_index": "low",
     "soc_pct": 74.0,
     "soc_kind": "path",
     "actions": []
@@ -429,6 +477,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.747,
+    "carbon_gco2": 68,
+    "carbon_index": "low",
     "soc_pct": 75.0,
     "soc_kind": "path",
     "actions": []
@@ -440,6 +490,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.787,
+    "carbon_gco2": 52,
+    "carbon_index": "low",
     "soc_pct": 76.3,
     "soc_kind": "path",
     "actions": []
@@ -451,6 +503,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.8,
+    "carbon_gco2": 35,
+    "carbon_index": "very low",
     "soc_pct": 77.8,
     "soc_kind": "path",
     "actions": []
@@ -462,6 +516,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.787,
+    "carbon_gco2": 35,
+    "carbon_index": "very low",
     "soc_pct": 79.3,
     "soc_kind": "path",
     "actions": [
@@ -475,6 +531,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.747,
+    "carbon_gco2": 35,
+    "carbon_index": "very low",
     "soc_pct": 80.7,
     "soc_kind": "path",
     "actions": [
@@ -488,6 +546,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.684,
+    "carbon_gco2": 36,
+    "carbon_index": "very low",
     "soc_pct": 82.0,
     "soc_kind": "path",
     "actions": [
@@ -501,6 +561,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.601,
+    "carbon_gco2": 58,
+    "carbon_index": "low",
     "soc_pct": 83.0,
     "soc_kind": "path",
     "actions": []
@@ -512,6 +574,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.502,
+    "carbon_gco2": 77,
+    "carbon_index": "low",
     "soc_pct": 83.6,
     "soc_kind": "path",
     "actions": []
@@ -523,6 +587,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.394,
+    "carbon_gco2": 88,
+    "carbon_index": "low",
     "soc_pct": 83.9,
     "soc_kind": "path",
     "actions": []
@@ -534,6 +600,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.55,
     "solar_kwh": 0.283,
+    "carbon_gco2": 95,
+    "carbon_index": "low",
     "soc_pct": 83.7,
     "soc_kind": "path",
     "actions": []
@@ -545,6 +613,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.55,
     "solar_kwh": 0.177,
+    "carbon_gco2": 106,
+    "carbon_index": "low",
     "soc_pct": 82.1,
     "soc_kind": "path",
     "actions": [
@@ -558,6 +628,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.95,
     "solar_kwh": 0.084,
+    "carbon_gco2": 129,
+    "carbon_index": "moderate",
     "soc_pct": 73.1,
     "soc_kind": "path",
     "actions": [
@@ -571,6 +643,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.95,
     "solar_kwh": 0.016,
+    "carbon_gco2": 159,
+    "carbon_index": "moderate",
     "soc_pct": 64.1,
     "soc_kind": "path",
     "actions": [
@@ -584,6 +658,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.95,
     "solar_kwh": 0.0,
+    "carbon_gco2": 183,
+    "carbon_index": "moderate",
     "soc_pct": 55.1,
     "soc_kind": "path",
     "actions": [
@@ -597,6 +673,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.95,
     "solar_kwh": 0.0,
+    "carbon_gco2": 187,
+    "carbon_index": "moderate",
     "soc_pct": 46.1,
     "soc_kind": "path",
     "actions": [
@@ -610,6 +688,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.95,
     "solar_kwh": 0.0,
+    "carbon_gco2": 166,
+    "carbon_index": "moderate",
     "soc_pct": 37.1,
     "soc_kind": "path",
     "actions": []
@@ -621,6 +701,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.95,
     "solar_kwh": 0.0,
+    "carbon_gco2": 129,
+    "carbon_index": "moderate",
     "soc_pct": 32.4,
     "soc_kind": "path",
     "actions": []
@@ -632,6 +714,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.6,
     "solar_kwh": 0.0,
+    "carbon_gco2": 91,
+    "carbon_index": "low",
     "soc_pct": 27.6,
     "soc_kind": "path",
     "actions": []
@@ -643,6 +727,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.6,
     "solar_kwh": 0.0,
+    "carbon_gco2": 66,
+    "carbon_index": "low",
     "soc_pct": 24.6,
     "soc_kind": "path",
     "actions": []
@@ -654,6 +740,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.6,
     "solar_kwh": 0.0,
+    "carbon_gco2": 60,
+    "carbon_index": "low",
     "soc_pct": 21.6,
     "soc_kind": "path",
     "actions": []
@@ -665,6 +753,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.6,
     "solar_kwh": 0.0,
+    "carbon_gco2": 69,
+    "carbon_index": "low",
     "soc_pct": 18.6,
     "soc_kind": "path",
     "actions": [
@@ -678,6 +768,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.4,
     "solar_kwh": 0.0,
+    "carbon_gco2": 82,
+    "carbon_index": "low",
     "soc_pct": 17.0,
     "soc_kind": "path",
     "actions": [
@@ -691,6 +783,8 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.4,
     "solar_kwh": 0.0,
+    "carbon_gco2": 88,
+    "carbon_index": "low",
     "soc_pct": 17.0,
     "soc_kind": "path",
     "actions": [
@@ -704,9 +798,278 @@ window.PLAN_FIXTURES["synthetic"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.4,
     "solar_kwh": 0.0,
+    "carbon_gco2": 82,
+    "carbon_index": "low",
     "soc_pct": 17.0,
     "soc_kind": "path",
     "actions": []
+   }
+  ],
+  "carbon_source": "synthetic (prototype)",
+  "history": [
+   {
+    "start": "2026-10-11T07:00:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": 0.0,
+    "carbon_gco2": 127,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T07:30:00+01:00",
+    "solar_forecast_kwh": 0.016,
+    "solar_actual_kwh": 0.018,
+    "carbon_gco2": 150,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T08:00:00+01:00",
+    "solar_forecast_kwh": 0.084,
+    "solar_actual_kwh": 0.094,
+    "carbon_gco2": 165,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T08:30:00+01:00",
+    "solar_forecast_kwh": 0.177,
+    "solar_actual_kwh": 0.198,
+    "carbon_gco2": 163,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T09:00:00+01:00",
+    "solar_forecast_kwh": 0.283,
+    "solar_actual_kwh": 0.317,
+    "carbon_gco2": 144,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T09:30:00+01:00",
+    "solar_forecast_kwh": 0.394,
+    "solar_actual_kwh": 0.441,
+    "carbon_gco2": 116,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T10:00:00+01:00",
+    "solar_forecast_kwh": 0.502,
+    "solar_actual_kwh": 0.562,
+    "carbon_gco2": 92,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T10:30:00+01:00",
+    "solar_forecast_kwh": 0.601,
+    "solar_actual_kwh": 0.673,
+    "carbon_gco2": 81,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T11:00:00+01:00",
+    "solar_forecast_kwh": 0.684,
+    "solar_actual_kwh": 0.766,
+    "carbon_gco2": 82,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T11:30:00+01:00",
+    "solar_forecast_kwh": 0.747,
+    "solar_actual_kwh": 0.837,
+    "carbon_gco2": 87,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T12:00:00+01:00",
+    "solar_forecast_kwh": 0.787,
+    "solar_actual_kwh": 0.881,
+    "carbon_gco2": 85,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T12:30:00+01:00",
+    "solar_forecast_kwh": 0.8,
+    "solar_actual_kwh": 0.896,
+    "carbon_gco2": 74,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T13:00:00+01:00",
+    "solar_forecast_kwh": 0.787,
+    "solar_actual_kwh": 0.433,
+    "carbon_gco2": 58,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T13:30:00+01:00",
+    "solar_forecast_kwh": 0.747,
+    "solar_actual_kwh": 0.411,
+    "carbon_gco2": 47,
+    "carbon_index": "very low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T14:00:00+01:00",
+    "solar_forecast_kwh": 0.684,
+    "solar_actual_kwh": 0.376,
+    "carbon_gco2": 49,
+    "carbon_index": "very low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T14:30:00+01:00",
+    "solar_forecast_kwh": 0.601,
+    "solar_actual_kwh": 0.331,
+    "carbon_gco2": 66,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T15:00:00+01:00",
+    "solar_forecast_kwh": 0.502,
+    "solar_actual_kwh": 0.276,
+    "carbon_gco2": 91,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T15:30:00+01:00",
+    "solar_forecast_kwh": 0.394,
+    "solar_actual_kwh": 0.217,
+    "carbon_gco2": 116,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T16:00:00+01:00",
+    "solar_forecast_kwh": 0.283,
+    "solar_actual_kwh": 0.156,
+    "carbon_gco2": 134,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T16:30:00+01:00",
+    "solar_forecast_kwh": 0.177,
+    "solar_actual_kwh": 0.097,
+    "carbon_gco2": 148,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T17:00:00+01:00",
+    "solar_forecast_kwh": 0.084,
+    "solar_actual_kwh": 0.046,
+    "carbon_gco2": 162,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T17:30:00+01:00",
+    "solar_forecast_kwh": 0.016,
+    "solar_actual_kwh": 0.009,
+    "carbon_gco2": 178,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T18:00:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": 0.0,
+    "carbon_gco2": 192,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T18:30:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": 0.0,
+    "carbon_gco2": 197,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T19:00:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": 0.0,
+    "carbon_gco2": 188,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T19:30:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": 0.0,
+    "carbon_gco2": 165,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T20:00:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": 0.0,
+    "carbon_gco2": 134,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T20:30:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": 0.0,
+    "carbon_gco2": 104,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T21:00:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": null,
+    "carbon_gco2": 84,
+    "carbon_index": "low",
+    "carbon_kind": "forecast"
+   },
+   {
+    "start": "2026-10-11T21:30:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": null,
+    "carbon_gco2": 80,
+    "carbon_index": "low",
+    "carbon_kind": "forecast"
+   },
+   {
+    "start": "2026-10-11T22:00:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": null,
+    "carbon_gco2": 90,
+    "carbon_index": "low",
+    "carbon_kind": "forecast"
+   },
+   {
+    "start": "2026-10-11T22:30:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": null,
+    "carbon_gco2": 105,
+    "carbon_index": "low",
+    "carbon_kind": "forecast"
+   },
+   {
+    "start": "2026-10-11T23:00:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": null,
+    "carbon_gco2": 113,
+    "carbon_index": "low",
+    "carbon_kind": "forecast"
    }
   ],
   "lines": [
@@ -833,7 +1196,7 @@ window.PLAN_FIXTURES["tight"] = {
    },
    {
     "entity_id": "sensor.ha_spark_last_run",
-    "state": "2026-10-11T16:40:03.388375+00:00",
+    "state": "2026-10-14T15:41:24.724318+00:00",
     "attributes": {
      "friendly_name": "ha-spark last run",
      "device_class": "timestamp"
@@ -909,6 +1272,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.4,
     "solar_kwh": 0.0,
+    "carbon_gco2": 109,
+    "carbon_index": "low",
     "soc_pct": 26.5,
     "soc_kind": "ramp",
     "actions": [
@@ -922,6 +1287,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 85,
+    "carbon_index": "low",
     "soc_pct": 31.6,
     "soc_kind": "ramp",
     "actions": [
@@ -935,6 +1302,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 87,
+    "carbon_index": "low",
     "soc_pct": 36.7,
     "soc_kind": "ramp",
     "actions": [
@@ -948,6 +1317,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 78,
+    "carbon_index": "low",
     "soc_pct": 41.8,
     "soc_kind": "ramp",
     "actions": [
@@ -961,6 +1332,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 63,
+    "carbon_index": "low",
     "soc_pct": 46.8,
     "soc_kind": "ramp",
     "actions": [
@@ -974,6 +1347,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 53,
+    "carbon_index": "low",
     "soc_pct": 51.9,
     "soc_kind": "ramp",
     "actions": [
@@ -987,6 +1362,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 55,
+    "carbon_index": "low",
     "soc_pct": 57.0,
     "soc_kind": "ramp",
     "actions": [
@@ -1000,6 +1377,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 67,
+    "carbon_index": "low",
     "soc_pct": 62.1,
     "soc_kind": "ramp",
     "actions": [
@@ -1013,6 +1392,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 81,
+    "carbon_index": "low",
     "soc_pct": 67.2,
     "soc_kind": "ramp",
     "actions": [
@@ -1026,6 +1407,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 89,
+    "carbon_index": "low",
     "soc_pct": 72.2,
     "soc_kind": "ramp",
     "actions": [
@@ -1039,6 +1422,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 85,
+    "carbon_index": "low",
     "soc_pct": 77.3,
     "soc_kind": "ramp",
     "actions": [
@@ -1052,6 +1437,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 74,
+    "carbon_index": "low",
     "soc_pct": 82.4,
     "soc_kind": "ramp",
     "actions": [
@@ -1065,6 +1452,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.22,
     "solar_kwh": 0.0,
+    "carbon_gco2": 67,
+    "carbon_index": "low",
     "soc_pct": 87.5,
     "soc_kind": "path",
     "actions": []
@@ -1076,6 +1465,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.35,
     "solar_kwh": 0.0,
+    "carbon_gco2": 73,
+    "carbon_index": "low",
     "soc_pct": 85.7,
     "soc_kind": "path",
     "actions": []
@@ -1087,6 +1478,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.35,
     "solar_kwh": 0.0,
+    "carbon_gco2": 92,
+    "carbon_index": "low",
     "soc_pct": 82.8,
     "soc_kind": "path",
     "actions": []
@@ -1098,6 +1491,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.65,
     "solar_kwh": 0.0,
+    "carbon_gco2": 119,
+    "carbon_index": "low",
     "soc_pct": 79.8,
     "soc_kind": "path",
     "actions": []
@@ -1109,6 +1504,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.65,
     "solar_kwh": 0.016,
+    "carbon_gco2": 138,
+    "carbon_index": "moderate",
     "soc_pct": 74.4,
     "soc_kind": "path",
     "actions": []
@@ -1120,6 +1517,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.65,
     "solar_kwh": 0.084,
+    "carbon_gco2": 141,
+    "carbon_index": "moderate",
     "soc_pct": 69.1,
     "soc_kind": "path",
     "actions": []
@@ -1131,6 +1530,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.65,
     "solar_kwh": 0.177,
+    "carbon_gco2": 126,
+    "carbon_index": "moderate",
     "soc_pct": 64.3,
     "soc_kind": "path",
     "actions": []
@@ -1142,6 +1543,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.283,
+    "carbon_gco2": 101,
+    "carbon_index": "low",
     "soc_pct": 60.1,
     "soc_kind": "path",
     "actions": []
@@ -1153,6 +1556,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.394,
+    "carbon_gco2": 80,
+    "carbon_index": "low",
     "soc_pct": 59.0,
     "soc_kind": "path",
     "actions": []
@@ -1164,6 +1569,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.502,
+    "carbon_gco2": 71,
+    "carbon_index": "low",
     "soc_pct": 58.6,
     "soc_kind": "path",
     "actions": []
@@ -1175,6 +1582,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.601,
+    "carbon_gco2": 72,
+    "carbon_index": "low",
     "soc_pct": 59.0,
     "soc_kind": "path",
     "actions": []
@@ -1186,6 +1595,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.684,
+    "carbon_gco2": 74,
+    "carbon_index": "low",
     "soc_pct": 60.1,
     "soc_kind": "path",
     "actions": []
@@ -1197,6 +1608,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.747,
+    "carbon_gco2": 68,
+    "carbon_index": "low",
     "soc_pct": 61.7,
     "soc_kind": "path",
     "actions": []
@@ -1208,6 +1621,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.787,
+    "carbon_gco2": 52,
+    "carbon_index": "low",
     "soc_pct": 63.9,
     "soc_kind": "path",
     "actions": []
@@ -1219,6 +1634,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.8,
+    "carbon_gco2": 35,
+    "carbon_index": "very low",
     "soc_pct": 66.3,
     "soc_kind": "path",
     "actions": []
@@ -1230,6 +1647,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.787,
+    "carbon_gco2": 35,
+    "carbon_index": "very low",
     "soc_pct": 68.8,
     "soc_kind": "path",
     "actions": [
@@ -1243,6 +1662,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.747,
+    "carbon_gco2": 35,
+    "carbon_index": "very low",
     "soc_pct": 71.2,
     "soc_kind": "path",
     "actions": [
@@ -1256,6 +1677,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 1.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.684,
+    "carbon_gco2": 36,
+    "carbon_index": "very low",
     "soc_pct": 73.3,
     "soc_kind": "path",
     "actions": [
@@ -1269,6 +1692,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.601,
+    "carbon_gco2": 58,
+    "carbon_index": "low",
     "soc_pct": 75.0,
     "soc_kind": "path",
     "actions": []
@@ -1280,6 +1705,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.502,
+    "carbon_gco2": 77,
+    "carbon_index": "low",
     "soc_pct": 76.1,
     "soc_kind": "path",
     "actions": []
@@ -1291,6 +1718,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.38,
     "solar_kwh": 0.394,
+    "carbon_gco2": 88,
+    "carbon_index": "low",
     "soc_pct": 76.5,
     "soc_kind": "path",
     "actions": []
@@ -1302,6 +1731,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.55,
     "solar_kwh": 0.283,
+    "carbon_gco2": 95,
+    "carbon_index": "low",
     "soc_pct": 76.1,
     "soc_kind": "path",
     "actions": []
@@ -1313,6 +1744,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.55,
     "solar_kwh": 0.177,
+    "carbon_gco2": 106,
+    "carbon_index": "low",
     "soc_pct": 73.5,
     "soc_kind": "path",
     "actions": [
@@ -1326,6 +1759,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.95,
     "solar_kwh": 0.084,
+    "carbon_gco2": 129,
+    "carbon_index": "moderate",
     "soc_pct": 70.2,
     "soc_kind": "path",
     "actions": [
@@ -1339,6 +1774,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.95,
     "solar_kwh": 0.016,
+    "carbon_gco2": 159,
+    "carbon_index": "moderate",
     "soc_pct": 62.9,
     "soc_kind": "path",
     "actions": [
@@ -1352,6 +1789,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.95,
     "solar_kwh": 0.0,
+    "carbon_gco2": 183,
+    "carbon_index": "moderate",
     "soc_pct": 55.1,
     "soc_kind": "path",
     "actions": [
@@ -1365,6 +1804,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.95,
     "solar_kwh": 0.0,
+    "carbon_gco2": 187,
+    "carbon_index": "moderate",
     "soc_pct": 47.1,
     "soc_kind": "path",
     "actions": [
@@ -1378,6 +1819,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.95,
     "solar_kwh": 0.0,
+    "carbon_gco2": 166,
+    "carbon_index": "moderate",
     "soc_pct": 32.1,
     "soc_kind": "path",
     "actions": []
@@ -1389,6 +1832,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.95,
     "solar_kwh": 0.0,
+    "carbon_gco2": 129,
+    "carbon_index": "moderate",
     "soc_pct": 24.2,
     "soc_kind": "path",
     "actions": [
@@ -1402,6 +1847,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.6,
     "solar_kwh": 0.0,
+    "carbon_gco2": 91,
+    "carbon_index": "low",
     "soc_pct": 20.0,
     "soc_kind": "path",
     "actions": [
@@ -1415,6 +1862,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.6,
     "solar_kwh": 0.0,
+    "carbon_gco2": 66,
+    "carbon_index": "low",
     "soc_pct": 20.0,
     "soc_kind": "path",
     "actions": [
@@ -1428,6 +1877,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.6,
     "solar_kwh": 0.0,
+    "carbon_gco2": 60,
+    "carbon_index": "low",
     "soc_pct": 20.0,
     "soc_kind": "path",
     "actions": [
@@ -1441,6 +1892,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.6,
     "solar_kwh": 0.0,
+    "carbon_gco2": 69,
+    "carbon_index": "low",
     "soc_pct": 20.0,
     "soc_kind": "path",
     "actions": [
@@ -1454,6 +1907,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.4,
     "solar_kwh": 0.0,
+    "carbon_gco2": 82,
+    "carbon_index": "low",
     "soc_pct": 18.3,
     "soc_kind": "path",
     "actions": [
@@ -1467,6 +1922,8 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.4,
     "solar_kwh": 0.0,
+    "carbon_gco2": 88,
+    "carbon_index": "low",
     "soc_pct": 18.3,
     "soc_kind": "path",
     "actions": [
@@ -1480,9 +1937,278 @@ window.PLAN_FIXTURES["tight"] = {
     "cheap_frac": 0.0,
     "load_kwh": 0.4,
     "solar_kwh": 0.0,
+    "carbon_gco2": 82,
+    "carbon_index": "low",
     "soc_pct": 18.3,
     "soc_kind": "path",
     "actions": []
+   }
+  ],
+  "carbon_source": "synthetic (prototype)",
+  "history": [
+   {
+    "start": "2026-10-11T07:00:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": 0.0,
+    "carbon_gco2": 127,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T07:30:00+01:00",
+    "solar_forecast_kwh": 0.016,
+    "solar_actual_kwh": 0.018,
+    "carbon_gco2": 150,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T08:00:00+01:00",
+    "solar_forecast_kwh": 0.084,
+    "solar_actual_kwh": 0.094,
+    "carbon_gco2": 165,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T08:30:00+01:00",
+    "solar_forecast_kwh": 0.177,
+    "solar_actual_kwh": 0.198,
+    "carbon_gco2": 163,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T09:00:00+01:00",
+    "solar_forecast_kwh": 0.283,
+    "solar_actual_kwh": 0.317,
+    "carbon_gco2": 144,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T09:30:00+01:00",
+    "solar_forecast_kwh": 0.394,
+    "solar_actual_kwh": 0.441,
+    "carbon_gco2": 116,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T10:00:00+01:00",
+    "solar_forecast_kwh": 0.502,
+    "solar_actual_kwh": 0.562,
+    "carbon_gco2": 92,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T10:30:00+01:00",
+    "solar_forecast_kwh": 0.601,
+    "solar_actual_kwh": 0.673,
+    "carbon_gco2": 81,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T11:00:00+01:00",
+    "solar_forecast_kwh": 0.684,
+    "solar_actual_kwh": 0.766,
+    "carbon_gco2": 82,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T11:30:00+01:00",
+    "solar_forecast_kwh": 0.747,
+    "solar_actual_kwh": 0.837,
+    "carbon_gco2": 87,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T12:00:00+01:00",
+    "solar_forecast_kwh": 0.787,
+    "solar_actual_kwh": 0.881,
+    "carbon_gco2": 85,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T12:30:00+01:00",
+    "solar_forecast_kwh": 0.8,
+    "solar_actual_kwh": 0.896,
+    "carbon_gco2": 74,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T13:00:00+01:00",
+    "solar_forecast_kwh": 0.787,
+    "solar_actual_kwh": 0.433,
+    "carbon_gco2": 58,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T13:30:00+01:00",
+    "solar_forecast_kwh": 0.747,
+    "solar_actual_kwh": 0.411,
+    "carbon_gco2": 47,
+    "carbon_index": "very low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T14:00:00+01:00",
+    "solar_forecast_kwh": 0.684,
+    "solar_actual_kwh": 0.376,
+    "carbon_gco2": 49,
+    "carbon_index": "very low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T14:30:00+01:00",
+    "solar_forecast_kwh": 0.601,
+    "solar_actual_kwh": 0.331,
+    "carbon_gco2": 66,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T15:00:00+01:00",
+    "solar_forecast_kwh": 0.502,
+    "solar_actual_kwh": 0.276,
+    "carbon_gco2": 91,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T15:30:00+01:00",
+    "solar_forecast_kwh": 0.394,
+    "solar_actual_kwh": 0.217,
+    "carbon_gco2": 116,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T16:00:00+01:00",
+    "solar_forecast_kwh": 0.283,
+    "solar_actual_kwh": 0.156,
+    "carbon_gco2": 134,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T16:30:00+01:00",
+    "solar_forecast_kwh": 0.177,
+    "solar_actual_kwh": 0.097,
+    "carbon_gco2": 148,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T17:00:00+01:00",
+    "solar_forecast_kwh": 0.084,
+    "solar_actual_kwh": 0.046,
+    "carbon_gco2": 162,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T17:30:00+01:00",
+    "solar_forecast_kwh": 0.016,
+    "solar_actual_kwh": 0.009,
+    "carbon_gco2": 178,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T18:00:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": 0.0,
+    "carbon_gco2": 192,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T18:30:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": 0.0,
+    "carbon_gco2": 197,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T19:00:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": 0.0,
+    "carbon_gco2": 188,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T19:30:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": 0.0,
+    "carbon_gco2": 165,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T20:00:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": 0.0,
+    "carbon_gco2": 134,
+    "carbon_index": "moderate",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T20:30:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": 0.0,
+    "carbon_gco2": 104,
+    "carbon_index": "low",
+    "carbon_kind": "actual"
+   },
+   {
+    "start": "2026-10-11T21:00:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": null,
+    "carbon_gco2": 84,
+    "carbon_index": "low",
+    "carbon_kind": "forecast"
+   },
+   {
+    "start": "2026-10-11T21:30:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": null,
+    "carbon_gco2": 80,
+    "carbon_index": "low",
+    "carbon_kind": "forecast"
+   },
+   {
+    "start": "2026-10-11T22:00:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": null,
+    "carbon_gco2": 90,
+    "carbon_index": "low",
+    "carbon_kind": "forecast"
+   },
+   {
+    "start": "2026-10-11T22:30:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": null,
+    "carbon_gco2": 105,
+    "carbon_index": "low",
+    "carbon_kind": "forecast"
+   },
+   {
+    "start": "2026-10-11T23:00:00+01:00",
+    "solar_forecast_kwh": 0.0,
+    "solar_actual_kwh": null,
+    "carbon_gco2": 113,
+    "carbon_index": "low",
+    "carbon_kind": "forecast"
    }
   ],
   "lines": [
