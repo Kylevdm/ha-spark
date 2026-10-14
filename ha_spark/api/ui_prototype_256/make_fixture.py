@@ -76,6 +76,33 @@ def _solar_kwh(t: datetime) -> float:
     return round(0.8 * bell, 3)
 
 
+# Synthetic grid carbon intensity (gCO2/kWh), standing in for the regional
+# NESO Carbon Intensity forecast until the source is researched. Windy October
+# night low, solar dip at midday, gas-heavy teatime peak.
+CARBON_BANDS = ((50, "very low"), (120, "low"), (200, "moderate"), (280, "high"))
+
+
+def _carbon_gco2(t: datetime) -> int:
+    import math
+
+    h = t.hour + t.minute / 60
+    day = 0 if t.date() == datetime(2026, 10, 11).date() else 1
+    base = 95 + 55 * math.exp(-((h - 8.0) ** 2) / 4) + 110 * math.exp(-((h - 18.0) ** 2) / 3)
+    base -= 35 * math.exp(-((h - 13.0) ** 2) / 5)
+    base += 18 * math.sin(h * 1.7 + day) - 25 * day
+    return round(max(35.0, base))
+
+
+def _carbon_index(g: int) -> str:
+    return next((name for limit, name in CARBON_BANDS if g < limit), "very high")
+
+
+def _solar_actual_kwh(t: datetime) -> float:
+    """Today's measured PV: a bright morning, then cloud after 13:00."""
+    f = _solar_kwh(t)
+    return round(f * (1.12 if t.hour < 13 else 0.55), 3)
+
+
 def synthetic(capacity_kwh: float = 20.0, label: str = "synthetic") -> dict[str, Any]:
     horizon = datetime(2026, 10, 11, 23, 30, tzinfo=LONDON)
     now = datetime(2026, 10, 11, 21, 10, tzinfo=LONDON)
@@ -235,6 +262,8 @@ def build(
                 "cheap_frac": round(schedule.cheap_fracs[i], 3) if schedule.cheap_fracs else 0,
                 "load_kwh": round(inputs.load_slots[i], 3),
                 "solar_kwh": round(inputs.solar_slots[i], 3) if inputs.solar_slots else 0.0,
+                "carbon_gco2": _carbon_gco2(t),
+                "carbon_index": _carbon_index(_carbon_gco2(t)),
                 "soc_pct": round(soc, 1) if soc is not None else None,
                 "soc_kind": soc_kind,
                 "actions": actions,
@@ -317,8 +346,35 @@ def build(
             "export_revenue": plan.export_revenue,
         },
         "slots": slots,
+        "carbon_source": "synthetic (prototype)",
+        "history": _history(starts[0], now),
         "lines": _merge(sorted(lines, key=lambda x: x["start"] or "")),
     }
+    return out
+
+
+def _history(horizon: datetime, now: datetime) -> list[dict[str, Any]]:
+    """Today from 07:00 up to the plan horizon: actuals where the slot has ended.
+
+    Proposed payload, synthetic values: the planner has no history read yet
+    (statistics fog). Solar actual is null for slots that haven't finished.
+    """
+    t = horizon.astimezone(LONDON).replace(hour=7, minute=0)
+    out = []
+    while t < horizon:
+        done = t + SLOT <= now
+        g = _carbon_gco2(t)
+        out.append(
+            {
+                "start": _iso(t),
+                "solar_forecast_kwh": _solar_kwh(t),
+                "solar_actual_kwh": _solar_actual_kwh(t) if done else None,
+                "carbon_gco2": g,
+                "carbon_index": _carbon_index(g),
+                "carbon_kind": "actual" if done else "forecast",
+            }
+        )
+        t += SLOT
     return out
 
 

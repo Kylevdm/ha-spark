@@ -17,6 +17,7 @@
   --charge: #2c68d0; --hold: #b97c0a; --export: #17905a; --skip: #c2412f; --v2l: #8150c4; --reserve: #66768a;
   --cheap: #cfe2f6; --peak: #efc7b9; --import: #2a3a36; --ring-idle: #e2e9e6;
   --good: #17905a; --warn: #b97c0a; --bad: #c2412f;
+  --solar: #d9a21b; --c-vlow: #17905a; --c-low: #74c08f; --c-mod: #cfd8d3; --c-high: #a39282; --c-vhigh: #6b5a4c;
   --shadow: 0 6px 24px #0f1a1726;
   --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-num: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
@@ -28,6 +29,7 @@
   --charge: #6c9ffb; --hold: #eeb13f; --export: #48c78b; --skip: #ff7c6b; --v2l: #b58bef; --reserve: #9aa8ba;
   --cheap: #1b3953; --peak: #5b2f25; --import: #d6e1dd; --ring-idle: #24302c;
   --good: #48c78b; --warn: #eeb13f; --bad: #ff7c6b; --shadow: 0 6px 24px #00000080; color-scheme: dark;
+  --solar: #f2c14e; --c-vlow: #48c78b; --c-low: #2e7d55; --c-mod: #3a4842; --c-high: #7d6c5e; --c-vhigh: #b39f8c;
 } }
 :root[data-theme="dark"] {
   --bg: #0e1412; --surface: #161f1c; --sunk: #1c2723; --fg: #e4ece9; --muted: #93a39e; --line: #2a3632;
@@ -35,6 +37,7 @@
   --charge: #6c9ffb; --hold: #eeb13f; --export: #48c78b; --skip: #ff7c6b; --v2l: #b58bef; --reserve: #9aa8ba;
   --cheap: #1b3953; --peak: #5b2f25; --import: #d6e1dd; --ring-idle: #24302c;
   --good: #48c78b; --warn: #eeb13f; --bad: #ff7c6b; --shadow: 0 6px 24px #00000080; color-scheme: dark;
+  --solar: #f2c14e; --c-vlow: #48c78b; --c-low: #2e7d55; --c-mod: #3a4842; --c-high: #7d6c5e; --c-vhigh: #b39f8c;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 var(--font-ui); }
@@ -304,49 +307,103 @@ function socPaths(tl, x, y) {
 }
 
 /* ---------------- Variant A: lanes ---------------- */
+const CARBON = { 'very low': 'var(--c-vlow)', low: 'var(--c-low)', moderate: 'var(--c-mod)', high: 'var(--c-high)', 'very high': 'var(--c-vhigh)' };
+/* Combined axis: today's history (k < h) then the plan horizon (k >= h). */
+const histOf = (tl) => tl.history || [];
+const slotAt = (tl, k) => { const h = histOf(tl).length; return k < h ? { past: true, ...tl.history[k] } : { past: false, ...tl.slots[k - h] }; };
+
 function LaneChart({ P, sel, setSel, hl }) {
   const [ref, w] = useWidth();
   const { tl, n } = P;
+  const h = histOf(tl).length, N = h + n;
   const W = Math.max(w, 280), L = 36, R = 10;
-  const x = (i) => L + (W - L - R) * i / n;
+  const x = (k) => L + (W - L - R) * k / N;
+  const xp = (i) => x(h + i);                       // plan-slot index → x
   const lanes = LANES.filter((a) => tl.slots.some((s) => s.actions.includes(a)));
-  const H1 = 140, laneH = 11, gap = 14, H3 = 64;
+  const H1 = 130, laneH = 11, gap = 16, HS = 46, HC = 12, H3 = 60;
   const y1 = (v) => 8 + H1 * (1 - v / 100);
-  const top2 = 8 + H1 + gap, top3 = top2 + lanes.length * (laneH + 3) + gap;
+  const topS = 8 + H1 + gap, topC = topS + HS + gap, top2 = topC + HC + gap;
+  const top3 = top2 + lanes.length * (laneH + 3) + gap;
+  const all = Array.from({ length: N }, (_, k) => slotAt(tl, k));
+  const solarF = (s) => s.past ? s.solar_forecast_kwh : s.solar_kwh;
+  const maxS = Math.max(0.2, ...all.map((s) => Math.max(solarF(s) || 0, s.solar_actual_kwh || 0))) * 1.1;
+  const yS = (v) => topS + HS * (1 - v / maxS);
   const maxP = Math.max(...tl.slots.map((s) => Math.max(s.import_price || 0, s.export_price || 0))) * 1.1;
   const y3 = (v) => top3 + H3 * (1 - v / maxP);
   const H = top3 + H3 + 22;
-  const soc = socPaths(tl, x, y1);
+  const soc = socPaths(tl, xp, y1);
   const step = (key) => {
-    let d = `M${x(0)},${y3(tl.slots[0][key])}`;
-    tl.slots.forEach((s, i) => { d += ` H${x(i + 1)}`; if (i + 1 < n) d += ` V${y3(tl.slots[i + 1][key])}`; });
+    let d = `M${xp(0)},${y3(tl.slots[0][key])}`;
+    tl.slots.forEach((s, i) => { d += ` H${xp(i + 1)}`; if (i + 1 < n) d += ` V${y3(tl.slots[i + 1][key])}`; });
     return d;
   };
+  const stepS = (vals) => {
+    let d = '';
+    vals.forEach((v, k) => { if (v == null) return; d += `${d && vals[k - 1] != null ? 'L' : 'M'}${x(k)},${yS(v)} H${x(k + 1)} `; });
+    return d;
+  };
+  const fc = all.map(solarF);
+  const act = all.map((s) => s.past ? s.solar_actual_kwh : null);
+  const nowX = x(h + (P.now - P.t0) / SLOT_MS);
   const ticks = [];
-  for (let i = 0; i <= n; i += W < 520 ? 12 : 6) ticks.push(i);
+  for (let k = 0; k <= N; k += W < 520 ? 12 : 6) ticks.push(k);
+  const tAt = (k) => P.t0 + (k - h) * SLOT_MS;
   return html`<div ref=${ref} style=${{ width: '100%' }}>
-    ${w > 0 && html`<svg width=${W} height=${H} role="img" aria-label="Plan timeline: state of charge, actions and prices per half-hour">
-      ${hl && html`<rect x=${x(hl.i0)} y="0" width=${x(hl.i1) - x(hl.i0)} height=${H - 18} fill="var(--hl)" />`}
+    ${w > 0 && html`<svg width=${W} height=${H} role="img" aria-label="Today and the plan: state of charge, solar, grid carbon, actions and prices per half-hour">
+      ${h > 0 && html`<rect x=${x(0)} y="0" width=${xp(0) - x(0)} height=${H - 18} fill="var(--sunk)" opacity="0.6" />`}
+      ${hl && html`<rect x=${xp(hl.i0)} y="0" width=${xp(hl.i1) - xp(hl.i0)} height=${H - 18} fill="var(--hl)" />`}
       ${sel != null && html`<rect x=${x(sel)} y="0" width=${x(sel + 1) - x(sel)} height=${H - 18} fill="var(--fg)" opacity="0.08" />`}
+      ${h > 0 && html`<text x=${x(0) + 4} y=${H - 22} class="muted">today so far</text><text x=${xp(0) + 4} y=${H - 22}>plan</text>`}
       ${[0, 50, 100].map((v) => html`<line x1=${L} x2=${W - R} y1=${y1(v)} y2=${y1(v)} stroke="var(--line)" /><text x=${L - 4} y=${y1(v) + 3} text-anchor="end">${v}%</text>`)}
-      <line x1=${L} x2=${W - R} y1=${y1(tl.min_soc)} y2=${y1(tl.min_soc)} stroke="var(--skip)" stroke-dasharray="3 3" />
+      <line x1=${xp(0)} x2=${W - R} y1=${y1(tl.min_soc)} y2=${y1(tl.min_soc)} stroke="var(--skip)" stroke-dasharray="3 3" />
       <text x=${W - R} y=${y1(tl.min_soc) - 3} text-anchor="end">min ${tl.min_soc}%</text>
       ${soc.pts.length && html`<path d=${`${soc.path} L${soc.pts.at(-1)[0]},${y1(0)} L${soc.pts[0][0]},${y1(0)} Z`} fill="var(--charge)" opacity="0.12" />`}
       <path d=${soc.ramp} fill="none" stroke="var(--charge)" stroke-width="2" stroke-dasharray="4 3" />
       <path d=${soc.path} fill="none" stroke="var(--charge)" stroke-width="2" />
-      <text x=${L + 4} y="18">SoC · dashed = estimated during the charge window</text>
-      ${lanes.map((a, r) => tl.slots.map((s, i) => s.actions.includes(a) && html`<rect x=${x(i) + 0.5} y=${top2 + r * (laneH + 3)} width=${Math.max(1, x(i + 1) - x(i) - 1)} height=${laneH} rx="2" fill=${ACT[a].c} />`))}
+      <text x=${xp(0) + 4} y="18">SoC · dashed = estimated during the charge window</text>
+
+      <line x1=${L} x2=${W - R} y1=${yS(0)} y2=${yS(0)} stroke="var(--line)" />
+      <path d=${`${stepS(fc)} L${x(N)},${yS(0)} L${x(0)},${yS(0)} Z`} fill="var(--solar)" opacity="0.22" />
+      <path d=${stepS(fc)} fill="none" stroke="var(--solar)" stroke-width="1.2" stroke-dasharray="3 2" />
+      <path d=${stepS(act)} fill="none" stroke="var(--solar)" stroke-width="2.2" />
+      <text x=${L - 4} y=${yS(maxS / 1.1) + 3} text-anchor="end">${(maxS / 1.1).toFixed(1)}</text>
+      <text x=${L - 4} y=${topS + HS / 2 + 3} text-anchor="end">solar</text>
+      <text x=${L + 4} y=${topS + 8}>solar kWh/slot · dashed = forecast (P50), solid = measured</text>
+
+      ${all.map((s, k) => html`<rect x=${x(k) + 0.25} y=${topC} width=${Math.max(1, x(k + 1) - x(k) - 0.5)} height=${HC} fill=${CARBON[s.carbon_index]} opacity=${s.past && s.carbon_kind === 'actual' ? 1 : 0.85} />`)}
+      <text x=${L - 4} y=${topC + 9} text-anchor="end">CO₂</text>
+
+      ${lanes.map((a, r) => tl.slots.map((s, i) => s.actions.includes(a) && html`<rect x=${xp(i) + 0.5} y=${top2 + r * (laneH + 3)} width=${Math.max(1, xp(i + 1) - xp(i) - 1)} height=${laneH} rx="2" fill=${ACT[a].c} />`))}
       ${lanes.map((a, r) => html`<text x=${L - 4} y=${top2 + r * (laneH + 3) + 9} text-anchor="end">${ACT[a].label.slice(0, 4)}</text>`)}
-      <line x1=${L} x2=${W - R} y1=${y3(0)} y2=${y3(0)} stroke="var(--line)" />
+      <line x1=${xp(0)} x2=${W - R} y1=${y3(0)} y2=${y3(0)} stroke="var(--line)" />
       <path d=${step('import_price')} fill="none" stroke="var(--import)" stroke-width="1.5" />
       <path d=${step('export_price')} fill="none" stroke="var(--export)" stroke-width="1.5" stroke-dasharray="4 2" />
       <text x=${L - 4} y=${y3(maxP / 1.1) + 3} text-anchor="end">${Math.round(maxP / 1.1 * 100)}p</text>
       <text x=${L - 4} y=${y3(0) + 3} text-anchor="end">0p</text>
-      <text x=${L + 4} y=${top3 + 8}>import (solid) · export (dashed) per kWh</text>
-      ${ticks.map((i) => html`<text x=${x(i)} y=${H - 6} text-anchor=${i === 0 ? 'start' : i === n ? 'end' : 'middle'}>${hm(P.at(i))}</text>`)}
-      ${tl.slots.map((_, i) => html`<rect x=${x(i)} y="0" width=${x(i + 1) - x(i)} height=${H - 18} fill="transparent" style=${{ cursor: 'pointer' }} onClick=${() => setSel(i)} />`)}
+      <text x=${xp(0) + 4} y=${top3 + 8}>import (solid) · export (dashed) per kWh</text>
+      ${h > 0 && html`<line x1=${nowX} x2=${nowX} y1="0" y2=${H - 18} stroke="var(--fg)" stroke-width="1.5" /><text x=${nowX - 3} y="10" text-anchor="end" style=${{ fontWeight: 600 }}>now</text>`}
+      ${ticks.map((k) => html`<text x=${x(k)} y=${H - 6} text-anchor=${k === 0 ? 'start' : k === N ? 'end' : 'middle'}>${hm(tAt(k))}</text>`)}
+      ${all.map((_, k) => html`<rect x=${x(k)} y="0" width=${x(k + 1) - x(k)} height=${H - 18} fill="transparent" style=${{ cursor: 'pointer' }} onClick=${() => setSel(k)} />`)}
     </svg>`}
   </div>`;
+}
+
+const LegendA = ({ tl }) => html`<div class="legend">
+  <${Legend} tl=${tl} />
+  <span><i style=${{ background: 'var(--solar)' }}></i>Solar</span>
+  <span>Grid CO₂:</span>${Object.entries(CARBON).map(([k, c]) => html`<span><i style=${{ background: c }}></i>${k}</span>`)}
+  <span class="muted">(${tl.carbon_source || 'no source'})</span></div>`;
+
+function ReadoutA({ P, k }) {
+  if (k == null) return html`<div class="readout muted">Tap a half-hour to see its numbers.</div>`;
+  const h = histOf(P.tl).length;
+  if (k >= h) return html`<div class="readout" aria-live="polite"><${SlotReadout} P=${P} i=${k - h} />
+    <span>grid <b>${P.tl.slots[k - h].carbon_gco2}</b> gCO₂/kWh (${P.tl.slots[k - h].carbon_index}, forecast)</span></div>`;
+  const s = P.tl.history[k], t = P.t0 + (k - h) * SLOT_MS;
+  return html`<div class="readout" aria-live="polite">
+    <span><b>${hm(t)}–${hm(t + SLOT_MS)}</b></span><span class="muted">today, before the plan</span>
+    <span>solar <b>${s.solar_actual_kwh == null ? '–' : s.solar_actual_kwh.toFixed(2)}</b> measured · <b>${s.solar_forecast_kwh.toFixed(2)}</b> forecast kWh</span>
+    <span>grid <b>${s.carbon_gco2}</b> gCO₂/kWh (${s.carbon_index}, ${s.carbon_kind})</span></div>`;
 }
 
 function PlanA({ P }) {
@@ -362,8 +419,8 @@ function PlanA({ P }) {
       <div class="tile"><small>Without battery</small><b>${money(tl.costs.baseline)}</b></div>
     </div>
     <div class="card stack">
-      <${Legend} tl=${tl} />
-      <${SlotReadout} P=${P} i=${sel} />
+      <${LegendA} tl=${tl} />
+      <${ReadoutA} P=${P} k=${sel} />
       <${LaneChart} P=${P} sel=${sel} setSel=${setSel} hl=${hl} />
     </div>
     <div class="card">
