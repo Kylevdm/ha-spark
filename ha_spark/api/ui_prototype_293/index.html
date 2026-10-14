@@ -1,0 +1,663 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ha-spark Onboarding Prototype</title>
+<!--
+  PROTOTYPE (#293), throwaway. Three variants of the onboarding screen on the shell's #/onboarding route, switchable via ?variant=A|B|C.
+  State transitions and readiness come only from onboarding_model.js. CDN and inline script are for this prototype.
+-->
+<style>
+:root {
+  --bg: #f3f6f5; --surface: #ffffff; --sunk: #e9eeec; --fg: #16201d; --muted: #5a6a65; --line: #d5dfdb;
+  --accent: #0e6a76; --accent-fg: #ffffff; --hl: #0e6a7624;
+  --charge: #2c68d0; --hold: #b97c0a; --export: #17905a; --skip: #c2412f; --v2l: #8150c4; --reserve: #66768a;
+  --cheap: #cfe2f6; --peak: #efc7b9; --import: #2a3a36; --ring-idle: #e2e9e6;
+  --good: #17905a; --warn: #b97c0a; --bad: #c2412f;
+  --solar: #d9a21b; --c-vlow: #17905a; --c-low: #74c08f; --c-mod: #cfd8d3; --c-high: #a39282; --c-vhigh: #6b5a4c;
+  --shadow: 0 6px 24px #0f1a1726;
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-num: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  --dock-h: 0px;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0e1412; --surface: #161f1c; --sunk: #1c2723; --fg: #e4ece9; --muted: #93a39e; --line: #2a3632;
+  --accent: #52c0cc; --accent-fg: #0e1412; --hl: #52c0cc2e;
+  --charge: #6c9ffb; --hold: #eeb13f; --export: #48c78b; --skip: #ff7c6b; --v2l: #b58bef; --reserve: #9aa8ba;
+  --cheap: #1b3953; --peak: #5b2f25; --import: #d6e1dd; --ring-idle: #24302c;
+  --good: #48c78b; --warn: #eeb13f; --bad: #ff7c6b; --shadow: 0 6px 24px #00000080; color-scheme: dark;
+  --solar: #f2c14e; --c-vlow: #48c78b; --c-low: #2e7d55; --c-mod: #3a4842; --c-high: #7d6c5e; --c-vhigh: #b39f8c;
+} }
+:root[data-theme="dark"] {
+  --bg: #0e1412; --surface: #161f1c; --sunk: #1c2723; --fg: #e4ece9; --muted: #93a39e; --line: #2a3632;
+  --accent: #52c0cc; --accent-fg: #0e1412; --hl: #52c0cc2e;
+  --charge: #6c9ffb; --hold: #eeb13f; --export: #48c78b; --skip: #ff7c6b; --v2l: #b58bef; --reserve: #9aa8ba;
+  --cheap: #1b3953; --peak: #5b2f25; --import: #d6e1dd; --ring-idle: #24302c;
+  --good: #48c78b; --warn: #eeb13f; --bad: #ff7c6b; --shadow: 0 6px 24px #00000080;
+  --solar: #f2c14e; --c-vlow: #48c78b; --c-low: #2e7d55; --c-mod: #3a4842; --c-high: #7d6c5e; --c-vhigh: #b39f8c;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 var(--font-ui); }
+button { font: inherit; color: inherit; }
+button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.num { font-family: var(--font-num); font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+h1, h2, h3 { text-wrap: balance; margin: 0; line-height: 1.2; }
+h1 { font-size: 1.35rem; font-weight: 650; }
+h2 { font-size: 1.05rem; font-weight: 650; }
+.eyebrow { font-size: .72rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+svg text { fill: var(--muted); font: 10px var(--font-num); }
+.empty { padding: 24px; border: 1px dashed var(--line); border-radius: 10px; color: var(--muted); }
+
+/* shared bits */
+.mode { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px; font-size: .78rem; font-weight: 600; border: 1px solid currentColor; white-space: nowrap; }
+.mode::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.mode.simulate { color: var(--warn); } .mode.on { color: var(--good); } .mode.off { color: var(--muted); }
+.chip { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: .72rem; font-weight: 650; color: var(--surface); white-space: nowrap; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px; min-width: 0; }
+.stack { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.btn { border: 1px solid var(--line); background: var(--surface); border-radius: 8px; padding: 8px 12px; cursor: pointer; }
+.btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.btn[disabled] { opacity: .55; cursor: not-allowed; }
+.note { font-size: .78rem; color: var(--muted); }
+.field { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 9px 0; border-top: 1px solid var(--line); }
+.field:first-of-type { border-top: 0; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; background: none; padding: 5px 10px; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); }
+.bubbles { display: flex; flex-direction: column; gap: 8px; }
+.bubble { max-width: 85%; padding: 8px 12px; border-radius: 12px; background: var(--sunk); }
+.bubble.me { align-self: flex-end; background: var(--accent); color: var(--accent-fg); }
+.bubble pre { margin: 0; white-space: pre-wrap; font: .78rem/1.45 var(--font-num); }
+.chatin { display: flex; gap: 8px; }
+.chatin input { flex: 1; min-width: 0; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+
+/* ---------- Variant A: rail + lanes ---------- */
+.shellA { display: grid; grid-template-columns: 196px minmax(0, 1fr); min-height: 100vh; }
+.railA { position: sticky; top: 0; height: 100vh; border-right: 1px solid var(--line); background: var(--surface); padding: 16px 10px; display: flex; flex-direction: column; gap: 4px; }
+.railA .brand { font-weight: 750; font-size: 1.05rem; padding: 4px 10px 14px; letter-spacing: -.01em; }
+.railA button { display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; border: 0; background: none; border-radius: 8px; cursor: pointer; text-align: left; color: var(--muted); }
+.railA button[aria-current="page"] { background: var(--hl); color: var(--fg); font-weight: 600; }
+.railA svg { width: 20px; height: 20px; flex: none; }
+.mainA { min-width: 0; padding: 18px 24px 140px; display: flex; flex-direction: column; gap: 16px; }
+.topA { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.topA .grow { flex: 1; }
+@media (max-width: 899px) {
+  .shellA { grid-template-columns: minmax(0, 1fr); }
+  .railA { position: fixed; top: auto; bottom: 0; left: 0; right: 0; height: auto; flex-direction: row; padding: 4px 4px calc(4px + env(safe-area-inset-bottom, 0px)); border-right: 0; border-top: 1px solid var(--line); z-index: 20; gap: 0; }
+  .railA .brand { display: none; }
+  .railA button { flex-direction: column; gap: 2px; font-size: .68rem; padding: 6px 2px; text-align: center; }
+  .mainA { padding: 14px 16px 150px; }
+  .shellA + .protobar { --dock-h: 64px; }
+}
+
+/* ---------- onboarding content ---------- */
+p { margin: 0; }
+input, select { max-width: 100%; font: inherit; }
+.textinput { width: min(100%, 340px); background: var(--surface); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.sim { border: 1px dashed #888; border-radius: 999px; background: #242424; color: #f2f2f2; font: 11px var(--font-num); padding: 6px 9px; cursor: pointer; }
+.sim::before { content: "sim: "; opacity: .7; }
+.simrow { display: flex; gap: 6px; flex-wrap: wrap; padding-top: 4px; }
+.status { display: inline-block; border-radius: 999px; padding: 2px 8px; font-size: .72rem; font-weight: 650; white-space: nowrap; background: var(--sunk); color: var(--muted); }
+.status.done { color: var(--good); background: color-mix(in srgb, var(--good) 12%, var(--surface)); }
+.status.skipped { color: var(--muted); }
+.status.failed, .refusal { color: var(--bad); background: color-mix(in srgb, var(--bad) 10%, var(--surface)); }
+.status.in_progress { color: var(--accent); background: var(--hl); }
+.refusal { border: 1px solid var(--bad); border-radius: 8px; padding: 9px 11px; font-weight: 600; }
+.eventline { font-size: .76rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: 8px; }
+.half { border: 2px solid var(--warn); background: var(--surface); border-radius: 12px; padding: 13px; display: flex; gap: 12px; justify-content: space-between; align-items: center; flex-wrap: wrap; }
+.half strong { color: var(--warn); }
+.half .stores { font: .78rem var(--font-num); margin: 5px 0; overflow-wrap: anywhere; }
+.gapbox { border-left: 3px solid var(--warn); padding: 10px 12px; background: var(--sunk); border-radius: 0 8px 8px 0; }
+.gapbox ul, .ready-detail ul { margin: 6px 0 0; padding-left: 19px; }
+.gapbox li, .ready-detail li { margin: 3px 0; }
+.devices { display: flex; flex-direction: column; gap: 8px; }
+.device { border: 1px solid var(--line); border-radius: 9px; padding: 10px; background: var(--surface); }
+.device-head { display: flex; flex-wrap: wrap; gap: 5px 10px; align-items: baseline; }
+.chips { display: flex; gap: 5px; flex-wrap: wrap; margin: 8px 0; }
+.chips .chip { background: var(--sunk); color: var(--fg); border: 1px solid var(--line); }
+.chips .chip.good { border-color: var(--good); color: var(--good); }
+.chips .chip.bad { border-color: var(--bad); color: var(--bad); }
+.chips .chip.unknown { border-color: var(--warn); color: var(--warn); }
+.ready-detail { font-size: .84rem; overflow-wrap: anywhere; }
+.ready-detail h3 { font-size: .91rem; }
+.ready-detail .advisory { color: var(--muted); }
+.activation { display: flex; gap: 10px; flex-wrap: wrap; }
+.activation > div { flex: 1 1 160px; min-width: 0; }
+.activation .btn { width: 100%; }
+.activation a { display: inline-block; font-size: .75rem; margin-top: 4px; color: var(--accent); }
+.complete { border-left: 4px solid var(--good); padding: 10px 12px; background: var(--sunk); border-radius: 0 8px 8px 0; }
+.confirm-backdrop { position: fixed; inset: 0; z-index: 60; background: #0009; display: grid; place-items: center; padding: 16px; }
+.confirm { width: min(450px, 100%); box-shadow: var(--shadow); }
+.confirm p { margin: 12px 0; }
+.local-message { color: var(--good); font-weight: 600; }
+
+/* A: focused screen with a numbered stepper */
+.stepperA { display: grid; grid-template-columns: minmax(185px, 230px) minmax(0, 1fr); gap: 16px; align-items: start; }
+.steprailA { position: sticky; top: 16px; }
+.steprailA ol { list-style: none; margin: 0; padding: 0; }
+.steprailA li + li { border-top: 1px solid var(--line); }
+.steprailA li button { display: flex; gap: 9px; align-items: center; width: 100%; padding: 8px 3px; text-align: left; border: 0; background: none; cursor: pointer; }
+.steprailA li button[aria-current="step"] { color: var(--accent); font-weight: 700; }
+.steprailA .number { display: grid; place-items: center; flex: none; width: 24px; height: 24px; border-radius: 50%; background: var(--sunk); font: .75rem var(--font-num); }
+.steprailA small { display: block; color: var(--muted); font-size: .68rem; }
+.pillsA { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 13px; }
+.pillsA button { border: 1px solid var(--line); border-radius: 999px; padding: 5px 8px; background: var(--surface); cursor: pointer; font-size: .72rem; }
+.pillsA button[aria-expanded="true"] { border-color: var(--accent); background: var(--hl); }
+.focusA { min-height: 330px; }
+.focusA > h2 { font-size: 1.35rem; margin: 4px 0 12px; }
+.focusA .backrow { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 16px; }
+@media (max-width: 700px) {
+  .stepperA { grid-template-columns: minmax(0, 1fr); }
+  .steprailA { position: static; }
+  .steprailA ol { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .steprailA li + li { border-top: 0; }
+  .steprailA li button { padding: 5px 2px; font-size: .78rem; }
+}
+
+/* B: long checklist and persistent readiness column */
+.checkB { display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 350px); gap: 18px; align-items: start; }
+.listB { display: flex; flex-direction: column; gap: 8px; }
+.sectionB { padding: 0; overflow: hidden; }
+.sectionB > button { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; gap: 10px; align-items: start; width: 100%; background: none; border: 0; padding: 13px; text-align: left; cursor: pointer; }
+.sectionB > button[aria-expanded="true"] { background: var(--hl); }
+.sectionB .summary { display: block; font-size: .8rem; color: var(--muted); margin-top: 2px; }
+.sectionB .inside { padding: 12px 14px 15px; border-top: 1px solid var(--line); }
+.sectionB .always-device { padding: 0 14px 12px; }
+.asideB { position: sticky; top: 16px; }
+.columnsB { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.columnsB > div { min-width: 0; border: 1px solid var(--line); padding: 9px; border-radius: 8px; }
+.columnsB .ready-detail { font-size: .76rem; }
+@media (max-width: 980px) {
+  .checkB { grid-template-columns: minmax(0, 1fr); }
+  .asideB { position: static; order: -1; }
+}
+@media (max-width: 500px) {
+  .columnsB { grid-template-columns: minmax(0, 1fr); }
+  .sectionB > button { grid-template-columns: 20px minmax(0, 1fr); }
+  .sectionB .status { grid-column: 2; justify-self: start; }
+}
+
+/* C: scripted conversation */
+.threadC { width: min(760px, 100%); margin: 0 auto; }
+.threadC .bubble { max-width: 94%; }
+.threadC .bubble.assistant { align-self: flex-start; border: 1px solid var(--line); background: var(--surface); }
+.threadC .bubble.me { max-width: 75%; }
+.threadC .bubble h2 { margin: 3px 0 8px; }
+.threadC .bubble .note { margin: 5px 0 10px; }
+.threadC .bubble .actions .btn { border-radius: 999px; }
+.threadC .answerline { font-size: .83rem; }
+.threadC .change { border: 0; background: none; color: var(--accent); text-decoration: underline; cursor: pointer; padding: 0; }
+.threadC .message-card { width: 100%; max-width: 100%; }
+.threadC .ready-detail { margin-top: 8px; }
+@media (max-width: 520px) { .threadC .bubble, .threadC .bubble.me { max-width: 100%; } }
+
+/* ---------- prototype chrome (not part of any design) ---------- */
+.protobar { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(12px + var(--dock-h) + env(safe-area-inset-bottom, 0px)); z-index: 50; display: flex; align-items: center; gap: 6px; padding: 5px 6px; background: #111; color: #f4f4f4; border-radius: 999px; box-shadow: 0 8px 28px #0007; font: 12px/1 var(--font-ui); max-width: calc(100% - 16px); }
+.protobar button, .protobar select { background: #2a2a2a; color: #f4f4f4; border: 0; border-radius: 999px; padding: 7px 10px; cursor: pointer; font: inherit; }
+.protobar .lbl { padding: 0 6px; white-space: nowrap; font-weight: 600; }
+.protobar .lbl small { font-weight: 400; opacity: .7; }
+.drawer { position: fixed; right: 12px; bottom: 76px; width: min(560px, calc(100% - 24px)); max-height: 70vh; z-index: 49; background: #111; color: #e8e8e8; border-radius: 12px; box-shadow: 0 8px 28px #0008; display: flex; flex-direction: column; overflow: hidden; }
+.drawer header { display: flex; gap: 6px; padding: 8px; flex-wrap: wrap; align-items: center; }
+.drawer header button { background: #2a2a2a; color: #eee; border: 0; border-radius: 6px; padding: 5px 8px; cursor: pointer; font-size: 12px; }
+.drawer header button[aria-pressed="true"] { background: #f4f4f4; color: #111; }
+.drawer pre { margin: 0; padding: 8px 12px 14px; overflow: auto; font: 11px/1.4 var(--font-num); white-space: pre; }
+@media (max-width: 520px) { .protobar .lbl small { display: none; } .protobar select { max-width: 120px; } }
+@media (prefers-reduced-motion: no-preference) { .railA button { transition: background .15s, color .15s; } }
+</style>
+
+<div id="app"></div>
+<script src="onboarding_model.js"></script>
+<script src="scenarios.js"></script>
+<script type="module">
+import { html, render, useState, useEffect, useRef } from 'https://cdn.jsdelivr.net/npm/htm@3.1.1/preact/standalone.module.js';
+
+const { STEP_NAMES, initialState, onboarding, readiness } = window.ONBOARDING;
+const SCENARIOS = window.ONBOARDING_SCENARIOS;
+const VARIANTS = [
+  { key: 'A', name: 'Stepper', note: 'one step per screen' },
+  { key: 'B', name: 'Checklist', note: 'all steps on one page' },
+  { key: 'C', name: 'Guided conversation', note: 'scripted setup thread' },
+];
+const ICON = {
+  plan: 'M3 17l5-6 4 3 6-8 3 3M3 21h18',
+  override: 'M12 3v8M6.3 6.3a8 8 0 1 0 11.4 0',
+  chat: 'M4 5h16v11H9l-5 4z',
+  stats: 'M5 20V11M10 20V5M15 20v-7M20 20V8',
+  settings: 'M4 7h10M18 7h2M4 17h4M12 17h8M14 4v6M8 14v6',
+  onboarding: 'M5 6l2 2 3-3M5 13l2 2 3-3M13 7h6M13 14h6M5 20h14',
+};
+const ROUTES = [
+  { key: 'plan', label: 'Plan' }, { key: 'override', label: 'Override' }, { key: 'chat', label: 'Chat' },
+  { key: 'stats', label: 'Stats' }, { key: 'settings', label: 'Settings' }, { key: 'onboarding', label: 'Setup' },
+];
+const store = {
+  get(k) { try { return localStorage.getItem('proto293.' + k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem('proto293.' + k, v); } catch { /* storage blocked */ } },
+};
+const Icon = ({ name }) => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d=${ICON[name]} /></svg>`;
+
+function ShellA({ route, go, mode, children }) {
+  return html`<div class="shell shellA">
+    <nav class="railA" aria-label="Sections"><div class="brand">ha-spark</div>
+      ${ROUTES.map((r) => html`<button aria-current=${route === r.key ? 'page' : null} onClick=${() => go(r.key)}><${Icon} name=${r.key} />${r.label}</button>`)}
+    </nav>
+    <div class="mainA">
+      <header class="topA"><h1>${ROUTES.find((r) => r.key === route).label}</h1><span class="grow"></span>
+        <span class=${'mode ' + (mode === 'Observe' ? 'off' : 'on')}>${mode}</span></header>
+      ${children}
+    </div>
+  </div>`;
+}
+
+function replay(scenario) {
+  let s = initialState(scenario.start);
+  for (const a of scenario.actions) s = onboarding(s, typeof a === 'string' ? { type: a } : a);
+  return s;
+}
+function loadState(id) {
+  const raw = store.get('state');
+  if (raw && store.get('scenario') === id) {
+    try {
+      const s = JSON.parse(raw);
+      if (Array.isArray(s.steps) && s.steps.length === STEP_NAMES.length && s.saved && s.integration) return s;
+    } catch { /* use scenario */ }
+  }
+  return replay(SCENARIOS.find(x => x.id === id) || SCENARIOS[0]);
+}
+function stepStatus(s, i) {
+  return s.steps[i] === 'not_started' && i === s.currentStep ? 'in_progress' : s.steps[i];
+}
+function summary(s, i) {
+  switch (i) {
+    case 0: return s.admin === true ? 'Administrator confirmed' : 'Confirm who can configure Home Assistant';
+    case 1: return s.integration.adopted ? 'Existing standalone integration adopted' :
+      s.integration.paired ? 'Integration paired' : 'HACS install · restart · discovery · pair';
+    case 2: return s.devices.length ? `${s.devices.length} inverter${s.devices.length === 1 ? '' : 's'} · capability evidence available` : 'Discover or enter a gateway host';
+    case 3: return s.topology.limitsSet ? `${s.topology.banks.length} battery bank · supply ${s.topology.siteImportA} A · export ${s.topology.siteExportW} W` : 'Assign battery banks and confirm limits';
+    case 4: return s.tariff.answer === 'confirmed' ? 'Octopus Energy rate and dispatch confirmed' : s.tariff.answer === 'skipped' ? 'Tariff skipped' : 'Confirm rate and dispatch entities, or skip';
+    case 5: return s.forecast.solcastKeySet ? `API key: set · ${s.forecast.sites} site${s.forecast.sites === 1 ? '' : 's'}` : s.forecast.answer === 'skipped' ? 'Solar forecast skipped' : 'Set Solcast key for up to two sites, or skip';
+    case 6: return s.loads.answer === 'unanswered' ? 'Confirm proposed entities and demand' : s.loads.major.length ? s.loads.major.map(x => `${x.name} ${x.amps} A`).join(' · ') : 'No EV charger or major loads';
+    case 7: return s.fallback.status === 'valid' ? `${s.fallback.window} · ${s.fallback.chargeA} A · validated` :
+      s.fallback.status === 'deferred' ? 'Deferred; Optimise unavailable' : s.fallback.status === 'rejected' ? s.fallback.reason : 'Propose, validate, or defer';
+    case 8: return `Integration: ${s.saved.integration ? 'saved, revision ' + s.saved.integrationRevision : 'not saved'} · Add-on: ${s.saved.addon ? 'saved, revision ' + s.saved.addonRevision : 'not saved'}`;
+    case 9: return s.steps[9] === 'done' ? 'Complete in Observe' : 'Finish in Observe after both saves';
+  }
+}
+function statusLabel(status) {
+  return ({ done: 'Done', skipped: 'Skipped', failed: 'Failed', in_progress: 'In progress', not_started: 'Not started', blocked: 'Blocked' })[status] || status;
+}
+function Status({ value }) { return html`<span class=${'status ' + value}>${statusLabel(value)}</span>`; }
+function Action({ label, type, run, i, primary = false, sim = false, payload = {} }) {
+  return html`<button class=${sim ? 'sim' : 'btn' + (primary ? ' primary' : '')} onClick=${() => run({ type, ...payload }, i)}>${label}</button>`;
+}
+function Feedback({ s, i, actionStep }) {
+  return html`${s.refused && actionStep === i && html`<div class="refusal" role="alert">${s.lastEvent}</div>`}`;
+}
+function EventLine({ s }) {
+  return html`<div class="eventline" aria-live="polite">Last event: ${s.lastEvent}</div>`;
+}
+function HalfBanner({ s, run }) {
+  if (!s.saved.integration || s.saved.addon) return null;
+  return html`<div class="half" role="status">
+    <div><strong>${s.steps[8] === 'failed' ? 'Add-on save failed' : 'Resume setup after reload'}</strong>
+      <div class="stores">Integration: saved, revision ${s.saved.integrationRevision} · Add-on: not saved</div>
+      <div class="note">The integration revision is durable. Complete the add-on save to continue.</div></div>
+    <button class="btn primary" onClick=${() => run({ type: 'SAVE_ADDON' }, 8)}>Retry add-on save</button>
+  </div>`;
+}
+function DeviceEvidence({ s, run, compact = false }) {
+  if (!s.devices.length) return html`<div class="note">No devices yet. Discover an inverter or enter a host in Devices.</div>`;
+  const r = readiness(s);
+  const deviceGaps = r.Protect.unmet.filter(x => /gateway|hold|release|read-back|fresh protection|inverter/i.test(x));
+  const warnings = s.warnings.filter(x => /gateway|device|capability|connection/i.test(x));
+  const chip = (label, value, tone) => html`<span class=${'chip ' + tone}>${label}: ${value}</span>`;
+  return html`<div class="devices">
+    ${s.devices.map(d => html`<div class="device">
+      <div class="device-head"><b>${d.type} · ${d.id}</b><span class="note">${d.connection}${d.bank ? ' · ' + d.bank : ''}</span></div>
+      <div class="chips">
+        ${chip('Caching', d.cache === 'not_applicable' ? 'n/a' : d.cache, d.cache === 'off' || d.cache === 'not_applicable' ? 'good' : d.cache === 'on' ? 'bad' : 'unknown')}
+        ${chip('TOU firmware', d.tou, d.tou === 'unknown' ? 'unknown' : 'good')}
+        ${chip('Hold', d.hold ? 'yes' : 'no', d.hold ? 'good' : 'bad')}
+        ${chip('Release', d.release ? 'yes' : 'no', d.release ? 'good' : 'bad')}
+        ${chip('Read-back', d.readback ? 'yes' : 'no', d.readback ? 'good' : 'bad')}
+        ${chip('Freshness', d.freshness ? 'yes' : 'no', d.freshness ? 'good' : 'bad')}
+      </div>
+      ${d.cache === 'on' && html`<p class="note">Turn off storage (caching) mode on the gateway, then re-probe.</p>`}
+    </div>`)}
+    ${(deviceGaps.length > 0 || warnings.length > 0) && html`<div class="gapbox"><b>Capability gaps and repair notes</b>
+      <ul>${[...new Set([...deviceGaps, ...warnings])].map(x => html`<li>${x}</li>`)}</ul></div>`}
+    <div class="actions">
+      ${s.devices.some(d => d.cache === 'on') && html`<${Action} label="Caching is off" type="CACHE_OFF" run=${run} i=${2} />`}
+      <${Action} label="Re-probe" type="REPROBE" run=${run} i=${2} primary=${!compact} />
+    </div>
+  </div>`;
+}
+function ReadinessDetail({ data, mode, id }) {
+  return html`<div class="ready-detail" id=${id}>
+    <h3>${mode} · ${data.ready ? 'Ready' : data.unmet.length + ' things missing'}</h3>
+    ${data.unmet.length ? html`<ul>${data.unmet.map(x => html`<li>${x}</li>`)}</ul>` : html`<p class="note">All prerequisites met.</p>`}
+    <div class="advisory"><b>Advisory</b><ul>${data.advisory.map(x => html`<li>${x}</li>`)}</ul></div>
+  </div>`;
+}
+function Activation({ s, r, onAsk, prefix }) {
+  const finished = s.steps[9] === 'done';
+  return html`<div class="activation">
+    ${['Protect', 'Optimise'].map(mode => {
+      const data = r[mode], enabled = finished && data.ready;
+      return html`<div><button class="btn primary" disabled=${!enabled} onClick=${() => onAsk(mode)}>Activate ${mode}</button>
+        ${!enabled && html`<a href=${'#' + prefix + mode}>${data.unmet.length ? data.unmet.length + ' things missing — see list' : 'Complete setup first'}</a>`}</div>`;
+    })}
+  </div>`;
+}
+function ConfirmDialog({ mode, close, confirm }) {
+  return html`<div class="confirm-backdrop" onClick=${close}>
+    <div class="card confirm" role="dialog" aria-modal="true" aria-labelledby="confirm-title" onClick=${e => e.stopPropagation()}>
+      <h2 id="confirm-title">Switch to ${mode}?</h2>
+      <p>${mode === 'Protect'
+        ? 'The integration enforces holds and limits on the devices.'
+        : "ha-spark's planner also controls charging. The fixed fallback charging schedule runs if the add-on goes away."}</p>
+      <div class="actions"><button class="btn" onClick=${close}>Cancel</button><button class="btn primary" onClick=${confirm}>Switch to ${mode}</button></div>
+    </div>
+  </div>`;
+}
+
+/* Action vocabulary is intentionally visible. Hardware and Home Assistant outcomes use simulation controls. */
+function StepControls({ i, s, run }) {
+  const keyRef = useRef(null);
+  const [sites, setSites] = useState(1);
+  const [keyHint, setKeyHint] = useState('');
+  const act = (label, type, primary = false, payload = {}) => html`<${Action} label=${label} type=${type} primary=${primary} payload=${payload} run=${run} i=${i} />`;
+  const sim = (label, type, payload = {}) => html`<${Action} label=${label} type=${type} sim=${true} payload=${payload} run=${run} i=${i} />`;
+  if (i === 0) return html`<div class="stack"><p>Only a Home Assistant administrator can pair devices and save setup.</p><div class="actions">${act('I am an administrator', 'ADMIN_YES', true)}</div><div class="simrow">${sim('non-admin viewer', 'ADMIN_NO')}</div></div>`;
+  if (i === 1) return html`<div class="stack">
+    ${s.integration.phase === 'standalone'
+      ? html`<p>An existing standalone integration is available. Adopt its devices, battery bank, and limits.</p>`
+      : html`<p>Install the companion integration through HACS yourself. Restart Home Assistant, accept Supervisor discovery, then pair.</p>`}
+    <div class="actions">
+      ${s.integration.phase === 'standalone' && act('Adopt existing integration', 'ADOPT', true)}
+      ${s.integration.phase === 'not_installed' && act('Installed through HACS', 'INTEGRATION_INSTALLED', true)}
+      ${s.integration.phase === 'awaiting_restart' && act('Home Assistant restarted', 'HA_RESTARTED', true)}
+      ${s.integration.phase === 'discovered' && act('Accept discovery and pair', 'PAIR', true)}
+      ${s.integration.paired && html`<span class="status done">Paired${s.integration.adopted ? ' · adopted' : ''}</span>`}
+    </div>
+    ${s.integration.versionSkew && html`<div class="gapbox">Repair warning: integration and add-on api_version differ. Setup can continue.</div>`}
+    <div class="simrow">${sim('discovery offered', 'INTEGRATION_FOUND')}${sim('api_version skew', 'VERSION_SKEW')}</div>
+  </div>`;
+  if (i === 2) return html`<div class="stack">
+    <p>Discover a Solis gateway or AlphaESS inverter. The probe detects gateway storage (caching) mode, TOU firmware register, hold, release, read-back, and freshness; no firmware choice is needed.</p>
+    <div class="actions">${act('Discover Solis gateway', 'DISCOVER_SOLIS', true)}${act('Discover AlphaESS', 'DISCOVER_ALPHA')}${act('Discover two inverters', 'DISCOVER_TWO')}</div>
+    <div class="chatin"><input class="textinput" aria-label="Gateway host" placeholder="Gateway host or IP address" /><button class="btn" onClick=${() => run({ type: 'MANUAL_HOST' }, 2)}>Use manual host</button></div>
+    ${s.devices.length > 0 && html`<div class="actions">${act('Probe capabilities', 'PROBE_OK', true)}</div>`}
+    <div class="simrow">${sim('none found', 'NONE_FOUND')}${sim('connection failed', 'CONNECT_FAIL')}${sim('caching on', 'CACHE_ON')}${sim('probe with gaps', 'PROBE_GAP')}</div>
+  </div>`;
+  if (i === 3) return html`<div class="stack">
+    <p>Preset values fill per-inverter and per-battery-bank current limits, the supply current limit, and the site export limit. Confirm ownership of these limits.</p>
+    ${s.topology.limitsSet && html`<div class="field"><span>Confirmed limits</span><span class="num">${s.topology.siteImportA} A supply · ${s.topology.siteExportW} W export</span></div>`}
+    <div class="actions">${act('Confirm one battery bank', 'LIMITS_ONE', true)}${act('Confirm shared battery bank', 'LIMITS_SHARED')}</div>
+  </div>`;
+  if (i === 4) return html`<div class="stack">
+    <p>Proposed Octopus Energy entities: <span class="num">sensor.octopus_current_rate</span> and <span class="num">binary_sensor.octopus_dispatch</span>.</p>
+    <div class="actions">${act('Confirm tariff entities', 'TARIFF_FOUND', true)}${act('Skip tariff', 'TARIFF_SKIP')}</div>
+    <p class="note">A missing tariff blocks Optimise only.</p>
+  </div>`;
+  if (i === 5) return html`<div class="stack">
+    ${s.forecast.solcastKeySet
+      ? html`<p>API key: set · ${s.forecast.sites} site${s.forecast.sites === 1 ? '' : 's'}</p>`
+      : html`<div class="actions"><label>Solcast API key<br/><input ref=${keyRef} class="textinput" type="password" autocomplete="off" aria-label="Solcast API key" /></label>
+          <label>Sites<br/><select value=${sites} onChange=${e => setSites(Number(e.target.value))}><option value="1">1</option><option value="2">2</option></select></label></div>`}
+    ${keyHint && html`<p class="refusal" role="alert">${keyHint}</p>`}
+    <div class="actions"><button class="btn primary" onClick=${() => {
+      if (!keyRef.current || !keyRef.current.value) { setKeyHint('Enter a Solcast API key first.'); return; }
+      setKeyHint('');
+      run({ type: 'SOLCAST_SET', sites }, 5);
+    }}>Save forecast</button>${act('Skip forecast', 'SOLCAST_SKIP')}</div>
+    <p class="note">The saved key is shown only as set or unset.</p>
+  </div>`;
+  if (i === 6) return html`<div class="stack">
+    <p>Confirm proposed entities and demand for loads the integration does not own.</p>
+    <div class="actions">${act('EV charger · 32 A', 'LOADS_EV', true)}${act('Heat pump + induction hob', 'LOADS_HEATPUMP')}${act('No major loads', 'LOADS_NONE')}</div>
+    <p class="note">EV proposal: plug, status, and power. Heat pump and hob proposal: power and demand.</p>
+  </div>`;
+  if (i === 7) return html`<div class="stack">
+    <p>A conservative fallback charging schedule uses confirmed limits and, when available, the tariff. It must validate before Optimise can run.</p>
+    ${s.fallback.status !== 'not_proposed' && html`<div class="field"><span>Fallback charging schedule</span><span class="num">${s.fallback.status === 'deferred' ? 'Deferred' : `${s.fallback.window} · ${s.fallback.chargeA} A · ${s.fallback.status}`}</span></div>`}
+    ${s.fallback.reason && html`<div class="refusal">${s.fallback.reason}</div>`}
+    <div class="actions">${act('Propose schedule', 'FALLBACK_PROPOSE', s.fallback.status === 'not_proposed')}${(s.fallback.status === 'proposed' || s.fallback.status === 'rejected') && act('Validate schedule', 'FALLBACK_VALIDATE', true)}${act('Defer fallback', 'FALLBACK_DEFER')}</div>
+    <div class="simrow">${sim('reject: supply limit', 'FALLBACK_REJECT', { reason: 'site' })}${sim('reject: bank limit', 'FALLBACK_REJECT', { reason: 'bank' })}${sim('reject: read-back', 'FALLBACK_REJECT', { reason: 'readback' })}</div>
+  </div>`;
+  if (i === 8) return html`<div class="stack">
+    <p>Save integration settings first, then add-on settings. Each store reports its own saved revision.</p>
+    <div class="field"><span>Integration</span><b>${s.saved.integration ? 'Saved · revision ' + s.saved.integrationRevision : 'Not saved'}</b></div>
+    <div class="field"><span>Add-on</span><b>${s.saved.addon ? 'Saved · revision ' + s.saved.addonRevision : 'Not saved'}</b></div>
+    <div class="actions">${!s.saved.integration && act('Save integration settings', 'SAVE_INTEGRATION', true)}
+      ${s.saved.integration && !s.saved.addon && act('Save add-on settings', 'SAVE_ADDON', true)}
+      ${s.saved.addon && html`<span class="status done">Both stores saved</span>`}</div>
+    <div class="simrow">${sim('add-on save fails', 'ADDON_SAVE_FAIL')}${sim('reload half-saved', 'RELOAD')}</div>
+  </div>`;
+  return html`<div class="stack">
+    ${s.steps[9] === 'done'
+      ? html`<div class="complete"><b>Setup complete — running in Observe.</b><br/>ha-spark reads but writes nothing.</div>`
+      : html`<p>Both stores must save before finishing. Finish always enters Observe; activation is a separate owner action.</p>`}
+    ${s.steps[9] !== 'done' && html`<div class="actions">${act('Finish in Observe', 'FINISH', true)}</div>`}
+  </div>`;
+}
+
+/* A: the numbered list controls a single focused panel. */
+function StepperA({ s, run, actionStep, ask, localMessage }) {
+  const [selected, setSelected] = useState(s.currentStep);
+  const [showReady, setShowReady] = useState(false);
+  useEffect(() => setSelected(s.currentStep), [s.currentStep]);
+  const r = readiness(s), finished = s.steps[9] === 'done';
+  return html`<div class="stack">
+    <${HalfBanner} s=${s} run=${run} />
+    <div class="stepperA">
+      <aside class="card steprailA">
+        <div class="eyebrow">Setup steps</div>
+        <ol>${STEP_NAMES.map((name, i) => html`<li><button aria-current=${selected === i ? 'step' : null} onClick=${() => setSelected(i)}>
+          <span class="number">${i + 1}</span><span>${name}<small>${statusLabel(stepStatus(s, i))}</small></span></button></li>`)}</ol>
+        <div class="pillsA">${['Protect', 'Optimise'].map(mode => html`<button aria-expanded=${showReady} onClick=${() => setShowReady(!showReady)}>${mode} · ${r[mode].ready ? 'Ready' : r[mode].unmet.length + ' missing'}</button>`)}</div>
+        ${showReady && html`<div class="stack" style=${{ marginTop: '12px' }}><${ReadinessDetail} data=${r.Protect} mode="Protect" id="AProtect" /><${ReadinessDetail} data=${r.Optimise} mode="Optimise" id="AOptimise" /></div>`}
+      </aside>
+      <div class="stack">
+        <section class="card focusA">
+          <div class="eyebrow">Step ${selected + 1} of 10 · <${Status} value=${stepStatus(s, selected)} /></div>
+          <h2>${STEP_NAMES[selected]}</h2>
+          <${Feedback} s=${s} i=${selected} actionStep=${actionStep} />
+          <${StepControls} i=${selected} s=${s} run=${run} />
+          ${selected === 9 && html`<div class="stack" style=${{ marginTop: '16px' }}>
+            <${ReadinessDetail} data=${r.Protect} mode="Protect" id="AProtect" />
+            <${ReadinessDetail} data=${r.Optimise} mode="Optimise" id="AOptimise" />
+            ${finished && html`<${Activation} s=${s} r=${r} onAsk=${ask} prefix="A" />`}
+            ${localMessage && html`<div class="local-message" role="status">${localMessage}</div>`}
+          </div>`}
+          <div class="backrow"><button class="btn" disabled=${selected === 0} onClick=${() => setSelected(Math.max(0, selected - 1))}>Back</button></div>
+        </section>
+        ${s.devices.length > 0 && selected !== 2 && html`<section class="card stack"><h2>Device capability evidence</h2><${DeviceEvidence} s=${s} run=${run} compact=${true} /></section>`}
+      </div>
+    </div>
+    <${EventLine} s=${s} />
+  </div>`;
+}
+
+/* B: sections are independent; reducer refusals explain ordering where a prerequisite is missing. */
+function ChecklistB({ s, run, actionStep, ask, localMessage }) {
+  const [open, setOpen] = useState([s.currentStep]);
+  const r = readiness(s), finished = s.steps[9] === 'done';
+  const toggle = i => setOpen(open.includes(i) ? open.filter(x => x !== i) : [...open, i]);
+  return html`<div class="stack">
+    <div><h2>Setup checklist</h2><p class="note">Open any section. Prerequisites are checked when you act.</p></div>
+    <${HalfBanner} s=${s} run=${run} />
+    <div class="checkB">
+      <div class="listB">
+        ${STEP_NAMES.map((name, i) => html`<section class="card sectionB">
+          <button aria-expanded=${open.includes(i)} onClick=${() => toggle(i)}>
+            <span class="num">${i + 1}</span><span><b>${name}</b><span class="summary">${summary(s, i)}</span></span>
+            <${Status} value=${stepStatus(s, i)} />
+          </button>
+          ${open.includes(i) && html`<div class="inside stack">
+            <${Feedback} s=${s} i=${i} actionStep=${actionStep} />
+            <${StepControls} i=${i} s=${s} run=${run} />
+          </div>`}
+          ${i === 2 && s.devices.length > 0 && html`<div class="always-device"><${DeviceEvidence} s=${s} run=${run} compact=${true} /></div>`}
+        </section>`)}
+        <${EventLine} s=${s} />
+      </div>
+      <aside class="card stack asideB">
+        <div><div class="eyebrow">Live readiness</div><h2>Protect / Optimise</h2></div>
+        <div class="columnsB"><div><${ReadinessDetail} data=${r.Protect} mode="Protect" id="BProtect" /></div><div><${ReadinessDetail} data=${r.Optimise} mode="Optimise" id="BOptimise" /></div></div>
+        ${finished && html`<div class="complete"><b>Setup complete — running in Observe.</b><br/>ha-spark reads but writes nothing.</div>`}
+        <${Activation} s=${s} r=${r} onAsk=${ask} prefix="B" />
+        ${localMessage && html`<div class="local-message" role="status">${localMessage}</div>`}
+        <div class="simrow"><${Action} label="session lost" type="SESSION_LOST" run=${run} i=${9} sim=${true} /><${Action} label="session restored" type="SESSION_RESTORED" run=${run} i=${9} sim=${true} /><${Action} label="SoC untrusted" type="SOC_UNTRUSTED" run=${run} i=${9} sim=${true} /><${Action} label="SoC trusted" type="SOC_TRUSTED" run=${run} i=${9} sim=${true} /><${Action} label="history ready" type="HISTORY_READY" run=${run} i=${9} sim=${true} /></div>
+      </aside>
+    </div>
+  </div>`;
+}
+
+/* C: a fixed script, with earlier answers reopened in place. No AI chat is involved. */
+function ConversationC({ s, run, actionStep, ask, localMessage }) {
+  const [openStep, setOpenStep] = useState(s.currentStep);
+  useEffect(() => setOpenStep(s.currentStep), [s.currentStep]);
+  const change = i => {
+    setOpenStep(i);
+    setTimeout(() => document.getElementById('conversation-step-' + i)?.scrollIntoView({ block: 'center', behavior: 'smooth' }), 0);
+  };
+  const r = readiness(s), finished = s.steps[9] === 'done';
+  const visible = STEP_NAMES.map((_, i) => i).filter(i => i <= s.currentStep || s.steps[i] !== 'not_started');
+  return html`<div class="stack threadC">
+    <div><div class="eyebrow">Setup assistant — scripted steps, not the AI chat</div><h2>Set up ha-spark</h2></div>
+    <${HalfBanner} s=${s} run=${run} />
+    <div class="bubbles">
+      <div class="bubble assistant">I’ll walk through ten setup steps. Every answer is checked by the onboarding flow.</div>
+      ${visible.map(i => html`<div class="stack" id=${'conversation-step-' + i}>
+        <div class="bubble assistant">
+          <div class="eyebrow">Step ${i + 1} · ${statusLabel(stepStatus(s, i))}</div>
+          <h2>${STEP_NAMES[i]}</h2>
+          <p class="note">${summary(s, i)}</p>
+          <${Feedback} s=${s} i=${i} actionStep=${actionStep} />
+          ${openStep === i && html`<${StepControls} i=${i} s=${s} run=${run} />`}
+          ${i === 2 && s.devices.length > 0 && html`<div class="stack" style=${{ marginTop: '12px' }}><${DeviceEvidence} s=${s} run=${run} compact=${true} /></div>`}
+          ${openStep !== i && html`<button class="change" onClick=${() => change(i)}>Change</button>`}
+        </div>
+        ${(s.steps[i] === 'done' || s.steps[i] === 'skipped') && html`<div class="bubble me answerline">${summary(s, i)} <button class="change" style=${{ color: 'inherit' }} onClick=${() => change(i)}>Change</button></div>`}
+      </div>`)}
+      ${(s.devices.length > 0 && r.Protect.unmet.some(x => /gateway|hold|release|read-back|fresh protection/i.test(x))) && html`<div class="bubble assistant gapbox">
+        <b>Device evidence needs attention.</b><p class="note">You can finish in Observe. Fix the gateway or device, then re-probe to update readiness.</p>
+        <button class="btn" onClick=${() => change(2)}>Go to device fix</button>
+      </div>`}
+      <div class="bubble assistant message-card">
+        <div class="eyebrow">Readiness message</div>
+        <div class="columnsB"><div><${ReadinessDetail} data=${r.Protect} mode="Protect" id="CProtect" /></div><div><${ReadinessDetail} data=${r.Optimise} mode="Optimise" id="COptimise" /></div></div>
+      </div>
+      ${finished && html`<div class="bubble assistant message-card stack">
+        <div class="complete"><b>Setup complete — running in Observe.</b><br/>ha-spark reads but writes nothing.</div>
+        <p>When you are ready, activation is a separate owner action.</p>
+        <${Activation} s=${s} r=${r} onAsk=${ask} prefix="C" />
+        ${localMessage && html`<div class="local-message" role="status">${localMessage}</div>`}
+      </div>`}
+      <div class="bubble assistant message-card"><div class="simrow"><${Action} label="session lost" type="SESSION_LOST" run=${run} i=${9} sim=${true} /><${Action} label="session restored" type="SESSION_RESTORED" run=${run} i=${9} sim=${true} /><${Action} label="SoC untrusted" type="SOC_UNTRUSTED" run=${run} i=${9} sim=${true} /><${Action} label="SoC trusted" type="SOC_TRUSTED" run=${run} i=${9} sim=${true} /><${Action} label="history ready" type="HISTORY_READY" run=${run} i=${9} sim=${true} /></div></div>
+    </div>
+    <${EventLine} s=${s} />
+  </div>`;
+}
+function NonAdmin({ s }) {
+  return html`<div class="card stack" style=${{ maxWidth: '620px' }}>
+    <div class="eyebrow">Read-only setup</div>
+    <h2>Ask a Home Assistant administrator</h2>
+    <p>Only an administrator can pair the integration, confirm device limits, save setup, and choose an operating mode.</p>
+    <${EventLine} s=${s} />
+  </div>`;
+}
+
+function readVariant() {
+  try { const v = new URLSearchParams(location.search).get('variant'); if (VARIANTS.some(x => x.key === v)) return v; } catch { /* no URL access */ }
+  const s = store.get('variant');
+  return VARIANTS.some(x => x.key === s) ? s : 'A';
+}
+function writeVariant(v) {
+  store.set('variant', v);
+  try { const u = new URL(location.href); u.searchParams.set('variant', v); history.replaceState(null, '', u); } catch { /* sandboxed */ }
+}
+function readRoute() {
+  const m = (location.hash || '').match(/^#\/?([a-z]+)/);
+  return m && ROUTES.some(r => r.key === m[1]) ? m[1] : 'onboarding';
+}
+function ProtoBar({ variant, setVariant, scenario, setScenario, drawer, setDrawer }) {
+  const i = VARIANTS.findIndex(v => v.key === variant), cur = VARIANTS[i];
+  const step = d => setVariant(VARIANTS[(i + d + VARIANTS.length) % VARIANTS.length].key);
+  return html`<div class="protobar" role="toolbar" aria-label="Prototype controls">
+    <button aria-label="Previous variant" onClick=${() => step(-1)}>←</button>
+    <span class="lbl">${cur.key} · ${cur.name} <small>(${cur.note})</small></span>
+    <button aria-label="Next variant" onClick=${() => step(1)}>→</button>
+    <select aria-label="Scenario" value=${scenario} onChange=${e => setScenario(e.target.value)}>${SCENARIOS.map(x => html`<option value=${x.id}>${x.title}</option>`)}</select>
+    <button aria-pressed=${drawer} aria-label="Show state" onClick=${() => setDrawer(!drawer)}>{ }</button>
+  </div>`;
+}
+function Drawer({ s, variant, route, scenario }) {
+  const [tab, setTab] = useState('readiness');
+  const body = tab === 'event' ? s.lastEvent : tab === 'readiness' ? readiness(s) : s;
+  return html`<div class="drawer"><header>
+    <span style=${{ fontSize: '12px', opacity: .8, marginRight: '6px' }}>variant ${variant} · #/${route} · ${scenario}</span>
+    ${[['event', 'lastEvent'], ['readiness', 'readiness(state)'], ['state', 'full state']].map(([k, label]) => html`<button aria-pressed=${tab === k} onClick=${() => setTab(k)}>${label}</button>`)}
+    </header><pre>${typeof body === 'string' ? body : JSON.stringify(body, null, 2)}</pre></div>`;
+}
+function App() {
+  const [variant, setV] = useState(readVariant);
+  const [route, setRoute] = useState(readRoute);
+  const [scenario, setScenarioState] = useState(() => {
+    const id = store.get('scenario');
+    return SCENARIOS.some(x => x.id === id) ? id : 'fresh';
+  });
+  const [s, setS] = useState(() => loadState(store.get('scenario') || 'fresh'));
+  const [drawer, setDrawer] = useState(false);
+  const [actionStep, setActionStep] = useState(null);
+  const [confirmMode, setConfirmMode] = useState(null);
+  const [localMessage, setLocalMessage] = useState('');
+  const setVariant = v => { writeVariant(v); setV(v); };
+  const setScenario = id => {
+    const next = replay(SCENARIOS.find(x => x.id === id) || SCENARIOS[0]);
+    store.set('scenario', id); store.set('state', JSON.stringify(next));
+    setScenarioState(id); setS(next); setActionStep(null); setLocalMessage(''); setConfirmMode(null);
+  };
+  const run = (action, i) => {
+    setS(previous => {
+      const next = onboarding(previous, action);
+      store.set('state', JSON.stringify(next));
+      return next;
+    });
+    setActionStep(i); setLocalMessage('');
+  };
+  const go = r => { try { location.hash = '#/' + r; } catch { /* sandboxed */ } setRoute(r); };
+  useEffect(() => {
+    if (!location.hash) go('onboarding');
+    const onHash = () => setRoute(readRoute());
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+  useEffect(() => {
+    const onKey = e => {
+      if (e.target?.closest('input, textarea, select, [contenteditable]')) return;
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      const i = VARIANTS.findIndex(v => v.key === variant);
+      setVariant(VARIANTS[(i + (e.key === 'ArrowRight' ? 1 : -1) + VARIANTS.length) % VARIANTS.length].key);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [variant]);
+  const ask = mode => setConfirmMode(mode);
+  const content = route !== 'onboarding' ? html`<div class="empty">Not part of this prototype</div>` :
+    s.admin === false ? html`<${NonAdmin} s=${s} />` :
+    variant === 'A' ? html`<${StepperA} key=${scenario + variant} s=${s} run=${run} actionStep=${actionStep} ask=${ask} localMessage=${localMessage} />` :
+    variant === 'B' ? html`<${ChecklistB} key=${scenario + variant} s=${s} run=${run} actionStep=${actionStep} ask=${ask} localMessage=${localMessage} />` :
+    html`<${ConversationC} key=${scenario + variant} s=${s} run=${run} actionStep=${actionStep} ask=${ask} localMessage=${localMessage} />`;
+  return html`<${ShellA} route=${route} go=${go} mode=${s.mode}>${content}<//>
+    <${ProtoBar} variant=${variant} setVariant=${setVariant} scenario=${scenario} setScenario=${setScenario} drawer=${drawer} setDrawer=${setDrawer} />
+    ${drawer && html`<${Drawer} s=${s} variant=${variant} route=${route} scenario=${scenario} />`}
+    ${confirmMode && html`<${ConfirmDialog} mode=${confirmMode} close=${() => setConfirmMode(null)} confirm=${() => {
+      setLocalMessage('Would switch to ' + confirmMode + ' (activation is outside onboarding)');
+      setConfirmMode(null);
+    }} />`}`;
+}
+render(html`<${App} />`, document.getElementById('app'));
+</script>
