@@ -98,13 +98,16 @@ _SLOT_SUFFIX = {1: "", 2: "_2", 3: "_3"}
 _CURRENT_SCALE = 10.0
 _MAX_CHARGE_CURRENT_A = 62.5
 # HA's update_entity service is asynchronous with respect to the Modbus
-# overlay sensors: on live hardware a landed write took ~5.2 s to appear, the
-# overlay's 5 s scan_interval (#164). Observe for up to ~15 s after each write;
-# the bound is deliberately finite so a stale overlay can never hold the caller.
+# overlay sensors. The ~5 s write-to-read-back latency first seen (#164) came
+# from the RS485 gateway's storage mode, not the overlay's scan_interval; with
+# storage off a landed write reads back in ~1.5 s median, <=7 s (#287). Observe
+# for up to ~15 s after each write: it costs nothing once a write lands, it is
+# the headroom the zero-confirm loop runs inside, and it is deliberately finite
+# so a stale overlay can never hold the caller.
 _READ_BACK_ATTEMPTS = 16
 _READ_BACK_DELAY_SECONDS = 1.0
-# Five read steps assume _READ_BACK_DELAY_SECONDS stays at 1.0 s, matching the
-# Solis overlay's 5 s scan interval.
+# The gap must outlast the ~4 s spurious 0.0 the overlay reports around program
+# writes (#178); five reads assume _READ_BACK_DELAY_SECONDS stays at 1.0 s.
 _ZERO_CONFIRM_GAP_READS = 5
 # Work-mode bitfield: bit 5 (mask 32) == grid charging permitted. A forced grid
 # charge is refused by firmware when this is unset, so assert it, never write it.
