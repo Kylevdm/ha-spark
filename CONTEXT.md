@@ -133,6 +133,10 @@ with a separate limit for each direction.
 A group of batteries operated as one energy store, with shared state of charge
 and charge/discharge limits. Multiple inverters may connect to the same bank.
 
+**Battery pack**:
+One battery with its own battery-management system. A battery bank is one or
+more packs operated as one store, such as packs wired in parallel.
+
 **Battery-bank current limit**:
 The maximum combined DC charge or discharge current a bank can accept or
 supply across its connected inverters, with a separate limit for each direction.
