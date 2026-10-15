@@ -146,12 +146,14 @@ uses this one value.
 (Decision: #283, 2026-10-12.)
 
 **Device export bound**:
-An export limit held and enforced by the inverter itself, covering its solar
-and battery output together. The owner or installer sets it; ha-spark verifies
-it and never writes it. Scheduled battery export needs a verified bound on
-every export-capable inverter, and those bounds must together stay within the
-site export limit.
-(Decision: #283, 2026-10-12.)
+An export ceiling held and enforced by the inverter itself, covering its solar
+and battery output together. It is either an export limit the owner or
+installer has enabled, or the inverter's rated AC output when that is already
+within the site export limit. ha-spark verifies it from the device and never
+writes it. Scheduled battery export needs a verified bound on every
+export-capable inverter, and those bounds must together stay within the site
+export limit.
+(Decision: #283, 2026-10-12; rated output added by #316, 2026-10-15.)
 _Avoid_: EPM (vendor term), export guard
 
 **Charging allocation**:
