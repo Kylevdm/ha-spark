@@ -48,7 +48,7 @@ An add-on command is never accepted as a Home Assistant service call. Every add-
 - **The add-on's port.** One port serves two auth regimes: ingress routes accept only the ingress proxy's address and require `X-Remote-User-Id` for mutations; integration routes (heartbeat, command fetch, results) require the bearer token and are not reachable through ingress. Everything else is refused, replacing today's unauthenticated `0.0.0.0` bind.
 - **Transport.** Add-on authority no longer depends on the Home Assistant caller context, so the Supervisor's Unix-socket path and its older TCP fallback need no separate proof.
 
-An API for other apps to command ha-spark is not part of v1's contract and is left to the v1 map's fog.
+Requests from API clients ([ADR-0006](0006-configuration-ownership-and-agent-edits.md), amended by [#314](https://github.com/Kylevdm/ha-spark/issues/314)) are never add-on commands. A client asks the add-on, the add-on decides under its own gates, and only the add-on's own fetched commands reach the integration.
 
 ## Stale and racing commands
 
