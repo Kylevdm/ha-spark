@@ -344,3 +344,18 @@ _Avoid_: onboarding screen, setup screen (for post-setup editing)
 Where the owner changes configuration after Setup. Changing a setting never
 changes the operating mode.
 (Decision: #306, 2026-10-14.)
+
+**Battery savings**:
+What the household's bills would have cost over a span with the same measured
+house load and solar but no battery, minus what they did cost. Each half-hour
+is priced at the import and export rates in force at the time; standing
+charges are excluded. It credits the battery and ha-spark's use of it
+together, not ha-spark alone, and never includes aggregator payments.
+(Decision: #309, 2026-10-14.)
+_Avoid_: ha-spark savings, money saved (unqualified)
+
+**Coverage**:
+The share of a span's half-hours that have trustworthy measurements (and, for
+cost figures, captured rates). Statistics always state their coverage;
+missing half-hours are left out, never filled from a forecast.
+(Decision: #309, 2026-10-14.)
