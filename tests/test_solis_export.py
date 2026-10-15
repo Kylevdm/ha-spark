@@ -1317,6 +1317,10 @@ async def test_misread_discharge_half_is_not_kept(tmp_path) -> None:
     """
     rest = FakeRest()
     export = _export(hours_ahead=0, duration_h=1.0)
+    if export.window_end.hour == 0:
+        # From 23:00 a one-hour window really ends at 00:00, so the misread 0
+        # would be the planned window; end it at 01:00 instead.
+        export = _export(hours_ahead=0, duration_h=2.0)
     _set_slot_one(rest, [23, 30, 5, 30, export.window_start.hour, 0, 0, 0])
     rest.states["sensor.solis_control_timed_charge_current"] = "1.0"
     rest.states["sensor.solis_control_timed_discharge_current"] = "62.5"

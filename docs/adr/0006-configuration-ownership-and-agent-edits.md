@@ -1,6 +1,6 @@
 # Configuration ownership and agent edits
 
-Status: accepted (2026-10-10), confirmed by the owner in [Config store: what leaves the Supervisor options, where it lives, and who edits it](https://github.com/Kylevdm/ha-spark/issues/253). Amended on 2026-10-12 by [#278](https://github.com/Kylevdm/ha-spark/issues/278) (approval on ingress, owner = any HA admin). Amended on 2026-10-15 by [#314](https://github.com/Kylevdm/ha-spark/issues/314) (API clients with their own credentials). This is a v1 planning contract, not implemented behavior.
+Status: accepted (2026-10-10), confirmed by the owner in [Config store: what leaves the Supervisor options, where it lives, and who edits it](https://github.com/Kylevdm/ha-spark/issues/253). Amended on 2026-10-12 by [#278](https://github.com/Kylevdm/ha-spark/issues/278) (approval on ingress, owner = any HA admin), and on 2026-10-15 by [#325](https://github.com/Kylevdm/ha-spark/issues/325) (protection evidence entities are integration-owned) and by [#314](https://github.com/Kylevdm/ha-spark/issues/314) (API clients with their own credentials). This is a v1 planning contract, not implemented behavior.
 
 The companion integration must execute protection and fallback while the add-on is unavailable. It therefore owns its device connections, validated device, bank, and site limits, fixed fallback charging schedule, and durable manual-control state. The add-on owns planning, tariff, UI, and agent settings. The ingress UI is the primary editor for both, but each field has one authoritative owner. This differs from a [Zigbee2MQTT-style add-on-owned device bridge](https://www.zigbee2mqtt.io/guide/usage/integrations/home_assistant.html) because the agreed fallback requirement survives an add-on outage.
 
@@ -11,6 +11,7 @@ The companion integration must execute protection and fallback while the add-on 
 | Device connection credentials and endpoints | Integration config entry data | HA config/reconfigure flow; ingress through a validated integration command |
 | Device, bank, and site limits and owner-configured fallback schedule | Integration config entry options | HA options flow; ingress through the same validated integration command |
 | Manual-control ownership and deadline | Integration durable runtime store | Integration authority commands only; not generic config |
+| Protection evidence sources: EV, Octopus dispatch, and battery-direction entity ids (**#325**) | Integration config entry options | Ingress *EV & evidence* section and onboarding step through the validated integration command; the add-on reads them over the authenticated channel. Freshness limits are fixed per source adapter, not config |
 | Planning, tariffs, UI, and agent settings | Versioned `/data/ha_spark_config.json` | Ingress, CLI, and approved agent changes through one validation/mutation service |
 | Add-on credentials | Separate `/data/ha_spark_secrets.json`, mode `0600` | Owner-facing ingress secret controls only |
 | Add-on startup diagnostics | Supervisor `log_level` option | Supervisor UI |
