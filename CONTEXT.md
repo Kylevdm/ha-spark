@@ -325,6 +325,16 @@ makes it.
 (Decision: #291, 2026-10-13.)
 _Avoid_: add-on service call, Supervisor call
 
+**Device intent**:
+What an add-on command asks one device to do, in device terms rather than
+register values: a charge window, a current limit, a dated export window. The
+integration decides how to carry it out on that device, and reports back
+whether it landed: applied, unchanged, deferred, refused, unverified or failed.
+An export intent names a date as well as a time, and the integration programs
+it only when the device's clock-only window would fire inside the event.
+(Decision: #323, 2026-10-15.)
+_Avoid_: setpoint, register write (when meaning the request)
+
 **Grid carbon intensity**:
 The estimated or forecast carbon emitted per unit of grid electricity for the
 owner's chosen region and half-hour. It is display-only: the plan never
