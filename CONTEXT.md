@@ -133,6 +133,10 @@ with a separate limit for each direction.
 A group of batteries operated as one energy store, with shared state of charge
 and charge/discharge limits. Multiple inverters may connect to the same bank.
 
+**Battery pack**:
+One battery with its own battery-management system. A battery bank is one or
+more packs operated as one store, such as packs wired in parallel.
+
 **Battery-bank current limit**:
 The maximum combined DC charge or discharge current a bank can accept or
 supply across its connected inverters, with a separate limit for each direction.
@@ -146,12 +150,14 @@ uses this one value.
 (Decision: #283, 2026-10-12.)
 
 **Device export bound**:
-An export limit held and enforced by the inverter itself, covering its solar
-and battery output together. The owner or installer sets it; ha-spark verifies
-it and never writes it. Scheduled battery export needs a verified bound on
-every export-capable inverter, and those bounds must together stay within the
-site export limit.
-(Decision: #283, 2026-10-12.)
+An export ceiling held and enforced by the inverter itself, covering its solar
+and battery output together. It is either an export limit the owner or
+installer has enabled, or the inverter's rated AC output when that is already
+within the site export limit. ha-spark verifies it from the device and never
+writes it. Scheduled battery export needs a verified bound on every
+export-capable inverter, and those bounds must together stay within the site
+export limit.
+(Decision: #283, 2026-10-12; rated output added by #316, 2026-10-15.)
 _Avoid_: EPM (vendor term), export guard
 
 **Charging allocation**:
@@ -325,6 +331,16 @@ makes it.
 (Decision: #291, 2026-10-13.)
 _Avoid_: add-on service call, Supervisor call
 
+**Device intent**:
+What an add-on command asks one device to do, in device terms rather than
+register values: a charge window, a current limit, a dated export window. The
+integration decides how to carry it out on that device, and reports back
+whether it landed: applied, unchanged, deferred, refused, unverified or failed.
+An export intent names a date as well as a time, and the integration programs
+it only when the device's clock-only window would fire inside the event.
+(Decision: #323, 2026-10-15.)
+_Avoid_: setpoint, register write (when meaning the request)
+
 **API client**:
 Another program, such as an AI agent or an automation, that an owner has
 given its own named access to ha-spark. Each one has its own permission
@@ -353,3 +369,18 @@ _Avoid_: onboarding screen, setup screen (for post-setup editing)
 Where the owner changes configuration after Setup. Changing a setting never
 changes the operating mode.
 (Decision: #306, 2026-10-14.)
+
+**Battery savings**:
+What the household's bills would have cost over a span with the same measured
+house load and solar but no battery, minus what they did cost. Each half-hour
+is priced at the import and export rates in force at the time; standing
+charges are excluded. It credits the battery and ha-spark's use of it
+together, not ha-spark alone, and never includes aggregator payments.
+(Decision: #309, 2026-10-14.)
+_Avoid_: ha-spark savings, money saved (unqualified)
+
+**Coverage**:
+The share of a span's half-hours that have trustworthy measurements (and, for
+cost figures, captured rates). Statistics always state their coverage;
+missing half-hours are left out, never filled from a forecast.
+(Decision: #309, 2026-10-14.)
