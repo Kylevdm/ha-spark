@@ -325,6 +325,15 @@ makes it.
 (Decision: #291, 2026-10-13.)
 _Avoid_: add-on service call, Supervisor call
 
+**API client**:
+Another program, such as an AI agent or an automation, that an owner has
+given its own named access to ha-spark. Each one has its own permission
+level, the owner can take its access away by itself, and its requests are
+recorded under its name. It asks ha-spark, never the devices: its requests
+are never add-on commands and carry no authority of their own.
+(Decision: #314, 2026-10-15.)
+_Avoid_: integration, other add-on, API key
+
 **Grid carbon intensity**:
 The estimated or forecast carbon emitted per unit of grid electricity for the
 owner's chosen region and half-hour. It is display-only: the plan never

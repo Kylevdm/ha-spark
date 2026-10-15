@@ -1,6 +1,6 @@
 # Configuration ownership and agent edits
 
-Status: accepted (2026-10-10), confirmed by the owner in [Config store: what leaves the Supervisor options, where it lives, and who edits it](https://github.com/Kylevdm/ha-spark/issues/253). Amended on 2026-10-12 by [#278](https://github.com/Kylevdm/ha-spark/issues/278) (approval on ingress, owner = any HA admin). This is a v1 planning contract, not implemented behavior.
+Status: accepted (2026-10-10), confirmed by the owner in [Config store: what leaves the Supervisor options, where it lives, and who edits it](https://github.com/Kylevdm/ha-spark/issues/253). Amended on 2026-10-12 by [#278](https://github.com/Kylevdm/ha-spark/issues/278) (approval on ingress, owner = any HA admin). Amended on 2026-10-15 by [#314](https://github.com/Kylevdm/ha-spark/issues/314) (API clients with their own credentials). This is a v1 planning contract, not implemented behavior.
 
 The companion integration must execute protection and fallback while the add-on is unavailable. It therefore owns its device connections, validated device, bank, and site limits, fixed fallback charging schedule, and durable manual-control state. The add-on owns planning, tariff, UI, and agent settings. The ingress UI is the primary editor for both, but each field has one authoritative owner. This differs from a [Zigbee2MQTT-style add-on-owned device bridge](https://www.zigbee2mqtt.io/guide/usage/integrations/home_assistant.html) because the agreed fallback requirement survives an add-on outage.
 
@@ -38,3 +38,14 @@ Agents **propose**; owners **approve on ingress**. A `set_config` call validates
 **Owner** means any HA administrator acting through ingress or the CLI, not one recorded user and not HA's `is_owner`. This matches who may change operating modes and start overrides; a narrower approver for config edits would make a config tweak harder to approve than entering Optimise. (Amended by [Agent config approval: who counts as the owner, and where the approval happens](https://github.com/Kylevdm/ha-spark/issues/278), 2026-10-12; this replaces the original requirement for a trusted approval inside the agent conversation, which no external client can provide.)
 
 This amends the v1 map's former exclusion of all LLM-proposed or LLM-applied configuration changes. An owner-approved, allowlisted configuration edit is in scope; direct LLM device writes and LLM-controlled operating-mode transitions remain out of scope.
+
+## API clients (amended by #314, 2026-10-15)
+
+Other programs, whether AI agents or automations, reach ha-spark as **API clients** on the existing agent surface: the published port's `/agent/*` routes and `/mcp`, sharing one operation table and the `read` < `read_act` < `read_propose` ladder. There is no second app API and no Home Assistant service for app requests. The surface stays off by default and has no clients until an owner creates one.
+
+- **Credentials.** An owner creates one named credential per client on ingress. It is shown once, stored only as a hash, carries its own ladder level (default `read`), and is revoked on its own. The shared `agent_api_token` option and `/data/agent_token` are retired without migration. These credentials are unrelated to the add-on's per-boot discovery token, and the integration never accepts them.
+- **Operations.** `read`: plan, state, forecast, predictions, health, context, statistics. `read_act`: `add_context` and a replan request. `read_propose`: `set_config`, which creates a config proposal approved by an owner on ingress as above. Never, at any level: overrides, operating-mode or authority transitions, approving proposals, device writes, credentials, or any client's permissions.
+- **Gating.** Each client is its own agent principal: one pending proposal, and replan requests at least 5 minutes apart (close requests still combine). Act and propose calls are audited under the client's name. The port backs off after failed authentication; there is no general request-rate limit.
+- **The ingress chat assistant** is an in-process principal, not an API client: it holds no credential and never uses the published port, but uses the same operation table and ladder.
+
+One surface was chosen over a separate app API so the permission table is written once (the drift #93 fixed), and per-client credentials are what make per-principal limits, proposals, audit and revocation real.
