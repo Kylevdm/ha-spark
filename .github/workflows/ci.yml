@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev,habits]"
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Mypy
+        run: mypy ha_spark
+
+      - name: Pytest
+        run: pytest -q
