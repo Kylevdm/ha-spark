@@ -60,6 +60,8 @@ Mode transitions and manual handover or resume come from ingress (admin-only), t
 
 Every device-entity write is validated against device, bank and site limits, read back, and logged with its caller context. In Observe any Home Assistant caller, including an automation, may write. In Protect the same applies except protection-owned controls. In Optimise or fallback, ha-spark-owned controls are refused until the owner takes manual control. In a manual session everything except kept-protection controls is open. A refusal is a clear service error naming the current owner and how to take control.
 
+Device write entities are `entity_category: config`, so none is exposed to Assist by default. If the owner deliberately exposes one, Home Assistant's own conversation agent writes as any Home Assistant caller would, under the same rules. "The LLM never controls hardware" binds ha-spark's own LLM, which can never reach add-on commands. This rule came from [#323](https://github.com/Kylevdm/ha-spark/issues/323#issuecomment-6194844529); the settled mode text did not already cover it.
+
 ## Fallback
 
 The SoC-integrity fallback and the add-on-unavailable fallback are one fallback charging schedule with two causes: add-on liveness lost, and sustained SoC-integrity failure reported by whichever side detects it. It applies only in Optimise. Fallback active records the set of causes, and every cause must clear.
