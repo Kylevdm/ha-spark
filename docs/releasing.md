@@ -11,14 +11,30 @@ The add-on build fails unless two things agree. The add-on Dockerfile installs
 
 The order is:
 
-1. Commit the version bump.
+1. Commit the version bump. In the same commit, fold the changelog fragments
+   (below).
 2. Tag it `vX.Y.Z`.
 3. Push the branch and the tag.
 4. Merge to `master`.
 
 Keep `config.yaml` `options`/`schema` in sync with `config.py` `_OPTION_KEYS`
-(a test enforces this). For any option or behaviour change, bump the version
-and update `CHANGELOG.md` and `DOCS.md`.
+(a test enforces this). For any option or behaviour change, bump the version,
+add a changelog fragment and update `DOCS.md`.
+
+## Changelog fragments
+
+PRs never edit `ha_spark_addon/CHANGELOG.md`; parallel PRs would all insert at
+the same line and conflict. Instead, each user-visible change adds
+`ha_spark_addon/changelog.d/<issue>.md` (use a short slug when there is no
+issue). It holds the final Markdown bullet(s), written as they will appear in
+the changelog.
+
+To fold them at release, in the version-bump commit:
+
+1. Add `## X.Y.Z` directly under `# Changelog`.
+2. Under it, paste the contents of every `changelog.d/*.md` in ascending issue
+   order, adding any release-wide notes (such as upgrade order) at the end.
+3. Delete the folded fragment files, keeping `changelog.d/.gitkeep`.
 
 ## Add-on base image
 
