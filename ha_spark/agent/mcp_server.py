@@ -68,11 +68,10 @@ def build_mcp(state: AppState) -> FastMCP:
         streamable_http_path="/",
         # Tool server: no per-client session state, so skip session-id round-trips.
         stateless_http=True,
-        # DNS-rebinding Host check disabled by design decision (2026-06-25): the
-        # /mcp surface already sits behind HA ingress auth (ingress) + the bearer
-        # token (published port), which cover the same threat; hosts are dynamic
-        # behind ingress/Nabu Casa so a fixed allow-list would reject legitimate
-        # clients.
+        # Keep the Host allow-list off (2026-06-25): hosts vary behind ingress
+        # and Nabu Casa, where a fixed list would reject legitimate clients.
+        # build_app rejects every present Origin on the token-gated published
+        # port; ingress accepts HA's varying browser Origin after its peer gate.
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
