@@ -6,7 +6,6 @@
   `chargestopsoc` service field (#260).
 - Validate configured notification services during health checks and add a
   `ha-spark notify-test` onboarding command to confirm delivery (#243).
-- Keep newly generated agent API tokens out of logs; log the token file path instead (#328).
 
 ## 0.22.0
 
