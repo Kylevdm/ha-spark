@@ -44,8 +44,12 @@ security and prefer the safe default. Hard rules:
   planner is the sole decider.
 - **Actuation invariants:** real writes only when `PROACTIVE_MODE == on` (and
   `control == ha_spark` under the driver layer), never on an invalid SoC, always
-  read-back verified, failures isolated per action. Don't weaken these
-  (`ha_spark/devices/inverters/`, `energy/supply_guard.py`).
+  read-back verified, failures isolated per action. One narrow exception: after
+  `soc_failure_threshold` failed SoC checks, Solis may program the configured
+  cheap-rate window at an explicitly set `solis_fallback_current_a`, through the
+  same gates and read-back; no default current, and AlphaESS never gets it.
+  Don't weaken these (`ha_spark/devices/inverters/`, `energy/supply_guard.py`,
+  `energy/soc_monitor.py`).
 - **Parameterised SQL only**; no `eval`/`exec`/`shell=True`/shell interpolation
   of external data.
 - **Network:** outbound only to configured endpoints; any inbound surface must
