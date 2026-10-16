@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Send the planned stop-SoC in AlphaESS charge calls using the integration's
+  `chargestopsoc` service field (#260).
+
 ## 0.22.0
 
 - Plan reservation-backed V2L house-battery refills when cheaper than the grid

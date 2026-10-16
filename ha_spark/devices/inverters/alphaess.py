@@ -65,10 +65,7 @@ class AlphaESSDevice:
         if mode in ("off", "observe"):
             return [f"[{mode.upper()}] computed: {desc}"]
         try:
-            # VERIFY before shipping: confirm the alphaess.setbatterycharge field
-            # names (serial, enabled, cp1start, cp1end, chargeStopSOC) against the
-            # integration's services.yaml on the tester's box (Developer Tools ->
-            # Services, or the CharlesGillanders integration repo) — unverified.
+            # Field names checked against the AlphaESS integration's services.yaml.
             await self._rest.call_service(
                 "alphaess",
                 "setbatterycharge",
@@ -77,7 +74,7 @@ class AlphaESSDevice:
                     "enabled": True,
                     "cp1start": fmt_hhmm(intent.window_start),
                     "cp1end": fmt_hhmm(intent.window_end),
-                    "chargeStopSOC": stop_soc,
+                    "chargestopsoc": stop_soc,
                 },
             )
         except Exception as exc:  # noqa: BLE001
