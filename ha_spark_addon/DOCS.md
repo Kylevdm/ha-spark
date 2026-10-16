@@ -162,6 +162,11 @@ always produces.
 - `charge_buffer_pct`, `charge_efficiency`, `solar_haircut_k`,
   `solar_percentile`, `expected_load_kwh`: forecast and sizing settings. You can
   usually leave them at their defaults.
+- `solar_haircut_k` (default `1.0`) multiplies the forecast reported by the
+  Solcast entity. Any dampening or hard limit configured in the Solcast
+  integration has already been applied, so the corrections stack. Use one
+  correction: leave Solcast dampening and hard limit off and tune
+  `solar_haircut_k`, or keep them on and leave `solar_haircut_k` at `1.0`.
 - `charge_window_start` / `charge_window_end`: your cheap-rate window.
 - `plan_run_time`: no longer used, and kept so existing configs still load. The
   daemon recomputes the plan every half-hour slot.
