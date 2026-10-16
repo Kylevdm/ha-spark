@@ -543,6 +543,42 @@ def test_pending_failure_still_resets_on_one_pass(tmp_path: Path) -> None:
     assert snap.state is SocOperatingState.NORMAL
 
 
+def test_threshold_without_fallback_waits_for_stable_advancing_reports(tmp_path: Path) -> None:
+    monitor = SocMonitor.load(_settings(tmp_path))
+    monitor.record(_measurement(ok=False), failure_threshold=1)
+    for minute in range(6):
+        snap = monitor.record(
+            _pass_at(minute, reported_minute=0, value=30 + minute),
+            failure_threshold=1,
+            recovery_duration=timedelta(minutes=2),
+            recover_without_fallback=True,
+        )
+        assert snap.state is SocOperatingState.FALLBACK_THRESHOLD
+        assert not snap.recovery_ready
+    for minute in range(6, 8):
+        snap = monitor.record(
+            _pass_at(minute, value=30 + minute), failure_threshold=1,
+            recovery_duration=timedelta(minutes=2), recover_without_fallback=True,
+        )
+    assert snap.recovery_ready
+    failed = monitor.record(_measurement(ok=False), failure_threshold=1,
+                            recover_without_fallback=True)
+    assert not failed.recovery_ready
+    assert failed.recovery_since is None
+
+
+def test_alphaess_recovery_restarts_after_a_missed_minute(tmp_path: Path) -> None:
+    monitor = SocMonitor.load(_settings(tmp_path))
+    monitor.record(_measurement(ok=False), failure_threshold=1)
+    for minute in (0, 1, 4):
+        snapshot = monitor.record(
+            _pass_at(minute), failure_threshold=1,
+            recovery_duration=timedelta(minutes=2), recover_without_fallback=True,
+        )
+    assert snapshot.recovery_since == _T0 + timedelta(minutes=4)
+    assert not snapshot.recovery_ready
+
+
 @respx.mock
 async def test_observe_soc_uses_power_evidence_and_tolerates_failed_power_read() -> None:
     settings = _settings(Path('/tmp'), soc_entity='sensor.soc', battery_power_entity='sensor.power')

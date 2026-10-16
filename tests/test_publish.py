@@ -384,3 +384,33 @@ async def test_publish_soc_integrity_reports_fallback_confirmation_not_request()
     assert body["attributes"]["fallback_confirmed"] is True
     assert body["attributes"]["fallback_action"] == "[FALLBACK] Solis fallback verified"
     assert body["attributes"]["fallback_actions"] == ["[FALLBACK] Solis fallback verified"]
+
+
+@respx.mock
+async def test_publish_soc_integrity_exposes_alphaess_recovery_action() -> None:
+    from ha_spark.energy.soc_monitor import SocMonitor
+
+    push = respx.post(f"{BASE}/states/sensor.ha_spark_soc_integrity").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    now = datetime.now(UTC)
+    failed = SocMeasurement(
+        status=SocStatus.STALE, observed_at=now, value=30.0,
+        raw_state="30", age_s=3600.0, max_age_s=600.0,
+    )
+    monitor = SocMonitor()
+    monitor.record(failed, failure_threshold=1)
+    passing = SocMeasurement(
+        status=SocStatus.OK, observed_at=now, value=31.0,
+        raw_state="31", reported_at=now, age_s=0.0, max_age_s=600.0,
+    )
+    monitor.record(passing, failure_threshold=1, recover_without_fallback=True)
+    snapshot = monitor.complete_recovery(action_line="[RECOVERED] AlphaESS plan applied")
+
+    async with HomeAssistantRest(BASE, "t") as rest:
+        await publish_soc_integrity(rest, snapshot, Settings(inverter="alphaess"))
+
+    attrs = json.loads(push.calls[0].request.content)["attributes"]
+    assert attrs["recovery_action"] == "[RECOVERED] AlphaESS plan applied"
+    assert attrs["recovery_actions"] == ["[RECOVERED] AlphaESS plan applied"]
+    assert attrs["fallback_confirmed"] is False
