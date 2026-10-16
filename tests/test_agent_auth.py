@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from ha_spark.agent.auth import resolve_token, verify
 from ha_spark.config import Settings
 
@@ -13,10 +15,13 @@ def test_configured_token_wins(tmp_path: Path) -> None:
     assert tok == "abc"
 
 
-def test_generates_and_persists(tmp_path: Path) -> None:
+def test_generates_and_persists(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     path = tmp_path / "agent_token"
-    first = resolve_token(_settings(), path)
+    with caplog.at_level("DEBUG", logger="ha_spark.agent.auth"):
+        first = resolve_token(_settings(), path)
     assert first and path.read_text().strip() == first
+    assert first not in caplog.text
+    assert str(path) in caplog.text
     assert resolve_token(_settings(), path) == first  # stable across calls
 
 

@@ -482,8 +482,10 @@ ha-spark's data and, optionally, trigger a few gated actions.
   predictions, health). `read_act` adds `add_context` and `run_plan`.
   `read_write` adds `set_config`.
 - `agent_api_token`: bearer token for the published port. If you leave it
-  blank, the add-on generates one on first start and prints it **once** to the
-  add-on log. It's a `password` field, so the UI never shows it again.
+  blank, the add-on generates one on first start and saves it to
+  `/data/agent_token` in the add-on container (read it from the add-on shell
+  with `cat /data/agent_token`). The token never appears in the add-on log.
+  It's a `password` field, so the UI never shows it again.
 - `agent_expose_port` (`bool`, default `false`): publish the agent surface on
   the host network for clients that can't reach add-on ingress.
 
