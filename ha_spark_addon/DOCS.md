@@ -290,7 +290,7 @@ energy at the configured rates less conversion losses, publishes
 | `v2l_peak_rate_gbp` | £/kWh import rate that V2L saves while it runs (default `0.30`). |
 | `v2l_offpeak_rate_gbp` | £/kWh cheap rate used to refill the car later (default `0.07`). |
 | `v2l_cutoff_time` | Local time the cheap window starts. The unplug notification fires at or after it (default `01:00`). |
-| `v2l_notify_service` | Deprecated fallback HA `notify.<service>` target, scheduled for removal. `notify_service` takes precedence; this is used only when `notify_service` is blank. |
+| `v2l_notify_service` | Deprecated fallback Home Assistant notify service name without `notify.` (for example, `mobile_app_<device>`), scheduled for removal. `notify_service` takes precedence; this is used only when `notify_service` is blank. |
 | `v2l_budget_kwh` | Optional V2L budget in kWh, used in place of car SoC (the car has no HA integration, so ha-spark can't read its SoC). `0` disables refill planning and the plug-in warning. Planned refills and top-up requests never exceed this. |
 | `v2l_max_rate_kw` | Maximum planned house-battery refill rate (default `3.0` kW). |
 | `v2l_preferred_rate_kw` | Preferred planned refill rate (default `1.5` kW); must be positive and no higher than the maximum. |
@@ -395,9 +395,10 @@ refuse the configuration after the update. Existing `axle_api_key`,
 `axle_api_url`, `axle_event_entity`, and `axle_event_rate_gbp_kwh` options are
 unchanged.
 
-Set `notify_service` to the single Home Assistant `notify.<service>` target for
-all notifications, including V2L and export lifecycle notices sent to the
-person supervising. ha-spark sends one notice when it accepts an event, one
+Set `notify_service` to the bare Home Assistant notify service name, such as
+`mobile_app_<device>` (without `notify.`), for all notifications, including V2L and
+export lifecycle notices sent to the person supervising. ha-spark sends one
+notice when it accepts an event, one
 after a verified export start, one after verified cleanup, and one for a
 terminal abort. It deduplicates notices by event and lifecycle step. A notice
 is never proof that a hardware write succeeded. Leave both `notify_service` and
@@ -516,7 +517,7 @@ every hardware decision.
 1. **Check the Log tab** after the first start. The add-on runs
    `ha-spark health` and prints one line per check: HA REST, HA WebSocket,
    Ollama, SQLite, load history, supply guard, tariff provider, household
-   clock, inverter clock (Solis only), and entity config.
+   clock, inverter clock (Solis only), notify service (when configured), and entity config.
 2. **Map your entities.** From a shell in the add-on container (e.g. the SSH
    add-on with `docker exec -it addon_<slug> sh`, or the add-on's own
    terminal), run `ha-spark onboard`. It scans your HA entities and proposes
@@ -537,8 +538,11 @@ every hardware decision.
    - Or set the `derive_*_entity` options (grid import is required) and run
      `ha-spark backfill-load --derive` once. See "Derived base load" above;
      each plan run then keeps the last 48 hours up to date.
-4. `ha-spark plan` prints tonight's plan without applying it.
-5. Leave the add-on running; it recomputes the plan every half-hour. When the
+4. If `notify_service` is configured, run `ha-spark notify-test` from the add-on
+   shell. Confirm that the test notice arrived on the intended device. A
+   successful command only confirms Home Assistant accepted the send.
+5. `ha-spark plan` prints tonight's plan without applying it.
+6. Leave the add-on running; it recomputes the plan every half-hour. When the
    simulated decisions look right, disable conflicting automations, confirm
    the Solis overlay and entity reads are healthy, then set
    `proactive_mode: on`. Follow the handover procedure linked above.
