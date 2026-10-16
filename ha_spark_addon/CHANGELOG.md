@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Read the Solcast day total from the configured percentile attribute (#261),
+  falling back to the sensor state with a warning when that attribute is invalid.
+
 ## 0.22.0
 
 - Plan reservation-backed V2L house-battery refills when cheaper than the grid
