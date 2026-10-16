@@ -1797,7 +1797,7 @@ async def test_loop_never_requests_fallback_for_alphaess(
     with pytest.raises(stop):
         await run_forever(settings, poll_seconds=0)
 
-    assert fallback_states == [False]
+    assert fallback_states == [True]  # threshold blocks normal programming
     assert _integrity_posts()[-1][0] == "fallback_threshold"
     assert _integrity_posts()[-1][1]["fallback_supported"] is False
     assert not any(call.request.url.path.startswith("/api/services/") for call in respx.calls)
@@ -3970,6 +3970,101 @@ def _patch_recovery_loop(
 
 def _monitor_file(tmp_path: Path) -> object:
     return json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text())
+
+
+@respx.mock
+async def test_alphaess_threshold_recovers_only_with_fresh_verified_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop, runs, settings = _patch_recovery_loop(
+        tmp_path, monkeypatch, [0, 1, 2, 3],
+        [["[APPLIED] AlphaESS charge plan read-back verified"]],
+    )
+    (tmp_path / "ha_spark_soc_monitor.json").write_text(
+        json.dumps({"consecutive_failures": 3, "fallback_status": "fallback_threshold"})
+    )
+    settings = Settings.model_validate(
+        {**settings.model_dump(), "inverter": "alphaess", "devices": []}
+    )
+
+    def forbid_fallback(_monitor: SocMonitor) -> None:
+        pytest.fail("AlphaESS requested fallback")
+
+    monkeypatch.setattr(SocMonitor, "request_fallback", forbid_fallback)
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert [run["held"] for run in runs] == [True, False]
+    assert runs[1]["previous"] is None
+    assert runs[1]["soc"] is not runs[0]["soc"]
+    assert runs[1]["soc"] == _passing_at(2)
+    assert [state for state, _ in _integrity_posts()] == [
+        "fallback_threshold", "fallback_threshold", "fallback_threshold", "normal", "normal"
+    ]
+    assert _integrity_posts()[2][1]["recovery_ready"] is True
+    assert _monitor_file(tmp_path) == {"consecutive_failures": 0, "fallback_status": "normal"}
+    assert not any("fallback" in call.request.url.path for call in respx.calls)
+
+
+@respx.mock
+async def test_alphaess_never_requests_fallback_from_failure_through_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop, runs, settings = _patch_recovery_loop(
+        tmp_path, monkeypatch, [0, 1, 2, 3], [["[APPLIED] AlphaESS charge plan"]]
+    )
+    (tmp_path / "ha_spark_soc_monitor.json").unlink()
+    settings = Settings.model_validate({
+        **settings.model_dump(), "inverter": "alphaess", "devices": [],
+        "soc_failure_threshold": 1,
+    })
+    observations = iter([
+        replace(_passing_at(0), status=SocStatus.STALE),
+        _passing_at(1), _passing_at(2), _passing_at(3),
+    ])
+
+    async def observe(
+        _settings: Settings, _rest: HomeAssistantRest, *, monitor: SocMonitor | None = None
+    ) -> SocMeasurement:
+        return next(observations)
+
+    def forbid_fallback(_monitor: SocMonitor) -> None:
+        pytest.fail("AlphaESS requested fallback")
+
+    monkeypatch.setattr(scheduler, "observe_soc", observe)
+    monkeypatch.setattr(SocMonitor, "request_fallback", forbid_fallback)
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert [run["held"] for run in runs] == [True, False]
+    assert runs[1]["soc"] is not runs[0]["soc"]
+    assert _monitor_file(tmp_path) == {"consecutive_failures": 0, "fallback_status": "normal"}
+
+
+@respx.mock
+async def test_alphaess_simulated_recovery_does_not_claim_hardware_was_programmed(
+    tmp_path: Path,
+) -> None:
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    monitor = SocMonitor(path=tmp_path / "ha_spark_soc_monitor.json")
+    monitor.record(replace(_passing_at(0), status=SocStatus.STALE), failure_threshold=1)
+    for minute in (1, 2, 3):
+        monitor.record(
+            _passing_at(minute), failure_threshold=1,
+            recovery_duration=timedelta(minutes=2), recover_without_fallback=True,
+        )
+    assert monitor.recovery_ready
+    settings = Settings(ha_url="http://ha.test", ha_token="t", inverter="alphaess")
+
+    await scheduler.finish_recovery(
+        settings, monitor, ("[SIMULATE] would charge to 80%",)
+    )
+
+    action = _integrity_posts()[-1][1]["recovery_action"]
+    assert action.startswith("[RECOVERED] plan computed without hardware programming:")
 
 
 @respx.mock
