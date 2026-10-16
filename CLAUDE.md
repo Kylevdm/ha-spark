@@ -90,13 +90,19 @@ write, through the same decision path with side effects suppressed.
 - **Phase-per-branch/PR**, each ending runnable. Status lives in the GitHub
   milestones/issues + CHANGELOG.md, not here.
 - **Add-on packaging per phase:** bump `ha_spark_addon/config.yaml` `version`,
-  add CHANGELOG entry, update DOCS.md + schema. Keep `config.yaml`
+  add a changelog fragment, update DOCS.md + schema. Keep `config.yaml`
   `options`/`schema` and `config.py` `_OPTION_KEYS` in sync (test-enforced).
 - **Release procedure (two things must agree):** the Supervisor build runs
   `pip install "...@v${BUILD_VERSION}"` where `BUILD_VERSION` = the `config.yaml`
   `version` **on `master`** (the store reads the default branch), and the
   matching `vX.Y.Z` tag must be pushed or the build fails. Sequence: commit
   bump → tag → push branch + tag → merge to `master`.
+- **Changelog fragments:** a PR never edits `CHANGELOG.md`, so parallel PRs
+  can't conflict there. A user-visible change adds
+  `ha_spark_addon/changelog.d/<issue>.md` holding its final bullet(s), written
+  as they will appear. The release's bump commit folds every fragment, in issue
+  order, into a new `## X.Y.Z` section at the top of `CHANGELOG.md` and deletes
+  them (`docs/releasing.md`).
 - **Add-on base image:** Supervisor 2026.04.0+ ignores `build.yaml`/`BUILD_FROM`;
   the base is set via `FROM` in `ha_spark_addon/Dockerfile`. It's a glibc
   `python:slim` base (musllinux has no sklearn wheels); no s6/bashio, so
