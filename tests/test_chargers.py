@@ -778,11 +778,13 @@ async def test_alphaess_apply_writes_window_and_stop_soc() -> None:
         lines = await _alpha_device(s, rest).apply(_intent(target_soc=80.0))
     assert route.called
     body = json.loads(route.calls.last.request.content)
-    assert body["serial"] == "ABC123"
-    assert body["enabled"] is True
-    assert body["cp1start"] == "23:30"
-    assert body["cp1end"] == "05:30"
-    assert body["chargeStopSOC"] == 80
+    assert body == {
+        "serial": "ABC123",
+        "enabled": True,
+        "cp1start": "23:30",
+        "cp1end": "05:30",
+        "chargestopsoc": 80,
+    }
     assert "[APPLIED]" in lines[0]
 
 
