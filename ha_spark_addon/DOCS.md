@@ -186,6 +186,43 @@ current as headroom returns. `supply_voltage_v` (default 240) converts the
 sensor's watts to amps. The guard's writes follow `proactive_mode` in the same
 way as the plan's. Leave `grid_power_entity` empty to turn the guard off.
 
+### SoC integrity and fallback
+
+ha-spark checks `soc_entity` once a minute (see the `soc_*` options above). It
+publishes the result as `sensor.ha_spark_soc_integrity`, whose state is the
+operating state and whose attributes give the failure count, the integrity
+reason and evidence, the fallback window and current ceiling, and recovery
+progress. What you see in that sensor, the log and the action lines:
+
+- **Blocked** (`pending_failure`): from the first failed check, real SoC-based
+  programming and charge-rate increases are refused with a `[BLOCKED]` line
+  quoting the reason. The program already on the inverter is left as it is,
+  and the supply guard can still reduce current.
+- **Fallback threshold** (`fallback_threshold`): `soc_failure_threshold`
+  consecutive failures without a configured `solis_fallback_current_a`, or
+  without a Solis inverter. Nothing new is written. AlphaESS has no fallback
+  and refuses new programming while the SoC fails.
+- **Verified fallback** (`fallback_verified`, `fallback_confirmed: true`): the
+  Solis fallback charging schedule (`charge_window_start`–`charge_window_end`
+  at the fallback current ceiling) read back as written, logged as
+  `[FALLBACK]`. The supply guard may lower it and restores no higher than the
+  ceiling.
+- **Failed or unconfirmed fallback** (`fallback_requested` or
+  `fallback_failed`, `fallback_confirmed: false`): the write failed or did
+  not read back, logged as `[FAILED]`. Increases stay blocked, reductions are
+  still allowed, and ha-spark retries each minute. In `simulate`, `off` or
+  `observe` nothing is written and the state stays `fallback_requested`.
+- **Recovery** (`recovery_since`, `recovery_ready`): after
+  `soc_recovery_minutes` of passing checks, ha-spark applies a fresh plan. The
+  fallback remains the reported state until that plan reads back clean, logged
+  as `[RECOVERED]`. If it doesn't, the fallback is kept but marked unconfirmed,
+  and ha-spark retries each minute.
+
+A computed plan is not a confirmed program. While the SoC is untrusted, the
+SoC-dependent plan sensors show `unavailable`, and only a matching read-back
+counts as confirmed. The failure count and fallback status survive a restart;
+recovery progress does not, so the wait starts over.
+
 ### ML load model (optional)
 
 The add-on image includes scikit-learn. A standalone install needs the
