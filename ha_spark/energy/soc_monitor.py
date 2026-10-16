@@ -17,7 +17,9 @@ configured threshold (default three) requests fallback only when a current is
 configured. A successful Solis read-back confirms it; a failed or unconfirmed
 attempt stays retryable on the next observation. Once requested, verified, or
 failed, a passing observation leaves the fallback state in place for recovery.
-Persisted confirmation is not hardware truth after restart (#118).
+Persisted confirmation is not hardware truth after restart (#118): restored
+trouble waits for this process's first checked observation, and Solis must
+reconcile the resident fallback program before normal rate increases.
 
 Recovery from an active Solis fallback or an AlphaESS threshold crossing needs
 ``soc_recovery_minutes`` of
@@ -71,6 +73,8 @@ class SocMonitorSnapshot:
     consecutive_failures: int
     failure_threshold: int
     state: SocOperatingState
+    restored_state: bool = False
+    fresh_observation: bool = False
     fallback_confirmed: bool = False
     fallback_action: str | None = None
     recovery_since: datetime | None = None
@@ -147,6 +151,7 @@ class SocMonitor:
         consecutive_failures: int = 0,
         fallback_status: SocOperatingState = SocOperatingState.NORMAL,
         path: Path | None = None,
+        restored_state: bool = False,
     ) -> None:
         self._consecutive_failures = consecutive_failures
         self._fallback_status = fallback_status
@@ -154,6 +159,8 @@ class SocMonitor:
         # current resident program. Only complete_fallback can set this true.
         self._fallback_confirmed = False
         self._path = path
+        self._restored_state = restored_state
+        self._fresh_observation = False
         self._last: SocMeasurement | None = None
         self._last_snapshot: SocMonitorSnapshot | None = None
         self._fallback_attempt_measurement: SocMeasurement | None = None
@@ -234,7 +241,20 @@ class SocMonitor:
         if count < 0:
             log.warning("SoC monitor: persisted failure count %d invalid; starting at 0", count)
             count = 0
-        return cls(consecutive_failures=count, fallback_status=fallback_status, path=path)
+        restored = count > 0 or fallback_status is not SocOperatingState.NORMAL
+        if restored:
+            log.warning(
+                "SoC monitor: restored software state %s with %d failure(s); "
+                "awaiting fresh checked observation; hardware unconfirmed",
+                fallback_status.value,
+                count,
+            )
+        return cls(
+            consecutive_failures=count,
+            fallback_status=fallback_status,
+            path=path,
+            restored_state=restored,
+        )
 
     def record(
         self,
@@ -247,6 +267,14 @@ class SocMonitor:
         """Fold one observation into the running state; counts it exactly once."""
         if measurement is self._last and self._last_snapshot is not None:
             return self._last_snapshot
+        if self.awaiting_fresh_observation:
+            log.info(
+                "SoC monitor: fresh checked observation %s after restored software state; "
+                "hardware %s",
+                measurement.status.value,
+                "unconfirmed" if self.fallback_active else "not applicable",
+            )
+        self._fresh_observation = True
         if measurement.ok:
             snapshot = self._record_pass(
                 measurement, failure_threshold, recovery_duration, recover_without_fallback
@@ -265,6 +293,11 @@ class SocMonitor:
             SocOperatingState.FALLBACK_VERIFIED,
             SocOperatingState.FALLBACK_FAILED,
         }
+
+    @property
+    def awaiting_fresh_observation(self) -> bool:
+        """Restored integrity trouble cannot authorize normal programming yet."""
+        return self._restored_state and not self._fresh_observation
 
     @property
     def fallback_confirmed(self) -> bool:
@@ -352,6 +385,7 @@ class SocMonitor:
         self._consecutive_failures = 0
         self._fallback_status = SocOperatingState.NORMAL
         self._fallback_confirmed = False
+        self._restored_state = False
         self._reset_recovery()
         self._save()
         return self._refresh_last_snapshot(
@@ -442,6 +476,7 @@ class SocMonitor:
             self._consecutive_failures = 0
             self._fallback_status = SocOperatingState.NORMAL
             self._fallback_confirmed = False
+            self._restored_state = False
             self._save()
         return self._snapshot(measurement, failure_threshold, SocOperatingState.NORMAL)
 
@@ -490,6 +525,8 @@ class SocMonitor:
             consecutive_failures=self._consecutive_failures,
             failure_threshold=failure_threshold,
             state=state,
+            restored_state=self._restored_state,
+            fresh_observation=self._fresh_observation,
             fallback_confirmed=self.fallback_confirmed,
             recovery_since=self._recovery_since,
             recovery_ready=self.recovery_ready,
@@ -509,6 +546,8 @@ class SocMonitor:
             consecutive_failures=self._consecutive_failures,
             failure_threshold=self._last_snapshot.failure_threshold,
             state=self._fallback_status,
+            restored_state=self._restored_state,
+            fresh_observation=self._fresh_observation,
             fallback_confirmed=fallback_confirmed,
             fallback_action=fallback_action,
             recovery_since=self._recovery_since,
