@@ -1,7 +1,6 @@
-"""Octopus Energy half-hourly consumption, standard-unit-rates, and Intelligent
-dispatch windows: CSV export parsing + REST/GraphQL API clients.
+"""Octopus Energy consumption, account tariff discovery, rates, and dispatches.
 
-The consumption/rates endpoints are the public REST v1 API (API-key Basic
+The consumption/account/rates endpoints are the public REST v1 API (API-key Basic
 Auth). Planned Intelligent dispatches are only available over the Kraken
 GraphQL API, which needs a short-lived JWT exchanged for the API key first
 (``obtainKrakenToken``) — never logged, and never echoed in any error message.
@@ -11,10 +10,12 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+from pydantic import BaseModel, StrictBool, StrictStr, ValidationError
 
 from ha_spark.config import Settings
 from ha_spark.energy.models import ConsumptionInterval, DispatchSlot, PricePoint
@@ -25,6 +26,74 @@ log = get_logger(__name__)
 
 class OctopusApiError(RuntimeError):
     """Raised when the Octopus API is misconfigured or returns an error."""
+
+
+class _Agreement(BaseModel):
+    tariff_code: StrictStr
+    valid_from: datetime
+    valid_to: datetime | None
+
+
+class _MeterPoint(BaseModel):
+    mpan: StrictStr
+    is_export: StrictBool
+    agreements: list[_Agreement]
+
+
+class _Property(BaseModel):
+    electricity_meter_points: list[_MeterPoint]
+
+
+class _Account(BaseModel):
+    properties: list[_Property]
+
+
+async def discover_import_tariff(settings: Settings) -> tuple[str, str]:
+    """Read the current import tariff from the configured Octopus account API."""
+    if not (settings.octopus_api_key and settings.octopus_account_number):
+        raise OctopusApiError("Octopus Intelligent not configured: set API key and account number")
+    url = f"{settings.octopus_api_url.rstrip('/')}/accounts/{settings.octopus_account_number}/"
+    try:
+        async with httpx.AsyncClient(
+            auth=httpx.BasicAuth(settings.octopus_api_key, ""), timeout=settings.ha_timeout
+        ) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            account = _Account.model_validate(response.json())
+    except (httpx.HTTPError, ValueError, ValidationError):
+        raise OctopusApiError(
+            "Octopus account discovery failed: HTTP or payload validation error"
+        ) from None
+
+    imports = [
+        point for prop in account.properties for point in prop.electricity_meter_points
+        if not point.is_export
+    ]
+    if len(imports) > 1 and not settings.octopus_mpan:
+        raise OctopusApiError("Octopus account has multiple import meter points; set OCTOPUS_MPAN")
+    if settings.octopus_mpan:
+        imports = [point for point in imports if point.mpan == settings.octopus_mpan]
+        if not imports:
+            raise OctopusApiError("Configured OCTOPUS_MPAN matches no import meter point")
+    if len(imports) != 1:
+        raise OctopusApiError(f"Octopus account has {len(imports)} eligible import meter points")
+    now = datetime.now(UTC)
+    agreements = [
+        item for item in imports[0].agreements
+        if item.valid_from.tzinfo is not None
+        and (item.valid_to is None or item.valid_to.tzinfo is not None)
+        and item.valid_from <= now
+        and (item.valid_to is None or now < item.valid_to)
+    ]
+    if len(agreements) != 1:
+        raise OctopusApiError(
+            f"Octopus import meter point has {len(agreements)} current agreements"
+        )
+    tariff_code = agreements[0].tariff_code
+    match = re.fullmatch(r"E-[1-9][0-9]*R-([A-Z0-9]+(?:-[A-Z0-9]+)*)-([A-Z])", tariff_code)
+    if match is None:
+        raise OctopusApiError("Octopus current tariff code has an invalid shape")
+    return match.group(1), tariff_code
 
 
 def _to_utc(raw: str) -> datetime:
@@ -158,18 +227,15 @@ async def fetch_standard_unit_rates(
     settings: Settings, *, period_from: datetime, period_to: datetime | None = None
 ) -> tuple[PricePoint, ...]:
     """Pull per-slot import prices from the Octopus standard-unit-rates REST endpoint."""
-    if not (
-        settings.octopus_api_key
-        and settings.octopus_product_code
-        and settings.octopus_tariff_code
-    ):
-        raise OctopusApiError(
-            "Octopus Intelligent not configured: set OCTOPUS_API_KEY, "
-            "OCTOPUS_PRODUCT_CODE and OCTOPUS_TARIFF_CODE"
-        )
+    if not settings.octopus_api_key:
+        raise OctopusApiError("Octopus Intelligent not configured: set OCTOPUS_API_KEY")
+    if settings.octopus_product_code and settings.octopus_tariff_code:
+        product_code, tariff_code = settings.octopus_product_code, settings.octopus_tariff_code
+    else:
+        product_code, tariff_code = await discover_import_tariff(settings)
     url = (
-        f"{settings.octopus_api_url.rstrip('/')}/products/{settings.octopus_product_code}"
-        f"/electricity-tariffs/{settings.octopus_tariff_code}/standard-unit-rates/"
+        f"{settings.octopus_api_url.rstrip('/')}/products/{product_code}"
+        f"/electricity-tariffs/{tariff_code}/standard-unit-rates/"
     )
     params: dict[str, str] = {"period_from": period_from.astimezone(UTC).isoformat()}
     if period_to is not None:
@@ -189,6 +255,11 @@ async def fetch_standard_unit_rates(
                 raise OctopusApiError(f"Octopus rates request failed: {exc}") from exc
             points.extend(_parse_rate_results(payload.get("results")))
             next_url = payload.get("next")
+            if next_url is not None and (
+                not isinstance(next_url, str)
+                or not next_url.startswith(f"{settings.octopus_api_url.rstrip('/')}/")
+            ):
+                raise OctopusApiError("Octopus rates pagination points outside configured API")
             next_params = None
     return tuple(sorted(points, key=lambda p: p.start))
 
