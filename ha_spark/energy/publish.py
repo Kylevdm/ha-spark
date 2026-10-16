@@ -235,6 +235,9 @@ async def publish_soc_integrity(
                     ),
                     "recovery_ready": snapshot.recovery_ready,
                     "recovery_action": snapshot.recovery_action,
+                    "recovery_actions": (
+                        [snapshot.recovery_action] if snapshot.recovery_action else []
+                    ),
                 },
             )
         ],

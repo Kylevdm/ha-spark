@@ -39,6 +39,8 @@ on a passing observation until `soc_recovery_minutes` of stable reports make
 recovery ready (#117); each tick then computes a fresh plan from that tick's
 measurement and applies it, leaving fallback only once the apply reads back
 clean. A failed recovered apply keeps the fallback (unconfirmed) and retries.
+AlphaESS has no fallback request: after the threshold it stays blocked until
+the same stable evidence qualifies a fresh plan and its apply succeeds.
 
 With `inverter_clock_dst_sync` on, the first tick after the household zone's
 UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
@@ -291,7 +293,12 @@ async def run_once(
         applied_plan = previous_plan
         apply_lines: list[str] = []
         if fallback_active:
-            lines.append("[SKIP] normal programming held while Solis fallback is active")
+            reason = (
+                "Solis fallback is active"
+                if any(d.type == "inverter" and d.driver == "solis" for d in settings.devices)
+                else "SoC integrity recovery is pending"
+            )
+            lines.append(f"[SKIP] normal programming held while {reason}")
             applied_plan = None
         elif needs_apply(previous_plan, intent, rate_w, settings.battery_voltage_v):
             apply_lines = await device.apply(intent)
@@ -738,6 +745,10 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
                 measurement,
                 failure_threshold=settings.soc_failure_threshold,
                 recovery_duration=timedelta(minutes=settings.soc_recovery_minutes),
+                recover_without_fallback=any(
+                    device.type == "inverter" and device.driver == "alphaess"
+                    for device in settings.devices
+                ),
             )
             inverter = next(
                 (device for device in settings.devices if device.type == "inverter"), None
@@ -823,12 +834,19 @@ async def finish_recovery(
             (line for line in reversed(apply_lines) if line.startswith(("[APPLIED]", "[SKIP]"))),
             apply_lines[-1],
         )
-        action = f"[RECOVERED] normal programming resumed: {line}"
+        if monitor.recovery_blocked and line.startswith(
+            ("[SIMULATE]", "[OFF]", "[OBSERVE]")
+        ):
+            action = f"[RECOVERED] plan computed without hardware programming: {line}"
+        else:
+            action = f"[RECOVERED] normal programming resumed: {line}"
         log.info(action)
         snapshot = monitor.complete_recovery(action_line=action)
     else:
+        retained = "SoC integrity block" if monitor.recovery_blocked else "fallback"
         log.warning(
-            "[FAILED] recovered normal program not verified; fallback kept, retrying next minute"
+            "[FAILED] recovered normal program not verified; %s kept, retrying next minute",
+            retained,
         )
         monitor.invalidate_fallback_confirmation()
         return
@@ -980,10 +998,17 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                 device.type == "inverter" and device.driver == "solis"
                 for device in settings.devices
             )
+            alphaess_recovery_blocked = any(
+                device.type == "inverter" and device.driver == "alphaess"
+                for device in settings.devices
+            ) and monitor.recovery_blocked
             fallback_confirmed = solis_fallback_active and monitor.fallback_confirmed
             # Recovery (#117): a fresh plan from this tick's measurement, applied
             # every minute until verified; the fallback stays effective till then.
-            recovering = solis_fallback_active and monitor.recovery_ready
+            recovering = (solis_fallback_active or alphaess_recovery_blocked) and (
+                monitor.recovery_ready
+                and (solis_fallback_active or (measurement is not None and measurement.ok))
+            )
             # Set once `run_once` has *returned*, because it makes its own
             # reconcile pass with the plan it just computed. A run that raises
             # after that pass (`apply` or `publish_plan`) therefore falls back
@@ -1002,7 +1027,8 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         previous_plan=previous_plan,
                         trusted_holds=last_trusted_holds,
                         ev_hold_state=ev_hold_state,
-                        fallback_active=solis_fallback_active and not recovering,
+                        fallback_active=(solis_fallback_active or alphaess_recovery_blocked)
+                        and not recovering,
                     )
                     plan, last_applied_plan = result.plan, result.applied_plan
                     if recovering:
