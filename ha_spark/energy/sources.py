@@ -535,14 +535,21 @@ async def gather_inputs(
 
     forecast = await predict_home_load(settings, lat=lat, lon=lon)
     solar_kwh = _to_float(solar.state if solar else None, 0.0)
-    # The sensor state is Solcast's median day total; estimate10/estimate90
-    # attributes carry the conservative/optimistic totals.
-    if settings.solar_percentile != 50 and solar is not None:
-        percentile_total = _opt_float(
-            solar.attributes.get(f"estimate{settings.solar_percentile}")
+    if solar is not None:
+        estimate_key = (
+            "estimate"
+            if settings.solar_percentile == 50
+            else f"estimate{settings.solar_percentile}"
         )
-        if percentile_total is not None:
+        percentile_total = _opt_float(solar.attributes.get(estimate_key))
+        if percentile_total is not None and isfinite(percentile_total):
             solar_kwh = percentile_total
+        else:
+            log.warning(
+                "Solcast %s day-total attribute missing or invalid; "
+                "using sensor state with unknown percentile",
+                estimate_key,
+            )
 
     tz = load_timezone(settings.timezone)
     window_start = parse_time(settings.charge_window_start)

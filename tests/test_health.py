@@ -26,6 +26,7 @@ from ha_spark.health import (
     check_ha_websocket,
     check_inverter_clock,
     check_load_history,
+    check_notify_service,
     check_ollama,
     check_sqlite,
     check_tariff_provider,
@@ -88,6 +89,40 @@ async def test_check_ha_rest_fail() -> None:
     respx.get(f"{HA}/api/config").mock(side_effect=httpx.ConnectError("boom"))
     res = await check_ha_rest(Settings(ha_url=HA, ha_token="tok"))
     assert res.status is Status.FAIL
+
+
+@respx.mock
+async def test_check_notify_service_exists() -> None:
+    respx.get(f"{HA}/api/services").mock(return_value=httpx.Response(
+        200, json=[{"domain": "notify", "services": {"mobile_app_x": {}}}]
+    ))
+    result = await check_notify_service(Settings(
+        ha_url=HA, ha_token="tok", notify_service="notify.mobile_app_x"
+    ))
+    assert result.status is Status.OK
+    assert "mobile_app_x" not in result.detail
+
+
+@respx.mock
+async def test_check_notify_service_missing_without_echoing_name() -> None:
+    respx.get(f"{HA}/api/services").mock(return_value=httpx.Response(
+        200, json=[{"domain": "notify", "services": {"other": {}}}]
+    ))
+    result = await check_notify_service(Settings(
+        ha_url=HA, ha_token="tok", notify_service="mobile_app_x"
+    ))
+    assert result.status is Status.WARN
+    assert "mobile_app_x" not in result.detail
+
+
+@respx.mock
+async def test_check_notify_service_registry_error_warns() -> None:
+    respx.get(f"{HA}/api/services").mock(side_effect=httpx.ConnectError("unavailable"))
+    result = await check_notify_service(Settings(
+        ha_url=HA, ha_token="tok", notify_service="mobile_app_x"
+    ))
+    assert result.status is Status.WARN
+    assert "mobile_app_x" not in result.detail
 
 
 # --- Tariff provider check ---

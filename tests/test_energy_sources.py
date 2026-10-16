@@ -604,40 +604,56 @@ def test_pre_window_drain_zero_inside_window_or_far_away() -> None:
     assert pre_window_drain(fc, far, time(23, 30), time(5, 30)) == 0.0
 
 
+@pytest.mark.parametrize(
+    ("percentile", "expected"),
+    [(50, 8.75), (10, 5.5), (90, 12.0)],
+)
 @respx.mock
 async def test_solar_percentile_prefers_estimate_attributes(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, percentile: int, expected: float,
 ) -> None:
     async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
     respx.get(f"{BASE}/states/sensor.solar").mock(
-        return_value=_state("sensor.solar", "8.75", {"estimate10": 5.5, "estimate90": 12.0})
+        return_value=_state(
+            "sensor.solar", "4.0", {"estimate": 8.75, "estimate10": 5.5, "estimate90": 12.0}
+        )
     )
     respx.route(method="GET").mock(return_value=httpx.Response(404))
 
-    s = Settings(**{**_settings().model_dump(), "solar_percentile": 10})
+    s = Settings(**{**_settings().model_dump(), "solar_percentile": percentile})
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         inputs, _, _ = await gather_inputs(s, rest)
-    assert inputs.solar_tomorrow_kwh == 5.5
+    assert inputs.solar_tomorrow_kwh == expected
 
 
+@pytest.mark.parametrize(
+    ("percentile", "attributes"),
+    [(10, {}), (50, {"estimate": "unavailable"})],
+)
 @respx.mock
-async def test_solar_percentile_falls_back_to_state(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_solar_percentile_falls_back_to_state(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    percentile: int,
+    attributes: dict[str, Any],
+) -> None:
     async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
     respx.get(f"{BASE}/states/sensor.solar").mock(
-        return_value=_state("sensor.solar", "8.75")  # no estimate10 attribute
+        return_value=_state("sensor.solar", "8.75", attributes)
     )
     respx.route(method="GET").mock(return_value=httpx.Response(404))
 
-    s = Settings(**{**_settings().model_dump(), "solar_percentile": 10})
+    s = Settings(**{**_settings().model_dump(), "solar_percentile": percentile})
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         inputs, _, _ = await gather_inputs(s, rest)
     assert inputs.solar_tomorrow_kwh == 8.75
+    assert "using sensor state with unknown percentile" in caplog.text
 
 
 def test_parse_detailed_forecast_percentile_key() -> None:

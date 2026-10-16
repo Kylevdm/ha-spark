@@ -1,7 +1,5 @@
 # Changelog
 
-## Unreleased
-
 ## 0.22.0
 
 - Plan reservation-backed V2L house-battery refills when cheaper than the grid

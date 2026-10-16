@@ -573,6 +573,11 @@ class Settings(BaseSettings):
     # count as a miscalculation worth a V2L top-up request (#208).
     v2l_soc_tolerance_pct: float = Field(default=5.0, ge=0)
 
+    @field_validator("notify_service", "v2l_notify_service")
+    @classmethod
+    def _normalise_notify_service(cls, value: str) -> str:
+        return value.removeprefix("notify.")
+
     @field_validator("solar_percentile", mode="before")
     @classmethod
     def _coerce_solar_percentile(cls, v: object) -> object:
