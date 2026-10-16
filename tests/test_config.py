@@ -182,6 +182,13 @@ def test_v2l_options_load_from_overlay() -> None:
     assert defaults.v2l_cutoff_time == "01:00"
 
 
+@pytest.mark.parametrize("field", ["notify_service", "v2l_notify_service"])
+@pytest.mark.parametrize("value", ["notify.mobile_app_x", "mobile_app_x"])
+def test_notify_service_loads_as_bare_name(field: str, value: str) -> None:
+    settings = Settings(**{field: value})
+    assert getattr(settings, field) == "mobile_app_x"
+
+
 def test_export_planner_limits_are_configurable_across_addon_surfaces() -> None:
     settings = Settings(battery_discharge_ceiling_kw=3.2, dno_export_limit_kw=7.36)
 

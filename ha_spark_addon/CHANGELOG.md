@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Validate configured notification services during health checks and add a
+  `ha-spark notify-test` onboarding command to confirm delivery (#243).
+
 ## 0.22.0
 
 - Plan reservation-backed V2L house-battery refills when cheaper than the grid
