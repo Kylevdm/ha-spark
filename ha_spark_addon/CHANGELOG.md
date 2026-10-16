@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Keep newly generated agent API tokens out of logs; log the token file path instead (#328).
+
 ## 0.22.0
 
 - Plan reservation-backed V2L house-battery refills when cheaper than the grid
