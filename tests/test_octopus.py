@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -11,6 +11,7 @@ import respx
 from ha_spark.config import Settings
 from ha_spark.energy.octopus import (
     OctopusApiError,
+    discover_import_tariff,
     fetch_consumption,
     fetch_planned_dispatches,
     fetch_standard_unit_rates,
@@ -213,6 +214,156 @@ async def test_rates_error_when_unconfigured() -> None:
         await fetch_standard_unit_rates(
             _rates_settings(octopus_product_code=""), period_from=datetime(2026, 6, 1, tzinfo=UTC)
         )
+
+
+@respx.mock
+async def test_discovery_uses_current_import_agreement() -> None:
+    now = datetime.now(UTC)
+    account = respx.get(f"{API}/accounts/A-1234ABCD/").mock(return_value=httpx.Response(200, json={
+        "properties": [{"electricity_meter_points": [
+            {"mpan": "export-id", "is_export": True, "agreements": [{
+                "tariff_code": "E-1R-EXPORT-A", "valid_from": (now - timedelta(days=1)).isoformat(),
+                "valid_to": None}]},
+            {"mpan": "import-id", "is_export": False, "agreements": [
+                {"tariff_code": "E-1R-OLD-A", "valid_from": (now - timedelta(days=2)).isoformat(),
+                 "valid_to": (now - timedelta(days=1)).isoformat()},
+                {"tariff_code": "E-1R-INTELLI-VAR-24-10-29-C",
+                 "valid_from": (now - timedelta(days=1)).isoformat(), "valid_to": None},
+            ]},
+        ]}],
+    }))
+    result = await discover_import_tariff(_dispatch_settings())
+    assert result == ("INTELLI-VAR-24-10-29", "E-1R-INTELLI-VAR-24-10-29-C")
+    assert account.called
+
+
+@respx.mock
+async def test_rates_discover_codes_on_each_fetch() -> None:
+    now = datetime.now(UTC)
+    account = respx.get(f"{API}/accounts/A-1234ABCD/").mock(return_value=httpx.Response(200, json={
+        "properties": [{"electricity_meter_points": [{
+            "mpan": "import-id", "is_export": False, "agreements": [{
+                "tariff_code": "E-1R-INTELLI-VAR-24-10-29-C",
+                "valid_from": (now - timedelta(days=1)).isoformat(), "valid_to": None,
+            }],
+        }]}],
+    }))
+    rates = respx.get(
+        f"{API}/products/INTELLI-VAR-24-10-29/electricity-tariffs/"
+        "E-1R-INTELLI-VAR-24-10-29-C/standard-unit-rates/"
+    ).mock(return_value=httpx.Response(200, json={"next": None, "results": [{
+        "valid_from": "2026-06-01T00:00:00Z", "valid_to": "2026-06-01T00:30:00Z",
+        "value_inc_vat": 0.12,
+    }]}))
+    settings = _dispatch_settings()
+    for _ in range(2):
+        points = await fetch_standard_unit_rates(settings, period_from=now)
+        assert [point.price for point in points] == [0.12]
+    assert account.call_count == 2
+    assert rates.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("points", "mpan", "expected"),
+    [
+        (["export"], "", "0 eligible import"),
+        (["expired"], "", "0 current agreements"),
+        (["import", "import2"], "", "multiple import meter points"),
+        (["import", "import2"], "missing", "matches no import"),
+        (["malformed"], "", "invalid shape"),
+    ],
+)
+@respx.mock
+async def test_discovery_fails_closed_without_exposing_identifiers(
+    points: list[str], mpan: str, expected: str
+) -> None:
+    now = datetime.now(UTC)
+    meters = []
+    for kind in points:
+        meters.append({
+            "mpan": kind, "is_export": kind == "export", "agreements": [{
+                "tariff_code": "bad" if kind == "malformed" else "E-1R-INTELLI-VAR-24-10-29-C",
+                "valid_from": (now - timedelta(days=2)).isoformat(),
+                "valid_to": (now - timedelta(days=1)).isoformat() if kind == "expired" else None,
+            }],
+        })
+    respx.get(f"{API}/accounts/A-1234ABCD/").mock(return_value=httpx.Response(200, json={
+        "properties": [{"electricity_meter_points": meters}],
+    }))
+    with pytest.raises(OctopusApiError, match=expected) as error:
+        await fetch_standard_unit_rates(
+            _dispatch_settings(octopus_mpan=mpan), period_from=now
+        )
+    assert all(value not in str(error.value) for value in ("A-1234ABCD", "import2", "missing"))
+
+
+@respx.mock
+async def test_discovery_selects_configured_mpan_among_imports() -> None:
+    now = datetime.now(UTC)
+    respx.get(f"{API}/accounts/A-1234ABCD/").mock(return_value=httpx.Response(200, json={
+        "properties": [{"electricity_meter_points": [
+            {"mpan": mpan, "is_export": False, "agreements": [{
+                "tariff_code": code, "valid_from": (now - timedelta(days=1)).isoformat(),
+                "valid_to": None,
+            }]}
+            for mpan, code in (("first", "E-1R-FIRST-A"), ("second", "E-1R-SECOND-B"))
+        ]}],
+    }))
+    assert await discover_import_tariff(_dispatch_settings(octopus_mpan="second")) == (
+        "SECOND", "E-1R-SECOND-B"
+    )
+
+
+@respx.mock
+async def test_discovery_http_and_validation_failures_are_sanitized() -> None:
+    route = respx.get(f"{API}/accounts/A-1234ABCD/").mock(return_value=httpx.Response(401))
+    for response in (httpx.Response(401), httpx.Response(200, json={"properties": "bad"})):
+        route.mock(return_value=response)
+        with pytest.raises(OctopusApiError, match="discovery failed") as error:
+            await discover_import_tariff(_dispatch_settings())
+        assert "A-1234ABCD" not in str(error.value)
+
+
+@respx.mock
+async def test_discovery_rejects_coerced_export_flag() -> None:
+    now = datetime.now(UTC)
+    respx.get(f"{API}/accounts/A-1234ABCD/").mock(return_value=httpx.Response(200, json={
+        "properties": [{"electricity_meter_points": [{
+            "mpan": "private-id", "is_export": "false", "agreements": [{
+                "tariff_code": "E-1R-INTELLI-A",
+                "valid_from": (now - timedelta(days=1)).isoformat(), "valid_to": None,
+            }],
+        }]}],
+    }))
+    with pytest.raises(OctopusApiError, match="payload validation error"):
+        await discover_import_tariff(_dispatch_settings())
+
+
+@respx.mock
+async def test_manual_rate_codes_skip_account_discovery() -> None:
+    account = respx.get(f"{API}/accounts/A-1234ABCD/").mock(return_value=httpx.Response(500))
+    rates = respx.get(url__startswith=f"{API}/products/INTELLI-VAR-22-10-14/").mock(
+        return_value=httpx.Response(200, json={"next": None, "results": []})
+    )
+    await fetch_standard_unit_rates(
+        _rates_settings(octopus_account_number="A-1234ABCD"),
+        period_from=datetime.now(UTC),
+    )
+    assert not account.called
+    assert rates.called
+
+
+@respx.mock
+async def test_rates_refuse_pagination_outside_configured_octopus_api() -> None:
+    respx.get(url__startswith=f"{API}/products/").mock(return_value=httpx.Response(
+        200, json={"next": "https://elsewhere.test/rates/", "results": []}
+    ))
+    outside = respx.get("https://elsewhere.test/rates/").mock(
+        return_value=httpx.Response(200, json={"next": None, "results": []})
+    )
+    with pytest.raises(OctopusApiError, match="outside configured API"):
+        await fetch_standard_unit_rates(_rates_settings(), period_from=datetime.now(UTC))
+    assert not outside.called
 
 
 @respx.mock

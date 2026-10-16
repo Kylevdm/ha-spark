@@ -224,6 +224,79 @@ async def test_check_tariff_provider_octopus_intelligent_auth_failure_warns() ->
 
 
 @respx.mock
+async def test_check_tariff_provider_discovers_codes_with_account_credentials() -> None:
+    now = datetime.now(UTC)
+    respx.post("http://octo.test/v1/graphql/").mock(side_effect=[
+        httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": "jwt-abc"}}}),
+        httpx.Response(200, json={"data": {"plannedDispatches": []}}),
+    ])
+    respx.get("http://octo.test/v1/accounts/A-1234ABCD/").mock(return_value=httpx.Response(
+        200, json={"properties": [{"electricity_meter_points": [{
+            "mpan": "private-id", "is_export": False, "agreements": [{
+                "tariff_code": "E-1R-INTELLI-VAR-24-10-29-C",
+                "valid_from": (now - timedelta(days=1)).isoformat(), "valid_to": None,
+            }],
+        }]}]},
+    ))
+    rates = respx.get(url__startswith="http://octo.test/v1/products/INTELLI-VAR-24-10-29/").mock(
+        return_value=httpx.Response(200, json={"next": None, "results": []})
+    )
+    res = await check_tariff_provider(_octopus_settings().model_copy(update={
+        "octopus_product_code": "", "octopus_tariff_code": "",
+    }))
+    assert res.status is Status.OK
+    assert rates.called
+
+
+@respx.mock
+async def test_check_tariff_provider_warns_without_exposing_account_or_mpan() -> None:
+    respx.post("http://octo.test/v1/graphql/").mock(side_effect=[
+        httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": "jwt-abc"}}}),
+        httpx.Response(200, json={"data": {"plannedDispatches": []}}),
+    ])
+    respx.get("http://octo.test/v1/accounts/A-1234ABCD/").mock(
+        return_value=httpx.Response(200, json={"properties": [{"electricity_meter_points": [
+            {"mpan": mpan, "is_export": False, "agreements": []}
+            for mpan in ("private-one", "private-two")
+        ]}]})
+    )
+    res = await check_tariff_provider(_octopus_settings().model_copy(update={
+        "octopus_product_code": "", "octopus_tariff_code": "",
+    }))
+    assert res.status is Status.WARN
+    assert "multiple import meter points" in res.detail
+    assert "fixed rate/window" in res.detail
+    assert all(value not in res.detail for value in (
+        "sk_test", "A-1234ABCD", "private-one", "private-two"
+    ))
+
+
+@pytest.mark.parametrize("failure", ["http", "tariff"])
+@respx.mock
+async def test_check_tariff_provider_warns_when_discovery_fails(failure: str) -> None:
+    now = datetime.now(UTC)
+    respx.post("http://octo.test/v1/graphql/").mock(side_effect=[
+        httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": "jwt-abc"}}}),
+        httpx.Response(200, json={"data": {"plannedDispatches": []}}),
+    ])
+    response = (httpx.Response(401) if failure == "http" else httpx.Response(200, json={
+        "properties": [{"electricity_meter_points": [{
+            "mpan": "private-id", "is_export": False, "agreements": [{
+                "tariff_code": "invalid",
+                "valid_from": (now - timedelta(days=1)).isoformat(), "valid_to": None,
+            }],
+        }]}],
+    }))
+    respx.get("http://octo.test/v1/accounts/A-1234ABCD/").mock(return_value=response)
+    res = await check_tariff_provider(_octopus_settings().model_copy(update={
+        "octopus_product_code": "", "octopus_tariff_code": "",
+    }))
+    assert res.status is Status.WARN
+    assert "fixed rate/window" in res.detail
+    assert all(value not in res.detail for value in ("sk_test", "A-1234ABCD", "private-id"))
+
+
+@respx.mock
 async def test_check_export_event_provider_axle_reports_event() -> None:
     respx.get("http://axle.test/vpp/home-assistant/event").mock(
         return_value=httpx.Response(
