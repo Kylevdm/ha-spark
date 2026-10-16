@@ -399,10 +399,14 @@ def build_app(
     # reachable without the bearer token while /api/* and /agent/* require it.
     # Wrap the mount in the same check so every inbound surface is gated alike.
     # The surface gate is applied first (checked on every request), then the
-    # token gate outermost so auth 401s before the surface 404s, matching the
-    # /agent/* ordering (router-level _auth runs before the route _Gate).
+    # Origin gate only on the published port, then the token gate outermost so
+    # auth 401s before Origin 403s and surface 404s. This matches the /agent/*
+    # ordering (router-level _auth runs before the route _Gate).
     mcp_mount = _surface_gated(mcp_app, state)
-    app.mount("/mcp", _token_gated(mcp_mount, token) if require_token else mcp_mount)
+    app.mount(
+        "/mcp",
+        _token_gated(_origin_gated(mcp_mount), token) if require_token else mcp_mount,
+    )
     return app
 
 
@@ -422,6 +426,22 @@ def _surface_gated(asgi_app: Any, state: AppState) -> Any:
         await asgi_app(scope, receive, send)
 
     return gated
+
+
+def _origin_gated(asgi_app: Any) -> Any:
+    """Reject browser origins on the published MCP port after token authentication."""
+
+    async def gated(scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and _has_origin(scope):
+            await JSONResponse({"error": "forbidden"}, status_code=403)(scope, receive, send)
+            return
+        await asgi_app(scope, receive, send)
+
+    return gated
+
+
+def _has_origin(scope: Any) -> bool:
+    return any(name.lower() == b"origin" for name, _ in scope.get("headers", []))
 
 
 class _PeerGate:
