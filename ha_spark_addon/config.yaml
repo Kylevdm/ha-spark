@@ -199,7 +199,7 @@ schema:
   notify_service: str?
   soc_entity: str?
   soc_max_report_age_minutes: float
-  soc_failure_threshold: int
+  soc_failure_threshold: int(1,)
   soc_recovery_minutes: int(1,)
   battery_voltage_entity: str?
   battery_power_entity: str?
