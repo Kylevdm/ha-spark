@@ -365,12 +365,16 @@ provider status.
 `octopus_intelligent` reads prices from the Octopus standard-unit-rates REST
 API and planned dispatch windows from the Octopus Kraken GraphQL API, instead
 of from HA sensors. Dispatch and cheap-window handling is otherwise the same as
-`fixed`. It needs `octopus_api_key`, `octopus_account_number` (for the
-dispatches query), and `octopus_product_code`/`octopus_tariff_code` (for the
-rates endpoint, e.g. `INTELLI-VAR-22-10-14` / `E-1R-INTELLI-VAR-22-10-14-A`).
-If authentication or an API call fails, ha-spark falls back to the fixed rates
-and dispatches. `ha-spark health` reports the live provider status. ha-spark
-never logs or echoes the API key.
+`fixed`. It needs `octopus_api_key` and `octopus_account_number`. It discovers
+the current import tariff and product codes from the account API on each rate
+fetch, so a tariff switch is picked up without a restart. Existing
+`octopus_product_code`/`octopus_tariff_code` settings are optional manual
+overrides; set both to skip discovery. If the account has multiple import meter
+points, set the existing `octopus_mpan` option to choose one. If that setting
+does not match, or discovery fails, rates fall back to the fixed rate/window
+and `ha-spark health` reports a warning. `octopus_meter_serial` is only needed
+for consumption reads. ha-spark never logs or echoes the API key, account
+number, or MPAN.
 
 `export_event_provider` selects an independent export-event source: `none`
 (the default) disables event reads, and `axle` adds supervised Axle export
