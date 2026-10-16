@@ -145,7 +145,7 @@ def _window_charge_limit(inputs: PlannerInputs, cfg: PlannerConfig) -> float:
     hours = cfg.window_hours
     if inputs.now is not None and inputs.horizon_start is not None:
         elapsed = (inputs.now - inputs.horizon_start).total_seconds() / 3600.0
-        if 0.0 <= elapsed < hours:
+        if 0.0 <= elapsed <= hours:
             hours -= elapsed
     return max(0.0, cfg.max_current_a * cfg.voltage_v * hours / 1000.0)
 

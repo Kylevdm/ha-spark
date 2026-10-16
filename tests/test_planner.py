@@ -1150,6 +1150,33 @@ def test_inside_the_window_only_the_rest_of_it_counts() -> None:
     assert plan.overnight_charge_capped is True
 
 
+@pytest.mark.parametrize(
+    ("hours_after_start", "expected_kwh"),
+    [(-1.0, 19.1), (3.0, 9.5625), (6.0, 0.0)],
+)
+def test_recovery_plan_charge_limit_uses_remaining_wrapping_window(
+    hours_after_start: float, expected_kwh: float
+) -> None:
+    plan = _rate_capped_plan(now=_HORIZON_START + timedelta(hours=hours_after_start))
+    assert plan.required_kwh == pytest.approx(expected_kwh)
+
+
+@pytest.mark.parametrize(
+    ("hours_after_start", "expected_kwh"),
+    [(-1.0, 12.75), (2.0, 6.375), (4.0, 0.0)],
+)
+def test_recovery_plan_charge_limit_uses_remaining_daytime_window(
+    hours_after_start: float, expected_kwh: float
+) -> None:
+    start = datetime(2026, 6, 10, 1, 0, tzinfo=UTC)
+    inputs = PlannerInputs(
+        soc=_soc(20.0), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=40.0,
+        horizon_start=start, now=start + timedelta(hours=hours_after_start),
+    )
+    plan = _plan(inputs, cfg(capacity_kwh=40.0, window_start=time(1), window_end=time(5)))
+    assert plan.required_kwh == pytest.approx(expected_kwh)
+
+
 def test_a_full_battery_within_reach_is_not_capped() -> None:
     # From 50%, 12 kWh usable plus 19.125 kWh more passes the 28 kWh cap.
     plan = _rate_capped_plan(soc=50.0)
