@@ -347,7 +347,6 @@ def build_app(
         app.add_middleware(_PeerGate, peer=ingress_peer)
 
     if require_token:
-        app.add_middleware(_BareMcpGate, token=token)
 
         async def _auth(authorization: str | None = Header(default=None)) -> None:
             if not auth.verify(authorization, token):
@@ -443,30 +442,6 @@ def _origin_gated(asgi_app: Any) -> Any:
 
 def _has_origin(scope: Any) -> bool:
     return any(name.lower() == b"origin" for name, _ in scope.get("headers", []))
-
-
-class _BareMcpGate:
-    """Apply published-port auth and Origin checks before /mcp redirects to /mcp/."""
-
-    def __init__(self, app: Any, token: str) -> None:
-        self.app = app
-        self.token = token
-
-    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope["type"] == "http" and scope["path"] == "/mcp":
-            header = next(
-                (v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"authorization"),
-                None,
-            )
-            if not auth.verify(header, self.token):
-                await JSONResponse({"error": "invalid or missing token"}, status_code=401)(
-                    scope, receive, send
-                )
-                return
-            if _has_origin(scope):
-                await JSONResponse({"error": "forbidden"}, status_code=403)(scope, receive, send)
-                return
-        await self.app(scope, receive, send)
 
 
 class _PeerGate:

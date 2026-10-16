@@ -165,34 +165,6 @@ async def test_published_mcp_rejects_origin_with_valid_token(
     assert response.status_code == 403
 
 
-async def test_published_mcp_bare_path_rejects_origin(tmp_path: Path) -> None:
-    app = build_app(_state(tmp_path, "read_act"), require_token=True, token="sekret")
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
-        base_url="http://testserver",
-        follow_redirects=False,
-    ) as client:
-        response = await client.post(
-            "/mcp", headers={"Authorization": "Bearer sekret", "Origin": "null"}
-        )
-    assert response.status_code == 403
-
-
-async def test_published_mcp_bare_path_auth_precedes_origin(tmp_path: Path) -> None:
-    app = build_app(_state(tmp_path, "read_act"), require_token=True, token="sekret")
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
-        base_url="http://testserver",
-        follow_redirects=False,
-    ) as client:
-        response = await client.post("/mcp", headers={"Origin": "null"})
-        no_token_no_origin = await client.post("/mcp")
-        no_origin = await client.post("/mcp", headers={"Authorization": "Bearer sekret"})
-    assert response.status_code == 401
-    assert no_token_no_origin.status_code == 401
-    assert no_origin.status_code == 307
-
-
 @pytest.mark.parametrize("authorization", [None, "Bearer wrong"])
 @pytest.mark.parametrize("origin", [None, "https://evil.example"])
 async def test_published_mcp_requires_token_before_origin(
