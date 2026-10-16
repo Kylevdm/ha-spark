@@ -11,13 +11,26 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from mcp.server.fastmcp.exceptions import ToolError
 
 from ha_spark.agent.mcp_server import build_mcp
-from ha_spark.api.server import AppState, build_app
+from ha_spark.api.server import INGRESS_PROXY_IP, AppState, build_app
 from ha_spark.config import Settings
+
+_INIT = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "t", "version": "1"},
+    },
+}
+_MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
 
 
 def _state(tmp_path: Path, exposure: str, surface: str = "on") -> AppState:
@@ -133,6 +146,117 @@ def test_mcp_requires_token_on_published_port(tmp_path: Path) -> None:
         assert "sekret" not in no_token.text
         ok = client.post("/mcp/", json=init, headers={**hdr, "Authorization": "Bearer sekret"})
         assert ok.status_code == 200
+
+
+@pytest.mark.parametrize("origin", ["https://evil.example", "null", ""])
+async def test_published_mcp_rejects_origin_with_valid_token(
+    tmp_path: Path, origin: str
+) -> None:
+    app = build_app(_state(tmp_path, "read_act"), require_token=True, token="sekret")
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            response = await client.post(
+                "/mcp/",
+                json=_INIT,
+                headers={**_MCP_HEADERS, "Authorization": "Bearer sekret", "Origin": origin},
+            )
+    assert response.status_code == 403
+
+
+async def test_published_mcp_bare_path_rejects_origin(tmp_path: Path) -> None:
+    app = build_app(_state(tmp_path, "read_act"), require_token=True, token="sekret")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+        follow_redirects=False,
+    ) as client:
+        response = await client.post(
+            "/mcp", headers={"Authorization": "Bearer sekret", "Origin": "null"}
+        )
+    assert response.status_code == 403
+
+
+async def test_published_mcp_bare_path_auth_precedes_origin(tmp_path: Path) -> None:
+    app = build_app(_state(tmp_path, "read_act"), require_token=True, token="sekret")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+        follow_redirects=False,
+    ) as client:
+        response = await client.post("/mcp", headers={"Origin": "null"})
+        no_token_no_origin = await client.post("/mcp")
+        no_origin = await client.post("/mcp", headers={"Authorization": "Bearer sekret"})
+    assert response.status_code == 401
+    assert no_token_no_origin.status_code == 401
+    assert no_origin.status_code == 307
+
+
+@pytest.mark.parametrize("authorization", [None, "Bearer wrong"])
+@pytest.mark.parametrize("origin", [None, "https://evil.example"])
+async def test_published_mcp_requires_token_before_origin(
+    tmp_path: Path, authorization: str | None, origin: str | None
+) -> None:
+    app = build_app(_state(tmp_path, "read_act", surface="off"), require_token=True, token="sekret")
+    headers = dict(_MCP_HEADERS)
+    if authorization is not None:
+        headers["Authorization"] = authorization
+    if origin is not None:
+        headers["Origin"] = origin
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        response = await client.post("/mcp/", json=_INIT, headers=headers)
+    assert response.status_code == 401
+
+
+async def test_published_mcp_keeps_surface_404_after_valid_token(tmp_path: Path) -> None:
+    app = build_app(_state(tmp_path, "read_act", surface="off"), require_token=True, token="sekret")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            "/mcp/", json=_INIT, headers={**_MCP_HEADERS, "Authorization": "Bearer sekret"}
+        )
+    assert response.status_code == 404
+
+
+async def test_published_mcp_without_origin_accepts_any_host(tmp_path: Path) -> None:
+    app = build_app(_state(tmp_path, "read_act"), require_token=True, token="sekret")
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            response = await client.post(
+                "/mcp/",
+                json=_INIT,
+                headers={
+                    **_MCP_HEADERS,
+                    "Authorization": "Bearer sekret",
+                    "Host": "foreign.example",
+                },
+            )
+    assert response.status_code == 200
+    assert "serverInfo" in response.text
+
+
+async def test_ingress_mcp_accepts_origin_and_any_host_from_proxy(tmp_path: Path) -> None:
+    app = build_app(_state(tmp_path, "read_act"), ingress_peer=INGRESS_PROXY_IP)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app=app, client=(INGRESS_PROXY_IP, 50000)
+            ),
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/mcp/",
+                json=_INIT,
+                headers={**_MCP_HEADERS, "Origin": "https://ha.example", "Host": "foreign.example"},
+            )
+    assert response.status_code == 200
+    assert "serverInfo" in response.text
 
 
 async def test_mcp_tools_follow_runtime_exposure_change(tmp_path: Path) -> None:
