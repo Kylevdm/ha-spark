@@ -3873,6 +3873,47 @@ async def test_run_forever_syncs_the_inverter_clock_at_a_clock_change_when_opted
 
 # --- recovery from an active Solis fallback (#117) ---
 
+
+@pytest.mark.parametrize("inverter", ["solis", "alphaess"])
+@respx.mock
+async def test_restored_pending_failure_blocks_normal_run_until_checked_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inverter: str
+) -> None:
+    (tmp_path / "ha_spark_soc_monitor.json").write_text(
+        '{"consecutive_failures": 1, "fallback_status": "pending_failure"}',
+        encoding="utf-8",
+    )
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    checked = _passing_at(0)
+    observations = iter([None, checked])
+
+    async def fake_monitor_tick(_settings: Settings, monitor: SocMonitor) -> SocMeasurement | None:
+        measurement = next(observations)
+        if measurement is not None:
+            monitor.record(measurement, failure_threshold=3)
+        return measurement
+
+    monkeypatch.setattr(scheduler, "soc_monitor_tick", fake_monitor_tick)
+    states: list[bool] = []
+    socs: list[SocMeasurement | None] = []
+    stop = _patch_monitor_loop(
+        monkeypatch,
+        [datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 22, 30)],
+        run_once_socs=socs,
+        fallback_states=states,
+    )
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", db_path=str(tmp_path / "ledger.db"),
+        soc_entity="sensor.soc", inverter=inverter, v2l_power_entity="",
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert states == [True, False]
+    assert socs == [None, checked]
+
+
 _REC_T0 = datetime(2026, 6, 10, 1, 0, tzinfo=UTC)
 
 
@@ -4091,6 +4132,15 @@ async def test_loop_recovers_with_a_fresh_plan_only_after_stable_duration(
     assert isinstance(soc, SocMeasurement) and soc.observed_at == _passing_at(2).observed_at
     states = [state for state, _ in _integrity_posts()]
     assert states == ["fallback_verified"] * 3 + ["normal", "normal"]
+    restored_attrs = _integrity_posts()[0][1]
+    assert restored_attrs["restored_state"] is True
+    assert restored_attrs["fresh_observation"] is True
+    assert restored_attrs["hardware_confirmation"] == "confirmed"
+    assert restored_attrs["integrity_actions"] == [
+        "[RESTORED] software integrity state",
+        "[OBSERVED] fresh checked SoC measurement",
+        "[CONFIRMED] Solis fallback hardware read-back",
+    ]
     _, attrs = _integrity_posts()[3]
     assert attrs["recovery_action"] == (
         "[RECOVERED] normal programming resumed: "

@@ -1027,7 +1027,13 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         previous_plan=previous_plan,
                         trusted_holds=last_trusted_holds,
                         ev_hold_state=ev_hold_state,
-                        fallback_active=(solis_fallback_active or alphaess_recovery_blocked)
+                        # A failed first tick after restart cannot delegate the
+                        # observation to run_once and lift a restored block.
+                        fallback_active=(
+                            solis_fallback_active
+                            or alphaess_recovery_blocked
+                            or monitor.awaiting_fresh_observation
+                        )
                         and not recovering,
                     )
                     plan, last_applied_plan = result.plan, result.applied_plan
@@ -1089,7 +1095,9 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         settings,
                         target_w,
                         soc=measurement,
-                        fallback_active=solis_fallback_active,
+                        fallback_active=(
+                            solis_fallback_active or monitor.awaiting_fresh_observation
+                        ),
                         fallback_confirmed=fallback_confirmed,
                     )
                 except Exception:
