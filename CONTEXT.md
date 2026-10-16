@@ -352,10 +352,37 @@ _Avoid_: integration, other add-on, API key
 
 **Grid carbon intensity**:
 The estimated or forecast carbon emitted per unit of grid electricity for the
-owner's chosen region and half-hour. It is display-only: the plan never
-considers it, and it plays no part in readiness. Past values are regional
-estimates, not metered actuals.
-(Decision: #305, 2026-10-14.)
+owner's chosen region and half-hour. Picking a region only displays it; the
+plan considers it only under **Charge when clean**, and it plays no part in
+readiness. Past values are regional estimates, not metered actuals.
+(Decisions: #305, 2026-10-14; #329, 2026-10-16.)
+
+**Charge when clean**:
+The owner's opt-in for carbon as a secondary planning objective, available
+once a region is picked. Cost, including flexibility events, always comes
+first: carbon only chooses between equal-price options, never costs a paid
+export, event or cheaper charge, and never touches export, event or discharge
+timing. Under it, an overnight charge that fits in less than the whole window
+is placed in its cleanest stretch, and a **clean dispatch** may charge beyond
+the plan. Without fresh carbon data the plan is exactly the cost-only plan.
+(Decision: #329, 2026-10-16.)
+_Avoid_: green mode, carbon optimisation, eco charging
+
+**Dispatch top-up**:
+Charging the house battery during a daytime Octopus dispatch, at the off-peak
+rate, with the energy it would otherwise need before the next overnight
+window. It is a cost decision, independent of Charge when clean. The overnight
+charge is never reduced in anticipation of a dispatch; only a dispatch that
+happens tops up, and replanning shrinks the next overnight charge.
+(Decision: #329, 2026-10-16.)
+
+**Clean dispatch**:
+A daytime dispatch whose forecast grid carbon intensity is lower than that of
+the overnight slots tonight's charge would otherwise use. Under Charge when
+clean it charges beyond the plan, up to the target cap less the day's
+remaining forecast solar surplus. Missing or stale carbon data means not
+clean.
+(Decision: #329, 2026-10-16.)
 
 **Setup**:
 The guided process that takes a new household from install to a saved
