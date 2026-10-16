@@ -2,8 +2,10 @@
 
 ## Unreleased
 
-- Read the Solcast day total from the configured percentile attribute (#261),
-  falling back to the sensor state with a warning when that attribute is invalid.
+- Send the planned stop-SoC in AlphaESS charge calls using the integration's
+  `chargestopsoc` service field (#260).
+- Validate configured notification services during health checks and add a
+  `ha-spark notify-test` onboarding command to confirm delivery (#243).
 
 ## 0.22.0
 

@@ -53,7 +53,7 @@ from ha_spark.energy.sources import _to_float
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.energy.v2l import delivered_fraction, load_session, savings
 from ha_spark.ha.models import StateChangedEvent
-from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.ha.rest import HomeAssistantRest, HomeAssistantRestError, notify
 from ha_spark.ha.state_cache import StateCache
 from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
@@ -135,6 +135,28 @@ async def _cmd_health(settings: Settings) -> int:
     results = await run_health(settings)
     print(format_report(results))
     return exit_code(results)
+
+
+async def _cmd_notify_test(settings: Settings) -> int:
+    """Send one test notice so the owner can confirm delivery."""
+    if not settings.notify_service:
+        print("Set notify_service before running notify-test.", file=sys.stderr)
+        return 2
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            await notify(
+                rest,
+                settings.notify_service,
+                "ha-spark test notification",
+                "This is a test notification from ha-spark. Please confirm it arrived.",
+            )
+    except HomeAssistantRestError:
+        print("Could not send test notification through Home Assistant.", file=sys.stderr)
+        return 1
+    print("Test notification sent. Please confirm it arrived on your device.")
+    return 0
 
 
 async def _cmd_solis_sync_clock(settings: Settings) -> int:
@@ -623,6 +645,7 @@ examples:
   ha-spark states --domain sensor          list all sensor entities
   ha-spark states --watch                  list entities, then stream live changes
   ha-spark health                          probe HA / Ollama / SQLite / load history
+  ha-spark notify-test                     send a test notice and confirm delivery
   ha-spark onboard                         check load-history readiness for the forecast
   ha-spark plan                            compute tonight's charge plan
   ha-spark plan --apply                    ...and run the charger (per PROACTIVE_MODE)
@@ -684,6 +707,11 @@ def build_parser() -> argparse.ArgumentParser:
         "handshake, the Ollama endpoint, that the SQLite path is writable, and whether "
         "the load forecast has enough history. Exit 0 = all green, 1 = a critical "
         "dependency (HA/SQLite) failed, 2 = degraded (e.g. Ollama down, thin history).",
+    )
+
+    sub.add_parser(
+        "notify-test",
+        help="Send one test notification and ask for delivery confirmation",
     )
 
     p_onboard = sub.add_parser(
@@ -938,6 +966,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "states":
         return asyncio.run(_cmd_states(settings, domain=args.domain, watch=args.watch))
+
+    if args.command == "notify-test":
+        return asyncio.run(_cmd_notify_test(settings))
 
     if args.command == "v2l":
         return asyncio.run(_cmd_v2l(settings))
