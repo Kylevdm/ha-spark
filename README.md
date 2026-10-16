@@ -27,12 +27,13 @@ for the ML load model), and the Octopus and Axle APIs if you configure them.
 >   switch off during Octopus dispatches and EV charging, and ha-spark checks
 >   the inverter clock before any export.
 > - SoC checks against integrated battery power. When readings keep failing,
->   ha-spark can program a fallback charge. It returns to normal planning once
->   readings have passed for `soc_recovery_minutes` (default 10).
-> - V2L planning. The planner schedules a house-battery refill from the car
->   when that costs less than grid import, and asks you to start V2L when an
->   Axle export slot would otherwise go unfunded. ha-spark never switches V2L
->   itself.
+>   ha-spark can program a fallback charge. Once readings have passed for
+>   `soc_recovery_minutes` (default 10), it applies a fresh plan and returns to
+>   normal planning when that plan reads back clean.
+> - V2L. The planner flags when a house-battery refill from the car would cost
+>   less than grid import (scheduling it waits on plugged-in sensing), and
+>   ha-spark asks you to start V2L when an Axle export slot would otherwise go
+>   unfunded. ha-spark never switches V2L itself.
 > - simulate mode and savings backtests
 > - onboarding, the NL copilot, and an optional API that external agents can
 >   use to read data and trigger gated actions (`agent_surface`)
@@ -66,7 +67,9 @@ UI ([#247](https://github.com/Kylevdm/ha-spark/issues/247)). It adds:
 The earlier v1 definition
 ([#94](https://github.com/Kylevdm/ha-spark/issues/94)) still applies where it
 doesn't conflict. Of its features, derived base load, half-hourly replanning,
-reservations, supervised Axle export, and V2L refill planning have shipped.
+reservations, and supervised Axle export have shipped. V2L refill planning
+has shipped in the planner but can't schedule a refill until plugged-in
+sensing lands.
 The morning plan digest and the readiness signal
 ([#53](https://github.com/Kylevdm/ha-spark/issues/53)) are still open. The
 readiness signal will tell you when your simulate history supports switching
