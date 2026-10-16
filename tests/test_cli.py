@@ -95,7 +95,7 @@ def test_help_mentions_every_command_and_flags() -> None:
     parser = build_parser()
     top = parser.format_help()
     for command in (
-        "states", "health", "onboard", "plan", "ask", "run",
+        "states", "health", "notify-test", "onboard", "plan", "ask", "run",
         "backfill-load", "import-csv", "pull-consumption", "backtest", "forecast-eval",
         "context", "learn-factors", "generate-dashboard", "solis",
     ):
@@ -120,6 +120,35 @@ def test_help_mentions_every_command_and_flags() -> None:
     assert args.apply is True
     args = parser.parse_args(["ask", "what's", "the", "plan"])
     assert args.command == "ask" and args.message == ["what's", "the", "plan"]
+
+
+@respx.mock
+def test_notify_test_sends_one_notice(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", notify_service="notify.mobile_app_x"
+    )
+    monkeypatch.setattr(cli, "load_settings", lambda: settings)
+    route = respx.post("http://ha.test/api/services/notify/mobile_app_x").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    assert cli.main(["notify-test"]) == 0
+    assert route.call_count == 1
+    assert "test" in route.calls[0].request.content.decode().lower()
+    output = capsys.readouterr().out
+    assert "confirm" in output.lower() and "arrived" in output.lower()
+    assert "mobile_app_x" not in output
+
+
+def test_notify_test_without_target_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "load_settings", lambda: Settings(notify_service=""))
+
+    assert cli.main(["notify-test"]) != 0
+    assert "notify_service" in capsys.readouterr().err
 
 
 async def test_backtest_rates_seeded_store(
