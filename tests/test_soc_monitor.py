@@ -224,6 +224,25 @@ def test_failure_count_is_persisted(tmp_path: Path) -> None:
         .consecutive_failures == 3
 
 
+@pytest.mark.parametrize("status", ["pending_failure", "fallback_verified", "fallback_failed"])
+def test_restored_trouble_needs_fresh_evidence_and_hardware_confirmation(
+    tmp_path: Path, status: str
+) -> None:
+    (tmp_path / MONITOR_FILE).write_text(
+        json.dumps({"consecutive_failures": 2, "fallback_status": status}), encoding="utf-8"
+    )
+    monitor = SocMonitor.load(_settings(tmp_path))
+    assert monitor.awaiting_fresh_observation
+    assert not monitor.fallback_confirmed
+
+    snapshot = monitor.record(_measurement(ok=False), failure_threshold=3)
+    assert not monitor.awaiting_fresh_observation
+    assert snapshot.restored_state
+    assert snapshot.fresh_observation
+    assert not snapshot.fallback_confirmed
+    assert snapshot.recovery_since is None
+
+
 def test_passing_reset_is_persisted(tmp_path: Path) -> None:
     s = _settings(tmp_path)
     m = SocMonitor.load(s)
