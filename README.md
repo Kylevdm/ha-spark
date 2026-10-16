@@ -16,51 +16,67 @@ is unreachable. There is no ha-spark cloud service or subscription. Apart from
 Home Assistant, ha-spark contacts only your Ollama server, Open-Meteo (weather
 for the ML load model), and the Octopus and Axle APIs if you configure them.
 
-> Status: add-on v0.19.3 includes:
+> Status: add-on v0.22.0 includes:
 >
-> - a deterministic planner that replans every half-hour and holds battery
->   energy back with slot reservations, with optional derived base load
+> - a deterministic planner that replans every half hour, holds battery energy
+>   back with reservations, and can derive base load from component statistics
 > - per-device control authority
-> - fixed, dynamic, Octopus Intelligent, and Axle event tariffs
-> - native Solis timed-slot control, with a per-minute power-switch reconcile
->   and an inverter-clock check before any export
+> - fixed, dynamic, and Octopus Intelligent tariffs, plus Axle export events
+>   as a separate provider that works with any of them
+> - native Solis timed-slot control. A per-minute reconcile turns the power
+>   switch off during Octopus dispatches and EV charging, and ha-spark checks
+>   the inverter clock before any export.
+> - SoC checks against integrated battery power. When readings keep failing,
+>   ha-spark can program a fallback charge. Once readings have passed for
+>   `soc_recovery_minutes` (default 10), it applies a fresh plan and returns to
+>   normal planning when that plan reads back clean.
+> - V2L. The planner flags when a house-battery refill from the car would cost
+>   less than grid import (scheduling it waits on plugged-in sensing), and
+>   ha-spark asks you to start V2L when an Axle export slot would otherwise go
+>   unfunded. ha-spark never switches V2L itself.
 > - simulate mode and savings backtests
-> - onboarding, the NL copilot, V2L monitoring, and an optional agent surface
+> - onboarding, the NL copilot, and an optional API that external agents can
+>   use to read data and trigger gated actions (`agent_surface`)
 >
-> Axle export delivery is a supervised prototype. It has not yet completed a
-> paid export on real hardware
-> ([#134](https://github.com/Kylevdm/ha-spark/issues/134)), so don't run it
-> unattended.
+> Axle export completed its first paid export on real hardware on 2026-10-05
+> ([#134](https://github.com/Kylevdm/ha-spark/issues/134)). It stays a
+> supervised prototype until it passes the v1.0.0 release gate, so follow
+> the [supervised export runbook](docs/runbooks/supervised-axle-export.md) and
+> don't run it unattended.
 >
 > [`ha_spark_addon/CHANGELOG.md`](ha_spark_addon/CHANGELOG.md) lists what each
 > release shipped, the GitHub
 > [milestones](https://github.com/Kylevdm/ha-spark/milestones) track open work,
 > and [`CONTEXT.md`](CONTEXT.md) defines the project's terms.
 
-## Destination
+## Road to v1.0.0
 
-**v1.0.0 is the competitive MVP, validated on real hardware.** It runs a
-zero-export house with a battery, solar panels, a V2L car, and Axle flexibility
-events without supervision. That needs:
+v1.0.0 lets a new household set up and run ha-spark from the Home Assistant
+UI ([#247](https://github.com/Kylevdm/ha-spark/issues/247)). It adds:
 
-- base load derived from component statistics, instead of a consumption sensor
-  that includes battery charging;
-- the plan recomputed every half-hourly tariff slot;
-- battery energy held back by named reservations, each computed backwards from
-  an obligation;
-- Axle export events delivered automatically (the main feature);
-- the car refilling the house battery over V2L when that costs less than grid
-  import;
-- a morning plan digest on your phone, and a readiness signal that tells you
-  when the simulate history supports switching on real control. You still make
-  the switch.
+- an ingress web app for onboarding, statistics, a visual plan, chat that can
+  run every CLI command, a manual override, and settings;
+- a companion HACS integration that talks to Solis and AlphaESS inverters
+  directly, replaces the Solcast integration, and owns ha-spark's entities.
+  The add-on keeps the
+  planner and the UI, and the integration makes no planning decisions
+  ([ADR 0005](docs/adr/0005-integration-authority-and-operating-modes.md));
+- configuration that you edit in the UI, with the Supervisor options cut down
+  to the keys needed to start the add-on.
 
-Derived base load, half-hourly replanning, and reservations have shipped. Axle
-export is a supervised prototype, and V2L refill, the phone digest, and the
-readiness signal are still open. Each step has a
-[milestone](https://github.com/Kylevdm/ha-spark/milestones). `1.0.0` follows
-once the [release gate](docs/releasing.md#v100-release-gate) passes on the real
-Solis.
+The earlier v1 definition
+([#94](https://github.com/Kylevdm/ha-spark/issues/94)) still applies where it
+doesn't conflict. Of its features, derived base load, half-hourly replanning,
+reservations, and supervised Axle export have shipped. V2L refill planning
+has shipped in the planner but can't schedule a refill until plugged-in
+sensing lands.
+The morning plan digest and the readiness signal
+([#53](https://github.com/Kylevdm/ha-spark/issues/53)) are still open. The
+readiness signal will tell you when your simulate history supports switching
+on real control. `1.0.0`
+ships once every item in the
+[release gate](docs/releasing.md#v100-release-gate) is confirmed on real
+hardware.
 
 ## Design rules
 
@@ -125,9 +141,9 @@ plan, then real control.
 
 A per-inverter driver controls battery charging. Set the `inverter` option to
 `solis` (the default) or `alphaess`. On Solis, ha-spark also checks the
-configured power switch every minute: it turns the switch off during a dispatch
-hold and back on afterwards, and leaves the inverter in a safe state when it
-gives up control. Disable any existing automations that write to the same
+configured power switch every minute. It turns the switch off during an
+Octopus dispatch or EV charging hold and back on afterwards, and leaves the
+inverter in a safe state when it gives up control. Disable any existing automations that write to the same
 inverter before you set `proactive_mode: on`.
 [`docs/adding-an-inverter.md`](docs/adding-an-inverter.md) describes the driver
 contract and how to add another inverter, and
