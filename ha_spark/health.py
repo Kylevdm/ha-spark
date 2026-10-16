@@ -78,6 +78,26 @@ async def check_ha_rest(settings: Settings) -> CheckResult:
         return CheckResult("HA REST", Status.FAIL, f"{settings.ha_rest_url}: {exc!r}")
 
 
+async def check_notify_service(settings: Settings) -> CheckResult:
+    """Check that the configured notification service exists in Home Assistant."""
+    if not settings.notify_service:
+        return CheckResult("Notify service", Status.OK, "not configured")
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            domains = await rest.get_services()
+        for domain in domains:
+            if not isinstance(domain, dict) or domain.get("domain") != "notify":
+                continue
+            services = domain.get("services")
+            if isinstance(services, dict) and settings.notify_service in services:
+                return CheckResult("Notify service", Status.OK, "available in Home Assistant")
+    except Exception:  # noqa: BLE001 - an unreadable registry degrades health
+        return CheckResult("Notify service", Status.WARN, "could not read HA services")
+    return CheckResult("Notify service", Status.WARN, "configured service is missing in HA")
+
+
 async def check_ha_websocket(settings: Settings) -> CheckResult:
     """Probe the HA WebSocket API by completing the auth handshake."""
     try:
@@ -378,6 +398,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
     results = await asyncio.gather(
         check_ha_rest(settings),
+        *([check_notify_service(settings)] if settings.notify_service else []),
         check_ha_websocket(settings),
         check_ollama(settings),
         check_sqlite(settings),
