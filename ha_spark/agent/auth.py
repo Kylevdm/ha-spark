@@ -25,7 +25,7 @@ def resolve_token(settings: Settings, token_path: Path = TOKEN_PATH) -> str:
     token_path.parent.mkdir(parents=True, exist_ok=True)
     token_path.write_text(token, encoding="utf-8")
     token_path.chmod(0o600)
-    log.info("Generated agent API token (printed once): %s", token)
+    log.info("Generated agent API token; find it at %s", token_path)
     return token
 
 
