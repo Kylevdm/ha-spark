@@ -251,8 +251,8 @@ def validate_octopus_intelligent_tariff(settings: Settings) -> None:
     if settings.tariff_provider != "octopus_intelligent":
         return
     # With dispatch authentication configured, missing product/tariff codes
-    # only disable live rate fetching. That fetch reports an OctopusApiError
-    # and the provider uses its fixed schedule, matching the health warning.
+    # are discovered from the account (#273). If discovery fails, the fetch
+    # reports an OctopusApiError and the provider uses its fixed schedule.
     if (
         settings.octopus_api_key
         and settings.octopus_account_number
