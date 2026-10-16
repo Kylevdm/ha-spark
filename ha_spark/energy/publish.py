@@ -197,6 +197,16 @@ async def publish_soc_integrity(
     fallback_supported = any(
         device.type == "inverter" and device.driver == "solis" for device in settings.devices
     )
+    hardware_confirmation = "not_applicable"
+    if fallback_supported and snapshot.state.value.startswith("fallback_"):
+        hardware_confirmation = "confirmed" if snapshot.fallback_confirmed else "unconfirmed"
+    integrity_actions = []
+    if snapshot.restored_state:
+        integrity_actions.append("[RESTORED] software integrity state")
+    if snapshot.fresh_observation:
+        integrity_actions.append("[OBSERVED] fresh checked SoC measurement")
+    if snapshot.fallback_confirmed:
+        integrity_actions.append("[CONFIRMED] Solis fallback hardware read-back")
     await _push(
         rest,
         [
@@ -207,6 +217,8 @@ async def publish_soc_integrity(
                     "friendly_name": "ha-spark SoC integrity",
                     "consecutive_failures": snapshot.consecutive_failures,
                     "failure_threshold": snapshot.failure_threshold,
+                    "restored_state": snapshot.restored_state,
+                    "fresh_observation": snapshot.fresh_observation,
                     "soc_status": m.status.value,
                     "soc_reason": m.reason,
                     "soc_value": m.value,
@@ -225,6 +237,8 @@ async def publish_soc_integrity(
                         fallback_charge_current_a(settings) if fallback_supported else None
                     ),
                     "fallback_confirmed": snapshot.fallback_confirmed,
+                    "hardware_confirmation": hardware_confirmation,
+                    "integrity_actions": integrity_actions,
                     "fallback_action": snapshot.fallback_action,
                     "fallback_actions": (
                         [snapshot.fallback_action] if snapshot.fallback_action else []
