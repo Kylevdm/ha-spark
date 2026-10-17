@@ -49,7 +49,10 @@ security and prefer the safe default. Hard rules:
   cheap-rate window at an explicitly set `solis_fallback_current_a`, through the
   same gates and read-back; no default current, and AlphaESS never gets it.
   Don't weaken these (`ha_spark/devices/inverters/`, `energy/supply_guard.py`,
-  `energy/soc_monitor.py`).
+  `energy/soc_monitor.py`). In v1 the site **operating mode** (Observe/Protect/
+  Optimise, decision #266) replaces `PROACTIVE_MODE`/`control` as the write gate;
+  until that lands, the current gates stand, and the replacement must be at
+  least as strict.
 - **Parameterised SQL only**; no `eval`/`exec`/`shell=True`/shell interpolation
   of external data.
 - **Network:** outbound only to configured endpoints; any inbound surface must
@@ -83,7 +86,8 @@ proxy with `SUPERVISOR_TOKEN`; **standalone/dev** needs both `HA_URL` +
 Standing decisions: single remote `OLLAMA_URL` tier
 with deterministic offline fallback; raw `entity_id` addressing, no fuzzy name
 matching; `proactive_mode = off|simulate|on` (default `simulate`) gates every
-write, through the same decision path with side effects suppressed.
+write, through the same decision path with side effects suppressed (retired in
+v1 for the operating mode; every v1 install starts in Observe).
 
 ## Conventions
 
