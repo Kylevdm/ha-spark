@@ -65,6 +65,12 @@ integration warns but remains manually usable without the add-on. #248 and
 #255 must settle the standalone/manual service and override contracts; no
 bypass is granted here.
 
+v1 retires `proactive_mode` and per-device `control` for the site operating
+mode ([#266](https://github.com/Kylevdm/ha-spark/issues/266),
+[ADR 0008](adr/0008-operating-mode-and-authority-lifecycle.md)). Each gate
+below carries over in those terms: `simulate` becomes Observe (zero writes),
+and a real write needs Optimise, or Protect for its own protection controls.
+
 - [ ] `proactive_mode: simulate` (default) computes a plan, logs `[SIMULATE]`
       action lines, and performs **zero** real writes.
 - [ ] A `control: observe` or `supplier` device never actuates, even with
