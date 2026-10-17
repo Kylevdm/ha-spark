@@ -6,6 +6,9 @@ Amended by [ADR-0008](0008-operating-mode-and-authority-lifecycle.md): fallback
 applies only in Optimise, and Protect does not depend on the add-on. Add-on
 commands are fetched by the integration over the authenticated discovery
 channel, not sent as HA services ([ADR-0008, amended by #291](0008-operating-mode-and-authority-lifecycle.md)).
+Amended on 2026-10-17 by
+[Integration architecture: a universal core with per-device modules](https://github.com/Kylevdm/ha-spark/issues/336):
+device modules are in-tree only, and an owner-built device may be entity-backed.
 Detailed lifecycle contracts remain follow-up decisions on the v1 map.
 This is a planning record, not implemented behavior.
 
@@ -94,6 +97,27 @@ The add-on uses the integration's command channel and entities, not a direct
 Modbus connection.
 Gateway caching must be disabled, following
 [Research: the full Solis Modbus register map over a Waveshare RS485-to-TCP gateway](https://github.com/Kylevdm/ha-spark/issues/249).
+
+## Core and device modules (amended by #336, 2026-10-17)
+
+The integration is a device-agnostic core plus one device module per kind of
+device, all inside this one integration and released in lockstep. Separate or
+third-party module integrations are not supported: every code path that can
+actuate hardware stays in the reviewed repository. The core decides *when and
+whether* to write (authority, mode, limits, supply guard, holds, fallback, the
+verify loop); a module decides *how* (transport, register or entity map, intent
+translation, read-back comparison).
+
+A module normally owns its bus, as above. The exception is an **entity-backed**
+module for a device whose firmware the owner maintains, first the V2L charger:
+the module reads and writes that device's own HA entities instead of owning a
+bus. The HA-as-transport reversal was about third-party integration defects,
+which do not apply to owner-built firmware. Because the integration cannot
+refuse other callers' writes to those entities, the device's protection rests
+on device-resident bounds (owner-set ceilings validated at setup, verified safe
+offline values), and read-back must use a value the device itself reports, never
+the commanded entity's echo. A write with no device-reported counterpart is
+`unverified`.
 
 ## Supersession and retained constraints
 
