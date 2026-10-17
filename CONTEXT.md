@@ -51,6 +51,15 @@ plans deeper than that. The car's own V2L discharge cutoff is the hard floor,
 and whether the car needs charging for a long trip stays the owner's decision,
 outside the planner. (Decisions: Q6+Q9+Q11, 2026-07-12.)
 
+**V2L charger**:
+The rectifier that carries the car's V2L energy into the house battery bank on
+its DC side. It is the device ha-spark can switch on and off and set the rate
+of. Its current counts against the battery-bank current limit alongside the
+inverters' charging, and its output voltage is an owner-set ceiling that the
+plan never changes.
+(Decision: #336, 2026-10-17.)
+_Avoid_: PSU, rectifier (when meaning the role)
+
 **Phone surface**:
 The main way the household talks to ha-spark: Home Assistant's Telegram bot,
 not the terminal. Outbound notifications ("plug in the car") go through HA
