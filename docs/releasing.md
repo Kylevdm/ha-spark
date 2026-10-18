@@ -53,8 +53,18 @@ households. Compatible #94 requirements remain below. See the individual
 
 The pre-1.0 line continues `0.x`; the misused `v1.0.0-rc1`–`rc4` tags were
 deleted on 2026-10-18, so those names are free for the real release
-candidates. Historical phase-to-version assignments are superseded. #247 owns
-phase sequencing. No unchecked item is claimed as validated.
+candidates. No unchecked item is claimed as validated.
+
+[#366](https://github.com/Kylevdm/ha-spark/issues/366#issuecomment-6253526844)
+sequences the build into 16 phases (#376–#391, one milestone each). Each ships
+as a `0.y.x` minor, and each phase issue lists the gate items it must pass in
+tests. Then:
+
+- **`1.0.0-rc1`** (tag `v1.0.0-rc1`): every phase shipped, ruff, mypy and
+  pytest green, and the reference household cut over and running Observe, then
+  Protect. Feature-complete; no new features after rc1.
+- **`1.0.0-rcN`**: fixes found while confirming the items below on hardware.
+- **`1.0.0`**: every item below confirmed on real hardware or live suppliers.
 
 Before tagging `v1.0.0`, ruff, mypy strict, and pytest must be green, **and**
 every item below must be confirmed on real hardware or live suppliers.
@@ -96,9 +106,8 @@ protection controls.
 - [ ] The `fixed`, `dynamic`, and `octopus_intelligent` providers read live
       prices; a runtime price-read failure falls back to `fixed` and still
       produces a plan.
-- [ ] Native AlphaESS local Modbus control is verified on supported hardware
-      against #250, including read-back and failure handling. Native Solis
-      verifies firmware, gateway caching and register semantics (#249/#259).
+- [ ] Native Solis verifies firmware, gateway caching and register semantics
+      (#249/#259).
       The integration is the sole Modbus client; #248 owns its service contract.
 - [ ] Agent surface: `get_state` reports each device's `control` authority;
       `/agent/*` writes still pass the gate; the LLM cannot reach
@@ -119,9 +128,9 @@ protection controls.
       the inverter's export and discharge limits, and the house is not left
       short before the next cheap slot. Malformed or absent Axle payloads fall
       back to the base schedule.
-- [ ] V2L refill is scheduled only when it is cheaper than grid and a
+- [ ] V2L refill is planned only when it is cheaper than grid and a
       reservation needs it; an unplugged car means no V2L; the plug-in
-      notification fires.
+      notification fires. Actuation is 1.0.x (below).
 - [ ] The readiness signal evaluates simulate history against the measured bar
       and never changes `proactive_mode` itself.
 
@@ -141,6 +150,15 @@ protection controls.
 - [ ] #165 validates timely supply-guard reductions without racing apply writes.
       #128 retains its supervised-event scope; its success alone does not
       establish unattended readiness.
+
+### 1.0.x (not required for 1.0.0)
+
+Deferred by #366 and the [v1.0.x map](https://github.com/Kylevdm/ha-spark/issues/374).
+
+- [ ] Native AlphaESS local Modbus control is verified on supported hardware
+      against #250, including read-back and failure handling.
+- [ ] V2L refill actuation through the rectifier driver (#49, #52) passes the
+      same gates and read-back as the inverter.
 
 ### Release mechanics (do last)
 
