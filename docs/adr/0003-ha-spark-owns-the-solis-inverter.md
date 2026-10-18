@@ -14,6 +14,8 @@ Amended since:
 - 2026-09-09: reconciled with the implemented driver (see the runbook)
 - 2026-09-15: power-switch lifecycle completed (see "The power-switch
   lifecycle is closed")
+- 2026-10-17: scope clarified as control only (see "Scope: control, not
+  sensing")
 
 ## Context
 
@@ -184,6 +186,36 @@ no trusted picture, plus a best-effort pass at clean shutdown),
 Slot 1 charging across the configured cheap window, and the discharge half
 zeroed unless a verified export is still running. It never fires on an
 ordinary degraded tick, where defaulting to `On` would release a live hold.
+
+### Scope: control, not sensing (2026-10-17)
+
+This ADR moved the Solis **control path** off the solax integration. It did
+not move **sensing**, and that is deliberate
+([#274](https://github.com/Kylevdm/ha-spark/issues/274)). On the add-on path,
+the SoC integrity checks that gate every write still read Home Assistant
+entities: the Solis preset points `soc_entity` and `battery_power_entity` at
+the solax integration, not at the `solis_control` overlay.
+
+Sourcing either input from the overlay was rejected. It would need new
+overlay registers whose address, scale and sign have no tier-A source and
+would have to be verified live. It would add polling to a gateway that
+already serves two clients. And the add-on path is interim: the solax
+integration is retired at cutover stage 2, so the work would be discarded.
+The guard already distrusts aged reports (`soc_max_report_age_minutes`) and
+reads battery voltage as a liveness signal (#169). One gap is accepted: a
+solax integration that keeps refreshing timestamps while serving frozen
+values would make the SoC-vs-power cross-check compare two readings of the
+same stale source.
+
+Settings stay entity IDs, so the guard remains vendor-neutral across drivers.
+
+In v1 the question does not arise. The companion integration is the sole
+Modbus client ([ADR-0005](0005-integration-authority-and-operating-modes.md))
+and reads SoC and battery power from the bus itself. A stale source then
+shows up directly as a failed or aged read, which is successful-read
+evidence rather than an HA timestamp. The SoC-vs-power cross-check stays as
+a glitch and stuck-value check, not a liveness check, and v1 does not
+require a second independent source.
 
 ## Cutover runbook
 
