@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime, time, timedelta, tzinfo
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -199,7 +199,7 @@ async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) 
 
     s = _settings()
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, cfg, load_source = await gather_inputs(s, rest)
+        inputs, cfg, forecast = await gather_inputs(s, rest)
 
     assert inputs.soc_now == 30.0
     assert inputs.soc.ok is True
@@ -213,7 +213,7 @@ async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) 
     assert inputs.ha_template_needed == 19.0
     assert len(inputs.dispatches) == 1
     assert inputs.dispatches[0].source == "SMART"
-    assert load_source == "test"
+    assert forecast.source == "test"
 
 
 @respx.mock
@@ -745,7 +745,8 @@ async def test_gather_inputs_reads_location_from_ha_config(
     s = Settings(ha_url="http://ha.test", ha_token="t")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         await gather_inputs(s, rest)
-    assert seen == {"lat": 51.5, "lon": -0.1}
+    assert (seen["lat"], seen["lon"]) == (51.5, -0.1)
+    assert isinstance(seen["target"], date)  # the served day (#397)
 
 
 @respx.mock
@@ -764,7 +765,8 @@ async def test_explicit_coordinates_override_ha_config(
     s = Settings(ha_url="http://ha.test", ha_token="t", latitude=55.9, longitude=-3.2)
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         await gather_inputs(s, rest)
-    assert seen == {"lat": 55.9, "lon": -3.2}
+    assert (seen["lat"], seen["lon"]) == (55.9, -3.2)
+    assert isinstance(seen["target"], date)  # the served day (#397)
 
 
 # --- dynamic-tariff price sensor reads (P8.4, #38) ---

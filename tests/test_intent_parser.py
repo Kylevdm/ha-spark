@@ -9,7 +9,7 @@ import pytest
 
 from ha_spark import intent_parser
 from ha_spark.config import Settings
-from ha_spark.energy.models import ChargeIntent, ChargePlan
+from ha_spark.energy.models import ChargeIntent, ChargePlan, LoadForecast
 from ha_spark.energy.plan_run import PlanRun
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.intent_parser import parse_offline
@@ -57,6 +57,7 @@ def _patch_plan(monkeypatch: pytest.MonkeyPatch, plan: ChargePlan) -> None:
         return PlanRun(
             plan=plan, inputs=object(), cfg=object(), schedule=object(),  # type: ignore[arg-type]
             load_source="test",
+            forecast=LoadForecast(total_kwh=17.7, slots=None, source="test"),
         )
 
     monkeypatch.setattr(intent_parser, "current_plan", fake_current_plan)

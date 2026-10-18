@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
+from datetime import UTC, date, datetime, time
 
 from ha_spark.energy.models import ChargeIntent, ChargePlan, ExportIntent, ExportSkip, Reservation
 from ha_spark.energy.report import format_plan
@@ -176,3 +176,15 @@ def test_report_explains_when_a_full_battery_cannot_fund_the_event() -> None:
         "Event needs 112% SoC at 20:00 (now 56%) — more than a full battery can fund"
         in out
     )
+
+
+def test_load_forecast_line_names_the_served_day() -> None:
+    """The report names the day the load forecast serves, not "tomorrow" (#397)."""
+    out = format_plan(_plan(), "test", forecast_date=date(2026, 1, 12))
+    assert "Home load forecast 17.70 kWh for Mon 12 Jan  (test)" in out
+
+
+def test_load_forecast_line_without_a_date_keeps_todays_wording() -> None:
+    """A forecast built without a served date renders exactly as before."""
+    out = format_plan(_plan(), "test")
+    assert "Home load forecast 17.70 kWh  (test)" in out

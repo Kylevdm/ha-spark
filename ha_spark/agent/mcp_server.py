@@ -87,7 +87,7 @@ def build_mcp(state: AppState) -> FastMCP:
 
     @mcp.tool()
     async def get_forecast() -> dict[str, object]:
-        """Tomorrow's load forecast and its source."""
+        """The served day's load forecast: 48 day-order slots, its date, source."""
         return (await tools.get_forecast(state.settings)).model_dump()
 
     @mcp.tool()

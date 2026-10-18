@@ -16,6 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 from mcp.server.fastmcp.exceptions import ToolError
 
+from ha_spark.agent import mcp_server as mcp_server_module
 from ha_spark.agent.mcp_server import build_mcp
 from ha_spark.api.server import INGRESS_PROXY_IP, AppState, build_app
 from ha_spark.config import Settings
@@ -254,3 +255,26 @@ async def test_mcp_denies_every_tool_when_surface_off(tmp_path: Path) -> None:
     assert await mcp.list_tools() == []
     with pytest.raises(ToolError):
         await mcp.call_tool("get_plan", {})
+
+
+async def test_get_forecast_tool_serves_the_served_day_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The MCP get_forecast tool answers with the unrotated 48-value day
+    profile plus its served date (#397), like the /agent/forecast route."""
+    from ha_spark.agent import tools
+
+    async def fake_get_forecast(_settings: Settings) -> tools.ForecastResult:
+        return tools.ForecastResult(
+            load_kwh=12.0,
+            slots=[float(i) for i in range(48)],
+            source="slot profile (14d hourly house stats)",
+            date="2026-01-12",
+        )
+
+    monkeypatch.setattr(mcp_server_module.tools, "get_forecast", fake_get_forecast)
+    mcp = build_mcp(_state(tmp_path, "read"))
+    _content, payload = await mcp.call_tool("get_forecast", {})
+    assert payload["date"] == "2026-01-12"
+    assert payload["slots"] == [float(i) for i in range(48)]
+    assert payload["load_kwh"] == 12.0

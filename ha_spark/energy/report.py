@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import date, datetime, time
 
 from ha_spark.energy.models import ChargePlan
 
@@ -15,8 +15,14 @@ def _fmt_window(start: datetime, end: datetime) -> str:
     return f"{start.hour:02d}:{start.minute:02d}-{end.hour:02d}:{end.minute:02d}"
 
 
-def format_plan(plan: ChargePlan, load_source: str) -> str:
-    """Render the plan as an aligned, scannable block."""
+def format_plan(
+    plan: ChargePlan, load_source: str, forecast_date: date | None = None
+) -> str:
+    """Render the plan as an aligned, scannable block.
+
+    ``forecast_date`` is the served day the load forecast targets (#397):
+    naming it keeps a plan made at 01:00 from being read as "tomorrow's".
+    """
     solar = f"{plan.solar_kwh:.2f} kWh"
     if abs(plan.effective_solar_kwh - plan.solar_kwh) > 1e-9:
         solar += f" (haircut -> {plan.effective_solar_kwh:.2f})"
@@ -25,11 +31,12 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
     if not plan.soc.ok:
         soc += f"  (untrusted: {plan.soc.reason})"
 
+    served = f" for {forecast_date:%a %d %b}" if forecast_date is not None else ""
     lines = [
         "Charge plan:",
         f"  SoC now            {soc}",
         f"  Solar tomorrow     {solar}",
-        f"  Home load forecast {plan.load_kwh:.2f} kWh  ({load_source})",
+        f"  Home load forecast {plan.load_kwh:.2f} kWh{served}  ({load_source})",
     ]
     if plan.cheap_covered_kwh > 0:
         lines.append(f"  Cheap-covered load {plan.cheap_covered_kwh:.2f} kWh (daytime dispatch)")

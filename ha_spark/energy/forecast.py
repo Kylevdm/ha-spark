@@ -87,14 +87,23 @@ def intervals_from_hourly_stats(rows: list[dict[str, Any]]) -> list[ConsumptionI
 
 
 async def predict_home_load(
-    settings: Settings, *, lat: float | None = None, lon: float | None = None
+    settings: Settings,
+    *,
+    lat: float | None = None,
+    lon: float | None = None,
+    target: date | None = None,
 ) -> LoadForecast:
-    """Predict tomorrow's home load, per-slot when enough local history exists.
+    """Predict the served day's home load, per-slot when history exists.
 
-    ``lat``/``lon`` enable the weather-aware ML model (Phase 6B); when None the
-    chain starts at the median slot profile as before.
+    ``target`` is the served day (#397): the local date the running-or-next
+    charge window ends, so a replan inside a window after midnight sizes
+    against the day the charge serves. When None it defaults to tomorrow,
+    the pre-#394 horizon's day. ``lat``/``lon`` enable the weather-aware ML
+    model (Phase 6B); when None the chain starts at the median slot profile.
     """
     tz = load_timezone(settings.timezone)
+    if target is None:
+        target = (datetime.now(tz) + timedelta(days=1)).date()
     intervals: list[ConsumptionInterval] = []
     median_forecast: LoadForecast | None = None
     try:
@@ -110,36 +119,38 @@ async def predict_home_load(
         intervals = intervals_from_hourly_stats(rows)
         profile = build_slot_profile(intervals, tz, min_days=settings.profile_min_days)
         if profile is not None:
-            tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
-            slots = predict_day_slots(profile, tomorrow)
+            slots = predict_day_slots(profile, target)
             median_forecast = LoadForecast(
                 total_kwh=sum(slots),
                 slots=slots,
                 source=f"slot profile ({profile.days_used}d hourly house stats)",
+                target_date=target,
             )
     except Exception as exc:  # noqa: BLE001 - the forecast must never crash the plan
         log.warning("Slot-profile forecast unavailable (%s); falling back", exc)
     if median_forecast is None:
         total, source = await predict_home_load_kwh(settings)
-        median_forecast = LoadForecast(total_kwh=total, slots=None, source=source)
+        median_forecast = LoadForecast(
+            total_kwh=total, slots=None, source=source, target_date=target
+        )
 
     # A dated context fact (away/guests/...) scales both candidate forecasts by
     # the same factor, so the ledger comparison and the P90/P50 buffer ratio are
     # unaffected; the report surfaces it via the forecast source. The away
     # factor is learned from past away periods (6E) when enough history exists.
-    ctx_scale, ctx_lines = await _context_scale(settings, tz, intervals)
+    ctx_scale, ctx_lines = await _context_scale(settings, tz, intervals, target)
     median_forecast = _apply_context(median_forecast, ctx_scale, ctx_lines)
     if settings.load_model == "median":
         return median_forecast
     try:
-        ml_forecast = await _ml_forecast(settings, intervals, tz, lat, lon)
+        ml_forecast = await _ml_forecast(settings, intervals, tz, lat, lon, target)
     except Exception:  # noqa: BLE001 - the ML path must never crash the plan
         log.exception("ML forecast failed; using %s", median_forecast.source)
         return median_forecast
     if ml_forecast is None:
         return median_forecast
     ml_forecast = _apply_context(ml_forecast, ctx_scale, ctx_lines)
-    await _record_shadow_forecasts(settings, tz, median_forecast, ml_forecast)
+    await _record_shadow_forecasts(settings, target, median_forecast, ml_forecast)
     if settings.load_model == "ml":
         return ml_forecast
     if await _ml_beats_median(settings, intervals, tz):
@@ -152,10 +163,13 @@ async def predict_home_load(
 
 
 async def _context_scale(
-    settings: Settings, tz: ZoneInfo, intervals: list[ConsumptionInterval]
+    settings: Settings,
+    tz: ZoneInfo,
+    intervals: list[ConsumptionInterval],
+    target: date,
 ) -> tuple[float, list[str]]:
-    """Combined load multiplier (and report lines) for context active tomorrow."""
-    target = (datetime.now(tz) + timedelta(days=1)).date()
+    """Combined load multiplier (and report lines) for context active on the
+    served day."""
     try:
         async with ContextStore(settings.db_path) as store:
             active = await store.active_on(target)
@@ -199,6 +213,7 @@ def _apply_context(
         total_kwh=forecast.total_kwh * scale,
         slots=tuple(s * scale for s in forecast.slots) if forecast.slots else None,
         source=f"{forecast.source} ×{scale:.2f} [context: {note}]",
+        target_date=forecast.target_date,
         p90_total_kwh=(
             forecast.p90_total_kwh * scale if forecast.p90_total_kwh is not None else None
         ),
@@ -211,6 +226,7 @@ async def _ml_forecast(
     tz: ZoneInfo,
     lat: float | None,
     lon: float | None,
+    target: date,
 ) -> LoadForecast | None:
     """Run the quantile ML model; None whenever it cannot responsibly run."""
     if lat is None or lon is None or not intervals or not ml.ml_available():
@@ -224,7 +240,6 @@ async def _ml_forecast(
         )
     except Exception as exc:  # noqa: BLE001 - degrade to recorded signal temps
         log.warning("Open-Meteo unavailable (%s); using recorded temperatures", exc)
-    tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
     occupancy: dict[date, float] = {}
     try:
         async with ForecastLedger(settings.db_path) as ledger:
@@ -236,15 +251,16 @@ async def _ml_forecast(
                 temps = dict(await ledger.signal_history("temp_out_c", since))
             occ_samples = await ledger.signal_history("occupancy_home_frac", since)
         occupancy = _mean_by_local_date(occ_samples, tz)
-        # Predict tomorrow's occupancy from the day-type pattern so the model
-        # has a real value for the target day, not just the history mean (6E).
-        predicted = habits.predict_occupancy(occ_samples, tomorrow, tz)
+        # Predict the served day's occupancy from the day-type pattern so the
+        # model has a real value for the target day, not just the history
+        # mean (6E).
+        predicted = habits.predict_occupancy(occ_samples, target, tz)
         if predicted is not None:
-            occupancy[tomorrow] = predicted
+            occupancy[target] = predicted
     except Exception as exc:  # noqa: BLE001 - the ledger is an optional enrichment here
         log.warning("Signal ledger unavailable for ML features (%s)", exc)
     prediction = ml.train_and_predict(
-        intervals, temps, occupancy, tomorrow, tz,
+        intervals, temps, occupancy, target, tz,
         min_days=max(14, settings.profile_min_days),
     )
     if prediction is None:
@@ -253,6 +269,7 @@ async def _ml_forecast(
         total_kwh=sum(prediction.p50),
         slots=prediction.p50,
         source=f"ml quantile gbr ({prediction.days_used}d, weather-aware)",
+        target_date=target,
         p90_total_kwh=sum(prediction.p90),
     )
 
@@ -276,10 +293,9 @@ def _daily_actuals(intervals: list[ConsumptionInterval], tz: ZoneInfo) -> dict[d
 
 
 async def _record_shadow_forecasts(
-    settings: Settings, tz: ZoneInfo, *forecasts: LoadForecast
+    settings: Settings, target: date, *forecasts: LoadForecast
 ) -> None:
     """Record every candidate forecast so `forecast-eval` compares them fairly."""
-    target = (datetime.now(tz) + timedelta(days=1)).date()
     try:
         async with ForecastLedger(settings.db_path) as ledger:
             for f in forecasts:
@@ -325,7 +341,7 @@ def _daily_totals(rows: list[dict[str, Any]]) -> list[float]:
 
 
 async def predict_home_load_kwh(settings: Settings) -> tuple[float, str]:
-    """Return (predicted tomorrow home-load kWh, human source description)."""
+    """Return (predicted served-day home-load kWh, human source description)."""
     start = datetime.now(UTC) - timedelta(days=settings.forecast_days + 1)
     try:
         rows = await statistics_during_period(

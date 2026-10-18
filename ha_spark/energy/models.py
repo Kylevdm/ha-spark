@@ -54,11 +54,15 @@ class SlotProfile:
 
 @dataclass(frozen=True)
 class LoadForecast:
-    """Tomorrow's predicted home load; ``slots`` is None on fallback paths."""
+    """The served day's predicted home load; ``slots`` is None on fallback paths."""
 
     total_kwh: float
     slots: tuple[float, ...] | None  # 48 local half-hour slot kWh (slot-of-day order)
     source: str
+    # The local date the forecast serves (#397): the day the running-or-next
+    # charge window ends. None on forecasts built without one (hand-built
+    # tests), which read as the pre-#394 "tomorrow".
+    target_date: date | None = None
     # P90 day total from the quantile ML model (None elsewhere); feeds the
     # dynamic buffer when buffer_mode is "quantile".
     p90_total_kwh: float | None = None

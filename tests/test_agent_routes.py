@@ -1,12 +1,17 @@
 import json
+from datetime import UTC, date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
+import pytest
 import respx
 from fastapi.testclient import TestClient
 
 from ha_spark.api.server import AppState, build_app
 from ha_spark.config import Settings
+from ha_spark.energy import sources
+from ha_spark.energy.models import SLOTS_PER_DAY, LoadForecast
 
 
 def _state(tmp_path: Path, exposure: str = "read_act", **extra: object) -> AppState:
@@ -177,3 +182,48 @@ def test_exposure_upgrade_via_api_config_applies_without_restart(tmp_path: Path)
         resp = client.post("/agent/config", json={"min_soc": 30.0})
     assert resp.status_code == 200
     assert resp.json()["min_soc"] == 30.0
+
+
+@respx.mock
+def test_forecast_route_serves_the_served_day_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET /agent/forecast serves the served day's forecast end to end (#397):
+    48 slot-of-day values plus the served day's ISO date -- a 01:00 replan
+    inside Sunday night's window answers with Monday's profile, not
+    Tuesday's (#200), and never the horizon-order ``load_slots``."""
+    frozen = datetime(2026, 1, 12, 1, 0, tzinfo=ZoneInfo("Europe/London"))
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> "FixedDatetime":
+            return cls.fromtimestamp(frozen.timestamp(), tz or UTC)
+
+    async def fake_load(
+        _s: Settings, *, lat: float | None = None, lon: float | None = None,
+        target: date | None = None,
+    ) -> LoadForecast:
+        return LoadForecast(
+            total_kwh=12.0,
+            slots=tuple(float(i) for i in range(SLOTS_PER_DAY)),
+            source="slot profile (14d hourly house stats)",
+            target_date=target,
+        )
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    monkeypatch.setattr(sources, "datetime", FixedDatetime)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    state = _state(
+        tmp_path,
+        charge_window_start="23:30",
+        charge_window_end="05:30",
+        timezone="Europe/London",
+    )
+    with TestClient(build_app(state)) as client:
+        body = client.get("/agent/forecast").json()
+
+    assert body["date"] == "2026-01-12"  # Monday, the served day
+    assert body["slots"] == [float(i) for i in range(SLOTS_PER_DAY)]
+    assert body["load_kwh"] == 12.0
+    assert body["source"] == "slot profile (14d hourly house stats)"

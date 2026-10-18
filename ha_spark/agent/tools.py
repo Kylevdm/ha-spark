@@ -36,8 +36,13 @@ class StateResult(BaseModel):
 
 class ForecastResult(BaseModel):
     load_kwh: float
+    # 48 day-order slot kWh (slot-of-day order) for the forecast's date —
+    # never the horizon-order ``inputs.load_slots`` (#397).
     slots: list[float] | None
     source: str
+    # ISO date of the served day the forecast targets; None on forecasts
+    # built without one.
+    date: str | None = None
 
 
 class PredictionsResult(BaseModel):
@@ -68,7 +73,7 @@ async def get_plan(settings: Settings) -> PlanResult:
 
 async def get_state(settings: Settings) -> StateResult:
     async with _rest(settings) as rest:
-        inputs, _cfg, _src = await gather_inputs(settings, rest)
+        inputs, _cfg, _forecast = await gather_inputs(settings, rest)
     data = jsonable_encoder(dataclasses.asdict(inputs))
     data.pop("load_slots", None)  # large; available via get_forecast
     devices = [
@@ -79,10 +84,16 @@ async def get_state(settings: Settings) -> StateResult:
 
 
 async def get_forecast(settings: Settings) -> ForecastResult:
+    """The served day's load forecast: 48 day-order slot values plus its date."""
     async with _rest(settings) as rest:
         run = await current_plan(settings, rest)
-    slots = list(run.inputs.load_slots) if run.inputs.load_slots is not None else None
-    return ForecastResult(load_kwh=run.plan.load_kwh, slots=slots, source=run.load_source)
+    forecast = run.forecast
+    return ForecastResult(
+        load_kwh=run.plan.load_kwh,
+        slots=list(forecast.slots) if forecast.slots is not None else None,
+        source=run.load_source,
+        date=forecast.target_date.isoformat() if forecast.target_date is not None else None,
+    )
 
 
 async def get_predictions(settings: Settings) -> PredictionsResult:

@@ -15,6 +15,7 @@ from ha_spark.energy.dispatch_evidence import (
     partition_dispatches,
 )
 from ha_spark.energy.forecast import load_timezone, predict_home_load
+from ha_spark.energy.horizon import compute_horizon_geometry
 from ha_spark.energy.models import (
     SLOTS_PER_DAY,
     DispatchSlot,
@@ -192,8 +193,8 @@ def pre_window_drain(
     if forecast.slots is None:
         return forecast.total_kwh / 24.0 * gap_hours
     # Sum slot-of-day values between now and the window, prorating partials.
-    # (Uses tomorrow's day-type profile for tonight — same approximation as
-    # the slot horizon.)
+    # (Uses the served day's day-type profile for tonight — same approximation
+    # as the slot horizon.)
     total = 0.0
     t = now
     while t < opens:
@@ -425,8 +426,8 @@ def ev_hold_status_from_read(state: EntityState | None, trusted: bool) -> bool |
 
 async def gather_inputs(
     settings: Settings, rest: HomeAssistantRest, *, soc: SocMeasurement | None = None
-) -> tuple[PlannerInputs, PlannerConfig, str]:
-    """Read live HA state and build (inputs, config, load-forecast source).
+) -> tuple[PlannerInputs, PlannerConfig, LoadForecast]:
+    """Read live HA state and build (inputs, config, load forecast).
 
     ``soc`` is the daemon tick's already-checked measurement: when supplied
     it is used as-is, so the plan is sized from the exact observation the
@@ -533,7 +534,15 @@ async def gather_inputs(
         except Exception as exc:  # noqa: BLE001 - location only gates the ML model
             log.warning("Could not read HA config for site location (%s)", exc)
 
-    forecast = await predict_home_load(settings, lat=lat, lon=lon)
+    tz = load_timezone(settings.timezone)
+    window_start = parse_time(settings.charge_window_start)
+    window_end = parse_time(settings.charge_window_end)
+    now = datetime.now(tz)
+    # The load forecast targets the served day (#397): the local date the
+    # running-or-next charge window ends. The horizon itself still starts at
+    # the window (activated in #404); only the forecast's target day moves.
+    served_day = compute_horizon_geometry(now, window_start, window_end, tz).served_day
+    forecast = await predict_home_load(settings, lat=lat, lon=lon, target=served_day)
     solar_kwh = _to_float(solar.state if solar else None, 0.0)
     if solar is not None:
         estimate_key = (
@@ -551,10 +560,6 @@ async def gather_inputs(
                 estimate_key,
             )
 
-    tz = load_timezone(settings.timezone)
-    window_start = parse_time(settings.charge_window_start)
-    window_end = parse_time(settings.charge_window_end)
-    now = datetime.now(tz)
     unrated_dispatches = dispatches
     dispatches, dropped_dispatches = partition_dispatches(
         dispatches, replace(evidence_read.evidence, forecast_house_kw=forecast.total_kwh / 24), now
@@ -618,4 +623,4 @@ async def gather_inputs(
         buffer_override = max(
             0.0, (forecast.p90_total_kwh / forecast.total_kwh - 1.0) * 100.0
         )
-    return inputs, build_config(settings, voltage_v, buffer_pct=buffer_override), forecast.source
+    return inputs, build_config(settings, voltage_v, buffer_pct=buffer_override), forecast

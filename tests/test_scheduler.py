@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
-from datetime import UTC, datetime, time, timedelta, tzinfo
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -20,7 +21,12 @@ from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.energy import scheduler, sources
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
-from ha_spark.energy.models import ChargeIntent, ChargePlan, LoadForecast
+from ha_spark.energy.models import (
+    SLOTS_PER_DAY,
+    ChargeIntent,
+    ChargePlan,
+    LoadForecast,
+)
 from ha_spark.energy.scheduler import (
     SIGNAL_SAMPLE_INTERVAL,
     charge_current_changed,
@@ -180,7 +186,8 @@ def _patch_run_once_io(
         if isinstance(plan, Exception):
             raise plan
         return SimpleNamespace(
-            plan=plan, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test"
+            plan=plan, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test",
+            forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )
 
     async def noop(*_args: object, **_kwargs: object) -> None:
@@ -398,6 +405,63 @@ async def test_run_once_computes_and_applies_plan(
     assert rows[0].source == "test"
 
 
+@respx.mock
+async def test_run_once_records_the_served_day_forecast_in_day_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 01:00 replan inside Sunday night's running window ledgers *Monday's*
+    forecast (#200/#397): the served day, in slot-of-day order — never the
+    horizon-order ``load_slots`` the plan itself is indexed by."""
+    frozen = datetime(2026, 1, 12, 1, 0, tzinfo=ZoneInfo("Europe/London"))
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> FixedDatetime:
+            return cls.fromtimestamp(frozen.timestamp(), tz or UTC)
+
+    observed: list[date | None] = []
+
+    async def fake_load(
+        _s: Settings, *, target: date | None = None, **_kw: object
+    ) -> LoadForecast:
+        observed.append(target)
+        return LoadForecast(
+            total_kwh=12.0,
+            slots=tuple(float(i) for i in range(SLOTS_PER_DAY)),
+            source="slot profile (14d hourly house stats)",
+            target_date=target,
+        )
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    monkeypatch.setattr(sources, "datetime", FixedDatetime)
+    monkeypatch.setattr(scheduler, "datetime", FixedDatetime)
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = Settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        proactive_mode="off",
+        db_path=str(tmp_path / "ledger.db"),
+        charge_window_start="23:30",
+        charge_window_end="05:30",
+        timezone="Europe/London",
+        load_model="median",
+    )
+    plan = (await run_once(s)).plan
+
+    assert observed == [date(2026, 1, 12)]  # Monday, not Tuesday (#200)
+    async with ForecastLedger(s.db_path) as ledger:
+        rows = await ledger.forecasts_since(date(2026, 1, 11))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.target_date == date(2026, 1, 12)
+    assert row.model == "slots"
+    assert row.total_kwh == plan.load_kwh
+    assert row.source == "slot profile (14d hourly house stats)"
+    # Slot-of-day order (0.0 at 00:00), not the horizon order (47.0 first).
+    assert row.slots == tuple(float(i) for i in range(SLOTS_PER_DAY))
+
+
 async def test_run_once_skips_unchanged_command_after_fresh_soc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -409,7 +473,8 @@ async def test_run_once_skips_unchanged_command_after_fresh_soc(
 
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
         return SimpleNamespace(
-            plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test"
+            plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test",
+            forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )
 
     class FakeDevice:
@@ -455,7 +520,8 @@ async def test_run_once_retries_after_untrusted_previous_plan(
 
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
         return SimpleNamespace(
-            plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test"
+            plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test",
+            forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )
 
     class FakeDevice:
@@ -2377,7 +2443,8 @@ async def test_run_once_reconciles_an_untrusted_plan_against_the_trusted_holds(
 
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
         return SimpleNamespace(
-            plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test"
+            plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test",
+            forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )
 
     class FakeDevice:
@@ -3084,6 +3151,7 @@ async def test_run_once_applies_the_ev_hold_on_a_replan_tick(
             plan=plan,
             inputs=SimpleNamespace(ev_hold_charging=True),
             load_source="test",
+            forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )
 
     async def noop(*_args: object, **_kwargs: object) -> None:

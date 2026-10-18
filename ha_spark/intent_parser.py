@@ -97,7 +97,9 @@ async def parse_offline(
         return IntentResult(_soc_line(plan), matched=True)
     if _contains(text, "solar", "forecast"):
         return IntentResult(_solar_line(plan), matched=True)
-    return IntentResult(format_plan(plan, load_source), matched=True)
+    return IntentResult(
+        format_plan(plan, load_source, forecast_date=run.forecast.target_date), matched=True
+    )
 
 
 # --- Phase 6D: offline context extraction + query (the no-LLM fallback) ---

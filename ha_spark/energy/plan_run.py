@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ha_spark.config import Settings
-from ha_spark.energy.models import ChargePlan, PlannerConfig, PlannerInputs
+from ha_spark.energy.models import ChargePlan, LoadForecast, PlannerConfig, PlannerInputs
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.energy.sources import build_schedule, gather_inputs
@@ -24,7 +24,7 @@ from ha_spark.ha.rest import HomeAssistantRest
 
 @dataclass(frozen=True)
 class PlanRun:
-    """A computed plan plus the inputs, config, schedule and forecast source it
+    """A computed plan plus the inputs, config, schedule and forecast it
     came from, so callers needn't re-derive any of them."""
 
     plan: ChargePlan
@@ -32,6 +32,10 @@ class PlanRun:
     cfg: PlannerConfig
     schedule: TariffSchedule
     load_source: str
+    # The load forecast the plan was sized from: its unrotated 48-value
+    # day profile (slot-of-day order) and its served date (#397), never the
+    # horizon-order ``inputs.load_slots``.
+    forecast: LoadForecast
 
 
 async def current_plan(
@@ -46,9 +50,10 @@ async def current_plan(
     daemon tick's checked measurement, reused as-is so the plan carries the
     exact observation the loop made (no independent reread).
     """
-    inputs, cfg, load_source = await gather_inputs(settings, rest, soc=soc)
+    inputs, cfg, forecast = await gather_inputs(settings, rest, soc=soc)
     schedule = build_schedule(settings, inputs, cfg)
     plan = compute_plan(inputs, cfg, schedule)
     return PlanRun(
-        plan=plan, inputs=inputs, cfg=cfg, schedule=schedule, load_source=load_source
+        plan=plan, inputs=inputs, cfg=cfg, schedule=schedule,
+        load_source=forecast.source, forecast=forecast,
     )
