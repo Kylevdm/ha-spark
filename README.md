@@ -29,8 +29,9 @@ for the ML load model), and the Octopus and Axle APIs if you configure them.
   the writes.
 - **Untrusted inputs.** ha-spark treats Home Assistant states, tariff and Axle
   payloads, and LLM replies as untrusted. It coerces or validates each one
-  before use. A bad payload drops out of the plan and never crashes ha-spark
-  or triggers a write. The LLM can't reach a hardware command.
+  before use. If a payload is bad, ha-spark plans without it. A bad payload
+  never crashes ha-spark or triggers a write. The LLM can't reach a hardware
+  command.
 - **One driver interface.** Solis and AlphaESS inverters implement the same
   driver interface, so the planner never handles vendor-specific charge
   mechanics. [`docs/adding-an-inverter.md`](docs/adding-an-inverter.md)
