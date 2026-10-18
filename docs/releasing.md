@@ -51,7 +51,8 @@ an ingress app, companion HACS integration and UI-owned configuration for new
 households. Compatible #94 requirements remain below. See the individual
 [carry-over dispositions](258-v1-gate-carryover.md).
 
-The pre-1.0 line continues `0.x`; retired rc tags remain unused. Historical
+The pre-1.0 line continues `0.x`; the misused `v1.0.0-rc1`–`rc4` tags were
+deleted on 2026-10-18, so those names are free for the real release candidates. Historical
 phase-to-version assignments are superseded. #247 owns phase sequencing.
 No unchecked item is claimed as validated.
 
