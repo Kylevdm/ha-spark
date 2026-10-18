@@ -108,6 +108,65 @@ and proving them on a real event is still open
 passes the v1.0.0 release gate, run it under the
 [supervised export runbook](docs/runbooks/supervised-axle-export.md).
 
+### When an export pays
+
+The planner funds export slots by charging beforehand and holding energy
+back. If that isn't enough, it may spend the post-event reservation, which is
+the energy set aside to run the house from the end of the event to the next
+cheap slot. It does that only when the event pays more than buying the energy
+back costs
+([#207](https://github.com/Kylevdm/ha-spark/issues/207)):
+
+```text
+fund the slot if  event rate > worst import price where the shortfall lands / round-trip efficiency
+```
+
+The rule includes no margin and no battery-wear cost. The planner never spends
+the energy reserved for house load before or during the event, and never takes
+the battery below `min_soc`.
+
+As an illustration (these aren't measured figures), take an event that pays
+£0.80/kWh and a battery with 90% round-trip efficiency. If the shortfall lands
+in slots priced at £0.30/kWh, buying it back costs £0.33/kWh, so the planner
+funds the slot. Its plan reason reads "Funded 1.20 kWh from the post-event
+reserve: £0.80 event vs £0.33 buy-back." If those slots cost £0.75/kWh, buying
+back costs £0.83/kWh and the planner skips the slot. The plan then reports
+the SoC the event would need at its start to fund every slot
+([#214](https://github.com/Kylevdm/ha-spark/issues/214)).
+
+ha-spark doesn't yet record what each event earned. The savings backtest
+covers grid import under your tariff, not Axle payments.
+
+### Axle roadmap
+
+The supervised prototype
+([#128](https://github.com/Kylevdm/ha-spark/issues/128)) closes after the next
+real event proves two things:
+
+- the lifecycle notices reach the owner's phone
+  ([#219](https://github.com/Kylevdm/ha-spark/issues/219));
+- the inverter can hold a timed-discharge current below its ceiling, with
+  reliable read-back ([#136](https://github.com/Kylevdm/ha-spark/issues/136)).
+
+In v1, the companion integration takes over the inverter export write,
+read-back, clock gate, and power-switch handling. The add-on will send it
+per-device intents, such as an export window, instead of register values
+([#316](https://github.com/Kylevdm/ha-spark/issues/316),
+[#323](https://github.com/Kylevdm/ha-spark/issues/323)). The add-on keeps the
+Axle provider, event funding, the buy-back rule, and the V2L request. Every v1
+install starts in Observe mode, so an owner has to opt in to Optimise before
+ha-spark exports for an event.
+
+Open work on the feature itself:
+
+- per-inverter current limits in place of one hard-coded model limit
+  ([#241](https://github.com/Kylevdm/ha-spark/issues/241));
+- reading today's solar forecast, so ha-spark can accept same-day daytime
+  events and check them against the DNO limit
+  ([#201](https://github.com/Kylevdm/ha-spark/issues/201));
+- counting a V2L refill from the car when funding an event
+  ([#188](https://github.com/Kylevdm/ha-spark/issues/188)).
+
 ## Road to v1.0.0
 
 v1.0.0 lets a new household set up and run ha-spark from the Home Assistant
