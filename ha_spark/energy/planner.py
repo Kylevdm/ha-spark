@@ -1073,11 +1073,16 @@ def compute_plan(
         target_soc = min(cfg.target_cap, inputs.soc_now + required / cfg.capacity_kwh * 100.0)
 
     expected_window_start_soc = None
-    if inputs.load_slots is not None and cfg.capacity_kwh > 0:
-        expected_window_start_soc = (
-            cfg.min_soc + max(0.0, usable_at_window) / cfg.capacity_kwh * 100.0
+    if inputs.load_slots is not None and cfg.capacity_kwh > 0 and inputs.geometry is not None:
+        # A rate-based charger sizes from this before the window (#402), so it
+        # is set only where the target is built from E_ws: a legacy target
+        # (soc_now + required) already prices in the drain. Never above the
+        # observed SoC: a battery below min_soc sizes from what it holds.
+        expected_window_start_soc = min(
+            inputs.soc_now,
+            cfg.min_soc + max(0.0, usable_at_window) / cfg.capacity_kwh * 100.0,
         )
-        if inputs.geometry is not None and window_first > 0:
+        if window_first > 0:
             target_energy = usable_at_window + required
             if pre_window_outflow > 0 and required == 0:
                 target_energy = obligation

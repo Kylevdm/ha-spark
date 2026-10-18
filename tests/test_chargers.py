@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, time
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -15,8 +16,11 @@ from ha_spark.devices import get_device, inverter_device
 from ha_spark.devices.base import Capability, ControlAuthority
 from ha_spark.devices.inverters.alphaess import AlphaESSDevice
 from ha_spark.devices.inverters.solis import SolisDevice, solis_current_a
-from ha_spark.energy.models import ChargeIntent
+from ha_spark.energy.horizon import compute_horizon_geometry
+from ha_spark.energy.models import ChargeIntent, PlannerConfig, PlannerInputs
+from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+from ha_spark.energy.tariff import fixed_schedule
 from ha_spark.ha.rest import HomeAssistantRest, HomeAssistantRestError
 
 
@@ -227,6 +231,56 @@ def test_solis_current_at_window_end_sizes_the_next_window() -> None:
     # 05:30 BST: tonight's window is over; the next one is a full 6.0 h.
     at = datetime(2026, 10, 4, 4, 30, tzinfo=UTC)
     intent = _intent(soc=_soc(50.0, at))
+    assert solis_current_a(intent, _sizing_settings()) == pytest.approx(26.35, abs=0.05)
+
+
+def _expecting(
+    expected_soc: float, target_soc: float = 77.0, soc: SocMeasurement | None = None
+) -> ChargeIntent:
+    """An intent whose plan expects ``expected_soc`` at window start (#402)."""
+    return ChargeIntent(
+        target_soc, soc if soc is not None else _soc(50.0), time(23, 30), time(5, 30),
+        expected_window_start_soc=expected_soc,
+    )
+
+
+def test_solis_current_before_window_sizes_from_expected_window_start_soc() -> None:
+    # 22:00 BST, 50% now but 40% expected at 23:30: needed (77-40)% of 26.88 =
+    # 9.9456 kWh, buy 11.0507 kWh over 6.0 h: 11.0507 / 0.306 = 36.11 A, not 26.35.
+    at = datetime(2026, 10, 3, 21, 0, tzinfo=UTC)
+    intent = _expecting(40.0, soc=_soc(50.0, at))
+    assert solis_current_a(intent, _sizing_settings()) == pytest.approx(36.11, abs=0.05)
+
+
+def test_solis_current_after_window_end_sizes_the_next_window_from_expected_soc() -> None:
+    at = datetime(2026, 10, 4, 4, 30, tzinfo=UTC)  # 05:30 BST: before the next window
+    intent = _expecting(40.0, soc=_soc(50.0, at))
+    assert solis_current_a(intent, _sizing_settings()) == pytest.approx(36.11, abs=0.05)
+
+
+def test_solis_current_inside_window_ignores_expected_window_start_soc() -> None:
+    # The #181 case: inside the window the observed 56% and the 2.0 h left decide.
+    at = datetime(2026, 10, 4, 2, 30, tzinfo=UTC)
+    intent = _expecting(30.0, target_soc=70.0, soc=_soc(56.0, at))
+    assert solis_current_a(intent, _sizing_settings()) == pytest.approx(40.99, abs=0.05)
+
+
+def test_solis_current_untrusted_soc_sizes_from_zero_not_the_projection() -> None:
+    # A failed read sizes from its 0 (30% of 26.88 / 0.9 / 0.306 = 29.28 A),
+    # never from the planner's projection, which would size 0 A here.
+    intent = _expecting(40.0, target_soc=30.0, soc=_bad_soc())
+    assert solis_current_a(intent, _sizing_settings()) == pytest.approx(29.28, abs=0.05)
+
+
+def test_solis_current_target_below_expected_window_start_soc_is_zero() -> None:
+    # Decision B: before the window the target can sit below the expected SoC.
+    at = datetime(2026, 10, 3, 21, 0, tzinfo=UTC)
+    intent = _expecting(60.0, target_soc=45.0, soc=_soc(70.0, at))
+    assert solis_current_a(intent, _sizing_settings()) == 0.0
+
+
+def test_solis_current_non_finite_projection_keeps_the_observed_soc() -> None:
+    intent = _expecting(float("nan"))
     assert solis_current_a(intent, _sizing_settings()) == pytest.approx(26.35, abs=0.05)
 
 
@@ -682,6 +736,17 @@ async def test_on_does_not_block_genuine_zero_soc() -> None:
 
 
 @respx.mock
+async def test_on_blocks_all_writes_when_soc_invalid_despite_a_projection() -> None:
+    posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    _get("select.solisac_power_switch", "On")
+    s = _settings(proactive_mode="on")
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        lines = await _solis_device(s, rest).apply(_expecting(40.0, soc=_bad_soc()))
+    assert posts.call_count == 0
+    assert any(line.startswith("[BLOCKED]") and "unavailable" in line for line in lines)
+
+
+@respx.mock
 async def test_simulate_unaffected_by_invalid_soc() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     s = _settings(proactive_mode="simulate")
@@ -710,6 +775,50 @@ def test_planned_rate_w_matches_current_times_voltage() -> None:
     rest = HomeAssistantRest(s.ha_rest_url, s.auth_token)
     expected = solis_current_a(intent, s) * s.battery_voltage_v
     assert _solis_device(s, rest).planned_rate_w(intent) == pytest.approx(expected)
+
+
+def test_solis_buys_exactly_the_planned_charge_before_the_window() -> None:
+    # A live pre-window plan (#401): P = 1 kWh before 23:30, required 7.8 kWh.
+    # Sized from the expected window-start SoC, the current buys 7.8 kWh over
+    # 6 h (25.49 A); sized from the observed 40% it would buy 6.8 kWh.
+    config = PlannerConfig(
+        capacity_kwh=20.0, voltage_v=51.0, min_soc=20.0, target_cap=90.0,
+        max_current_a=62.5, solar_haircut_k=1.0, window_start=time(23, 30),
+        window_end=time(5, 30), buffer_pct=20.0, charge_efficiency=1.0,
+    )
+    now = datetime(2026, 1, 5, 22, 30, tzinfo=UTC)
+    geometry = compute_horizon_geometry(
+        now, config.window_start, config.window_end, ZoneInfo("UTC")
+    )
+    first, end = geometry.window_slot_range
+    loads = [0.0] * len(geometry.slot_starts)
+    loads[:first] = [0.5] * first
+    loads[end:] = [0.25] * (len(loads) - end)
+    inputs = PlannerInputs(
+        soc=_soc(40.0, now), solar_tomorrow_kwh=0, predicted_home_load_kwh=sum(loads),
+        now=now, horizon_start=geometry.horizon_start, geometry=geometry,
+        load_slots=tuple(loads),
+    )
+    plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
+    s = _settings(
+        battery_capacity_kwh=20.0, charge_efficiency=1.0, battery_voltage_v=51.0,
+        max_charge_current_a=62.5, timezone="UTC",
+    )
+    assert plan.required_kwh == pytest.approx(7.8)
+    assert solis_current_a(plan.charge_intent, s) == pytest.approx(
+        7.8 / (6.0 * 51.0 / 1000.0)
+    )
+
+
+def test_planned_rate_w_sizes_from_expected_window_start_soc() -> None:
+    # The supply guard restores to planned_rate_w (scheduler._planned_rate_w):
+    # it must follow the same pre-window rule as the current write (#402).
+    s = _sizing_settings()
+    intent = _expecting(40.0)
+    rest = HomeAssistantRest(s.ha_rest_url, s.auth_token)
+    assert _solis_device(s, rest).planned_rate_w(intent) == pytest.approx(
+        36.11 * s.battery_voltage_v, abs=0.05 * s.battery_voltage_v
+    )
 
 
 @respx.mock

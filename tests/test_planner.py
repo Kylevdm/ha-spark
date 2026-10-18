@@ -1741,6 +1741,27 @@ def test_pre_window_ledger_target_is_exactly_stable(
     assert first.charge_intent.soc is first.soc
 
 
+def test_legacy_inputs_carry_no_expected_window_start_soc() -> None:
+    # A legacy target (soc_now + required) already prices in the drain, so a
+    # rate-based charger must keep sizing from the observed SoC (#402).
+    plan = _plan(
+        PlannerInputs(
+            soc=_soc(50), solar_tomorrow_kwh=0, predicted_home_load_kwh=0,
+            pre_window_drain_kwh=2.0, load_slots=(0.25,) * 48, solar_slots=(0.0,) * 48,
+            horizon_start=_HORIZON_START,
+        ),
+        cfg(),
+    )
+    assert plan.charge_intent.expected_window_start_soc is None
+
+
+def test_expected_window_start_soc_never_exceeds_the_observed_soc() -> None:
+    # Already below min_soc: E_ws is 0, but the battery holds 15%, not 20%.
+    config = cfg(capacity_kwh=20)
+    plan = _plan(_pre_window_inputs(datetime(2026, 1, 5, 22, 30, tzinfo=UTC), 15, config), config)
+    assert plan.charge_intent.expected_window_start_soc == 15
+
+
 @pytest.mark.parametrize("soc, shortfall", [
     (40, ""),
     (22.5, " A 0.50 kWh shortfall will be imported before the charge window."),
