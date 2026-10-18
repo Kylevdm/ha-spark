@@ -108,6 +108,12 @@ and `off` only computes. A real write requires **both** `control == ha_spark`
 **and** `proactive_mode == on`. Anything else suppresses side effects through
 the same decision path. Don't weaken this gate.
 
+In v1 the add-on drivers retire at cutover into device modules in the
+companion integration
+([#336](https://github.com/Kylevdm/ha-spark/issues/336#issuecomment-6228760140)),
+and the site operating mode replaces `control`/`proactive_mode` as this gate
+([ADR 0008](adr/0008-operating-mode-and-authority-lifecycle.md)).
+
 ## Registering a new driver
 
 1. Implement the `Device` protocol as a class in

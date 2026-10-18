@@ -6,6 +6,10 @@ overnight cheap-rate charge. With `proactive_mode: on` it programs the inverter
 and keeps the Solis power switch in step with dispatch holds. The default,
 `simulate`, logs the writes it would make without changing hardware.
 
+> v1.0.0 replaces `proactive_mode` with a site-wide operating mode (Observe,
+> Protect or Optimise), set from the add-on's own page. Until you upgrade,
+> `proactive_mode` works as described here.
+
 ## Installation
 
 1. In Home Assistant go to **Settings → Add-ons → Add-on Store → ⋮ →

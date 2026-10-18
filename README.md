@@ -54,15 +54,19 @@ for the ML load model), and the Octopus and Axle APIs if you configure them.
 v1.0.0 lets a new household set up and run ha-spark from the Home Assistant
 UI ([#247](https://github.com/Kylevdm/ha-spark/issues/247)). It adds:
 
-- an ingress web app for onboarding, statistics, a visual plan, chat that can
-  run every CLI command, a manual override, and settings;
+- an ingress web app for onboarding, statistics, a visual plan, chat, a manual
+  override, and settings, giving every owner task a home in the UI
+  ([CLI parity](https://github.com/Kylevdm/ha-spark/issues/364#issuecomment-6241994831));
 - a companion HACS integration that talks to Solis and AlphaESS inverters
   directly, replaces the Solcast integration, and owns ha-spark's entities.
   The add-on keeps the
   planner and the UI, and the integration makes no planning decisions
   ([ADR 0005](docs/adr/0005-integration-authority-and-operating-modes.md));
 - configuration that you edit in the UI, with the Supervisor options cut down
-  to the keys needed to start the add-on.
+  to the keys needed to start the add-on;
+- one site-wide operating mode (Observe, Protect or Optimise) in place of
+  `proactive_mode` and per-device `control`. Every v1 install starts in
+  Observe ([ADR 0008](docs/adr/0008-operating-mode-and-authority-lifecycle.md)).
 
 The earlier v1 definition
 ([#94](https://github.com/Kylevdm/ha-spark/issues/94)) still applies where it
@@ -181,3 +185,8 @@ Other commands: `onboard` (propose entity mappings), `generate-dashboard`,
 `forecast-eval`, `context`, `learn-factors`, `v2l`, `solis sync-clock`, and
 `run` (the daemon). ha-spark reads its configuration from environment variables
 or `.env` (see `.env.example`). The add-on reads `/data/options.json` instead.
+
+In v1, `backtest` and `forecast-eval` fold into a new `stats` command,
+`plan --apply` is retired (`run` becomes a replan request), and
+`solis sync-clock` becomes a device-generic `clock sync`
+([#364](https://github.com/Kylevdm/ha-spark/issues/364#issuecomment-6241994831)).
