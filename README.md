@@ -16,6 +16,33 @@ is unreachable. There is no ha-spark cloud service or subscription. Apart from
 Home Assistant, ha-spark contacts only your Ollama server, Open-Meteo (weather
 for the ML load model), and the Octopus and Axle APIs if you configure them.
 
+## Engineering highlights
+
+- **A pure planner.** `compute_plan` takes inputs and config and returns a
+  plan, with no I/O. Every plan line traces to a reservation or a price, so
+  every decision can be replayed, tested, and explained
+  ([why not an LP solver](docs/adr/0002-auditable-over-optimal-planning.md)).
+- **Gated actuation.** Writes to hardware go through one decision path. Real
+  writes happen only when control is switched on, never on an invalid SoC
+  reading, and always with read-back verification. A failed action is
+  isolated and doesn't block the others. Simulate mode runs the same path with
+  the writes suppressed.
+- **Untrusted inputs.** Home Assistant states, tariff and Axle payloads, and
+  LLM replies are all treated as untrusted. They are coerced or validated
+  before ha-spark uses them, and a bad payload degrades the plan instead of
+  crashing ha-spark or triggering a write. The LLM can't reach a hardware
+  command.
+- **Device drivers behind a contract.** Solis and AlphaESS inverters share one
+  driver interface ([adding an inverter](docs/adding-an-inverter.md)), so the
+  planner never deals with vendor-specific charge mechanics.
+- **Quality gates.** Python 3.11+ and asyncio, mypy strict, ruff, and over
+  1,000 tests (respx for HTTP, fake servers for WebSocket) that must pass
+  before every merge. Ships as a Docker-built Home Assistant add-on from
+  pinned release tags.
+- **Decisions on record.** Architecture choices are written up as
+  [ADRs](docs/adr/), and the domain terms are defined in
+  [`CONTEXT.md`](CONTEXT.md).
+
 > Status: add-on v0.22.0 includes:
 >
 > - a deterministic planner that replans every half hour, holds battery energy
@@ -48,6 +75,38 @@ for the ML load model), and the Octopus and Axle APIs if you configure them.
 > release shipped, the GitHub
 > [milestones](https://github.com/Kylevdm/ha-spark/milestones) track open work,
 > and [`CONTEXT.md`](CONTEXT.md) defines the project's terms.
+
+## Axle export events
+
+ha-spark can take part in [Axle](https://axle.energy) flexibility events,
+exporting battery energy to the grid during paid slots. Axle is a separate
+event provider, so it works alongside any of the supported tariffs.
+
+1. **Event intake.** ha-spark reads the event from the Axle API and falls back
+   to a Home Assistant entity if the API read fails. Events with a missing or
+   timezone-less timestamp, an end before their start, a future-dated update,
+   or an unknown direction are rejected, so the planner never schedules from
+   an event it can't trust.
+2. **Planning.** The planner picks complete half-hour slots inside the event,
+   caps export at the configured DNO export limit, and uses reservations to
+   charge and hold back enough energy to fund those slots. It also keeps the
+   household's own post-event reservation.
+3. **Actuation.** The inverter driver writes the discharge window behind the
+   power-switch, control-authority, and fresh-SoC guards, then reads it back.
+   ha-spark checks the inverter clock first, because the inverter fires the
+   window on its own clock.
+4. **Cleanup.** Once the event ends, ha-spark clears the window and confirms
+   it by read-back so the schedule can't repeat the next day.
+
+The first paid event ran end to end on real hardware on 2026-10-05, with no
+manual entry of the event window and no intervention during the event
+([evidence log](https://github.com/Kylevdm/ha-spark/issues/134)). It also
+showed two gaps. Export paused briefly at each mid-event replan, which was
+fixed in 0.20.0 ([#218](https://github.com/Kylevdm/ha-spark/issues/218)).
+Lifecycle notices weren't sent, and proving them on a real event is still
+open ([#219](https://github.com/Kylevdm/ha-spark/issues/219)). Until the feature
+passes the v1.0.0 release gate, run it under the
+[supervised export runbook](docs/runbooks/supervised-axle-export.md).
 
 ## Road to v1.0.0
 
