@@ -412,9 +412,10 @@ changes the operating mode.
 What the household's bills would have cost over a span with the same measured
 house load and solar but no battery, minus what they did cost. Each half-hour
 is priced at the import and export rates in force at the time; standing
-charges are excluded. It credits the battery and ha-spark's use of it
-together, not ha-spark alone, and never includes aggregator payments.
-(Decision: #309, 2026-10-14.)
+charges are excluded. Estimated Axle earnings count as a credit in what the
+bills did cost, and never in the no-battery cost. It credits the battery and
+ha-spark's use of it together, not ha-spark alone.
+(Decision: #309, 2026-10-14; amended 2026-10-18 to include Axle earnings.)
 _Avoid_: ha-spark savings, money saved (unqualified)
 
 **Coverage**:

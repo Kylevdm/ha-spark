@@ -16,6 +16,33 @@ is unreachable. There is no ha-spark cloud service or subscription. Apart from
 Home Assistant, ha-spark contacts only your Ollama server, Open-Meteo (weather
 for the ML load model), and the Octopus and Axle APIs if you configure them.
 
+## Engineering highlights
+
+- **A pure planner.** `compute_plan` takes inputs and config, returns a plan,
+  and does no I/O. Every plan line comes from a reservation or a price, so a
+  test can replay any decision and the copilot can explain it
+  ([why not an LP solver](docs/adr/0002-auditable-over-optimal-planning.md)).
+- **Gated actuation.** All hardware writes go through one decision path.
+  ha-spark writes only when the owner has switched on real control and the
+  SoC reading is valid, and it reads back every write to confirm it. A failed
+  action doesn't stop the others. Simulate mode runs the same path and skips
+  the writes.
+- **Untrusted inputs.** ha-spark treats Home Assistant states, tariff and Axle
+  payloads, and LLM replies as untrusted. It coerces or validates each one
+  before use. If a payload is bad, ha-spark plans without it. A bad payload
+  never crashes ha-spark or triggers a write. The LLM can't reach a hardware
+  command.
+- **One driver interface.** Solis and AlphaESS inverters implement the same
+  driver interface, so the planner never handles vendor-specific charge
+  mechanics. [`docs/adding-an-inverter.md`](docs/adding-an-inverter.md)
+  describes it.
+- **Quality gates.** ha-spark is Python 3.11+ on asyncio. Ruff, strict mypy,
+  and over 1,000 tests must pass before every merge. The tests use respx for
+  HTTP and fake servers for WebSocket. The add-on is a Docker image that Home
+  Assistant builds from a pinned release tag.
+- **Written decisions.** Each architecture decision has an
+  [ADR](docs/adr/), and [`CONTEXT.md`](CONTEXT.md) defines the domain terms.
+
 > Status: add-on v0.22.0 includes:
 >
 > - a deterministic planner that replans every half hour, holds battery energy
@@ -48,6 +75,104 @@ for the ML load model), and the Octopus and Axle APIs if you configure them.
 > release shipped, the GitHub
 > [milestones](https://github.com/Kylevdm/ha-spark/milestones) track open work,
 > and [`CONTEXT.md`](CONTEXT.md) defines the project's terms.
+
+## Axle export events
+
+ha-spark can take part in [Axle](https://axle.energy) flexibility events. It
+exports battery energy to the grid during the paid slots. Axle is a separate
+event provider, so it works with any supported tariff.
+
+1. **Event intake.** ha-spark reads the event from the Axle API and falls back
+   to a Home Assistant entity if the API read fails. It rejects an event with
+   a missing or timezone-less timestamp, an end before its start, a
+   future-dated update, or an unknown direction. The planner never schedules
+   from a rejected event.
+2. **Planning.** The planner picks complete half-hour slots inside the event
+   and caps export at the configured DNO export limit. It uses reservations to
+   charge and hold back enough energy to fund those slots, and keeps the
+   household's own post-event reservation.
+3. **Actuation.** The inverter driver checks the power switch, control
+   authority, and SoC freshness, then writes the discharge window and reads it
+   back. ha-spark checks the inverter clock first, because the inverter fires
+   the window on its own clock.
+4. **Cleanup.** After the event ends, ha-spark clears the window and reads it
+   back to confirm, so the schedule can't repeat the next day.
+
+The first paid event ran end to end on real hardware on 2026-10-05. Nobody
+entered the event window by hand or intervened during the event
+([evidence log](https://github.com/Kylevdm/ha-spark/issues/134)). The run
+found two gaps. Export paused for 10 to 15 seconds at each mid-event replan,
+and 0.20.0 fixed that ([#218](https://github.com/Kylevdm/ha-spark/issues/218)).
+ha-spark sent no lifecycle notices because no notify service was configured,
+and proving them on a real event is still open
+([#219](https://github.com/Kylevdm/ha-spark/issues/219)). Until the feature
+passes the v1.0.0 release gate, run it under the
+[supervised export runbook](docs/runbooks/supervised-axle-export.md).
+
+### When an export pays
+
+The planner funds export slots by charging beforehand and holding energy
+back. If that isn't enough, it may spend the post-event reservation, which is
+the energy set aside to run the house from the end of the event to the next
+cheap slot. It does that only when the event pays more than buying the energy
+back costs
+([#207](https://github.com/Kylevdm/ha-spark/issues/207)):
+
+```text
+fund the slot if  event rate > worst import price where the shortfall lands / round-trip efficiency
+```
+
+The rule includes no margin and no battery-wear cost. The planner never spends
+the energy reserved for house load before or during the event, and never takes
+the battery below `min_soc`.
+
+As an illustration (these aren't measured figures), take an event that pays
+£0.80/kWh and a battery with 90% round-trip efficiency. If the shortfall lands
+in slots priced at £0.30/kWh, buying it back costs £0.33/kWh, so the planner
+funds the slot. Its plan reason reads "Funded 1.20 kWh from the post-event
+reserve: £0.80 event vs £0.33 buy-back." If those slots cost £0.75/kWh, buying
+back costs £0.83/kWh and the planner skips the slot. The plan then reports
+the SoC the event would need at its start to fund every slot
+([#214](https://github.com/Kylevdm/ha-spark/issues/214)).
+
+ha-spark doesn't yet record what each event earned. In v1 it will estimate
+each event's earnings from its own measurements, as the grid export measured
+during the event times the event rate. The estimate will count as a credit in
+the day's cost and in battery savings
+([#373](https://github.com/Kylevdm/ha-spark/issues/373)). Until then, the
+savings backtest covers grid import under your tariff, not Axle payments.
+
+### Axle roadmap
+
+The supervised prototype
+([#128](https://github.com/Kylevdm/ha-spark/issues/128)) closes after the next
+real event proves two things:
+
+- the lifecycle notices reach the owner's phone
+  ([#219](https://github.com/Kylevdm/ha-spark/issues/219));
+- the inverter can hold a timed-discharge current below its ceiling, with
+  reliable read-back ([#136](https://github.com/Kylevdm/ha-spark/issues/136)).
+
+In v1, the companion integration takes over the inverter export write,
+read-back, clock gate, and power-switch handling. The add-on will send it
+per-device intents, such as an export window, instead of register values
+([#316](https://github.com/Kylevdm/ha-spark/issues/316),
+[#323](https://github.com/Kylevdm/ha-spark/issues/323)). The add-on keeps the
+Axle provider, event funding, the buy-back rule, and the V2L request. Every v1
+install starts in Observe mode, so an owner has to opt in to Optimise before
+ha-spark exports for an event.
+
+Open work on the feature itself:
+
+- per-inverter current limits in place of one hard-coded model limit
+  ([#241](https://github.com/Kylevdm/ha-spark/issues/241));
+- reading today's solar forecast, so ha-spark can accept same-day daytime
+  events and check them against the DNO limit
+  ([#201](https://github.com/Kylevdm/ha-spark/issues/201));
+- counting a V2L refill from the car when funding an event
+  ([#188](https://github.com/Kylevdm/ha-spark/issues/188));
+- estimating what each event earned and counting it in the day's cost
+  ([#373](https://github.com/Kylevdm/ha-spark/issues/373)).
 
 ## Road to v1.0.0
 
