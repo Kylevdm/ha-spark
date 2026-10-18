@@ -109,6 +109,17 @@ def _slot_hours(geometry: HorizonGeometry | None, index: int) -> float:
     return 0.5 * (_slot0_remaining(geometry) if index == 0 else 1.0)
 
 
+def _pre_window_share(geometry: HorizonGeometry | None, index: int) -> float:
+    """Fraction of slot ``index``'s part still to come that falls before the
+    window opens: the pre-window half of a slot the window starts inside."""
+    if geometry is None:
+        return 0.0
+    end = geometry.slot_starts[index] + timedelta(minutes=30)
+    hours = _slot_hours(geometry, index)
+    before = (geometry.window_start - (end - timedelta(hours=hours))).total_seconds() / 3600.0
+    return min(1.0, max(0.0, before / hours))
+
+
 def _hours_left(start: datetime, now: datetime | None) -> float:
     """Hours of the half-hour slot at ``start`` still to come at ``now``.
 
@@ -780,9 +791,10 @@ def _v2l_refills(
             (i for i in reversed(range(first, target)) if missing[i] > 1e-9), first
         )
         for slot in reversed(range(earliest, target)):
-            hours = 0.5 * (1 - geometry.window_fracs[slot]) if geometry is not None else 0.5
-            if geometry is not None and slot == 0:  # the elapsed part can't refill either
-                hours = min(hours, _slot_hours(geometry, 0))
+            hours = (
+                _slot_hours(geometry, slot) * (1 - geometry.window_fracs[slot])
+                if geometry is not None else 0.5
+            )
             amount = min(need, budget, rate * hours - additions[slot],
                          min(capacity - stored[i] for i in range(slot, target)))
             if amount <= 1e-9:
@@ -859,8 +871,17 @@ def compute_plan(
         expensive_load_kwh = expensive_need
         # Load before the window is carried from now (reach-charge-window),
         # so the deficit is the post-window peak load (legacy: whole horizon).
-        deficit = sum((1.0 - fracs[i]) * net[i] for i in range(window_first, n))
-        pre_window_outflow += sum((1.0 - fracs[i]) * net[i] for i in range(window_first))
+        # A window opening inside a slot splits it: its expensive load before
+        # the window opens is carried from now too.
+        straddle = (
+            min(_pre_window_share(geometry, window_first), 1.0 - fracs[window_first])
+            * net[window_first]
+            if window_first < n else 0.0
+        )
+        deficit = sum((1.0 - fracs[i]) * net[i] for i in range(window_first, n)) - straddle
+        pre_window_outflow += (
+            sum((1.0 - fracs[i]) * net[i] for i in range(window_first)) + straddle
+        )
         # Dispatch-covered load outside the fixed window (for the report).
         # Clockless legacy arrays keep the original fixed-window indexing.
         window_fracs = (
@@ -936,11 +957,12 @@ def compute_plan(
         )
     else:
         headroom += pre_window_export_kwh
-    reservation_need = sum(
-        reservation.energy_kwh
-        for reservation in reservations
-        if reservation.target_slot > window_first
+    # Tonight's charge funds only the reservations targeted after the window
+    # start; earlier ones are carried from now (#394).
+    charge_funded = tuple(
+        reservation for reservation in reservations if reservation.target_slot > window_first
     )
+    reservation_need = sum(reservation.energy_kwh for reservation in charge_funded)
     obligation = max(reservation_need, buffered_deficit)
     export_overlaps_charge = (
         export is not None
@@ -1140,6 +1162,7 @@ def compute_plan(
             sum(abs(d.charge_in_kwh) for d in inputs.dispatches) if inputs.dispatches else None
         ),
         reservations=reservations,
+        charge_funded_reservations=charge_funded,
         v2l_refills=refills,
         v2l_wanted_but_unavailable=v2l_unavailable,
         export_skips=export_skips,

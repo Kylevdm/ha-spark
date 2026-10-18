@@ -49,7 +49,8 @@ class HorizonGeometry:
     # Absolute start of every slot, 30 real minutes apart (UTC arithmetic).
     slot_starts: tuple[datetime, ...]
     # Fraction of each slot covered by the charge window (real interval
-    # overlap, so a boundary off the half-hour gives partial coverage).
+    # overlap, so a boundary off the half-hour gives partial coverage). For a
+    # part-elapsed slot 0 it is the fraction of the part still to come.
     window_fracs: tuple[float, ...]
     # Half-open ``[first, end)`` index range spanned by the running-or-next
     # window (every slot with any window coverage).
@@ -139,10 +140,13 @@ def compute_horizon_geometry(
     n_slots = math.ceil((horizon_end - horizon_start).total_seconds() / 1800.0)
     slot_starts = tuple(horizon_start + SLOT * i for i in range(n_slots))
 
+    # Slot 0's coverage is over the part still to come, the part its energy
+    # totals carry (#394 review).
     fracs: list[float] = []
-    for slot_start in slot_starts:
-        overlap = min(slot_start + SLOT, window_end_dt) - max(slot_start, window_start_dt)
-        fracs.append(max(0.0, overlap.total_seconds() / 1800.0))
+    for i, slot_start in enumerate(slot_starts):
+        lo = max(slot_start, now_utc) if i == 0 else slot_start
+        overlap = min(slot_start + SLOT, window_end_dt) - max(lo, window_start_dt)
+        fracs.append(max(0.0, overlap / (slot_start + SLOT - lo)))
 
     covered = [i for i, frac in enumerate(fracs) if frac > 0.0]
     window_slot_range = (covered[0], covered[-1] + 1) if covered else (0, 0)

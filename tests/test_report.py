@@ -114,7 +114,11 @@ def test_charge_funds_only_post_window_reservations() -> None:
         obligation_kind="reach-next-cheap-slot", reason="Reserving daytime energy.",
     )
     out = format_plan(
-        _plan(reservations=(evening, daytime), pre_window_drain_kwh=1), "test"
+        _plan(
+            reservations=(evening, daytime), charge_funded_reservations=(daytime,),
+            pre_window_drain_kwh=1,
+        ),
+        "test",
     )
 
     assert evening.reason in out

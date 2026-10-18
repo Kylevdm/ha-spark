@@ -86,7 +86,10 @@ def _cheap_fractions(
                 if geometry is not None else i * 0.5
             )
             slot_end = slot_start + 0.5
-            overlap = max(0.0, min(b, slot_end) - max(a, slot_start)) / 0.5
+            # Slot 0's fraction is over its part still to come, as its window
+            # coverage is.
+            length = 0.5 * (geometry.slot0_remaining_frac if geometry and i == 0 else 1.0)
+            overlap = max(0.0, min(b, slot_end) - max(a, slot_end - length)) / length
             if overlap > 0:
                 fracs[i] = min(1.0, fracs[i] + overlap)
     return fracs
@@ -169,7 +172,8 @@ def _carry_cycle_marks(
 ) -> list[float]:
     """Carry the cycle's cheap marks onto the horizon slots by real overlap
     (a window boundary off the half-hour splits a mark across two slots).
-    Slots before the window are never marked."""
+    Slots before the window are never marked; slot 0's fraction is over its
+    part still to come."""
     origin = _geometry_origin(inputs, geometry)
     horizon = [_hours_since(origin, s, absolute=True) for s in geometry.slot_starts]
     fracs = [0.0] * len(horizon)
@@ -177,9 +181,10 @@ def _carry_cycle_marks(
         a = _hours_since(origin, starts[j], absolute=True)
         b = a + 0.5
         for i, sa in enumerate(horizon):
-            overlap = max(0.0, min(b, sa + 0.5) - max(a, sa))
+            length = 0.5 * (geometry.slot0_remaining_frac if i == 0 else 1.0)
+            overlap = max(0.0, min(b, sa + 0.5) - max(a, sa + 0.5 - length))
             if overlap > 0:
-                fracs[i] = min(1.0, fracs[i] + overlap / 0.5)
+                fracs[i] = min(1.0, fracs[i] + overlap / length)
     return fracs
 
 

@@ -437,6 +437,21 @@ def _same_day_plan(inputs: PlannerInputs, config: PlannerConfig) -> Any:
     return _plan(_current_event_inputs(inputs, config), config)
 
 
+def test_same_day_event_reservations_are_not_charge_funded() -> None:
+    """Tonight's charge funds only the post-window reservation, not the evening event."""
+    from ha_spark.energy.report import format_plan
+
+    plan = _same_day_plan(
+        _same_day_inputs(soc_now=60.0, now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC)),
+        _same_day_cfg(),
+    )
+
+    assert plan.charge_intent.export is not None
+    assert "axle-export-event" in {r.name for r in plan.reservations}
+    assert [r.name for r in plan.charge_funded_reservations] == ["reach-next-cheap-slot"]
+    assert "(funds reach-next-cheap-slot)" in format_plan(plan, "test")
+
+
 def test_same_day_export_is_funded_from_the_live_soc() -> None:
     """An event earlier than tonight's window is planned from the battery as it is now."""
     plan = _same_day_plan(
@@ -1584,9 +1599,8 @@ def test_geometry_partial_window_coverage_and_soc_path() -> None:
     plan = _plan(inp, config)
     assert len(plan.slot_prices or ()) == 49
     assert plan.slot_prices is not None
-    assert plan.slot_prices[0] == pytest.approx(
-        config.rate_offpeak / 3 + config.rate_peak * 2 / 3
-    )
+    # Only 23:20-23:30 of slot 0 is still to come, all of it in the window.
+    assert plan.slot_prices[0] == pytest.approx(config.rate_offpeak)
     assert plan.required_kwh == pytest.approx(62.5 * 51 * 6 / 1000)
     assert plan.soc_path[0] == (geom.window_end, plan.target_soc)
 
@@ -1873,8 +1887,57 @@ def test_midslot_soc_path_drains_only_the_rest_of_slot_0() -> None:
     )
 
     assert plan.soc_path[0] == (geom.window_end, 50.0)
-    # 0.1 kWh of remaining energy, 1/3 of it outside the window: 0.0333 kWh.
-    assert plan.soc_path[1][1] == pytest.approx(50.0 - 0.1 / 3 / 26.88 * 100)
+    # 05:10-05:30 is still to come; its last ten minutes, after the window
+    # ends, drain 0.15 / 3 = 0.05 kWh (#394 review).
+    assert plan.soc_path[1][1] == pytest.approx(50.0 - 0.05 / 26.88 * 100)
+    assert plan.expensive_load_kwh == pytest.approx(0.05)
+
+
+def test_window_opening_inside_a_slot_drains_its_first_part_before_the_window() -> None:
+    """A 23:45 window splits the 23:30 slot: its first half is pre-window drain."""
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, 1, 10, 23, 30, tzinfo=tz)
+    config = cfg(window_start=time(23, 45), window_end=time(5, 45), capacity_kwh=20)
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    loads = [0.0] * len(geom.slot_starts)
+    loads[0] = 1.0
+    loads[20] = 2.0  # post-window peak load stays in the deficit
+    plan = _plan(
+        PlannerInputs(
+            soc=_soc(50), solar_tomorrow_kwh=0, predicted_home_load_kwh=0,
+            now=now, geometry=geom, horizon_start=geom.horizon_start,
+            load_slots=tuple(loads),
+        ),
+        config,
+    )
+
+    assert plan.pre_window_drain_kwh == pytest.approx(0.5)
+    assert plan.deficit_kwh == pytest.approx(2.0)
+    assert plan.charge_intent.expected_window_start_soc == pytest.approx(47.5)
+    assert plan.reservations[0].obligation_kind == "reach-charge-window"
+    assert plan.reservations[0].energy_kwh == pytest.approx(0.5)
+
+
+def test_midslot_window_start_counts_only_the_rest_before_the_window() -> None:
+    """At 23:35 with a 23:45 window, 10 of the 25 minutes left are pre-window."""
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, 1, 10, 23, 35, tzinfo=tz)
+    config = cfg(window_start=time(23, 45), window_end=time(5, 45), capacity_kwh=20)
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    assert geom.window_fracs[0] == pytest.approx(15 / 25)
+    loads = [0.0] * len(geom.slot_starts)
+    loads[0] = 1.5
+    plan = _plan(
+        PlannerInputs(
+            soc=_soc(50), solar_tomorrow_kwh=0, predicted_home_load_kwh=0,
+            now=now, geometry=geom, horizon_start=geom.horizon_start,
+            load_slots=tuple(loads),
+        ),
+        config,
+    )
+
+    assert plan.pre_window_drain_kwh == pytest.approx(1.5 * 10 / 30)
+    assert plan.deficit_kwh == pytest.approx(0.0)
 
 
 def test_midslot_v2l_ledger_counts_only_the_rest_of_an_export_slot_0() -> None:

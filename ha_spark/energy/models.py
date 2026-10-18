@@ -406,6 +406,9 @@ class ChargePlan:
     # Named battery obligations computed from the slot horizon. The daily model
     # intentionally leaves this empty to preserve its legacy contract.
     reservations: tuple[Reservation, ...] = ()
+    # The reservations tonight's charge funds: those targeted after the window
+    # start (a pre-window one is carried from now, never charged).
+    charge_funded_reservations: tuple[Reservation, ...] = ()
     v2l_refills: tuple[V2LRefill, ...] = ()
     v2l_wanted_but_unavailable: bool = False
     # Skips are part of the plan rather than silently becoming lower-current
