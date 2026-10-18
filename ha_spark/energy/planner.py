@@ -34,6 +34,10 @@ needs to cover the *expensive* slots' net load (load - solar), so
 replaces ``deficit``, then the same buffer and clamps apply. Both models also
 project a two-rate cost (off-peak/peak) with and without the battery.
 
+Each slot's forecast power is full-slot (kWh x 2); energy totals carry only the
+remaining part of a part-elapsed slot 0, while the DNO/supply/export-capacity
+checks compare full-slot power (#400).
+
 Daytime dispatch slots are expressed as ``holds`` on the ``ChargeIntent``, so
 the battery holds (doesn't discharge) while cheap grid covers the house.
 """
@@ -61,6 +65,35 @@ from ha_spark.energy.tariff import TariffSchedule, _controlled_windows
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def _slot0_remaining(geometry: HorizonGeometry | None) -> float:
+    """Fraction of horizon slot 0 still to come (#400).
+
+    Only slot 0 can be part-elapsed (the horizon starts at the current
+    half-hour); a legacy input's geometry keeps the whole slot. Energy totals
+    carry this fraction of slot 0, while power-based safety checks (DNO,
+    supply, export capacity) compare the full slot instead.
+    """
+    return geometry.slot0_remaining_frac if geometry is not None else 1.0
+
+
+def _slot_hours(geometry: HorizonGeometry | None, index: int) -> float:
+    """Hours of horizon slot ``index`` still to come (see ``_slot0_remaining``)."""
+    return 0.5 * (_slot0_remaining(geometry) if index == 0 else 1.0)
+
+
+def _hours_left(start: datetime, now: datetime | None) -> float:
+    """Hours of the half-hour slot at ``start`` still to come at ``now``.
+
+    For a pre-horizon slot (a same-day export before tonight's window), which
+    the horizon geometry does not cover, the time left is read off the clock.
+    """
+    if now is None:
+        return 0.5
+    return max(
+        0.0, min(0.5, (start + timedelta(minutes=30) - now).total_seconds() / 3600.0)
+    )
 
 
 def _slot_reservation(
@@ -603,6 +636,7 @@ def _event_export_plan(
             geometry.slot_starts[i],
             solar_slots[i] * cfg.solar_haircut_k * 2,
             inputs.load_slots[i] * 2 if inputs.load_slots is not None else 0.0,
+            _slot_hours(geometry, i),
         )
         for i in event_slots
     ]
@@ -641,7 +675,7 @@ def _event_export_plan(
     )
 
     export = _export_intent(event, cfg, selected[0][0].start, selected)
-    event_energy = house_through_event_energy + sum(power * 0.5 for _, power in selected)
+    event_energy = house_through_event_energy + sum(power * slot.hours for slot, power in selected)
     event_reservation = Reservation(
         name="axle-export-event",
         target_slot=event_slots[slots.index(selected[-1][0])] + 1,
@@ -684,8 +718,12 @@ def _soc_path(
     slot. Never below ``min_soc``.
     """
     exported = (
-        {start: power * 0.5 for start, power in
-         zip(export.selected_slots, export.slot_export_kw, strict=True)}
+        {
+            start: power * _slot_hours(geometry, geometry.slot_starts.index(start))
+            for start, power in
+            zip(export.selected_slots, export.slot_export_kw, strict=True)
+            if start in geometry.slot_starts
+        }
         if export is not None
         else {}
     )
@@ -744,7 +782,7 @@ def _v2l_refills(
     exported = {}
     if export is not None and inputs.horizon_start is not None:
         exported = {
-            i: power * 0.5
+            i: power * _slot_hours(geometry, i)
             for start, power in zip(export.selected_slots, export.slot_export_kw, strict=True)
             for i, slot_start in enumerate(geometry.slot_starts if geometry else ())
             if start == slot_start
@@ -756,6 +794,8 @@ def _v2l_refills(
         missing = [0.0] * n
         for slot in range(first, n):
             net = loads[slot] - solar[slot] * cfg.solar_haircut_k
+            if slot == 0:  # only the rest of a part-elapsed slot 0 drains or refills
+                net *= _slot0_remaining(geometry)
             drain = (max(0.0, net) * (1 - schedule.cheap_fracs[slot])
                      if slot not in exported else max(0.0, net) + exported[slot])
             missing[slot] = max(0.0, drain - energy)
@@ -777,6 +817,8 @@ def _v2l_refills(
         )
         for slot in reversed(range(earliest, target)):
             hours = 0.5 * (1 - geometry.window_fracs[slot]) if geometry is not None else 0.5
+            if geometry is not None and slot == 0:  # the elapsed part can't refill either
+                hours = min(hours, _slot_hours(geometry, 0))
             amount = min(need, budget, rate * hours - additions[slot],
                          min(capacity - stored[i] for i in range(slot, target)))
             if amount <= 1e-9:
@@ -840,6 +882,11 @@ def compute_plan(
             max(0.0, load - solar * cfg.solar_haircut_k)
             for load, solar in zip(inputs.load_slots, solar_slots, strict=False)
         ]
+        # Energy totals (reservations, funding, the SoC/V2L ledgers, the
+        # deficit) carry only what is left of a part-elapsed slot 0; the
+        # power-based checks read full-slot powers instead (#400).
+        if net:
+            net[0] *= _slot0_remaining(geometry)
         fracs = schedule.cheap_fracs
         prices = schedule.prices
         expensive_need = sum((1.0 - f) * e for f, e in zip(fracs, net, strict=True))
@@ -894,7 +941,10 @@ def compute_plan(
     # the battery invisibly — size against the usable energy at window start.
     # A same-day export (#198) also spends battery before the window opens.
     same_day_export_kwh = (
-        sum(power * 0.5 for power in export.slot_export_kw)
+        sum(
+            power * _hours_left(start, inputs.now)
+            for start, power in zip(export.selected_slots, export.slot_export_kw, strict=True)
+        )
         if export is not None
         and inputs.horizon_start is not None
         and export.window_end <= inputs.horizon_start
@@ -954,7 +1004,8 @@ def compute_plan(
                 if 0 <= slot < len(schedule.export_prices)
                 else (inputs.flexibility_event.rate_gbp_kwh if inputs.flexibility_event else 0.0)
             )
-            paid_export_revenue += power_kw * 0.5 * rate
+            hours = _slot_hours(geometry, slot) if slot >= 0 else _hours_left(start, inputs.now)
+            paid_export_revenue += power_kw * hours * rate
         planned_cost -= paid_export_revenue
 
     # Incidental solar surplus is identical with or without overnight charge,

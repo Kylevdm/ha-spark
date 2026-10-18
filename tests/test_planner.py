@@ -1432,3 +1432,177 @@ def test_geometry_v2l_refill_uses_only_the_part_after_the_window() -> None:
     assert plan.soc_path[0] == (geom.window_end, config.min_soc)
     assert plan.soc_path[1][1] == pytest.approx(config.min_soc + 0.25 / 26.88 * 100)
     assert _plan(replace(inp, car_plugged_in=False), config).v2l_refills == ()
+
+
+# --- slot 0: remaining energy vs full-slot power (#400) ---
+
+
+def test_midslot_replan_counts_only_the_rest_of_slot_0_in_energy_totals() -> None:
+    """A 17:40 replan carries 2/3 of the 17:30 slot's 0.3 kWh load as energy."""
+    tz = ZoneInfo("Europe/London")
+    config = cfg()
+    loads = [0.0] * 60  # 17:30 Monday to 23:30 Tuesday
+    loads[0] = 0.3
+    mid = datetime(2026, 1, 5, 17, 40, tzinfo=tz)
+    geom = compute_horizon_geometry(mid, config.window_start, config.window_end, tz)
+    assert geom.slot0_remaining_frac == pytest.approx(2 / 3)
+    plan = _plan(
+        PlannerInputs(
+            soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=0,
+            now=mid, geometry=geom, horizon_start=geom.horizon_start,
+            load_slots=tuple(loads),
+        ),
+        config,
+    )
+
+    # Only the 20 minutes left of slot 0 are carried: 0.3 kWh x 2/3.
+    assert plan.expensive_load_kwh == pytest.approx(0.2)
+    assert plan.required_kwh == pytest.approx(0.2)
+    assert plan.reservations[0].energy_kwh == pytest.approx(0.2)
+
+    # The whole-slot replan at 17:30 still counts the full 0.3 kWh.
+    whole = datetime(2026, 1, 5, 17, 30, tzinfo=tz)
+    whole_geom = compute_horizon_geometry(whole, config.window_start, config.window_end, tz)
+    whole_plan = _plan(
+        PlannerInputs(
+            soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=0,
+            now=whole, geometry=whole_geom, horizon_start=whole_geom.horizon_start,
+            load_slots=tuple(loads),
+        ),
+        config,
+    )
+    assert whole_plan.expensive_load_kwh == pytest.approx(0.3)
+
+
+def _midslot_export_inputs(
+    now: datetime, config: PlannerConfig, tz: ZoneInfo,
+    *, solar_slots: tuple[float, ...] | None = None,
+) -> PlannerInputs:
+    """A 17:30-18:30 export event, replanned 10 minutes in (2/3 of slot 0 left)."""
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    event = FlexibilityEvent(
+        start=datetime(2026, 1, 5, 17, 30, tzinfo=tz),
+        end=datetime(2026, 1, 5, 18, 30, tzinfo=tz),
+        direction="export", updated_at=now, rate_gbp_kwh=1.0,
+    )
+    return PlannerInputs(
+        soc=_soc(90), solar_tomorrow_kwh=0, predicted_home_load_kwh=0,
+        now=now, geometry=geom, horizon_start=geom.horizon_start,
+        load_slots=(0.0,) * len(geom.slot_starts), solar_slots=solar_slots,
+        flexibility_event=event,
+    )
+
+
+def test_midslot_export_carries_remaining_energy_at_full_power() -> None:
+    """Energy and revenue carry the 1/3 h left of slot 0; its power stays 3.2 kW."""
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, 1, 5, 17, 40, tzinfo=tz)
+    config = cfg()
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    plan = _plan(_midslot_export_inputs(now, config, tz), config)
+
+    export = plan.charge_intent.export
+    assert export is not None, [skip.reason for skip in plan.export_skips]
+    # Power is full-slot: 3.2 kW for the slot in progress too.
+    assert export.selected_slots == (geom.slot_starts[0], geom.slot_starts[1])
+    assert export.slot_export_kw == pytest.approx((3.2, 3.2))
+    # Energy: the 1/3 h left of slot 0 plus the whole 18:00 slot.
+    assert plan.export_revenue == pytest.approx(3.2 * (1 / 3 + 0.5))
+    reservation = next(r for r in plan.reservations if r.name == "axle-export-event")
+    assert reservation.energy_kwh == pytest.approx(3.2 * (1 / 3 + 0.5))
+
+
+def test_midslot_slot_over_the_dno_limit_at_full_power_is_refused_not_capped() -> None:
+    """1 kW of forecast solar puts slot 0's full 4.2 kW over the 3.68 kW DNO limit.
+
+    The 20 minutes left of the slot don't shrink the power check: the slot is
+    refused outright, never capped, and the clean 18:00 slot still exports at
+    its full 3.2 kW.
+    """
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, 1, 5, 17, 40, tzinfo=tz)
+    config = cfg()
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    solar = [0.0] * len(geom.slot_starts)
+    solar[0] = 0.5  # 1 kW of full-slot solar power
+    plan = _plan(_midslot_export_inputs(now, config, tz, solar_slots=tuple(solar)), config)
+
+    export = plan.charge_intent.export
+    assert export is not None, [skip.reason for skip in plan.export_skips]
+    assert export.selected_slots == (geom.slot_starts[1],)
+    assert export.slot_export_kw == pytest.approx((3.2,))
+    assert any("DNO or supply limit" in skip.reason for skip in plan.export_skips)
+    assert plan.export_revenue == pytest.approx(3.2 * 0.5)
+
+
+def test_midslot_soc_path_drains_only_the_rest_of_slot_0() -> None:
+    """With the window ending 05:20, the 05:00-05:30 slot is 2/3 left, 2/3 window."""
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, 1, 6, 5, 10, tzinfo=tz)
+    config = cfg(window_end=time(5, 20))
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    assert geom.slot0_remaining_frac == pytest.approx(2 / 3)
+    loads = [0.0] * len(geom.slot_starts)
+    loads[0] = 0.15
+    plan = _plan(
+        PlannerInputs(
+            soc=_soc(50), solar_tomorrow_kwh=0, predicted_home_load_kwh=0,
+            now=now, geometry=geom, horizon_start=geom.horizon_start,
+            load_slots=tuple(loads),
+        ),
+        config,
+    )
+
+    assert plan.soc_path[0] == (geom.window_end, 50.0)
+    # 0.1 kWh of remaining energy, 1/3 of it outside the window: 0.0333 kWh.
+    assert plan.soc_path[1][1] == pytest.approx(50.0 - 0.1 / 3 / 26.88 * 100)
+
+
+def test_midslot_v2l_ledger_counts_only_the_rest_of_an_export_slot_0() -> None:
+    """An export overlapping the window's last partial slot drains what is left.
+
+    The window ends 05:20, so slot 0 (05:00-05:30) is both 2/3 covered and 2/3
+    left. The 05:00-06:00 event exports from it; the V2L ledger that sizes the
+    refill for the 06:30 shortfall sees only the 1/3 h still to come.
+    """
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, 1, 6, 5, 10, tzinfo=tz)
+    config = cfg(window_end=time(5, 20), v2l_budget_kwh=15)
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    event = FlexibilityEvent(
+        start=datetime(2026, 1, 6, 5, 0, tzinfo=tz),
+        end=datetime(2026, 1, 6, 6, 0, tzinfo=tz),
+        direction="export", updated_at=now, rate_gbp_kwh=1.0,
+    )
+    loads = [0.0] * len(geom.slot_starts)
+    loads[2] = 3.0
+    loads[4] = 3.0
+    plan = _plan(
+        PlannerInputs(
+            soc=_soc(50), solar_tomorrow_kwh=0, predicted_home_load_kwh=0,
+            now=now, geometry=geom, horizon_start=geom.horizon_start,
+            load_slots=tuple(loads), flexibility_event=event, car_plugged_in=True,
+        ),
+        config,
+    )
+
+    # 8.064 usable - 1.0667 exported from slot 0 - 1.6 from slot 1 - 3 at 05:30
+    # leaves 2.397 kWh: one 0.603 kWh refill covers the 06:30 slot's shortfall.
+    # Charging the elapsed 2/3 of slot 0 would need 1.136 kWh and two refills.
+    assert [(action.slot, action.kwh) for action in plan.v2l_refills] == [
+        (3, pytest.approx(3.0 - (26.88 * 0.30 - 3.2 / 3 - 1.6 - 3.0)))
+    ]
+
+
+def test_midslot_same_day_export_spends_only_the_rest_of_the_slot_in_progress() -> None:
+    """At 19:15 only 45 min of the 2.7 kW export drains before tonight's window."""
+    now = datetime(2026, 6, 8, 19, 15, tzinfo=UTC)
+    without = _plan(_same_day_inputs(soc_now=60.0, now=now, event=None), _same_day_cfg())
+    plan = _plan(_same_day_inputs(soc_now=60.0, now=now), _same_day_cfg())
+
+    export = plan.charge_intent.export
+    assert export is not None, [skip.reason for skip in plan.export_skips]
+    # Power unchanged: the full 2.7 kW for both slots, elapsed part included.
+    assert export.slot_export_kw == pytest.approx((2.7, 2.7))
+    assert plan.export_revenue == pytest.approx(2.7 * 0.75)
+    assert plan.required_kwh == pytest.approx(without.required_kwh + 2.7 * 0.75)
