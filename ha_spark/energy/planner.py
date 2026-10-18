@@ -30,7 +30,7 @@ window, or overlapping an Octopus dispatch, are "cheap"; the battery only needs
 to cover the *expensive* slots' net load (load - solar).
 
 Pre-window outflow P includes expensive net load before the window, selected
-exports before it and, until horizon activation, the legacy pre-window drain.
+exports before it. Legacy inputs also carry their separate pre-window drain.
 The reach-charge-window reservation traces P but is never funded by charging.
 Explicit geometry sizes charging from E_ws = max(0, usable_now - P), against the
 larger of post-window reservations and the buffered post-window deficit. Its
@@ -47,8 +47,7 @@ Events on explicit current-slot horizons use one suffix planner. Events before
 window end can spend only the battery energy already present; events before
 window start initially protect all house load through the window, without a
 solar or dispatch discount. Only bounded, strictly profitable post-event
-buy-back can spend that protection. Legacy pre-horizon events retain their
-same-day route until horizon activation is complete.
+buy-back can spend that protection. Events outside the horizon are skipped.
 
 Daytime dispatch slots are expressed as ``holds`` on the ``ChargeIntent``, so
 the battery holds (doesn't discharge) while cheap grid covers the house.
@@ -420,101 +419,6 @@ _DAYLIGHT_REFUSAL = (
 )
 
 
-def _same_day_export_plan(
-    inputs: PlannerInputs,
-    cfg: PlannerConfig,
-    schedule: TariffSchedule,
-    event: FlexibilityEvent,
-    horizon_start: datetime,
-    now: datetime,
-    load_slots: tuple[float, ...],
-) -> tuple[
-    ExportIntent | None,
-    tuple[ExportSkip, ...],
-    str | None,
-    float | None,
-    datetime | None,
-]:
-    """Plan an export event that ends before tonight's horizon start (#198).
-
-    The horizon begins at tonight's charge window, so an event later today lies
-    before it, after last night's charge. It is funded from the live SoC: house
-    load from now through the event, plus the buffered load from the event end
-    until the window opens, stays in the battery. Only what is left of the slot
-    in progress counts, so a replan during the event keeps exporting.
-
-    Today's solar isn't forecast: the horizon's profile is tomorrow's. Night
-    looks the same on both days whatever the weather, so a slot is refused
-    wherever tomorrow's forecast shows solar, and the rest are checked against
-    the DNO limit with none. Solar never counts towards funding.
-
-    Today's prices aren't in the schedule either, so buying back a spent
-    post-event reserve is priced at the standard rate.
-    """
-    n = len(load_slots)
-    solar_slots = inputs.solar_slots or (0.0,) * n
-
-    def in_event(start: datetime) -> bool:
-        return event.start <= start and start + timedelta(minutes=30) <= event.end
-
-    # The horizon repeats one day's profile from the window start, so the slot
-    # k half-hours before it shares its time of day with horizon slot n - k.
-    day = [
-        (horizon_start - timedelta(minutes=30 * k), load_slots[n - k], solar_slots[n - k])
-        for k in range(n, 0, -1)
-    ]
-    # (start, load kWh, solar kWh, hours left) for each slot not yet over.
-    remaining = [
-        (start, load, solar, min(0.5, (start + timedelta(minutes=30) - now).total_seconds() / 3600))
-        for start, load, solar in day
-        if start + timedelta(minutes=30) > now
-    ]
-    slots = [
-        _EventSlot(start, 0.0, load * 2, hours, _DAYLIGHT_REFUSAL if solar > 1e-9 else None)
-        for start, load, solar, hours in remaining
-        if in_event(start)
-    ]
-    if not slots:
-        return None, (
-            ExportSkip(
-                event.start,
-                "Skipped paid event: no complete slot of it is left before tonight's "
-                "charge window.",
-            ),
-        ), None, None, None
-
-    event_end = slots[-1].start + timedelta(minutes=30)
-    through_event = sum(
-        load * hours * 2 for start, load, _, hours in remaining if start < event_end
-    )
-    post_event = sum(load for start, load, _, _ in remaining if start >= event_end)
-    usable_now = max(0.0, cfg.capacity_kwh * (inputs.soc_now - cfg.min_soc) / 100.0)
-    buffered_post_energy = post_event * (1.0 + cfg.buffer_pct / 100.0)
-    post_energy = buffered_post_energy
-    available = max(0.0, usable_now - through_event - post_energy)
-    reserve = _Reserve(
-        energy=min(post_energy, max(0.0, usable_now - through_event)),
-        event_rate=event.rate_gbp_kwh,
-        efficiency=cfg.charge_efficiency if cfg.charge_efficiency > 0 else 1.0,
-        price_for=lambda _shortfall: schedule.standard_rate,
-    )
-    selected, skips, spent = _select_export_suffix(slots, available, cfg, schedule, reserve)
-    house_energy_by_start = {slot.start: slot.load_kw * slot.hours for slot in slots}
-    needed_pct, needed_at = _export_soc_needed(
-        slots, selected, skips, house_energy_by_start, buffered_post_energy, cfg
-    )
-    if not selected:
-        return None, skips, None, needed_pct, needed_at
-
-    # Once the event is under way, keep the start it was armed with: dropping a
-    # finished slot changes nothing on the inverter but costs a Slot 1 write.
-    window_start = selected[0][0].start
-    if window_start == slots[0].start:
-        window_start = next(start for start, _, _ in day if in_event(start))
-    funding = reserve.funding(spent) if spent > 1e-9 else None
-    return _export_intent(event, cfg, window_start, selected), skips, funding, needed_pct, needed_at
-
-
 def _event_export_plan(
     inputs: PlannerInputs,
     cfg: PlannerConfig,
@@ -545,17 +449,6 @@ def _event_export_plan(
     event = inputs.flexibility_event
     if event is None or event.direction != "export" or inputs.horizon_start is None:
         return None, (), (), None, None, None, False
-    if (
-        inputs.geometry is None
-        and inputs.now is not None
-        and inputs.load_slots is not None
-        and event.end <= inputs.horizon_start
-    ):
-        export, skips, funding, needed_pct, needed_at = _same_day_export_plan(
-            inputs, cfg, schedule, event, inputs.horizon_start, inputs.now, inputs.load_slots
-        )
-        return export, (), skips, funding, needed_pct, needed_at, False
-
     geometry = inputs.geometry_for(cfg)
     assert geometry is not None
     event_slots: list[int] = []
@@ -1010,7 +903,7 @@ def compute_plan(
         export_kwh = max(0.0, effective_solar - inputs.predicted_home_load_kwh)
 
     buffered_deficit = deficit * (1.0 + cfg.buffer_pct / 100.0)
-    # Until horizon activation, the legacy drain still covers load outside
+    # On legacy inputs, the separate drain still covers load outside
     # the slot horizon. Selected exports before the window spend energy too.
     pre_window_export_kwh = (
         sum(

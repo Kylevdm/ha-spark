@@ -1,4 +1,4 @@
-"""Tests for the daily scheduled plan/apply loop."""
+"""Tests for the half-hourly scheduled plan/apply loop."""
 
 from __future__ import annotations
 
@@ -40,6 +40,173 @@ from ha_spark.energy.scheduler import (
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor
 from ha_spark.ha.rest import HomeAssistantRest
+
+
+@respx.mock
+@pytest.mark.parametrize("initial_soc", [45.0, 80.0])
+@pytest.mark.parametrize("new_input", ["dispatch", "event"])
+async def test_live_current_horizon_ticks_skip_writes_then_absorb_new_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, initial_soc: float, new_input: str,
+) -> None:
+    """Real gather/planner/Solis sizing and read-back, seeded by a verified apply."""
+    from ha_spark.devices.inverters import solis
+    from ha_spark.energy import axle
+
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, 1, 5, 18, 0, tzinfo=tz)
+    profile = tuple(0.2 + i * 0.001 for i in range(48))
+    dispatches: list[dict[str, object]] = []
+    event: dict[str, str] = {}
+    states = {
+        "select.power": "On",
+        "sensor.solis_control_work_mode_bitfield": "35",
+        "sensor.solis_control_timed_charge_current": "0",
+        "sensor.solis_control_timed_discharge_current": "0",
+    }
+    fields = (
+        "timed_charge_start_hours", "timed_charge_start_minutes",
+        "timed_charge_end_hours", "timed_charge_end_minutes",
+        "timed_discharge_start_hours", "timed_discharge_start_minutes",
+        "timed_discharge_end_hours", "timed_discharge_end_minutes",
+    )
+    for suffix in ("", "_2", "_3"):
+        for field in fields:
+            states[f"sensor.solis_control_{field}{suffix}"] = "0"
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            return cls.fromtimestamp(now.timestamp(), tz or UTC)
+
+    async def fake_load(_s: Settings, **kw: object) -> LoadForecast:
+        return LoadForecast(
+            total_kwh=sum(profile), slots=profile, source="slot profile (14d hourly house stats)",
+            target_date=kw["target"],
+        )
+
+    async def noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    def get_state(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/vpp/home-assistant/event":
+            return httpx.Response(200, json=event)
+        entity = request.url.path.rsplit("/", 1)[-1]
+        if entity == "sensor.solis_control_inverter_clock":
+            states[entity] = now.strftime("%y,%m,%d,%H,%M,%S")
+        attrs = {"planned_dispatches": dispatches} if entity == "binary_sensor.dispatch" else {}
+        state = "off" if entity == "binary_sensor.dispatch" else states.get(entity)
+        if state is None:
+            return httpx.Response(404)
+        return httpx.Response(200, json={
+            "entity_id": entity, "state": state, "attributes": attrs,
+            "last_reported": now.isoformat(), "last_updated": now.isoformat(),
+        })
+
+    def write_register(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/api/services/modbus/write_register":
+            return httpx.Response(200, json=[])
+        payload = json.loads(request.content)
+        address, value = payload["address"], payload["value"]
+        if address == 43141:
+            states["sensor.solis_control_timed_charge_current"] = str(value / 10)
+        elif address == 43142:
+            states["sensor.solis_control_timed_discharge_current"] = str(value / 10)
+        elif address in (43143, 43153, 43163):
+            suffix = {43143: "", 43153: "_2", 43163: "_3"}[address]
+            for field, item in zip(fields, value, strict=True):
+                states[f"sensor.solis_control_{field}{suffix}"] = str(item)
+        return httpx.Response(200, json=[])
+
+    monkeypatch.setattr(sources, "datetime", FixedDatetime)
+    monkeypatch.setattr(scheduler, "datetime", FixedDatetime)
+    monkeypatch.setattr(solis, "datetime", FixedDatetime)
+    monkeypatch.setattr(axle, "datetime", FixedDatetime)
+    monkeypatch.setattr(solis, "_READ_BACK_DELAY_SECONDS", 0)
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
+    monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
+    respx.route(method="GET").mock(side_effect=get_state)
+    respx.route(method="POST").mock(side_effect=write_register)
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", proactive_mode="on", timezone="Europe/London",
+        db_path=str(tmp_path / "ledger.db"), v2l_power_entity="",
+        inverter_power_switch_entity="select.power", dispatch_entity="binary_sensor.dispatch",
+        latitude=0.0, longitude=0.0, charge_buffer_pct=0.0,
+        export_event_provider="axle", axle_api_url="http://axle.test", axle_api_key="test-key",
+    )
+
+    def checked_soc(value: float) -> SocMeasurement:
+        return SocMeasurement(
+            status=SocStatus.OK, observed_at=now, value=value, reported_at=now,
+            raw_state=str(value), age_s=0.0, max_age_s=600.0,
+        )
+
+    baseline = await run_once(settings, soc=checked_soc(initial_soc))
+    assert baseline.applied_plan is baseline.plan
+    if initial_soc == 45.0:
+        assert baseline.plan.required_kwh > 0
+    else:
+        assert baseline.plan.required_kwh == 0
+    target = baseline.plan.target_soc
+    intent = baseline.plan.charge_intent
+    assert intent is not None
+    rate = _planned_w(settings, intent)  # real Solis current, not a sizing stub
+    baseline_calls = len(respx.calls)
+    observed_soc = initial_soc
+    previous = baseline.applied_plan
+    for slot in (36, 37):
+        observed_soc -= profile[slot] / settings.battery_capacity_kwh * 100
+        now += timedelta(minutes=30)
+        result = await run_once(settings, soc=checked_soc(observed_soc), previous_plan=previous)
+        assert result.plan.target_soc == pytest.approx(target)
+        assert result.plan.charge_intent is not None
+        assert _planned_w(settings, result.plan.charge_intent) == rate
+        assert result.applied_plan is baseline.plan
+        assert result.apply_lines == ()
+        previous = result.applied_plan
+    assert not [
+        call for call in list(respx.calls)[baseline_calls:]
+        if call.request.url.path.startswith("/api/services/")
+    ]
+
+    # New inputs are read on the next ordinary slot tick, without an extra trigger.
+    if new_input == "dispatch":
+        dispatches.append({
+            "start": "2026-01-05T20:00:00+00:00", "end": "2026-01-05T20:30:00+00:00",
+            "charge_in_kwh": -2.0, "source": "SMART",
+        })
+    else:
+        event.update({
+            "start_time": "2026-01-05T21:00:00+00:00",
+            "end_time": "2026-01-05T21:30:00+00:00",
+            "import_export": "export", "updated_at": now.isoformat(),
+        })
+    observed_soc -= profile[38] / settings.battery_capacity_kwh * 100
+    now += timedelta(minutes=30)
+    changed = await run_once(settings, soc=checked_soc(observed_soc), previous_plan=previous)
+    assert changed.plan.charge_intent is not None
+    if new_input == "dispatch":
+        assert changed.plan.charge_intent.holds == ((
+            datetime(2026, 1, 5, 20, 0, tzinfo=tz), datetime(2026, 1, 5, 20, 30, tzinfo=tz),
+        ),)
+    else:
+        assert changed.plan.charge_intent.export is not None
+        assert states["sensor.solis_control_timed_discharge_start_hours"] == "21"
+        assert states["sensor.solis_control_timed_discharge_end_minutes"] == "30"
+    assert changed.apply_lines  # a normal tick reached apply, with no extra trigger
+    assert changed.applied_plan is changed.plan
+    if new_input == "event":
+        # Once armed, even an identical replan must still take apply (#148).
+        repeated = await run_once(
+            settings, soc=checked_soc(observed_soc), previous_plan=changed.applied_plan
+        )
+        assert repeated.plan.charge_intent == changed.plan.charge_intent
+        assert repeated.apply_lines
+        assert repeated.applied_plan is repeated.plan
+    async with ForecastLedger(settings.db_path) as ledger:
+        rows = await ledger.forecasts_since(date(2026, 1, 5))
+    assert rows
+    assert all(row.target_date == date(2026, 1, 6) and row.slots == profile for row in rows)
 
 
 def _soc(value: float) -> SocMeasurement:
@@ -458,7 +625,7 @@ async def test_run_once_records_the_served_day_forecast_in_day_order(
     assert row.model == "slots"
     assert row.total_kwh == plan.load_kwh
     assert row.source == "slot profile (14d hourly house stats)"
-    # Slot-of-day order (0.0 at 00:00), not the horizon order (47.0 first).
+    # Slot-of-day order (0.0 at 00:00), not the current-half-hour horizon order.
     assert row.slots == tuple(float(i) for i in range(SLOTS_PER_DAY))
 
 

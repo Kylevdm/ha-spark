@@ -158,21 +158,37 @@ def test_build_config_threads_export_limits_to_the_pure_planner() -> None:
         ),
     ],
 )
-def test_slot_horizon_starts_at_the_running_or_next_charge_window(
+@respx.mock
+async def test_gather_inputs_starts_now_and_locates_the_running_or_next_window(
+    monkeypatch: pytest.MonkeyPatch,
     now: datetime,
     window_start: time,
     window_end: time,
     expected_start: datetime,
     expected_first_slot: float,
 ) -> None:
-    day_slots = tuple(float(i) for i in range(48))
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(
+            total_kwh=1128.0, slots=tuple(float(i) for i in range(48)), source="test"
+        )
 
-    rotated, horizon_start = sources._slot_horizon(
-        day_slots, window_start, window_end, _HOUSEHOLD_TZ, now
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    monkeypatch.setattr(sources, "datetime", _frozen_clock(now))
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    settings = _settings().model_copy(update={
+        "charge_window_start": window_start.strftime("%H:%M"),
+        "charge_window_end": window_end.strftime("%H:%M"),
+    })
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        inputs, _, _ = await gather_inputs(settings, rest)
+    assert inputs.geometry is not None
+    assert inputs.geometry.window_start == expected_start
+    assert expected_start.hour * 2 + expected_start.minute // 30 == expected_first_slot
+    assert inputs.horizon_start == now.replace(
+        minute=now.minute // 30 * 30, second=0, microsecond=0
     )
-
-    assert horizon_start == expected_start
-    assert rotated[0] == expected_first_slot
+    assert inputs.load_slots is not None
+    assert inputs.load_slots[0] == now.hour * 2 + now.minute // 30
 
 
 @respx.mock
@@ -736,7 +752,10 @@ async def test_invalid_today_solar_counts_today_as_zero(
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         inputs, _, _ = await gather_inputs(s, rest)
 
-    assert inputs.solar_slots == (0.0,) * 48
+    assert inputs.geometry is not None
+    assert inputs.horizon_start == datetime(2026, 6, 8, 1, 0, tzinfo=_HOUSEHOLD_TZ)
+    assert len(inputs.geometry.slot_starts) == 45
+    assert inputs.solar_slots == (0.0,) * len(inputs.geometry.slot_starts)
     assert inputs.solar_tomorrow_kwh == 0.0
 
 
@@ -757,13 +776,13 @@ async def test_invalid_tomorrow_solar_counts_only_that_date_as_zero(
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
     monkeypatch.setattr(sources, "datetime", _frozen_clock(_DAYTIME_NOW))
     respx.get(f"{BASE}/states/sensor.soc").mock(return_value=_state("sensor.soc", "50"))
-    # Today's entity forecasts 3 kWh at 23:30 tonight, tonight's window start.
+    # Today's entity forecasts 3 kWh after this daytime replan.
     respx.get(f"{BASE}/states/sensor.solar_today").mock(
         return_value=_state(
             "sensor.solar_today",
             "3.0",
             {"detailedForecast": [
-                {"period_start": "2026-06-08T23:30:00+01:00", "pv_estimate": 1.0}
+                {"period_start": "2026-06-08T17:00:00+01:00", "pv_estimate": 1.0}
             ]},
         )
     )
@@ -776,10 +795,14 @@ async def test_invalid_tomorrow_solar_counts_only_that_date_as_zero(
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         inputs, _, _ = await gather_inputs(s, rest)
 
-    # Horizon slot 0 is tonight's window start (Monday 23:30), a today-dated
-    # slot; every other slot is tomorrow's date, which reads invalid.
-    assert inputs.horizon_start == datetime(2026, 6, 8, 23, 30, tzinfo=_HOUSEHOLD_TZ)
-    assert inputs.solar_slots == (3.0,) + (0.0,) * 47
+    assert inputs.geometry is not None
+    assert inputs.horizon_start == _DAYTIME_NOW.replace(minute=0, second=0, microsecond=0)
+    assert inputs.solar_slots is not None
+    assert len(inputs.solar_slots) == len(inputs.geometry.slot_starts)
+    for start, solar in zip(inputs.geometry.slot_starts, inputs.solar_slots, strict=True):
+        local = start.astimezone(_HOUSEHOLD_TZ)
+        expected = 3.0 if local == datetime(2026, 6, 8, 17, 0, tzinfo=_HOUSEHOLD_TZ) else 0.0
+        assert solar == expected
     assert inputs.solar_tomorrow_kwh == 0.0
 
 

@@ -1,4 +1,9 @@
-"""Gather live planner inputs from Home Assistant (REST reads)."""
+"""Gather live planner inputs from Home Assistant (REST reads).
+
+Slot horizons start at the current half-hour and end at the window following
+the running-or-next charge window. Daily load profiles use household clock time;
+solar uses each slot's calendar date. The planner prorates slot 0's energy.
+"""
 
 from __future__ import annotations
 
@@ -198,17 +203,14 @@ def _solar_reading(
 
 def _solar_slots(
     readings: dict[date, _SolarDayReading | None],
-    horizon_start: datetime,
+    slot_starts: tuple[datetime, ...],
     tz: ZoneInfo,
 ) -> tuple[float, ...]:
-    """Lay each date's solar onto the 48-slot horizon by local clock time.
+    """Lay each date's daily solar profile onto real half-hours by household clock.
 
-    Solar is forecast per calendar date (#398): today's entity covers
-    today's slots, the tomorrow entity tomorrow's, and any other date in the
-    horizon (yesterday's tail of a running window) is zero. Each date's
-    48-value profile keeps its local slot order; slot i's clock time is the
-    window-start clock plus 30 i minutes of wall clock, exactly the legacy
-    rotation ``_slot_horizon`` lays the load profile onto.
+    Today's entity covers today, the tomorrow entity tomorrow, and any other
+    calendar date is zero. Daily profiles stay in 48-value local clock order,
+    including when the horizon crosses a DST transition.
     """
     profiles: dict[date, tuple[float, ...]] = {}
     for day, reading in readings.items():
@@ -217,45 +219,11 @@ def _solar_slots(
         else:
             profiles[day] = distribute_solar(reading.total_kwh, reading.detailed, tz, day)
     values: list[float] = []
-    for i in range(SLOTS_PER_DAY):
-        local = horizon_start + timedelta(minutes=30 * i)
+    for start in slot_starts:
+        local = start.astimezone(tz)
         profile = profiles.get(local.date())
         values.append(profile[local.hour * 2 + local.minute // 30] if profile else 0.0)
     return tuple(values)
-
-
-def _slot_horizon(
-    day_slots: tuple[float, ...],
-    window_start: time,
-    window_end: time,
-    tz: ZoneInfo,
-    now: datetime,
-) -> tuple[tuple[float, ...], datetime]:
-    """Rotate slot-of-day values so index 0 is the running or next window start.
-
-    The horizon spans two calendar days but uses one day's profile values
-    throughout — adjacent days share a day-type often enough that the error in
-    the first day's slots is negligible.
-    """
-    start_idx = window_start.hour * 2 + window_start.minute // 30
-    rotated = tuple(day_slots[(start_idx + i) % SLOTS_PER_DAY] for i in range(SLOTS_PER_DAY))
-
-    now_time = now.time()
-    if window_start >= window_end:
-        in_window = now_time >= window_start or now_time < window_end
-    else:
-        in_window = window_start <= now_time < window_end
-
-    origin_date = now.date()
-    # Only a wrapping window before its start began yesterday; otherwise use today or next start.
-    if in_window:
-        if window_start >= window_end and now_time < window_start:
-            origin_date -= timedelta(days=1)
-    elif now_time >= window_start:
-        origin_date += timedelta(days=1)
-
-    horizon_start = datetime.combine(origin_date, window_start, tzinfo=tz)
-    return rotated, horizon_start
 
 
 def pre_window_drain(
@@ -263,8 +231,8 @@ def pre_window_drain(
 ) -> float:
     """Forecast battery drain (kWh) from ``now`` until the charge window opens.
 
-    The planner horizon starts at the window, so this load is otherwise
-    invisible. 0 when already inside the window, or when the window is more
+    Used by the daily-balance fallback; slot horizons account for this load
+    directly. 0 when already inside the window, or when the window is more
     than 12 h away (a daytime manual run shouldn't dock half a day of load).
     """
     if _in_overnight_window(now.time(), window_start, window_end):
@@ -625,10 +593,8 @@ async def gather_inputs(
     window_start = parse_time(settings.charge_window_start)
     window_end = parse_time(settings.charge_window_end)
     now = datetime.now(tz)
-    # The load forecast targets the served day (#397): the local date the
-    # running-or-next charge window ends. The horizon itself still starts at
-    # the window (activated in #404); only the forecast's target day moves.
-    served_day = compute_horizon_geometry(now, window_start, window_end, tz).served_day
+    geometry = compute_horizon_geometry(now, window_start, window_end, tz)
+    served_day = geometry.served_day
     forecast = await predict_home_load(settings, lat=lat, lon=lon, target=served_day)
     # Solar is forecast per calendar date (#398): today's from the optional
     # today's-solar entity, tomorrow's from the existing tomorrow entity. A
@@ -661,16 +627,21 @@ async def gather_inputs(
             dropped.end.isoformat(),
             plug_value or "unreadable",
         )
-    drain = pre_window_drain(forecast, now, window_start, window_end)
+    drain = 0.0
 
     load_slots: tuple[float, ...] | None = None
     solar_slots: tuple[float, ...] | None = None
     horizon_start: datetime | None = None
     if forecast.slots is not None:
-        load_slots, horizon_start = _slot_horizon(
-            forecast.slots, window_start, window_end, tz, now
+        horizon_start = geometry.horizon_start
+        load_slots = tuple(
+            forecast.slots[local.hour * 2 + local.minute // 30]
+            for start in geometry.slot_starts
+            for local in (start.astimezone(tz),)
         )
-        solar_slots = _solar_slots(readings, horizon_start, tz)
+        solar_slots = _solar_slots(readings, geometry.slot_starts, tz)
+    else:
+        drain = pre_window_drain(forecast, now, window_start, window_end)
 
     inputs = PlannerInputs(
         soc=soc_measurement,
@@ -687,6 +658,7 @@ async def gather_inputs(
         load_slots=load_slots,
         solar_slots=solar_slots,
         horizon_start=horizon_start,
+        geometry=geometry if load_slots is not None else None,
         now=now,
         dynamic_prices=dynamic_prices,
         unrated_dispatches=unrated_dispatches,

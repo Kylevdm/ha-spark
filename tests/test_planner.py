@@ -432,9 +432,14 @@ def _same_day_cfg() -> PlannerConfig:
     return cfg(battery_discharge_ceiling_kw=3.2, dno_export_limit_kw=3.68)
 
 
+def _same_day_plan(inputs: PlannerInputs, config: PlannerConfig) -> Any:
+    """Exercise the former same-day cases through the live current-slot horizon."""
+    return _plan(_current_event_inputs(inputs, config), config)
+
+
 def test_same_day_export_is_funded_from_the_live_soc() -> None:
     """An event earlier than tonight's window is planned from the battery as it is now."""
-    plan = _plan(
+    plan = _same_day_plan(
         _same_day_inputs(soc_now=60.0, now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC)),
         _same_day_cfg(),
     )
@@ -452,7 +457,7 @@ def test_same_day_export_is_funded_from_the_live_soc() -> None:
 
 def test_same_day_export_reports_soc_needed_for_the_funded_suffix() -> None:
     event = replace(_SAME_DAY_EVENT, rate_gbp_kwh=0.20)
-    plan = _plan(
+    plan = _same_day_plan(
         _same_day_inputs(
             soc_now=43.0,
             now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC),
@@ -473,8 +478,8 @@ def test_same_day_export_reports_soc_needed_for_the_funded_suffix() -> None:
 def test_same_day_export_leaves_tonights_charge_to_refill_what_it_spent() -> None:
     """Tonight's charge is sized after the export, not zeroed by it."""
     now = datetime(2026, 6, 8, 16, 0, tzinfo=UTC)
-    without = _plan(_same_day_inputs(soc_now=60.0, now=now, event=None), _same_day_cfg())
-    with_export = _plan(_same_day_inputs(soc_now=60.0, now=now), _same_day_cfg())
+    without = _same_day_plan(_same_day_inputs(soc_now=60.0, now=now, event=None), _same_day_cfg())
+    with_export = _same_day_plan(_same_day_inputs(soc_now=60.0, now=now), _same_day_cfg())
 
     assert with_export.charge_intent.export is not None
     assert without.required_kwh > 0.0
@@ -484,7 +489,7 @@ def test_same_day_export_leaves_tonights_charge_to_refill_what_it_spent() -> Non
 
 def test_same_day_export_keeps_the_slot_in_progress() -> None:
     """A replan during the event must not shorten or clear the running window."""
-    plan = _plan(
+    plan = _same_day_plan(
         _same_day_inputs(soc_now=60.0, now=datetime(2026, 6, 8, 19, 0, 30, tzinfo=UTC)),
         _same_day_cfg(),
     )
@@ -497,7 +502,7 @@ def test_same_day_export_keeps_the_slot_in_progress() -> None:
 
 def test_same_day_export_keeps_its_window_once_a_slot_has_finished() -> None:
     """At 19:30 the window stays 19:00-20:00, so Slot 1 isn't rewritten mid-event."""
-    plan = _plan(
+    plan = _same_day_plan(
         _same_day_inputs(soc_now=60.0, now=datetime(2026, 6, 8, 19, 30, 30, tzinfo=UTC)),
         _same_day_cfg(),
     )
@@ -519,7 +524,7 @@ def test_same_day_export_counts_only_what_is_left_of_the_slot_in_progress() -> N
     # the 19:00 slot) + 1.35 + 0.25 (19:30) + 1.75 (20:00-23:30) = 4.15 kWh.
     # Counting the 19:00 slot in full would need 4.95 kWh and drop it.
     soc = 20.0 + 4.5 / 26.88 * 100.0  # 4.5 kWh usable
-    plan = _plan(
+    plan = _same_day_plan(
         _same_day_inputs(soc_now=soc, now=datetime(2026, 6, 8, 19, 15, tzinfo=UTC)),
         _same_day_cfg(),
     )
@@ -537,7 +542,7 @@ def test_same_day_export_refuses_a_slot_with_forecast_daylight() -> None:
         solar_slots=daylight_at_19_30,
     )
 
-    plan = _plan(inputs, _same_day_cfg())
+    plan = _same_day_plan(inputs, _same_day_cfg())
 
     assert plan.charge_intent.export is None
     assert any("daylight" in skip.reason for skip in plan.export_skips)
@@ -547,8 +552,8 @@ def test_same_day_export_frees_headroom_for_tonights_charge() -> None:
     """At the cap, a fill-to-cap night still refills what the event exports."""
     now = datetime(2026, 6, 8, 16, 0, tzinfo=UTC)
     fill = replace(_same_day_cfg(), strategy="fill")
-    without = _plan(_same_day_inputs(soc_now=90.0, now=now, event=None), fill)
-    with_export = _plan(_same_day_inputs(soc_now=90.0, now=now), fill)
+    without = _same_day_plan(_same_day_inputs(soc_now=90.0, now=now, event=None), fill)
+    with_export = _same_day_plan(_same_day_inputs(soc_now=90.0, now=now), fill)
 
     assert with_export.charge_intent.export is not None
     assert with_export.required_kwh == pytest.approx(without.required_kwh + 2.7)
@@ -556,7 +561,7 @@ def test_same_day_export_frees_headroom_for_tonights_charge() -> None:
 
 def test_same_day_export_skips_when_the_live_soc_cannot_fund_it() -> None:
     """At 30% only 2.69 kWh is usable: less than the 3.75 kWh house load to 23:30."""
-    plan = _plan(
+    plan = _same_day_plan(
         _same_day_inputs(soc_now=30.0, now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC)),
         _same_day_cfg(),
     )
@@ -593,43 +598,6 @@ def _current_event_inputs(legacy: PlannerInputs, config: PlannerConfig) -> Plann
     )
 
 
-@pytest.mark.parametrize(
-    ("soc", "hour", "minute", "rate", "buffer"),
-    [
-        (60.0, 16, 0, 1.0, 0.0),  # fully funded
-        (43.0, 16, 0, 0.20, 20.0),  # funding suffix and full SoC obligation
-        (30.0, 16, 0, 1.0, 0.0),  # no charge borrowed from tonight
-        (20.0 + 5.6 / 26.88 * 100, 16, 0, 1.0, 0.0),  # profitable reserve
-        (20.0 + 4.5 / 26.88 * 100, 16, 0, 1.0, 0.0),  # bounded reserve
-        (20.0 + 4.5 / 26.88 * 100, 19, 15, 1.0, 0.0),  # remaining energy
-        (60.0, 19, 30, 1.0, 0.0),  # kept armed start
-    ],
-)
-def test_current_event_matches_legacy_same_day_funding(
-    soc: float, hour: int, minute: int, rate: float, buffer: float
-) -> None:
-    config = replace(_same_day_cfg(), buffer_pct=buffer)
-    legacy = _same_day_inputs(
-        soc_now=soc, now=datetime(2026, 6, 8, hour, minute, tzinfo=UTC),
-        event=replace(_SAME_DAY_EVENT, rate_gbp_kwh=rate),
-    )
-    expected = _plan(legacy, config)
-    actual = _plan(_current_event_inputs(legacy, config), config)
-
-    assert actual.charge_intent.export == expected.charge_intent.export
-    assert actual.export_skips == expected.export_skips
-    assert actual.export_funding == expected.export_funding
-    assert actual.export_soc_needed_pct == pytest.approx(expected.export_soc_needed_pct)
-    assert actual.export_soc_needed_at == expected.export_soc_needed_at
-    assert actual.export_revenue == pytest.approx(expected.export_revenue)
-    # The event's reservations are carried from now; tonight's charge still
-    # owes the post-window reservation, as on the legacy route.
-    assert actual.reservations[-1].name == expected.reservations[-1].name
-    assert actual.reservations[-1].energy_kwh == pytest.approx(
-        expected.reservations[-1].energy_kwh
-    )
-
-
 @pytest.mark.parametrize("guard", ["daylight", "dno", "supply", "hold", "capacity"])
 def test_current_event_preserves_hard_refusals_and_suffix_termination(guard: str) -> None:
     config = _same_day_cfg()
@@ -658,11 +626,15 @@ def test_current_event_preserves_hard_refusals_and_suffix_termination(guard: str
     else:
         legacy = replace(legacy, load_slots=(0.25,) * 40 + (2.0,) + (0.25,) * 7)
 
-    expected = _plan(legacy, config)
     actual = _plan(_current_event_inputs(legacy, config), config)
 
     assert actual.charge_intent.export is None
-    assert actual.export_skips == expected.export_skips
+    assert len(actual.export_skips) == 2
+    assert (
+        actual.export_skips[0].reason == reasons[guard]
+        if guard in {"dno", "supply"}
+        else "a later slot is unavailable" in actual.export_skips[0].reason
+    )
     assert actual.export_skips[-1].reason == reasons[guard]
     assert actual.export_soc_needed_pct is None  # more SoC cannot repair a hard refusal
     assert actual.export_funding is None
@@ -988,7 +960,7 @@ def test_same_day_export_spends_the_post_event_reserve_at_the_standard_rate() ->
     # 5.6 kWh usable: 2.0 kWh of house load to 20:00, 1.75 kWh reserved to the
     # 23:30 window, then 1.85 kWh for two 1.35 kWh slots. 0.85 kWh is short.
     soc = 20.0 + 5.6 / 26.88 * 100.0
-    plan = _plan(
+    plan = _same_day_plan(
         _same_day_inputs(soc_now=soc, now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC)),
         _same_day_cfg(),
     )
@@ -1005,7 +977,7 @@ def test_same_day_export_never_spends_more_than_the_post_event_reserve() -> None
     # 4.5 kWh usable leaves 0.75 kWh after house load and the reserve: the
     # 1.75 kWh reserve can fund one 1.35 kWh slot but not both (2.7 > 2.5).
     soc = 20.0 + 4.5 / 26.88 * 100.0
-    plan = _plan(
+    plan = _same_day_plan(
         _same_day_inputs(soc_now=soc, now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC)),
         _same_day_cfg(),
     )
@@ -1944,8 +1916,8 @@ def test_midslot_v2l_ledger_counts_only_the_rest_of_an_export_slot_0() -> None:
 def test_midslot_same_day_export_spends_only_the_rest_of_the_slot_in_progress() -> None:
     """At 19:15 only 45 min of the 2.7 kW export drains before tonight's window."""
     now = datetime(2026, 6, 8, 19, 15, tzinfo=UTC)
-    without = _plan(_same_day_inputs(soc_now=60.0, now=now, event=None), _same_day_cfg())
-    plan = _plan(_same_day_inputs(soc_now=60.0, now=now), _same_day_cfg())
+    without = _same_day_plan(_same_day_inputs(soc_now=60.0, now=now, event=None), _same_day_cfg())
+    plan = _same_day_plan(_same_day_inputs(soc_now=60.0, now=now), _same_day_cfg())
 
     export = plan.charge_intent.export
     assert export is not None, [skip.reason for skip in plan.export_skips]

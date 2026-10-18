@@ -3,14 +3,14 @@
 Flipped from ``research/200-horizon-after-midnight`` (which pinned the old
 behaviour): a replan inside Sunday night's running charge window now sizes
 against *Monday's* load profile — the day the charge serves — instead of
-Tuesday's. The horizon itself still starts at the running-or-next window
-(the current-slot horizon is activated in #404); only the forecast's target
-day moves, so the plan describes the day it is living through.
+Tuesday's. The horizon starts at the current half-hour, with daily profiles
+laid onto real half-hours by the household clock.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -20,8 +20,10 @@ import respx
 
 from ha_spark.config import Settings
 from ha_spark.energy import forecast, sources
-from ha_spark.energy.models import LoadForecast, PlannerInputs, SlotProfile
+from ha_spark.energy.models import DispatchSlot, LoadForecast, PlannerInputs, SlotProfile
+from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+from ha_spark.energy.sources import build_config, build_schedule
 from ha_spark.ha.rest import HomeAssistantRest
 
 TZ = ZoneInfo("Europe/London")
@@ -51,6 +53,7 @@ async def _gather(
     now: datetime,
     window: tuple[str, str],
     *,
+    daily_slots: tuple[float, ...] | None = None,
     solar_today_entity: str = "",
     solar_today: tuple[str, dict[str, Any]] | None = None,
     solar_tomorrow: tuple[str, dict[str, Any]] | None = None,
@@ -75,7 +78,7 @@ async def _gather(
 
     def day_slots(_profile: SlotProfile, target: date) -> tuple[float, ...]:
         observed.append(target)
-        return (0.25 if target == MONDAY else 0.5,) * 48
+        return daily_slots or (0.25 if target == MONDAY else 0.5,) * 48
 
     monkeypatch.setattr(forecast, "statistics_during_period", no_statistics)
     monkeypatch.setattr(
@@ -133,17 +136,17 @@ async def _gather(
 
 @respx.mock
 @pytest.mark.parametrize(
-    ("now", "served", "horizon_start", "load_kwh", "drain"),
+    ("now", "served", "horizon_start", "load_kwh", "slot_count"),
     [
         # Before the window: tonight's window (Sun 23:30) serves Monday.
-        (at(SUNDAY, 23, 0), MONDAY, at(SUNDAY, 23, 30), 12.0, 0.25),
+        (at(SUNDAY, 23, 0), MONDAY, at(SUNDAY, 23, 0), 12.0, 49),
         # Inside Sunday night's running window: the charge serves Monday, not
         # Tuesday (#200) — the whole 00:30–05:30 stretch replans on Monday.
-        (at(MONDAY, 0, 30), MONDAY, at(SUNDAY, 23, 30), 12.0, 0.0),
-        (at(MONDAY, 1, 0), MONDAY, at(SUNDAY, 23, 30), 12.0, 0.0),
-        (at(MONDAY, 5, 0), MONDAY, at(SUNDAY, 23, 30), 12.0, 0.0),
+        (at(MONDAY, 0, 30), MONDAY, at(MONDAY, 0, 30), 12.0, 46),
+        (at(MONDAY, 1, 0), MONDAY, at(MONDAY, 1, 0), 12.0, 45),
+        (at(MONDAY, 5, 0), MONDAY, at(MONDAY, 5, 0), 12.0, 37),
         # The window has closed: the next one (Mon 23:30) serves Tuesday.
-        (at(MONDAY, 6, 0), TUESDAY, at(MONDAY, 23, 30), 24.0, 0.0),
+        (at(MONDAY, 6, 0), TUESDAY, at(MONDAY, 6, 0), 24.0, 83),
     ],
     ids=["sun-2300", "mon-0030", "mon-0100", "mon-0500", "mon-0600"],
 )
@@ -153,7 +156,7 @@ async def test_gather_inputs_loads_the_served_days_profile(
     served: date,
     horizon_start: datetime,
     load_kwh: float,
-    drain: float,
+    slot_count: int,
 ) -> None:
     inputs, load_forecast, observed = await _gather(monkeypatch, now, ("23:30", "05:30"))
 
@@ -164,9 +167,14 @@ async def test_gather_inputs_loads_the_served_days_profile(
     assert inputs.predicted_home_load_kwh == pytest.approx(load_kwh)
     assert inputs.load_slots is not None
     assert inputs.load_slots[0] == pytest.approx(load_kwh / 48.0)
-    # The horizon itself still starts at the running-or-next window (#404).
+    # The live horizon starts at the current half-hour.
     assert inputs.horizon_start == horizon_start
-    assert inputs.pre_window_drain_kwh == pytest.approx(drain)
+    assert inputs.geometry is not None
+    assert inputs.solar_slots is not None
+    assert len(inputs.load_slots) == len(inputs.solar_slots) == len(
+        inputs.geometry.slot_starts
+    ) == slot_count
+    assert inputs.pre_window_drain_kwh == 0.0
 
 
 @respx.mock
@@ -174,11 +182,11 @@ async def test_gather_inputs_loads_the_served_days_profile(
     ("now", "served", "horizon_start"),
     [
         # A non-wrapping 00:30-04:30 window serves its own day while it runs.
-        (at(MONDAY, 0, 0), MONDAY, at(MONDAY, 0, 30)),
-        (at(MONDAY, 1, 0), MONDAY, at(MONDAY, 0, 30)),
+        (at(MONDAY, 0, 0), MONDAY, at(MONDAY, 0, 0)),
+        (at(MONDAY, 1, 0), MONDAY, at(MONDAY, 1, 0)),
         # Half-open membership: at 04:30 the window has ended, so Tuesday's
         # window is the running-or-next one and Tuesday is served.
-        (at(MONDAY, 4, 30), TUESDAY, at(TUESDAY, 0, 30)),
+        (at(MONDAY, 4, 30), TUESDAY, at(MONDAY, 4, 30)),
     ],
     ids=["mon-0000", "mon-0100", "mon-0430"],
 )
@@ -229,15 +237,14 @@ async def test_gather_inputs_places_solar_by_calendar_date(
         solar_tomorrow=_SOLAR_TOMORROW,
     )
 
-    # The horizon still starts at the running window (Sun 23:30): slot 0 is
-    # Sunday 23:30 (yesterday's date) and Monday 17:00 is slot 35.
-    assert inputs.horizon_start == at(SUNDAY, 23, 30)
+    # Slot 0 is Monday 01:00; Monday 17:00 is slot 32.
+    assert inputs.horizon_start == at(MONDAY, 1, 0)
     assert inputs.solar_slots is not None
-    # Yesterday-dated slots are zero: slot 0 is Sunday 23:30.
+    # There is no solar forecast at Monday 01:00.
     assert inputs.solar_slots[0] == 0.0
     # Today's (Monday's) forecast solar lands on the Monday-dated slots.
-    assert inputs.solar_slots[35] == pytest.approx(4.0)  # Monday 17:00
-    assert inputs.solar_slots[24] == 0.0  # Monday 12:00 has no forecast solar
+    assert inputs.solar_slots[32] == pytest.approx(4.0)  # Monday 17:00
+    assert inputs.solar_slots[22] == 0.0  # Monday 12:00 has no forecast solar
     # The tomorrow entity is read but its Tuesday date is not in this
     # horizon, so nothing else carries solar.
     assert max(inputs.solar_slots) == pytest.approx(4.0)
@@ -259,14 +266,14 @@ async def test_gather_inputs_serves_tomorrows_solar_after_the_window_closes(
         solar_tomorrow=_SOLAR_TOMORROW,
     )
 
-    # The horizon starts at tonight's window (Mon 23:30): slot 0 is Monday
-    # 23:30 (today) and Tuesday 12:00 is slot 25.
-    assert inputs.horizon_start == at(MONDAY, 23, 30)
+    # Slot 0 is Monday 06:00; Tuesday 12:00 is slot 60.
+    assert inputs.horizon_start == at(MONDAY, 6, 0)
     assert inputs.solar_slots is not None
     # Today-dated slots carry today's forecast (nothing at 23:30), and
     # tomorrow's date carries the tomorrow entity's solar.
     assert inputs.solar_slots[0] == 0.0
-    assert inputs.solar_slots[25] == pytest.approx(8.0)  # Tuesday 12:00
+    assert inputs.solar_slots[22] == pytest.approx(4.0)  # Monday 17:00, before the window
+    assert inputs.solar_slots[60] == pytest.approx(8.0)  # Tuesday 12:00
     assert max(inputs.solar_slots) == pytest.approx(8.0)
     # The served day is Tuesday (tomorrow), so the day total is the tomorrow
     # entity's.
@@ -292,5 +299,108 @@ async def test_gather_inputs_zero_solar_for_today_without_the_today_entity(
     )
 
     assert inputs.solar_slots is not None
-    assert inputs.solar_slots == (0.0,) * 48
+    assert inputs.solar_slots == (0.0,) * 45
     assert inputs.solar_tomorrow_kwh == 0.0
+
+
+@respx.mock
+async def test_gather_inputs_zeroes_a_third_calendar_dates_solar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs, _, _ = await _gather(
+        monkeypatch, at(MONDAY, 4, 30), ("00:30", "04:30"),
+        solar_today_entity="sensor.solar_today",
+        solar_today=_SOLAR_TODAY, solar_tomorrow=_SOLAR_TOMORROW,
+    )
+    assert inputs.geometry is not None
+    assert inputs.solar_slots is not None
+    dates = {start.astimezone(TZ).date() for start in inputs.geometry.slot_starts}
+    assert dates == {MONDAY, TUESDAY, date(2026, 1, 7)}
+    for start, solar in zip(inputs.geometry.slot_starts, inputs.solar_slots, strict=True):
+        if start.astimezone(TZ).date() == date(2026, 1, 7):
+            assert solar == 0.0
+    assert sum(inputs.solar_slots) == pytest.approx(12.0)
+
+
+@respx.mock
+@pytest.mark.parametrize("day", [date(2026, 3, 29), date(2026, 10, 25)])
+async def test_gather_inputs_maps_daily_profiles_by_clock_across_dst(
+    monkeypatch: pytest.MonkeyPatch, day: date,
+) -> None:
+    profile = tuple(float(i + 1) for i in range(48))
+    inputs, _, _ = await _gather(
+        monkeypatch, at(day, 0, 0), ("23:30", "05:30"), daily_slots=profile,
+        solar_today_entity="sensor.solar_today",
+        solar_today=("48.0", {"detailedForecast": [
+            {"period_start": at(day, 3, 0).isoformat(), "pv_estimate": 1.0}
+        ]}),
+    )
+    assert inputs.geometry is not None
+    assert inputs.load_slots is not None
+    assert inputs.solar_slots is not None
+    assert len(inputs.load_slots) == len(inputs.solar_slots) == (
+        45 if day.month == 3 else 49
+    )
+    for start, load, solar in zip(
+        inputs.geometry.slot_starts, inputs.load_slots, inputs.solar_slots, strict=True
+    ):
+        local = start.astimezone(TZ)
+        assert load == profile[local.hour * 2 + local.minute // 30]
+        assert solar == (48.0 if local.hour == 3 and local.minute == 0 else 0.0)
+
+
+@respx.mock
+async def test_gather_inputs_leaves_slot_zero_power_unprorated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(timezone="Europe/London")
+    start, _, _ = await _gather(monkeypatch, at(MONDAY, 18, 0), ("23:30", "05:30"))
+    middle, _, _ = await _gather(monkeypatch, at(MONDAY, 18, 15), ("23:30", "05:30"))
+    assert middle.geometry is not None
+    assert middle.geometry.slot0_remaining_frac == 0.5
+    assert middle.load_slots == start.load_slots
+    cfg = build_config(settings, settings.battery_voltage_v)
+    start_plan = compute_plan(start, cfg, build_schedule(settings, start, cfg))
+    middle_plan = compute_plan(middle, cfg, build_schedule(settings, middle, cfg))
+    # Tuesday's 0.5 kWh daily profile is unprorated at the REST seam;
+    # the planner accounts for just half of slot 0 in the evening ledger.
+    assert start_plan.pre_window_drain_kwh - middle_plan.pre_window_drain_kwh == pytest.approx(
+        0.25
+    )
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("with_dispatch", "required", "target", "baseline_cost", "planned_cost"),
+    [
+        (False, 7.392, 82.5, 4.5312, 0.89792),
+        (True, 5.592, 75.803571, 4.1847, 0.86342),
+    ],
+)
+async def test_live_window_start_reproduces_golden_slot_plans(
+    monkeypatch: pytest.MonkeyPatch, with_dispatch: bool, required: float, target: float,
+    baseline_cost: float, planned_cost: float,
+) -> None:
+    # The golden daily profiles, in clock order instead of horizon order.
+    profile = tuple(0.4 if i < 11 or i == 47 else 0.5 for i in range(48))
+    solar_start = at(TUESDAY, 9, 30)
+    inputs, _, _ = await _gather(
+        monkeypatch, at(MONDAY, 23, 30), ("23:30", "05:30"), daily_slots=profile,
+        solar_tomorrow=("8.0", {"detailedForecast": [
+            {"period_start": (solar_start + timedelta(minutes=30 * i)).isoformat(),
+             "pv_estimate": 1.0}
+            for i in range(8)
+        ]}),
+    )
+    dispatch = DispatchSlot(at(TUESDAY, 13, 30), at(TUESDAY, 15, 0), -5.2, "octopus")
+    inputs = replace(
+        inputs, soc=replace(inputs.soc, value=55.0),
+        dispatches=(dispatch,) if with_dispatch else (),
+    )
+    settings = Settings(solar_haircut_k=0.85)
+    cfg = build_config(settings, settings.battery_voltage_v)
+    plan = compute_plan(inputs, cfg, build_schedule(settings, inputs, cfg))
+    assert plan.required_kwh == pytest.approx(required, abs=1e-6)
+    assert plan.target_soc == pytest.approx(target, abs=1e-6)
+    assert plan.baseline_cost == pytest.approx(baseline_cost, abs=1e-6)
+    assert plan.planned_cost == pytest.approx(planned_cost, abs=1e-6)
