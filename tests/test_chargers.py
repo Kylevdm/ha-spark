@@ -268,7 +268,11 @@ def test_solis_current_inside_window_ignores_expected_window_start_soc() -> None
 def test_solis_current_untrusted_soc_sizes_from_zero_not_the_projection() -> None:
     # A failed read sizes from its 0 (30% of 26.88 / 0.9 / 0.306 = 29.28 A),
     # never from the planner's projection, which would size 0 A here.
-    intent = _expecting(40.0, target_soc=30.0, soc=_bad_soc())
+    unavailable = SocMeasurement(
+        status=SocStatus.UNAVAILABLE, observed_at=_NOON, raw_state="unavailable",
+        max_age_s=600.0,
+    )
+    intent = _expecting(40.0, target_soc=30.0, soc=unavailable)
     assert solis_current_a(intent, _sizing_settings()) == pytest.approx(29.28, abs=0.05)
 
 

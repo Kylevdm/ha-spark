@@ -983,7 +983,14 @@ def compute_plan(
             export_soc_needed_at,
             overnight_charge_capped,
         ) = _event_export_plan(inputs, cfg, schedule, net, charge_limit, pre_window_outflow)
-        reservations = event_reservations or (_slot_reservation(inputs, cfg, schedule, net),)
+        slot_reservation = _slot_reservation(inputs, cfg, schedule, net)
+        reservations = event_reservations or (slot_reservation,)
+        if event_reservations and all(
+            reservation.target_slot <= window_first for reservation in event_reservations
+        ):
+            # A pre-window event's reservations are carried from now, never
+            # charged; tonight's charge still owes the post-window one (#403).
+            reservations = (*event_reservations, slot_reservation)
     else:
         # --- v1 daily balance ---
         model = "daily"
@@ -1113,7 +1120,12 @@ def compute_plan(
             inputs.soc_now,
             cfg.min_soc + max(0.0, usable_at_window) / cfg.capacity_kwh * 100.0,
         )
-        if window_first > 0:
+        if window_first > 0 and export_overlaps_charge:
+            # Export wins the window (required = 0). Decision B's target
+            # (min_soc + O) can sit above the expected window-start SoC, which
+            # a rate-based charger would turn into current in the export window.
+            target_soc = expected_window_start_soc
+        elif window_first > 0:
             target_energy = usable_at_window + required
             if pre_window_outflow > 0 and required == 0:
                 target_energy = obligation

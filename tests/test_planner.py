@@ -622,6 +622,12 @@ def test_current_event_matches_legacy_same_day_funding(
     assert actual.export_soc_needed_pct == pytest.approx(expected.export_soc_needed_pct)
     assert actual.export_soc_needed_at == expected.export_soc_needed_at
     assert actual.export_revenue == pytest.approx(expected.export_revenue)
+    # The event's reservations are carried from now; tonight's charge still
+    # owes the post-window reservation, as on the legacy route.
+    assert actual.reservations[-1].name == expected.reservations[-1].name
+    assert actual.reservations[-1].energy_kwh == pytest.approx(
+        expected.reservations[-1].energy_kwh
+    )
 
 
 @pytest.mark.parametrize("guard", ["daylight", "dno", "supply", "hold", "capacity"])
@@ -778,9 +784,12 @@ def test_current_pre_window_export_overlapping_charge_keeps_zero_purchase() -> N
     assert export is not None
     assert (export.window_start, export.window_end) == (event.start, event.end)
     assert plan.required_kwh == 0.0
-    # Decision B still expresses the post-window obligation as a target, even
-    # when export suppresses charging. It must not create a purchase or SoC path.
-    assert plan.target_soc == pytest.approx(20 + 9.0 / 26.88 * 100)
+    # Export wins the window: the target is the expected window-start SoC, not
+    # decision B's min_soc + O (20 + 9.0/26.88), so a rate-based charger sizes
+    # 0 A instead of charging into the export window.
+    assert plan.charge_intent.expected_window_start_soc is not None
+    assert plan.target_soc == plan.charge_intent.expected_window_start_soc
+    assert plan.target_soc < 20 + 9.0 / 26.88 * 100
     assert plan.soc_path == ()
 
 
