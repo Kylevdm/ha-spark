@@ -135,7 +135,8 @@ the SoC the event would need at its start to fund every slot
 ([#214](https://github.com/Kylevdm/ha-spark/issues/214)).
 
 ha-spark doesn't yet record what each event earned. The savings backtest
-covers grid import under your tariff, not Axle payments.
+covers grid import under your tariff, not Axle payments. Recording per-event
+earnings is tracked in [#373](https://github.com/Kylevdm/ha-spark/issues/373).
 
 ### Axle roadmap
 
@@ -165,7 +166,9 @@ Open work on the feature itself:
   events and check them against the DNO limit
   ([#201](https://github.com/Kylevdm/ha-spark/issues/201));
 - counting a V2L refill from the car when funding an event
-  ([#188](https://github.com/Kylevdm/ha-spark/issues/188)).
+  ([#188](https://github.com/Kylevdm/ha-spark/issues/188));
+- recording what each event earned
+  ([#373](https://github.com/Kylevdm/ha-spark/issues/373)).
 
 ## Road to v1.0.0
 
