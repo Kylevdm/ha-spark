@@ -398,7 +398,7 @@ async def test_onboard_write_fragment_uses_preset_for_gaps(
         return CheckResult("Load history", Status.OK, "ready")
 
     monkeypatch.setattr(cli, "check_load_history", ok)
-    # Only the SoC entity is discoverable; the dispatch sensor must come from the preset.
+    # Only the SoC entity is discoverable; the power switch must come from the preset.
     respx.get("http://ha.test/api/states").mock(
         return_value=httpx.Response(
             200,
@@ -416,7 +416,7 @@ async def test_onboard_write_fragment_uses_preset_for_gaps(
     out = capsys.readouterr().out
     assert rc == 0
     assert "soc_entity: sensor.solisac_battery_soc    # discovered" in out
-    assert "dispatch_entity:" in out and "# preset" in out
+    assert "inverter_power_switch_entity: select.solisac_power_switch    # preset" in out
 
 
 @respx.mock
