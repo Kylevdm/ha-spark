@@ -99,7 +99,8 @@ async def parse_offline(
     if _contains(text, "solar", "forecast"):
         return IntentResult(_solar_line(plan, run.forecast.target_date), matched=True)
     return IntentResult(
-        format_plan(plan, load_source, forecast_date=run.forecast.target_date), matched=True
+        format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz),
+        matched=True,
     )
 
 

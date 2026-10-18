@@ -605,8 +605,8 @@ def test_current_event_preserves_hard_refusals_and_suffix_termination(guard: str
         soc_now=90.0, now=datetime(2026, 6, 8, 19, 15, tzinfo=UTC)
     )
     reasons = {
-        "daylight": "Skipped paid slot: today's solar isn't forecast, so in daylight the fixed "
-        "discharge command can't be checked against the DNO limit.",
+        "daylight": "Skipped paid slot: for a same-day slot in daylight the fixed discharge "
+        "command isn't checked against the DNO limit, even with today's solar forecast.",
         "dno": "Skipped paid slot: the fixed discharge command would exceed "
         "the DNO or supply limit.",
         "supply": "Skipped paid slot: the fixed discharge command would exceed "
@@ -2164,3 +2164,81 @@ def test_pre_window_zero_charge_soc_path_starts_with_energy_actually_carried() -
     assert plan.target_soc == 65  # Decision B: target is the obligation, not surplus.
     assert inputs.geometry is not None
     assert plan.soc_path[0] == (inputs.geometry.window_end, 75)
+
+
+_LONDON = ZoneInfo("Europe/London")
+
+
+def _live_inputs(
+    now: datetime, soc: float, *, solar: dict[int, float] | None = None, **kw: Any
+) -> PlannerInputs:
+    config = cfg()
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, _LONDON)
+    n = len(geom.slot_starts)
+    return PlannerInputs(
+        soc=_soc(soc), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=0.25 * n,
+        geometry=geom, horizon_start=geom.horizon_start, now=now,
+        load_slots=(0.25,) * n,
+        solar_slots=tuple((solar or {}).get(i, 0.0) for i in range(n)),
+        **kw,
+    )
+
+
+@pytest.mark.parametrize(
+    ("usable_now", "required", "uncovered"),
+    [
+        (13.75, 0.0, 0.0),  # covers 4.75 kWh before the window and 9 kWh after
+        (2.0, 9.0, 2.75),  # 2.75 kWh of the evening load is imported at peak
+    ],
+)
+def test_projected_cost_counts_the_evening_load_once(
+    usable_now: float, required: float, uncovered: float
+) -> None:
+    """At 14:00 BST, 19 slots before 23:30 and 36 after 05:30 carry 0.25 kWh each."""
+    config = cfg()
+    inp = _live_inputs(
+        datetime(2026, 6, 8, 14, 0, tzinfo=_LONDON), 20.0 + usable_now / 26.88 * 100.0
+    )
+    schedule = fixed_schedule(inp, config)
+    plan = compute_plan(inp, config, schedule)
+
+    assert plan.deficit_kwh == pytest.approx(9.0)
+    assert plan.required_kwh == pytest.approx(required)
+    assert plan.planned_cost == pytest.approx(
+        (3.0 + required) * schedule.cheap_rate + uncovered * schedule.standard_rate
+    )
+
+
+def test_plan_times_read_on_the_household_clock() -> None:
+    """A 17:00-18:00 BST event is described as 17:00, not its 16:00 UTC instant."""
+    from ha_spark.energy.report import format_plan
+
+    now = datetime(2026, 6, 8, 12, 0, tzinfo=_LONDON)
+    start = datetime(2026, 6, 8, 17, 0, tzinfo=_LONDON)
+    inp = _live_inputs(
+        now, 90.0,
+        flexibility_event=FlexibilityEvent(
+            start=start, end=start + timedelta(hours=1), direction="export",
+            rate_gbp_kwh=1.0, updated_at=now,
+        ),
+    )
+    plan = _plan(inp, cfg())
+
+    assert plan.charge_intent.export is not None, [s.reason for s in plan.export_skips]
+    event = next(r for r in plan.reservations if r.name == "axle-export-event")
+    assert "from 17:00 to 18:00" in event.reason
+    assert "Paid export       17:00-18:00" in format_plan(plan, "test", tz=_LONDON)
+
+
+def test_solar_export_counts_only_the_rest_of_slot_0() -> None:
+    """At 14:15 only half of slot 0's 1 kWh surplus is still to come."""
+    config = cfg(rate_export=0.15)
+    at_start = _plan(
+        _live_inputs(datetime(2026, 6, 8, 14, 0, tzinfo=_LONDON), 50.0, solar={0: 1.25}), config
+    )
+    midslot = _plan(
+        _live_inputs(datetime(2026, 6, 8, 14, 15, tzinfo=_LONDON), 50.0, solar={0: 1.25}), config
+    )
+
+    assert at_start.export_revenue == pytest.approx(1.0 * 0.15)
+    assert midslot.export_revenue == pytest.approx(0.5 * 0.15)

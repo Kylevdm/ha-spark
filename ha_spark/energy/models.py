@@ -206,13 +206,15 @@ class PlannerInputs:
     # readable EV status source. The pure planner does not forecast this hold.
     ev_hold_charging: bool | None = None
     ha_template_needed: float | None = None
-    # v2 per-slot horizon (48 half-hour slots starting at the charge-window start
-    # tonight). When load_slots is None the planner uses the v1 daily balance.
+    # v2 per-slot horizon: one value per ``geometry.slot_starts`` slot, from the
+    # current half-hour on live inputs (legacy inputs without geometry: 48 slots
+    # from the charge-window start). When load_slots is None the planner uses
+    # the v1 daily balance.
     load_slots: tuple[float, ...] | None = None
     solar_slots: tuple[float, ...] | None = None
     horizon_start: datetime | None = None
-    # When these inputs were read. Lets the pure planner place an event that
-    # ends before ``horizon_start`` (later today) against the live SoC (#198).
+    # When these inputs were read, on the household clock. Places elapsed
+    # time within slot 0 and formats plan times locally.
     now: datetime | None = None
     # Live per-slot import prices from a `dynamic` tariff price sensor, sorted
     # by start; empty when the dynamic provider isn't in use or the read failed.

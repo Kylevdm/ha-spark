@@ -354,6 +354,7 @@ def _patch_run_once_io(
             raise plan
         return SimpleNamespace(
             plan=plan, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test",
+            tz=None,
             forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )
 
@@ -641,6 +642,7 @@ async def test_run_once_skips_unchanged_command_after_fresh_soc(
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
         return SimpleNamespace(
             plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test",
+            tz=None,
             forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )
 
@@ -688,6 +690,7 @@ async def test_run_once_retries_after_untrusted_previous_plan(
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
         return SimpleNamespace(
             plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test",
+            tz=None,
             forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )
 
@@ -768,7 +771,8 @@ async def test_dynamic_plan_parity_between_scheduler_and_agent_plan(
     plan = (await run_once(s)).plan
     # The dynamic schedule actually flowed through the daemon's plan.
     assert plan.model == "slots"
-    assert plan.slot_prices == tuple(0.99 for _ in range(48))
+    # The live horizon runs from the current half-hour, so its length follows the clock.
+    assert plan.slot_prices and set(plan.slot_prices) == {0.99}
 
     # baseline_cost tallies each slot at its live import price, so it reflects the
     # 0.99 dynamic prices (unlike planned_cost, which costs at the representative
@@ -2611,6 +2615,7 @@ async def test_run_once_reconciles_an_untrusted_plan_against_the_trusted_holds(
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
         return SimpleNamespace(
             plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test",
+            tz=None,
             forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )
 
@@ -3318,6 +3323,7 @@ async def test_run_once_applies_the_ev_hold_on_a_replan_tick(
             plan=plan,
             inputs=SimpleNamespace(ev_hold_charging=True),
             load_source="test",
+            tz=None,
             forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )
 

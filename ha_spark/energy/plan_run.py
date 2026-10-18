@@ -12,6 +12,7 @@ the schedule here, once, removes that whole class of drift.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import tzinfo
 
 from ha_spark.config import Settings
 from ha_spark.energy.models import ChargePlan, LoadForecast, PlannerConfig, PlannerInputs
@@ -36,6 +37,9 @@ class PlanRun:
     # day profile (slot-of-day order) and its served date (#397), never the
     # horizon-order ``inputs.load_slots``.
     forecast: LoadForecast
+    # The household zone the inputs were read in, for formatting plan times
+    # (horizon instants are UTC).
+    tz: tzinfo | None = None
 
 
 async def current_plan(
@@ -56,4 +60,5 @@ async def current_plan(
     return PlanRun(
         plan=plan, inputs=inputs, cfg=cfg, schedule=schedule,
         load_source=forecast.source, forecast=forecast,
+        tz=inputs.now.tzinfo if inputs.now is not None else None,
     )
