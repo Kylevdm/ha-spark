@@ -11,22 +11,13 @@ defaults — use ``ha-spark onboard`` or a preset to fill them in.
 
 from __future__ import annotations
 
-# Original reference setup the author built ha-spark against.
+# Original reference setup the author built ha-spark against. Octopus and zappi
+# entity ids embed per-household meter/device ids, so auto-discovery finds them.
 SOLIS: dict[str, str] = {
     "soc_entity": "sensor.solisac_battery_soc",
     "battery_voltage_entity": "sensor.solisac_battery_voltage",
     "battery_power_entity": "sensor.solisac_battery_power",
     "solar_tomorrow_entity": "sensor.solcast_pv_forecast_forecast_tomorrow",
-    "octopus_rate_entity": (
-        "sensor.octopus_energy_electricity_22l4386358_2200012282082_current_rate"
-    ),
-    "dispatch_entity": (
-        "binary_sensor.octopus_energy_00000000_0009_4000_8020_000000068b29"
-        "_intelligent_dispatching"
-    ),
-    "ev_plug_entity": "sensor.myenergi_zappi_22300254_plug_status",
-    "ev_status_entity": "sensor.myenergi_zappi_22300254_status",
-    "ev_power_entity": "sensor.myenergi_zappi_22300254_power_ct_internal_load",
     "dispatch_grid_power_entity": "sensor.solisac_meter_active_power",
     "dispatch_grid_power_invert": "true",
     "consumption_energy_entity": "sensor.historic_household_usage",

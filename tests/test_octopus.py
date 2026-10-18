@@ -25,8 +25,8 @@ def _settings(api_key: str = "sk_test") -> Settings:
     return Settings(
         octopus_api_url=API,
         octopus_api_key=api_key,
-        octopus_mpan="2200012282082",
-        octopus_meter_serial="22L4386358",
+        octopus_mpan="1000000000001",
+        octopus_meter_serial="00A0000000",
     )
 
 
@@ -74,7 +74,7 @@ def test_csv_rejects_unrecognized_header() -> None:
 
 @respx.mock
 async def test_api_follows_pagination_and_authenticates() -> None:
-    url = f"{API}/electricity-meter-points/2200012282082/meters/22L4386358/consumption/"
+    url = f"{API}/electricity-meter-points/1000000000001/meters/00A0000000/consumption/"
     route = respx.get(url__startswith=url).mock(
         side_effect=[
             httpx.Response(
