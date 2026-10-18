@@ -1432,3 +1432,93 @@ def test_geometry_v2l_refill_uses_only_the_part_after_the_window() -> None:
     assert plan.soc_path[0] == (geom.window_end, config.min_soc)
     assert plan.soc_path[1][1] == pytest.approx(config.min_soc + 0.25 / 26.88 * 100)
     assert _plan(replace(inp, car_plugged_in=False), config).v2l_refills == ()
+
+
+@pytest.mark.parametrize("solar_source", ["today", "served", "missing"])
+def test_geometry_today_event_daylight_refusal(solar_source: str) -> None:
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, 1, 5, 1, tzinfo=tz)
+    config = cfg(capacity_kwh=100, strategy="fill")
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    start = datetime(2026, 1, 5, 17, tzinfo=tz)
+    solar = tuple(
+        1.0 if slot.hour == 17 and slot.minute == 0 and solar_source != "missing" else 0.0
+        for slot in geom.slot_starts
+    )
+    # A served-day profile can show daylight at the same clock time even
+    # when today's forecast has no solar in the event slot.
+    if solar_source == "served":
+        geom = compute_horizon_geometry(
+            datetime(2026, 1, 5, 6, tzinfo=tz),
+            config.window_start, config.window_end, tz,
+        )
+        solar = tuple(
+            1.0 if slot.hour == 17 and slot.minute == 0 and slot.date() == geom.served_day
+            else 0.0 for slot in geom.slot_starts
+        )
+    inp = PlannerInputs(
+        soc=_soc(50), solar_tomorrow_kwh=1, predicted_home_load_kwh=0,
+        geometry=geom, horizon_start=geom.horizon_start, now=now,
+        load_slots=(0.0,) * len(geom.slot_starts), solar_slots=solar,
+        flexibility_event=FlexibilityEvent(
+            start=start, end=start + timedelta(minutes=30), direction="export",
+            rate_gbp_kwh=1, updated_at=now,
+        ),
+    )
+    plan = _plan(inp, config)
+    if solar_source == "missing":
+        assert plan.charge_intent.export is not None
+    else:
+        assert plan.charge_intent.export is None
+        assert any("in daylight the fixed discharge" in skip.reason for skip in plan.export_skips)
+
+
+def test_served_day_solar_keeps_legacy_input_keyword() -> None:
+    inp = PlannerInputs(soc=_soc(50), solar_tomorrow_kwh=3.5, predicted_home_load_kwh=10)
+    plan = _plan(inp, cfg())
+    assert inp.served_day_solar_kwh == 3.5
+    assert plan.served_day_solar_kwh == 3.5
+    assert plan.solar_kwh == 3.5
+
+
+def test_today_solar_does_not_fund_event_house_load() -> None:
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, 1, 5, 1, tzinfo=tz)
+    config = cfg(capacity_kwh=10, buffer_pct=0)
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    start = datetime(2026, 1, 5, 17, tzinfo=tz)
+    loads = tuple(0.5 if slot.hour == 16 else 0.0 for slot in geom.slot_starts)
+    inp = PlannerInputs(
+        soc=_soc(50), solar_tomorrow_kwh=0, predicted_home_load_kwh=sum(loads),
+        geometry=geom, horizon_start=geom.horizon_start, now=now, load_slots=loads,
+        flexibility_event=FlexibilityEvent(
+            start=start, end=start + timedelta(minutes=30), direction="export",
+            rate_gbp_kwh=1, updated_at=now,
+        ),
+    )
+    without_solar = _plan(inp, config)
+    with_solar = _plan(replace(inp, solar_slots=loads), config)
+    assert with_solar.charge_intent.export == without_solar.charge_intent.export
+    assert with_solar.export_soc_needed_pct == without_solar.export_soc_needed_pct
+    assert with_solar.export_skips == without_solar.export_skips
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_today_daylight_guard_leaves_legacy_or_undated_inputs_unchanged(legacy: bool) -> None:
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, 1, 5, 1, tzinfo=tz)
+    config = cfg(capacity_kwh=100, strategy="fill")
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    start = datetime(2026, 1, 5, 17, tzinfo=tz)
+    inp = PlannerInputs(
+        soc=_soc(50), solar_tomorrow_kwh=0.1, predicted_home_load_kwh=0,
+        geometry=None if legacy else geom,
+        horizon_start=geom.horizon_start, now=now if legacy else None,
+        load_slots=(0.0,) * len(geom.slot_starts),
+        solar_slots=tuple(0.1 if slot == start else 0.0 for slot in geom.slot_starts),
+        flexibility_event=FlexibilityEvent(
+            start=start, end=start + timedelta(minutes=30), direction="export",
+            rate_gbp_kwh=1, updated_at=now,
+        ),
+    )
+    assert _plan(inp, config).charge_intent.export is not None

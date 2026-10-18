@@ -225,3 +225,21 @@ async def test_answer_context_query_empty(tmp_path: Any) -> None:
     settings = Settings(db_path=str(tmp_path / "test.db"))
     out = await answer_context_query(settings, _TODAY)
     assert "No context facts" in out
+
+
+async def test_solar_query_names_served_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import date
+
+    async def fake_current_plan(settings: Settings, rest: Any) -> PlanRun:
+        return PlanRun(
+            plan=_plan(), inputs=object(), cfg=object(), schedule=object(),  # type: ignore[arg-type]
+            load_source="test",
+            forecast=LoadForecast(
+                total_kwh=17.7, slots=None, source="test", target_date=date(2026, 1, 5)
+            ),
+        )
+
+    monkeypatch.setattr(intent_parser, "current_plan", fake_current_plan)
+    result = await parse_offline("solar", Settings(), REST)  # type: ignore[arg-type]
+    assert "Solar forecast for Mon 05 Jan: 3.40 kWh" in result.text
+    assert "tomorrow" not in result.text

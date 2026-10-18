@@ -32,10 +32,11 @@ def format_plan(
         soc += f"  (untrusted: {plan.soc.reason})"
 
     served = f" for {forecast_date:%a %d %b}" if forecast_date is not None else ""
+    solar_label = "Solar forecast" if forecast_date is not None else "Solar tomorrow"
     lines = [
         "Charge plan:",
         f"  SoC now            {soc}",
-        f"  Solar tomorrow     {solar}",
+        f"  {solar_label}     {solar}{served}",
         f"  Home load forecast {plan.load_kwh:.2f} kWh{served}  ({load_source})",
     ]
     if plan.cheap_covered_kwh > 0:

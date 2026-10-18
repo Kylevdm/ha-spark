@@ -47,13 +47,21 @@ def _freeze_clock(monkeypatch: pytest.MonkeyPatch, frozen: datetime) -> None:
 
 
 async def _gather(
-    monkeypatch: pytest.MonkeyPatch, now: datetime, window: tuple[str, str]
+    monkeypatch: pytest.MonkeyPatch,
+    now: datetime,
+    window: tuple[str, str],
+    *,
+    solar_today_entity: str = "",
+    solar_today: tuple[str, dict[str, Any]] | None = None,
+    solar_tomorrow: tuple[str, dict[str, Any]] | None = None,
 ) -> tuple[PlannerInputs, LoadForecast, list[date]]:
     """Run ``gather_inputs`` at a frozen clock; return inputs, forecast, targets.
 
     The mocked forecast pipeline yields 0.25 kWh per slot for Monday's
     day-type profile (12 kWh/day) and 0.5 per slot otherwise (24 kWh/day), so
-    the served day is visible in every number the plan carries.
+    the served day is visible in every number the plan carries. Solar
+    payloads are ``(state, attributes)`` pairs for the today/tomorrow
+    entities; an unset pair leaves that date's solar unread (zero).
     """
     _freeze_clock(monkeypatch, now)
 
@@ -80,6 +88,30 @@ async def _gather(
     monkeypatch.setattr(forecast, "predict_day_slots", day_slots)
     monkeypatch.setattr(forecast, "_context_scale", no_context)
 
+    respx.get("http://ha.test/api/states/sensor.solar_today").mock(
+        return_value=httpx.Response(404)
+        if solar_today is None
+        else httpx.Response(
+            200,
+            json={
+                "entity_id": "sensor.solar_today",
+                "state": solar_today[0],
+                "attributes": solar_today[1],
+            },
+        )
+    )
+    respx.get("http://ha.test/api/states/sensor.solar").mock(
+        return_value=httpx.Response(404)
+        if solar_tomorrow is None
+        else httpx.Response(
+            200,
+            json={
+                "entity_id": "sensor.solar",
+                "state": solar_tomorrow[0],
+                "attributes": solar_tomorrow[1],
+            },
+        )
+    )
     respx.route(method="GET").mock(return_value=httpx.Response(404))
     settings = Settings(
         ha_url="http://ha.test",
@@ -90,6 +122,8 @@ async def _gather(
         latitude=0.0,
         longitude=0.0,
         load_model="median",
+        solar_tomorrow_entity="sensor.solar",
+        solar_today_entity=solar_today_entity,
     )
     soc = SocMeasurement(status=SocStatus.OK, observed_at=now, value=50.0)
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
@@ -160,3 +194,103 @@ async def test_served_day_for_a_non_wrapping_window_end_to_end(
     assert observed == [served]
     assert load_forecast.target_date == served
     assert inputs.horizon_start == horizon_start
+
+
+# Solar payloads: (state, attributes). One detailed entry each, so every
+# placed value is unambiguous: the today entity forecasts 4 kWh at Monday
+# 17:00, the tomorrow entity 8 kWh at Tuesday 12:00.
+_SOLAR_TODAY = (
+    "4.0",
+    {"detailedForecast": [{"period_start": "2026-01-05T17:00:00+00:00", "pv_estimate": 1.0}]},
+)
+_SOLAR_TOMORROW = (
+    "8.0",
+    {"detailedForecast": [{"period_start": "2026-01-06T12:00:00+00:00", "pv_estimate": 1.0}]},
+)
+
+
+@respx.mock
+async def test_gather_inputs_places_solar_by_calendar_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#398: solar is placed per calendar date, from the today/tomorrow entities.
+
+    The #200 research test pinned the old behaviour (the today's-solar entity
+    was configured but never read); flipped, the entity is read and its solar
+    lands on today-dated slots, while any other date in the horizon (the
+    yesterday-dated tail of a running window) stays zero.
+    """
+    inputs, _load_forecast, _observed = await _gather(
+        monkeypatch,
+        at(MONDAY, 1, 0),
+        ("23:30", "05:30"),
+        solar_today_entity="sensor.solar_today",
+        solar_today=_SOLAR_TODAY,
+        solar_tomorrow=_SOLAR_TOMORROW,
+    )
+
+    # The horizon still starts at the running window (Sun 23:30): slot 0 is
+    # Sunday 23:30 (yesterday's date) and Monday 17:00 is slot 35.
+    assert inputs.horizon_start == at(SUNDAY, 23, 30)
+    assert inputs.solar_slots is not None
+    # Yesterday-dated slots are zero: slot 0 is Sunday 23:30.
+    assert inputs.solar_slots[0] == 0.0
+    # Today's (Monday's) forecast solar lands on the Monday-dated slots.
+    assert inputs.solar_slots[35] == pytest.approx(4.0)  # Monday 17:00
+    assert inputs.solar_slots[24] == 0.0  # Monday 12:00 has no forecast solar
+    # The tomorrow entity is read but its Tuesday date is not in this
+    # horizon, so nothing else carries solar.
+    assert max(inputs.solar_slots) == pytest.approx(4.0)
+    # The served day is Monday (today), so the day total is the today entity's.
+    assert inputs.solar_tomorrow_kwh == pytest.approx(4.0)
+
+
+@respx.mock
+async def test_gather_inputs_serves_tomorrows_solar_after_the_window_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the window closes, the next window's day is tomorrow: its entity serves."""
+    inputs, _load_forecast, _observed = await _gather(
+        monkeypatch,
+        at(MONDAY, 6, 0),
+        ("23:30", "05:30"),
+        solar_today_entity="sensor.solar_today",
+        solar_today=_SOLAR_TODAY,
+        solar_tomorrow=_SOLAR_TOMORROW,
+    )
+
+    # The horizon starts at tonight's window (Mon 23:30): slot 0 is Monday
+    # 23:30 (today) and Tuesday 12:00 is slot 25.
+    assert inputs.horizon_start == at(MONDAY, 23, 30)
+    assert inputs.solar_slots is not None
+    # Today-dated slots carry today's forecast (nothing at 23:30), and
+    # tomorrow's date carries the tomorrow entity's solar.
+    assert inputs.solar_slots[0] == 0.0
+    assert inputs.solar_slots[25] == pytest.approx(8.0)  # Tuesday 12:00
+    assert max(inputs.solar_slots) == pytest.approx(8.0)
+    # The served day is Tuesday (tomorrow), so the day total is the tomorrow
+    # entity's.
+    assert inputs.solar_tomorrow_kwh == pytest.approx(8.0)
+
+
+@respx.mock
+async def test_gather_inputs_zero_solar_for_today_without_the_today_entity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a today's-solar entity, today-dated solar counts as zero.
+
+    A missing forecast is zero everywhere (decision A): the served day is
+    Monday (the running window serves it), so the day-total input is zero and
+    no slot carries solar, even though the tomorrow entity reads fine — its
+    Tuesday date is not in this horizon.
+    """
+    inputs, _load_forecast, _observed = await _gather(
+        monkeypatch,
+        at(MONDAY, 1, 0),
+        ("23:30", "05:30"),
+        solar_tomorrow=_SOLAR_TOMORROW,
+    )
+
+    assert inputs.solar_slots is not None
+    assert inputs.solar_slots == (0.0,) * 48
+    assert inputs.solar_tomorrow_kwh == 0.0

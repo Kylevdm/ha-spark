@@ -188,3 +188,11 @@ def test_load_forecast_line_without_a_date_keeps_todays_wording() -> None:
     """A forecast built without a served date renders exactly as before."""
     out = format_plan(_plan(), "test")
     assert "Home load forecast 17.70 kWh  (test)" in out
+
+
+def test_solar_report_names_served_day() -> None:
+    from datetime import date
+
+    out = format_plan(_plan(), "test", forecast_date=date(2026, 1, 5))
+    assert "Solar forecast     3.40 kWh for Mon 05 Jan" in out
+    assert "Solar tomorrow" not in out

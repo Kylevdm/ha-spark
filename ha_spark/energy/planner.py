@@ -2,7 +2,7 @@
 
 v1 model (daily energy balance, used when no per-slot forecast is available):
 
-    effective_solar = solar_tomorrow * haircut_k
+    effective_solar = served_day_solar * haircut_k
     cheap_covered   = home-load energy during daytime dispatch slots (cheap grid)
     deficit         = max(0, home_load - effective_solar - cheap_covered)
     usable_now      = capacity * (soc_now - min_soc) / 100
@@ -522,6 +522,30 @@ def _event_export_plan(
             ),
         ), None, None, None, False
 
+    solar_slots = inputs.solar_slots or (0.0,) * len(net)
+    today_slots: set[int] = set()
+    served_daylight: set[tuple[int, int]] = set()
+    if inputs.geometry is not None and inputs.now is not None:
+        for i, start in enumerate(geometry.slot_starts):
+            local = start.astimezone(inputs.now.tzinfo)
+            if local.date() == inputs.now.date():
+                today_slots.add(i)
+            if local.date() == geometry.served_day and solar_slots[i] > 1e-9:
+                served_daylight.add((local.hour, local.minute))
+        # Today's solar never funds an event: protect the house without its
+        # discount, including the load before and after the paid slots.
+        net = list(net)
+        for i in today_slots:
+            if inputs.load_slots is not None:
+                net[i] = inputs.load_slots[i]
+
+    daylight_slots: set[int] = set()
+    if inputs.now is not None:
+        for i in today_slots:
+            local = geometry.slot_starts[i].astimezone(inputs.now.tzinfo)
+            if solar_slots[i] > 1e-9 or (local.hour, local.minute) in served_daylight:
+                daylight_slots.add(i)
+
     # If any event slot overlaps the physical timed-charge window, export
     # outranks discretionary charging. Only energy already in the battery may
     # fund that event; the caller will emit a zero-charge intent below.
@@ -597,12 +621,12 @@ def _event_export_plan(
         efficiency=cfg.charge_efficiency if cfg.charge_efficiency > 0 else 1.0,
         price_for=shortfall_price,
     )
-    solar_slots = inputs.solar_slots or (0.0,) * len(net)
     slots = [
         _EventSlot(
             geometry.slot_starts[i],
-            solar_slots[i] * cfg.solar_haircut_k * 2,
+            0.0 if i in today_slots else solar_slots[i] * cfg.solar_haircut_k * 2,
             inputs.load_slots[i] * 2 if inputs.load_slots is not None else 0.0,
+            refused=_DAYLIGHT_REFUSAL if i in daylight_slots else None,
         )
         for i in event_slots
     ]
@@ -809,7 +833,7 @@ def compute_plan(
     that let callers describe a different plan than the daemon applied (#91).
     For the legacy fixed-window two-rate behaviour, pass ``fixed_schedule``.
     """
-    effective_solar = inputs.solar_tomorrow_kwh * cfg.solar_haircut_k
+    effective_solar = inputs.served_day_solar_kwh * cfg.solar_haircut_k
 
     # Daytime dispatch slots (the schedule's controlled windows) run the house
     # off cheap grid so that load needn't come from the battery; in the daily
@@ -1023,7 +1047,7 @@ def compute_plan(
     return ChargePlan(
         soc=inputs.soc,
         capacity_kwh=cfg.capacity_kwh,
-        solar_kwh=inputs.solar_tomorrow_kwh,
+        solar_kwh=inputs.served_day_solar_kwh,
         effective_solar_kwh=effective_solar,
         load_kwh=inputs.predicted_home_load_kwh,
         cheap_covered_kwh=cheap_covered,

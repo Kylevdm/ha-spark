@@ -185,7 +185,7 @@ class PlannerInputs:
     # its value through `soc_now`, never by re-reading the sensor, so one read
     # can never certify a different read.
     soc: SocMeasurement
-    solar_tomorrow_kwh: float
+    solar_tomorrow_kwh: float  # served-day total; legacy constructor keyword
     predicted_home_load_kwh: float
     # Forecast battery drain between plan time and the charge-window start
     # (the horizon starts at the window, so this load is otherwise invisible).
@@ -230,6 +230,11 @@ class PlannerInputs:
     def soc_now(self) -> float:
         """The checked SoC percentage; 0 when the measurement failed."""
         return self.soc.soc_now
+
+    @property
+    def served_day_solar_kwh(self) -> float:
+        """Served-day solar total (stored under the legacy constructor keyword)."""
+        return self.solar_tomorrow_kwh
 
     def geometry_for(self, config: PlannerConfig) -> HorizonGeometry | None:
         """The horizon geometry, or the legacy one derived from ``config``.
@@ -368,7 +373,7 @@ class ChargePlan:
 
     soc: SocMeasurement  # failed -> block real writes
     capacity_kwh: float
-    solar_kwh: float
+    solar_kwh: float  # served-day total; legacy constructor keyword
     effective_solar_kwh: float
     load_kwh: float
     cheap_covered_kwh: float
@@ -414,6 +419,11 @@ class ChargePlan:
     # plan is followed (slot model only). Lets a later reading show the plan
     # was wrong (#208).
     soc_path: tuple[tuple[datetime, float], ...] = ()
+
+    @property
+    def served_day_solar_kwh(self) -> float:
+        """Served-day solar total before the configured haircut."""
+        return self.solar_kwh
 
     @property
     def soc_now(self) -> float:

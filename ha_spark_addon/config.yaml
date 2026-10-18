@@ -94,6 +94,7 @@ options:
   battery_voltage_entity: ""
   battery_power_entity: ""
   solar_tomorrow_entity: ""
+  solar_today_entity: ""
   octopus_rate_entity: ""
   dispatch_entity: ""
   ev_plug_entity: ""
@@ -204,6 +205,7 @@ schema:
   battery_voltage_entity: str?
   battery_power_entity: str?
   solar_tomorrow_entity: str?
+  solar_today_entity: str?
   octopus_rate_entity: str?
   dispatch_entity: str?
   ev_plug_entity: str?
