@@ -42,11 +42,13 @@ def parse_axle_event(
 ) -> FlexibilityEvent | None:
     """Parse one Axle event snapshot, rejecting ambiguous or stale data.
 
-    An empty object means that Axle has no next event. Any partially populated
-    object is malformed and fails closed. Import events are valid Axle data but
-    are intentionally ignored by this export-only prototype.
+    An object with no event fields means that Axle has no next event. Any
+    partially populated event is malformed and fails closed. Import events are
+    valid Axle data but are intentionally ignored by this export-only prototype.
     """
     if payload is None or not payload:
+        return None
+    if all(payload.get(field) is None for field in ("start_time", "end_time", "import_export")):
         return None
     if not isinstance(now, datetime) or now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
@@ -133,8 +135,13 @@ async def read_axle_event(
     state_value = state.state.strip().lower()
     if state_value in {"unknown", "unavailable"}:
         raise AxleApiError("Home Assistant Axle event state is unavailable")
-    if "start_time" not in payload and state_value:
+    is_calendar = settings.axle_event_entity.startswith("calendar.")
+    if not is_calendar and "start_time" not in payload and state_value:
         payload["start_time"] = state.state
+    if is_calendar and state_value == "on" and all(
+        payload.get(field) is None for field in ("start_time", "end_time", "import_export")
+    ):
+        raise AxleApiError("Home Assistant Axle calendar is on without event details")
     event = parse_axle_event(
         payload or None,
         now=now or datetime.now(UTC),

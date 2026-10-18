@@ -82,7 +82,28 @@ def test_parse_import_event_is_ignored() -> None:
 @pytest.mark.parametrize(
     "payload",
     [
+        {},
+        {"updated_at": "2026-09-12T15:55:00+00:00", "opted_out": False},
+        {
+            "start_time": None,
+            "end_time": None,
+            "import_export": None,
+            "opted_out": False,
+            "updated_at": "2026-09-12T15:55:00+00:00",
+        },
+    ],
+)
+def test_parse_snapshot_without_event_fields_returns_none(payload: dict[str, object]) -> None:
+    assert parse_axle_event(payload, now=NOW, rate_gbp_kwh=1.0) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
         {"start_time": "2026-09-12T17:00:00+00:00"},
+        _payload(end_time=None),
+        _payload(start_time=None),
+        _payload(import_export=None),
         _payload(end_time="bad-time"),
         _payload(start_time="2026-09-12T18:00:00+00:00"),
         _payload(import_export="sideways"),
@@ -192,6 +213,28 @@ async def test_fetch_axle_event_accepts_empty_snapshot_as_no_event() -> None:
 
 
 @respx.mock
+async def test_fetch_axle_event_accepts_populated_no_event_snapshot() -> None:
+    respx.get(f"{AXLE}/vpp/home-assistant/event").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "start_time": None,
+                "end_time": None,
+                "import_export": None,
+                "opted_out": False,
+                "updated_at": "2026-09-12T15:55:00+00:00",
+            },
+        )
+    )
+
+    event = await fetch_axle_event(
+        Settings(axle_api_url=AXLE, axle_api_key="secret-token"), now=NOW
+    )
+
+    assert event is None
+
+
+@respx.mock
 async def test_axle_http_event_flows_through_build_schedule() -> None:
     respx.get(f"{AXLE}/vpp/home-assistant/event").mock(
         return_value=httpx.Response(200, json=_payload())
@@ -220,13 +263,15 @@ async def test_axle_http_event_flows_through_build_schedule() -> None:
 @respx.mock
 async def test_read_axle_event_uses_ha_mirror_when_api_fails() -> None:
     respx.get(f"{AXLE}/vpp/home-assistant/event").mock(return_value=httpx.Response(503))
+    attributes = _payload()
+    attributes.pop("start_time")
     respx.get(f"{HA}/states/sensor.axle_event").mock(
         return_value=httpx.Response(
             200,
             json={
                 "entity_id": "sensor.axle_event",
                 "state": _payload()["start_time"],
-                "attributes": _payload(),
+                "attributes": attributes,
             },
         )
     )
@@ -243,6 +288,75 @@ async def test_read_axle_event_uses_ha_mirror_when_api_fails() -> None:
 
     assert event is not None
     assert event.start == datetime(2026, 9, 12, 17, 0, tzinfo=UTC)
+
+
+@respx.mock
+async def test_read_axle_event_accepts_off_calendar_without_event() -> None:
+    respx.get(f"{HA}/states/calendar.axle_event").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "entity_id": "calendar.axle_event",
+                "state": "off",
+                "attributes": {
+                    "friendly_name": "Example Axle event",
+                    "import_export": None,
+                    "updated_at": "2026-09-12T15:55:00+00:00",
+                },
+            },
+        )
+    )
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="ha-token", axle_event_entity="calendar.axle_event"
+    )
+
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        event = await read_axle_event(settings, rest, now=NOW)
+
+    assert event is None
+
+
+@respx.mock
+async def test_read_axle_event_rejects_partial_off_calendar_event() -> None:
+    respx.get(f"{HA}/states/calendar.axle_event").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "entity_id": "calendar.axle_event",
+                "state": "off",
+                "attributes": {
+                    "start_time": "2026-09-12T17:00:00+00:00",
+                    "end_time": None,
+                    "import_export": None,
+                    "updated_at": "2026-09-12T15:55:00+00:00",
+                },
+            },
+        )
+    )
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="ha-token", axle_event_entity="calendar.axle_event"
+    )
+
+    with pytest.raises(AxleApiError, match="end_time"):
+        async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+            await read_axle_event(settings, rest, now=NOW)
+
+
+@respx.mock
+async def test_read_axle_event_rejects_on_calendar_without_event_details() -> None:
+    respx.get(f"{HA}/states/calendar.axle_event").mock(
+        return_value=httpx.Response(
+            200,
+            json={"entity_id": "calendar.axle_event", "state": "on", "attributes": {}},
+        )
+    )
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="ha-token", axle_event_entity="calendar.axle_event"
+    )
+
+    with pytest.raises(AxleApiError, match="without event details"):
+        async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+            await read_axle_event(settings, rest, now=NOW)
 
 
 @respx.mock
