@@ -187,6 +187,7 @@ Other commands: `onboard` (propose entity mappings), `generate-dashboard`,
 or `.env` (see `.env.example`). The add-on reads `/data/options.json` instead.
 
 In v1, `backtest` and `forecast-eval` fold into a new `stats` command,
-`plan --apply` is retired (`run` becomes a replan request), and
+`plan --apply` is retired, `run` becomes the replan request (today's
+`run --once`; the bare daemon becomes the add-on's entry point), and
 `solis sync-clock` becomes a device-generic `clock sync`
 ([#364](https://github.com/Kylevdm/ha-spark/issues/364#issuecomment-6241994831)).

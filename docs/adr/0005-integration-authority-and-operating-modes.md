@@ -117,7 +117,12 @@ refuse other callers' writes to those entities, the device's protection rests
 on device-resident bounds (owner-set ceilings validated at setup, verified safe
 offline values), and read-back must use a value the device itself reports, never
 the commanded entity's echo. A write with no device-reported counterpart is
-`unverified`.
+`unverified` and can't be used to leave fallback. This is an exception to
+[ADR 0008](0008-operating-mode-and-authority-lifecycle.md)'s refusal of other
+callers' writes in Optimise: for an entity-backed device, only the
+device-resident bounds hold. The V2L charger's current counts against the
+battery-bank current limit; the supply guard ignores it, because car energy
+isn't grid import.
 
 ## Supersession and retained constraints
 

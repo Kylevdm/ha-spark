@@ -110,7 +110,7 @@ the same decision path. Don't weaken this gate.
 
 In v1 the add-on drivers retire at cutover into device modules in the
 companion integration
-([#336](https://github.com/Kylevdm/ha-spark/issues/336#issuecomment-6228760140)),
+([ADR 0005](adr/0005-integration-authority-and-operating-modes.md#core-and-device-modules-amended-by-336-2026-10-17)),
 and the site operating mode replaces `control`/`proactive_mode` as this gate
 ([ADR 0008](adr/0008-operating-mode-and-authority-lifecycle.md)).
 

@@ -52,9 +52,9 @@ households. Compatible #94 requirements remain below. See the individual
 [carry-over dispositions](258-v1-gate-carryover.md).
 
 The pre-1.0 line continues `0.x`; the misused `v1.0.0-rc1`–`rc4` tags were
-deleted on 2026-10-18, so those names are free for the real release candidates. Historical
-phase-to-version assignments are superseded. #247 owns phase sequencing.
-No unchecked item is claimed as validated.
+deleted on 2026-10-18, so those names are free for the real release
+candidates. Historical phase-to-version assignments are superseded. #247 owns
+phase sequencing. No unchecked item is claimed as validated.
 
 Before tagging `v1.0.0`, ruff, mypy strict, and pytest must be green, **and**
 every item below must be confirmed on real hardware or live suppliers.
@@ -69,8 +69,9 @@ bypass is granted here.
 v1 retires `proactive_mode` and per-device `control` for the site operating
 mode ([#266](https://github.com/Kylevdm/ha-spark/issues/266),
 [ADR 0008](adr/0008-operating-mode-and-authority-lifecycle.md)). Each gate
-below carries over in those terms: `simulate` becomes Observe (zero writes),
-and a real write needs Optimise, or Protect for its own protection controls.
+below carries over in those terms (`supplier` is dropped): `simulate` becomes
+Observe (zero writes), and a real write needs Optimise, or Protect for its own
+protection controls.
 
 - [ ] `proactive_mode: simulate` (default) computes a plan, logs `[SIMULATE]`
       action lines, and performs **zero** real writes.

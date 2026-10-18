@@ -35,8 +35,8 @@ from a single user-supplied sensor. (Decision: Q4, 2026-07-12.)
 
 **Car battery (V2L)**:
 A slow refill *source for the house battery*, not a parallel battery. Energy
-flows from the car through a rectifier into the house battery only, never
-directly to house loads or the grid, at up to 3 kW with 1.5 kW preferred.
+flows from the car through the **V2L charger** into the house battery only,
+never directly to house loads or the grid, at up to 3 kW with 1.5 kW preferred.
 Rectifier temperature limits that rate, so it is a calibration setting rather
 than a constant. The car's energy is priced at what it cost to fill plus
 round-trip losses. Its role is peak-shaving: it covers heavy periods the house
@@ -148,7 +148,8 @@ more packs operated as one store, such as packs wired in parallel.
 
 **Battery-bank current limit**:
 The maximum combined DC charge or discharge current a bank can accept or
-supply across its connected inverters, with a separate limit for each direction.
+supply across its connected inverters and any V2L charger, with a separate
+limit for each direction.
 
 **Site export limit**:
 The maximum combined grid-export power permitted at the household's grid
@@ -171,7 +172,8 @@ _Avoid_: EPM (vendor term), export guard
 
 **Charging allocation**:
 The charging power assigned to a bank and divided across its connected
-inverters within device, bank and shared site limits.
+inverters within device, bank and shared site limits. A V2L charger's current
+comes out of the same bank allowance.
 
 **Supply guard**:
 The safeguard that cuts controlled grid charging quickly when measured site
