@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time
+from typing import TYPE_CHECKING
 
 from ha_spark.energy.soc_integrity import SocMeasurement
+
+if TYPE_CHECKING:
+    from ha_spark.energy.horizon import HorizonGeometry
 
 # Half-hour slots in a (non-DST-transition) day; the planner horizon is always 48.
 SLOTS_PER_DAY = 48
@@ -212,11 +216,34 @@ class PlannerInputs:
     # Original dispatches before evidence rating. The planner prices and sizes
     # only `dispatches`, but carries these for local per-minute hold re-rating.
     unrated_dispatches: tuple[DispatchSlot, ...] = ()
+    # Horizon geometry (#395): where the plan's slots fall on the clock, from
+    # the current half-hour. ``None`` on inputs built without one (hand-built
+    # tests, the backtest, the v1 daily path); read it through
+    # :meth:`geometry_for`, which derives the legacy layout from the config.
+    geometry: HorizonGeometry | None = None
 
     @property
     def soc_now(self) -> float:
         """The checked SoC percentage; 0 when the measurement failed."""
         return self.soc.soc_now
+
+    def geometry_for(self, config: PlannerConfig) -> HorizonGeometry | None:
+        """The horizon geometry, or the legacy one derived from ``config``.
+
+        ``None`` on the v1 daily path (no ``horizon_start``, no geometry). The
+        legacy derivation reproduces today's layout exactly — as many 30-minute
+        slots as ``load_slots`` (48 without them) from ``horizon_start``, the
+        window covering the first ``int(window_hours * 2)`` slots — so inputs
+        built without a geometry keep today's indexing and numbers.
+        """
+        from ha_spark.energy.horizon import legacy_geometry
+
+        if self.geometry is not None:
+            return self.geometry
+        if self.horizon_start is None:
+            return None
+        n_slots = len(self.load_slots) if self.load_slots is not None else SLOTS_PER_DAY
+        return legacy_geometry(self.horizon_start, config, n_slots)
 
 
 @dataclass(frozen=True)

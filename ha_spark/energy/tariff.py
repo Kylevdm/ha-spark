@@ -30,7 +30,11 @@ from ha_spark.energy.models import (
 
 
 def _in_overnight_window(t: time, start: time, end: time) -> bool:
-    """True if clock time ``t`` falls in the charge window (which may wrap midnight)."""
+    """True if clock time ``t`` falls in the charge window (which may wrap midnight).
+
+    Legacy end-inclusive clock membership; the horizon geometry (#395) uses
+    half-open ``[start, end)`` — kept apart for its non-geometry callers.
+    """
     if start <= end:
         return start <= t <= end
     return t >= start or t <= end
