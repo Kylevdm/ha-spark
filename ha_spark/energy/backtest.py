@@ -57,13 +57,18 @@ def _window_end(window_start: time, window_hours: float) -> time:
     return time(total // 60, total % 60)
 
 
-def _cheap_fraction_by_time(schedule: TariffSchedule) -> Callable[[time], float]:
+def _cheap_fraction_by_time(
+    schedule: TariffSchedule, tz: ZoneInfo
+) -> Callable[[time], float]:
     """A local-clock-time → off-peak-fraction classifier drawn from ``schedule``.
 
     With per-slot ``prices`` (the dynamic/intelligent path), the schedule's own
-    ``cheap_fracs`` decide: each slot's supplier-controlled-cheap fraction, keyed
-    off the clock via ``window_start`` (``cheap_fracs[0]`` is the window start).
-    Without them (the v1 fixed path) it falls back to the flat charge window
+    cheap fractions decide. A schedule that also carries the charge cycle
+    (#399 — a horizon anchored at the current half-hour) bins them by each
+    cycle slot's local clock time, first occurrence on a fall-back night
+    (decision C); a legacy, window-anchored one keys them off the clock via
+    ``window_start`` (``cheap_fracs[0]`` is the window start). Without them
+    (the v1 fixed path) it falls back to the flat charge window
     ``[window_start, window_start + window_hours)``. A schedule missing
     ``window_start`` cannot anchor either, so everything rates peak.
     """
@@ -71,6 +76,15 @@ def _cheap_fraction_by_time(schedule: TariffSchedule) -> Callable[[time], float]
     if window_start is None:
         return lambda _t: 0.0
     if schedule.prices and schedule.cheap_fracs:
+        if schedule.cycle_cheap_slots:
+            by_clock: dict[int, float] = {}
+            for slot_start, frac in schedule.cycle_cheap_slots:
+                by_clock.setdefault(_slot_index(slot_start.astimezone(tz).time()), frac)
+
+            def by_cycle_slot(t: time) -> float:
+                return by_clock.get(_slot_index(t), 0.0)
+
+            return by_cycle_slot
         fracs = schedule.cheap_fracs
         start_idx = _slot_index(window_start)
 
@@ -102,7 +116,7 @@ def backtest_cost(
     """
     if not intervals:
         return None
-    cheap_fraction = _cheap_fraction_by_time(schedule)
+    cheap_fraction = _cheap_fraction_by_time(schedule, tz)
     offpeak_kwh = peak_kwh = 0.0
     dates = set()
     for interval in intervals:
