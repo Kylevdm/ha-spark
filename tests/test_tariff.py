@@ -9,6 +9,7 @@ test_golden_baseline.py.
 from __future__ import annotations
 
 from datetime import UTC, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -19,6 +20,7 @@ from ha_spark.config import (
     validate_fixed_tariff,
     validate_octopus_intelligent_tariff,
 )
+from ha_spark.energy.horizon import compute_horizon_geometry
 from ha_spark.energy.models import DispatchSlot, PlannerConfig, PlannerInputs, PricePoint
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
@@ -402,6 +404,34 @@ def test_validate_octopus_intelligent_allows_missing_rate_codes_with_dispatch_au
             octopus_tariff_code=tariff_code,
         )
     )  # no raise
+
+
+@pytest.mark.parametrize("month, day", [(3, 28), (10, 24)])
+def test_geometry_tariffs_keep_naive_dispatches_on_the_household_clock(
+    month: int, day: int,
+) -> None:
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, month, day, 23, 30, tzinfo=tz)
+    config = cfg()
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    # Naive supplier timestamps still mean the household clock, not UTC.
+    start = datetime(2026, month, day + 1, 12)
+    end = start + timedelta(minutes=30)
+    inp = PlannerInputs(
+        soc=_soc(50), solar_tomorrow_kwh=0, predicted_home_load_kwh=0,
+        now=now, horizon_start=geom.horizon_start, geometry=geom,
+        load_slots=(0.0,) * len(geom.slot_starts),
+        dispatches=(DispatchSlot(start=start, end=end),),
+        dynamic_prices=(PricePoint(start=start, end=end, price=0.123),),
+    )
+    slot = geom.slot_starts.index(start.replace(tzinfo=tz).astimezone(UTC))
+    fixed = FixedTariffProvider(0.069, 0.30, 0)
+    schedule = fixed.schedule(inp, config)
+    assert schedule.cheap_fracs[slot - 1:slot + 2] == (0, 1, 0)
+    assert schedule.controlled_windows == ((start, end),)
+    for provider in (DynamicTariffProvider(fixed), OctopusIntelligentProvider(fixed)):
+        live = provider.schedule(inp, config)
+        assert live.prices[slot - 1:slot + 2] == (0.30, 0.123, 0.30)
 
 
 def test_validate_octopus_intelligent_still_requires_dispatch_auth() -> None:
