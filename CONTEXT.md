@@ -184,10 +184,21 @@ whenever charging is controlled, including temporary manual control.
 _Avoid_: fuse guard, throttle
 
 **Major load**:
-A household load large enough to use up supply headroom by itself, such as
-the car charger, a heat pump heating or cooling, or an induction hob.
-Onboarding records each one's demand.
+A long-running household load of a kind notified to the DNO: an EV charger or
+a heat pump (air conditioning counts as a heat pump, with heating and cooling
+demands). Each device is declared separately with its demand. Short spikes
+such as an induction hob or electric shower are not major loads; they stay in
+base load.
+(Decision: #365, 2026-10-18; the hob was dropped from #241.)
 _Avoid_: big load, heavy appliance
+
+**Major-load reserve**:
+The site import the plan leaves unused in a slot: the larger of the biggest
+major load and half of all major loads, counting only those neither running
+nor expected to run. A plan that keeps its reserve is never near the supply
+limit.
+(Decision: #365, 2026-10-18.)
+_Avoid_: comfortable headroom, headroom allowance
 
 **Export ceiling**:
 The maximum grid-export power for a slot, after applying the relevant site or
