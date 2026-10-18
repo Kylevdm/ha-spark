@@ -103,6 +103,36 @@ def test_report_renders_reservation_reason() -> None:
     assert reservation.reason in out
 
 
+def test_charge_funds_only_post_window_reservations() -> None:
+    evening = Reservation(
+        name="reach-charge-window", target_slot=2, energy_kwh=1,
+        obligation_kind="reach-charge-window",
+        reason="Reserving 1.00 kWh to cover forecast house load until the 23:30 charge window.",
+    )
+    daytime = Reservation(
+        name="reach-next-cheap-slot", target_slot=50, energy_kwh=9,
+        obligation_kind="reach-next-cheap-slot", reason="Reserving daytime energy.",
+    )
+    out = format_plan(
+        _plan(reservations=(evening, daytime), pre_window_drain_kwh=1), "test"
+    )
+
+    assert evening.reason in out
+    assert "(-1.00 by window start -> 12.17)" in out
+    assert "(funds reach-next-cheap-slot)" in out
+    assert "(funds reach-charge-window" not in out
+
+
+def test_charge_does_not_claim_to_fund_an_evening_only_reservation() -> None:
+    evening = Reservation(
+        name="reach-charge-window", target_slot=2, energy_kwh=1,
+        obligation_kind="reach-charge-window", reason="Reserving evening energy.",
+    )
+    out = format_plan(_plan(reservations=(evening,)), "test")
+    assert evening.reason in out
+    assert "(funds" not in out
+
+
 def test_report_explains_selected_and_skipped_paid_export_slots() -> None:
     start = datetime(2026, 6, 9, 17, 0, tzinfo=UTC)
     export = ExportIntent(

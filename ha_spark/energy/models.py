@@ -287,6 +287,8 @@ class ChargeIntent:
     # evidence ladder filtered them. Reconcile uses these only for local
     # re-rating; `holds` remains the rated set used by this plan.
     unrated_holds: tuple[tuple[datetime, datetime], ...] = ()
+    # Sizing projection only; never replaces the checked SoC measurement.
+    expected_window_start_soc: float | None = None
 
     @property
     def soc_now(self) -> float:

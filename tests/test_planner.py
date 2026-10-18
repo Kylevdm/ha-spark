@@ -1545,7 +1545,9 @@ def test_midslot_replan_counts_only_the_rest_of_slot_0_in_energy_totals() -> Non
 
     # Only the 20 minutes left of slot 0 are carried: 0.3 kWh x 2/3.
     assert plan.expensive_load_kwh == pytest.approx(0.2)
-    assert plan.required_kwh == pytest.approx(0.2)
+    assert plan.required_kwh == 0
+    assert plan.pre_window_drain_kwh == pytest.approx(0.2)
+    assert plan.reservations[0].name == "reach-charge-window"
     assert plan.reservations[0].energy_kwh == pytest.approx(0.2)
 
     # The whole-slot replan at 17:30 still counts the full 0.3 kWh.
@@ -1560,6 +1562,8 @@ def test_midslot_replan_counts_only_the_rest_of_slot_0_in_energy_totals() -> Non
         config,
     )
     assert whole_plan.expensive_load_kwh == pytest.approx(0.3)
+    assert whole_plan.pre_window_drain_kwh == pytest.approx(0.3)
+    assert whole_plan.required_kwh == 0
 
 
 def _midslot_export_inputs(
@@ -1696,3 +1700,221 @@ def test_midslot_same_day_export_spends_only_the_rest_of_the_slot_in_progress() 
     assert export.slot_export_kw == pytest.approx((2.7, 2.7))
     assert plan.export_revenue == pytest.approx(2.7 * 0.75)
     assert plan.required_kwh == pytest.approx(without.required_kwh + 2.7 * 0.75)
+
+
+def _pre_window_inputs(now: datetime, soc: float, config: PlannerConfig) -> PlannerInputs:
+    geometry = compute_horizon_geometry(
+        now, config.window_start, config.window_end, ZoneInfo("UTC")
+    )
+    first, end = geometry.window_slot_range
+    loads = [0.0] * len(geometry.slot_starts)
+    loads[:first] = [0.5] * first
+    loads[end:] = [0.25] * (len(loads) - end)
+    return PlannerInputs(
+        soc=_soc(soc), solar_tomorrow_kwh=0, predicted_home_load_kwh=sum(loads),
+        now=now, horizon_start=geometry.horizon_start, geometry=geometry,
+        load_slots=tuple(loads),
+    )
+
+
+@pytest.mark.parametrize("soc, required", [(40.0, 7.8), (80.0, 0.0)])
+def test_pre_window_ledger_target_is_exactly_stable(
+    soc: float, required: float,
+) -> None:
+    config = cfg(capacity_kwh=20, buffer_pct=20)
+    now = datetime(2026, 1, 5, 22, 30, tzinfo=UTC)
+    first = _plan(_pre_window_inputs(now, soc, config), config)
+    second = _plan(_pre_window_inputs(now + timedelta(minutes=30), soc - 2.5, config), config)
+
+    # P = 1, E_ws = 3 (or 11), O = 36 * 0.25 * 1.2 = 10.8.
+    assert first.required_kwh == pytest.approx(required)
+    assert first.required_kwh < 14 - (soc - 25) / 5  # headroom at window start
+    assert first.required_kwh < config.max_current_a * config.voltage_v / 1000 * 6
+    assert first.target_soc == pytest.approx(74)
+    assert not (first.target_soc != second.target_soc)
+    assert first.charge_intent.expected_window_start_soc == (
+        second.charge_intent.expected_window_start_soc
+    )
+    assert first.charge_intent.expected_window_start_soc == soc - 5
+    assert first.pre_window_drain_kwh == 1
+    assert second.pre_window_drain_kwh == 0.5
+    assert first.charge_intent.soc is first.soc
+
+
+@pytest.mark.parametrize("soc, shortfall", [
+    (40, ""),
+    (22.5, " A 0.50 kWh shortfall will be imported before the charge window."),
+])
+def test_reach_charge_window_reservation_reason(soc: float, shortfall: str) -> None:
+    config = cfg(capacity_kwh=20)
+    inputs = _pre_window_inputs(datetime(2026, 1, 5, 22, 30, tzinfo=UTC), soc, config)
+    plan = _plan(inputs, config)
+    reach = next(r for r in plan.reservations if r.name == "reach-charge-window")
+    assert reach.energy_kwh == 1
+    assert reach.target_slot == 2
+    assert inputs.geometry is not None
+    assert reach.target_time == inputs.geometry.window_start
+    assert reach.reason == (
+        "Reserving 1.00 kWh to cover forecast house load until the 23:30 charge window."
+        + shortfall
+    )
+    assert plan.required_kwh == pytest.approx(9 - max(0, (soc - 20) / 5 - 1))
+
+
+def test_window_start_omits_evening_reservation_and_keeps_zero_charge_target() -> None:
+    config = cfg(capacity_kwh=20)
+    inputs = _pre_window_inputs(datetime(2026, 1, 5, 23, 30, tzinfo=UTC), 80, config)
+    plan = _plan(inputs, config)
+    assert plan.required_kwh == 0
+    assert plan.target_soc == 80
+    assert all(r.name != "reach-charge-window" for r in plan.reservations)
+
+
+def test_pre_window_slot_outflow_adds_legacy_drain_and_discounts_solar_and_dispatch() -> None:
+    config = cfg(capacity_kwh=20)
+    now = datetime(2026, 1, 5, 22, 30, tzinfo=UTC)
+    inputs = _pre_window_inputs(now, 40, config)
+    assert inputs.geometry is not None
+    solar = [0.0] * len(inputs.load_slots or ())
+    solar[0] = 0.25
+    inputs = replace(
+        inputs, pre_window_drain_kwh=0.5, solar_slots=tuple(solar),
+        dispatches=(DispatchSlot(
+            start=now + timedelta(minutes=30), end=now + timedelta(hours=1),
+        ),),
+    )
+    plan = _plan(inputs, config)
+
+    # First slot: 0.5 - 0.25 solar; second: grid-covered; legacy drain: 0.5.
+    assert plan.pre_window_drain_kwh == 0.75
+    assert plan.charge_intent.expected_window_start_soc == 36.25
+    assert plan.required_kwh == 5.75  # O = 9, E_ws = 3.25 (not P + O)
+    assert plan.target_soc == 65
+    evening, daytime = plan.reservations
+    assert evening.name == "reach-charge-window"
+    assert evening.energy_kwh == 0.75
+    assert daytime.name == "reach-next-cheap-slot"
+    assert daytime.energy_kwh == 9
+
+
+@pytest.mark.parametrize("strategy, required", [("deficit", 9), ("fill", 14)])
+def test_pre_window_shortfall_does_not_become_a_charge_obligation(
+    strategy: str, required: float,
+) -> None:
+    config = cfg(capacity_kwh=20, strategy=strategy)
+    inputs = _pre_window_inputs(datetime(2026, 1, 5, 22, 30, tzinfo=UTC), 20, config)
+    plan = _plan(inputs, config)
+
+    assert plan.required_kwh == required
+    assert plan.charge_intent.expected_window_start_soc == 20
+    assert plan.target_soc == 20 + required * 5
+    assert plan.pre_window_drain_kwh == 1
+
+
+@pytest.mark.parametrize("soc", [10, 80])
+def test_running_window_zero_charge_target_keeps_observed_soc(soc: float) -> None:
+    config = cfg(capacity_kwh=20)
+    now = datetime(2026, 1, 6, 1, tzinfo=UTC)
+    inputs = _pre_window_inputs(now, soc, config)
+    inputs = replace(inputs, load_slots=(0.0,) * len(inputs.load_slots or ()))
+    plan = _plan(inputs, config)
+
+    assert plan.required_kwh == 0
+    assert plan.target_soc == soc
+    assert plan.pre_window_drain_kwh == 0
+    assert all(r.name != "reach-charge-window" for r in plan.reservations)
+
+
+@pytest.mark.parametrize("elapsed_slots", [0, 3])
+def test_window_start_and_running_window_keep_the_dispatch_deficit_floor(
+    elapsed_slots: int,
+) -> None:
+    config = cfg(buffer_pct=20, solar_haircut_k=0.85, charge_efficiency=0.9)
+    window_start = datetime(2026, 1, 15, 23, 30, tzinfo=UTC)
+    now = window_start + timedelta(minutes=30 * elapsed_slots)
+    geometry = compute_horizon_geometry(
+        now, config.window_start, config.window_end, ZoneInfo("UTC")
+    )
+    loads = tuple(0.4 if i < 12 else 0.5 for i in range(elapsed_slots, 48))
+    solar = tuple(1.0 if 20 <= i < 28 else 0.0 for i in range(elapsed_slots, 48))
+    inputs = PlannerInputs(
+        soc=_soc(55), solar_tomorrow_kwh=8, predicted_home_load_kwh=sum(loads),
+        load_slots=loads, solar_slots=solar, now=now, geometry=geometry,
+        horizon_start=geometry.horizon_start,
+        dispatches=(DispatchSlot(
+            start=datetime(2026, 1, 16, 13, 30, tzinfo=UTC),
+            end=datetime(2026, 1, 16, 15, tzinfo=UTC),
+        ),),
+    )
+    plan = _plan(inputs, config)
+
+    assert plan.pre_window_drain_kwh == 0
+    assert plan.expensive_load_kwh == 12.5
+    assert plan.required_kwh == pytest.approx(5.592)
+    assert plan.target_soc == pytest.approx(75.803571, abs=1e-6)
+    assert plan.charge_intent.expected_window_start_soc == 55
+    assert len(plan.reservations) == 1
+    assert plan.reservations[0].energy_kwh == pytest.approx(4.8)
+    assert plan.soc_path[0][0] == geometry.window_end
+
+
+@pytest.mark.parametrize("strategy", ["deficit", "fill"])
+def test_running_window_ledger_caps_purchase_at_remaining_charge_delivery(strategy: str) -> None:
+    config = cfg(capacity_kwh=100, strategy=strategy)
+    inputs = _pre_window_inputs(datetime(2026, 1, 6, 1, tzinfo=UTC), 20, config)
+    inputs = replace(inputs, load_slots=tuple(10 * e for e in inputs.load_slots or ()))
+    plan = _plan(inputs, config)
+
+    assert plan.required_kwh == pytest.approx(4.5 * 62.5 * 51 / 1000)
+    assert plan.target_soc == pytest.approx(20 + plan.required_kwh)
+    assert plan.charge_intent.expected_window_start_soc == 20
+    assert plan.pre_window_drain_kwh == 0
+
+
+def test_pre_window_outflow_counts_only_selected_export_slots_before_the_window() -> None:
+    config = cfg(capacity_kwh=100)
+    now = datetime(2026, 1, 5, 22, 30, tzinfo=UTC)
+    inputs = _pre_window_inputs(now, 80, config)
+    inputs = replace(inputs, flexibility_event=FlexibilityEvent(
+        start=now, end=now + timedelta(hours=2), direction="export",
+        rate_gbp_kwh=1, updated_at=now,
+    ))
+    plan = _plan(inputs, config)
+
+    export = plan.charge_intent.export
+    assert export is not None
+    assert len(export.selected_slots) == 4
+    # Fixed output serves 1 kW of house load, leaving 2.2 kW exported in each
+    # pre-window slot: P = 1 kWh house load + 2.2 kWh exported.
+    assert export.slot_export_kw[:2] == pytest.approx((2.2, 2.2))
+    assert plan.pre_window_drain_kwh == pytest.approx(3.2)
+    assert plan.reservations[0].energy_kwh == pytest.approx(3.2)
+    assert plan.charge_intent.expected_window_start_soc == pytest.approx(76.8)
+    assert plan.required_kwh == 0  # The other two slots conflict with charging.
+
+
+def test_v2l_never_funds_the_reach_charge_window_reservation() -> None:
+    config = cfg(capacity_kwh=20, max_current_a=0, v2l_budget_kwh=5)
+    inputs = _pre_window_inputs(datetime(2026, 1, 5, 22, 30, tzinfo=UTC), 20, config)
+    assert inputs.geometry is not None
+    loads = (0.5,) * inputs.geometry.window_slot_range[0]
+    loads += (0.0,) * (len(inputs.load_slots or ()) - len(loads))
+    inputs = replace(inputs, load_slots=loads, car_plugged_in=True)
+    plan = _plan(inputs, config)
+
+    assert plan.reservations[0].name == "reach-charge-window"
+    assert plan.reservations[0].energy_kwh == 1
+    assert plan.required_kwh == 0
+    assert plan.v2l_refills == ()
+    assert plan.soc_path[0] == (inputs.geometry.window_end, 20)
+
+
+def test_pre_window_zero_charge_soc_path_starts_with_energy_actually_carried() -> None:
+    config = cfg(capacity_kwh=20)
+    inputs = _pre_window_inputs(datetime(2026, 1, 5, 22, 30, tzinfo=UTC), 80, config)
+    plan = _plan(inputs, config)
+
+    assert plan.required_kwh == 0
+    assert plan.target_soc == 65  # Decision B: target is the obligation, not surplus.
+    assert inputs.geometry is not None
+    assert plan.soc_path[0] == (inputs.geometry.window_end, 75)

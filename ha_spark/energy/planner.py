@@ -24,15 +24,20 @@ night (``required = headroom``) — optimal once the export rate exceeds
 off-peak; the carried-over surplus is an asset the cost projection does not
 model.
 
-v2 model (per-slot horizon, when ``inputs.load_slots`` is set): the horizon is 48
-half-hour slots starting at the charge-window start tonight. Slots inside the
-fixed window, or overlapping an Octopus dispatch, are "cheap"; the battery only
-needs to cover the *expensive* slots' net load (load - solar), so
+v2 model (per-slot horizon, when ``inputs.load_slots`` is set): geometry locates
+half-hour slots and the running-or-next charge window. Slots inside the fixed
+window, or overlapping an Octopus dispatch, are "cheap"; the battery only needs
+to cover the *expensive* slots' net load (load - solar).
 
-    expensive_need  = sum_slots (1 - cheap_frac) * max(0, load - solar)
-
-replaces ``deficit``, then the same buffer and clamps apply. Both models also
-project a two-rate cost (off-peak/peak) with and without the battery.
+Pre-window outflow P includes expensive net load before the window, selected
+exports before it and, until horizon activation, the legacy pre-window drain.
+The reach-charge-window reservation traces P but is never funded by charging.
+Explicit geometry sizes charging from E_ws = max(0, usable_now - P), against the
+larger of post-window reservations and the buffered post-window deficit. Its
+target is the SoC to reach at the window end, not the observed SoC plus a purchase
+that would ignore the evening drain. Legacy inputs keep their original numbers;
+the daily-balance fallback above is unchanged. Both models also project a two-rate
+cost (off-peak/peak) with and without the battery.
 
 Each slot's forecast power is full-slot (kWh x 2); energy totals carry only the
 remaining part of a part-elapsed slot 0, while the DNO/supply/export-capacity
@@ -110,8 +115,10 @@ def _slot_reservation(
     expensive daytime afterward) reserve exactly its expensive-slot need.
     """
     fracs = schedule.cheap_fracs
+    geometry = inputs.geometry_for(cfg)
+    first = geometry.window_slot_range[0] if geometry is not None else 0
     first_expensive = next(
-        (i for i, fraction in enumerate(fracs) if fraction < 1.0 - 1e-9),
+        (i for i in range(first, len(fracs)) if fracs[i] < 1.0 - 1e-9),
         None,
     )
     if first_expensive is None:
@@ -128,7 +135,7 @@ def _slot_reservation(
 
     expensive_need = sum(
         (1.0 - fraction) * energy
-        for fraction, energy in zip(fracs[:target_slot], net[:target_slot], strict=True)
+        for fraction, energy in zip(fracs[first:target_slot], net[first:target_slot], strict=True)
     )
     buffered_need = expensive_need * (1.0 + cfg.buffer_pct / 100.0)
     usable_capacity = max(0.0, cfg.capacity_kwh * (cfg.target_cap - cfg.min_soc) / 100.0)
@@ -507,6 +514,7 @@ def _event_export_plan(
     schedule: TariffSchedule,
     net: list[float],
     charge_limit: float,
+    pre_window_outflow: float,
 ) -> tuple[
     ExportIntent | None,
     tuple[Reservation, ...],
@@ -596,7 +604,7 @@ def _event_export_plan(
             max(
                 0.0,
                 cfg.capacity_kwh * (inputs.soc_now - cfg.min_soc) / 100.0
-                - inputs.pre_window_drain_kwh,
+                - pre_window_outflow,
             )
             + charge_limit
         )
@@ -897,6 +905,8 @@ def compute_plan(
     overnight_charge_capped = False
     geometry = inputs.geometry_for(cfg)
     charge_limit = _window_charge_limit(inputs, cfg)
+    pre_window_outflow = inputs.pre_window_drain_kwh
+    window_first = geometry.window_slot_range[0] if geometry is not None else 0
     if inputs.load_slots is not None:
         # --- v2 per-slot horizon: cost against the schedule's per-slot prices ---
         model = "slots"
@@ -916,6 +926,7 @@ def compute_plan(
         expensive_need = sum((1.0 - f) * e for f, e in zip(fracs, net, strict=True))
         expensive_load_kwh = expensive_need
         deficit = expensive_need
+        pre_window_outflow += sum((1.0 - fracs[i]) * net[i] for i in range(window_first))
         # Dispatch-covered load outside the fixed window (for the report).
         # Clockless legacy arrays keep the original fixed-window indexing.
         window_fracs = (
@@ -940,7 +951,7 @@ def compute_plan(
             export_soc_needed_pct,
             export_soc_needed_at,
             overnight_charge_capped,
-        ) = _event_export_plan(inputs, cfg, schedule, net, charge_limit)
+        ) = _event_export_plan(inputs, cfg, schedule, net, charge_limit, pre_window_outflow)
         reservations = event_reservations or (_slot_reservation(inputs, cfg, schedule, net),)
     else:
         # --- v1 daily balance ---
@@ -961,23 +972,39 @@ def compute_plan(
         export_kwh = max(0.0, effective_solar - inputs.predicted_home_load_kwh)
 
     buffered_deficit = deficit * (1.0 + cfg.buffer_pct / 100.0)
-    # The horizon starts at the window, so load between now and then drains
-    # the battery invisibly — size against the usable energy at window start.
-    # A same-day export (#198) also spends battery before the window opens.
-    same_day_export_kwh = (
+    # Until horizon activation, the legacy drain still covers load outside
+    # the slot horizon. Selected exports before the window spend energy too.
+    pre_window_export_kwh = (
         sum(
             power * _hours_left(start, inputs.now)
             for start, power in zip(export.selected_slots, export.slot_export_kw, strict=True)
+            if start < geometry.window_start
         )
-        if export is not None
-        and inputs.horizon_start is not None
-        and export.window_end <= inputs.horizon_start
+        if export is not None and geometry is not None
         else 0.0
     )
-    usable_at_window = usable_now - inputs.pre_window_drain_kwh - same_day_export_kwh
-    # ...and frees the same room under the cap for tonight's charge.
-    headroom += same_day_export_kwh
-    reservation_need = sum(reservation.energy_kwh for reservation in reservations)
+    pre_window_outflow += pre_window_export_kwh
+    usable_at_window = usable_now - pre_window_outflow
+    # Explicit current-slot geometry uses the window-start balance. Legacy
+    # inputs and the daily fallback retain their original numbers.
+    if inputs.load_slots is not None and inputs.geometry is not None:
+        usable_at_window = max(0.0, usable_at_window)
+        headroom = max(
+            0.0, cfg.capacity_kwh * (cfg.target_cap - cfg.min_soc) / 100.0 - usable_at_window
+        )
+    else:
+        headroom += pre_window_export_kwh
+    reservation_need = sum(
+        reservation.energy_kwh
+        for reservation in reservations
+        if reservation.target_slot > window_first
+    )
+    post_window_deficit = (
+        sum((1.0 - fracs[i]) * net[i] for i in range(window_first, len(net)))
+        * (1.0 + cfg.buffer_pct / 100.0)
+        if inputs.load_slots is not None else buffered_deficit
+    )
+    obligation = max(reservation_need, post_window_deficit)
     export_overlaps_charge = (
         export is not None
         and geometry is not None
@@ -999,7 +1026,6 @@ def compute_plan(
         # slot can refill the battery. A short daytime dispatch cannot, so it
         # is a floor on the overnight buy, not the whole obligation — the
         # buffered horizon deficit still stands.
-        obligation = max(reservation_need, buffered_deficit) if reservations else buffered_deficit
         required = _clamp(
             obligation - usable_at_window,
             0.0,
@@ -1046,6 +1072,19 @@ def compute_plan(
     if cfg.capacity_kwh > 0:
         target_soc = min(cfg.target_cap, inputs.soc_now + required / cfg.capacity_kwh * 100.0)
 
+    expected_window_start_soc = None
+    if inputs.load_slots is not None and cfg.capacity_kwh > 0:
+        expected_window_start_soc = (
+            cfg.min_soc + max(0.0, usable_at_window) / cfg.capacity_kwh * 100.0
+        )
+        if inputs.geometry is not None and window_first > 0:
+            target_energy = usable_at_window + required
+            if pre_window_outflow > 0 and required == 0:
+                target_energy = obligation
+            target_soc = min(
+                cfg.target_cap, cfg.min_soc + target_energy / cfg.capacity_kwh * 100.0
+            )
+
     refills, v2l_unavailable, v2l_saving = _v2l_refills(
         inputs, cfg, schedule, reservations, usable_at_window + required, export
     )
@@ -1064,21 +1103,43 @@ def compute_plan(
         ) if refills else ()
         # The V2L ledger starts with the energy actually left after the
         # pre-window drain and overnight purchase. Its projection must share
-        # that starting balance, rather than the legacy charge target.
+        # that starting balance, rather than a charge target that can omit
+        # carried surplus when no pre-window purchase is needed (decision B).
         path_start_soc = (
             _clamp(
                 cfg.min_soc + (usable_at_window + required) / cfg.capacity_kwh * 100,
                 cfg.min_soc,
                 cfg.target_cap,
-            ) if refills else target_soc
+            ) if refills or inputs.geometry is not None else target_soc
         )
         soc_path = _soc_path(
             geometry, net, schedule, export, path_start_soc, cfg, refills, surplus
         )
 
+    # This reservation is carried from now, never funded by charging or V2L.
+    if inputs.load_slots is not None and pre_window_outflow > 0:
+        reason = (
+            f"Reserving {pre_window_outflow:.2f} kWh to cover forecast house load until the "
+            f"{cfg.window_start:%H:%M} charge window."
+        )
+        shortfall = max(0.0, pre_window_outflow - usable_now)
+        if shortfall > 1e-9:
+            reason += (
+                f" A {shortfall:.2f} kWh shortfall will be imported before the charge window."
+            )
+        reservations = (
+            Reservation(
+                name="reach-charge-window", target_slot=window_first,
+                energy_kwh=pre_window_outflow, obligation_kind="reach-charge-window",
+                reason=reason, target_time=geometry.window_start if geometry is not None else None,
+            ),
+            *reservations,
+        )
+
     holds = controlled
     intent = ChargeIntent(
         target_soc_pct=target_soc,
+        expected_window_start_soc=expected_window_start_soc,
         soc=inputs.soc,
         window_start=cfg.window_start,
         window_end=cfg.window_end,
@@ -1119,7 +1180,9 @@ def compute_plan(
         charge_efficiency=efficiency,
         export_revenue=export_revenue,
         strategy=cfg.strategy,
-        pre_window_drain_kwh=inputs.pre_window_drain_kwh,
+        pre_window_drain_kwh=(
+            pre_window_outflow if inputs.load_slots is not None else inputs.pre_window_drain_kwh
+        ),
         # Octopus reports planned charge_in_kwh as negative (energy into the
         # car); report the magnitude.
         dispatch_ev_kwh=(

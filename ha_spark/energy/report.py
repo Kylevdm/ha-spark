@@ -89,8 +89,12 @@ def format_plan(
         deficit += f"  (+{plan.buffer_pct:.0f}% buffer -> {buffered:.2f})"
 
     required = f"{plan.required_kwh:.2f} kWh"
-    if plan.reservations and plan.strategy != "fill":
-        names = ", ".join(reservation.name for reservation in plan.reservations)
+    post_window_reservations = tuple(
+        reservation for reservation in plan.reservations
+        if reservation.obligation_kind != "reach-charge-window"
+    )
+    if post_window_reservations and plan.strategy != "fill":
+        names = ", ".join(reservation.name for reservation in post_window_reservations)
         required += f"  (funds {names})"
     if plan.strategy == "fill":
         required += f"  (fill to {plan.target_soc:.0f}%)"
