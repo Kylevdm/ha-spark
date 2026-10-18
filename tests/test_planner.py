@@ -570,6 +570,250 @@ def test_same_day_export_skips_when_the_live_soc_cannot_fund_it() -> None:
     )
 
 
+# --- current-slot same-day events (#403): the legacy #198 contract ---
+
+
+def _current_event_inputs(legacy: PlannerInputs, config: PlannerConfig) -> PlannerInputs:
+    assert legacy.now is not None
+    geometry = compute_horizon_geometry(
+        legacy.now, config.window_start, config.window_end, legacy.now.tzinfo or UTC
+    )
+    assert legacy.load_slots is not None
+    assert legacy.horizon_start is not None
+    # Lay the legacy daily profile onto absolute half-hours, including DST folds.
+    indices = [
+        int((start - legacy.horizon_start).total_seconds() / 1800) % 48
+        for start in geometry.slot_starts
+    ]
+    return replace(
+        legacy, geometry=geometry, horizon_start=geometry.horizon_start,
+        pre_window_drain_kwh=0.0,
+        load_slots=tuple(legacy.load_slots[i] for i in indices),
+        solar_slots=tuple((legacy.solar_slots or (0.0,) * 48)[i] for i in indices),
+    )
+
+
+@pytest.mark.parametrize(
+    ("soc", "hour", "minute", "rate", "buffer"),
+    [
+        (60.0, 16, 0, 1.0, 0.0),  # fully funded
+        (43.0, 16, 0, 0.20, 20.0),  # funding suffix and full SoC obligation
+        (30.0, 16, 0, 1.0, 0.0),  # no charge borrowed from tonight
+        (20.0 + 5.6 / 26.88 * 100, 16, 0, 1.0, 0.0),  # profitable reserve
+        (20.0 + 4.5 / 26.88 * 100, 16, 0, 1.0, 0.0),  # bounded reserve
+        (20.0 + 4.5 / 26.88 * 100, 19, 15, 1.0, 0.0),  # remaining energy
+        (60.0, 19, 30, 1.0, 0.0),  # kept armed start
+    ],
+)
+def test_current_event_matches_legacy_same_day_funding(
+    soc: float, hour: int, minute: int, rate: float, buffer: float
+) -> None:
+    config = replace(_same_day_cfg(), buffer_pct=buffer)
+    legacy = _same_day_inputs(
+        soc_now=soc, now=datetime(2026, 6, 8, hour, minute, tzinfo=UTC),
+        event=replace(_SAME_DAY_EVENT, rate_gbp_kwh=rate),
+    )
+    expected = _plan(legacy, config)
+    actual = _plan(_current_event_inputs(legacy, config), config)
+
+    assert actual.charge_intent.export == expected.charge_intent.export
+    assert actual.export_skips == expected.export_skips
+    assert actual.export_funding == expected.export_funding
+    assert actual.export_soc_needed_pct == pytest.approx(expected.export_soc_needed_pct)
+    assert actual.export_soc_needed_at == expected.export_soc_needed_at
+    assert actual.export_revenue == pytest.approx(expected.export_revenue)
+
+
+@pytest.mark.parametrize("guard", ["daylight", "dno", "supply", "hold", "capacity"])
+def test_current_event_preserves_hard_refusals_and_suffix_termination(guard: str) -> None:
+    config = _same_day_cfg()
+    legacy = _same_day_inputs(
+        soc_now=90.0, now=datetime(2026, 6, 8, 19, 15, tzinfo=UTC)
+    )
+    reasons = {
+        "daylight": "Skipped paid slot: today's solar isn't forecast, so in daylight the fixed "
+        "discharge command can't be checked against the DNO limit.",
+        "dno": "Skipped paid slot: the fixed discharge command would exceed "
+        "the DNO or supply limit.",
+        "supply": "Skipped paid slot: the fixed discharge command would exceed "
+        "the DNO or supply limit.",
+        "hold": "Skipped paid slot: it overlaps an Octopus dispatch hold.",
+        "capacity": "Skipped paid slot: forecast house load leaves no export capacity.",
+    }
+    if guard == "daylight":
+        legacy = replace(legacy, solar_slots=(0.0,) * 40 + (0.5,) + (0.0,) * 7)
+    elif guard == "dno":
+        config = replace(config, dno_export_limit_kw=2.0)
+    elif guard == "supply":
+        config = replace(config, supply_max_current_a=8.0, supply_voltage_v=240.0)
+    elif guard == "hold":
+        start = _SAME_DAY_EVENT.start + timedelta(minutes=30)
+        legacy = replace(legacy, dispatches=(DispatchSlot(start, _SAME_DAY_EVENT.end),))
+    else:
+        legacy = replace(legacy, load_slots=(0.25,) * 40 + (2.0,) + (0.25,) * 7)
+
+    expected = _plan(legacy, config)
+    actual = _plan(_current_event_inputs(legacy, config), config)
+
+    assert actual.charge_intent.export is None
+    assert actual.export_skips == expected.export_skips
+    assert actual.export_skips[-1].reason == reasons[guard]
+    assert actual.export_soc_needed_pct is None  # more SoC cannot repair a hard refusal
+    assert actual.export_funding is None
+
+
+@pytest.mark.parametrize("discount", ["solar", "dispatch_before", "dispatch_after"])
+def test_current_event_strict_protection_ignores_solar_and_dispatch(discount: str) -> None:
+    config = replace(_same_day_cfg(), buffer_pct=20.0)
+    legacy = _same_day_inputs(
+        soc_now=43.0, now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC),
+        event=replace(_SAME_DAY_EVENT, rate_gbp_kwh=0.20),
+    )
+    inputs = _current_event_inputs(legacy, config)
+    if discount == "solar":
+        inputs = replace(
+            inputs, solar_slots=(2.0,) * 6 + (0.0,) * (len(inputs.load_slots or ()) - 6)
+        )
+    else:
+        start = datetime(2026, 6, 8, 17 if discount == "dispatch_before" else 21, tzinfo=UTC)
+        inputs = replace(inputs, dispatches=(DispatchSlot(start, start + timedelta(hours=1)),))
+
+    plan = _plan(inputs, config)
+
+    export = plan.charge_intent.export
+    assert export is not None
+    assert export.selected_slots == (_SAME_DAY_EVENT.start + timedelta(minutes=30),)
+    assert plan.export_skips[0].reason == (
+        "Skipped paid slot: funding it would consume reserved house or post-event energy."
+    )
+    assert plan.export_funding is None
+    assert plan.export_soc_needed_pct == pytest.approx(20 + 5.3 / 26.88 * 100)
+
+
+@pytest.mark.parametrize(
+    ("dear_hour", "dear_minute", "price", "funded"),
+    [(20, 0, 2.0, True), (22, 30, 2.0, False), (23, 0, 1.0, False)],
+)
+def test_current_event_buy_back_uses_worst_marginal_live_price_strictly(
+    dear_hour: int, dear_minute: int, price: float, funded: bool
+) -> None:
+    config = _same_day_cfg()
+    inputs = _current_event_inputs(
+        _same_day_inputs(
+            soc_now=20 + 5.6 / 26.88 * 100,
+            now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC),
+        ), config,
+    )
+    assert inputs.geometry is not None
+    dear_slot = inputs.geometry.slot_starts.index(
+        datetime(2026, 6, 8, dear_hour, dear_minute, tzinfo=UTC)
+    )
+    schedule = fixed_schedule(inputs, config)
+    schedule = replace(schedule, prices=tuple(
+        price if i == dear_slot else p for i, p in enumerate(schedule.prices)
+    ))
+
+    plan = compute_plan(inputs, config, schedule)
+
+    export = plan.charge_intent.export
+    assert export is not None
+    assert len(export.selected_slots) == (2 if funded else 1)
+    assert plan.export_funding == (
+        "Funded 0.85 kWh from the post-event reserve: £1.00 event vs £0.30 buy-back."
+        if funded else None
+    )
+
+
+@pytest.mark.parametrize(("month", "day", "event_hour", "count"), [(3, 29, 1, 2), (10, 25, 0, 4)])
+def test_current_event_selects_real_half_hours_across_dst(
+    month: int, day: int, event_hour: int, count: int
+) -> None:
+    config = _same_day_cfg()
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, month, day, 0, 0, tzinfo=tz)
+    start = datetime(2026, month, day, event_hour, tzinfo=UTC)
+    event = replace(_SAME_DAY_EVENT, start=start, end=start + timedelta(minutes=30 * count))
+    inputs = _current_event_inputs(_same_day_inputs(soc_now=90, now=now, event=event), config)
+
+    plan = _plan(inputs, config)
+
+    export = plan.charge_intent.export
+    assert export is not None
+    assert export.selected_slots == tuple(start + timedelta(minutes=30 * i) for i in range(count))
+    assert export.event_identity == event.identity
+    assert plan.export_revenue == pytest.approx(2.7 * 0.5 * count)
+    assert plan.required_kwh == 0.0
+
+
+@pytest.mark.parametrize(("strategy", "soc"), [("reserve", 60.0), ("fill", 90.0)])
+def test_current_event_is_refilled_by_the_next_charge(strategy: str, soc: float) -> None:
+    config = replace(_same_day_cfg(), strategy=strategy)
+    inputs = _current_event_inputs(
+        _same_day_inputs(soc_now=soc, now=datetime(2026, 6, 8, 16, tzinfo=UTC)), config
+    )
+
+    without = _plan(replace(inputs, flexibility_event=None), config)
+    with_export = _plan(inputs, config)
+
+    assert with_export.charge_intent.export is not None
+    assert with_export.required_kwh == pytest.approx(without.required_kwh + 2.7)
+    assert with_export.pre_window_drain_kwh == pytest.approx(3.75 + 2.7)
+
+
+def test_current_pre_window_export_overlapping_charge_keeps_zero_purchase() -> None:
+    config = _same_day_cfg()
+    event = replace(
+        _SAME_DAY_EVENT, start=datetime(2026, 6, 8, 23, tzinfo=UTC),
+        end=datetime(2026, 6, 9, 0, tzinfo=UTC),
+    )
+    inputs = _current_event_inputs(
+        _same_day_inputs(
+            soc_now=60, now=datetime(2026, 6, 8, 22, 30, tzinfo=UTC), event=event
+        ), config,
+    )
+
+    plan = _plan(inputs, config)
+
+    export = plan.charge_intent.export
+    assert export is not None
+    assert (export.window_start, export.window_end) == (event.start, event.end)
+    assert plan.required_kwh == 0.0
+    # Decision B still expresses the post-window obligation as a target, even
+    # when export suppresses charging. It must not create a purchase or SoC path.
+    assert plan.target_soc == pytest.approx(20 + 9.0 / 26.88 * 100)
+    assert plan.soc_path == ()
+
+
+def test_current_post_window_event_charge_cap_uses_energy_at_window_start() -> None:
+    config = replace(_same_day_cfg(), max_current_a=1000 / (51 * 6))  # 1 kWh charge limit
+    event = replace(
+        _SAME_DAY_EVENT,
+        start=datetime(2026, 6, 9, 19, tzinfo=UTC),
+        end=datetime(2026, 6, 9, 19, 30, tzinfo=UTC),
+    )
+    inputs = _current_event_inputs(
+        _same_day_inputs(
+            soc_now=20 + 2 / 26.88 * 100,
+            now=datetime(2026, 6, 8, 16, tzinfo=UTC), event=event,
+        ), config,
+    )
+    assert inputs.geometry is not None
+    inputs = replace(inputs, load_slots=tuple(
+        2.0 if i == 0 else 0.0 for i in range(len(inputs.geometry.slot_starts))
+    ))
+
+    plan = _plan(inputs, config)
+
+    # The 2 kWh present now is spent before charging. Only 1 kWh can be
+    # added, less than the 1.6 kWh needed for the post-window export slot.
+    assert plan.charge_intent.export is None
+    assert plan.overnight_charge_capped is True
+    assert plan.export_skips[0].reason == (
+        "Skipped paid slot: funding it would consume reserved house or post-event energy."
+    )
+    assert plan.export_soc_needed_pct == pytest.approx(20 + 1.6 / 26.88 * 100)
+
+
 # --- funding an event from the post-event reserve (#207) ---
 
 

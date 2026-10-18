@@ -43,6 +43,13 @@ Each slot's forecast power is full-slot (kWh x 2); energy totals carry only the
 remaining part of a part-elapsed slot 0, while the DNO/supply/export-capacity
 checks compare full-slot power (#400).
 
+Events on explicit current-slot horizons use one suffix planner. Events before
+window end can spend only the battery energy already present; events before
+window start initially protect all house load through the window, without a
+solar or dispatch discount. Only bounded, strictly profitable post-event
+buy-back can spend that protection. Legacy pre-horizon events retain their
+same-day route until horizon activation is complete.
+
 Daytime dispatch slots are expressed as ``holds`` on the ``ChargeIntent``, so
 the battery holds (doesn't discharge) while cheap grid covers the house.
 """
@@ -539,7 +546,8 @@ def _event_export_plan(
     if event is None or event.direction != "export" or inputs.horizon_start is None:
         return None, (), (), None, None, None, False
     if (
-        inputs.now is not None
+        inputs.geometry is None
+        and inputs.now is not None
         and inputs.load_slots is not None
         and event.end <= inputs.horizon_start
     ):
@@ -587,13 +595,22 @@ def _event_export_plan(
             if solar_slots[i] > 1e-9 or (local.hour, local.minute) in served_daylight:
                 daylight_slots.add(i)
 
-    # If any event slot overlaps the physical timed-charge window, export
-    # outranks discretionary charging. Only energy already in the battery may
-    # fund that event; the caller will emit a zero-charge intent below.
+    # Funding before window end: charging that has not happened cannot fund
+    # an event. Legacy window-start horizons retain the overlap-only rule.
     charge_window_conflict = any(geometry.window_fracs[i] > 0 for i in event_slots)
+    battery_funded = charge_window_conflict or (
+        inputs.geometry is not None
+        and geometry.slot_starts[event_slots[0]] < geometry.window_end
+    )
+    pre_window_event = inputs.geometry is not None and event.end <= geometry.window_start
+    if pre_window_event and inputs.load_slots is not None:
+        # Strict pre-window protection: no solar or cheap-grid discount, even
+        # for a dispatch between the event and the window. Only the bounded,
+        # strictly profitable reserve buy-back below may spend this obligation.
+        net = [load * _slot_hours(geometry, i) * 2 for i, load in enumerate(inputs.load_slots)]
     usable_capacity = max(0.0, cfg.capacity_kwh * (cfg.target_cap - cfg.min_soc) / 100.0)
     charge_capped = False
-    if charge_window_conflict:
+    if battery_funded:
         usable_capacity = max(
             0.0, cfg.capacity_kwh * (inputs.soc_now - cfg.min_soc) / 100.0
         )
@@ -615,22 +632,27 @@ def _event_export_plan(
     # an event only when buying it back pays (#207).  Like the existing
     # reservation, it carries the planner safety buffer.
     after_event = event_slots[-1] + 1
-    target_slot = next(
-        (i for i in range(after_event, len(net)) if schedule.cheap_fracs[i] > 1e-9),
-        len(net),
+    target_slot = (
+        geometry.window_slot_range[0] if pre_window_event else next(
+            (i for i in range(after_event, len(net)) if schedule.cheap_fracs[i] > 1e-9),
+            len(net),
+        )
     )
-    post_need = sum(
-        (1.0 - schedule.cheap_fracs[i]) * net[i] for i in range(after_event, target_slot)
-    )
+    post_needs = [
+        net[i] if pre_window_event else (1.0 - schedule.cheap_fracs[i]) * net[i]
+        for i in range(after_event, target_slot)
+    ]
+    post_need = sum(post_needs)
     buffered_post_energy = post_need * (1.0 + cfg.buffer_pct / 100.0)
-    post_energy = min(buffered_post_energy, usable_capacity)
+    post_energy = (
+        buffered_post_energy if pre_window_event else min(buffered_post_energy, usable_capacity)
+    )
 
     def shortfall_price(shortfall: float) -> float:
         # The battery serves the slots after the event in order and runs dry at
         # the end of the stretch, so a shortfall is bought in its last slots.
         worst = 0.0
-        for i in reversed(range(after_event, target_slot)):
-            need = (1.0 - schedule.cheap_fracs[i]) * net[i]
+        for i, need in reversed(list(enumerate(post_needs, start=after_event))):
             if need <= 1e-9:
                 continue
             worst = max(worst, schedule.prices[i])
@@ -646,9 +668,12 @@ def _event_export_plan(
     window_end_slot = geometry.window_slot_range[1]
     if window_end_slot and 0 < geometry.window_fracs[window_end_slot - 1] < 1:
         window_end_slot -= 1
-    pre_event_start = min(window_end_slot, event_slots[0])
+    pre_event_start = (
+        0 if inputs.geometry is not None and battery_funded
+        else min(window_end_slot, event_slots[0])
+    )
     pre_event_house_energy = sum(
-        (1.0 - schedule.cheap_fracs[i]) * net[i]
+        net[i] if pre_window_event else (1.0 - schedule.cheap_fracs[i]) * net[i]
         for i in range(pre_event_start, event_slots[0])
     )
     # Cheap grid never serves a slot while it is being exported: preserve its
@@ -706,7 +731,13 @@ def _event_export_plan(
         target_time=target_time,
     )
 
-    export = _export_intent(event, cfg, selected[0][0].start, selected)
+    window_start = selected[0][0].start
+    if inputs.geometry is not None and window_start == slots[0].start:
+        # Kept armed start: dropping an elapsed slot must not rewrite the
+        # resident window. Align to the first complete event slot in real time.
+        half_hour = timedelta(minutes=30)
+        window_start -= ((window_start - event.start.astimezone(UTC)) // half_hour) * half_hour
+    export = _export_intent(event, cfg, window_start, selected)
     event_energy = house_through_event_energy + sum(power * slot.hours for slot, power in selected)
     event_reservation = Reservation(
         name="axle-export-event",
