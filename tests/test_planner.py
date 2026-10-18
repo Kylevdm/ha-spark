@@ -5,9 +5,11 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from ha_spark.energy.horizon import compute_horizon_geometry
 from ha_spark.energy.models import DispatchSlot, FlexibilityEvent, PlannerConfig, PlannerInputs
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
@@ -1320,3 +1322,113 @@ def test_v2l_soc_path_starts_after_pre_window_drain() -> None:
     assert plan.soc_path[0][1] == pytest.approx(71.3988095238)
     # At the final slot start only its 20/36 kWh remains above the 20% floor.
     assert plan.soc_path[-1][1] == pytest.approx(22.0667989418)
+
+
+@pytest.mark.parametrize(
+    ("day", "slots", "hours"),
+    [(datetime(2026, 3, 28), 46, 5), (datetime(2026, 10, 24), 50, 7)],
+)
+def test_geometry_dst_window_limit_and_soc_path(day: datetime, slots: int, hours: int) -> None:
+    tz = ZoneInfo("Europe/London")
+    now = day.replace(hour=23, minute=30, tzinfo=tz)
+    config = cfg(strategy="fill", capacity_kwh=100)
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    inp = PlannerInputs(
+        soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=0,
+        now=now, geometry=geom, horizon_start=geom.horizon_start,
+        load_slots=(0.0,) * len(geom.slot_starts),
+    )
+    plan = _plan(inp, config)
+    assert len(plan.slot_prices or ()) == slots
+    assert plan.required_kwh == pytest.approx(62.5 * 51 * hours / 1000)
+    assert plan.soc_path[0] == (geom.window_end, plan.target_soc)
+    assert len(plan.soc_path) == slots - hours * 2
+
+
+def test_geometry_partial_window_coverage_and_soc_path() -> None:
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, 1, 10, 23, 20, tzinfo=tz)
+    config = cfg(window_start=time(23, 20), window_end=time(5, 20), strategy="fill",
+                 capacity_kwh=100)
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    inp = PlannerInputs(
+        soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=0,
+        now=now, geometry=geom, horizon_start=geom.horizon_start,
+        load_slots=(0.0,) * len(geom.slot_starts),
+    )
+    plan = _plan(inp, config)
+    assert len(plan.slot_prices or ()) == 49
+    assert plan.slot_prices is not None
+    assert plan.slot_prices[0] == pytest.approx(
+        config.rate_offpeak / 3 + config.rate_peak * 2 / 3
+    )
+    assert plan.required_kwh == pytest.approx(62.5 * 51 * 6 / 1000)
+    assert plan.soc_path[0] == (geom.window_end, plan.target_soc)
+
+
+@pytest.mark.parametrize(
+    ("now", "window_start", "window_end", "event_start", "event_end", "conflict"),
+    [
+        (datetime(2026, 3, 28, 23, 30), time(23, 30), time(5, 30),
+         datetime(2026, 3, 29, 5, 30), datetime(2026, 3, 29, 6, 45), False),
+        (datetime(2026, 10, 24, 23, 30), time(23, 30), time(5, 30),
+         datetime(2026, 10, 25, 5), datetime(2026, 10, 25, 5, 45), True),
+        (datetime(2026, 1, 10, 23, 20), time(23, 20), time(5, 20),
+         datetime(2026, 1, 11, 5), datetime(2026, 1, 11, 5, 45), True),
+    ],
+)
+def test_geometry_event_containment_and_charge_conflict(
+    now: datetime, window_start: time, window_end: time,
+    event_start: datetime, event_end: datetime, conflict: bool,
+) -> None:
+    tz = ZoneInfo("Europe/London")
+    now = now.replace(tzinfo=tz)
+    config = cfg(window_start=window_start, window_end=window_end,
+                 capacity_kwh=100, strategy="fill")
+    geom = compute_horizon_geometry(now, window_start, window_end, tz)
+    event = FlexibilityEvent(
+        start=event_start.replace(tzinfo=tz), end=event_end.replace(tzinfo=tz),
+        direction="export", rate_gbp_kwh=1, updated_at=now,
+    )
+    inp = PlannerInputs(
+        soc=_soc(50), solar_tomorrow_kwh=0, predicted_home_load_kwh=0,
+        geometry=geom, horizon_start=geom.horizon_start, now=now,
+        load_slots=(0.0,) * len(geom.slot_starts), flexibility_event=event,
+    )
+    plan = _plan(inp, config)
+    export = plan.charge_intent.export
+    assert export is not None
+    expected = tuple(
+        start for start in geom.slot_starts
+        if event.start <= start and start + timedelta(minutes=30) <= event.end
+    )
+    assert export.selected_slots == expected
+    assert export.window_end == expected[-1] + timedelta(minutes=30)
+    assert (plan.required_kwh == 0) is conflict
+    assert plan.export_revenue == pytest.approx(
+        sum(export.slot_export_kw) * 0.5 * event.rate_gbp_kwh
+    )
+
+
+def test_geometry_v2l_refill_uses_only_the_part_after_the_window() -> None:
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, 1, 10, 23, 30, tzinfo=tz)
+    config = cfg(window_start=time(23, 30), window_end=time(5, 20),
+                 max_current_a=0, v2l_budget_kwh=5)
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    loads = [0.0] * len(geom.slot_starts)
+    first_full_post_window = geom.window_slot_range[1]
+    loads[first_full_post_window] = 1
+    inp = PlannerInputs(
+        soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=1,
+        geometry=geom, horizon_start=geom.horizon_start, now=now,
+        load_slots=tuple(loads), car_plugged_in=True,
+    )
+    plan = _plan(inp, config)
+    assert len(plan.v2l_refills) == 1
+    refill = plan.v2l_refills[0]
+    assert refill.slot == first_full_post_window - 1
+    assert refill.kwh == pytest.approx(1.5 / 6)  # ten minutes after 05:20
+    assert plan.soc_path[0] == (geom.window_end, config.min_soc)
+    assert plan.soc_path[1][1] == pytest.approx(config.min_soc + 0.25 / 26.88 * 100)
+    assert _plan(replace(inp, car_plugged_in=False), config).v2l_refills == ()
