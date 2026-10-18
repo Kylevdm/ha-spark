@@ -377,7 +377,7 @@ async def check_export_event_provider(settings: Settings) -> CheckResult:
             f"Axle event source unavailable: {exc}; plans keep the base schedule",
         )
     if event is None:
-        return CheckResult("Export event provider", Status.OK, "Axle has no upcoming export event")
+        return CheckResult("Export event provider", Status.OK, "Axle has no event scheduled")
     return CheckResult(
         "Export event provider",
         Status.OK,

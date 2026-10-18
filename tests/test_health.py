@@ -298,14 +298,15 @@ async def test_check_tariff_provider_warns_when_discovery_fails(failure: str) ->
 
 @respx.mock
 async def test_check_export_event_provider_axle_reports_event() -> None:
+    now = datetime.now(UTC)
     respx.get("http://axle.test/vpp/home-assistant/event").mock(
         return_value=httpx.Response(
             200,
             json={
-                "start_time": "2026-09-12T17:00:00+00:00",
-                "end_time": "2026-09-12T18:00:00+00:00",
+                "start_time": (now + timedelta(hours=1)).isoformat(),
+                "end_time": (now + timedelta(hours=2)).isoformat(),
                 "import_export": "export",
-                "updated_at": datetime.now(UTC).isoformat(),
+                "updated_at": now.isoformat(),
             },
         )
     )
@@ -322,6 +323,59 @@ async def test_check_export_event_provider_axle_reports_event() -> None:
     assert res.status is Status.OK
     assert "export event" in res.detail
     assert res.name == "Export event provider"
+
+
+@pytest.mark.parametrize("source", ["api", "calendar"])
+@respx.mock
+async def test_check_export_event_provider_reports_no_event_as_ok(source: str) -> None:
+    updated_at = "2026-09-12T15:55:00+00:00"
+    if source == "api":
+        respx.get("http://axle.test/vpp/home-assistant/event").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "start_time": None,
+                    "end_time": None,
+                    "import_export": None,
+                    "opted_out": False,
+                    "updated_at": updated_at,
+                },
+            )
+        )
+        settings = Settings(
+            ha_url=HA,
+            ha_token="tok",
+            export_event_provider="axle",
+            axle_api_url="http://axle.test",
+            axle_api_key="secret-token",
+        )
+    else:
+        respx.get(f"{HA}/api/states/calendar.axle_event").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "entity_id": "calendar.axle_event",
+                    "state": "off",
+                    "attributes": {
+                        "friendly_name": "Example Axle event",
+                        "import_export": None,
+                        "updated_at": updated_at,
+                    },
+                },
+            )
+        )
+        settings = Settings(
+            ha_url=HA,
+            ha_token="tok",
+            export_event_provider="axle",
+            axle_event_entity="calendar.axle_event",
+        )
+
+    result = await check_export_event_provider(settings)
+
+    assert result.name == "Export event provider"
+    assert result.status is Status.OK
+    assert "no event scheduled" in result.detail
 
 
 @respx.mock
