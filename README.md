@@ -135,9 +135,12 @@ back costs £0.83/kWh and the planner skips the slot. The plan then reports
 the SoC the event would need at its start to fund every slot
 ([#214](https://github.com/Kylevdm/ha-spark/issues/214)).
 
-ha-spark doesn't yet record what each event earned. The savings backtest
-covers grid import under your tariff, not Axle payments. Recording per-event
-earnings is tracked in [#373](https://github.com/Kylevdm/ha-spark/issues/373).
+ha-spark doesn't yet record what each event earned. In v1 it will estimate
+each event's earnings from its own measurements, as the grid export measured
+during the event times the event rate. The estimate will count as a credit in
+the day's cost and in battery savings
+([#373](https://github.com/Kylevdm/ha-spark/issues/373)). Until then, the
+savings backtest covers grid import under your tariff, not Axle payments.
 
 ### Axle roadmap
 
@@ -168,7 +171,7 @@ Open work on the feature itself:
   ([#201](https://github.com/Kylevdm/ha-spark/issues/201));
 - counting a V2L refill from the car when funding an event
   ([#188](https://github.com/Kylevdm/ha-spark/issues/188));
-- recording what each event earned
+- estimating what each event earned and counting it in the day's cost
   ([#373](https://github.com/Kylevdm/ha-spark/issues/373)).
 
 ## Road to v1.0.0
