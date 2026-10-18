@@ -18,30 +18,29 @@ for the ML load model), and the Octopus and Axle APIs if you configure them.
 
 ## Engineering highlights
 
-- **A pure planner.** `compute_plan` takes inputs and config and returns a
-  plan, with no I/O. Every plan line traces to a reservation or a price, so
-  every decision can be replayed, tested, and explained
+- **A pure planner.** `compute_plan` takes inputs and config, returns a plan,
+  and does no I/O. Every plan line comes from a reservation or a price, so a
+  test can replay any decision and the copilot can explain it
   ([why not an LP solver](docs/adr/0002-auditable-over-optimal-planning.md)).
-- **Gated actuation.** Writes to hardware go through one decision path. Real
-  writes happen only when control is switched on, never on an invalid SoC
-  reading, and always with read-back verification. A failed action is
-  isolated and doesn't block the others. Simulate mode runs the same path with
-  the writes suppressed.
-- **Untrusted inputs.** Home Assistant states, tariff and Axle payloads, and
-  LLM replies are all treated as untrusted. They are coerced or validated
-  before ha-spark uses them, and a bad payload degrades the plan instead of
-  crashing ha-spark or triggering a write. The LLM can't reach a hardware
-  command.
-- **Device drivers behind a contract.** Solis and AlphaESS inverters share one
-  driver interface ([adding an inverter](docs/adding-an-inverter.md)), so the
-  planner never deals with vendor-specific charge mechanics.
-- **Quality gates.** Python 3.11+ and asyncio, mypy strict, ruff, and over
-  1,000 tests (respx for HTTP, fake servers for WebSocket) that must pass
-  before every merge. Ships as a Docker-built Home Assistant add-on from
-  pinned release tags.
-- **Decisions on record.** Architecture choices are written up as
-  [ADRs](docs/adr/), and the domain terms are defined in
-  [`CONTEXT.md`](CONTEXT.md).
+- **Gated actuation.** All hardware writes go through one decision path.
+  ha-spark writes only when the owner has switched on real control and the
+  SoC reading is valid, and it reads back every write to confirm it. A failed
+  action doesn't stop the others. Simulate mode runs the same path and skips
+  the writes.
+- **Untrusted inputs.** ha-spark treats Home Assistant states, tariff and Axle
+  payloads, and LLM replies as untrusted. It coerces or validates each one
+  before use. A bad payload drops out of the plan and never crashes ha-spark
+  or triggers a write. The LLM can't reach a hardware command.
+- **One driver interface.** Solis and AlphaESS inverters implement the same
+  driver interface, so the planner never handles vendor-specific charge
+  mechanics. [`docs/adding-an-inverter.md`](docs/adding-an-inverter.md)
+  describes it.
+- **Quality gates.** ha-spark is Python 3.11+ on asyncio. Ruff, strict mypy,
+  and over 1,000 tests must pass before every merge. The tests use respx for
+  HTTP and fake servers for WebSocket. The add-on is a Docker image that Home
+  Assistant builds from a pinned release tag.
+- **Written decisions.** Each architecture decision has an
+  [ADR](docs/adr/), and [`CONTEXT.md`](CONTEXT.md) defines the domain terms.
 
 > Status: add-on v0.22.0 includes:
 >
@@ -78,33 +77,34 @@ for the ML load model), and the Octopus and Axle APIs if you configure them.
 
 ## Axle export events
 
-ha-spark can take part in [Axle](https://axle.energy) flexibility events,
-exporting battery energy to the grid during paid slots. Axle is a separate
-event provider, so it works alongside any of the supported tariffs.
+ha-spark can take part in [Axle](https://axle.energy) flexibility events. It
+exports battery energy to the grid during the paid slots. Axle is a separate
+event provider, so it works with any supported tariff.
 
 1. **Event intake.** ha-spark reads the event from the Axle API and falls back
-   to a Home Assistant entity if the API read fails. Events with a missing or
-   timezone-less timestamp, an end before their start, a future-dated update,
-   or an unknown direction are rejected, so the planner never schedules from
-   an event it can't trust.
-2. **Planning.** The planner picks complete half-hour slots inside the event,
-   caps export at the configured DNO export limit, and uses reservations to
-   charge and hold back enough energy to fund those slots. It also keeps the
+   to a Home Assistant entity if the API read fails. It rejects an event with
+   a missing or timezone-less timestamp, an end before its start, a
+   future-dated update, or an unknown direction. The planner never schedules
+   from a rejected event.
+2. **Planning.** The planner picks complete half-hour slots inside the event
+   and caps export at the configured DNO export limit. It uses reservations to
+   charge and hold back enough energy to fund those slots, and keeps the
    household's own post-event reservation.
-3. **Actuation.** The inverter driver writes the discharge window behind the
-   power-switch, control-authority, and fresh-SoC guards, then reads it back.
-   ha-spark checks the inverter clock first, because the inverter fires the
-   window on its own clock.
-4. **Cleanup.** Once the event ends, ha-spark clears the window and confirms
-   it by read-back so the schedule can't repeat the next day.
+3. **Actuation.** The inverter driver checks the power switch, control
+   authority, and SoC freshness, then writes the discharge window and reads it
+   back. ha-spark checks the inverter clock first, because the inverter fires
+   the window on its own clock.
+4. **Cleanup.** After the event ends, ha-spark clears the window and reads it
+   back to confirm, so the schedule can't repeat the next day.
 
-The first paid event ran end to end on real hardware on 2026-10-05, with no
-manual entry of the event window and no intervention during the event
-([evidence log](https://github.com/Kylevdm/ha-spark/issues/134)). It also
-showed two gaps. Export paused briefly at each mid-event replan, which was
-fixed in 0.20.0 ([#218](https://github.com/Kylevdm/ha-spark/issues/218)).
-Lifecycle notices weren't sent, and proving them on a real event is still
-open ([#219](https://github.com/Kylevdm/ha-spark/issues/219)). Until the feature
+The first paid event ran end to end on real hardware on 2026-10-05. Nobody
+entered the event window by hand or intervened during the event
+([evidence log](https://github.com/Kylevdm/ha-spark/issues/134)). The run
+found two gaps. Export paused for 10 to 15 seconds at each mid-event replan,
+and 0.20.0 fixed that ([#218](https://github.com/Kylevdm/ha-spark/issues/218)).
+ha-spark sent no lifecycle notices because no notify service was configured,
+and proving them on a real event is still open
+([#219](https://github.com/Kylevdm/ha-spark/issues/219)). Until the feature
 passes the v1.0.0 release gate, run it under the
 [supervised export runbook](docs/runbooks/supervised-axle-export.md).
 
