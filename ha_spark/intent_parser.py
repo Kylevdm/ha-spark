@@ -28,7 +28,7 @@ I couldn't match that to a known query (and the LLM is unavailable).
 Offline, I can answer questions containing:
   plan / charge / tonight / overnight   tonight's full charge plan
   soc / battery / state of charge       current battery state of charge
-  solar / forecast                      tomorrow's solar forecast
+  solar / forecast                      served-day solar forecast
   strategy                              the configured charge strategy
   mode / proactive                      the PROACTIVE_MODE setting
   window                                the off-peak charge window"""
@@ -52,8 +52,9 @@ def _soc_line(plan: ChargePlan) -> str:
     return f"Battery is at {plan.soc_now:.0f}% ({plan.usable_now_kwh:.2f} kWh usable)."
 
 
-def _solar_line(plan: ChargePlan) -> str:
-    line = f"Solar forecast for tomorrow: {plan.solar_kwh:.2f} kWh"
+def _solar_line(plan: ChargePlan, forecast_date: date | None = None) -> str:
+    served = f"{forecast_date:%a %d %b}" if forecast_date is not None else "tomorrow"
+    line = f"Solar forecast for {served}: {plan.served_day_solar_kwh:.2f} kWh"
     if abs(plan.effective_solar_kwh - plan.solar_kwh) > 1e-9:
         line += f" ({plan.effective_solar_kwh:.2f} kWh after haircut)"
     return line + "."
@@ -96,8 +97,11 @@ async def parse_offline(
     if _contains(text, "soc", "battery", "state of charge"):
         return IntentResult(_soc_line(plan), matched=True)
     if _contains(text, "solar", "forecast"):
-        return IntentResult(_solar_line(plan), matched=True)
-    return IntentResult(format_plan(plan, load_source), matched=True)
+        return IntentResult(_solar_line(plan, run.forecast.target_date), matched=True)
+    return IntentResult(
+        format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz),
+        matched=True,
+    )
 
 
 # --- Phase 6D: offline context extraction + query (the no-LLM fallback) ---

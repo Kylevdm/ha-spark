@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
+from datetime import UTC, date, datetime, time
 
 from ha_spark.energy.models import ChargeIntent, ChargePlan, ExportIntent, ExportSkip, Reservation
 from ha_spark.energy.report import format_plan
@@ -103,6 +103,40 @@ def test_report_renders_reservation_reason() -> None:
     assert reservation.reason in out
 
 
+def test_charge_funds_only_post_window_reservations() -> None:
+    evening = Reservation(
+        name="reach-charge-window", target_slot=2, energy_kwh=1,
+        obligation_kind="reach-charge-window",
+        reason="Reserving 1.00 kWh to cover forecast house load until the 23:30 charge window.",
+    )
+    daytime = Reservation(
+        name="reach-next-cheap-slot", target_slot=50, energy_kwh=9,
+        obligation_kind="reach-next-cheap-slot", reason="Reserving daytime energy.",
+    )
+    out = format_plan(
+        _plan(
+            reservations=(evening, daytime), charge_funded_reservations=(daytime,),
+            pre_window_drain_kwh=1,
+        ),
+        "test",
+    )
+
+    assert evening.reason in out
+    assert "(-1.00 by window start -> 12.17)" in out
+    assert "(funds reach-next-cheap-slot)" in out
+    assert "(funds reach-charge-window" not in out
+
+
+def test_charge_does_not_claim_to_fund_an_evening_only_reservation() -> None:
+    evening = Reservation(
+        name="reach-charge-window", target_slot=2, energy_kwh=1,
+        obligation_kind="reach-charge-window", reason="Reserving evening energy.",
+    )
+    out = format_plan(_plan(reservations=(evening,)), "test")
+    assert evening.reason in out
+    assert "(funds" not in out
+
+
 def test_report_explains_selected_and_skipped_paid_export_slots() -> None:
     start = datetime(2026, 6, 9, 17, 0, tzinfo=UTC)
     export = ExportIntent(
@@ -176,3 +210,23 @@ def test_report_explains_when_a_full_battery_cannot_fund_the_event() -> None:
         "Event needs 112% SoC at 20:00 (now 56%) — more than a full battery can fund"
         in out
     )
+
+
+def test_load_forecast_line_names_the_served_day() -> None:
+    """The report names the day the load forecast serves, not "tomorrow" (#397)."""
+    out = format_plan(_plan(), "test", forecast_date=date(2026, 1, 12))
+    assert "Home load forecast 17.70 kWh for Mon 12 Jan  (test)" in out
+
+
+def test_load_forecast_line_without_a_date_keeps_todays_wording() -> None:
+    """A forecast built without a served date renders exactly as before."""
+    out = format_plan(_plan(), "test")
+    assert "Home load forecast 17.70 kWh  (test)" in out
+
+
+def test_solar_report_names_served_day() -> None:
+    from datetime import date
+
+    out = format_plan(_plan(), "test", forecast_date=date(2026, 1, 5))
+    assert "Solar forecast     3.40 kWh for Mon 05 Jan" in out
+    assert "Solar tomorrow" not in out

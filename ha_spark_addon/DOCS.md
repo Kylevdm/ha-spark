@@ -36,6 +36,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `battery_power_entity` | Optional battery power in W, sampled each minute to check SoC against energy flow. The Solis preset uses `sensor.solisac_battery_power`. Both power signs count. Jumps unexplained by energy flow by more than 2 percentage points fail; unchanged SoC fails after more than 2 points of energy flows. Two consecutive reads of a rejected changed value accept a possible BMS recalibration with a warning. Missing power skips that interval; without this option these checks are off. The baseline resets on restart |
 | `battery_voltage_entity` | Battery voltage (V). ha-spark also uses it to tell whether the SoC's source is live, so pick the voltage sensor from the same integration as `soc_entity` |
 | `solar_tomorrow_entity` | Solcast "forecast tomorrow" sensor (with `detailedForecast` attribute) |
+| `solar_today_entity` | Optional Solcast "forecast today" sensor; recommended for accurate charge sizing. Honours `solar_percentile` and `detailedForecast`, like the tomorrow sensor. If missing or invalid, today's solar counts as zero: this oversizes the charge, never undersizes it. |
 | `octopus_rate_entity` | Octopus current electricity rate sensor |
 | `dispatch_entity` | Octopus Intelligent dispatching binary sensor |
 | `ev_plug_entity` / `ev_status_entity` | EV charger plug/status sensors; `ev_status_entity` also drives the charging hold |

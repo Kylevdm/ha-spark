@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -364,3 +364,110 @@ async def test_learned_away_factor_overrides_config(
     # Learned factor ~0.4 (away/normal), not the configured 0.7.
     assert result.total_kwh == pytest.approx(24.0 * 0.4, abs=0.5)
     assert "learned" in result.source
+
+
+# --- #397: the forecast targets the served day, not "tomorrow" ---
+
+
+def _profiled_settings(tmp_path: Any, **overrides: Any) -> Settings:
+    kw: dict[str, Any] = {
+        "ha_url": "http://ha.test",
+        "ha_token": "t",
+        "db_path": str(tmp_path / "f.db"),
+        "load_model": "median",
+        "timezone": "UTC",
+    }
+    kw.update(overrides)
+    return Settings(**kw)
+
+
+def _patch_profile(monkeypatch: pytest.MonkeyPatch, weekdays: float, weekends: float) -> None:
+    """Stub a profile whose weekday and weekend slots differ, so the target
+    day's day-type is visible in every returned slot."""
+    from ha_spark.energy.models import SlotProfile
+
+    monkeypatch.setattr(
+        forecast,
+        "build_slot_profile",
+        lambda *_args, **_kwargs: SlotProfile(
+            weekday=(weekdays,) * SLOTS_PER_DAY,
+            weekend=(weekends,) * SLOTS_PER_DAY,
+            days_used=14,
+        ),
+    )
+
+
+async def test_predict_home_load_targets_the_passed_day(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_stats(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        return _hourly_rows(days=14, kwh_per_hour=1.0)
+
+    monkeypatch.setattr(forecast, "statistics_during_period", fake_stats)
+    _patch_profile(monkeypatch, weekdays=0.2, weekends=0.6)
+    settings = _profiled_settings(tmp_path)
+
+    monday = await predict_home_load(settings, target=date(2026, 1, 12))
+    assert monday.target_date == date(2026, 1, 12)
+    assert monday.slots is not None
+    assert all(s == pytest.approx(0.2) for s in monday.slots)
+    assert monday.total_kwh == pytest.approx(0.2 * SLOTS_PER_DAY)
+
+    sunday = await predict_home_load(settings, target=date(2026, 1, 11))
+    assert sunday.target_date == date(2026, 1, 11)
+    assert sunday.slots is not None
+    assert all(s == pytest.approx(0.6) for s in sunday.slots)
+
+
+async def test_context_scales_the_served_day_not_tomorrow(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An away fact scales the forecast only when it covers the served day."""
+    from ha_spark.energy.context import ContextStore
+
+    async def fake_stats(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        return _hourly_rows(days=14, kwh_per_hour=1.0)
+
+    monkeypatch.setattr(forecast, "statistics_during_period", fake_stats)
+    _patch_profile(monkeypatch, weekdays=0.2, weekends=0.2)
+    settings = _profiled_settings(tmp_path, away_load_factor=0.4)
+    target = date(2026, 1, 12)
+
+    async with ContextStore(settings.db_path) as store:
+        await store.add("away", target, target, note="holiday")
+    scaled = await predict_home_load(settings, target=target)
+    assert scaled.total_kwh == pytest.approx(0.2 * SLOTS_PER_DAY * 0.4)
+    assert "context" in scaled.source
+
+    tomorrow = date(2026, 1, 13)
+    # A fresh store: only the away fact on tomorrow (not the served day).
+    async with ContextStore(str(tmp_path / "f2.db")) as store:
+        await store.add("away", tomorrow, tomorrow, note="holiday")
+    other = _profiled_settings(tmp_path, db_path=str(tmp_path / "f2.db"))
+    unscaled = await predict_home_load(other, target=target)
+    assert unscaled.total_kwh == pytest.approx(0.2 * SLOTS_PER_DAY)
+    assert "context" not in unscaled.source
+
+
+async def test_shadow_forecasts_record_the_served_day(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both shadow candidates are ledgered under the served day's date."""
+    from ha_spark.energy.ledger import ForecastLedger
+
+    async def fake_stats(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        return _hourly_rows(days=14, kwh_per_hour=1.0)
+
+    monkeypatch.setattr(forecast, "statistics_during_period", fake_stats)
+    _patch_profile(monkeypatch, weekdays=0.2, weekends=0.2)
+    _patch_ml(monkeypatch, _stub_prediction())
+    settings = _profiled_settings(tmp_path, load_model="ml")
+    target = date(2026, 1, 12)
+
+    result = await predict_home_load(settings, lat=51.5, lon=-0.1, target=target)
+    assert result.target_date == target
+
+    async with ForecastLedger(settings.db_path) as ledger:
+        rows = await ledger.forecasts_since(date.min)
+    assert {r.model for r in rows} == {"ml", "slots"}
+    assert {r.target_date for r in rows} == {target}

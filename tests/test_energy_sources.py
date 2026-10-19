@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime, time, timedelta, tzinfo
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -22,6 +22,9 @@ from ha_spark.ha.rest import HomeAssistantRest
 
 BASE = "http://ha.test/api"
 _HOUSEHOLD_TZ = ZoneInfo("Europe/London")
+# A daytime replan (12:00 BST): the served day of the default 23:30-05:30
+# window is tomorrow, so the tomorrow solar entity is the served-day source.
+_DAYTIME_NOW = datetime(2026, 6, 8, 12, 0, tzinfo=_HOUSEHOLD_TZ)
 
 
 def _state(
@@ -155,21 +158,37 @@ def test_build_config_threads_export_limits_to_the_pure_planner() -> None:
         ),
     ],
 )
-def test_slot_horizon_starts_at_the_running_or_next_charge_window(
+@respx.mock
+async def test_gather_inputs_starts_now_and_locates_the_running_or_next_window(
+    monkeypatch: pytest.MonkeyPatch,
     now: datetime,
     window_start: time,
     window_end: time,
     expected_start: datetime,
     expected_first_slot: float,
 ) -> None:
-    day_slots = tuple(float(i) for i in range(48))
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(
+            total_kwh=1128.0, slots=tuple(float(i) for i in range(48)), source="test"
+        )
 
-    rotated, horizon_start = sources._slot_horizon(
-        day_slots, window_start, window_end, _HOUSEHOLD_TZ, now
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    monkeypatch.setattr(sources, "datetime", _frozen_clock(now))
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    settings = _settings().model_copy(update={
+        "charge_window_start": window_start.strftime("%H:%M"),
+        "charge_window_end": window_end.strftime("%H:%M"),
+    })
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        inputs, _, _ = await gather_inputs(settings, rest)
+    assert inputs.geometry is not None
+    assert inputs.geometry.window_start == expected_start
+    assert expected_start.hour * 2 + expected_start.minute // 30 == expected_first_slot
+    assert inputs.horizon_start == now.replace(
+        minute=now.minute // 30 * 30, second=0, microsecond=0
     )
-
-    assert horizon_start == expected_start
-    assert rotated[0] == expected_first_slot
+    assert inputs.load_slots is not None
+    assert inputs.load_slots[0] == now.hour * 2 + now.minute // 30
 
 
 @respx.mock
@@ -177,6 +196,10 @@ async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) 
     async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
+    # Frozen at a daytime replan (12:00 BST, before the 13:00 dispatch below):
+    # the served day is tomorrow, so the tomorrow entity is the served-day
+    # source (#398).
+    monkeypatch.setattr(sources, "datetime", _frozen_clock(_DAYTIME_NOW))
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
 
     respx.get(f"{BASE}/states/sensor.soc").mock(return_value=_state("sensor.soc", "30"))
@@ -199,7 +222,7 @@ async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) 
 
     s = _settings()
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, cfg, load_source = await gather_inputs(s, rest)
+        inputs, cfg, forecast = await gather_inputs(s, rest)
 
     assert inputs.soc_now == 30.0
     assert inputs.soc.ok is True
@@ -213,7 +236,7 @@ async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) 
     assert inputs.ha_template_needed == 19.0
     assert len(inputs.dispatches) == 1
     assert inputs.dispatches[0].source == "SMART"
-    assert load_source == "test"
+    assert forecast.source == "test"
 
 
 @respx.mock
@@ -615,6 +638,10 @@ async def test_solar_percentile_prefers_estimate_attributes(
     async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
+    # Frozen at a daytime replan: the served day is tomorrow, so the tomorrow
+    # entity is the served-day source (#398). Unfrozen, the night window would
+    # flip the served day to today and read the (unconfigured) today entity.
+    monkeypatch.setattr(sources, "datetime", _frozen_clock(_DAYTIME_NOW))
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
     respx.get(f"{BASE}/states/sensor.solar").mock(
         return_value=_state(
@@ -643,6 +670,8 @@ async def test_solar_percentile_falls_back_to_state(
     async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
+    # Frozen at a daytime replan: the served day is tomorrow (#398).
+    monkeypatch.setattr(sources, "datetime", _frozen_clock(_DAYTIME_NOW))
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
     respx.get(f"{BASE}/states/sensor.solar").mock(
         return_value=_state("sensor.solar", "8.75", attributes)
@@ -654,6 +683,127 @@ async def test_solar_percentile_falls_back_to_state(
         inputs, _, _ = await gather_inputs(s, rest)
     assert inputs.solar_tomorrow_kwh == 8.75
     assert "using sensor state with unknown percentile" in caplog.text
+
+
+# Invalid solar payloads: every one must degrade to zero solar for that date,
+# never raise. The percentile-attribute cases pin the #398 rule that the total
+# is the attribute "if valid", then checked as a day total: a negative
+# attribute is a valid number but a negative total, so the date counts as zero.
+_INVALID_SOLAR = [
+    pytest.param("not-a-number", {}, id="non-numeric-state"),
+    pytest.param("nan", {}, id="nan-state"),
+    pytest.param("inf", {}, id="infinite-state"),
+    pytest.param("-3.5", {}, id="negative-state"),
+    pytest.param("5.0", {"estimate": "-3.5"}, id="negative-attribute-total"),
+    pytest.param(
+        "5.0",
+        {"detailedForecast": [{"period_start": "not-a-timestamp", "pv_estimate": 1.0}]},
+        id="malformed-timestamp",
+    ),
+    pytest.param(
+        "5.0",
+        {
+            "detailedForecast": [
+                {"period_start": "2026-06-09T17:00:00+01:00", "pv_estimate": 1.0},
+                {"period_start": "2026-06-09T17:30:00+01:00", "pv_estimate": "nan"},
+            ]
+        },
+        id="mixed-validity-detailed",
+    ),
+    pytest.param(
+        "5.0",
+        {
+            "detailedForecast": [
+                {"period_start": "2026-06-09T17:00:00+01:00", "pv_estimate": 1.0},
+                {"period_start": "2026-06-09T17:30:00+01:00", "pv_estimate": -2.0},
+            ]
+        },
+        id="negative-detailed-value",
+    ),
+]
+
+
+@pytest.mark.parametrize(("state_value", "attributes"), _INVALID_SOLAR)
+@respx.mock
+async def test_invalid_today_solar_counts_today_as_zero(
+    monkeypatch: pytest.MonkeyPatch, state_value: str, attributes: dict[str, Any],
+) -> None:
+    """An invalid today's-solar payload degrades to zero solar for today (#398).
+
+    Frozen at 01:00 inside the running window, the served day is today, so the
+    day-total input is zero and no slot carries solar — the valid tomorrow
+    entity cannot fill in for it (its date is not in this horizon).
+    """
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=12.0, slots=(0.25,) * 48, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    monkeypatch.setattr(
+        sources, "datetime", _frozen_clock(datetime(2026, 6, 8, 1, 0, tzinfo=_HOUSEHOLD_TZ))
+    )
+    respx.get(f"{BASE}/states/sensor.soc").mock(return_value=_state("sensor.soc", "50"))
+    respx.get(f"{BASE}/states/sensor.solar_today").mock(
+        return_value=_state("sensor.solar_today", state_value, attributes)
+    )
+    respx.get(f"{BASE}/states/sensor.solar").mock(return_value=_state("sensor.solar", "8.0"))
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = _settings().model_copy(update={"solar_today_entity": "sensor.solar_today"})
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, _, _ = await gather_inputs(s, rest)
+
+    assert inputs.geometry is not None
+    assert inputs.horizon_start == datetime(2026, 6, 8, 1, 0, tzinfo=_HOUSEHOLD_TZ)
+    assert len(inputs.geometry.slot_starts) == 45
+    assert inputs.solar_slots == (0.0,) * len(inputs.geometry.slot_starts)
+    assert inputs.solar_tomorrow_kwh == 0.0
+
+
+@pytest.mark.parametrize(("state_value", "attributes"), _INVALID_SOLAR)
+@respx.mock
+async def test_invalid_tomorrow_solar_counts_only_that_date_as_zero(
+    monkeypatch: pytest.MonkeyPatch, state_value: str, attributes: dict[str, Any],
+) -> None:
+    """An invalid tomorrow payload zeroes tomorrow's date, not today's (#398).
+
+    Frozen at a daytime replan, the served day is tomorrow, so the day-total
+    input is zero and tomorrow's slots carry no solar — while today's valid
+    reading still lands on today's own slots.
+    """
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=12.0, slots=(0.25,) * 48, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    monkeypatch.setattr(sources, "datetime", _frozen_clock(_DAYTIME_NOW))
+    respx.get(f"{BASE}/states/sensor.soc").mock(return_value=_state("sensor.soc", "50"))
+    # Today's entity forecasts 3 kWh after this daytime replan.
+    respx.get(f"{BASE}/states/sensor.solar_today").mock(
+        return_value=_state(
+            "sensor.solar_today",
+            "3.0",
+            {"detailedForecast": [
+                {"period_start": "2026-06-08T17:00:00+01:00", "pv_estimate": 1.0}
+            ]},
+        )
+    )
+    respx.get(f"{BASE}/states/sensor.solar").mock(
+        return_value=_state("sensor.solar", state_value, attributes)
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = _settings().model_copy(update={"solar_today_entity": "sensor.solar_today"})
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, _, _ = await gather_inputs(s, rest)
+
+    assert inputs.geometry is not None
+    assert inputs.horizon_start == _DAYTIME_NOW.replace(minute=0, second=0, microsecond=0)
+    assert inputs.solar_slots is not None
+    assert len(inputs.solar_slots) == len(inputs.geometry.slot_starts)
+    for start, solar in zip(inputs.geometry.slot_starts, inputs.solar_slots, strict=True):
+        local = start.astimezone(_HOUSEHOLD_TZ)
+        expected = 3.0 if local == datetime(2026, 6, 8, 17, 0, tzinfo=_HOUSEHOLD_TZ) else 0.0
+        assert solar == expected
+    assert inputs.solar_tomorrow_kwh == 0.0
 
 
 def test_parse_detailed_forecast_percentile_key() -> None:
@@ -745,7 +895,8 @@ async def test_gather_inputs_reads_location_from_ha_config(
     s = Settings(ha_url="http://ha.test", ha_token="t")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         await gather_inputs(s, rest)
-    assert seen == {"lat": 51.5, "lon": -0.1}
+    assert (seen["lat"], seen["lon"]) == (51.5, -0.1)
+    assert isinstance(seen["target"], date)  # the served day (#397)
 
 
 @respx.mock
@@ -764,7 +915,8 @@ async def test_explicit_coordinates_override_ha_config(
     s = Settings(ha_url="http://ha.test", ha_token="t", latitude=55.9, longitude=-3.2)
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         await gather_inputs(s, rest)
-    assert seen == {"lat": 55.9, "lon": -3.2}
+    assert (seen["lat"], seen["lon"]) == (55.9, -3.2)
+    assert isinstance(seen["target"], date)  # the served day (#397)
 
 
 # --- dynamic-tariff price sensor reads (P8.4, #38) ---

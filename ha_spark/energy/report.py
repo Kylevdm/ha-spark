@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import date, datetime, time, tzinfo
 
 from ha_spark.energy.models import ChargePlan
 
@@ -11,12 +11,23 @@ def _fmt(t: time) -> str:
     return f"{t.hour:02d}:{t.minute:02d}"
 
 
-def _fmt_window(start: datetime, end: datetime) -> str:
-    return f"{start.hour:02d}:{start.minute:02d}-{end.hour:02d}:{end.minute:02d}"
+def format_plan(
+    plan: ChargePlan,
+    load_source: str,
+    forecast_date: date | None = None,
+    tz: tzinfo | None = None,
+) -> str:
+    """Render the plan as an aligned, scannable block.
 
+    ``forecast_date`` is the served day the load forecast targets (#397):
+    naming it keeps a plan made at 01:00 from being read as "tomorrow's".
+    ``tz`` is the household zone: horizon instants are UTC, so their clock
+    times are shown in it.
+    """
 
-def format_plan(plan: ChargePlan, load_source: str) -> str:
-    """Render the plan as an aligned, scannable block."""
+    def clock(t: datetime) -> time:
+        return (t.astimezone(tz) if tz is not None else t).time()
+
     solar = f"{plan.solar_kwh:.2f} kWh"
     if abs(plan.effective_solar_kwh - plan.solar_kwh) > 1e-9:
         solar += f" (haircut -> {plan.effective_solar_kwh:.2f})"
@@ -25,11 +36,13 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
     if not plan.soc.ok:
         soc += f"  (untrusted: {plan.soc.reason})"
 
+    served = f" for {forecast_date:%a %d %b}" if forecast_date is not None else ""
+    solar_label = "Solar forecast" if forecast_date is not None else "Solar tomorrow"
     lines = [
         "Charge plan:",
         f"  SoC now            {soc}",
-        f"  Solar tomorrow     {solar}",
-        f"  Home load forecast {plan.load_kwh:.2f} kWh  ({load_source})",
+        f"  {solar_label}     {solar}{served}",
+        f"  Home load forecast {plan.load_kwh:.2f} kWh{served}  ({load_source})",
     ]
     if plan.cheap_covered_kwh > 0:
         lines.append(f"  Cheap-covered load {plan.cheap_covered_kwh:.2f} kWh (daytime dispatch)")
@@ -53,8 +66,9 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
             )
     if plan.charge_intent.export is not None:
         export = plan.charge_intent.export
+        window = f"{_fmt(clock(export.window_start))}-{_fmt(clock(export.window_end))}"
         lines.append(
-            f"  Paid export       {_fmt_window(export.window_start, export.window_end)}  "
+            f"  Paid export       {window}  "
             f"{export.planned_export_kw:.2f} kW planned "
             f"(DNO limit {export.dno_export_limit_kw:.2f} kW; "
             f"{len(export.selected_slots)} complete slots)"
@@ -71,18 +85,18 @@ def format_plan(plan: ChargePlan, load_source: str) -> str:
             )
             lines.append(
                 f"    Event needs {plan.export_soc_needed_pct:.0f}% SoC at "
-                f"{_fmt(plan.export_soc_needed_at.time())} (now {plan.soc_now:.0f}%){suffix}"
+                f"{_fmt(clock(plan.export_soc_needed_at))} (now {plan.soc_now:.0f}%){suffix}"
             )
         for skip in plan.export_skips:
-            lines.append(f"    {_fmt(skip.start.time())}  — {skip.reason}")
+            lines.append(f"    {_fmt(clock(skip.start))}  — {skip.reason}")
     deficit = f"{plan.deficit_kwh:.2f} kWh"
     if plan.buffer_pct > 0 and plan.deficit_kwh > 0:
         buffered = plan.deficit_kwh * (1.0 + plan.buffer_pct / 100.0)
         deficit += f"  (+{plan.buffer_pct:.0f}% buffer -> {buffered:.2f})"
 
     required = f"{plan.required_kwh:.2f} kWh"
-    if plan.reservations and plan.strategy != "fill":
-        names = ", ".join(reservation.name for reservation in plan.reservations)
+    if plan.charge_funded_reservations and plan.strategy != "fill":
+        names = ", ".join(reservation.name for reservation in plan.charge_funded_reservations)
         required += f"  (funds {names})"
     if plan.strategy == "fill":
         required += f"  (fill to {plan.target_soc:.0f}%)"

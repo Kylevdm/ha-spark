@@ -185,7 +185,7 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
     ) as rest:
         run = await current_plan(settings, rest)
         plan, load_source = run.plan, run.load_source
-        print(format_plan(plan, load_source))
+        print(format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz))
         if apply:
             intent = plan.charge_intent
             assert intent is not None  # planner always sets it

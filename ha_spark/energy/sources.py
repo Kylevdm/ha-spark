@@ -1,11 +1,16 @@
-"""Gather live planner inputs from Home Assistant (REST reads)."""
+"""Gather live planner inputs from Home Assistant (REST reads).
+
+Slot horizons start at the current half-hour and end at the window following
+the running-or-next charge window. Daily load profiles use household clock time;
+solar uses each slot's calendar date. The planner prorates slot 0's energy.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from math import isfinite
-from typing import Any
+from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
 from ha_spark.config import Settings
@@ -15,6 +20,7 @@ from ha_spark.energy.dispatch_evidence import (
     partition_dispatches,
 )
 from ha_spark.energy.forecast import load_timezone, predict_home_load
+from ha_spark.energy.horizon import compute_horizon_geometry
 from ha_spark.energy.models import (
     SLOTS_PER_DAY,
     DispatchSlot,
@@ -114,10 +120,14 @@ def _parse_price_points(raw: Any) -> tuple[PricePoint, ...]:
 def _parse_detailed_forecast(
     raw: Any, percentile: int = 50
 ) -> list[tuple[datetime, float]] | None:
-    """Tolerantly parse Solcast's ``detailedForecast`` attribute (shape varies).
+    """Parse Solcast's ``detailedForecast`` attribute (shape varies).
 
     ``percentile`` selects ``pv_estimate10``/``pv_estimate90`` when present,
-    falling back to the median ``pv_estimate``.
+    falling back to the median ``pv_estimate``. One malformed entry — a
+    non-dict, an unparseable ``period_start``, a missing or non-numeric value
+    — makes the whole list unusable (``None``): that date's solar then counts
+    as zero instead of being sized on a shape the payload can't be trusted
+    for (#398).
     """
     if not isinstance(raw, list):
         return None
@@ -125,7 +135,7 @@ def _parse_detailed_forecast(
     entries: list[tuple[datetime, float]] = []
     for item in raw:
         if not isinstance(item, dict):
-            continue
+            return None
         try:
             start = datetime.fromisoformat(str(item["period_start"]))
             value = item.get(key)
@@ -133,42 +143,87 @@ def _parse_detailed_forecast(
                 value = item["pv_estimate"]
             entries.append((start, float(value)))
         except (KeyError, ValueError, TypeError):
-            continue
+            return None
     return entries or None
 
 
-def _slot_horizon(
-    day_slots: tuple[float, ...],
-    window_start: time,
-    window_end: time,
-    tz: ZoneInfo,
-    now: datetime,
-) -> tuple[tuple[float, ...], datetime]:
-    """Rotate slot-of-day values so index 0 is the running or next window start.
+class _SolarDayReading(NamedTuple):
+    """One calendar date's validated solar forecast."""
 
-    The horizon spans two calendar days but uses one day's profile values
-    throughout — adjacent days share a day-type often enough that the error in
-    the first day's slots is negligible.
+    total_kwh: float
+    # Solcast detailed-forecast weights, or None to use the fallback shape.
+    detailed: list[tuple[datetime, float]] | None
+
+
+def _solar_reading(
+    state: EntityState | None, percentile: int
+) -> _SolarDayReading | None:
+    """One date's solar reading, or ``None`` to count that date as zero.
+
+    The total is the percentile attribute when it is a finite number, else the
+    sensor state (as before #398, with a warning). The reading is then used
+    only when that total is finite and >= 0 and every ``detailedForecast``
+    entry is finite and >= 0 — a non-numeric, NaN, infinite, negative or
+    malformed payload makes the date's solar zero, so a bad sensor degrades
+    the plan instead of crashing it.
     """
-    start_idx = window_start.hour * 2 + window_start.minute // 30
-    rotated = tuple(day_slots[(start_idx + i) % SLOTS_PER_DAY] for i in range(SLOTS_PER_DAY))
-
-    now_time = now.time()
-    if window_start >= window_end:
-        in_window = now_time >= window_start or now_time < window_end
+    if state is None:
+        return None
+    estimate_key = "estimate" if percentile == 50 else f"estimate{percentile}"
+    percentile_total = _opt_float(state.attributes.get(estimate_key))
+    total: float
+    if percentile_total is not None and isfinite(percentile_total):
+        total = percentile_total
     else:
-        in_window = window_start <= now_time < window_end
+        log.warning(
+            "Solcast %s day-total attribute missing or invalid; "
+            "using sensor state with unknown percentile",
+            estimate_key,
+        )
+        total = _to_float(state.state, 0.0)
+    if not isfinite(total) or total < 0:
+        log.warning(
+            "Solcast solar day total %s is negative or not a number; "
+            "counting that day's solar as zero",
+            total,
+        )
+        return None
+    detailed: list[tuple[datetime, float]] | None = None
+    raw_detailed = state.attributes.get("detailedForecast")
+    if raw_detailed is not None:
+        detailed = _parse_detailed_forecast(raw_detailed, percentile)
+        if detailed is None or any(not isfinite(v) or v < 0 for _, v in detailed):
+            log.warning(
+                "Solcast detailedForecast is malformed or holds a negative "
+                "value; counting that day's solar as zero",
+            )
+            return None
+    return _SolarDayReading(total, detailed)
 
-    origin_date = now.date()
-    # Only a wrapping window before its start began yesterday; otherwise use today or next start.
-    if in_window:
-        if window_start >= window_end and now_time < window_start:
-            origin_date -= timedelta(days=1)
-    elif now_time >= window_start:
-        origin_date += timedelta(days=1)
 
-    horizon_start = datetime.combine(origin_date, window_start, tzinfo=tz)
-    return rotated, horizon_start
+def _solar_slots(
+    readings: dict[date, _SolarDayReading | None],
+    slot_starts: tuple[datetime, ...],
+    tz: ZoneInfo,
+) -> tuple[float, ...]:
+    """Lay each date's daily solar profile onto real half-hours by household clock.
+
+    Today's entity covers today, the tomorrow entity tomorrow, and any other
+    calendar date is zero. Daily profiles stay in 48-value local clock order,
+    including when the horizon crosses a DST transition.
+    """
+    profiles: dict[date, tuple[float, ...]] = {}
+    for day, reading in readings.items():
+        if reading is None:
+            profiles[day] = (0.0,) * SLOTS_PER_DAY
+        else:
+            profiles[day] = distribute_solar(reading.total_kwh, reading.detailed, tz, day)
+    values: list[float] = []
+    for start in slot_starts:
+        local = start.astimezone(tz)
+        profile = profiles.get(local.date())
+        values.append(profile[local.hour * 2 + local.minute // 30] if profile else 0.0)
+    return tuple(values)
 
 
 def pre_window_drain(
@@ -176,8 +231,8 @@ def pre_window_drain(
 ) -> float:
     """Forecast battery drain (kWh) from ``now`` until the charge window opens.
 
-    The planner horizon starts at the window, so this load is otherwise
-    invisible. 0 when already inside the window, or when the window is more
+    Used by the daily-balance fallback; slot horizons account for this load
+    directly. 0 when already inside the window, or when the window is more
     than 12 h away (a daytime manual run shouldn't dock half a day of load).
     """
     if _in_overnight_window(now.time(), window_start, window_end):
@@ -192,8 +247,8 @@ def pre_window_drain(
     if forecast.slots is None:
         return forecast.total_kwh / 24.0 * gap_hours
     # Sum slot-of-day values between now and the window, prorating partials.
-    # (Uses tomorrow's day-type profile for tonight — same approximation as
-    # the slot horizon.)
+    # (Uses the served day's day-type profile for tonight — same approximation
+    # as the slot horizon.)
     total = 0.0
     t = now
     while t < opens:
@@ -425,8 +480,8 @@ def ev_hold_status_from_read(state: EntityState | None, trusted: bool) -> bool |
 
 async def gather_inputs(
     settings: Settings, rest: HomeAssistantRest, *, soc: SocMeasurement | None = None
-) -> tuple[PlannerInputs, PlannerConfig, str]:
-    """Read live HA state and build (inputs, config, load-forecast source).
+) -> tuple[PlannerInputs, PlannerConfig, LoadForecast]:
+    """Read live HA state and build (inputs, config, load forecast).
 
     ``soc`` is the daemon tick's already-checked measurement: when supplied
     it is used as-is, so the plan is sized from the exact observation the
@@ -448,6 +503,7 @@ async def gather_inputs(
         log.warning("SoC measurement failed integrity check: %s", soc_measurement.reason)
     voltage = await state(settings.battery_voltage_entity)
     solar = await state(settings.solar_tomorrow_entity)
+    solar_today = await state(settings.solar_today_entity)
     ha_needed = await state(settings.ha_template_charge_needed_entity)
 
     voltage_v = _to_float(voltage.state if voltage else None, settings.battery_voltage_v)
@@ -533,28 +589,28 @@ async def gather_inputs(
         except Exception as exc:  # noqa: BLE001 - location only gates the ML model
             log.warning("Could not read HA config for site location (%s)", exc)
 
-    forecast = await predict_home_load(settings, lat=lat, lon=lon)
-    solar_kwh = _to_float(solar.state if solar else None, 0.0)
-    if solar is not None:
-        estimate_key = (
-            "estimate"
-            if settings.solar_percentile == 50
-            else f"estimate{settings.solar_percentile}"
-        )
-        percentile_total = _opt_float(solar.attributes.get(estimate_key))
-        if percentile_total is not None and isfinite(percentile_total):
-            solar_kwh = percentile_total
-        else:
-            log.warning(
-                "Solcast %s day-total attribute missing or invalid; "
-                "using sensor state with unknown percentile",
-                estimate_key,
-            )
-
     tz = load_timezone(settings.timezone)
     window_start = parse_time(settings.charge_window_start)
     window_end = parse_time(settings.charge_window_end)
     now = datetime.now(tz)
+    geometry = compute_horizon_geometry(now, window_start, window_end, tz)
+    served_day = geometry.served_day
+    forecast = await predict_home_load(settings, lat=lat, lon=lon, target=served_day)
+    # Solar is forecast per calendar date (#398): today's from the optional
+    # today's-solar entity, tomorrow's from the existing tomorrow entity. A
+    # date with no entity, or a payload that fails the checks in
+    # :func:`_solar_reading`, counts as zero that day.
+    today_date = now.date()
+    tomorrow_date = (now + timedelta(days=1)).date()
+    readings: dict[date, _SolarDayReading | None] = {
+        today_date: _solar_reading(solar_today, settings.solar_percentile),
+        tomorrow_date: _solar_reading(solar, settings.solar_percentile),
+    }
+    # The plan's day-total solar is the served day's: today's while its charge
+    # window is still running, otherwise the day the next window serves.
+    served_solar = readings.get(served_day)
+    solar_kwh = served_solar.total_kwh if served_solar is not None else 0.0
+
     unrated_dispatches = dispatches
     dispatches, dropped_dispatches = partition_dispatches(
         dispatches, replace(evidence_read.evidence, forecast_house_kw=forecast.total_kwh / 24), now
@@ -571,22 +627,21 @@ async def gather_inputs(
             dropped.end.isoformat(),
             plug_value or "unreadable",
         )
-    drain = pre_window_drain(forecast, now, window_start, window_end)
+    drain = 0.0
 
     load_slots: tuple[float, ...] | None = None
     solar_slots: tuple[float, ...] | None = None
     horizon_start: datetime | None = None
     if forecast.slots is not None:
-        load_slots, horizon_start = _slot_horizon(
-            forecast.slots, window_start, window_end, tz, now
+        horizon_start = geometry.horizon_start
+        load_slots = tuple(
+            forecast.slots[local.hour * 2 + local.minute // 30]
+            for start in geometry.slot_starts
+            for local in (start.astimezone(tz),)
         )
-        tomorrow = (now + timedelta(days=1)).date()
-        detailed = _parse_detailed_forecast(
-            solar.attributes.get("detailedForecast") if solar else None,
-            settings.solar_percentile,
-        )
-        solar_day = distribute_solar(solar_kwh, detailed, tz, tomorrow)
-        solar_slots, _ = _slot_horizon(solar_day, window_start, window_end, tz, now)
+        solar_slots = _solar_slots(readings, geometry.slot_starts, tz)
+    else:
+        drain = pre_window_drain(forecast, now, window_start, window_end)
 
     inputs = PlannerInputs(
         soc=soc_measurement,
@@ -603,6 +658,7 @@ async def gather_inputs(
         load_slots=load_slots,
         solar_slots=solar_slots,
         horizon_start=horizon_start,
+        geometry=geometry if load_slots is not None else None,
         now=now,
         dynamic_prices=dynamic_prices,
         unrated_dispatches=unrated_dispatches,
@@ -618,4 +674,4 @@ async def gather_inputs(
         buffer_override = max(
             0.0, (forecast.p90_total_kwh / forecast.total_kwh - 1.0) * 100.0
         )
-    return inputs, build_config(settings, voltage_v, buffer_pct=buffer_override), forecast.source
+    return inputs, build_config(settings, voltage_v, buffer_pct=buffer_override), forecast

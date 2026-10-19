@@ -82,7 +82,7 @@ from ha_spark.energy.dispatch_evidence import partition_dispatches
 from ha_spark.energy.dst_clock_sync import DstClockSync
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
-from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, PlannerInputs
+from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
 from ha_spark.energy.orchestrator import orchestrate
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.publish import (
@@ -218,20 +218,27 @@ def _apply_failed(lines: list[str]) -> bool:
     return any(line.startswith(("[FAILED]", "[BLOCKED]")) for line in lines)
 
 
-async def _record_forecast(settings: Settings, plan: ChargePlan, inputs: PlannerInputs,
-                            load_source: str) -> None:
-    """Log tonight's forecast for tomorrow so `forecast-eval` can score it later."""
+async def _record_forecast(
+    settings: Settings, plan: ChargePlan, forecast: LoadForecast
+) -> None:
+    """Log the plan's load forecast for its served day so `forecast-eval` can
+    score it later.
+
+    Records the forecast's own unrotated day-order ``slots`` and its served
+    date (#397), never the horizon-order ``inputs.load_slots``; a forecast
+    built without a date (hand-built tests) reads as the pre-#394 tomorrow.
+    """
     tz = load_timezone(settings.timezone)
-    target_date = (datetime.now(tz) + timedelta(days=1)).date()
+    target_date = forecast.target_date or (datetime.now(tz) + timedelta(days=1)).date()
     try:
         async with ForecastLedger(settings.db_path) as ledger:
             await ledger.record_forecast(
                 datetime.now(UTC),
                 target_date,
-                forecast_model_tag(load_source),
+                forecast_model_tag(forecast.source),
                 plan.load_kwh,
-                inputs.load_slots,
-                load_source,
+                forecast.slots,
+                forecast.source,
             )
     except Exception:
         log.exception("Recording forecast failed")
@@ -262,7 +269,10 @@ async def run_once(
     ) as rest:
         run = await current_plan(settings, rest, soc=soc)
         plan, inputs, load_source = run.plan, run.inputs, run.load_source
-        log.info("Charge plan:\n%s", format_plan(plan, load_source))
+        log.info(
+            "Charge plan:\n%s",
+            format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz),
+        )
         intent = plan.charge_intent
         assert intent is not None  # planner always sets it
         device = inverter_device(settings, rest)
@@ -314,7 +324,7 @@ async def run_once(
                 await run_v2l_topup(settings, rest, plan, inputs.flexibility_event, now)
             except Exception:  # noqa: BLE001 - a request never breaks a plan run
                 log.warning("V2L top-up request failed", exc_info=True)
-    await _record_forecast(settings, plan, inputs, load_source)
+    await _record_forecast(settings, plan, run.forecast)
     await _run_orchestrator(settings)
     await _run_derived_rerive(settings)
     return RunResult(plan, applied_plan, tuple(apply_lines))

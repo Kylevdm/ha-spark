@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time
+from typing import TYPE_CHECKING
 
 from ha_spark.energy.soc_integrity import SocMeasurement
+
+if TYPE_CHECKING:
+    from ha_spark.energy.horizon import HorizonGeometry
 
 # Half-hour slots in a (non-DST-transition) day; the planner horizon is always 48.
 SLOTS_PER_DAY = 48
@@ -50,11 +54,15 @@ class SlotProfile:
 
 @dataclass(frozen=True)
 class LoadForecast:
-    """Tomorrow's predicted home load; ``slots`` is None on fallback paths."""
+    """The served day's predicted home load; ``slots`` is None on fallback paths."""
 
     total_kwh: float
     slots: tuple[float, ...] | None  # 48 local half-hour slot kWh (slot-of-day order)
     source: str
+    # The local date the forecast serves (#397): the day the running-or-next
+    # charge window ends. None on forecasts built without one (hand-built
+    # tests), which read as the pre-#394 "tomorrow".
+    target_date: date | None = None
     # P90 day total from the quantile ML model (None elsewhere); feeds the
     # dynamic buffer when buffer_mode is "quantile".
     p90_total_kwh: float | None = None
@@ -177,7 +185,7 @@ class PlannerInputs:
     # its value through `soc_now`, never by re-reading the sensor, so one read
     # can never certify a different read.
     soc: SocMeasurement
-    solar_tomorrow_kwh: float
+    solar_tomorrow_kwh: float  # served-day total; legacy constructor keyword
     predicted_home_load_kwh: float
     # Forecast battery drain between plan time and the charge-window start
     # (the horizon starts at the window, so this load is otherwise invisible).
@@ -198,13 +206,15 @@ class PlannerInputs:
     # readable EV status source. The pure planner does not forecast this hold.
     ev_hold_charging: bool | None = None
     ha_template_needed: float | None = None
-    # v2 per-slot horizon (48 half-hour slots starting at the charge-window start
-    # tonight). When load_slots is None the planner uses the v1 daily balance.
+    # v2 per-slot horizon: one value per ``geometry.slot_starts`` slot, from the
+    # current half-hour on live inputs (legacy inputs without geometry: 48 slots
+    # from the charge-window start). When load_slots is None the planner uses
+    # the v1 daily balance.
     load_slots: tuple[float, ...] | None = None
     solar_slots: tuple[float, ...] | None = None
     horizon_start: datetime | None = None
-    # When these inputs were read. Lets the pure planner place an event that
-    # ends before ``horizon_start`` (later today) against the live SoC (#198).
+    # When these inputs were read, on the household clock. Places elapsed
+    # time within slot 0 and formats plan times locally.
     now: datetime | None = None
     # Live per-slot import prices from a `dynamic` tariff price sensor, sorted
     # by start; empty when the dynamic provider isn't in use or the read failed.
@@ -212,11 +222,39 @@ class PlannerInputs:
     # Original dispatches before evidence rating. The planner prices and sizes
     # only `dispatches`, but carries these for local per-minute hold re-rating.
     unrated_dispatches: tuple[DispatchSlot, ...] = ()
+    # Horizon geometry (#395): where the plan's slots fall on the clock, from
+    # the current half-hour. ``None`` on inputs built without one (hand-built
+    # tests, the backtest, the v1 daily path); read it through
+    # :meth:`geometry_for`, which derives the legacy layout from the config.
+    geometry: HorizonGeometry | None = None
 
     @property
     def soc_now(self) -> float:
         """The checked SoC percentage; 0 when the measurement failed."""
         return self.soc.soc_now
+
+    @property
+    def served_day_solar_kwh(self) -> float:
+        """Served-day solar total (stored under the legacy constructor keyword)."""
+        return self.solar_tomorrow_kwh
+
+    def geometry_for(self, config: PlannerConfig) -> HorizonGeometry | None:
+        """The horizon geometry, or the legacy one derived from ``config``.
+
+        ``None`` on the v1 daily path (no ``horizon_start``, no geometry). The
+        legacy derivation reproduces today's layout exactly — as many 30-minute
+        slots as ``load_slots`` (48 without them) from ``horizon_start``, the
+        window covering the first ``int(window_hours * 2)`` slots — so inputs
+        built without a geometry keep today's indexing and numbers.
+        """
+        from ha_spark.energy.horizon import legacy_geometry
+
+        if self.geometry is not None:
+            return self.geometry
+        if self.horizon_start is None:
+            return None
+        n_slots = len(self.load_slots) if self.load_slots is not None else SLOTS_PER_DAY
+        return legacy_geometry(self.horizon_start, config, n_slots)
 
 
 @dataclass(frozen=True)
@@ -251,6 +289,8 @@ class ChargeIntent:
     # evidence ladder filtered them. Reconcile uses these only for local
     # re-rating; `holds` remains the rated set used by this plan.
     unrated_holds: tuple[tuple[datetime, datetime], ...] = ()
+    # Sizing projection only; never replaces the checked SoC measurement.
+    expected_window_start_soc: float | None = None
 
     @property
     def soc_now(self) -> float:
@@ -337,7 +377,7 @@ class ChargePlan:
 
     soc: SocMeasurement  # failed -> block real writes
     capacity_kwh: float
-    solar_kwh: float
+    solar_kwh: float  # served-day total; legacy constructor keyword
     effective_solar_kwh: float
     load_kwh: float
     cheap_covered_kwh: float
@@ -366,6 +406,9 @@ class ChargePlan:
     # Named battery obligations computed from the slot horizon. The daily model
     # intentionally leaves this empty to preserve its legacy contract.
     reservations: tuple[Reservation, ...] = ()
+    # The reservations tonight's charge funds: those targeted after the window
+    # start (a pre-window one is carried from now, never charged).
+    charge_funded_reservations: tuple[Reservation, ...] = ()
     v2l_refills: tuple[V2LRefill, ...] = ()
     v2l_wanted_but_unavailable: bool = False
     # Skips are part of the plan rather than silently becoming lower-current
@@ -383,6 +426,11 @@ class ChargePlan:
     # plan is followed (slot model only). Lets a later reading show the plan
     # was wrong (#208).
     soc_path: tuple[tuple[datetime, float], ...] = ()
+
+    @property
+    def served_day_solar_kwh(self) -> float:
+        """Served-day solar total before the configured haircut."""
+        return self.solar_kwh
 
     @property
     def soc_now(self) -> float:

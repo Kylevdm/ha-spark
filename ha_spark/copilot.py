@@ -39,7 +39,10 @@ async def build_grounding(settings: Settings, rest: HomeAssistantRest) -> str | 
     """
     try:
         run = await current_plan(settings, rest)
-        return format_plan(run.plan, run.load_source)
+        return format_plan(
+            run.plan, run.load_source, forecast_date=run.forecast.target_date,
+            tz=run.tz,
+        )
     except Exception as exc:  # noqa: BLE001 - grounding is best-effort
         log.warning("Could not build copilot grounding (%s); answering ungrounded", exc)
         return None

@@ -114,6 +114,7 @@ _OPTION_KEYS = frozenset(
         "battery_voltage_entity",
         "battery_power_entity",
         "solar_tomorrow_entity",
+        "solar_today_entity",
         "octopus_rate_entity",
         "dispatch_entity",
         "ev_plug_entity",
@@ -470,6 +471,11 @@ class Settings(BaseSettings):
     battery_voltage_entity: str = Field(default="")
     battery_power_entity: str = Field(default="")
     solar_tomorrow_entity: str = Field(default="")
+    # Optional Solcast "forecast today" sensor (#398): today's solar for
+    # charge sizing while the charge window's day is today. Without it (or on
+    # an invalid payload) today's solar counts as zero, which oversizes the
+    # charge and never undersizes it.
+    solar_today_entity: str = Field(default="")
     octopus_rate_entity: str = Field(default="")
     dispatch_entity: str = Field(default="")
     ev_plug_entity: str = Field(default="")

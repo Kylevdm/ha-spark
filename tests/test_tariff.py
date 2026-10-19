@@ -8,7 +8,8 @@ test_golden_baseline.py.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -19,6 +20,7 @@ from ha_spark.config import (
     validate_fixed_tariff,
     validate_octopus_intelligent_tariff,
 )
+from ha_spark.energy.horizon import compute_horizon_geometry
 from ha_spark.energy.models import DispatchSlot, PlannerConfig, PlannerInputs, PricePoint
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
@@ -280,6 +282,194 @@ def test_dynamic_schedule_places_charge_in_the_cheapest_slots() -> None:
     assert plan.baseline_cost == pytest.approx(0.5 * 12 * 0.05 + 0.5 * 36 * 0.30, abs=APPROX)
 
 
+# --- charge-cycle selection over a mid-day horizon (#399) ---
+
+LONDON = ZoneInfo("Europe/London")
+# 2026-01-11 is a Sunday, 2026-01-12 a Monday (GMT: no DST in January).
+SUN = date(2026, 1, 11)
+MON = date(2026, 1, 12)
+TUE = date(2026, 1, 13)
+
+
+def at(day: date, h: int, m: int) -> datetime:
+    return datetime(day.year, day.month, day.day, h, m, tzinfo=LONDON)
+
+
+def _cycle_points(start: datetime, prices: list[float]) -> tuple[PricePoint, ...]:
+    """One PricePoint per real half-hour from ``start`` (UTC), in order."""
+    start = start.astimezone(UTC)
+    return tuple(
+        PricePoint(
+            start=start + timedelta(minutes=30 * i),
+            end=start + timedelta(minutes=30 * (i + 1)),
+            price=p,
+        )
+        for i, p in enumerate(prices)
+    )
+
+
+def _geom_inputs(
+    now: datetime,
+    points: tuple[PricePoint, ...] = (),
+    *,
+    dispatches: tuple[DispatchSlot, ...] = (),
+    window: tuple[time, time] = (time(23, 30), time(5, 30)),
+) -> PlannerInputs:
+    """Inputs on a real horizon geometry: slot 0 is the current half-hour."""
+    geom = compute_horizon_geometry(now, *window, LONDON)
+    return PlannerInputs(
+        soc=_soc(50), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
+        now=now, horizon_start=geom.horizon_start, geometry=geom,
+        load_slots=tuple(0.5 for _ in geom.slot_starts),
+        dynamic_prices=points, dispatches=dispatches,
+    )
+
+
+def test_dynamic_midday_selection_equals_window_start_selection() -> None:
+    """A 12:00 replan selects the same cheap slots over the charge cycle (the
+    running-or-next window start to the next window start) as a window-start
+    replan; the stretch before the window is priced live, never cheap."""
+    cycle_prices = [0.30] * 48
+    for i in (3, 4, 20, 21, 22, 23, 30, 31, 32, 40, 41, 42):
+        cycle_prices[i] = 0.05
+    points = _cycle_points(at(MON, 23, 30), cycle_prices)
+    midday = _dynamic().schedule(_geom_inputs(at(MON, 12, 0), points), cfg())
+    at_start = _dynamic().schedule(_geom_inputs(at(MON, 23, 30), points), cfg())
+    # The selection over the cycle is identical, so the marks carried onto the
+    # mid-day horizon line up 23 slots in (the pre-window stretch).
+    assert midday.cycle_cheap_slots == at_start.cycle_cheap_slots
+    assert midday.cheap_fracs[:23] == (0.0,) * 23  # before the window: never cheap
+    assert midday.cheap_fracs[23:] == at_start.cheap_fracs  # marks carry over
+    # Pre-window slots are priced live (standard rate where the feed misses).
+    assert midday.prices[:23] == (0.30,) * 23
+    assert midday.prices[23:] == at_start.prices
+
+
+def test_dynamic_in_window_selection_keeps_elapsed_cheapest_slots() -> None:
+    """A 01:00 replan inside the running window ranks the elapsed cycle slots
+    from the feed too, so the selection equals the window-start one; the
+    elapsed marks fall off the already-past head of the horizon."""
+    cycle_prices = [0.30] * 48
+    for i in (1, 2, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19):
+        cycle_prices[i] = 0.05
+    points = _cycle_points(at(SUN, 23, 30), cycle_prices)
+    in_window = _dynamic().schedule(_geom_inputs(at(MON, 1, 0), points), cfg())
+    at_start = _dynamic().schedule(_geom_inputs(at(SUN, 23, 30), points), cfg())
+    assert in_window.cycle_cheap_slots == at_start.cycle_cheap_slots
+    # Horizon slot i (from 01:00) is cycle slot i+3: the marks shift by the
+    # three elapsed slots, which are already past and carry nothing.
+    assert in_window.cheap_fracs == at_start.cheap_fracs[3:]
+    assert in_window.prices == at_start.prices[3:]
+
+
+def test_dynamic_missing_elapsed_prices_degrade_to_standard_rate() -> None:
+    """Elapsed cycle slots the feed no longer covers price at the standard
+    rate (degradation case 2), so they stop outranking the live-priced slots."""
+    points = _cycle_points(at(MON, 1, 0), [0.05] * 12 + [0.30] * 33)
+    sched = _dynamic().schedule(_geom_inputs(at(MON, 1, 0), points), cfg())
+    marked = [start for start, frac in sched.cycle_cheap_slots if frac == 1.0]
+    assert marked == [at(MON, 1, 0) + timedelta(minutes=30 * i) for i in range(12)]
+    assert sched.cheap_fracs == (1.0,) * 12 + (0.0,) * 33
+    assert sched.prices == (0.05,) * 12 + (0.30,) * 33
+
+
+@pytest.mark.parametrize(("month", "day", "n_cycle"), [(3, 28, 46), (10, 24, 50)])
+def test_dynamic_cycle_spans_real_half_hours_across_dst(
+    month: int, day: int, n_cycle: int,
+) -> None:
+    """The cheap-set cycle runs from the window start to the next one in real
+    half-hours — 46 slots on the spring-forward night, 50 on the fall-back one
+    (decision C) — and the window_hours-worth of cheapest marks carry onto the
+    horizon one-for-one from the window start."""
+    now = datetime(2026, month, day, 23, 30, tzinfo=LONDON)
+    prices = [0.30] * n_cycle
+    for i in range(5, 17):
+        prices[i] = 0.05
+    sched = _dynamic().schedule(_geom_inputs(now, _cycle_points(now, prices)), cfg())
+    assert len(sched.cycle_cheap_slots) == n_cycle
+    assert sched.cheap_fracs == tuple(frac for _, frac in sched.cycle_cheap_slots)
+    assert sum(1 for _, frac in sched.cycle_cheap_slots if frac == 1.0) == 12
+
+
+def test_dynamic_carries_marks_by_real_overlap_off_the_half_hour() -> None:
+    """A window start off the half-hour: the cycle runs from 23:45 in real
+    half-hours and a marked cycle slot splits its mark across the two horizon
+    slots it straddles, exactly as window coverage splits."""
+    window = (time(23, 45), time(5, 45))
+    now = at(MON, 12, 0)
+    geom = compute_horizon_geometry(now, *window, LONDON)
+    # All-equal prices: the stable sort marks the first 12 cycle slots, so
+    # cycle slot 0 (23:45-00:15) straddles two horizon slots.
+    points = _cycle_points(at(MON, 23, 45), [0.30] * 48)
+    sched = _dynamic().schedule(
+        _geom_inputs(now, points, window=window), cfg(window_start=window[0], window_end=window[1])
+    )
+    assert len(sched.cycle_cheap_slots) == 48
+    idx = geom.slot_starts.index(at(MON, 23, 30).astimezone(UTC))
+    assert sched.cheap_fracs[: idx] == (0.0,) * idx  # wholly pre-window: never cheap
+    assert sched.cheap_fracs[idx] == pytest.approx(0.5, abs=APPROX)
+    assert sched.cheap_fracs[idx + 1] == pytest.approx(1.0, abs=APPROX)
+
+
+def test_fixed_cycle_folds_window_and_dispatch_like_the_horizon() -> None:
+    """The fixed/Octopus cycle view folds window coverage and dispatch overlap
+    with the same 1.0 cap as the horizon (a partial slot never double-
+    discounts a dispatch/window); a daytime dispatch cheapens its cycle slot."""
+    now = at(MON, 12, 0)
+    dispatches = (
+        DispatchSlot(start=at(TUE, 13, 0), end=at(TUE, 13, 30)),  # daytime: no window
+        DispatchSlot(start=at(TUE, 14, 0), end=at(TUE, 14, 15)),  # partial slot
+        DispatchSlot(start=at(TUE, 5, 0), end=at(TUE, 5, 45)),  # overlaps the window
+    )
+    sched = fixed_schedule(_geom_inputs(now, dispatches=dispatches), cfg())
+    by_clock = {
+        start.astimezone(LONDON).time(): frac for start, frac in sched.cycle_cheap_slots
+    }
+    assert by_clock[time(13, 0)] == pytest.approx(1.0, abs=APPROX)  # dispatch
+    assert by_clock[time(14, 0)] == pytest.approx(0.5, abs=APPROX)  # 15 of 30 minutes
+    assert by_clock[time(5, 0)] == pytest.approx(1.0, abs=APPROX)  # window + dispatch, capped
+    assert by_clock[time(5, 30)] == pytest.approx(0.5, abs=APPROX)  # dispatch only
+    assert by_clock[time(23, 30)] == pytest.approx(1.0, abs=APPROX)  # window
+    assert by_clock[time(12, 30)] == 0.0  # pre-window
+    # The horizon view (#396) and the cycle view agree slot for slot.
+    geom = compute_horizon_geometry(now, time(23, 30), time(5, 30), LONDON)
+    for clock in (time(13, 0), time(14, 0), time(5, 0), time(5, 30)):
+        idx = geom.slot_starts.index(at(TUE, clock.hour, clock.minute).astimezone(UTC))
+        assert sched.cheap_fracs[idx] == pytest.approx(by_clock[clock], abs=APPROX)
+
+
+def test_dynamic_geometry_falls_back_to_fixed_without_live_prices() -> None:
+    """No usable live price over a mid-day horizon -> the fixed schedule
+    verbatim (degradation case 1), cycle view included."""
+    inputs = _geom_inputs(at(MON, 12, 0))
+    assert _dynamic().schedule(inputs, cfg()) == fixed_schedule(inputs, cfg())
+
+
+def test_octopus_intelligent_carries_the_fixed_cycle_over_a_geometry() -> None:
+    """Intelligent overlays live prices on the fixed folding; the cycle view
+    rides along from the fixed base so the backtest stays window-anchored."""
+    now = at(MON, 12, 0)
+    dispatch = DispatchSlot(start=at(TUE, 13, 0), end=at(TUE, 13, 30))
+    points = _cycle_points(at(MON, 12, 0), [0.08] * 71)
+    inputs = _geom_inputs(now, points, dispatches=(dispatch,))
+    base = fixed_schedule(inputs, cfg())
+    sched = _octopus().schedule(inputs, cfg())
+    assert sched.cycle_cheap_slots == base.cycle_cheap_slots
+    assert sched.cheap_fracs == base.cheap_fracs
+    assert sched.prices == (0.08,) * 71
+
+
+def test_legacy_inputs_keep_today_s_schedule_without_a_cycle() -> None:
+    """Hand-built, window-anchored inputs expose no separate cycle: their
+    horizon already starts at the window, exactly as before #399."""
+    prices = [0.30] * 48
+    for i in range(20, 32):
+        prices[i] = 0.05
+    inputs = _dynamic_inputs(prices)
+    assert _dynamic().schedule(inputs, cfg()).cycle_cheap_slots == ()
+    assert fixed_schedule(inputs, cfg()).cycle_cheap_slots == ()
+
+
 # --- dynamic startup validation (P8.4, #38) ---
 
 
@@ -402,6 +592,34 @@ def test_validate_octopus_intelligent_allows_missing_rate_codes_with_dispatch_au
             octopus_tariff_code=tariff_code,
         )
     )  # no raise
+
+
+@pytest.mark.parametrize("month, day", [(3, 28), (10, 24)])
+def test_geometry_tariffs_keep_naive_dispatches_on_the_household_clock(
+    month: int, day: int,
+) -> None:
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, month, day, 23, 30, tzinfo=tz)
+    config = cfg()
+    geom = compute_horizon_geometry(now, config.window_start, config.window_end, tz)
+    # Naive supplier timestamps still mean the household clock, not UTC.
+    start = datetime(2026, month, day + 1, 12)
+    end = start + timedelta(minutes=30)
+    inp = PlannerInputs(
+        soc=_soc(50), solar_tomorrow_kwh=0, predicted_home_load_kwh=0,
+        now=now, horizon_start=geom.horizon_start, geometry=geom,
+        load_slots=(0.0,) * len(geom.slot_starts),
+        dispatches=(DispatchSlot(start=start, end=end),),
+        dynamic_prices=(PricePoint(start=start, end=end, price=0.123),),
+    )
+    slot = geom.slot_starts.index(start.replace(tzinfo=tz).astimezone(UTC))
+    fixed = FixedTariffProvider(0.069, 0.30, 0)
+    schedule = fixed.schedule(inp, config)
+    assert schedule.cheap_fracs[slot - 1:slot + 2] == (0, 1, 0)
+    assert schedule.controlled_windows == ((start, end),)
+    for provider in (DynamicTariffProvider(fixed), OctopusIntelligentProvider(fixed)):
+        live = provider.schedule(inp, config)
+        assert live.prices[slot - 1:slot + 2] == (0.30, 0.123, 0.30)
 
 
 def test_validate_octopus_intelligent_still_requires_dispatch_auth() -> None:

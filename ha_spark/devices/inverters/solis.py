@@ -1628,6 +1628,18 @@ def _charge_current_description(
     )
 
 
+def _window_elapsed(intent: ChargeIntent, settings: Settings) -> tuple[float, float]:
+    """The window's length and the hours of it elapsed when the plan's SoC was
+    observed (outside the window when not strictly between 0 and the length)."""
+    from ha_spark.energy.forecast import load_timezone  # import cycle, see apply
+
+    full = window_hours(intent.window_start, intent.window_end)
+    local = intent.soc.observed_at.astimezone(load_timezone(settings.timezone))
+    minute = local.hour * 60 + local.minute + local.second / 60
+    start = intent.window_start.hour * 60 + intent.window_start.minute
+    return full, (minute - start) % (24 * 60) / 60
+
+
 def charge_hours(intent: ChargeIntent, settings: Settings) -> float:
     """Hours the charge current is sized over: what is left of the window when
     the plan's SoC was observed inside it, else the full window (#181).
@@ -1635,20 +1647,41 @@ def charge_hours(intent: ChargeIntent, settings: Settings) -> float:
     A mid-window replan spreading the remaining energy over the full window
     undercharges: at 03:30 it programmed 14 A where 41 A was needed.
     """
-    from ha_spark.energy.forecast import load_timezone  # import cycle, see apply
-
-    full = window_hours(intent.window_start, intent.window_end)
-    local = intent.soc.observed_at.astimezone(load_timezone(settings.timezone))
-    minute = local.hour * 60 + local.minute + local.second / 60
-    start = intent.window_start.hour * 60 + intent.window_start.minute
-    elapsed = (minute - start) % (24 * 60) / 60
+    full, elapsed = _window_elapsed(intent, settings)
     return full - elapsed if 0 < elapsed < full else full
 
 
+def _sizing_soc(intent: ChargeIntent, settings: Settings) -> float:
+    """The SoC the charge current is sized from (#402).
+
+    Observed before the window, it is the plan's expected SoC at window start:
+    sizing from the observed SoC would ignore the evening drain and undercharge.
+    Inside the window it is the observed SoC (#181). An untrusted measurement
+    always sizes from its 0, never from the projection, and is refused at the
+    gate; a plan without a projection keeps the observed SoC.
+    """
+    full, elapsed = _window_elapsed(intent, settings)
+    if (
+        intent.soc.ok
+        and intent.expected_window_start_soc is not None
+        and math.isfinite(intent.expected_window_start_soc)
+        and not 0 < elapsed < full
+    ):
+        return intent.expected_window_start_soc
+    return intent.soc_now
+
+
 def solis_current_a(intent: ChargeIntent, settings: Settings) -> float:
-    """DC charge current (A) for the intent — the legacy planner sizing, inverted."""
+    """DC charge current (A) for the intent — the legacy planner sizing, inverted.
+
+    A target at or below the sizing SoC (decision B can set one below the
+    expected window-start SoC) sizes 0 A: the window then adds nothing.
+    """
     needed_kwh = max(
-        0.0, (intent.target_soc_pct - intent.soc_now) / 100.0 * settings.battery_capacity_kwh
+        0.0,
+        (intent.target_soc_pct - _sizing_soc(intent, settings))
+        / 100.0
+        * settings.battery_capacity_kwh,
     )
     eff = settings.charge_efficiency if settings.charge_efficiency > 0 else 1.0
     purchase = needed_kwh / eff

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
+from datetime import UTC, date, datetime, time
 from typing import Any
 
 import pytest
@@ -10,7 +10,7 @@ import pytest
 from ha_spark import copilot
 from ha_spark.config import Settings
 from ha_spark.copilot import COPILOT_SYSTEM, build_grounding, grounded_system_prompt
-from ha_spark.energy.models import ChargeIntent, ChargePlan
+from ha_spark.energy.models import ChargeIntent, ChargePlan, LoadForecast
 from ha_spark.energy.plan_run import PlanRun
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 
@@ -48,6 +48,10 @@ async def test_build_grounding_renders_plan(monkeypatch: pytest.MonkeyPatch) -> 
         return PlanRun(
             plan=_plan(), inputs=object(), cfg=object(), schedule=object(),  # type: ignore[arg-type]
             load_source="slot profile (14d hourly house stats)",
+            forecast=LoadForecast(
+                total_kwh=24.2, slots=None, source="slot profile (14d hourly house stats)",
+                target_date=date(2026, 1, 12),
+            ),
         )
 
     monkeypatch.setattr(copilot, "current_plan", fake_current_plan)
