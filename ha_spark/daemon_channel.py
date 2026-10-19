@@ -1,13 +1,16 @@
 """Private fixed-operation transport; only the scheduler consumes the work queue.
 
 The socket is not an authority boundary: requests add no write permission and
-carry no caller identity. Device work never runs in a connection handler.
+carry no caller identity. Device work never runs in a connection handler. Besides
+the 0600 mode, the kernel-reported peer uid must match the daemon's own uid.
 """
 from __future__ import annotations
 
 import asyncio
 import fcntl
 import os
+import socket
+import struct
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -47,6 +50,16 @@ class Reply(BaseModel):
     plan: list[dict[str, object]] = Field(default_factory=list)
     synced: bool = False
     error: str | None = None
+
+
+def _peer_uid(writer: asyncio.StreamWriter) -> int | None:
+    """Kernel-reported uid of the connecting process; None if unavailable."""
+    sock = writer.get_extra_info("socket")
+    try:
+        creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        return int(struct.unpack("3i", creds)[1])
+    except (AttributeError, OSError, struct.error):
+        return None
 
 
 @dataclass
@@ -120,6 +133,11 @@ class DaemonChannel:
         assert task is not None
         self._handlers.add(task)
         try:
+            if _peer_uid(writer) != os.getuid():
+                writer.write(Reply(error="daemon request refused").model_dump_json().encode()
+                             + b"\n")
+                await writer.drain()
+                return
             try:
                 raw = await asyncio.wait_for(reader.readline(), timeout=5)
                 if len(raw) > 4096 or not raw.endswith(b"\n"):
