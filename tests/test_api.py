@@ -71,7 +71,8 @@ def test_health_ok(tmp_path: Path) -> None:
         resp = client.get("/api/health")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "ok"
+    assert body["status"] == "fail"
+    assert body["operating_mode"] == "authority_unknown"
     assert body["plan_at"] is None  # no plan computed yet
 
 

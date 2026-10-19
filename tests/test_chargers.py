@@ -11,7 +11,6 @@ import pytest
 import respx
 
 import ha_spark.devices.inverters.solis as solis_driver
-from ha_spark.config import Settings
 from ha_spark.devices import get_device, inverter_device
 from ha_spark.devices.base import Capability, ControlAuthority
 from ha_spark.devices.inverters.alphaess import AlphaESSDevice
@@ -22,6 +21,8 @@ from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.tariff import fixed_schedule
 from ha_spark.ha.rest import HomeAssistantRest, HomeAssistantRestError
+from tests.authority_helpers import legacy_settings as Settings
+from tests.authority_helpers import seed_authority
 
 
 def _settings(**overrides: object) -> Settings:
@@ -45,6 +46,7 @@ def _solis_device(
     config = s.devices[0]
     if control != "ha_spark":
         config = config.model_copy(update={"control": ControlAuthority(control)})
+        seed_authority(s, "observe")
     return SolisDevice(config, s, rest)
 
 
@@ -54,6 +56,7 @@ def _alpha_device(
     config = s.devices[0]
     if control != "ha_spark":
         config = config.model_copy(update={"control": ControlAuthority(control)})
+        seed_authority(s, "observe")
     return AlphaESSDevice(config, s, rest)
 
 
@@ -318,7 +321,7 @@ async def test_solis_observe_authority_never_writes_even_when_on() -> None:
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest, control="observe").apply(_intent())
     assert posts.call_count == 0  # observe authority suppresses the write despite "on"
-    assert any("[OBSERVE]" in line for line in lines)
+    assert any("[SIMULATE]" in line for line in lines)
 
 
 @respx.mock
@@ -765,7 +768,7 @@ async def test_off_mode_computes_without_calls() -> None:
     s = _settings(proactive_mode="off")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(_intent())
-    assert all("OFF" in line or "SKIP" in line for line in lines)
+    assert all("SIMULATE" in line or "SKIP" in line for line in lines)
 
 
 def test_planned_rate_w_matches_current_times_voltage() -> None:
@@ -915,7 +918,7 @@ async def test_alphaess_apply_off_mode_computes_without_calls() -> None:
     s = _settings(inverter="alphaess", proactive_mode="off")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _alpha_device(s, rest).apply(_intent())
-    assert "[OFF]" in lines[0]
+    assert "[SIMULATE]" in lines[0]
 
 
 @respx.mock

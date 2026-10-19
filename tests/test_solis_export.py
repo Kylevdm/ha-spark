@@ -6,7 +6,6 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from ha_spark.config import Settings
 from ha_spark.devices.inverters.solis import (
     SolisDevice,
     _export_not_yet_armed,
@@ -17,6 +16,7 @@ from ha_spark.energy.models import ChargeIntent, ExportIntent
 from ha_spark.energy.scheduler import setpoint_changed
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.ha.models import EntityState
+from tests.authority_helpers import legacy_settings as Settings
 
 
 @pytest.fixture(autouse=True)

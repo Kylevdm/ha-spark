@@ -6,24 +6,25 @@ from unittest.mock import Mock
 
 import pytest
 
-from ha_spark.config import Settings
 from ha_spark.devices import get_device, inverter_device
-from ha_spark.devices.base import ControlAuthority, effective_mode
+from ha_spark.devices.base import ControlAuthority
 from ha_spark.devices.execution import ExecutionContext, Ownership
 from ha_spark.devices.inverters.alphaess import AlphaESSDevice
 from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.energy.supply_guard import SupplyGuard
+from tests.authority_helpers import legacy_settings as Settings
+from tests.authority_helpers import seeded_execution
 from tests.test_solis_power_switch import FakeRest, _intent, _now
 
 
 @pytest.mark.parametrize("control", list(ControlAuthority))
 @pytest.mark.parametrize("mode", ["off", "simulate", "on"])
 @pytest.mark.parametrize("ownership", list(Ownership))
-def test_gate_is_exactly_the_existing_predicate(control, mode, ownership):
+def test_legacy_keys_grant_nothing_to_an_unbound_context(control, mode, ownership):
     settings = Settings(proactive_mode=mode)
     config = settings.devices[0].model_copy(update={"control": control})
     context = ExecutionContext()
-    assert context.gate.mode_for(ownership, config, settings) == effective_mode(control, mode)
+    assert context.gate.mode_for(ownership, config, settings) == "refuse:authority unknown"
 
 
 def test_all_construction_paths_share_the_bus():
@@ -66,7 +67,7 @@ async def test_apply_is_indivisible_across_driver_instances(tmp_path, monkeypatc
     rest = FakeRest()
     rest.states["sensor.solis_control_timed_charge_start_hours"] = "1"
     rest.states["sensor.solis_control_timed_charge_current"] = "5"
-    context = ExecutionContext()
+    context = seeded_execution(settings)
     context.gate = Mock(wraps=context.gate)
     first = SolisDevice(settings.devices[0], settings, rest, execution=context)
     second = SolisDevice(settings.devices[0], settings, rest, execution=context)
@@ -149,7 +150,7 @@ async def test_production_actions_ask_one_gate_with_their_owner(tmp_path, monkey
     monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
     settings = Settings(proactive_mode="simulate", db_path=str(tmp_path / "events.db"),
                         solis_fallback_current_a="20")
-    context = ExecutionContext()
+    context = seeded_execution(settings)
     context.gate = Mock(wraps=context.gate)
     device = SolisDevice(settings.devices[0], settings, FakeRest(), execution=context)
     for action, owners in [
@@ -172,7 +173,7 @@ async def test_supply_guard_holds_bus_from_live_read_through_read_back(tmp_path,
     rest = FakeRest()
     rest.states["sensor.grid"] = "15000"
     rest.states["sensor.solis_control_timed_charge_current"] = "20"
-    context = ExecutionContext()
+    context = seeded_execution(settings)
     context.gate = Mock(wraps=context.gate)
     guard = SupplyGuard(settings, rest, execution=context)
     other = inverter_device(settings, rest, execution=context)
@@ -216,7 +217,7 @@ async def test_failed_device_action_does_not_stop_the_next(tmp_path, monkeypatch
     from ha_spark.devices.outcomes import ActionOutcome
 
     settings = Settings(proactive_mode="on", db_path=str(tmp_path / "events.db"))
-    context = ExecutionContext()
+    context = seeded_execution(settings)
     first = SolisDevice(settings.devices[0], settings, FakeRest(), execution=context)
     second = SolisDevice(settings.devices[0], settings, FakeRest(), execution=context)
     monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
@@ -234,7 +235,7 @@ async def test_dst_entry_point_threads_the_context(monkeypatch):
     from ha_spark.energy.dst_clock_sync import DstClockSync
 
     settings = Settings(proactive_mode="simulate")
-    context = ExecutionContext()
+    context = seeded_execution(settings)
     context.gate = Mock(wraps=context.gate)
     rest = FakeRest()
     constructed = []
@@ -256,7 +257,7 @@ async def test_dst_entry_point_threads_the_context(monkeypatch):
 async def test_alphaess_uses_the_charging_gate():
     settings = Settings(proactive_mode="simulate")
     config = settings.devices[0].model_copy(update={"driver": "alphaess"})
-    context = ExecutionContext()
+    context = seeded_execution(settings)
     context.gate = Mock(wraps=context.gate)
     device = AlphaESSDevice(config, settings, FakeRest(), execution=context)
     await device.apply(_intent())

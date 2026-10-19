@@ -17,7 +17,9 @@ from pathlib import Path
 
 import aiosqlite
 
+from ha_spark.authority import load_authority
 from ha_spark.config import Settings
+from ha_spark.daemon_channel import submit_socket
 from ha_spark.devices.inverters.solis_clock import (
     FAIL_AT,
     UNREADABLE,
@@ -60,7 +62,7 @@ class CheckResult:
 
 # Checks ha-spark cannot run without. Ollama is deliberately excluded: when it is
 # unreachable the offline intent parser takes over, so that is degraded, not broken.
-_CRITICAL = frozenset({"HA REST", "HA WS", "SQLite"})
+_CRITICAL = frozenset({"HA REST", "HA WS", "SQLite", "Operating mode"})
 
 _GLYPH = {Status.OK: "✓", Status.WARN: "⚠", Status.FAIL: "✗"}
 
@@ -394,9 +396,27 @@ async def check_tariff_provider(settings: Settings) -> CheckResult:
     return CheckResult("Tariff provider", Status.OK, "fixed (no live source)")
 
 
+async def check_operating_mode(settings: Settings) -> CheckResult:
+    """Read the store without initialisation; query only the daemon's live fault flag."""
+    result = load_authority(settings)
+    reply = await submit_socket(settings, "authority_status")
+    if reply is not None and reply.authority is not None:
+        if reply.authority.get("save_failed"):
+            return CheckResult("Operating mode", Status.FAIL, "authority save failure")
+        if reply.authority.get("mode") == "authority_unknown":
+            return CheckResult("Operating mode", Status.FAIL, "authority_unknown")
+    if result.status == "uninitialised":
+        # No daemon of this version has started yet; nothing can write either way.
+        return CheckResult("Operating mode", Status.WARN, "uninitialised (daemon not yet started)")
+    if result.status != "known" or result.state is None:
+        return CheckResult("Operating mode", Status.FAIL, result.status)
+    return CheckResult("Operating mode", Status.OK, result.state.committed_mode)
+
+
 async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
     results = await asyncio.gather(
+        check_operating_mode(settings),
         check_ha_rest(settings),
         *([check_notify_service(settings)] if settings.notify_service else []),
         check_ha_websocket(settings),

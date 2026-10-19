@@ -15,7 +15,8 @@ import pytest
 import respx
 
 from ha_spark.api.server import AppState
-from ha_spark.config import DeviceConfig, Settings
+from ha_spark.config import DeviceConfig
+from ha_spark.config import Settings as ConfigSettings
 from ha_spark.devices import Capability, inverter_device
 from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.energy import scheduler, sources
@@ -40,6 +41,8 @@ from ha_spark.energy.scheduler import (
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor
 from ha_spark.ha.rest import HomeAssistantRest
+from tests.authority_helpers import legacy_settings as Settings
+from tests.authority_helpers import seed_authority
 
 
 @respx.mock
@@ -561,7 +564,7 @@ async def test_run_once_computes_and_applies_plan(
 
     assert plan.charge_intent.target_soc_pct >= 0
     assert any("Charge plan" in r.message for r in caplog.records)
-    assert any("OFF" in r.message for r in caplog.records)
+    assert any("SIMULATE" in r.message for r in caplog.records)
 
     tomorrow = (datetime.now(load_timezone(s.timezone)) + timedelta(days=1)).date()
     async with ForecastLedger(s.db_path) as ledger:
@@ -1677,6 +1680,7 @@ async def test_soc_monitor_tick_skips_fallback_when_factory_returns_non_solis(
         v2l_power_entity="",
     )
 
+    seed_authority(settings, "optimise")
     with caplog.at_level("ERROR"):
         await scheduler.soc_monitor_tick(
             settings, SocMonitor(path=tmp_path / "ha_spark_soc_monitor.json")
@@ -1727,6 +1731,7 @@ async def test_loop_enters_configured_fallback_at_threshold_and_publishes_confir
         solis_fallback_current_a=42.0,
         v2l_power_entity="",
     )
+    seed_authority(settings, "optimise")
     fallback_states: list[bool] = []
     # Preserve the loop harness's run_once stub while capturing its fallback gate.
     stop = _patch_monitor_loop(
@@ -1812,6 +1817,7 @@ async def test_loop_retries_unconfirmed_fallback_once_on_next_observation(
         v2l_power_entity="",
     )
 
+    seed_authority(settings, "optimise")
     with pytest.raises(stop):
         await run_forever(settings, poll_seconds=0)
 
@@ -1837,10 +1843,7 @@ async def test_loop_keeps_simulated_fallback_unconfirmed_without_warning(
 
     class SimulatedFallbackDevice(SolisDevice):
         async def apply_fallback(self, _soc: SocMeasurement) -> list[str]:
-            return [
-                "[SIMULATE] Solis fallback at 42 A in 23:30-05:30 "
-                "would be programmed (not written)"
-            ]
+            pytest.fail("Observe must never request fallback programming")
 
         def planned_rate_w(self, _intent: object) -> float:
             return 0.0
@@ -1873,12 +1876,9 @@ async def test_loop_keeps_simulated_fallback_unconfirmed_without_warning(
         await run_forever(settings, poll_seconds=0)
 
     state, attrs = _integrity_posts()[0]
-    assert state == "fallback_requested"
+    assert state == "fallback_threshold"
     assert attrs["fallback_confirmed"] is False
-    assert attrs["fallback_action"] == (
-        "[SIMULATE] Solis fallback at 42 A in 23:30-05:30 "
-        "would be programmed (not written)"
-    )
+    assert attrs["fallback_action"] is None
     assert not any(
         record.levelname == "WARNING"
         and record.message.startswith(("[FAILED] Solis fallback", "[SIMULATE] Solis fallback"))
@@ -1932,6 +1932,7 @@ async def test_loop_reconciles_persisted_fallback_even_when_soc_passes(
         v2l_power_entity="",
     )
 
+    seed_authority(settings, "optimise")
     with pytest.raises(stop):
         await run_forever(settings, poll_seconds=0)
 
@@ -1999,6 +2000,7 @@ async def test_loop_caps_verified_fallback_guard_target(
         v2l_power_entity="",
     )
 
+    seed_authority(settings, "optimise")
     with pytest.raises(stop):
         await run_forever(settings, poll_seconds=0)
 
@@ -3788,7 +3790,9 @@ async def _run_forever_until_cancelled(
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
     _patch_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0), shutdown_at])
 
-    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00", authority_mode="optimise"
+    )
     with pytest.raises(asyncio.CancelledError):
         await run_forever(s, poll_seconds=0)
 
@@ -4224,7 +4228,11 @@ def _patch_recovery_loop(
         if isinstance(result, Exception):
             raise result
         failed = any(line.startswith(("[FAILED]", "[BLOCKED]")) for line in result)
-        return scheduler.RunResult(plan, None if failed else plan, tuple(result))
+        from ha_spark.devices.outcomes import legacy_action_line
+
+        return scheduler.RunResult(
+            plan, None if failed else plan, tuple(legacy_action_line(line) for line in result)
+        )
 
     async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
         return None
@@ -4247,6 +4255,7 @@ def _patch_recovery_loop(
         solis_fallback_current_a=42.0,
         v2l_power_entity="",
     )
+    seed_authority(settings, "optimise")
     return stop, runs, settings
 
 
@@ -4266,7 +4275,7 @@ async def test_alphaess_threshold_recovers_only_with_fresh_verified_plan(
     (tmp_path / "ha_spark_soc_monitor.json").write_text(
         json.dumps({"consecutive_failures": 3, "fallback_status": "fallback_threshold"})
     )
-    settings = Settings.model_validate(
+    settings = ConfigSettings.model_validate(
         {**settings.model_dump(), "inverter": "alphaess", "devices": []}
     )
 
@@ -4299,7 +4308,7 @@ async def test_alphaess_never_requests_fallback_from_failure_through_recovery(
         tmp_path, monkeypatch, [0, 1, 2, 3], [["[APPLIED] AlphaESS charge plan"]]
     )
     (tmp_path / "ha_spark_soc_monitor.json").unlink()
-    settings = Settings.model_validate({
+    settings = ConfigSettings.model_validate({
         **settings.model_dump(), "inverter": "alphaess", "devices": [],
         "soc_failure_threshold": 1,
     })
@@ -4441,6 +4450,7 @@ async def test_loop_completes_recovery_in_simulate_mode(
         [["[SIMULATE] would set timed charge current to 20 A"]],
     )
     assert settings.proactive_mode == "simulate"
+    seed_authority(settings, "observe")
 
     with pytest.raises(stop):
         await run_forever(settings, poll_seconds=0)

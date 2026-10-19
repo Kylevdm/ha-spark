@@ -111,10 +111,20 @@ async def orchestrate(settings: Settings) -> list[Decision]:
     """Request the habit API's predictions for tomorrow, decide + log each, return them.
 
     Nothing is executed yet (every outcome is ``advisory``); this is the seam
-    later proactivity hangs off. Honors ``settings.proactive_mode`` in the audit.
+    later proactivity hangs off. Observe and unhealthy authority are simulated.
     """
-    ctx = await _gather_context(settings)
-    decisions = decisions_for(ctx, settings.proactive_mode)
+    from ha_spark.devices.execution import Ownership, execution_context
+
+    context = execution_context()
+    # This is independently planned advisory work, including on read-only API requests.
+    with context.planning():
+        ctx = await _gather_context(settings)
+        actuates = any(
+            device.type == "inverter"
+            and context.gate.mode_for(Ownership.CHARGING, device, settings) == "on"
+            for device in settings.devices
+        )
+    decisions = decisions_for(ctx, "on" if actuates else "simulate")
     for d in decisions:
         log.info(
             "Proactive decision [mode=%s -> %s] %s (%.0f%% confidence): %s",

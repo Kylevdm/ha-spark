@@ -5,6 +5,13 @@ from __future__ import annotations
 import pytest
 
 from ha_spark.config import Settings
+from tests.authority_helpers import cleanup_authority
+
+
+@pytest.fixture(autouse=True)
+def _unbind_authority():
+    yield
+    cleanup_authority()
 
 
 @pytest.fixture(autouse=True)

@@ -37,7 +37,8 @@ async def test_serves_health_on_a_port(tmp_path: Path) -> None:
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"http://127.0.0.1:{port}/api/health")
         assert resp.status_code == 200
-        assert resp.json()["status"] == "ok"
+        assert resp.json()["status"] == "fail"
+        assert resp.json()["operating_mode"] == "authority_unknown"
     finally:
         await stop_server(server, task)
 

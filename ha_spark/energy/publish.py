@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ha_spark.authority import AuthorityStore, authority_view
 from ha_spark.config import Settings
 from ha_spark.devices.inverters.solis import fallback_charge_current_a
 from ha_spark.energy.models import ChargePlan
@@ -181,6 +182,12 @@ async def publish_plan(rest: HomeAssistantRest, plan: ChargePlan, settings: Sett
         path.write_text(json.dumps(entities), encoding="utf-8")
     except OSError:
         log.warning("Caching published states failed", exc_info=True)
+
+
+async def publish_operating_mode(rest: HomeAssistantRest, store: AuthorityStore) -> None:
+    attributes = authority_view(store.state, known=store.known, save_failed=store.save_failed)
+    mode = str(attributes.pop("mode"))
+    await _push(rest, [("sensor.ha_spark_operating_mode", mode, attributes)])
 
 
 async def publish_soc_integrity(

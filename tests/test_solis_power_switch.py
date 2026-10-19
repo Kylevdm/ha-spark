@@ -17,7 +17,6 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from ha_spark.config import Settings
 from ha_spark.devices.base import ControlAuthority
 from ha_spark.devices.inverters.alphaess import AlphaESSDevice
 from ha_spark.devices.inverters.solis import SolisDevice
@@ -25,6 +24,8 @@ from ha_spark.energy.export_store import ExportEventStore
 from ha_spark.energy.models import ChargeIntent, ExportIntent
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.ha.models import EntityState
+from tests.authority_helpers import legacy_settings as Settings
+from tests.authority_helpers import seed_authority
 
 
 @pytest.fixture(autouse=True)
@@ -167,6 +168,8 @@ def _device(
     config = settings.devices[0]
     if control is not None:
         config = config.model_copy(update={"control": control})
+        if control != ControlAuthority.HA_SPARK:
+            seed_authority(settings, "observe")
     return SolisDevice(config, settings, rest)  # type: ignore[arg-type]
 
 
@@ -652,7 +655,7 @@ async def test_safe_state_under_observe_writes_nothing(tmp_path) -> None:
     lines = await device.write_safe_state()
 
     assert rest.calls == []
-    assert all(line.startswith("[OBSERVE]") for line in lines)
+    assert all(line.startswith("[SIMULATE]") for line in lines)
 
 
 @pytest.mark.asyncio
@@ -786,8 +789,8 @@ async def test_fallback_without_configuration_leaves_resident_program_untouched(
     ("mode", "control", "expected_prefix"),
     [
         ("simulate", None, "[SIMULATE] Solis fallback"),
-        ("off", None, "[SKIP]"),
-        ("on", ControlAuthority.SUPPLIER, "[SKIP]"),
+        ("off", None, "[SIMULATE] Solis fallback"),
+        ("on", ControlAuthority.SUPPLIER, "[SIMULATE] Solis fallback"),
     ],
 )
 async def test_fallback_without_write_authority_is_preview_or_skip(
@@ -932,7 +935,7 @@ async def test_fallback_keeps_proactive_mode_and_control_ownership_gates(
     lines = await device.apply_fallback(failed_soc)
 
     assert _register_writes(rest) == []
-    assert any(line.startswith("[SKIP]") for line in lines)
+    assert any(line.startswith("[SIMULATE]") for line in lines)
     assert not any(line.startswith("[FALLBACK]") for line in lines)
 
 

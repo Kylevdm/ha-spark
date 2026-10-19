@@ -48,6 +48,7 @@ def legacy_action_line(line: str) -> ActionLine:
         ("[OBSERVE]", ActionOutcome.SIMULATED),
         ("[FAILED]", ActionOutcome.FAILED),
         ("[BLOCKED]", ActionOutcome.BLOCKED),
+        ("[REFUSED]", ActionOutcome.REFUSED),
     ):
         if line.startswith(prefix):
             return ActionLine(line, outcome)
