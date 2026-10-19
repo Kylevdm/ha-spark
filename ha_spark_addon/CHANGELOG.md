@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.23.0
+
+- Recover AlphaESS programming only after stable, advancing SoC reports and a fresh plan for the remaining cheap-rate window; never request a fallback program on AlphaESS (#116).
+- Restore SoC failure and fallback state safely after restart, requiring a fresh observation and Solis hardware confirmation before charge-rate increases.
+- Document SoC integrity operating states (#119): DOCS.md explains each state
+  of `sensor.ha_spark_soc_integrity` (blocked, verified fallback, failed or
+  unconfirmed fallback, recovery) and how a computed plan differs from a
+  program confirmed on the inverter. The add-on schema now rejects a
+  `soc_failure_threshold` below 1, which ha-spark already refused at startup.
+- Validate configured notification services during health checks and add a
+  `ha-spark notify-test` onboarding command to confirm delivery (#243).
+- Send the planned stop-SoC in AlphaESS charge calls using the integration's
+  `chargestopsoc` service field (#260).
+- Read the Solcast day total from the configured percentile attribute (#261),
+  falling back to the sensor state with a warning when that attribute is invalid.
+- Clarify that `solar_haircut_k` stacks with Solcast dampening and hard limits,
+  and document how to use only one correction (#262).
+- Discover current Octopus import tariff and product codes from the account API; use the existing `octopus_mpan` option when an account has multiple import meter points (#273).
+- Report Axle snapshots with no scheduled event as healthy, including the direct API and Home Assistant calendar mirror (#275).
+- Reject MCP requests carrying an Origin header on the published agent port,
+  after bearer-token authentication (#279).
+- Keep newly generated agent API tokens out of logs; log the token file path
+  instead (#328).
+- Plan from the current half-hour, sizing the next charge from the battery level
+  expected at the window start, including after-midnight replans (#200, #376).
+- See the evening drain as a named `reach-charge-window` reservation, with any
+  shortfall explained (#376).
+- Forecast solar per calendar date; configure the recommended optional
+  `solar_today_entity` to count today's solar, otherwise it safely counts as zero (#376).
+- Plan flexibility events later today in the same horizon as events after the
+  charge window (#376).
+
 ## 0.22.0
 
 - Plan reservation-backed V2L house-battery refills when cheaper than the grid
