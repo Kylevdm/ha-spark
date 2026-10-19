@@ -181,6 +181,21 @@ class ConfigError(RuntimeError):
     """Raised when the runtime configuration is invalid or incomplete."""
 
 
+def _validation_error_reason(exc: ValidationError) -> str:
+    """The failing field(s) + message per error; never an input value.
+
+    ``str(ValidationError)`` embeds ``input_value`` for each error, which can
+    be a secret option (``_SECRET_OPTION_KEYS``) or a nested ``devices``
+    entry. Rejection reasons reach API clients, the agent surface and logs,
+    so they are built from the error locations and messages only (#412).
+    """
+    reasons: list[str] = []
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error["loc"])
+        reasons.append(f"{location}: {error['msg']}" if location else error["msg"])
+    return "; ".join(reasons)
+
+
 class FixedTariffConfig(BaseModel):
     """The ``fixed`` tariff provider's settings, validated at startup.
 
@@ -204,7 +219,9 @@ class FixedTariffConfig(BaseModel):
             h, m = v.split(":")
             time(int(h), int(m))
         except (ValueError, TypeError) as exc:
-            raise ValueError(f"must be HH:MM (got {v!r})") from exc
+            # No input value in the message: rejection reasons reach API clients
+            # and logs, which must never echo an option's value (#412).
+            raise ValueError("must be HH:MM") from exc
         return v
 
 
@@ -219,7 +236,7 @@ def validate_fixed_tariff(settings: Settings) -> None:
             window_end=settings.charge_window_end,
         )
     except ValidationError as exc:
-        raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
+        raise ConfigError(f"Invalid tariff configuration: {_validation_error_reason(exc)}") from exc
 
 
 class DynamicTariffConfig(BaseModel):
@@ -235,7 +252,7 @@ def validate_dynamic_tariff(settings: Settings) -> None:
     try:
         DynamicTariffConfig(dynamic_rates_entity=settings.dynamic_rates_entity)
     except ValidationError as exc:
-        raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
+        raise ConfigError(f"Invalid tariff configuration: {_validation_error_reason(exc)}") from exc
 
 
 class OctopusIntelligentTariffConfig(BaseModel):
@@ -268,7 +285,7 @@ def validate_octopus_intelligent_tariff(settings: Settings) -> None:
             octopus_tariff_code=settings.octopus_tariff_code,
         )
     except ValidationError as exc:
-        raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
+        raise ConfigError(f"Invalid tariff configuration: {_validation_error_reason(exc)}") from exc
 
 
 class AxleTariffConfig(BaseModel):
@@ -296,7 +313,7 @@ def validate_axle_tariff(settings: Settings) -> None:
             axle_event_rate_gbp_kwh=settings.axle_event_rate_gbp_kwh,
         )
     except ValidationError as exc:
-        raise ConfigError(f"Invalid tariff configuration: {exc}") from exc
+        raise ConfigError(f"Invalid tariff configuration: {_validation_error_reason(exc)}") from exc
 
 
 class DeviceConfig(BaseModel):
@@ -667,6 +684,35 @@ def _read_options_overlay(path: Path = _OPTIONS_PATH) -> dict[str, Any]:
     return {k: v for k, v in raw.items() if k in _OPTION_KEYS and v is not None}
 
 
+def _validated_settings(settings: Settings) -> Settings:
+    """Run the cross-field tariff validations; raise ``ConfigError`` naming the field."""
+    validate_fixed_tariff(settings)
+    validate_dynamic_tariff(settings)
+    validate_octopus_intelligent_tariff(settings)
+    validate_axle_tariff(settings)
+    return settings
+
+
+def validate_options_document(options: dict[str, Any]) -> Settings:
+    """Build complete :class:`Settings` from a candidate options document and validate it.
+
+    The same overlay semantics as :func:`load_settings` (only ``_OPTION_KEYS``
+    honoured, ``None`` values dropped) and the same validation, minus the
+    environment credential check -- credentials come from the environment,
+    not the options document. Used to validate the complete merged candidate
+    *before* it is persisted by an options save (API, agent, MCP), so an
+    invalid document is rejected without touching disk or the running
+    settings. Raises ``ConfigError`` naming the failing field(s); the reason
+    never carries an input value (see ``_validation_error_reason``).
+    """
+    overlay = {k: v for k, v in options.items() if k in _OPTION_KEYS and v is not None}
+    try:
+        settings = Settings(**overlay)
+    except ValidationError as exc:
+        raise ConfigError(_validation_error_reason(exc)) from exc
+    return _validated_settings(settings)
+
+
 def load_settings(*, validate: bool = True) -> Settings:
     """Build :class:`Settings`, overlaying add-on options, and validate.
 
@@ -687,8 +733,5 @@ def load_settings(*, validate: bool = True) -> Settings:
             "HA_TOKEN (see .env.example)."
         )
     if validate:
-        validate_fixed_tariff(settings)
-        validate_dynamic_tariff(settings)
-        validate_octopus_intelligent_tariff(settings)
-        validate_axle_tariff(settings)
+        _validated_settings(settings)
     return settings
