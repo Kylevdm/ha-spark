@@ -93,4 +93,7 @@ class AlphaESSDevice:
             )
         except Exception as exc:  # noqa: BLE001
             return [ActionLine(f"[FAILED] {desc}: {exc!r}", ActionOutcome.FAILED)]
+        # No read-back exists on this driver: VERIFIED keeps today's "[APPLIED]
+        # is success" baseline (#410). AlphaESS never qualifies for an active
+        # operating mode (#409), so this never counts as activation evidence.
         return [ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)]

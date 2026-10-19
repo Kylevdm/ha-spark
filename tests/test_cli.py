@@ -764,3 +764,25 @@ async def test_solis_sync_clock_refuses_another_inverter(
     settings = Settings(ha_url="http://ha", ha_token="t", inverter="alphaess")
     assert await cli._cmd_solis_sync_clock(settings) == 2
     assert "inverter is alphaess" in capsys.readouterr().err
+
+
+@respx.mock
+async def test_solis_sync_clock_without_a_daemon_only_reads_the_clock(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#414: no daemon -> report the clock error read-only, write nothing, exit 1."""
+    async def no_daemon(s: Settings, op: Op) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "submit_socket", no_daemon)
+    reads = respx.get(url__regex=r"http://ha/api/states/.*").mock(
+        return_value=httpx.Response(404)
+    )
+    writes = respx.post(url__regex=r"http://ha/api/services/.*").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    assert await cli._cmd_solis_sync_clock(Settings(ha_url="http://ha", ha_token="t")) == 1
+    out = capsys.readouterr().out
+    assert "inverter clock: unreadable" in out
+    assert "[REFUSED]" in out
+    assert reads.called and not writes.called

@@ -20,6 +20,7 @@ import yaml
 from ha_spark.config import ConfigError, Settings, load_settings
 from ha_spark.daemon_channel import REFUSED, DaemonAlreadyRunning, Reply, submit_socket
 from ha_spark.dashboard import build_dashboard
+from ha_spark.devices.inverters.solis_clock import clock_entity, clock_error, describe_error
 from ha_spark.energy import habits
 from ha_spark.energy.backtest import backtest_cost, format_backtest
 from ha_spark.energy.context import KINDS, ContextStore
@@ -162,12 +163,33 @@ async def _cmd_solis_sync_clock(settings: Settings) -> int:
     if settings.inverter != "solis":
         print(f"sync-clock is Solis-only; inverter is {settings.inverter}", file=sys.stderr)
         return 2
+    print(_DAEMON_WAIT, file=sys.stderr)
     reply = await submit_socket(settings, "sync_clock")
     if reply is None:
+        # Read-only: report the clock error so the operator still sees it.
+        print(f"inverter clock: {await _read_clock_error(settings)}")
         print(REFUSED)
         return 1
     _print_reply(reply)
     return 0 if reply.synced else 1
+
+
+_DAEMON_WAIT = "Submitting to the ha-spark daemon; it runs on its next tick (up to a minute)."
+
+
+async def _read_clock_error(settings: Settings) -> str:
+    """The Solis clock error against the household clock, or ``unreadable``."""
+    tz = load_timezone(settings.timezone)
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            error = clock_error(
+                await rest.get_state(clock_entity(settings.solis_control_hub)), tz
+            )
+    except Exception:  # noqa: BLE001 - a read-only report never fails the command
+        error = None
+    return "unreadable" if error is None else f"{describe_error(error)} {settings.timezone}"
 
 
 def _print_reply(reply: Reply) -> None:
@@ -182,6 +204,7 @@ def _print_reply(reply: Reply) -> None:
 async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
     """Print a plan; only the running daemon may apply it."""
     if apply:
+        print(_DAEMON_WAIT, file=sys.stderr)
         reply = await submit_socket(settings, "apply")
         if reply is not None:
             _print_reply(reply)
@@ -210,6 +233,7 @@ async def _cmd_ask(settings: Settings, message: str) -> int:
 async def _cmd_run(settings: Settings, *, once: bool) -> int:
     """Run the planner daemon: compute & apply once, or loop half-hourly."""
     if once:
+        print(_DAEMON_WAIT, file=sys.stderr)
         reply = await submit_socket(settings, "replan")
         if reply is not None:
             _print_reply(reply)
