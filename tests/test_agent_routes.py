@@ -227,3 +227,26 @@ def test_forecast_route_serves_the_served_day_profile(
     assert body["slots"] == [float(i) for i in range(SLOTS_PER_DAY)]
     assert body["load_kwh"] == 12.0
     assert body["source"] == "slot profile (14d hourly house stats)"
+
+
+def test_agent_config_rejects_invalid_document_before_saving(tmp_path: Path) -> None:
+    """#412: /agent/config validates the whole candidate before persisting.
+
+    A rejected save must leave the options file byte-identical and the running
+    settings untouched, and the 400 reason must name the failing field without
+    echoing its value or the secret sitting next to it in the document.
+    """
+    options = tmp_path / "options.json"
+    seeded = json.dumps({"min_soc": 20.0, "octopus_api_key": "SECRET_OCTO"}).encode()
+    options.write_bytes(seeded)
+    state = _state(
+        tmp_path, exposure="read_write", min_soc=20.0, octopus_api_key="SECRET_OCTO"
+    )
+    with TestClient(build_app(state)) as client:
+        resp = client.post("/agent/config", json={"min_soc": "not-a-number"})
+    assert resp.status_code == 400
+    assert "min_soc" in resp.json()["detail"]
+    assert "not-a-number" not in resp.text
+    assert "SECRET_OCTO" not in resp.text
+    assert options.read_bytes() == seeded
+    assert state.settings.min_soc == 20.0
