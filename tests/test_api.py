@@ -312,3 +312,74 @@ def test_token_port_is_not_peer_restricted(tmp_path: Path) -> None:
         assert client.get("/api/health").status_code == 401
         ok = client.get("/api/health", headers={"Authorization": "Bearer sekret"})
         assert ok.status_code == 200
+
+
+def test_post_config_rejects_invalid_document_before_saving(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#412: the complete merged candidate is validated before anything is saved.
+
+    A rejected save must leave the options file byte-identical and the running
+    settings untouched, and the 400 reason must name the failing field without
+    echoing its value or the secret sitting next to it in the document.
+    """
+    options = tmp_path / "options.json"
+    seeded = json.dumps({"min_soc": 20.0, "octopus_api_key": "SECRET_OCTO"}).encode()
+    options.write_bytes(seeded)
+    state = _state(tmp_path, min_soc=20.0, octopus_api_key="SECRET_OCTO")
+    with caplog.at_level("WARNING"):
+        with _client(state) as client:
+            resp = client.post("/api/config", json={"min_soc": "not-a-number"})
+    assert resp.status_code == 400
+    assert "min_soc" in resp.json()["error"]
+    assert "not-a-number" not in resp.text
+    assert "SECRET_OCTO" not in resp.text
+    assert "SECRET_OCTO" not in caplog.text
+    assert options.read_bytes() == seeded
+    assert state.settings.min_soc == 20.0
+
+
+def test_post_config_rejection_never_echoes_a_secret_value(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A bad value for a secret option must not echo that value in the 400 or logs.
+
+    pydantic's ValidationError embeds ``input_value``, so a rejected secret
+    value would otherwise leave the process in cleartext (CLAUDE.md top rule).
+    """
+    options = tmp_path / "options.json"
+    seeded = json.dumps({"agent_api_token": "REAL_AGENT"}).encode()
+    options.write_bytes(seeded)
+    state = _state(tmp_path, agent_api_token="REAL_AGENT")
+    with caplog.at_level("WARNING"):
+        with _client(state) as client:
+            resp = client.post("/api/config", json={"agent_api_token": ["TOPSECRET_AGENT"]})
+    assert resp.status_code == 400
+    assert "agent_api_token" in resp.json()["error"]
+    assert "TOPSECRET_AGENT" not in resp.text
+    assert "TOPSECRET_AGENT" not in caplog.text
+    assert options.read_bytes() == seeded
+    assert state.settings.agent_api_token == "REAL_AGENT"
+
+
+def test_post_config_rejection_of_nested_device_entry_is_secret_safe(tmp_path: Path) -> None:
+    """A bad nested ``devices`` entry must not echo the offending value."""
+    state = _state(tmp_path)
+    with _client(state) as client:
+        resp = client.post(
+            "/api/config",
+            json={
+                "devices": [
+                    {
+                        "id": "main_inverter",
+                        "driver": "solis",
+                        "entities": {"power_switch": ["TOPSECRET_AGENT"]},
+                    }
+                ]
+            },
+        )
+    assert resp.status_code == 400
+    assert "devices" in resp.json()["error"]
+    assert "TOPSECRET_AGENT" not in resp.text
+    assert not (tmp_path / "options.json").exists()
+    assert state.settings.agent_api_token == ""
