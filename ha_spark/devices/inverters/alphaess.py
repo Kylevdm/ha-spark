@@ -84,6 +84,7 @@ class AlphaESSDevice:
             return [ActionLine(f"[{mode.upper()}] computed: {desc}", ActionOutcome.SIMULATED)]
         try:
             # Field names checked against the AlphaESS integration's services.yaml.
+            self._coordinator.confirm_write()
             await self._rest.call_service(
                 "alphaess",
                 "setbatterycharge",

@@ -400,6 +400,9 @@ async def check_operating_mode(settings: Settings) -> CheckResult:
     """Read the store without initialisation; query only the daemon's live fault flag."""
     result = load_authority(settings)
     reply = await submit_socket(settings, "authority_status")
+    if reply is not None and reply.authority is None:
+        # A reachable daemon whose live status is unreadable may be hiding a save failure.
+        return CheckResult("Operating mode", Status.FAIL, "daemon authority status unavailable")
     if reply is not None and reply.authority is not None:
         if reply.authority.get("save_failed"):
             return CheckResult("Operating mode", Status.FAIL, "authority save failure")

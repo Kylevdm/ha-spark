@@ -179,10 +179,11 @@ class AuthorityStore:
 
     @property
     def known(self) -> bool:
-        return (
-            self._state is not None
-            and _load(self.store_path, self.marker_path).status == "known"
-        )
+        """Known only while disk holds exactly this writer's state; any divergence fails closed."""
+        if self._state is None:
+            return False
+        loaded = _load(self.store_path, self.marker_path)
+        return loaded.status == "known" and loaded.state == self._state
 
     def start_process(self) -> None:
         """Initialise Observe or fence work from an earlier daemon process."""

@@ -588,3 +588,72 @@ async def test_uninitialised_store_warns_without_failing_health(settings):
     result = await check_operating_mode(settings)
     assert result.status is Status.WARN
     assert not load_authority(settings).status == "known"
+
+
+@pytest.mark.parametrize("revoke", ["deleted", "save_failed", "epoch_moved", "disk_diverged"])
+@pytest.mark.parametrize("ownership", list(Ownership))
+async def test_authority_lost_during_prerequisite_reads_blocks_the_write(
+    settings, ha, monkeypatch, revoke, ownership
+):
+    """The grant is re-checked at the actuating call, not only on action entry."""
+    context = ExecutionContext()
+    store = seed_authority(settings, "optimise", epoch=4, context=context)
+    assert store.state is not None
+    original = HomeAssistantRest.get_state
+    revoked = False
+
+    async def get_state(self, entity_id):
+        nonlocal revoked
+        if not revoked:
+            revoked = True
+            if revoke == "deleted":
+                store.store_path.unlink()
+            elif revoke == "save_failed":
+                store.save_failed = True
+            elif revoke == "epoch_moved":
+                store.save(store.state.model_copy(update={"epoch": 5}))
+            else:
+                diverged = store.state.model_copy(update={"committed_mode": "observe"})
+                store.store_path.write_text(diverged.model_dump_json(), encoding="utf-8")
+        return await original(self, entity_id)
+
+    monkeypatch.setattr(HomeAssistantRest, "get_state", get_state)
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        device = inverter_device(settings, rest, execution=context)
+        if ownership == Ownership.PROTECTION:
+            lines = await device.reconcile_holds(_intent(holds=(_window(-5),)), _now())
+        elif ownership == Ownership.CLOCK:
+            _, lines = await device.sync_clock()
+        else:
+            lines = [await device.set_charge_rate(1000)]
+    assert revoked
+    assert not hardware_calls(ha)
+    assert not any(line.outcome in (
+        ActionOutcome.VERIFIED, ActionOutcome.UNCHANGED_VERIFIED
+    ) for line in lines if isinstance(line, ActionLine))
+
+
+async def test_valid_but_different_store_on_disk_is_authority_unknown(settings, ha):
+    context = ExecutionContext()
+    store = seed_authority(settings, "optimise", epoch=4, context=context)
+    assert store.state is not None
+    replaced = store.state.model_copy(update={"committed_mode": "observe", "epoch": 5})
+    store.store_path.write_text(replaced.model_dump_json(), encoding="utf-8")
+    assert load_authority(settings).status == "known"
+    assert not store.known
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        line = await inverter_device(settings, rest, execution=context).set_charge_rate(1000)
+    assert line.startswith("[REFUSED] authority unknown")
+    assert not hardware_calls(ha)
+
+
+async def test_unreadable_daemon_status_fails_health(settings, monkeypatch):
+    from ha_spark import health
+    from ha_spark.daemon_channel import Reply
+
+    seed_authority(settings, "optimise")
+    monkeypatch.setattr(health, "submit_socket", AsyncMock(
+        return_value=Reply(error="daemon response unavailable")
+    ))
+    result = await check_operating_mode(settings)
+    assert result.status is Status.FAIL

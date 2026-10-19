@@ -1037,6 +1037,7 @@ class SolisDevice:
 
     async def _select_option(self, entity: str, option: str) -> str | None:
         """Write a select option and confirm it; returns the read-back mismatch."""
+        self._coordinator.confirm_write()
         await self._rest.call_service(
             "select", "select_option", {"entity_id": entity, "option": option}
         )
@@ -1401,6 +1402,7 @@ class SolisDevice:
         return f"sensor.{self._hub}_{field}"
 
     async def _write_register(self, address: int, value: int | list[int]) -> None:
+        self._coordinator.confirm_write()
         await self._rest.call_service(
             "modbus",
             "write_register",

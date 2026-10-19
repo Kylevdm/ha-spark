@@ -51,12 +51,21 @@ class WriteGate:
             return "simulate"
         return "on"
 
+    def recheck(self, ownership: Ownership, config: DeviceConfig, settings: Settings) -> str:
+        """Write-time re-evaluation under the held lock: the same rules, not a new decision."""
+        return self.mode_for(ownership, config, settings)
+
+
+class AuthorityRevoked(RuntimeError):
+    """Authority no longer permits the write this action was granted; nothing was sent."""
+
 
 @dataclass
 class _BusState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     owner: asyncio.Task[Any] | None = None
     modes: list[str] = field(default_factory=list)
+    checks: list[Callable[[], str]] = field(default_factory=list)
     decisions: dict[tuple[Ownership, int, int], str] = field(default_factory=dict)
 
 
@@ -79,6 +88,20 @@ class BusCoordinator:
             raise RuntimeError("Device permission requested outside a held action")
         return state.modes[-1]
 
+    def confirm_write(self) -> None:
+        """Re-ask the gate immediately before an actuating call; raise unless still "on".
+
+        The cached decision covers presentation and prerequisite reads only. Authority
+        can change while they await (store deleted, save failed, epoch moved), so every
+        hardware write re-checks under the held lock and is never sent on a stale grant.
+        """
+        state = self._state()
+        if state.owner is not asyncio.current_task() or not state.checks:
+            raise RuntimeError("Device write requested outside a held action")
+        mode = state.checks[-1]()
+        if mode != "on" or state.modes[-1] != "on":
+            raise AuthorityRevoked(mode.removeprefix("refuse:"))
+
     @asynccontextmanager
     async def action(
         self, gate: WriteGate, ownership: Ownership, config: DeviceConfig, settings: Settings
@@ -94,9 +117,11 @@ class BusCoordinator:
             if key not in state.decisions:
                 state.decisions[key] = gate.mode_for(ownership, config, settings)
             state.modes.append(state.decisions[key])
+            state.checks.append(lambda: gate.recheck(ownership, config, settings))
             try:
                 yield
             finally:
+                state.checks.pop()
                 state.modes.pop()
         finally:
             if outer:
