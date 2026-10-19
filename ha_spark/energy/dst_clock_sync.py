@@ -29,6 +29,7 @@ from datetime import UTC, datetime, timedelta
 
 from ha_spark.config import Settings
 from ha_spark.devices import inverter_device
+from ha_spark.devices.execution import ExecutionContext
 from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.ha.rest import HomeAssistantRest, notify
 from ha_spark.logging import get_logger
@@ -77,12 +78,18 @@ class DstClockSync:
         change = last_clock_change(now)
         return change if change is not None and change != self.handled else None
 
-    async def run(self, settings: Settings, rest: HomeAssistantRest, now: datetime) -> None:
-        """One attempt at the due sync. Raises only what the caller isolates."""
+    async def run(
+        self, settings: Settings, rest: HomeAssistantRest, now: datetime,
+        *, execution: ExecutionContext | None = None,
+    ) -> None:
+        """Attempt the due sync under the shared execution context's bus lock."""
         change = self.due(now)
         if change is None:
             return
-        device = inverter_device(settings, rest)
+        device = (
+            inverter_device(settings, rest) if execution is None
+            else inverter_device(settings, rest, execution=execution)
+        )
         if not isinstance(device, SolisDevice):
             self.handled = change
             return

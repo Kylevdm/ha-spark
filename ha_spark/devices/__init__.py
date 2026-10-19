@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 from ha_spark.devices.base import Capability, ControlAuthority, Device, effective_mode
+from ha_spark.devices.execution import ExecutionContext
 
 # Import driver modules so their @register side effects run.
 from ha_spark.devices.inverters import alphaess as _alphaess  # noqa: F401
@@ -20,10 +21,19 @@ __all__ = [
 ]
 
 
-def get_device(config: DeviceConfig, settings: Settings, rest: HomeAssistantRest) -> Device:
-    return cast(Device, lookup(config.driver)(config, settings, rest))
+def get_device(
+    config: DeviceConfig, settings: Settings, rest: HomeAssistantRest,
+    *, execution: ExecutionContext | None = None,
+) -> Device:
+    if execution is None:
+        return cast(Device, lookup(config.driver)(config, settings, rest))
+    return cast(Device, lookup(config.driver)(config, settings, rest, execution=execution))
 
 
-def inverter_device(settings: Settings, rest: HomeAssistantRest) -> Device:
+def inverter_device(
+    settings: Settings, rest: HomeAssistantRest, *, execution: ExecutionContext | None = None,
+) -> Device:
     config = next(d for d in settings.devices if d.type == "inverter")
-    return get_device(config, settings, rest)
+    if execution is None:
+        return get_device(config, settings, rest)
+    return get_device(config, settings, rest, execution=execution)

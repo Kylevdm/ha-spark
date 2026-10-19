@@ -45,7 +45,13 @@ from datetime import UTC, datetime, time, timedelta
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypeVar
 from zoneinfo import ZoneInfo
 
-from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
+from ha_spark.devices.base import Capability, fmt_hhmm
+from ha_spark.devices.execution import (
+    ExecutionContext,
+    Ownership,
+    device_action,
+    execution_context,
+)
 from ha_spark.devices.inverters.solis_clock import (
     CLOCK_SYNC_REG,
     STALE_AFTER,
@@ -172,7 +178,12 @@ class SolisDevice:
     # superseded by `Capability.CHARGE_RATE in capabilities` in Task 6.
     supports_live_rate = True
 
-    def __init__(self, config: DeviceConfig, settings: Settings, rest: HomeAssistantRest) -> None:
+    def __init__(
+        self, config: DeviceConfig, settings: Settings, rest: HomeAssistantRest,
+        *, execution: ExecutionContext | None = None,
+    ) -> None:
+        self._execution = execution or execution_context()
+        self._coordinator = self._execution.coordinator_for(config, settings)
         self._config = config
         self._settings = settings
         self._rest = rest
@@ -186,6 +197,7 @@ class SolisDevice:
 
     # --- apply: the forced-charge sequence ---
 
+    @device_action(Ownership.CHARGING)
     async def apply_fallback(self, soc: SocMeasurement) -> list[ActionLine]:
         """Apply the configured cheap-window fallback using the normal Solis gates.
 
@@ -213,7 +225,7 @@ class SolisDevice:
             window_start=time.fromisoformat(self._settings.charge_window_start),
             window_end=time.fromisoformat(self._settings.charge_window_end),
         )
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         description = (
             f"Solis fallback at {current_a} A in "
             f"{fmt_hhmm(intent.window_start)}-{fmt_hhmm(intent.window_end)}"
@@ -250,8 +262,9 @@ class SolisDevice:
     async def apply(self, intent: ChargeIntent) -> list[ActionLine]:
         return (await self._apply(intent, None)).lines
 
+    @device_action(Ownership.CHARGING)
     async def _apply(self, intent: ChargeIntent, fallback_current_a: float | None) -> _ApplyResult:
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         # load_timezone, not ZoneInfo: a minimal container without tzdata (or a
         # typo'd option) must degrade to UTC, not raise before the reconcile and
         # the SoC guard have run and cost the daemon every device write.
@@ -475,6 +488,7 @@ class SolisDevice:
 
     # --- internal writes (PROACTIVE_MODE-gated, failure-isolated, read-back verified) ---
 
+    @device_action(Ownership.CHARGING)
     async def _write_charge_window(
         self,
         intent: ChargeIntent,
@@ -500,7 +514,7 @@ class SolisDevice:
             )
         elif kept_discharge is not None:
             desc += " and keep the verified export window"
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         keeps_discharge = export_window is not None or kept_discharge is not None
         current_a = (
             solis_current_a(intent, self._settings)
@@ -599,9 +613,10 @@ class SolisDevice:
             else ActionLine(f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED)
         )
 
+    @device_action(Ownership.CHARGING)
     async def _clear_discharge_window(self, desc: str) -> ActionLine:
         """Clear only Slot 1's discharge half, preserving any charge schedule."""
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         safe_desc = desc.replace("set charge window", "set timed charge schedule")
         clear_desc = f"clear timed export window ({safe_desc})"
         if mode == "simulate":
@@ -630,6 +645,7 @@ class SolisDevice:
             )
         )
 
+    @device_action(Ownership.CHARGING)
     async def _write_charge_current_result(
         self,
         intent: ChargeIntent,
@@ -647,7 +663,7 @@ class SolisDevice:
         desc = _charge_current_description(
             intent, self._settings, amps, fallback=fallback
         )
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if blocked and mode in ("on", "simulate"):
             prefix = "[SIMULATE] " if mode == "simulate" else ""
             line = ActionLine(
@@ -658,6 +674,7 @@ class SolisDevice:
             return False, line
         return await self._set_current_result(amps, desc)
 
+    @device_action(Ownership.CHARGING)
     async def _prepare_slot_one_current(
         self,
         intent: ChargeIntent,
@@ -730,6 +747,7 @@ class SolisDevice:
         desc = f"zero timed slot {slot} window"
         return await self._zero_slot(slot, desc)
 
+    @device_action(Ownership.CHARGING)
     async def _zero_slot(
         self, slot: int, desc: str, *, keep_discharge: list[int] | None = None
     ) -> tuple[bool, ActionLine]:
@@ -737,7 +755,7 @@ class SolisDevice:
 
         ``keep_discharge`` zeroes only the charge half, writing these four
         registers back as the discharge half in the same atomic block."""
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if mode == "simulate":
             return True, ActionLine(
                 f"[SIMULATE] would {desc} (if non-zero)", ActionOutcome.SIMULATED
@@ -773,9 +791,10 @@ class SolisDevice:
         _ok, line = await self._set_current_result(amps, desc)
         return line
 
+    @device_action(Ownership.CHARGING)
     async def _set_current_result(self, amps: float, desc: str) -> tuple[bool, ActionLine]:
         """Set current and return whether its post-write value was confirmed."""
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if mode == "simulate":
             log.info("[SIMULATE] would %s", desc)
             return True, ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
@@ -821,10 +840,11 @@ class SolisDevice:
         """
         return [await self._reconcile_power_switch(intent, now)]
 
+    @device_action(Ownership.PROTECTION)
     async def _reconcile_power_switch(self, intent: ChargeIntent, now: datetime) -> ActionLine:
         wanted = "Off" if intent.hold_active(now) else "On"
         desc = f"set inverter power switch to {wanted}"
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if mode == "simulate":
             return ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
@@ -889,9 +909,10 @@ class SolisDevice:
         """
         return [await self._write_safe_power_switch(), await self._write_safe_slot_block()]
 
+    @device_action(Ownership.PROTECTION)
     async def _write_safe_power_switch(self) -> ActionLine:
         desc = "set inverter power switch to On (relinquishing control)"
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if mode == "simulate":
             return ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
@@ -920,6 +941,7 @@ class SolisDevice:
             else ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)
         )
 
+    @device_action(Ownership.CHARGING)
     async def _write_safe_slot_block(self) -> ActionLine:
         # Imported here for the same import-cycle reason as in `apply`.
         from ha_spark.energy.sources import parse_time
@@ -935,7 +957,7 @@ class SolisDevice:
             return line
         charge = [start.hour, start.minute, end.hour, end.minute]
         desc = f"set charge window {fmt_hhmm(start)}-{fmt_hhmm(end)} (relinquishing control)"
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if mode == "simulate":
             return ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
@@ -992,10 +1014,11 @@ class SolisDevice:
         )
         return await self._read_back_option(entity, option)
 
+    @device_action(Ownership.CHARGING)
     async def _write_discharge_current_result(self) -> tuple[bool, ActionLine]:
         """Set and verify the fixed full-rate command used for paid export."""
         desc = f"set timed discharge current to {_EXPORT_CURRENT_A:g} A for export"
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if mode == "simulate":
             return True, ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
@@ -1093,6 +1116,7 @@ class SolisDevice:
         tolerance = timedelta(minutes=self._settings.inverter_clock_tolerance_minutes)
         return clock_refusal(state, now, tz, tolerance)
 
+    @device_action(Ownership.CLOCK)
     async def sync_clock(self) -> tuple[ClockSyncOutcome, list[ActionLine]]:
         """Set the inverter clock from the household clock and confirm it (#161).
 
@@ -1117,7 +1141,7 @@ class SolisDevice:
         zone = self._settings.timezone
         before_text = "unreadable" if before is None else f"{describe_error(before)} {zone}"
         lines = [ActionLine(f"inverter clock before: {before_text}", ActionOutcome.UNVERIFIED)]
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if mode != "on":
             lines.append(
                 ActionLine(
