@@ -7,7 +7,6 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from ha_spark.devices.base import ControlAuthority
 from ha_spark.energy.dst_clock_sync import DstClockSync, last_clock_change
 from ha_spark.ha.models import EntityState
 from tests.authority_helpers import legacy_settings as Settings
@@ -70,7 +69,7 @@ class FakeRest:
 
 def _settings(mode: str = "on") -> Settings:
     return Settings(
-        proactive_mode=mode,
+        authority_mode="optimise" if mode == "on" else "observe",
         inverter_clock_dst_sync=True,
         notify_service="mobile_app_phone",
     )
@@ -179,8 +178,6 @@ async def test_switching_to_on_within_the_lookback_still_syncs() -> None:
 async def test_without_control_authority_it_never_writes() -> None:
     rest = FakeRest()
     settings = _settings()
-    observe = {"control": ControlAuthority.OBSERVE}
-    settings.devices[0] = settings.devices[0].model_copy(update=observe)
     seed_authority(settings, "observe")
 
     await DstClockSync().run(settings, rest, _at(0))  # type: ignore[arg-type]

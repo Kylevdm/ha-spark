@@ -6,6 +6,7 @@ import respx
 
 from ha_spark.agent import tools
 from ha_spark.config import Settings
+from tests.authority_helpers import seed_authority
 
 
 def _settings(tmp_path: Path, **kw: object) -> Settings:
@@ -27,5 +28,7 @@ async def test_run_plan_simulate_makes_no_service_call(tmp_path: Path) -> None:
     service = respx.post(url__regex=r"http://ha\.test/api/services/.*").mock(
         return_value=httpx.Response(200, json=[])
     )
-    await tools.run_plan(_settings(tmp_path, proactive_mode="simulate"))
+    settings = _settings(tmp_path)
+    seed_authority(settings, "observe")
+    await tools.run_plan(settings)
     assert not service.called

@@ -67,8 +67,8 @@ def make_notice(
         message = (
             f"Accepted Axle export for {window}. Planned export: {planned}; "
             f"DNO limit: {limit}. Required preparation: keep a person present, "
-            "confirm proactive_mode is on and ha-spark has control authority, "
-            "then return to simulate after verified cleanup."
+            "confirm the site operating mode is Optimise, "
+            "then return to Observe after verified cleanup."
         )
     elif transition == "started":
         title = "Axle export started"

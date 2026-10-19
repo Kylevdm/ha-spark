@@ -131,7 +131,7 @@ async def test_live_current_horizon_ticks_skip_writes_then_absorb_new_inputs(
     respx.route(method="GET").mock(side_effect=get_state)
     respx.route(method="POST").mock(side_effect=write_register)
     settings = Settings(
-        ha_url="http://ha.test", ha_token="t", proactive_mode="on", timezone="Europe/London",
+        ha_url="http://ha.test", ha_token="t", authority_mode="optimise", timezone="Europe/London",
         db_path=str(tmp_path / "ledger.db"), v2l_power_entity="",
         inverter_power_switch_entity="select.power", dispatch_entity="binary_sensor.dispatch",
         latitude=0.0, longitude=0.0, charge_buffer_pct=0.0,
@@ -555,7 +555,7 @@ async def test_run_once_computes_and_applies_plan(
     respx.route(method="GET").mock(return_value=httpx.Response(404))
 
     s = Settings(
-        ha_url="http://ha.test", ha_token="t", proactive_mode="off",
+        ha_url="http://ha.test", ha_token="t", authority_mode="observe",
         db_path=str(tmp_path / "ledger.db"),
     )
 
@@ -611,7 +611,7 @@ async def test_run_once_records_the_served_day_forecast_in_day_order(
     s = Settings(
         ha_url="http://ha.test",
         ha_token="t",
-        proactive_mode="off",
+        authority_mode="observe",
         db_path=str(tmp_path / "ledger.db"),
         charge_window_start="23:30",
         charge_window_end="05:30",
@@ -766,7 +766,7 @@ async def test_dynamic_plan_parity_between_scheduler_and_agent_plan(
     respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
 
     s = Settings(
-        ha_url="http://ha.test", ha_token="t", proactive_mode="off",
+        ha_url="http://ha.test", ha_token="t", authority_mode="observe",
         db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
         tariff_provider="dynamic", dynamic_rates_entity="sensor.dynamic_rates",
     )
@@ -1132,7 +1132,7 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
 @respx.mock
 async def test_guard_tick_adopts_setpoint_as_target_on_restart() -> None:
     s = Settings(
-        ha_url="http://ha.test", ha_token="t", proactive_mode="simulate",
+        ha_url="http://ha.test", ha_token="t", authority_mode="observe",
         grid_power_entity="sensor.house_supply_power", battery_voltage_v=51.0,
     )
     for entity, state in (
@@ -1154,7 +1154,7 @@ async def test_guard_tick_uses_configured_fallback_as_restore_target() -> None:
     s = Settings(
         ha_url="http://ha.test",
         ha_token="t",
-        proactive_mode="simulate",
+        authority_mode="observe",
         grid_power_entity="sensor.house_supply_power",
         battery_voltage_v=51.0,
         solis_fallback_current_a=15.0,
@@ -1319,7 +1319,7 @@ async def test_run_once_logs_proactive_decisions(
     respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
 
     s = Settings(
-        ha_url="http://ha.test", ha_token="t", proactive_mode="simulate",
+        ha_url="http://ha.test", ha_token="t", authority_mode="observe",
         db_path=str(tmp_path / "ledger.db"), timezone="UTC",
     )
     # Seed low occupancy so a suggestion fires, and no away context.
@@ -1377,7 +1377,7 @@ async def test_run_once_triggers_derived_rerive_when_configured(
     monkeypatch.setattr(scheduler, "rerive_trailing_window", fake_rerive)
 
     s = Settings(
-        ha_url="http://ha.test", ha_token="t", proactive_mode="off",
+        ha_url="http://ha.test", ha_token="t", authority_mode="observe",
         db_path=str(tmp_path / "ledger.db"),
         derive_grid_import_entity="sensor.grid_import",
     )
@@ -1409,7 +1409,7 @@ async def test_run_once_skips_derived_rerive_without_grid_import(
     monkeypatch.setattr(scheduler, "rerive_trailing_window", fake_rerive)
 
     s = Settings(
-        ha_url="http://ha.test", ha_token="t", proactive_mode="off",
+        ha_url="http://ha.test", ha_token="t", authority_mode="observe",
         db_path=str(tmp_path / "ledger.db"),
     )
     await run_once(s)
@@ -1436,7 +1436,7 @@ async def test_run_once_rerive_failure_does_not_block_plan(
     monkeypatch.setattr(scheduler, "rerive_trailing_window", boom_rerive)
 
     s = Settings(
-        ha_url="http://ha.test", ha_token="t", proactive_mode="off",
+        ha_url="http://ha.test", ha_token="t", authority_mode="observe",
         db_path=str(tmp_path / "ledger.db"),
         derive_grid_import_entity="sensor.grid_import",
     )
@@ -1864,7 +1864,7 @@ async def test_loop_keeps_simulated_fallback_unconfirmed_without_warning(
         ha_url="http://ha.test",
         ha_token="t",
         plan_run_time="22:00",
-        proactive_mode="simulate",
+        authority_mode="observe",
         db_path=str(tmp_path / "ledger.db"),
         soc_entity="sensor.soc",
         soc_failure_threshold=1,
@@ -2162,7 +2162,7 @@ async def test_run_once_failed_soc_leaves_solis_resident_program_untouched(
     respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
 
     s = Settings(
-        ha_url="http://ha.test", ha_token="t", proactive_mode="on",
+        ha_url="http://ha.test", ha_token="t", authority_mode="optimise",
         db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
     )
     failed = _failed_soc()
@@ -2191,7 +2191,7 @@ async def test_run_once_failed_soc_blocks_alphaess_programming(
     respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
 
     s = Settings(
-        ha_url="http://ha.test", ha_token="t", proactive_mode="on",
+        ha_url="http://ha.test", ha_token="t", authority_mode="optimise",
         db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
         inverter="alphaess", alphaess_serial="SN1",
     )
@@ -3261,7 +3261,7 @@ async def test_ev_hold_uses_the_real_solis_switch_path(
         dispatch_entity="",
         ev_status_entity="sensor.ev",
         inverter_power_switch_entity="select.solisac_power_switch",
-        proactive_mode=mode,
+        authority_mode="optimise" if mode == "on" else "observe",
     )
 
     result = await scheduler.reconcile_tick(
@@ -3356,7 +3356,7 @@ async def test_run_once_applies_the_ev_hold_on_a_replan_tick(
         dispatch_entity="",
         ev_status_entity="sensor.ev",
         inverter_power_switch_entity="select.solisac_power_switch",
-        proactive_mode="on",
+        authority_mode="optimise",
     )
 
     await run_once(
@@ -4192,6 +4192,8 @@ def _patch_recovery_loop(
     monkeypatch: pytest.MonkeyPatch,
     minutes: list[int],
     apply_results: list[list[str] | Exception],
+    *,
+    authority_mode: str = "optimise",
 ) -> tuple[type[Exception], list[dict[str, object]], Settings]:
     """A loop resumed in persisted verified fallback, one passing SoC per tick.
 
@@ -4255,7 +4257,7 @@ def _patch_recovery_loop(
         solis_fallback_current_a=42.0,
         v2l_power_entity="",
     )
-    seed_authority(settings, "optimise")
+    seed_authority(settings, authority_mode)
     return stop, runs, settings
 
 
@@ -4448,9 +4450,11 @@ async def test_loop_completes_recovery_in_simulate_mode(
         monkeypatch,
         [0, 1, 2],
         [["[SIMULATE] would set timed charge current to 20 A"]],
+        authority_mode="observe",
     )
-    assert settings.proactive_mode == "simulate"
-    seed_authority(settings, "observe")
+    from ha_spark.devices.execution import execution_context
+
+    assert execution_context().authority.state.committed_mode == "observe"
 
     with pytest.raises(stop):
         await run_forever(settings, poll_seconds=0)

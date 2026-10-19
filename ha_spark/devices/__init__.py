@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
-from ha_spark.devices.base import Capability, ControlAuthority, Device, effective_mode
+from ha_spark.devices.base import Capability, Device
 from ha_spark.devices.execution import ExecutionContext
 
 # Import driver modules so their @register side effects run.
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from ha_spark.ha.rest import HomeAssistantRest
 
 __all__ = [
-    "Capability", "ControlAuthority", "Device", "effective_mode",
+    "Capability", "Device",
     "get_device", "inverter_device",
 ]
 

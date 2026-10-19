@@ -1,8 +1,7 @@
 """Persisted authority fixtures; production permission code is never patched.
 
-The migration adapter preserves the intent of legacy driver tests: former real
-write cases explicitly receive Optimise, and *all* retired-gate cases receive
-Observe. It must not be used by tests of defaults or implicit grants.
+Driver tests choose their authority explicitly. This helper never infers a
+permission from settings and must not be used to test defaults or implicit grants.
 """
 from __future__ import annotations
 
@@ -43,20 +42,15 @@ def seed_authority(
 
 
 def legacy_settings(
-    *, authority_mode: OperatingMode | None = None, **kwargs: Any
+    *, authority_mode: OperatingMode = "observe", **kwargs: Any
 ) -> Settings:
-    """Map old test setup to explicit authority, never a production permission fallback."""
+    """Build settings and seed only the explicitly requested test authority."""
     if "db_path" not in kwargs:
         directory = TemporaryDirectory(prefix="ha-spark-authority-test-")
         _directories.append(directory)
         kwargs["db_path"] = str(Path(directory.name) / "events.db")
     settings = Settings(**kwargs)
-    mode: OperatingMode = "observe"
-    if settings.proactive_mode == "on" and all(
-        device.control == "ha_spark" for device in settings.devices if device.type == "inverter"
-    ):
-        mode = "optimise"
-    seed_authority(settings, authority_mode or mode)
+    seed_authority(settings, authority_mode)
     return settings
 
 

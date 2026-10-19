@@ -81,7 +81,7 @@ def test_throttle_export_counts_as_headroom() -> None:
 @respx.mock
 async def test_tick_skips_small_deltas_without_writing() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = _guard_settings(proactive_mode="on")
+    s = _guard_settings(authority_mode="optimise")
     _mock_state(s.grid_power_entity, "5000")  # well under the limit
     # 40 A * 51 V = 2040 W, already at target
     _mock_state("sensor.solis_control_timed_charge_current", "40")
@@ -94,7 +94,7 @@ async def test_tick_skips_small_deltas_without_writing() -> None:
 @respx.mock
 async def test_tick_simulate_logs_but_does_not_write() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = _guard_settings(proactive_mode="simulate")
+    s = _guard_settings(authority_mode="observe")
     _mock_state(s.grid_power_entity, "20000")  # over the limit
     _mock_state("sensor.solis_control_timed_charge_current", "40")  # setpoint 2040 W
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
@@ -110,7 +110,7 @@ async def test_tick_on_writes_and_verifies_read_back() -> None:
     set_value = respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(200, json=[])
     )
-    s = _guard_settings(proactive_mode="on")
+    s = _guard_settings(authority_mode="optimise")
     _mock_state(s.grid_power_entity, "20000")
     _mock_state("sensor.solis_control_timed_charge_current", "40")  # also serves the read-back
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
@@ -125,7 +125,7 @@ async def test_tick_on_writes_and_verifies_read_back() -> None:
 @respx.mock
 async def test_tick_restores_toward_target_when_headroom_returns() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = _guard_settings(proactive_mode="simulate")
+    s = _guard_settings(authority_mode="observe")
     _mock_state(s.grid_power_entity, "3000")  # EV gone, light house load
     _mock_state("sensor.solis_control_timed_charge_current", "5")  # previously throttled (255 W)
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
@@ -138,7 +138,7 @@ async def test_tick_restores_toward_target_when_headroom_returns() -> None:
 @respx.mock
 async def test_tick_unreadable_grid_sensor_does_nothing() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = _guard_settings(proactive_mode="on")
+    s = _guard_settings(authority_mode="optimise")
     respx.get(f"http://ha.test/api/states/{s.grid_power_entity}").mock(
         return_value=httpx.Response(500)
     )
@@ -152,7 +152,7 @@ async def test_tick_unreadable_grid_sensor_does_nothing() -> None:
 @respx.mock
 async def test_tick_unreadable_setpoint_does_nothing() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = _guard_settings(proactive_mode="on")
+    s = _guard_settings(authority_mode="optimise")
     _mock_state(s.grid_power_entity, "20000")
     respx.get("http://ha.test/api/states/sensor.solis_control_timed_charge_current").mock(
         return_value=httpx.Response(500)
@@ -169,7 +169,7 @@ async def test_guard_dormant_when_no_live_rate() -> None:
     # writes, just echoes the target back.
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     gets = respx.route(method="GET").mock(return_value=httpx.Response(200, json={}))
-    s = _guard_settings(inverter="alphaess", proactive_mode="on")
+    s = _guard_settings(inverter="alphaess", authority_mode="optimise")
     out = await guard_tick(s, 5000.0)
     assert out == 5000.0
     assert posts.call_count == 0
@@ -205,7 +205,7 @@ async def test_tick_failed_soc_blocks_rate_increase() -> None:
     """Pending failure: plenty of headroom would normally restore toward the
     plan target (an increase); an untrusted SoC must not raise grid charging."""
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = _guard_settings(proactive_mode="on")
+    s = _guard_settings(authority_mode="optimise")
     _mock_state(s.grid_power_entity, "3000")  # light load, huge headroom
     _mock_state("sensor.solis_control_timed_charge_current", "40")  # setpoint 2040 W
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
@@ -222,7 +222,7 @@ async def test_tick_failed_soc_still_allows_reduction() -> None:
     set_value = respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(200, json=[])
     )
-    s = _guard_settings(proactive_mode="on")
+    s = _guard_settings(authority_mode="optimise")
     _mock_state(s.grid_power_entity, "20000")  # over the 18000 W limit
     _mock_state("sensor.solis_control_timed_charge_current", "40")  # setpoint 2040 W
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
@@ -237,7 +237,7 @@ async def test_tick_passing_soc_restores_toward_target() -> None:
     """A checked, passing measurement lifts the cap: restoration (increase)
     toward the plan target works exactly as before #114."""
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = _guard_settings(proactive_mode="simulate")
+    s = _guard_settings(authority_mode="observe")
     _mock_state(s.grid_power_entity, "3000")
     _mock_state("sensor.solis_control_timed_charge_current", "5")  # throttled: 255 W
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
@@ -249,7 +249,7 @@ async def test_tick_passing_soc_restores_toward_target() -> None:
 @respx.mock
 async def test_unconfirmed_fallback_blocks_increases_but_keeps_valid_reductions() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    settings = _guard_settings(proactive_mode="simulate", solis_fallback_current_a=20.0)
+    settings = _guard_settings(authority_mode="observe", solis_fallback_current_a=20.0)
     _mock_state(settings.grid_power_entity, "3000")
     _mock_state("sensor.solis_control_timed_charge_current", "5")
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
@@ -272,7 +272,7 @@ async def test_unconfirmed_fallback_blocks_increases_but_keeps_valid_reductions(
 @respx.mock
 async def test_verified_fallback_caps_guard_restoration_at_its_configured_current() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    settings = _guard_settings(proactive_mode="simulate", solis_fallback_current_a=15.0)
+    settings = _guard_settings(authority_mode="observe", solis_fallback_current_a=15.0)
     _mock_state(settings.grid_power_entity, "3000")
     _mock_state("sensor.solis_control_timed_charge_current", "5")
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:

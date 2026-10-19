@@ -113,6 +113,12 @@ def load_authority(settings: Settings) -> AuthorityLoadResult:
     return _load(directory / "authority.json", directory / "authority.marker.json")
 
 
+def operating_mode(settings: Settings) -> str:
+    """Read the committed site mode; missing or invalid authority stays unknown."""
+    result = load_authority(settings)
+    return result.state.committed_mode if result.state is not None else "authority_unknown"
+
+
 def authority_view(
     state: AuthorityState | None, *, known: bool, save_failed: bool = False
 ) -> dict[str, Any]:

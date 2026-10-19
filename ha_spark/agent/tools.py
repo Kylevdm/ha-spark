@@ -13,6 +13,7 @@ from datetime import UTC, date, datetime
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 
+from ha_spark.authority import operating_mode
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import REFUSED, DaemonChannel, Line
 from ha_spark.energy.context import ContextStore
@@ -35,7 +36,8 @@ class PlanResult(BaseModel):
 
 class StateResult(BaseModel):
     inputs: dict[str, object]
-    # {id, type, driver, control} per configured device — no entity IDs/secrets.
+    operating_mode: str
+    # {id, type, driver} per configured device — no entity IDs/secrets.
     devices: list[dict[str, str]] = Field(default_factory=list)
 
 
@@ -86,10 +88,10 @@ async def get_state(settings: Settings) -> StateResult:
     data = jsonable_encoder(dataclasses.asdict(inputs))
     data.pop("load_slots", None)  # large; available via get_forecast
     devices = [
-        {"id": d.id, "type": d.type, "driver": d.driver, "control": d.control.value}
+        {"id": d.id, "type": d.type, "driver": d.driver}
         for d in settings.devices
     ]
-    return StateResult(inputs=data, devices=devices)
+    return StateResult(inputs=data, devices=devices, operating_mode=operating_mode(settings))
 
 
 async def get_forecast(settings: Settings) -> ForecastResult:

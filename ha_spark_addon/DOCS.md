@@ -2,13 +2,10 @@
 
 Local-first battery charge planner for Home Assistant. Every half-hour (local
 time) it re-forecasts household load and solar generation and resizes the
-overnight cheap-rate charge. With `proactive_mode: on` it programs the inverter
-and keeps the Solis power switch in step with dispatch holds. The default,
-`simulate`, logs the writes it would make without changing hardware.
-
-> v1.0.0 replaces `proactive_mode` with a site-wide operating mode (Observe,
-> Protect or Optimise), set from the add-on's own page. Until you upgrade,
-> `proactive_mode` works as described here.
+overnight cheap-rate charge. The site operating mode (Observe, Protect or
+Optimise) determines which automatic hardware writes are authorised. Every
+fresh install starts in Observe: it previews plans without changing hardware.
+Settings, presets and agent requests cannot change the operating mode.
 
 ## Installation
 
@@ -31,7 +28,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `soc_entity` | Battery state of charge (%) |
 | `soc_max_report_age_minutes` | How old Home Assistant's `last_reported` for `soc_entity` may be before ha-spark treats the SoC as stale and blocks real charge writes (default `10.0`). Some integrations never re-report an unchanged SoC, so an older SoC still counts as fresh if `battery_voltage_entity` reported within this age, which shows the integration is live. That exception lasts up to 12 hours. ha-spark does not check whether the battery is idle |
 | `soc_failure_threshold` | How many consecutive failed SoC observations trigger the configured Solis fallback (default `3`). Before fallback entry, one good observation resets the count. Once fallback is requested, verified, or unconfirmed, a passing observation leaves it in place until recovery (`soc_recovery_minutes`) |
-| `soc_recovery_minutes` | How many minutes of continuously passing SoC observations an active Solis fallback needs before ha-spark recovers (default `10`). Any failed observation restarts the count. The SoC may move, but its `last_reported` must never go backwards and must advance at least once; the battery-voltage liveness exception does not count. ha-spark then computes a fresh plan from the current SoC and the remaining cheap-rate window. The fallback stays in place until that plan is written and read back; a failed or mismatched read-back keeps the fallback and retries every minute. In `simulate`, `off` or `observe` mode nothing is written, so recovery completes once the fresh plan is computed |
+| `soc_recovery_minutes` | How many minutes of continuously passing SoC observations an active Solis fallback needs before ha-spark recovers (default `10`). Any failed observation restarts the count. The SoC may move, but its `last_reported` must never go backwards and must advance at least once; the battery-voltage liveness exception does not count. ha-spark then computes a fresh plan from the current SoC and the remaining cheap-rate window. The fallback stays in place until that plan is written and read back; a failed or mismatched read-back keeps the fallback and retries every minute. In Observe nothing is written, so recovery completes once the fresh plan is computed |
 | `solis_fallback_current_a` | Optional fallback-current ceiling in amps. When set, a sustained SoC failure programs only the configured `charge_window_start`–`charge_window_end` and this current, capped by `max_charge_current_a` and the Solis 62.5 A register limit. It is disabled when blank; there is no implicit current default. Only a successful Solis read-back is reported as verified |
 | `battery_power_entity` | Optional battery power in W, sampled each minute to check SoC against energy flow. The Solis preset uses `sensor.solisac_battery_power`. Both power signs count. Jumps unexplained by energy flow by more than 2 percentage points fail; unchanged SoC fails after more than 2 points of energy flows. Two consecutive reads of a rejected changed value accept a possible BMS recalibration with a warning. Missing power skips that interval; without this option these checks are off. The baseline resets on restart |
 | `battery_voltage_entity` | Battery voltage (V). ha-spark also uses it to tell whether the SoC's source is live, so pick the voltage sensor from the same integration as `soc_entity` |
@@ -49,7 +46,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `solis_control_hub` | Name of the HA `modbus:` overlay hub that ha-spark uses to write the Solis timed-slot registers (default `solis_control`; see [`docs/solis-control-modbus-overlay.yaml`](../docs/solis-control-modbus-overlay.yaml)) |
 | `solis_modbus_slave` | Modbus slave/unit id on that hub (default `1`) |
 | `inverter_clock_tolerance_minutes` | How far the Solis inverter clock may drift from the household clock (`timezone`) before ha-spark refuses to arm an export window and `health` warns (default `5`). Fix drift with `python -m ha_spark solis sync-clock` |
-| `inverter_clock_dst_sync` | Off by default. When on, ha-spark syncs the Solis inverter clock from the household clock after a daylight-saving change, as `sync-clock` does. It writes only when `proactive_mode` is `on` with control authority; in `simulate` it logs "would sync". It can sync at any point in the six hours after the change, so a restart or a switch to `on` in that time still syncs, and it retries each minute. It notifies through `notify_service` on success, or if the sync is still failing after 30 minutes. It never corrects ordinary drift |
+| `inverter_clock_dst_sync` | Off by default. When on, ha-spark syncs the Solis inverter clock from the household clock after a daylight-saving change, as `sync-clock` does. It writes only when the site operating mode authorises clock changes; in Observe it logs "would sync". It can sync at any point in the six hours after the change, so a restart or an authorised mode change in that time still syncs, and it retries each minute. It notifies through `notify_service` on success, or if the sync is still failing after 30 minutes. It never corrects ordinary drift |
 | `alphaess_serial` | AlphaESS system serial (only needed when `inverter: alphaess`) |
 | `person_entities` | Optional comma-separated `person`/`device_tracker` entity ids for occupancy signal recording |
 | `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
@@ -68,8 +65,8 @@ your `configuration.yaml`, so you add the overlay
 Within one ha-spark process, actions on the same inverter bus are serialised
 from prerequisite reads through the final read-back. This includes plan and
 fallback programming, supply-guard resizing, power-switch holds and clock
-sync. The permission is unchanged: real writes still require both
-`control: ha_spark` and `proactive_mode: on`. This coordination does not cover
+sync. The daemon's authority store is the sole write gate, applying the site
+operating mode to each action. This coordination does not cover
 other processes or external Home Assistant automations.
 
 ### Power-switch holds
@@ -89,7 +86,7 @@ cheap charge window (default `23:30`-`05:30`), and an empty discharge window
 (`00:00`-`00:00`) unless a verified export is still running. If ha-spark can't
 trust the dispatch state, it won't open a new export window.
 
-Before setting `proactive_mode: on`, disable any Home Assistant automation or
+Before enabling Optimise, disable any Home Assistant automation or
 manual schedule that writes the same inverter or power switch, and keep them
 disabled while ha-spark has control. The handover and rollback steps are in
 [`docs/adr/0003-ha-spark-owns-the-solis-inverter.md`](../docs/adr/0003-ha-spark-owns-the-solis-inverter.md).
@@ -131,19 +128,18 @@ Each hourly component must use a supported unit: `W`/`kW` mean power, or
 `kWh`/`Wh` energy change. A component with any other unit is disabled, and the
 run report gives the reason.
 
-### Multiple inverters / device control (optional)
+### Multiple inverters (optional)
 
 Single-inverter installs need no change here. ha-spark still reads the flat
 `inverter` and entity-ID options above, converting them in memory without
 rewriting `options.json`. `devices` is the structured alternative for installs
-that want explicit per-device authority:
+that need explicit device definitions. The site operating mode covers them all:
 
 ```yaml
 devices:
   - id: main_inverter
     type: inverter
     driver: solis          # solis | alphaess
-    control: ha_spark       # observe | ha_spark | supplier
     entities:
       charge_current: number.solisac_timed_charge_current
       window_start: time.solisac_charge_start
@@ -151,20 +147,8 @@ devices:
       power_switch: select.solisac_power_switch
 ```
 
-`control` decides who may write the device. A real write needs **both**
-`control: ha_spark` **and** `proactive_mode: on`. With `observe`, ha-spark
-reads and plans around the device but never writes it. `supplier` is reserved
-for a device a third party controls. Both compute and log an `[OBSERVE]` action
-line instead of writing, whatever `proactive_mode` is set to. Leave `control`
-unset for `ha_spark`, which is the default and what the flat-key conversion
-always produces.
-
 ### Planner
 
-- `proactive_mode`: `off` (compute only), `simulate` (log the writes it
-  *would* make; default), `on` (program the configured inverter and power
-  switch where applicable). Run in `simulate` for a few nights and check the
-  log before switching to `on`.
 - `battery_capacity_kwh`, `battery_voltage_v`, `min_soc`, `target_soc_cap`,
   `max_charge_current_a`, `solis_fallback_current_a`: the battery and inverter
   model. The fallback current is optional and has no default.
@@ -183,22 +167,13 @@ always produces.
 - `plan_run_time`: no longer used, and kept so existing configs still load. The
   daemon recomputes the plan every half-hour slot.
 
-When `proactive_mode` changes to `on`, ha-spark logs a reminder to disable
-pre-existing automations or manual schedules that write the same devices. This
-applies to Supervisor configuration changes followed by a restart as well as
-API changes. A first startup already set to `on` also warns. The last observed
-mode is stored in `/data/proactive_mode.txt`, so restarting with `on` unchanged
-does not repeat the reminder. If that record cannot be read or written, startup
-continues and the reminder may repeat. The reminder does not detect conflicts
-or block real control; disabling competing controllers is the operator's job.
-
 ### Daemon-only hardware writes
 
 `plan --apply`, `run --once`, `solis sync-clock`, the agent's `run_plan`
 (including MCP) and `POST /agent/run` submit fixed operations to the running
 ha-spark daemon. Replans use the daemon's live SoC, fallback and hold state;
 a one-shot request cannot overwrite an active fallback charging schedule.
-Existing `proactive_mode` and device `control` gates still apply.
+The daemon's committed site operating mode and safety checks still apply.
 
 The CLI connects only to `ha_spark.sock` in `/data` (standalone/dev: beside the
 configured database). The Unix socket is mode `0600`, not a TCP endpoint or an
@@ -220,8 +195,8 @@ whole-house supply power sensor (W). On every tick inside the charge window,
 the daemon then lowers the timed-charge current to keep total draw under
 `supply_max_current_a` (default 75 A), and raises it back toward the planned
 current as headroom returns. `supply_voltage_v` (default 240) converts the
-sensor's watts to amps. The guard's writes follow `proactive_mode` in the same
-way as the plan's. Leave `grid_power_entity` empty to turn the guard off.
+sensor's watts to amps. The guard's writes follow the site operating mode and
+safety checks, as the plan's do. Leave `grid_power_entity` empty to turn the guard off.
 
 ### SoC integrity and fallback
 
@@ -247,8 +222,8 @@ progress. What you see in that sensor, the log and the action lines:
 - **Failed or unconfirmed fallback** (`fallback_requested` or
   `fallback_failed`, `fallback_confirmed: false`): the write failed or did
   not read back, logged as `[FAILED]`. Increases stay blocked, reductions are
-  still allowed, and ha-spark retries each minute. In `simulate`, `off` or
-  `observe` nothing is written and the state stays `fallback_requested`.
+  still allowed, and ha-spark retries each minute. In Observe nothing is
+  written and the state stays `fallback_requested`.
 - **Recovery** (`recovery_since`, `recovery_ready`): after
   `soc_recovery_minutes` of passing checks, ha-spark applies a fresh plan. The
   fallback remains the reported state until that plan reads back clean, logged
@@ -335,7 +310,7 @@ ha-spark learns from occupancy and away history as it builds up:
 
 `ha-spark learn-factors` shows the current learned away factor, tomorrow's
 predicted occupancy, and any advisory habit predictions. The daemon logs those
-predictions each run, labelled with `proactive_mode`. They are advisory and
+predictions each run, labelled with `operating_mode`. They are advisory and
 never write to hardware.
 
 ### V2L (vehicle-to-load, optional)
@@ -491,7 +466,7 @@ Otherwise it sends an "Axle export held: inverter clock" notice and retries on
 each pass. `ha-spark health` reports the clock error as a warning above the
 tolerance and a failure at 30 minutes or more. `ha-spark solis sync-clock` sets
 the inverter clock from the household clock and reads it back. It writes only
-when `proactive_mode` is `on`. ha-spark never runs it on its own, except after
+when the site operating mode authorises clock changes. ha-spark never runs it on its own, except after
 a daylight-saving change when `inverter_clock_dst_sync` is on.
 
 For paid export, the planner uses `battery_discharge_ceiling_kw` (default 3.2)
@@ -586,7 +561,7 @@ token.
   can't reach a bare LAN or Tailnet address. You set that up yourself; the
   add-on doesn't.
 
-Act and write tools still go through the `proactive_mode` gate, and the model
+Hardware actions still go through the daemon's site operating mode gate, and the model
 never calls `call_service` directly. The deterministic planner still makes
 every hardware decision.
 
@@ -622,8 +597,8 @@ every hardware decision.
 5. `ha-spark plan` prints tonight's plan without applying it.
 6. Leave the add-on running; it recomputes the plan every half-hour. When the
    simulated decisions look right, disable conflicting automations, confirm
-   the Solis overlay and entity reads are healthy, then set
-   `proactive_mode: on`. Follow the handover procedure linked above.
+   the Solis overlay and entity reads are healthy before enabling Optimise.
+   Follow the handover procedure linked above.
 
 ## Data
 

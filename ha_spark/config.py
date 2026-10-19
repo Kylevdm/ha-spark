@@ -22,7 +22,6 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from ha_spark.devices.base import ControlAuthority
 from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
@@ -44,7 +43,6 @@ _OPTION_KEYS = frozenset(
         "db_path",
         "log_level",
         # Energy planner knobs.
-        "proactive_mode",
         "battery_capacity_kwh",
         "min_soc",
         "target_soc_cap",
@@ -322,7 +320,6 @@ class DeviceConfig(BaseModel):
     id: str
     type: Literal["inverter"] = "inverter"
     driver: str
-    control: ControlAuthority = ControlAuthority.HA_SPARK
     entities: dict[str, str] = Field(default_factory=dict)
 
 
@@ -358,10 +355,6 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
 
     # --- Energy planner ---
-    # Proactivity: "off" (compute only), "simulate" (log intended writes, default),
-    # "on" (real control — not exercised in v1).
-    proactive_mode: Literal["off", "simulate", "on"] = Field(default="simulate")
-
     # Battery / inverter model.
     battery_capacity_kwh: float = Field(default=26.88)
     battery_voltage_v: float = Field(default=51.0)  # fallback if the sensor is unavailable
@@ -626,7 +619,6 @@ class Settings(BaseSettings):
                     id="main_inverter",
                     type="inverter",
                     driver=self.inverter,
-                    control=ControlAuthority.HA_SPARK,
                     entities={
                         # charge_current is telemetry/dashboard only for Solis
                         # (control is native modbus via solis_control_hub); kept
@@ -681,6 +673,16 @@ def _read_options_overlay(path: Path = _OPTIONS_PATH) -> dict[str, Any]:
         return {}
     if not isinstance(raw, dict):
         return {}
+    retired = []
+    if "proactive_mode" in raw:
+        retired.append("proactive_mode")
+    devices = raw.get("devices")
+    if isinstance(devices, list) and any(
+        isinstance(device, dict) and "control" in device for device in devices
+    ):
+        retired.append("devices.control")
+    if retired:
+        log.warning("Ignoring deprecated options: %s", ", ".join(retired))
     return {k: v for k, v in raw.items() if k in _OPTION_KEYS and v is not None}
 
 

@@ -4,7 +4,7 @@ Mounts at ``/mcp`` from :func:`ha_spark.api.server.build_app`. The tools are the
 same protocol-agnostic core the ``/agent/*`` routes use (:mod:`ha_spark.agent.tools`);
 this module only adapts them to MCP and applies the same exposure gating, so an
 LLM client sees exactly the tools the configured tier permits. The act/write
-tools route through the same PROACTIVE_MODE-gated / ``_OPTION_KEYS``-whitelisted
+tools route through the same operating-mode-gated / ``_OPTION_KEYS``-whitelisted
 paths as the routes -- the model never reaches ``call_service`` directly.
 """
 
@@ -122,7 +122,7 @@ def build_mcp(state: AppState) -> FastMCP:
 
     @mcp.tool()
     async def run_plan() -> dict[str, object]:
-        """Recompute and apply the plan now (apply still PROACTIVE_MODE-gated)."""
+        """Recompute and apply the plan now (apply gated by the site operating mode)."""
         return (await tools.run_plan(state.settings, executor=state.executor)).model_dump()
 
     @mcp.tool()

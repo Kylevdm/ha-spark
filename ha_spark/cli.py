@@ -1,7 +1,7 @@
 """ha-spark: a local-first energy planner and agent for Home Assistant.
 
 Reads live state over the HA REST/WebSocket APIs, plans the overnight battery
-charge deterministically, and (per PROACTIVE_MODE) applies it to the inverter.
+charge deterministically, and (per the site operating mode) applies it to the inverter.
 Configure via .env / add-on options; see .env.example for every setting.
 """
 
@@ -669,7 +669,7 @@ examples:
   ha-spark notify-test                     send a test notice and confirm delivery
   ha-spark onboard                         check load-history readiness for the forecast
   ha-spark plan                            compute tonight's charge plan
-  ha-spark plan --apply                    ...and run the charger (per PROACTIVE_MODE)
+  ha-spark plan --apply                    ...and run the charger (per operating mode)
   ha-spark ask "what's tonight's plan"     answer via Ollama, or offline if unreachable
   ha-spark run                             daemon: plan + apply every half-hour
   ha-spark run --once                      plan + apply immediately, then exit
@@ -786,9 +786,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan.add_argument(
         "--apply",
         action="store_true",
-        help="Run the charger with the computed plan. PROACTIVE_MODE gates side effects: "
-        "off = compute only, simulate = log intended writes (default), on = real "
-        "service calls to the inverter",
+        help="Run the charger with the computed plan. The daemon's site operating mode "
+        "gates side effects: Observe (the default) logs intended writes only",
     )
 
     p_ask = sub.add_parser(
@@ -813,7 +812,7 @@ def build_parser() -> argparse.ArgumentParser:
         "run",
         help="Daemon: compute & apply the plan every half-hour",
         description="Long-running loop that recomputes the charge plan every local "
-        "half-hour slot. Writes are still gated by PROACTIVE_MODE.",
+        "half-hour slot. Writes are gated by the site operating mode.",
     )
     p_run.add_argument(
         "--once",
@@ -945,7 +944,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Set the inverter clock from the household clock and read it back",
         description="Write the household clock (the `timezone` option) to the Solis "
         "clock registers (holding 43000) through the solis_control modbus hub, then "
-        "read it back. Writes only when proactive_mode is on and ha-spark has control. "
+        "read it back. Writes only when the site operating mode authorises it. "
         "Exit 0 = synced and confirmed, 1 = not written or not confirmed, 2 = not Solis.",
     )
 

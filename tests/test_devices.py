@@ -1,7 +1,9 @@
 import pytest
 
 from ha_spark.devices import registry
-from ha_spark.devices.base import Capability, ControlAuthority, effective_mode
+from ha_spark.devices.base import Capability
+from ha_spark.devices.execution import Ownership, execution_context
+from tests.authority_helpers import legacy_settings
 
 
 @pytest.fixture(autouse=True)
@@ -12,30 +14,26 @@ def _isolate_registry():
     registry._REGISTRY.update(saved)
 
 
-def test_effective_mode_only_ha_spark_passes_proactive_through():
-    # ha_spark authority: proactive_mode passes through unchanged.
-    assert effective_mode(ControlAuthority.HA_SPARK, "on") == "on"
-    assert effective_mode(ControlAuthority.HA_SPARK, "simulate") == "simulate"
-    assert effective_mode(ControlAuthority.HA_SPARK, "off") == "off"
+@pytest.mark.parametrize("mode,expected", [
+    ("optimise", "on"), ("observe", "simulate"), ("observe", "simulate"),
+])
+def test_explicit_site_mode_gates_writes(mode, expected):
+    settings = legacy_settings(authority_mode=mode)
+    assert execution_context().gate.mode_for(
+        Ownership.CHARGING, settings.devices[0], settings
+    ) == expected
 
 
-def test_effective_mode_non_ha_spark_never_writes():
-    # observe and supplier collapse to a no-write "observe", even with on.
-    assert effective_mode(ControlAuthority.OBSERVE, "on") == "observe"
-    assert effective_mode(ControlAuthority.SUPPLIER, "on") == "observe"
-    assert effective_mode(ControlAuthority.OBSERVE, "simulate") == "observe"
-    assert effective_mode(ControlAuthority.SUPPLIER, "simulate") == "observe"
-    assert effective_mode(ControlAuthority.SUPPLIER, "off") == "observe"
-    assert effective_mode(ControlAuthority.OBSERVE, "off") == "observe"
+@pytest.mark.parametrize("legacy_control", ["observe", "supplier"])
+@pytest.mark.parametrize("legacy_mode", ["on", "simulate", "off"])
+def test_retired_device_control_never_grants_writes(legacy_control, legacy_mode):
+    settings = legacy_settings(authority_mode="observe", proactive_mode=legacy_mode)
+    config = settings.devices[0].model_copy(update={"control": legacy_control})
+    assert execution_context().gate.mode_for(Ownership.CHARGING, config, settings) == "simulate"
 
 
-def test_capability_and_authority_values():
+def test_capability_values():
     assert Capability.CHARGE_RATE == "charge_rate"
-    assert set(ControlAuthority) == {
-        ControlAuthority.OBSERVE,
-        ControlAuthority.HA_SPARK,
-        ControlAuthority.SUPPLIER,
-    }
 
 
 def test_registry_register_and_lookup():

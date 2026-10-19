@@ -66,7 +66,7 @@ async def test_real_write_baseline_uses_outcomes(monkeypatch, outcome: ActionOut
     from tests.authority_helpers import legacy_settings as Settings
     from tests.test_scheduler import _AmpsDevice, _patch_run_once_io, _plan_at
 
-    settings = Settings(proactive_mode="on")
+    settings = Settings(authority_mode="optimise")
     plan = _plan_at(31.0)
     device = _AmpsDevice({31.0: 38.0}, settings.battery_voltage_v)
     device.results = [[ActionLine("[APPLIED] presentation only", outcome)]]
@@ -95,7 +95,7 @@ async def test_real_write_recovery_remains_active(tmp_path, line: str) -> None:
     monitor.record(_measurement(ok=False), failure_threshold=1)
     monitor.request_fallback()
     monitor.complete_fallback(action_line=ActionLine("fallback confirmed", ActionOutcome.VERIFIED))
-    await finish_recovery(Settings(proactive_mode="on"), monitor, (line,))
+    await finish_recovery(Settings(authority_mode="optimise"), monitor, (line,))
     assert monitor.fallback_active
 
 
@@ -130,7 +130,7 @@ async def test_real_write_baseline_rejects_plain_apply_results(monkeypatch) -> N
     from tests.authority_helpers import legacy_settings as Settings
     from tests.test_scheduler import _AmpsDevice, _patch_run_once_io, _plan_at
 
-    settings = Settings(proactive_mode="on")
+    settings = Settings(authority_mode="optimise")
     plan = _plan_at(31.0)
     device = _AmpsDevice({31.0: 38.0}, settings.battery_voltage_v)
     _patch_run_once_io(monkeypatch, plan, device)
@@ -157,7 +157,9 @@ async def test_production_alphaess_emits_typed_lines(mode: str) -> None:
     from tests.authority_helpers import legacy_settings as Settings
     from tests.test_solis_power_switch import _intent
 
-    settings = Settings(inverter="alphaess", proactive_mode=mode)
+    settings = Settings(
+        inverter="alphaess", authority_mode="optimise" if mode == "on" else "observe"
+    )
     device = AlphaESSDevice(settings.devices[0], settings, AsyncMock())
     lines = await device.apply(_intent())
     assert lines and all(isinstance(line, ActionLine) for line in lines)

@@ -25,17 +25,22 @@ async def test_get_plan_returns_entities(tmp_path: Path) -> None:
     assert isinstance(result.plan, list)
 
 
+@pytest.mark.parametrize("mode", ["observe", "protect", "optimise"])
 @respx.mock
-async def test_get_state_reports_device_control(tmp_path: Path) -> None:
+async def test_get_state_reports_operating_mode(tmp_path: Path, mode) -> None:
     respx.get("http://ha.test/api/states").mock(
         return_value=httpx.Response(200, json=[])
     )
     s = Settings(  # type: ignore[call-arg]
         ha_url="http://ha.test", ha_token="x", db_path=str(tmp_path / "t.db"), inverter="solis"
     )
+    from tests.authority_helpers import seed_authority
+
+    seed_authority(s, mode)
     result = await tools.get_state(s)
+    assert result.operating_mode == mode
     assert result.devices == [
-        {"id": "main_inverter", "type": "inverter", "driver": "solis", "control": "ha_spark"}
+        {"id": "main_inverter", "type": "inverter", "driver": "solis"}
     ]
 
 

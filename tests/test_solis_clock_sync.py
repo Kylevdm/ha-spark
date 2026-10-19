@@ -55,7 +55,7 @@ class ClockRest:
 
 
 def _device(rest: ClockRest, *, mode: str = "on") -> SolisDevice:
-    settings = Settings(proactive_mode=mode)
+    settings = Settings(authority_mode="optimise" if mode == "on" else "observe")
     return SolisDevice(settings.devices[0], settings, rest)  # type: ignore[arg-type]
 
 
@@ -133,7 +133,7 @@ async def test_sync_fails_when_the_write_raises() -> None:
 
 
 @pytest.mark.parametrize("mode", ["simulate", "off"])
-async def test_sync_never_writes_unless_proactive_mode_is_on(mode: str) -> None:
+async def test_sync_never_writes_without_authorised_site_mode(mode: str) -> None:
     rest = ClockRest()
 
     outcome, lines = await _device(rest, mode=mode).sync_clock()

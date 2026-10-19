@@ -25,7 +25,6 @@ ports_description:
   8098/tcp: ha-spark agent surface (MCP + OpenAPI) — token-protected; leave unmapped unless used
 options:
   log_level: INFO
-  proactive_mode: simulate
   db_path: /data/ha_spark.db
   ha_timeout: 10.0
   ollama_url: "http://127.0.0.1:11434"
@@ -137,7 +136,6 @@ options:
   v2l_soc_tolerance_pct: 5.0
 schema:
   log_level: list(DEBUG|INFO|WARNING|ERROR)
-  proactive_mode: list(off|simulate|on)
   db_path: str
   ha_timeout: float
   ollama_url: url
@@ -230,7 +228,6 @@ schema:
     - id: str
       type: list(inverter)
       driver: list(solis|alphaess)
-      control: list(observe|ha_spark|supplier)?
       entities:
         charge_current: str?
         power_switch: str?

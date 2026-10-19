@@ -7,7 +7,6 @@ from unittest.mock import Mock
 import pytest
 
 from ha_spark.devices import get_device, inverter_device
-from ha_spark.devices.base import ControlAuthority
 from ha_spark.devices.execution import ExecutionContext, Ownership
 from ha_spark.devices.inverters.alphaess import AlphaESSDevice
 from ha_spark.devices.inverters.solis import SolisDevice
@@ -17,7 +16,7 @@ from tests.authority_helpers import seeded_execution
 from tests.test_solis_power_switch import FakeRest, _intent, _now
 
 
-@pytest.mark.parametrize("control", list(ControlAuthority))
+@pytest.mark.parametrize("control", ["observe", "ha_spark", "supplier"])
 @pytest.mark.parametrize("mode", ["off", "simulate", "on"])
 @pytest.mark.parametrize("ownership", list(Ownership))
 def test_legacy_keys_grant_nothing_to_an_unbound_context(control, mode, ownership):
@@ -63,7 +62,7 @@ def test_write_site_ownership(driver, site, owner):
 @pytest.mark.parametrize("pause_at", ["deactivated", "current_confirmed"])
 async def test_apply_is_indivisible_across_driver_instances(tmp_path, monkeypatch, pause_at):
     monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
-    settings = Settings(proactive_mode="on", db_path=str(tmp_path / "events.db"))
+    settings = Settings(authority_mode="optimise", db_path=str(tmp_path / "events.db"))
     rest = FakeRest()
     rest.states["sensor.solis_control_timed_charge_start_hours"] = "1"
     rest.states["sensor.solis_control_timed_charge_current"] = "5"
@@ -148,7 +147,7 @@ async def test_exception_and_cancellation_release_the_bus():
 
 async def test_production_actions_ask_one_gate_with_their_owner(tmp_path, monkeypatch):
     monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
-    settings = Settings(proactive_mode="simulate", db_path=str(tmp_path / "events.db"),
+    settings = Settings(authority_mode="observe", db_path=str(tmp_path / "events.db"),
                         solis_fallback_current_a="20")
     context = seeded_execution(settings)
     context.gate = Mock(wraps=context.gate)
@@ -168,7 +167,7 @@ async def test_production_actions_ask_one_gate_with_their_owner(tmp_path, monkey
 
 async def test_supply_guard_holds_bus_from_live_read_through_read_back(tmp_path, monkeypatch):
     monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
-    settings = Settings(proactive_mode="on", db_path=str(tmp_path / "events.db"),
+    settings = Settings(authority_mode="optimise", db_path=str(tmp_path / "events.db"),
                         grid_power_entity="sensor.grid")
     rest = FakeRest()
     rest.states["sensor.grid"] = "15000"
@@ -216,7 +215,7 @@ async def test_supply_guard_holds_bus_from_live_read_through_read_back(tmp_path,
 async def test_failed_device_action_does_not_stop_the_next(tmp_path, monkeypatch):
     from ha_spark.devices.outcomes import ActionOutcome
 
-    settings = Settings(proactive_mode="on", db_path=str(tmp_path / "events.db"))
+    settings = Settings(authority_mode="optimise", db_path=str(tmp_path / "events.db"))
     context = seeded_execution(settings)
     first = SolisDevice(settings.devices[0], settings, FakeRest(), execution=context)
     second = SolisDevice(settings.devices[0], settings, FakeRest(), execution=context)
@@ -234,7 +233,7 @@ async def test_failed_device_action_does_not_stop_the_next(tmp_path, monkeypatch
 async def test_dst_entry_point_threads_the_context(monkeypatch):
     from ha_spark.energy.dst_clock_sync import DstClockSync
 
-    settings = Settings(proactive_mode="simulate")
+    settings = Settings(authority_mode="observe")
     context = seeded_execution(settings)
     context.gate = Mock(wraps=context.gate)
     rest = FakeRest()
@@ -255,7 +254,7 @@ async def test_dst_entry_point_threads_the_context(monkeypatch):
 
 
 async def test_alphaess_uses_the_charging_gate():
-    settings = Settings(proactive_mode="simulate")
+    settings = Settings(authority_mode="observe")
     config = settings.devices[0].model_copy(update={"driver": "alphaess"})
     context = seeded_execution(settings)
     context.gate = Mock(wraps=context.gate)
