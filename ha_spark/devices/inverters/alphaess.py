@@ -9,7 +9,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
+from ha_spark.devices.base import Capability, fmt_hhmm
+from ha_spark.devices.execution import (
+    ExecutionContext,
+    Ownership,
+    device_action,
+    execution_context,
+)
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 from ha_spark.devices.registry import register
 from ha_spark.energy.models import ChargeIntent
@@ -31,7 +37,12 @@ class AlphaESSDevice:
     # superseded by `Capability.CHARGE_RATE in capabilities` in Task 6.
     supports_live_rate = False
 
-    def __init__(self, config: DeviceConfig, settings: Settings, rest: HomeAssistantRest) -> None:
+    def __init__(
+        self, config: DeviceConfig, settings: Settings, rest: HomeAssistantRest,
+        *, execution: ExecutionContext | None = None,
+    ) -> None:
+        self._execution = execution or execution_context()
+        self._coordinator = self._execution.coordinator_for(config, settings)
         self._config = config
         self._settings = settings
         self._rest = rest
@@ -53,13 +64,14 @@ class AlphaESSDevice:
         """No hold surface, so nothing is left steered when ha-spark lets go."""
         return []
 
+    @device_action(Ownership.CHARGING)
     async def apply(self, intent: ChargeIntent) -> list[ActionLine]:
         stop_soc = round(intent.target_soc_pct)
         desc = (
             f"charge to {stop_soc}% in window "
             f"{fmt_hhmm(intent.window_start)}-{fmt_hhmm(intent.window_end)}"
         )
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if mode == "on" and not intent.soc.ok:
             return [ActionLine(f"[BLOCKED] {intent.soc.reason}; not {desc}", ActionOutcome.BLOCKED)]
         if mode == "simulate":

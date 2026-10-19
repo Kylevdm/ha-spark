@@ -72,6 +72,7 @@ from ha_spark.api.server import (
 from ha_spark.config import Settings
 from ha_spark.devices import Capability, inverter_device
 from ha_spark.devices.base import effective_mode
+from ha_spark.devices.execution import ExecutionContext
 from ha_spark.devices.inverters.solis import SolisDevice, fallback_charge_current_a
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome, is_verified, legacy_action_line
 from ha_spark.energy.derived_base_load import (
@@ -275,6 +276,7 @@ async def run_once(
     trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ev_hold_state: EvHoldState | None = None,
     fallback_active: bool = False,
+    execution: ExecutionContext | None = None,
 ) -> RunResult:
     """Compute the charge plan, log it, and apply it per PROACTIVE_MODE.
 
@@ -286,6 +288,10 @@ async def run_once(
 
     ``trusted_holds`` is the daemon's last trusted hold set, used by the
     reconcile when this plan's hold data is untrusted (#143 §3).
+
+    ``execution`` defaults to the process-shared driver context, as do the
+    guard, reconcile, fallback, DST and shutdown entry points. Per-call REST
+    clients and driver instances therefore never create independent bus locks.
     """
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
@@ -298,7 +304,10 @@ async def run_once(
         )
         intent = plan.charge_intent
         assert intent is not None  # planner always sets it
-        device = inverter_device(settings, rest)
+        device = (
+            inverter_device(settings, rest) if execution is None
+            else inverter_device(settings, rest, execution=execution)
+        )
         ev_hold_state = ev_hold_state or EvHoldState()
         now = datetime.now(load_timezone(settings.timezone))
         ev_hold_active = _observe_ev_hold(

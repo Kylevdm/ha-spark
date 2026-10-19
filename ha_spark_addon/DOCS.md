@@ -65,6 +65,13 @@ not depend on the solax integration. An add-on can't add `modbus:` entries to
 your `configuration.yaml`, so you add the overlay
 (`docs/solis-control-modbus-overlay.yaml`) once by hand.
 
+Within one ha-spark process, actions on the same inverter bus are serialised
+from prerequisite reads through the final read-back. This includes plan and
+fallback programming, supply-guard resizing, power-switch holds and clock
+sync. The permission is unchanged: real writes still require both
+`control: ha_spark` and `proactive_mode: on`. This coordination does not cover
+other processes or external Home Assistant automations.
+
 ### Power-switch holds
 
 On the Solis, ha-spark re-reads the dispatch state and checks

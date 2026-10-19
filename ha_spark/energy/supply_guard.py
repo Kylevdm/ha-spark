@@ -26,6 +26,12 @@ from __future__ import annotations
 
 from ha_spark.config import Settings
 from ha_spark.devices import inverter_device
+from ha_spark.devices.execution import (
+    ExecutionContext,
+    Ownership,
+    device_action,
+    execution_context,
+)
 from ha_spark.devices.inverters.solis import fallback_charge_current_a
 from ha_spark.devices.outcomes import ActionLine
 from ha_spark.energy.soc_integrity import SocMeasurement
@@ -61,11 +67,21 @@ def throttled_rate_w(
 class SupplyGuard:
     """Per-tick watcher that resizes the charge-rate setpoint to fit supply."""
 
-    def __init__(self, settings: Settings, rest: HomeAssistantRest) -> None:
+    def __init__(
+        self, settings: Settings, rest: HomeAssistantRest,
+        *, execution: ExecutionContext | None = None,
+    ) -> None:
         self._settings = settings
         self._rest = rest
-        self._charger = inverter_device(settings, rest)
+        self._execution = execution or execution_context()
+        self._config = next(d for d in settings.devices if d.type == "inverter")
+        self._coordinator = self._execution.coordinator_for(self._config, settings)
+        self._charger = (
+            inverter_device(settings, rest) if execution is None
+            else inverter_device(settings, rest, execution=execution)
+        )
 
+    @device_action(Ownership.CHARGING)
     async def tick(
         self,
         target_w: float,
