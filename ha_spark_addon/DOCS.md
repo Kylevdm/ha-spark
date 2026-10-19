@@ -192,6 +192,26 @@ does not repeat the reminder. If that record cannot be read or written, startup
 continues and the reminder may repeat. The reminder does not detect conflicts
 or block real control; disabling competing controllers is the operator's job.
 
+### Daemon-only hardware writes
+
+`plan --apply`, `run --once`, `solis sync-clock`, the agent's `run_plan`
+(including MCP) and `POST /agent/run` submit fixed operations to the running
+ha-spark daemon. Replans use the daemon's live SoC, fallback and hold state;
+a one-shot request cannot overwrite an active fallback charging schedule.
+Existing `proactive_mode` and device `control` gates still apply.
+
+The CLI connects only to `ha_spark.sock` in `/data` (standalone/dev: beside the
+configured database). The Unix socket is mode `0600`, not a TCP endpoint or an
+ingress/agent port. An exclusive `ha_spark.lock` prevents a second daemon;
+only its holder removes a stale socket, and shutdown removes the socket.
+In-process agent requests use the same daemon queue directly. Requests are
+processed on the loop's next tick, normally within 60 seconds.
+
+Without a reachable daemon, plan/run commands and standalone agent apps still
+compute and return the plan, but refuse hardware writes with a clear reason.
+CLI plan/run exit successfully after printing that refusal; `sync-clock`
+returns 1 because no sync was verified (2 for a non-Solis install).
+
 ### Supply guard (optional)
 
 If an EV dispatch overlaps the battery's timed charge, total supply draw can

@@ -38,6 +38,7 @@ from ha_spark.config import (
     load_settings,
     validate_options_document,
 )
+from ha_spark.daemon_channel import DaemonChannel
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.logging import get_logger
@@ -76,6 +77,7 @@ class AppState:
     reload: Callable[[], Settings] = load_settings
     plan: ChargePlan | None = None
     plan_at: datetime | None = None
+    executor: DaemonChannel | None = None
 
     def __post_init__(self) -> None:
         previous_mode: str | None = None
@@ -313,7 +315,7 @@ def _agent_router(state: AppState) -> APIRouter:
 
     @router.post("/run", dependencies=[Depends(_Gate(state, "run_plan"))])
     async def run() -> tools.PlanResult:
-        return await tools.run_plan(state.settings)
+        return await tools.run_plan(state.settings, executor=state.executor)
 
     @router.post("/config", dependencies=[Depends(_Gate(state, "set_config"))])
     async def config(body: dict[str, object]) -> dict[str, Any]:

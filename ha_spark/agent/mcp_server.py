@@ -123,7 +123,7 @@ def build_mcp(state: AppState) -> FastMCP:
     @mcp.tool()
     async def run_plan() -> dict[str, object]:
         """Recompute and apply the plan now (apply still PROACTIVE_MODE-gated)."""
-        return (await tools.run_plan(state.settings)).model_dump()
+        return (await tools.run_plan(state.settings, executor=state.executor)).model_dump()
 
     @mcp.tool()
     async def set_config(updates: dict[str, object]) -> dict[str, object]:
