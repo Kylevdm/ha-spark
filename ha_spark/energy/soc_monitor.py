@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from ha_spark.config import Settings
+from ha_spark.devices.outcomes import ActionLine, ActionOutcome, legacy_action_line
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus, check_soc
 from ha_spark.ha.models import EntityState
 from ha_spark.ha.rest import HomeAssistantRest
@@ -346,9 +347,17 @@ class SocMonitor:
 
     def complete_fallback(self, *, action_line: str) -> SocMonitorSnapshot:
         """Record the latest Solis read-back verdict and persist its status."""
-        confirmed = action_line.startswith("[FALLBACK]")
-        non_actuation = action_line.startswith(("[SIMULATE]", "[SKIP]", "[OFF]", "[OBSERVE]"))
-        failed = action_line.startswith("[FAILED]")
+        # Plain strings survive only at this legacy public boundary. Production
+        # callers supply typed verdicts, which always override presentation.
+        verdict = legacy_action_line(action_line).outcome
+        confirmed = verdict is ActionOutcome.VERIFIED and (
+            isinstance(action_line, ActionLine) or action_line.startswith("[FALLBACK]")
+        )
+        non_actuation = verdict in (
+            ActionOutcome.SIMULATED,
+            ActionOutcome.UNCHANGED_VERIFIED,
+        )
+        failed = verdict is ActionOutcome.FAILED
         if not confirmed and not failed and not non_actuation:
             action_line = f"[FAILED] Solis fallback unconfirmed: {action_line}"
             failed = True

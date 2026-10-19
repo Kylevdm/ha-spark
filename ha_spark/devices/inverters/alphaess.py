@@ -3,12 +3,14 @@
 
 No settable rate -> the supply guard stays dormant for this inverter.
 """
+
 from __future__ import annotations
 
 from datetime import datetime
 from typing import TYPE_CHECKING
 
 from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
+from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 from ha_spark.devices.registry import register
 from ha_spark.energy.models import ChargeIntent
 
@@ -37,21 +39,21 @@ class AlphaESSDevice:
     def planned_rate_w(self, intent: ChargeIntent) -> float:
         return 0.0  # no rate control; the inverter self-regulates to the SOC target
 
-    async def set_charge_rate(self, watts: float) -> str:
-        return "[SKIP] AlphaESS has no settable charge rate"
+    async def set_charge_rate(self, watts: float) -> ActionLine:
+        return ActionLine("[SKIP] AlphaESS has no settable charge rate", ActionOutcome.UNVERIFIED)
 
     async def read_charge_rate(self) -> float:
         return 0.0
 
-    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[ActionLine]:
         """No hold surface: AlphaESS exposes no whole-inverter enable to drive."""
         return []
 
-    async def write_safe_state(self) -> list[str]:
+    async def write_safe_state(self) -> list[ActionLine]:
         """No hold surface, so nothing is left steered when ha-spark lets go."""
         return []
 
-    async def apply(self, intent: ChargeIntent) -> list[str]:
+    async def apply(self, intent: ChargeIntent) -> list[ActionLine]:
         stop_soc = round(intent.target_soc_pct)
         desc = (
             f"charge to {stop_soc}% in window "
@@ -59,11 +61,11 @@ class AlphaESSDevice:
         )
         mode = effective_mode(self._config.control, self._settings.proactive_mode)
         if mode == "on" and not intent.soc.ok:
-            return [f"[BLOCKED] {intent.soc.reason}; not {desc}"]
+            return [ActionLine(f"[BLOCKED] {intent.soc.reason}; not {desc}", ActionOutcome.BLOCKED)]
         if mode == "simulate":
-            return [f"[SIMULATE] would {desc}"]
+            return [ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)]
         if mode in ("off", "observe"):
-            return [f"[{mode.upper()}] computed: {desc}"]
+            return [ActionLine(f"[{mode.upper()}] computed: {desc}", ActionOutcome.SIMULATED)]
         try:
             # Field names checked against the AlphaESS integration's services.yaml.
             await self._rest.call_service(
@@ -78,5 +80,5 @@ class AlphaESSDevice:
                 },
             )
         except Exception as exc:  # noqa: BLE001
-            return [f"[FAILED] {desc}: {exc!r}"]
-        return [f"[APPLIED] {desc}"]
+            return [ActionLine(f"[FAILED] {desc}: {exc!r}", ActionOutcome.FAILED)]
+        return [ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)]

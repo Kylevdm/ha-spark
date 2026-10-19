@@ -71,7 +71,9 @@ from ha_spark.api.server import (
 )
 from ha_spark.config import Settings
 from ha_spark.devices import Capability, inverter_device
+from ha_spark.devices.base import effective_mode
 from ha_spark.devices.inverters.solis import SolisDevice, fallback_charge_current_a
+from ha_spark.devices.outcomes import ActionLine, ActionOutcome, is_verified, legacy_action_line
 from ha_spark.energy.derived_base_load import (
     BACKFILL_NAME,
     BACKFILL_STATISTIC_ID,
@@ -211,11 +213,32 @@ class RunResult(NamedTuple):
 
 
 def _apply_failed(lines: list[str]) -> bool:
-    """Whether an apply's lines report a ``[FAILED]`` or ``[BLOCKED]`` action.
+    """An unknown or non-verified result cannot establish a resident baseline."""
+    return not lines or not all(is_verified(line) for line in lines)
 
-    ``[SIMULATE] [BLOCKED]`` does not count: simulate mode writes nothing.
+
+def _preview_accepted(lines: tuple[str, ...]) -> bool:
+    """Legacy non-real-mode bookkeeping is not hardware verification.
+
+    Plain strings are accepted only here for callers predating typed outcomes.
     """
-    return any(line.startswith(("[FAILED]", "[BLOCKED]")) for line in lines)
+    return bool(lines) and all(
+        legacy_action_line(line).outcome
+        in (
+            ActionOutcome.VERIFIED,
+            ActionOutcome.UNCHANGED_VERIFIED,
+            ActionOutcome.SIMULATED,
+        )
+        for line in lines
+    )
+
+
+def _real_write_mode(settings: Settings) -> bool:
+    return any(
+        device.type == "inverter"
+        and effective_mode(device.control, settings.proactive_mode) == "on"
+        for device in settings.devices
+    )
 
 
 async def _record_forecast(
@@ -293,8 +316,8 @@ async def run_once(
         # minute; here it also covers the skipped-setpoint path below, which
         # would otherwise leave the clock unserved for a whole slot.
         reconcile_intent = hold_reconcile_intent(intent, trusted_holds)
-        lines = (
-            await device.reconcile_holds(reconcile_intent, now)
+        lines: list[str] = (
+            list(await device.reconcile_holds(reconcile_intent, now))
             if reconcile_intent is not None
             else [UNTRUSTED_HOLDS_LINE]
         )
@@ -311,9 +334,14 @@ async def run_once(
             lines.append(f"[SKIP] normal programming held while {reason}")
             applied_plan = None
         elif needs_apply(previous_plan, intent, rate_w, settings.battery_voltage_v):
-            apply_lines = await device.apply(intent)
+            apply_lines = list(await device.apply(intent))
             lines.extend(apply_lines)
-            applied_plan = None if _apply_failed(apply_lines) else plan
+            accepted = (
+                not _apply_failed(apply_lines)
+                if _real_write_mode(settings)
+                else _preview_accepted(tuple(apply_lines))
+            )
+            applied_plan = plan if accepted else None
         else:
             lines.append("[SKIP] charge setpoint unchanged")
         for line in lines:
@@ -719,10 +747,10 @@ async def reconcile_tick(
                 )
                 relinquished = True
                 trusted_holds = ()
-                lines = read_lines + await inverter_device(settings, rest).write_safe_state()
+                lines = read_lines + list(await inverter_device(settings, rest).write_safe_state())
             else:
-                lines = read_lines + await inverter_device(settings, rest).reconcile_holds(
-                    intent, now
+                lines = read_lines + list(
+                    await inverter_device(settings, rest).reconcile_holds(intent, now)
                 )
     except Exception:
         log.exception("Hold reconcile tick failed; will retry next minute")
@@ -774,25 +802,36 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
                     try:
                         device = inverter_device(settings, rest)
                         if isinstance(device, SolisDevice):
-                            action_lines = await device.apply_fallback(measurement)
+                            action_lines = list(await device.apply_fallback(measurement))
                         else:
                             log.error(
                                 "Solis fallback skipped: inverter factory returned %s",
                                 type(device).__name__,
                             )
                             action_lines = [
-                                "[SKIP] Solis fallback skipped: inverter factory returned "
-                                f"non-Solis device ({type(device).__name__})"
+                                ActionLine(
+                                    "[SKIP] Solis fallback skipped: inverter factory returned "
+                                    f"non-Solis device ({type(device).__name__})",
+                                    ActionOutcome.SIMULATED,
+                                )
                             ]
                     except Exception:
                         log.exception("Solis fallback attempt failed; will retry next minute")
-                        action_lines = ["[FAILED] Solis fallback attempt raised; unconfirmed"]
+                        action_lines = [
+                            ActionLine(
+                                "[FAILED] Solis fallback attempt raised; unconfirmed",
+                                ActionOutcome.FAILED,
+                            )
+                        ]
                     action_line = next(
                         (
                             line
                             for line in reversed(action_lines)
-                            if line.startswith(
+                            if isinstance(line, ActionLine)
+                            or line.startswith(
                                 (
+                                    # Legacy fallback boundary only; production drivers
+                                    # emit typed lines. Never used for normal apply.
                                     "[FALLBACK]",
                                     "[FAILED]",
                                     "[BLOCKED]",
@@ -803,11 +842,14 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
                                 )
                             )
                         ),
-                        "[FAILED] Solis fallback produced no confirmation action",
+                        ActionLine(
+                            "[FAILED] Solis fallback produced no confirmation action",
+                            ActionOutcome.FAILED,
+                        ),
                     )
                     snapshot = monitor.complete_fallback(action_line=action_line)
                     for line in action_lines:
-                        if line.startswith("[FAILED]"):
+                        if legacy_action_line(line).outcome is ActionOutcome.FAILED:
                             log.warning(line)
                         else:
                             log.info(line)
@@ -821,12 +863,10 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
 def recovery_verified(apply_lines: tuple[str, ...]) -> bool:
     """Whether a recovered normal apply may end the fallback (#117).
 
-    Stricter than :func:`_apply_failed`: a ``[WARNING]`` read-back mismatch is
-    not verification either. An empty list means nothing was applied.
+    Like the resident baseline, this needs explicit verification for every
+    action. A read-back warning or an empty result is never verification.
     """
-    return bool(apply_lines) and not any(
-        line.startswith(("[FAILED]", "[BLOCKED]", "[WARNING]")) for line in apply_lines
-    )
+    return bool(apply_lines) and all(is_verified(line) for line in apply_lines)
 
 
 async def finish_recovery(
@@ -839,14 +879,17 @@ async def finish_recovery(
     confirmation: increases stay blocked until the next minute's retry either
     verifies the recovered plan or, if recovery is lost, re-programs the fallback.
     """
-    if apply_lines is not None and recovery_verified(apply_lines):
+    preview = (
+        apply_lines is not None
+        and not _real_write_mode(settings)
+        and _preview_accepted(apply_lines)
+    )
+    if apply_lines is not None and (recovery_verified(apply_lines) or preview):
         line = next(
-            (line for line in reversed(apply_lines) if line.startswith(("[APPLIED]", "[SKIP]"))),
+            (line for line in reversed(apply_lines) if is_verified(line)),
             apply_lines[-1],
         )
-        if monitor.recovery_blocked and line.startswith(
-            ("[SIMULATE]", "[OFF]", "[OBSERVE]")
-        ):
+        if monitor.recovery_blocked and preview and not is_verified(line):
             action = f"[RECOVERED] plan computed without hardware programming: {line}"
         else:
             action = f"[RECOVERED] normal programming resumed: {line}"
