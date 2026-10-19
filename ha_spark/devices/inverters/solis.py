@@ -35,6 +35,7 @@ inverter's work mode (bit 5); the live rate-tier throttle is not so gated. The
 SoC fallback uses the same forced-charge sequence with an explicitly configured
 current ceiling and the configured cheap-rate window.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -44,7 +45,13 @@ from datetime import UTC, datetime, time, timedelta
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypeVar
 from zoneinfo import ZoneInfo
 
-from ha_spark.devices.base import Capability, effective_mode, fmt_hhmm
+from ha_spark.devices.base import Capability, fmt_hhmm
+from ha_spark.devices.execution import (
+    ExecutionContext,
+    Ownership,
+    device_action,
+    execution_context,
+)
 from ha_spark.devices.inverters.solis_clock import (
     CLOCK_SYNC_REG,
     STALE_AFTER,
@@ -54,6 +61,7 @@ from ha_spark.devices.inverters.solis_clock import (
     clock_registers,
     describe_error,
 )
+from ha_spark.devices.outcomes import ActionLine, ActionOutcome, is_verified
 from ha_spark.devices.registry import register
 from ha_spark.energy.export_notifications import (
     ExportNotificationStore,
@@ -124,7 +132,7 @@ ClockSyncOutcome = Literal["synced", "failed", "not_written"]
 class _ApplyResult(NamedTuple):
     """Action lines and read-back verdicts from one forced-charge apply pass."""
 
-    lines: list[str]
+    lines: list[ActionLine]
     current_ok: bool
     window_verified: bool
     cleanup_ok: bool
@@ -170,7 +178,12 @@ class SolisDevice:
     # superseded by `Capability.CHARGE_RATE in capabilities` in Task 6.
     supports_live_rate = True
 
-    def __init__(self, config: DeviceConfig, settings: Settings, rest: HomeAssistantRest) -> None:
+    def __init__(
+        self, config: DeviceConfig, settings: Settings, rest: HomeAssistantRest,
+        *, execution: ExecutionContext | None = None,
+    ) -> None:
+        self._execution = execution or execution_context()
+        self._coordinator = self._execution.coordinator_for(config, settings)
         self._config = config
         self._settings = settings
         self._rest = rest
@@ -184,7 +197,8 @@ class SolisDevice:
 
     # --- apply: the forced-charge sequence ---
 
-    async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+    @device_action(Ownership.CHARGING)
+    async def apply_fallback(self, soc: SocMeasurement) -> list[ActionLine]:
         """Apply the configured cheap-window fallback using the normal Solis gates.
 
         The SoC reading is carried for timing and diagnostics only. The plan
@@ -192,9 +206,18 @@ class SolisDevice:
         """
         current_a = fallback_charge_current_a(self._settings)
         if current_a is None:
-            return ["[BLOCKED] Solis fallback current is not configured"]
+            return [
+                ActionLine(
+                    "[BLOCKED] Solis fallback current is not configured", ActionOutcome.BLOCKED
+                )
+            ]
         if current_a < 1:
-            return ["[FAILED] Solis fallback current is below 1 A after configured limits"]
+            return [
+                ActionLine(
+                    "[FAILED] Solis fallback current is below 1 A after configured limits",
+                    ActionOutcome.FAILED,
+                )
+            ]
 
         intent = ChargeIntent(
             target_soc_pct=0.0,
@@ -202,38 +225,46 @@ class SolisDevice:
             window_start=time.fromisoformat(self._settings.charge_window_start),
             window_end=time.fromisoformat(self._settings.charge_window_end),
         )
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         description = (
             f"Solis fallback at {current_a} A in "
             f"{fmt_hhmm(intent.window_start)}-{fmt_hhmm(intent.window_end)}"
         )
         if mode == "simulate":
-            return [f"[SIMULATE] {description} would be programmed (not written)"]
+            return [
+                ActionLine(
+                    f"[SIMULATE] {description} would be programmed (not written)",
+                    ActionOutcome.SIMULATED,
+                )
+            ]
         if mode != "on":
-            return [f"[SKIP] {description} not written (mode {mode})"]
+            return [
+                ActionLine(
+                    f"[SKIP] {description} not written (mode {mode})", ActionOutcome.SIMULATED
+                )
+            ]
 
         result = await self._apply(intent, current_a)
         if result.current_ok and result.window_verified and result.cleanup_ok:
-            result.lines.append(f"[FALLBACK] {description} read-back verified")
+            result.lines.append(
+                ActionLine(f"[FALLBACK] {description} read-back verified", ActionOutcome.VERIFIED)
+            )
         else:
             detail = next(
-                (
-                    line
-                    for line in result.lines
-                    if line.startswith(("[FAILED]", "[WARNING]", "[BLOCKED]"))
-                ),
+                (line for line in result.lines if not is_verified(line)),
                 "real read-back verification was not completed",
             )
-            result.lines.append(f"[FAILED] {description} unconfirmed: {detail}")
+            result.lines.append(
+                ActionLine(f"[FAILED] {description} unconfirmed: {detail}", ActionOutcome.FAILED)
+            )
         return result.lines
 
-    async def apply(self, intent: ChargeIntent) -> list[str]:
+    async def apply(self, intent: ChargeIntent) -> list[ActionLine]:
         return (await self._apply(intent, None)).lines
 
-    async def _apply(
-        self, intent: ChargeIntent, fallback_current_a: float | None
-    ) -> _ApplyResult:
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+    @device_action(Ownership.CHARGING)
+    async def _apply(self, intent: ChargeIntent, fallback_current_a: float | None) -> _ApplyResult:
+        mode = self._coordinator.mode
         # load_timezone, not ZoneInfo: a minimal container without tzdata (or a
         # typo'd option) must degrade to UTC, not raise before the reconcile and
         # the SoC guard have run and cost the daemon every device write.
@@ -248,15 +279,16 @@ class SolisDevice:
         # so the switch has already settled by the time `_require_power_switch_on`
         # reads it — otherwise export would be refused on the very tick a hold
         # ends, against a state already being corrected.
-        lines: list[str] = []
+        lines: list[ActionLine] = []
         # SoC-unreadable guard: soc_now==0 from a dead sensor would size a max charge.
         # Apply this safety decision in every mode; the write helpers below
         # suppress side effects while simulate reports the block as a preview.
         if not intent.soc.ok and fallback_current_a is None:
             prefix = "[SIMULATE] " if mode == "simulate" else ""
-            line = (
+            line = ActionLine(
                 f"{prefix}[BLOCKED] {intent.soc.reason}; not charging to "
-                f"{intent.target_soc_pct:.0f}%"
+                f"{intent.target_soc_pct:.0f}%",
+                (ActionOutcome.SIMULATED if prefix else ActionOutcome.BLOCKED),
             )
             log.warning(line)
             lines.append(line)
@@ -282,9 +314,9 @@ class SolisDevice:
             and await self._has_live_verified_export(now)
         ):
             prefix = "[SIMULATE] " if mode == "simulate" else ""
-            line = (
-                f"{prefix}[SKIP] Axle event read untrusted; "
-                "preserving the verified export window"
+            line = ActionLine(
+                f"{prefix}[SKIP] Axle event read untrusted; preserving the verified export window",
+                (ActionOutcome.SIMULATED if prefix else ActionOutcome.UNCHANGED_VERIFIED),
             )
             log.warning(line)
             return _ApplyResult([line], False, False, False)
@@ -302,7 +334,10 @@ class SolisDevice:
             try:
                 resident = await self._read_slot_block(1)
             except Exception:  # noqa: BLE001 - never clobber an unreadable live export
-                line = "[BLOCKED] Solis fallback held: live verified export slot 1 is unreadable"
+                line = ActionLine(
+                    "[BLOCKED] Solis fallback held: live verified export slot 1 is unreadable",
+                    ActionOutcome.BLOCKED,
+                )
                 log.info(line)
                 return _ApplyResult([line], False, False, False)
             if any(resident[4:]):
@@ -310,7 +345,9 @@ class SolisDevice:
         if raw_export is not None and export is None:
             export_ready = False
             export_error = "malformed export window"
-            lines.append(f"[BLOCKED] export refused: {export_error}")
+            lines.append(
+                ActionLine(f"[BLOCKED] export refused: {export_error}", ActionOutcome.BLOCKED)
+            )
         elif export_ready:
             assert export is not None
             export_error = _validate_export(intent, export)
@@ -341,14 +378,24 @@ class SolisDevice:
             if export_error is not None:
                 export_ready = False
                 prefix = "[SIMULATE] " if mode == "simulate" else ""
-                lines.append(f"{prefix}[BLOCKED] export refused: {export_error}")
+                lines.append(
+                    ActionLine(
+                        f"{prefix}[BLOCKED] export refused: {export_error}",
+                        (ActionOutcome.SIMULATED if prefix else ActionOutcome.BLOCKED),
+                    )
+                )
             else:
                 discharge_ok, discharge_line = await self._write_discharge_current_result()
                 lines.append(discharge_line)
                 export_ready = discharge_ok
                 if not discharge_ok:
                     export_error = "discharge current was not confirmed"
-                    lines.append("[BLOCKED] export refused: discharge current was not confirmed")
+                    lines.append(
+                        ActionLine(
+                            "[BLOCKED] export refused: discharge current was not confirmed",
+                            ActionOutcome.BLOCKED,
+                        )
+                    )
         # Grid-charge gate for the whole forced-charge program: read the work
         # mode once. A real write is refused when bit 5 is unset (firmware would
         # ignore the force anyway), and simulate must preview the same decision.
@@ -361,11 +408,12 @@ class SolisDevice:
         # is active at another current, deactivate it and confirm zero before
         # attempting the current transition. This leaves a failed transition
         # safe at zero rather than continuing an old, higher-rate window.
-        deactivation_line: str | None = None
+        deactivation_line: ActionLine | None = None
         preserve_prefix = "[SIMULATE] " if mode == "simulate" else ""
-        preserve_line = (
+        preserve_line = ActionLine(
             f"{preserve_prefix}[SKIP] preserving the verified export window "
-            "while it is not yet armed"
+            "while it is not yet armed",
+            (ActionOutcome.SIMULATED if preserve_prefix else ActionOutcome.UNCHANGED_VERIFIED),
         )
         if preserve_resident_export:
             current_ok = True
@@ -396,7 +444,7 @@ class SolisDevice:
                 charge_current_a=current_a,
             )
         lines.append(window_line)
-        window_verified = window_line.startswith(("[APPLIED]", "[SKIP]"))
+        window_verified = is_verified(window_line)
         if mode == "on" and raw_export is not None and export_ready and not window_verified:
             export_ready = False
             export_error = "timed export window was not confirmed"
@@ -422,7 +470,7 @@ class SolisDevice:
             )
         return _ApplyResult(lines, current_ok, window_verified, cleanup_ok)
 
-    async def set_charge_rate(self, watts: float) -> str:
+    async def set_charge_rate(self, watts: float) -> ActionLine:
         amps = (
             round(watts / self._settings.battery_voltage_v)
             if self._settings.battery_voltage_v > 0
@@ -440,6 +488,7 @@ class SolisDevice:
 
     # --- internal writes (PROACTIVE_MODE-gated, failure-isolated, read-back verified) ---
 
+    @device_action(Ownership.CHARGING)
     async def _write_charge_window(
         self,
         intent: ChargeIntent,
@@ -448,7 +497,7 @@ class SolisDevice:
         export_window: tuple[datetime, datetime] | None = None,
         kept_discharge: list[int] | None = None,
         charge_current_a: float | None = None,
-    ) -> str:
+    ) -> ActionLine:
         """Program charge slot 1's window block, write-if-changed, read-back verified.
 
         Writing the 8-register block at 43143, including its optional discharge
@@ -465,7 +514,7 @@ class SolisDevice:
             )
         elif kept_discharge is not None:
             desc += " and keep the verified export window"
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         keeps_discharge = export_window is not None or kept_discharge is not None
         current_a = (
             solis_current_a(intent, self._settings)
@@ -476,14 +525,19 @@ class SolisDevice:
         if mode == "simulate":
             if blocked:
                 if not keeps_discharge:
-                    line = f"[SIMULATE] [BLOCKED] {desc}: {blocked}"
+                    line = ActionLine(
+                        f"[SIMULATE] [BLOCKED] {desc}: {blocked}", ActionOutcome.SIMULATED
+                    )
                     log.warning(line)
                     return line
                 if not zero_charge:
                     try:
                         await self._read_slot_block(1)
                     except Exception:  # noqa: BLE001 - match the live fail-closed check
-                        line = f"[SIMULATE] [BLOCKED] {desc}: slot 1 state unreadable"
+                        line = ActionLine(
+                            f"[SIMULATE] [BLOCKED] {desc}: slot 1 state unreadable",
+                            ActionOutcome.SIMULATED,
+                        )
                         log.warning(line)
                         return line
                 charge_action = (
@@ -499,13 +553,15 @@ class SolisDevice:
                     )
                 else:
                     export_action = "keep the verified export window"
-                line = f"[SIMULATE] would {charge_action} and {export_action}"
+                line = ActionLine(
+                    f"[SIMULATE] would {charge_action} and {export_action}", ActionOutcome.SIMULATED
+                )
                 log.info(line)
                 return line
             log.info("[SIMULATE] would %s", desc)
-            return f"[SIMULATE] would {desc}"
+            return ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
-            return f"[{mode.upper()}] computed: {desc}"
+            return ActionLine(f"[{mode.upper()}] computed: {desc}", ActionOutcome.SIMULATED)
         if blocked and not keeps_discharge:
             # Grid-charge permission is not a prerequisite for clearing a
             # resident discharge schedule. Inspect the block first so an
@@ -514,10 +570,10 @@ class SolisDevice:
             try:
                 existing = await self._read_slot_block(1)
             except Exception:
-                return f"[BLOCKED] {desc}: {blocked}"
+                return ActionLine(f"[BLOCKED] {desc}: {blocked}", ActionOutcome.BLOCKED)
             if any(existing[4:]):
                 return await self._clear_discharge_window(desc)
-            return f"[BLOCKED] {desc}: {blocked}"
+            return ActionLine(f"[BLOCKED] {desc}: {blocked}", ActionOutcome.BLOCKED)
         if blocked and keeps_discharge and not zero_charge:
             # An export write must not be gated by the charge-only work-mode
             # bit. Preserve the resident charge half and replace the discharge
@@ -525,7 +581,7 @@ class SolisDevice:
             try:
                 existing = await self._read_slot_block(1)
             except Exception:  # noqa: BLE001 - fail closed
-                return f"[FAILED] {desc}: slot 1 state unreadable"
+                return ActionLine(f"[FAILED] {desc}: slot 1 state unreadable", ActionOutcome.FAILED)
             charge_values = existing[:4]
         elif zero_charge:
             charge_values = [0, 0, 0, 0]
@@ -547,21 +603,26 @@ class SolisDevice:
             )
         except Exception:  # noqa: BLE001 - isolate per action
             log.error("[FAILED] %s", desc)
-            return f"[FAILED] {desc}"
+            return ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)
         if mismatch:
             log.warning("[WARNING] %s, but %s", desc, mismatch)
-            return f"[WARNING] {desc}, but {mismatch}"
-        return f"[APPLIED] {desc}" if wrote else f"[SKIP] {desc} (already set)"
+            return ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED)
+        return (
+            ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)
+            if wrote
+            else ActionLine(f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED)
+        )
 
-    async def _clear_discharge_window(self, desc: str) -> str:
+    @device_action(Ownership.CHARGING)
+    async def _clear_discharge_window(self, desc: str) -> ActionLine:
         """Clear only Slot 1's discharge half, preserving any charge schedule."""
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         safe_desc = desc.replace("set charge window", "set timed charge schedule")
         clear_desc = f"clear timed export window ({safe_desc})"
         if mode == "simulate":
-            return f"[SIMULATE] would {clear_desc}"
+            return ActionLine(f"[SIMULATE] would {clear_desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
-            return f"[{mode.upper()}] computed: {clear_desc}"
+            return ActionLine(f"[{mode.upper()}] computed: {clear_desc}", ActionOutcome.SIMULATED)
         try:
             existing = await self._read_slot_block(1)
             want = existing[:4] + [0, 0, 0, 0]
@@ -573,11 +634,18 @@ class SolisDevice:
             )
         except Exception:  # noqa: BLE001 - cleanup is failure-isolated
             log.error("[FAILED] %s", clear_desc)
-            return f"[FAILED] {clear_desc}"
+            return ActionLine(f"[FAILED] {clear_desc}", ActionOutcome.FAILED)
         if mismatch:
-            return f"[WARNING] {clear_desc}, but {mismatch}"
-        return f"[APPLIED] {clear_desc}" if wrote else f"[SKIP] {clear_desc} (already clear)"
+            return ActionLine(f"[WARNING] {clear_desc}, but {mismatch}", ActionOutcome.UNVERIFIED)
+        return (
+            ActionLine(f"[APPLIED] {clear_desc}", ActionOutcome.VERIFIED)
+            if wrote
+            else ActionLine(
+                f"[SKIP] {clear_desc} (already clear)", ActionOutcome.UNCHANGED_VERIFIED
+            )
+        )
 
+    @device_action(Ownership.CHARGING)
     async def _write_charge_current_result(
         self,
         intent: ChargeIntent,
@@ -585,7 +653,7 @@ class SolisDevice:
         *,
         current_a: float | None = None,
         fallback: bool = False,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, ActionLine]:
         """Write and freshly verify the planned current, returning success separately."""
         # solis_current_a already clamps to max_charge_current_a (<= the 62.5 A
         # DC hardware ceiling); round to the integer register value.
@@ -595,14 +663,18 @@ class SolisDevice:
         desc = _charge_current_description(
             intent, self._settings, amps, fallback=fallback
         )
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if blocked and mode in ("on", "simulate"):
             prefix = "[SIMULATE] " if mode == "simulate" else ""
-            line = f"{prefix}[BLOCKED] {desc}: {blocked}"
+            line = ActionLine(
+                f"{prefix}[BLOCKED] {desc}: {blocked}",
+                (ActionOutcome.SIMULATED if prefix else ActionOutcome.BLOCKED),
+            )
             log.warning(line)
             return False, line
         return await self._set_current_result(amps, desc)
 
+    @device_action(Ownership.CHARGING)
     async def _prepare_slot_one_current(
         self,
         intent: ChargeIntent,
@@ -610,7 +682,7 @@ class SolisDevice:
         *,
         current_a: float | None = None,
         fallback: bool = False,
-    ) -> tuple[bool, str, str | None]:
+    ) -> tuple[bool, ActionLine, ActionLine | None]:
         """Make slot 1 safe before changing its planned charge current.
 
         ``planned_discharge`` is the discharge half this apply will program."""
@@ -630,7 +702,9 @@ class SolisDevice:
                 )
                 active = zero_confirmed is not True
         except Exception:  # noqa: BLE001 - do not guess at an active window
-            line = f"[FAILED] {current_desc}: slot 1 state unreadable"
+            line = ActionLine(
+                f"[FAILED] {current_desc}: slot 1 state unreadable", ActionOutcome.FAILED
+            )
             log.error(line)
             return False, line, None
         if not active:
@@ -655,7 +729,10 @@ class SolisDevice:
                 1, desc, keep_discharge=keep_discharge
             )
             if not deactivated:
-                line = f"[BLOCKED] {current_desc}: slot 1 was not safely deactivated"
+                line = ActionLine(
+                    f"[BLOCKED] {current_desc}: slot 1 was not safely deactivated",
+                    ActionOutcome.BLOCKED,
+                )
                 log.warning(line)
                 return False, line, deactivation_line
             ok, line = await self._set_current_result(amps, current_desc)
@@ -664,24 +741,29 @@ class SolisDevice:
         ok, line = await self._set_current_result(amps, current_desc)
         return ok, line, None
 
-    async def _zero_guard_slot(self, slot: int) -> tuple[bool, str]:
+    async def _zero_guard_slot(self, slot: int) -> tuple[bool, ActionLine]:
         """Zero a non-driven slot's window block, but only if it is non-zero
         (register endurance: steady state costs zero writes)."""
         desc = f"zero timed slot {slot} window"
         return await self._zero_slot(slot, desc)
 
+    @device_action(Ownership.CHARGING)
     async def _zero_slot(
         self, slot: int, desc: str, *, keep_discharge: list[int] | None = None
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, ActionLine]:
         """Zero a slot and confirm it, returning whether zero was confirmed.
 
         ``keep_discharge`` zeroes only the charge half, writing these four
         registers back as the discharge half in the same atomic block."""
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if mode == "simulate":
-            return True, f"[SIMULATE] would {desc} (if non-zero)"
+            return True, ActionLine(
+                f"[SIMULATE] would {desc} (if non-zero)", ActionOutcome.SIMULATED
+            )
         if mode in ("off", "observe"):
-            return True, f"[{mode.upper()}] computed: {desc} (if non-zero)"
+            return True, ActionLine(
+                f"[{mode.upper()}] computed: {desc} (if non-zero)", ActionOutcome.SIMULATED
+            )
         want = [0] * 4 + (keep_discharge or [0] * 4)
         try:
             current = await self._read_slot_block(slot)
@@ -691,30 +773,33 @@ class SolisDevice:
                 )
                 if zero_confirmed is not False:
                     half = " charge half" if keep_discharge else ""
-                    return True, f"[SKIP] slot {slot}{half} already zeroed"
+                    return True, ActionLine(
+                        f"[SKIP] slot {slot}{half} already zeroed", ActionOutcome.UNCHANGED_VERIFIED
+                    )
             await self._write_register(_SLOT_BLOCK_REG[slot], want)
             mismatch = await self._verify_slot_block(slot, want, refresh=True)
         except Exception:  # noqa: BLE001
             log.error("[FAILED] %s", desc)
-            return False, f"[FAILED] {desc}"
+            return False, ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)
         if mismatch:
-            return False, f"[WARNING] {desc}, but {mismatch}"
-        return True, f"[APPLIED] {desc}"
+            return False, ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED)
+        return True, ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)
 
-    async def _set_current(self, amps: float, desc: str) -> str:
+    async def _set_current(self, amps: float, desc: str) -> ActionLine:
         """Live charge-rate write (rate tier / supply guard). Single register,
         no commit block needed."""
         _ok, line = await self._set_current_result(amps, desc)
         return line
 
-    async def _set_current_result(self, amps: float, desc: str) -> tuple[bool, str]:
+    @device_action(Ownership.CHARGING)
+    async def _set_current_result(self, amps: float, desc: str) -> tuple[bool, ActionLine]:
         """Set current and return whether its post-write value was confirmed."""
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if mode == "simulate":
             log.info("[SIMULATE] would %s", desc)
-            return True, f"[SIMULATE] would {desc}"
+            return True, ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
-            return True, f"[{mode.upper()}] computed: {desc}"
+            return True, ActionLine(f"[{mode.upper()}] computed: {desc}", ActionOutcome.SIMULATED)
         try:
             wrote, zero_confirmed = await self._apply_current(
                 round(amps * _CURRENT_SCALE), amps
@@ -724,13 +809,13 @@ class SolisDevice:
             )
         except Exception:  # noqa: BLE001 - isolate per write
             log.error("[FAILED] %s", desc)
-            return False, f"[FAILED] {desc}"
+            return False, ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)
         if mismatch:
             log.warning("[WARNING] %s, but %s", desc, mismatch)
-            return False, f"[WARNING] {desc}, but {mismatch}"
-        return True, f"[APPLIED] {desc}"
+            return False, ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED)
+        return True, ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)
 
-    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]:
+    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[ActionLine]:
         """Converge the whole-inverter enable on the state the clock implies (#140).
 
         Desired state is a pure function of ``now`` and ``intent.holds``: ``Off``
@@ -755,17 +840,21 @@ class SolisDevice:
         """
         return [await self._reconcile_power_switch(intent, now)]
 
-    async def _reconcile_power_switch(self, intent: ChargeIntent, now: datetime) -> str:
+    @device_action(Ownership.PROTECTION)
+    async def _reconcile_power_switch(self, intent: ChargeIntent, now: datetime) -> ActionLine:
         wanted = "Off" if intent.hold_active(now) else "On"
         desc = f"set inverter power switch to {wanted}"
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if mode == "simulate":
-            return f"[SIMULATE] would {desc}"
+            return ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
-            return f"[{mode.upper()}] computed: {desc}"
+            return ActionLine(f"[{mode.upper()}] computed: {desc}", ActionOutcome.SIMULATED)
         entity = self._config.entities.get("power_switch", "")
         if not entity:
-            return "[SKIP] no power_switch entity configured; discharge left as-is"
+            return ActionLine(
+                "[SKIP] no power_switch entity configured; discharge left as-is",
+                ActionOutcome.UNVERIFIED,
+            )
         try:
             # The pre-read suppresses a redundant write, and on a failure it
             # decides asymmetrically (#143): unreadable evidence may *close* a
@@ -776,7 +865,9 @@ class SolisDevice:
             # one freeing a battery ha-spark can no longer see to discharge.
             try:
                 if (await self._rest.get_state(entity)).state.strip().lower() == wanted.lower():
-                    return f"[SKIP] {desc} (already set)"
+                    return ActionLine(
+                        f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED
+                    )
             except Exception:  # noqa: BLE001 - direction decides
                 if wanted == "On":
                     # Not a benign skip: while the reads stay broken the inverter
@@ -786,18 +877,23 @@ class SolisDevice:
                     # which writes the safe state once ha-spark is past every
                     # known hold end and still has no picture.
                     log.warning("Power-switch unreadable; not releasing a hold")
-                    return (
+                    return ActionLine(
                         f"[WARNING] {desc} refused: state unreadable; "
-                        "a hold is never released blind"
+                        "a hold is never released blind",
+                        ActionOutcome.REFUSED,
                     )
                 log.warning("Power-switch pre-read failed; writing %s anyway", wanted)
             mismatch = await self._select_option(entity, wanted)
         except Exception:  # noqa: BLE001 - isolate this action's failure
             log.error("[FAILED] %s", desc)
-            return f"[FAILED] {desc}"
-        return f"[WARNING] {desc}, but {mismatch}" if mismatch else f"[APPLIED] {desc}"
+            return ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)
+        return (
+            ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED)
+            if mismatch
+            else ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)
+        )
 
-    async def write_safe_state(self) -> list[str]:
+    async def write_safe_state(self) -> list[ActionLine]:
         """Leave the inverter self-managing when ha-spark stops steering (#143 §5).
 
         Inverter ``On``, Slot 1 charging across the configured cheap window, and
@@ -813,29 +909,40 @@ class SolisDevice:
         """
         return [await self._write_safe_power_switch(), await self._write_safe_slot_block()]
 
-    async def _write_safe_power_switch(self) -> str:
+    @device_action(Ownership.PROTECTION)
+    async def _write_safe_power_switch(self) -> ActionLine:
         desc = "set inverter power switch to On (relinquishing control)"
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if mode == "simulate":
-            return f"[SIMULATE] would {desc}"
+            return ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
-            return f"[{mode.upper()}] computed: {desc}"
+            return ActionLine(f"[{mode.upper()}] computed: {desc}", ActionOutcome.SIMULATED)
         entity = self._config.entities.get("power_switch", "")
         if not entity:
-            return "[SKIP] no power_switch entity configured; discharge left as-is"
+            return ActionLine(
+                "[SKIP] no power_switch entity configured; discharge left as-is",
+                ActionOutcome.UNVERIFIED,
+            )
         try:
             try:
                 if (await self._rest.get_state(entity)).state.strip().lower() == "on":
-                    return f"[SKIP] {desc} (already set)"
+                    return ActionLine(
+                        f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED
+                    )
             except Exception:  # noqa: BLE001 - unreadable is written, not refused
                 log.warning("Power-switch pre-read failed; writing On anyway")
             mismatch = await self._select_option(entity, "On")
         except Exception:  # noqa: BLE001 - isolate this action's failure
             log.error("[FAILED] %s", desc)
-            return f"[FAILED] {desc}"
-        return f"[WARNING] {desc}, but {mismatch}" if mismatch else f"[APPLIED] {desc}"
+            return ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)
+        return (
+            ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED)
+            if mismatch
+            else ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)
+        )
 
-    async def _write_safe_slot_block(self) -> str:
+    @device_action(Ownership.CHARGING)
+    async def _write_safe_slot_block(self) -> ActionLine:
         # Imported here for the same import-cycle reason as in `apply`.
         from ha_spark.energy.sources import parse_time
 
@@ -843,16 +950,18 @@ class SolisDevice:
             start = parse_time(self._settings.charge_window_start)
             end = parse_time(self._settings.charge_window_end)
         except ValueError:
-            line = "[FAILED] set charge window (relinquishing control)"
+            line = ActionLine(
+                "[FAILED] set charge window (relinquishing control)", ActionOutcome.FAILED
+            )
             log.error(line)
             return line
         charge = [start.hour, start.minute, end.hour, end.minute]
         desc = f"set charge window {fmt_hhmm(start)}-{fmt_hhmm(end)} (relinquishing control)"
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if mode == "simulate":
-            return f"[SIMULATE] would {desc}"
+            return ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
-            return f"[{mode.upper()}] computed: {desc}"
+            return ActionLine(f"[{mode.upper()}] computed: {desc}", ActionOutcome.SIMULATED)
         try:
             async with ExportEventStore(self._settings.db_path) as store:
                 record = await store.load()
@@ -866,7 +975,10 @@ class SolisDevice:
                 if export_live:
                     # A blind block write cannot carry a window it cannot see:
                     # it would zero a paid export mid-event.
-                    line = f"[BLOCKED] {desc}: slot 1 unreadable while a verified export is live"
+                    line = ActionLine(
+                        f"[BLOCKED] {desc}: slot 1 unreadable while a verified export is live",
+                        ActionOutcome.BLOCKED,
+                    )
                     log.warning(line)
                     return line
                 discharge = [0, 0, 0, 0]
@@ -881,13 +993,19 @@ class SolisDevice:
                     want, lambda: self._verify_slot_block(1, want)
                 )
                 if zero_confirmed is not False:
-                    return f"[SKIP] {desc} (already set)"
+                    return ActionLine(
+                        f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED
+                    )
             await self._write_register(_SLOT_BLOCK_REG[1], want)
             mismatch = await self._verify_slot_block(1, want, refresh=True)
         except Exception:  # noqa: BLE001 - isolate this action's failure
             log.error("[FAILED] %s", desc)
-            return f"[FAILED] {desc}"
-        return f"[WARNING] {desc}, but {mismatch}" if mismatch else f"[APPLIED] {desc}"
+            return ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)
+        return (
+            ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED)
+            if mismatch
+            else ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)
+        )
 
     async def _select_option(self, entity: str, option: str) -> str | None:
         """Write a select option and confirm it; returns the read-back mismatch."""
@@ -896,14 +1014,15 @@ class SolisDevice:
         )
         return await self._read_back_option(entity, option)
 
-    async def _write_discharge_current_result(self) -> tuple[bool, str]:
+    @device_action(Ownership.CHARGING)
+    async def _write_discharge_current_result(self) -> tuple[bool, ActionLine]:
         """Set and verify the fixed full-rate command used for paid export."""
         desc = f"set timed discharge current to {_EXPORT_CURRENT_A:g} A for export"
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        mode = self._coordinator.mode
         if mode == "simulate":
-            return True, f"[SIMULATE] would {desc}"
+            return True, ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
-            return True, f"[{mode.upper()}] computed: {desc}"
+            return True, ActionLine(f"[{mode.upper()}] computed: {desc}", ActionOutcome.SIMULATED)
         try:
             wrote = await self._apply_discharge_current(_EXPORT_CURRENT_RAW)
             mismatch = await self._verify_discharge_current(
@@ -911,11 +1030,16 @@ class SolisDevice:
             )
         except Exception:  # noqa: BLE001 - isolate export action
             log.error("[FAILED] %s", desc)
-            return False, f"[FAILED] {desc}"
+            return False, ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)
         if mismatch:
             log.warning("[WARNING] %s, but %s", desc, mismatch)
-            return False, f"[WARNING] {desc}, but {mismatch}"
-        return True, f"[APPLIED] {desc}" if wrote else f"[SKIP] {desc} (already set)"
+            return False, ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED)
+        line = (
+            ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)
+            if wrote
+            else ActionLine(f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED)
+        )
+        return True, line
 
     async def _untrusted_holds_export(
         self, export: tuple[datetime, datetime], mode: str, now: datetime
@@ -992,7 +1116,8 @@ class SolisDevice:
         tolerance = timedelta(minutes=self._settings.inverter_clock_tolerance_minutes)
         return clock_refusal(state, now, tz, tolerance)
 
-    async def sync_clock(self) -> tuple[ClockSyncOutcome, list[str]]:
+    @device_action(Ownership.CLOCK)
+    async def sync_clock(self) -> tuple[ClockSyncOutcome, list[ActionLine]]:
         """Set the inverter clock from the household clock and confirm it (#161).
 
         Run by the operator (``python -m ha_spark solis sync-clock``) and, when
@@ -1015,10 +1140,15 @@ class SolisDevice:
             before = None
         zone = self._settings.timezone
         before_text = "unreadable" if before is None else f"{describe_error(before)} {zone}"
-        lines = [f"inverter clock before: {before_text}"]
-        mode = effective_mode(self._config.control, self._settings.proactive_mode)
+        lines = [ActionLine(f"inverter clock before: {before_text}", ActionOutcome.UNVERIFIED)]
+        mode = self._coordinator.mode
         if mode != "on":
-            lines.append(f"[{mode.upper()}] would {desc}; not written (mode is {mode})")
+            lines.append(
+                ActionLine(
+                    f"[{mode.upper()}] would {desc}; not written (mode is {mode})",
+                    ActionOutcome.SIMULATED,
+                )
+            )
             return "not_written", lines
 
         after: list[timedelta] = []  # the confirming reading, kept for the report
@@ -1049,13 +1179,17 @@ class SolisDevice:
             )
         except Exception:  # noqa: BLE001 - isolate this action's failure
             log.error("[FAILED] %s", desc)
-            lines.append(f"[FAILED] {desc}")
+            lines.append(ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED))
             return "failed", lines
         if mismatch:
             log.warning("[WARNING] %s, but %s", desc, mismatch)
-            lines.append(f"[WARNING] {desc}, but {mismatch}")
+            lines.append(ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED))
             return "failed", lines
-        lines.append(f"[APPLIED] {desc} (now {describe_error(after[-1])})")
+        lines.append(
+            ActionLine(
+                f"[APPLIED] {desc} (now {describe_error(after[-1])})", ActionOutcome.VERIFIED
+            )
+        )
         return "synced", lines
 
     async def _require_power_switch_on(self) -> str | None:
@@ -1078,14 +1212,10 @@ class SolisDevice:
         """Record only a fully verified event; clear state for cancellation/failure."""
         try:
             async with ExportEventStore(self._settings.db_path) as store:
-                if (
-                    export is not None
-                    and export_ready
-                    and window_line.startswith(("[APPLIED]", "[SKIP]"))
-                ):
+                if export is not None and export_ready and is_verified(window_line):
                     start, end = export
                     await store.save(_export_identity(raw_export, start, end), end)
-                elif export is None and window_line.startswith(("[APPLIED]", "[SKIP]")):
+                elif export is None and is_verified(window_line):
                     await store.clear()
         except Exception:  # noqa: BLE001 - persistence cannot undo HA writes
             log.error("Export event state persistence failed")
@@ -1126,7 +1256,7 @@ class SolisDevice:
             )
             return
         if raw_export is None:
-            if previous_record is None or not window_line.startswith(("[APPLIED]", "[SKIP]")):
+            if previous_record is None or not is_verified(window_line):
                 return
             parsed = parse_event_id(previous_record[0])
             if parsed is None:
@@ -1144,7 +1274,7 @@ class SolisDevice:
         if context is None:
             return
         event_id, start, end, planned_kw, dno_limit_kw = context
-        if export_ready and window_line.startswith(("[APPLIED]", "[SKIP]")):
+        if export_ready and is_verified(window_line):
             await send_once(
                 store,
                 self._rest,
@@ -1182,7 +1312,7 @@ class SolisDevice:
             return
         safe_state = (
             "no export window remains programmed"
-            if window_line.startswith(("[APPLIED]", "[SKIP]"))
+            if is_verified(window_line)
             else "the Solis export state was not verified; remain in simulate and inspect it"
         )
         await send_once(

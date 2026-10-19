@@ -65,6 +65,13 @@ not depend on the solax integration. An add-on can't add `modbus:` entries to
 your `configuration.yaml`, so you add the overlay
 (`docs/solis-control-modbus-overlay.yaml`) once by hand.
 
+Within one ha-spark process, actions on the same inverter bus are serialised
+from prerequisite reads through the final read-back. This includes plan and
+fallback programming, supply-guard resizing, power-switch holds and clock
+sync. The permission is unchanged: real writes still require both
+`control: ha_spark` and `proactive_mode: on`. This coordination does not cover
+other processes or external Home Assistant automations.
+
 ### Power-switch holds
 
 On the Solis, ha-spark re-reads the dispatch state and checks
@@ -184,6 +191,26 @@ mode is stored in `/data/proactive_mode.txt`, so restarting with `on` unchanged
 does not repeat the reminder. If that record cannot be read or written, startup
 continues and the reminder may repeat. The reminder does not detect conflicts
 or block real control; disabling competing controllers is the operator's job.
+
+### Daemon-only hardware writes
+
+`plan --apply`, `run --once`, `solis sync-clock`, the agent's `run_plan`
+(including MCP) and `POST /agent/run` submit fixed operations to the running
+ha-spark daemon. Replans use the daemon's live SoC, fallback and hold state;
+a one-shot request cannot overwrite an active fallback charging schedule.
+Existing `proactive_mode` and device `control` gates still apply.
+
+The CLI connects only to `ha_spark.sock` in `/data` (standalone/dev: beside the
+configured database). The Unix socket is mode `0600`, not a TCP endpoint or an
+ingress/agent port. An exclusive `ha_spark.lock` prevents a second daemon;
+only its holder removes a stale socket, and shutdown removes the socket.
+In-process agent requests use the same daemon queue directly. Requests are
+processed on the loop's next tick, normally within 60 seconds.
+
+Without a reachable daemon, plan/run commands and standalone agent apps still
+compute and return the plan, but refuse hardware writes with a clear reason.
+CLI plan/run exit successfully after printing that refusal; `sync-clock`
+returns 1 because no sync was verified (2 for a non-Solis install).
 
 ### Supply guard (optional)
 

@@ -55,8 +55,11 @@ security and prefer the safe default. Hard rules:
   least as strict.
 - **Parameterised SQL only**; no `eval`/`exec`/`shell=True`/shell interpolation
   of external data.
-- **Network:** outbound only to configured endpoints; any inbound surface must
-  be token-authenticated, ingress-bound, and gated like the CLI.
+- **Network:** outbound only to configured endpoints; any inbound network
+  surface must be token-authenticated, ingress-bound, and gated like the CLI.
+  Local IPC (the daemon's Unix socket) needs owner-only (0600) permissions in
+  the data dir plus a kernel peer-uid check instead of a token, and must not
+  grant write permission beyond the daemon's own gates.
 - **Dependencies:** pinned, minimal, each addition justified. The add-on
   installs from a pinned `vX.Y.Z` tag.
 

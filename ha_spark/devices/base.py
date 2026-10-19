@@ -5,6 +5,8 @@ from datetime import datetime, time
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from ha_spark.devices.outcomes import ActionLine
+
 if TYPE_CHECKING:  # avoid an import cycle: models never imports config/devices at runtime
     from ha_spark.energy.models import ChargeIntent
 
@@ -41,7 +43,10 @@ def effective_mode(control: ControlAuthority, proactive_mode: str) -> str:
 
 @runtime_checkable
 class Device(Protocol):
-    """Realizes a ChargeIntent via a specific inverter; returns action lines.
+    """Realizes a ChargeIntent; returns string-compatible, typed action verdicts.
+
+    Human prefixes are presentation only. Callers use each line's outcome for
+    verification, never infer hardware success from its text.
 
     ``apply`` is the plan seam: driven by a plan diff, on the half-hourly replan
     cadence. ``reconcile_holds`` is the *clock* seam (#143): a cheap read-first
@@ -55,9 +60,9 @@ class Device(Protocol):
 
     capabilities: frozenset[Capability]
 
-    async def apply(self, intent: ChargeIntent) -> list[str]: ...
-    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[str]: ...
-    async def write_safe_state(self) -> list[str]: ...
-    async def set_charge_rate(self, watts: float) -> str: ...
+    async def apply(self, intent: ChargeIntent) -> list[ActionLine]: ...
+    async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[ActionLine]: ...
+    async def write_safe_state(self) -> list[ActionLine]: ...
+    async def set_charge_rate(self, watts: float) -> ActionLine: ...
     async def read_charge_rate(self) -> float: ...
     def planned_rate_w(self, intent: ChargeIntent) -> float: ...

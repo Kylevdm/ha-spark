@@ -70,8 +70,12 @@ from ha_spark.api.server import (
     stop_server,
 )
 from ha_spark.config import Settings
+from ha_spark.daemon_channel import DaemonChannel, Reply, action_lines
 from ha_spark.devices import Capability, inverter_device
+from ha_spark.devices.base import effective_mode
+from ha_spark.devices.execution import ExecutionContext
 from ha_spark.devices.inverters.solis import SolisDevice, fallback_charge_current_a
+from ha_spark.devices.outcomes import ActionLine, ActionOutcome, is_verified, legacy_action_line
 from ha_spark.energy.derived_base_load import (
     BACKFILL_NAME,
     BACKFILL_STATISTIC_ID,
@@ -86,6 +90,7 @@ from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadF
 from ha_spark.energy.orchestrator import orchestrate
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.publish import (
+    plan_to_payload,
     publish_plan,
     publish_predictions,
     publish_soc_integrity,
@@ -208,14 +213,37 @@ class RunResult(NamedTuple):
     applied_plan: ChargePlan | None
     # The device's `apply` lines; empty when the apply was skipped or held.
     apply_lines: tuple[str, ...] = ()
+    text: str = ""
+    action_lines: tuple[str, ...] = ()
 
 
 def _apply_failed(lines: list[str]) -> bool:
-    """Whether an apply's lines report a ``[FAILED]`` or ``[BLOCKED]`` action.
+    """An unknown or non-verified result cannot establish a resident baseline."""
+    return not lines or not all(is_verified(line) for line in lines)
 
-    ``[SIMULATE] [BLOCKED]`` does not count: simulate mode writes nothing.
+
+def _preview_accepted(lines: tuple[str, ...]) -> bool:
+    """Legacy non-real-mode bookkeeping is not hardware verification.
+
+    Plain strings are accepted only here for callers predating typed outcomes.
     """
-    return any(line.startswith(("[FAILED]", "[BLOCKED]")) for line in lines)
+    return bool(lines) and all(
+        legacy_action_line(line).outcome
+        in (
+            ActionOutcome.VERIFIED,
+            ActionOutcome.UNCHANGED_VERIFIED,
+            ActionOutcome.SIMULATED,
+        )
+        for line in lines
+    )
+
+
+def _real_write_mode(settings: Settings) -> bool:
+    return any(
+        device.type == "inverter"
+        and effective_mode(device.control, settings.proactive_mode) == "on"
+        for device in settings.devices
+    )
 
 
 async def _record_forecast(
@@ -252,6 +280,7 @@ async def run_once(
     trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
     ev_hold_state: EvHoldState | None = None,
     fallback_active: bool = False,
+    execution: ExecutionContext | None = None,
 ) -> RunResult:
     """Compute the charge plan, log it, and apply it per PROACTIVE_MODE.
 
@@ -263,6 +292,10 @@ async def run_once(
 
     ``trusted_holds`` is the daemon's last trusted hold set, used by the
     reconcile when this plan's hold data is untrusted (#143 §3).
+
+    ``execution`` defaults to the process-shared driver context, as do the
+    guard, reconcile, fallback, DST and shutdown entry points. Per-call REST
+    clients and driver instances therefore never create independent bus locks.
     """
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
@@ -275,7 +308,10 @@ async def run_once(
         )
         intent = plan.charge_intent
         assert intent is not None  # planner always sets it
-        device = inverter_device(settings, rest)
+        device = (
+            inverter_device(settings, rest) if execution is None
+            else inverter_device(settings, rest, execution=execution)
+        )
         ev_hold_state = ev_hold_state or EvHoldState()
         now = datetime.now(load_timezone(settings.timezone))
         ev_hold_active = _observe_ev_hold(
@@ -293,8 +329,8 @@ async def run_once(
         # minute; here it also covers the skipped-setpoint path below, which
         # would otherwise leave the clock unserved for a whole slot.
         reconcile_intent = hold_reconcile_intent(intent, trusted_holds)
-        lines = (
-            await device.reconcile_holds(reconcile_intent, now)
+        lines: list[str] = (
+            list(await device.reconcile_holds(reconcile_intent, now))
             if reconcile_intent is not None
             else [UNTRUSTED_HOLDS_LINE]
         )
@@ -308,12 +344,19 @@ async def run_once(
                 if any(d.type == "inverter" and d.driver == "solis" for d in settings.devices)
                 else "SoC integrity recovery is pending"
             )
-            lines.append(f"[SKIP] normal programming held while {reason}")
+            lines.append(ActionLine(
+                f"[SKIP] normal programming held while {reason}", ActionOutcome.BLOCKED
+            ))
             applied_plan = None
         elif needs_apply(previous_plan, intent, rate_w, settings.battery_voltage_v):
-            apply_lines = await device.apply(intent)
+            apply_lines = list(await device.apply(intent))
             lines.extend(apply_lines)
-            applied_plan = None if _apply_failed(apply_lines) else plan
+            accepted = (
+                not _apply_failed(apply_lines)
+                if _real_write_mode(settings)
+                else _preview_accepted(tuple(apply_lines))
+            )
+            applied_plan = plan if accepted else None
         else:
             lines.append("[SKIP] charge setpoint unchanged")
         for line in lines:
@@ -327,7 +370,11 @@ async def run_once(
     await _record_forecast(settings, plan, run.forecast)
     await _run_orchestrator(settings)
     await _run_derived_rerive(settings)
-    return RunResult(plan, applied_plan, tuple(apply_lines))
+    return RunResult(
+        plan, applied_plan, tuple(apply_lines),
+        format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz),
+        tuple(lines),
+    )
 
 
 async def _run_orchestrator(settings: Settings) -> None:
@@ -719,10 +766,10 @@ async def reconcile_tick(
                 )
                 relinquished = True
                 trusted_holds = ()
-                lines = read_lines + await inverter_device(settings, rest).write_safe_state()
+                lines = read_lines + list(await inverter_device(settings, rest).write_safe_state())
             else:
-                lines = read_lines + await inverter_device(settings, rest).reconcile_holds(
-                    intent, now
+                lines = read_lines + list(
+                    await inverter_device(settings, rest).reconcile_holds(intent, now)
                 )
     except Exception:
         log.exception("Hold reconcile tick failed; will retry next minute")
@@ -774,25 +821,36 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
                     try:
                         device = inverter_device(settings, rest)
                         if isinstance(device, SolisDevice):
-                            action_lines = await device.apply_fallback(measurement)
+                            action_lines = list(await device.apply_fallback(measurement))
                         else:
                             log.error(
                                 "Solis fallback skipped: inverter factory returned %s",
                                 type(device).__name__,
                             )
                             action_lines = [
-                                "[SKIP] Solis fallback skipped: inverter factory returned "
-                                f"non-Solis device ({type(device).__name__})"
+                                ActionLine(
+                                    "[SKIP] Solis fallback skipped: inverter factory returned "
+                                    f"non-Solis device ({type(device).__name__})",
+                                    ActionOutcome.SIMULATED,
+                                )
                             ]
                     except Exception:
                         log.exception("Solis fallback attempt failed; will retry next minute")
-                        action_lines = ["[FAILED] Solis fallback attempt raised; unconfirmed"]
+                        action_lines = [
+                            ActionLine(
+                                "[FAILED] Solis fallback attempt raised; unconfirmed",
+                                ActionOutcome.FAILED,
+                            )
+                        ]
                     action_line = next(
                         (
                             line
                             for line in reversed(action_lines)
-                            if line.startswith(
+                            if isinstance(line, ActionLine)
+                            or line.startswith(
                                 (
+                                    # Legacy fallback boundary only; production drivers
+                                    # emit typed lines. Never used for normal apply.
                                     "[FALLBACK]",
                                     "[FAILED]",
                                     "[BLOCKED]",
@@ -803,11 +861,14 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
                                 )
                             )
                         ),
-                        "[FAILED] Solis fallback produced no confirmation action",
+                        ActionLine(
+                            "[FAILED] Solis fallback produced no confirmation action",
+                            ActionOutcome.FAILED,
+                        ),
                     )
                     snapshot = monitor.complete_fallback(action_line=action_line)
                     for line in action_lines:
-                        if line.startswith("[FAILED]"):
+                        if legacy_action_line(line).outcome is ActionOutcome.FAILED:
                             log.warning(line)
                         else:
                             log.info(line)
@@ -821,12 +882,10 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
 def recovery_verified(apply_lines: tuple[str, ...]) -> bool:
     """Whether a recovered normal apply may end the fallback (#117).
 
-    Stricter than :func:`_apply_failed`: a ``[WARNING]`` read-back mismatch is
-    not verification either. An empty list means nothing was applied.
+    Like the resident baseline, this needs explicit verification for every
+    action. A read-back warning or an empty result is never verification.
     """
-    return bool(apply_lines) and not any(
-        line.startswith(("[FAILED]", "[BLOCKED]", "[WARNING]")) for line in apply_lines
-    )
+    return bool(apply_lines) and all(is_verified(line) for line in apply_lines)
 
 
 async def finish_recovery(
@@ -839,14 +898,17 @@ async def finish_recovery(
     confirmation: increases stay blocked until the next minute's retry either
     verifies the recovered plan or, if recovery is lost, re-programs the fallback.
     """
-    if apply_lines is not None and recovery_verified(apply_lines):
+    preview = (
+        apply_lines is not None
+        and not _real_write_mode(settings)
+        and _preview_accepted(apply_lines)
+    )
+    if apply_lines is not None and (recovery_verified(apply_lines) or preview):
         line = next(
-            (line for line in reversed(apply_lines) if line.startswith(("[APPLIED]", "[SKIP]"))),
+            (line for line in reversed(apply_lines) if is_verified(line)),
             apply_lines[-1],
         )
-        if monitor.recovery_blocked and line.startswith(
-            ("[SIMULATE]", "[OFF]", "[OBSERVE]")
-        ):
+        if monitor.recovery_blocked and preview and not is_verified(line):
             action = f"[RECOVERED] plan computed without hardware programming: {line}"
         else:
             action = f"[RECOVERED] normal programming resumed: {line}"
@@ -892,6 +954,17 @@ async def _charger_supports_live_rate(settings: Settings) -> bool:
 
 
 async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
+    """Claim the local executor before starting any services or device work."""
+    channel = DaemonChannel(settings)
+    try:
+        await _run_forever(settings, channel, poll_seconds=poll_seconds)
+    finally:
+        await channel.__aexit__(None, None, None)
+
+
+async def _run_forever(
+    settings: Settings, channel: DaemonChannel, *, poll_seconds: int
+) -> None:
     """Loop: recompute and apply the plan once per local half-hour slot.
 
     Serves the add-on HTTP API (behind ingress) sharing an :class:`AppState`
@@ -899,7 +972,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     up the reloaded settings on its next tick (hot reload, no restart).
     """
     warn_deprecated_notify_target(settings)
-    state = AppState(settings=settings, options_path=OPTIONS_PATH)
+    state = AppState(settings=settings, options_path=OPTIONS_PATH, executor=channel)
     # Add-on mode: listen on all interfaces (the ingress proxy connects over the
     # hassio network) but answer only the proxy's address. Standalone/dev has no
     # ingress proxy, so bind to loopback and let the OS keep the network out.
@@ -911,6 +984,9 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             "0.0.0.0",  # noqa: S104 - peer-restricted to the ingress proxy
             INGRESS_PORT,
         )
+    # Constructing the HTTP server above does not bind it. Claim the executor
+    # before starting listeners or touching hardware, including startup probes.
+    await channel.__aenter__()
     serve_task: asyncio.Task[None] | None = None
     try:
         serve_task = await serve_in_background(server)
@@ -971,6 +1047,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     last_signal_at: datetime | None = None
     monitor = SocMonitor.load(settings)
     clock_sync = DstClockSync()
+    pending = None
     try:
         while True:
             settings = state.settings  # hot-reloaded by POST /api/config
@@ -1026,7 +1103,26 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             # which is what every tick in that failure window steers by anyway,
             # so it costs a duplicate read rather than new stale exposure.
             replanned = False
-            if recovering or should_run(now, last_run_slot):
+            pending = channel.queue.get_nowait() if not channel.queue.empty() else None
+            if pending is not None and pending.request.op == "sync_clock":
+                try:
+                    async with HomeAssistantRest(
+                        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+                    ) as rest:
+                        device = inverter_device(settings, rest)
+                        if isinstance(device, SolisDevice):
+                            outcome, clock_lines = await device.sync_clock()
+                            reply = Reply(
+                                lines=action_lines(clock_lines), synced=outcome == "synced"
+                            )
+                        else:
+                            reply = Reply(error="sync-clock is Solis-only")
+                    pending.future.set_result(reply)
+                except Exception:
+                    last_applied_plan = None
+                    pending.future.set_result(Reply(error="daemon clock request failed"))
+                pending = None
+            if pending is not None or recovering or should_run(now, last_run_slot):
                 try:
                     # Recovery never compares against a baseline: the resident
                     # program is the fallback, not any earlier plan.
@@ -1067,11 +1163,23 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         # instead (reductions only) until a plan is computed from
                         # a trusted measurement (#117 recomputes on recovery).
                         target_w = None
+                    if pending is not None:
+                        pending.future.set_result(Reply(
+                            text=result.text,
+                            lines=action_lines(result.action_lines),
+                            plan=[{"entity_id": eid, "state": value, "attributes": attrs}
+                                  for eid, value, attrs in plan_to_payload(plan, settings)],
+                        ))
                 except Exception:
+                    if pending is not None and not pending.future.done():
+                        pending.future.set_result(Reply(error="daemon plan request failed"))
                     # It may have raised mid-apply: the device state is unknown,
                     # so the retry must not skip an unchanged plan (#168).
                     last_applied_plan = None
-                    log.exception("Scheduled plan run failed; will retry next tick")
+                    if pending is not None:
+                        log.error("Daemon plan request failed; will retry next tick")
+                    else:
+                        log.exception("Scheduled plan run failed; will retry next tick")
                     if recovering:
                         await finish_recovery(settings, monitor, None)
                         fallback_confirmed = False
@@ -1133,6 +1241,9 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                     log.exception("V2L tick failed; will retry next tick")
             await asyncio.sleep(poll_seconds)
     finally:
+        state.executor = None
+        if pending is not None and not pending.future.done():
+            pending.future.set_result(Reply(error="daemon stopped during request"))
         if serve_task is not None:
             await stop_server(server, serve_task)
         if port_server is not None and port_task is not None:

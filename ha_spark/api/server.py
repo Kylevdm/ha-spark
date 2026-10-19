@@ -31,7 +31,14 @@ from fastapi.routing import APIRoute
 
 from ha_spark.agent import auth, tools
 from ha_spark.agent.exposure import OPERATION_TIERS, allowed, surface_on
-from ha_spark.config import _OPTION_KEYS, _SECRET_OPTION_KEYS, Settings, load_settings
+from ha_spark.config import (
+    _OPTION_KEYS,
+    _SECRET_OPTION_KEYS,
+    Settings,
+    load_settings,
+    validate_options_document,
+)
+from ha_spark.daemon_channel import DaemonChannel
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.logging import get_logger
@@ -70,6 +77,7 @@ class AppState:
     reload: Callable[[], Settings] = load_settings
     plan: ChargePlan | None = None
     plan_at: datetime | None = None
+    executor: DaemonChannel | None = None
 
     def __post_init__(self) -> None:
         previous_mode: str | None = None
@@ -133,13 +141,19 @@ class AppState:
         return out
 
     def apply_options(self, updates: dict[str, Any]) -> Settings:
-        """Merge ``updates`` into the persisted options, then reload settings.
+        """Merge ``updates`` into the persisted options, validate, then save.
 
         Only keys in ``_OPTION_KEYS`` are accepted; unknown keys are ignored. An
         incoming secret value equal to ``_REDACTED`` is dropped (treated as
         "unchanged"), so a GET-then-POST round-trip of the masked options can't
-        clobber the real secret with the mask. Raises if the merged config fails
-        validation (the caller maps that to 400).
+        clobber the real secret with the mask.
+
+        The complete merged candidate is validated into :class:`Settings`
+        (the same overlay/validation semantics as :func:`load_settings`) *before*
+        anything touches disk or the running settings (#412): an invalid
+        document is rejected with a secret-safe reason naming the failing
+        field(s) -- never an input value -- and leaves the options file
+        byte-identical and the running settings exactly as they were.
         """
         previous_mode = self.settings.proactive_mode
         current: dict[str, Any] = {}
@@ -153,8 +167,13 @@ class AppState:
                 and not (k in _SECRET_OPTION_KEYS and v == _REDACTED)
             }
         )
+        # Validate the whole candidate before persisting anything; a rejected
+        # save must leave the file byte-identical.
+        validate_options_document(current)
         self.options_path.parent.mkdir(parents=True, exist_ok=True)
-        self.options_path.write_text(json.dumps(current), encoding="utf-8")
+        temporary = self.options_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(current), encoding="utf-8")
+        temporary.replace(self.options_path)
         self.settings = self.reload()
         self._record_proactive_mode(previous_mode)
         return self.settings
@@ -296,7 +315,7 @@ def _agent_router(state: AppState) -> APIRouter:
 
     @router.post("/run", dependencies=[Depends(_Gate(state, "run_plan"))])
     async def run() -> tools.PlanResult:
-        return await tools.run_plan(state.settings)
+        return await tools.run_plan(state.settings, executor=state.executor)
 
     @router.post("/config", dependencies=[Depends(_Gate(state, "set_config"))])
     async def config(body: dict[str, object]) -> dict[str, Any]:

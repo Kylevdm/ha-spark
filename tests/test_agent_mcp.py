@@ -278,3 +278,39 @@ async def test_get_forecast_tool_serves_the_served_day_profile(
     assert payload["date"] == "2026-01-12"
     assert payload["slots"] == [float(i) for i in range(48)]
     assert payload["load_kwh"] == 12.0
+
+
+async def test_set_config_rejects_invalid_document_before_saving(tmp_path: Path) -> None:
+    """#412: the set_config tool validates the whole candidate before persisting.
+
+    A rejected save must leave the options file byte-identical and the running
+    settings untouched, and the tool error must name the failing field without
+    echoing its value or the secret sitting next to it in the document.
+    """
+    options = tmp_path / "options.json"
+    seeded = json.dumps({"min_soc": 20.0, "octopus_api_key": "SECRET_OCTO"}).encode()
+    options.write_bytes(seeded)
+    settings_kw: dict[str, object] = {
+        "ha_url": "http://ha.test",
+        "ha_token": "x",
+        "db_path": str(tmp_path / "t.db"),
+        "agent_surface": "on",
+        "agent_exposure": "read_write",
+        "min_soc": 20.0,
+        "octopus_api_key": "SECRET_OCTO",
+    }
+    state = AppState(  # type: ignore[call-arg]
+        settings=Settings(**settings_kw),  # type: ignore[arg-type]
+        options_path=options,
+        reload=lambda: Settings(
+            **{**settings_kw, **json.loads(options.read_text(encoding="utf-8"))}  # type: ignore[arg-type]
+        ),
+    )
+    mcp = build_mcp(state)
+    with pytest.raises(ToolError) as excinfo:
+        await mcp.call_tool("set_config", {"updates": {"min_soc": "not-a-number"}})
+    assert "min_soc" in str(excinfo.value)
+    assert "not-a-number" not in str(excinfo.value)
+    assert "SECRET_OCTO" not in str(excinfo.value)
+    assert options.read_bytes() == seeded
+    assert state.settings.min_soc == 20.0

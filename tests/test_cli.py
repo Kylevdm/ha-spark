@@ -28,6 +28,7 @@ from ha_spark.cli import (
     build_parser,
 )
 from ha_spark.config import Settings
+from ha_spark.daemon_channel import Op, Reply, action_lines
 from ha_spark.health import CheckResult, Status
 from ha_spark.router import RouterResult
 
@@ -668,17 +669,18 @@ def _cmd_backfill_load_for_dispatch(settings: Settings, *, source: str, derive: 
     return 0
 
 
-async def test_run_once_invokes_run_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[Settings] = []
+async def test_run_once_submits_to_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[Settings, str]] = []
 
-    async def fake_run_once(s: Settings) -> None:
-        calls.append(s)
+    async def fake_submit(s: Settings, op: Op) -> Reply:
+        calls.append((s, op))
+        return Reply(text="daemon plan")
 
-    monkeypatch.setattr(cli, "run_once", fake_run_once)
+    monkeypatch.setattr(cli, "submit_socket", fake_submit)
     settings = Settings(ha_url="http://ha.test", ha_token="t")
 
     assert await _cmd_run(settings, once=True) == 0
-    assert calls == [settings]
+    assert calls == [(settings, "replan")]
 
 
 async def test_run_forever_handles_keyboard_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -744,10 +746,13 @@ async def test_a_second_sigterm_does_not_abort_the_shutdown_work(
 async def test_solis_sync_clock_prints_lines_and_exits_on_the_result(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], outcome: str, code: int
 ) -> None:
-    async def fake_sync(self: object) -> tuple[str, list[str]]:
-        return outcome, ["inverter clock before: 60 min behind Europe/London", "[APPLIED] synced"]
+    async def fake_submit(s: Settings, op: Op) -> Reply:
+        assert op == "sync_clock"
+        return Reply(synced=outcome == "synced", lines=action_lines([
+            "inverter clock before: 60 min behind Europe/London", "[APPLIED] synced"
+        ]))
 
-    monkeypatch.setattr(cli.SolisDevice, "sync_clock", fake_sync)
+    monkeypatch.setattr(cli, "submit_socket", fake_submit)
     assert await cli._cmd_solis_sync_clock(Settings(ha_url="http://ha", ha_token="t")) == code
     out = capsys.readouterr().out
     assert "60 min behind" in out and "[APPLIED] synced" in out
@@ -759,3 +764,25 @@ async def test_solis_sync_clock_refuses_another_inverter(
     settings = Settings(ha_url="http://ha", ha_token="t", inverter="alphaess")
     assert await cli._cmd_solis_sync_clock(settings) == 2
     assert "inverter is alphaess" in capsys.readouterr().err
+
+
+@respx.mock
+async def test_solis_sync_clock_without_a_daemon_only_reads_the_clock(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#414: no daemon -> report the clock error read-only, write nothing, exit 1."""
+    async def no_daemon(s: Settings, op: Op) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "submit_socket", no_daemon)
+    reads = respx.get(url__regex=r"http://ha/api/states/.*").mock(
+        return_value=httpx.Response(404)
+    )
+    writes = respx.post(url__regex=r"http://ha/api/services/.*").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    assert await cli._cmd_solis_sync_clock(Settings(ha_url="http://ha", ha_token="t")) == 1
+    out = capsys.readouterr().out
+    assert "inverter clock: unreadable" in out
+    assert "[REFUSED]" in out
+    assert reads.called and not writes.called
