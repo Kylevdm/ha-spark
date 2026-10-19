@@ -14,10 +14,12 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 
 from ha_spark.config import Settings
+from ha_spark.daemon_channel import REFUSED, DaemonChannel, Line
 from ha_spark.energy.context import ContextStore
 from ha_spark.energy.orchestrator import orchestrate
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.publish import plan_to_payload
+from ha_spark.energy.report import format_plan
 from ha_spark.energy.sources import gather_inputs
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.health import run_health
@@ -26,6 +28,9 @@ from ha_spark.health import run_health
 class PlanResult(BaseModel):
     plan: list[dict[str, object]]
     generated_at: str | None
+    text: str = ""
+    actions: list[Line] = Field(default_factory=list)
+    refusal: str | None = None
 
 
 class StateResult(BaseModel):
@@ -63,12 +68,16 @@ def _rest(settings: Settings) -> HomeAssistantRest:
 
 async def get_plan(settings: Settings) -> PlanResult:
     async with _rest(settings) as rest:
-        plan = (await current_plan(settings, rest)).plan
+        run = await current_plan(settings, rest)
+    plan = run.plan
     entities = [
         {"entity_id": eid, "state": value, "attributes": attrs}
         for eid, value, attrs in plan_to_payload(plan, settings)
     ]
-    return PlanResult(plan=entities, generated_at=datetime.now(UTC).isoformat())
+    return PlanResult(
+        plan=entities, generated_at=datetime.now(UTC).isoformat(),
+        text=format_plan(plan, run.load_source, forecast_date=run.forecast.target_date, tz=run.tz),
+    )
 
 
 async def get_state(settings: Settings) -> StateResult:
@@ -122,13 +131,14 @@ async def add_context(
     return await get_context(settings)
 
 
-async def run_plan(settings: Settings) -> PlanResult:
-    # local import: avoids api.server <-> scheduler <-> tools import cycle (see Task 7)
-    from ha_spark.energy.scheduler import run_once
-
-    plan = (await run_once(settings)).plan
-    entities = [
-        {"entity_id": eid, "state": value, "attributes": attrs}
-        for eid, value, attrs in plan_to_payload(plan, settings)
-    ]
-    return PlanResult(plan=entities, generated_at=datetime.now(UTC).isoformat())
+async def run_plan(settings: Settings, *, executor: DaemonChannel | None = None) -> PlanResult:
+    """Enqueue a fixed replan operation, never device parameters or identity."""
+    if executor is None:
+        result = await get_plan(settings)
+        result.refusal = REFUSED
+        return result
+    reply = await executor.submit("replan")
+    return PlanResult(
+        plan=reply.plan, generated_at=datetime.now(UTC).isoformat(),
+        text=reply.text, actions=reply.lines, refusal=reply.error,
+    )

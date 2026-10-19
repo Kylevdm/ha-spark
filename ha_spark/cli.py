@@ -18,9 +18,8 @@ from pathlib import Path
 import yaml
 
 from ha_spark.config import ConfigError, Settings, load_settings
+from ha_spark.daemon_channel import REFUSED, DaemonAlreadyRunning, Reply, submit_socket
 from ha_spark.dashboard import build_dashboard
-from ha_spark.devices import inverter_device
-from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.energy import habits
 from ha_spark.energy.backtest import backtest_cost, format_backtest
 from ha_spark.energy.context import KINDS, ContextStore
@@ -43,12 +42,7 @@ from ha_spark.energy.onboarding import (
 )
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.report import format_plan
-from ha_spark.energy.scheduler import (
-    UNTRUSTED_HOLDS_LINE,
-    hold_reconcile_intent,
-    run_forever,
-    run_once,
-)
+from ha_spark.energy.scheduler import run_forever
 from ha_spark.energy.sources import _to_float
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.energy.v2l import delivered_fraction, load_session, savings
@@ -165,21 +159,33 @@ async def _cmd_solis_sync_clock(settings: Settings) -> int:
     Exit 0 = synced and confirmed, 1 = not written or not confirmed (including
     any mode but ``on``), 2 = not a Solis install.
     """
-    async with HomeAssistantRest(
-        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
-    ) as rest:
-        device = inverter_device(settings, rest)
-        if not isinstance(device, SolisDevice):
-            print(f"sync-clock is Solis-only; inverter is {settings.inverter}", file=sys.stderr)
-            return 2
-        outcome, lines = await device.sync_clock()
-    for line in lines:
-        print(line)
-    return 0 if outcome == "synced" else 1
+    if settings.inverter != "solis":
+        print(f"sync-clock is Solis-only; inverter is {settings.inverter}", file=sys.stderr)
+        return 2
+    reply = await submit_socket(settings, "sync_clock")
+    if reply is None:
+        print(REFUSED)
+        return 1
+    _print_reply(reply)
+    return 0 if reply.synced else 1
+
+
+def _print_reply(reply: Reply) -> None:
+    if reply.text:
+        print(reply.text)
+    for line in reply.lines:
+        print(line.text)
+    if reply.error:
+        print(f"[REFUSED] {reply.error}")
 
 
 async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
-    """Compute the battery charge plan, print it, optionally run the charger."""
+    """Print a plan; only the running daemon may apply it."""
+    if apply:
+        reply = await submit_socket(settings, "apply")
+        if reply is not None:
+            _print_reply(reply)
+            return 0
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
@@ -187,25 +193,7 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
         plan, load_source = run.plan, run.load_source
         print(format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz))
         if apply:
-            intent = plan.charge_intent
-            assert intent is not None  # planner always sets it
-            device = inverter_device(settings, rest)
-            # Reconcile the power switch first, as every device-driving caller
-            # does (#143): the CLI owns the inverter no less than the daemon.
-            # A one-shot has no trusted hold history, so an untrusted read
-            # leaves the switch as-is (#143 §3).
-            reconcile_intent = hold_reconcile_intent(intent, None)
-            lines = (
-                await device.reconcile_holds(
-                    reconcile_intent, datetime.now(load_timezone(settings.timezone))
-                )
-                if reconcile_intent is not None
-                else [UNTRUSTED_HOLDS_LINE]
-            )
-            lines.extend(await device.apply(intent))
-            print(f"\nActions (PROACTIVE_MODE={settings.proactive_mode}):")
-            for line in lines:
-                print(f"  {line}")
+            print(REFUSED)
     return 0
 
 
@@ -222,7 +210,12 @@ async def _cmd_ask(settings: Settings, message: str) -> int:
 async def _cmd_run(settings: Settings, *, once: bool) -> int:
     """Run the planner daemon: compute & apply once, or loop half-hourly."""
     if once:
-        await run_once(settings)
+        reply = await submit_socket(settings, "replan")
+        if reply is not None:
+            _print_reply(reply)
+            return 0
+        await _cmd_plan(settings, apply=False)
+        print(REFUSED)
         return 0
     # The add-on stops with SIGTERM, whose default action exits without
     # unwinding: cancel the loop instead so its `finally` hands control back to
@@ -242,6 +235,9 @@ async def _cmd_run(settings: Settings, *, once: bool) -> int:
         await run_forever(settings)
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
+    except DaemonAlreadyRunning:
+        print("[REFUSED] ha-spark daemon already running", file=sys.stderr)
+        return 1
     finally:
         loop.remove_signal_handler(signal.SIGTERM)
     return 0

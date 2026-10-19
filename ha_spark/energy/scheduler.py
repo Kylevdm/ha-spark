@@ -70,6 +70,7 @@ from ha_spark.api.server import (
     stop_server,
 )
 from ha_spark.config import Settings
+from ha_spark.daemon_channel import DaemonChannel, Reply, action_lines
 from ha_spark.devices import Capability, inverter_device
 from ha_spark.devices.base import effective_mode
 from ha_spark.devices.execution import ExecutionContext
@@ -89,6 +90,7 @@ from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadF
 from ha_spark.energy.orchestrator import orchestrate
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.publish import (
+    plan_to_payload,
     publish_plan,
     publish_predictions,
     publish_soc_integrity,
@@ -211,6 +213,8 @@ class RunResult(NamedTuple):
     applied_plan: ChargePlan | None
     # The device's `apply` lines; empty when the apply was skipped or held.
     apply_lines: tuple[str, ...] = ()
+    text: str = ""
+    action_lines: tuple[str, ...] = ()
 
 
 def _apply_failed(lines: list[str]) -> bool:
@@ -340,7 +344,9 @@ async def run_once(
                 if any(d.type == "inverter" and d.driver == "solis" for d in settings.devices)
                 else "SoC integrity recovery is pending"
             )
-            lines.append(f"[SKIP] normal programming held while {reason}")
+            lines.append(ActionLine(
+                f"[SKIP] normal programming held while {reason}", ActionOutcome.BLOCKED
+            ))
             applied_plan = None
         elif needs_apply(previous_plan, intent, rate_w, settings.battery_voltage_v):
             apply_lines = list(await device.apply(intent))
@@ -364,7 +370,11 @@ async def run_once(
     await _record_forecast(settings, plan, run.forecast)
     await _run_orchestrator(settings)
     await _run_derived_rerive(settings)
-    return RunResult(plan, applied_plan, tuple(apply_lines))
+    return RunResult(
+        plan, applied_plan, tuple(apply_lines),
+        format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz),
+        tuple(lines),
+    )
 
 
 async def _run_orchestrator(settings: Settings) -> None:
@@ -944,6 +954,17 @@ async def _charger_supports_live_rate(settings: Settings) -> bool:
 
 
 async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
+    """Claim the local executor before starting any services or device work."""
+    channel = DaemonChannel(settings)
+    try:
+        await _run_forever(settings, channel, poll_seconds=poll_seconds)
+    finally:
+        await channel.__aexit__(None, None, None)
+
+
+async def _run_forever(
+    settings: Settings, channel: DaemonChannel, *, poll_seconds: int
+) -> None:
     """Loop: recompute and apply the plan once per local half-hour slot.
 
     Serves the add-on HTTP API (behind ingress) sharing an :class:`AppState`
@@ -951,7 +972,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     up the reloaded settings on its next tick (hot reload, no restart).
     """
     warn_deprecated_notify_target(settings)
-    state = AppState(settings=settings, options_path=OPTIONS_PATH)
+    state = AppState(settings=settings, options_path=OPTIONS_PATH, executor=channel)
     # Add-on mode: listen on all interfaces (the ingress proxy connects over the
     # hassio network) but answer only the proxy's address. Standalone/dev has no
     # ingress proxy, so bind to loopback and let the OS keep the network out.
@@ -963,6 +984,9 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             "0.0.0.0",  # noqa: S104 - peer-restricted to the ingress proxy
             INGRESS_PORT,
         )
+    # Constructing the HTTP server above does not bind it. Claim the executor
+    # before starting listeners or touching hardware, including startup probes.
+    await channel.__aenter__()
     serve_task: asyncio.Task[None] | None = None
     try:
         serve_task = await serve_in_background(server)
@@ -1023,6 +1047,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     last_signal_at: datetime | None = None
     monitor = SocMonitor.load(settings)
     clock_sync = DstClockSync()
+    pending = None
     try:
         while True:
             settings = state.settings  # hot-reloaded by POST /api/config
@@ -1078,7 +1103,26 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
             # which is what every tick in that failure window steers by anyway,
             # so it costs a duplicate read rather than new stale exposure.
             replanned = False
-            if recovering or should_run(now, last_run_slot):
+            pending = channel.queue.get_nowait() if not channel.queue.empty() else None
+            if pending is not None and pending.request.op == "sync_clock":
+                try:
+                    async with HomeAssistantRest(
+                        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+                    ) as rest:
+                        device = inverter_device(settings, rest)
+                        if isinstance(device, SolisDevice):
+                            outcome, clock_lines = await device.sync_clock()
+                            reply = Reply(
+                                lines=action_lines(clock_lines), synced=outcome == "synced"
+                            )
+                        else:
+                            reply = Reply(error="sync-clock is Solis-only")
+                    pending.future.set_result(reply)
+                except Exception:
+                    last_applied_plan = None
+                    pending.future.set_result(Reply(error="daemon clock request failed"))
+                pending = None
+            if pending is not None or recovering or should_run(now, last_run_slot):
                 try:
                     # Recovery never compares against a baseline: the resident
                     # program is the fallback, not any earlier plan.
@@ -1119,11 +1163,23 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                         # instead (reductions only) until a plan is computed from
                         # a trusted measurement (#117 recomputes on recovery).
                         target_w = None
+                    if pending is not None:
+                        pending.future.set_result(Reply(
+                            text=result.text,
+                            lines=action_lines(result.action_lines),
+                            plan=[{"entity_id": eid, "state": value, "attributes": attrs}
+                                  for eid, value, attrs in plan_to_payload(plan, settings)],
+                        ))
                 except Exception:
+                    if pending is not None and not pending.future.done():
+                        pending.future.set_result(Reply(error="daemon plan request failed"))
                     # It may have raised mid-apply: the device state is unknown,
                     # so the retry must not skip an unchanged plan (#168).
                     last_applied_plan = None
-                    log.exception("Scheduled plan run failed; will retry next tick")
+                    if pending is not None:
+                        log.error("Daemon plan request failed; will retry next tick")
+                    else:
+                        log.exception("Scheduled plan run failed; will retry next tick")
                     if recovering:
                         await finish_recovery(settings, monitor, None)
                         fallback_confirmed = False
@@ -1185,6 +1241,9 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
                     log.exception("V2L tick failed; will retry next tick")
             await asyncio.sleep(poll_seconds)
     finally:
+        state.executor = None
+        if pending is not None and not pending.future.done():
+            pending.future.set_result(Reply(error="daemon stopped during request"))
         if serve_task is not None:
             await stop_server(server, serve_task)
         if port_server is not None and port_task is not None:
