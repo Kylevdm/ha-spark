@@ -27,6 +27,7 @@ from __future__ import annotations
 from ha_spark.config import Settings
 from ha_spark.devices import inverter_device
 from ha_spark.devices.inverters.solis import fallback_charge_current_a
+from ha_spark.devices.outcomes import ActionLine
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
@@ -72,7 +73,7 @@ class SupplyGuard:
         soc: SocMeasurement | None = None,
         fallback_active: bool = False,
         fallback_confirmed: bool = False,
-    ) -> str | None:
+    ) -> ActionLine | None:
         """One guard pass; returns the action line if a resize was applied.
 
         ``soc`` is the daemon tick's checked measurement. A failed measurement
