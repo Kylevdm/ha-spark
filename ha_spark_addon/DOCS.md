@@ -44,6 +44,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `ha_template_charge_needed_entity` | Optional HA template sensor; the plan report shows its value next to ha-spark's for comparison |
 | `inverter` | Which inverter ha-spark controls: `solis` (default) or `alphaess` |
 | `solis_control_hub` | Name of the HA `modbus:` overlay hub that ha-spark uses to write the Solis timed-slot registers (default `solis_control`; see [`docs/solis-control-modbus-overlay.yaml`](../docs/solis-control-modbus-overlay.yaml)) |
+| `solis_model_confirmed` | Boolean, default `false`. Owner confirmation that the inverter is the validated reference (33000 = `0x0026` AND 35000 = `0x2031`) when identity sensors cannot be read. Readable mismatches always override confirmation; V2 TOU (`33289 = 0xAA55`) is not validated. This setting grants no write authority |
 | `solis_modbus_slave` | Modbus slave/unit id on that hub (default `1`) |
 | `inverter_clock_tolerance_minutes` | How far the Solis inverter clock may drift from the household clock (`timezone`) before ha-spark refuses to arm an export window and `health` warns (default `5`). Fix drift with `python -m ha_spark solis sync-clock` |
 | `inverter_clock_dst_sync` | Off by default. When on, ha-spark syncs the Solis inverter clock from the household clock after a daylight-saving change, as `sync-clock` does. It writes only when the site operating mode authorises clock changes; in Observe it logs "would sync". It can sync at any point in the six hours after the change, so a restart or an authorised mode change in that time still syncs, and it retries each minute. It notifies through `notify_service` on success, or if the sync is still failing after 30 minutes. It never corrects ordinary drift |
@@ -52,6 +53,25 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
 | `outdoor_weather_entity` | Weather entity with a `temperature` attribute (default `weather.home`) for signal recording |
 | `v2l_power_entity` | Optional V2L discharge-power sensor (W); enables the V2L tally (see "V2L" below) |
+
+### Read-only inverter diagnostic
+
+Run `python -m ha_spark inverter show` to read each configured inverter's model
+identity, validation reason, declared hold contract, and resident slot-1 charge
+window, charge current (43141) and configured power-switch state. Identity words
+are shown as raw integers, keyed by register address; `null` means unreadable.
+Resident readings show `unknown` when unreadable, never a configured substitute.
+This command uses only HA REST GETs: no register writes, select/switch service
+calls, clock writes, refresh service calls, or authority-store writes. It works
+in Observe as well as Protect/Optimise and does not change any existing write gate.
+
+Add the three slow-polling input sensors from the overlay document to enable
+identity reads (`model_word`, `inverter_type_definition`, `tou_version`). Only
+the two-word reference identity is validated, not Solis in general. If identity
+cannot be read, leave `solis_model_confirmed: false` unless you have independently
+confirmed that reference identity. AlphaESS declares no validated hold surface
+(#196). The contract declaration is for future protection preconditions; this
+diagnostic does not itself establish fresh protection evidence.
 
 ### Solis control
 

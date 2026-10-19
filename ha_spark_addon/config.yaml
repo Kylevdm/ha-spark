@@ -108,6 +108,7 @@ options:
   inverter_power_switch_entity: ""
   ha_template_charge_needed_entity: ""
   inverter: solis
+  solis_model_confirmed: false
   solis_control_hub: "solis_control"
   solis_modbus_slave: 1
   inverter_clock_tolerance_minutes: 5.0
@@ -219,6 +220,7 @@ schema:
   inverter_power_switch_entity: str?
   ha_template_charge_needed_entity: str?
   inverter: list(solis|alphaess)
+  solis_model_confirmed: bool?
   solis_control_hub: str?
   solis_modbus_slave: int
   inverter_clock_tolerance_minutes: float(0.1,29.9)
