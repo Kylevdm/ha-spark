@@ -101,93 +101,24 @@ def test_get_config_returns_options(tmp_path: Path) -> None:
     assert "min_soc" in resp.json()
 
 
-@pytest.mark.parametrize("previous_mode", ["off", "simulate"])
-def test_proactive_mode_on_transition_warns_about_conflicting_automation(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, previous_mode: str
-) -> None:
-    state = _state(tmp_path, proactive_mode=previous_mode)
-
-    with caplog.at_level("WARNING"):
-        state.apply_options({"proactive_mode": "on"})
-
-    assert any(
-        "disable any pre-existing automations or manual schedules" in record.message
-        for record in caplog.records
-    )
-
-
-@pytest.mark.parametrize("previous_mode", ["off", "simulate"])
-def test_supervisor_restart_into_on_warns(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, previous_mode: str
-) -> None:
-    _state(tmp_path, proactive_mode=previous_mode)
-    caplog.clear()
-    state = _state(tmp_path, proactive_mode="on")
-    assert state.settings.proactive_mode == "on"
-    assert any("pre-existing automations" in record.message for record in caplog.records)
-
-
-def test_proactive_mode_reload_without_transition_does_not_warn(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    state = _state(tmp_path, proactive_mode="on")
-
-    caplog.clear()
-    with caplog.at_level("WARNING"):
-        state.apply_options({"proactive_mode": "on"})
-
-    assert not any("pre-existing automations" in record.message for record in caplog.records)
-
-
-@pytest.mark.parametrize("mode", ["off", "simulate", "on"])
-def test_restart_with_unchanged_mode_does_not_repeat_reminder(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, mode: str
-) -> None:
-    _state(tmp_path, proactive_mode=mode)
-    caplog.clear()
-    _state(tmp_path, proactive_mode=mode)
-    assert not any("pre-existing automations" in record.message for record in caplog.records)
-
-
-def test_first_start_already_on_warns(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    _state(tmp_path, proactive_mode="on")
-    assert any("pre-existing automations" in record.message for record in caplog.records)
-
-
-def test_api_handover_is_remembered_across_restart(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    state = _state(tmp_path, proactive_mode="simulate")
+@pytest.mark.parametrize("saved", ["off", "simulate", "on", "invalid", "\udcff"])
+def test_retired_sidecar_is_not_read_or_changed(tmp_path, caplog, saved):
+    path = tmp_path / "proactive_mode.txt"
+    original = saved.encode("utf-8", errors="surrogateescape")
+    path.write_bytes(original)
+    state = _state(tmp_path)
     state.apply_options({"proactive_mode": "on"})
-    caplog.clear()
-    _state(tmp_path, proactive_mode="on")
-    assert not any("pre-existing automations" in record.message for record in caplog.records)
-    _state(tmp_path, proactive_mode="off")
-    caplog.clear()
-    _state(tmp_path, proactive_mode="on")
-    assert any("pre-existing automations" in record.message for record in caplog.records)
+    assert path.read_bytes() == original
+    assert not caplog.records
+    assert "proactive_mode" not in state.current_options()
 
 
-@pytest.mark.parametrize("saved", ["invalid", "\udcff"])
-def test_invalid_persisted_mode_is_unknown(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, saved: str
-) -> None:
-    (tmp_path / "proactive_mode.txt").write_bytes(saved.encode("utf-8", errors="surrogateescape"))
-    state = _state(tmp_path, proactive_mode="on")
-    assert state.settings.proactive_mode == "on"
-    assert any("pre-existing automations" in record.message for record in caplog.records)
-
-
-def test_unwritable_mode_record_does_not_block_handover(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    # A directory at the record path causes read and replace to fail on all platforms.
+def test_retired_sidecar_directory_is_ignored(tmp_path, caplog):
     (tmp_path / "proactive_mode.txt").mkdir()
-    state = _state(tmp_path, proactive_mode="simulate")
+    state = _state(tmp_path)
     state.apply_options({"proactive_mode": "on"})
-    assert state.settings.proactive_mode == "on"
-    assert any("Could not persist proactive mode" in record.message for record in caplog.records)
-    assert any("pre-existing automations" in record.message for record in caplog.records)
+    assert not caplog.records
+    assert "proactive_mode" not in state.current_options()
 
 
 def test_config_roundtrip_persists_and_reloads(tmp_path: Path) -> None:

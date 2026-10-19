@@ -80,39 +80,6 @@ class AppState:
     plan_at: datetime | None = None
     executor: DaemonChannel | None = None
 
-    def __post_init__(self) -> None:
-        previous_mode: str | None = None
-        try:
-            saved = self._mode_path.read_text(encoding="utf-8").strip()
-            if saved in ("off", "simulate", "on"):
-                previous_mode = saved
-        except FileNotFoundError:
-            pass
-        except (OSError, UnicodeError):
-            log.warning("Could not read persisted proactive mode; treating it as unknown")
-        self._record_proactive_mode(previous_mode)
-
-    @property
-    def _mode_path(self) -> Path:
-        return self.options_path.with_name("proactive_mode.txt")
-
-    def _record_proactive_mode(self, previous_mode: str | None) -> None:
-        # An unknown first run already on is also a handover to real control.
-        if previous_mode != "on" and self.settings.proactive_mode == "on":
-            log.warning(
-                "proactive_mode transitioned from %s to on; disable any pre-existing "
-                "automations or manual schedules that write the same devices before "
-                "proceeding",
-                previous_mode or "unknown",
-            )
-        try:
-            self._mode_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self._mode_path.with_suffix(".tmp")
-            temporary.write_text(self.settings.proactive_mode, encoding="utf-8")
-            temporary.replace(self._mode_path)
-        except OSError:
-            log.warning("Could not persist proactive mode; the reminder may repeat on restart")
-
     def set_plan(self, plan: ChargePlan) -> None:
         """Record the latest computed plan (called by the daemon each run)."""
         self.plan = plan
@@ -156,7 +123,6 @@ class AppState:
         field(s) -- never an input value -- and leaves the options file
         byte-identical and the running settings exactly as they were.
         """
-        previous_mode = self.settings.proactive_mode
         current: dict[str, Any] = {}
         if self.options_path.exists():
             current = json.loads(self.options_path.read_text(encoding="utf-8"))
@@ -176,7 +142,6 @@ class AppState:
         temporary.write_text(json.dumps(current), encoding="utf-8")
         temporary.replace(self.options_path)
         self.settings = self.reload()
-        self._record_proactive_mode(previous_mode)
         return self.settings
 
 

@@ -70,6 +70,6 @@ async def test_publish_predictions_pushes_sensor(tmp_path: Path) -> None:
     assert route.called
     body = json.loads(respx.calls.last.request.content)
     assert body["state"] == "1"
-    assert body["attributes"]["proactive_mode"] == "simulate"
+    assert body["attributes"]["operating_mode"] == "authority_unknown"
     assert body["attributes"]["predictions"][0]["action"] == "reduce_overnight_charge"
     assert body["attributes"]["predictions"][0]["outcome"] == "advisory"

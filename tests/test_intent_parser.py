@@ -104,7 +104,7 @@ async def test_mode_query_needs_no_plan() -> None:
     settings = Settings(proactive_mode="simulate")
     result = await parse_offline("what proactive mode are we in?", settings, REST)  # type: ignore[arg-type]
     assert result.matched
-    assert result.text == "PROACTIVE_MODE: simulate."
+    assert result.text == "Operating mode: authority_unknown."
 
 
 async def test_window_query_needs_no_plan() -> None:

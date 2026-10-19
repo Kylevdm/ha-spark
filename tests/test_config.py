@@ -14,7 +14,6 @@ from ha_spark.config import (
     _read_options_overlay,
     load_settings,
 )
-from ha_spark.devices.base import ControlAuthority
 
 ADDON_CONFIG = Path(__file__).parent.parent / "ha_spark_addon" / "config.yaml"
 
@@ -248,7 +247,7 @@ def test_devices_synthesized_from_flat_keys_when_absent() -> None:
     assert d.id == "main_inverter"
     assert d.type == "inverter"
     assert d.driver == "solis"
-    assert d.control == ControlAuthority.HA_SPARK
+    assert "control" not in d.model_dump()
     assert d.entities["charge_current"] == "number.cc"
     assert d.entities["power_switch"] == "select.pw"
 
@@ -268,7 +267,7 @@ def test_explicit_devices_list_parses_through() -> None:
     )  # type: ignore[call-arg]
     assert len(s.devices) == 1
     assert s.devices[0].driver == "alphaess"
-    assert s.devices[0].control == ControlAuthority.OBSERVE
+    assert "control" not in s.devices[0].model_dump()
 
 
 def test_devices_in_option_keys() -> None:

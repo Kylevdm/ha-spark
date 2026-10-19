@@ -12,6 +12,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 
+from ha_spark.authority import operating_mode
 from ha_spark.config import Settings
 from ha_spark.context_intent import ExtractedContext
 from ha_spark.energy.context import ContextEntry, ContextStore
@@ -30,7 +31,7 @@ Offline, I can answer questions containing:
   soc / battery / state of charge       current battery state of charge
   solar / forecast                      served-day solar forecast
   strategy                              the configured charge strategy
-  mode / proactive                      the PROACTIVE_MODE setting
+  mode / proactive                      the site operating mode
   window                                the off-peak charge window"""
 
 
@@ -79,7 +80,7 @@ async def parse_offline(
     if _contains(text, "strategy"):
         return IntentResult(f"Charge strategy: {settings.charge_strategy}.", matched=True)
     if _contains(text, "mode", "proactive"):
-        return IntentResult(f"PROACTIVE_MODE: {settings.proactive_mode}.", matched=True)
+        return IntentResult(f"Operating mode: {operating_mode(settings)}.", matched=True)
     if _contains(text, "window"):
         return IntentResult(
             f"Charge window: {settings.charge_window_start} – {settings.charge_window_end}.",

@@ -268,7 +268,7 @@ def _device(
     notify_service: str = "",
 ) -> SolisDevice:
     settings = Settings(
-        proactive_mode="on",
+        authority_mode="optimise",
         db_path=str(tmp_path / "events.db"),
         inverter_power_switch_entity="select.solisac_power_switch",
         timezone=timezone,
@@ -520,7 +520,7 @@ async def test_discharge_readback_failure_never_leaves_an_export_window(tmp_path
 async def test_simulate_export_never_calls_home_assistant_write_services(tmp_path) -> None:
     rest = FakeRest()
     settings = Settings(
-        proactive_mode="simulate",
+        authority_mode="observe",
         db_path=str(tmp_path / "events.db"),
         inverter_power_switch_entity="select.solisac_power_switch",
     )
@@ -536,7 +536,7 @@ async def test_simulate_export_never_calls_home_assistant_write_services(tmp_pat
 async def test_untrusted_soc_refuses_export_writes(tmp_path) -> None:
     rest = FakeRest()
     settings = Settings(
-        proactive_mode="on",
+        authority_mode="optimise",
         db_path=str(tmp_path / "events.db"),
         inverter_power_switch_entity="select.solisac_power_switch",
     )
@@ -583,7 +583,7 @@ async def test_simulate_mode_notifies_of_an_accepted_event_without_claiming_a_wr
 ) -> None:
     rest = FakeRest()
     settings = Settings(
-        proactive_mode="simulate",
+        authority_mode="observe",
         db_path=str(tmp_path / "events.db"),
         inverter_power_switch_entity="select.solisac_power_switch",
         notify_service="mobile_app_phone",
@@ -1148,7 +1148,7 @@ async def test_simulate_takes_the_same_clock_decision(tmp_path) -> None:
     rest = FakeRest()
     rest.clock_state = "unavailable"
     settings = Settings(
-        proactive_mode="simulate",
+        authority_mode="observe",
         db_path=str(tmp_path / "events.db"),
         inverter_power_switch_entity="select.solisac_power_switch",
     )
@@ -1210,7 +1210,7 @@ async def test_an_overlapping_hold_is_reported_before_the_clock(tmp_path) -> Non
 
 def _simulate_device(rest: FakeRest, tmp_path) -> SolisDevice:
     settings = Settings(
-        proactive_mode="simulate",
+        authority_mode="observe",
         db_path=str(tmp_path / "events.db"),
         inverter_power_switch_entity="select.solisac_power_switch",
     )

@@ -12,7 +12,7 @@ import respx
 
 import ha_spark.devices.inverters.solis as solis_driver
 from ha_spark.devices import get_device, inverter_device
-from ha_spark.devices.base import Capability, ControlAuthority
+from ha_spark.devices.base import Capability
 from ha_spark.devices.inverters.alphaess import AlphaESSDevice
 from ha_spark.devices.inverters.solis import SolisDevice, solis_current_a
 from ha_spark.energy.horizon import compute_horizon_geometry
@@ -29,7 +29,7 @@ def _settings(**overrides: object) -> Settings:
     defaults: dict[str, object] = {
         "ha_url": "http://ha.test",
         "ha_token": "t",
-        "proactive_mode": "simulate",
+        "authority_mode": "observe",
         "charge_current_entity": "number.solisac_timed_charge_current",
         "inverter_power_switch_entity": "select.solisac_power_switch",
     }
@@ -38,25 +38,23 @@ def _settings(**overrides: object) -> Settings:
 
 
 def _solis_device(
-    s: Settings, rest: HomeAssistantRest, *, control: str = "ha_spark"
+    s: Settings, rest: HomeAssistantRest, *, authority_mode: str | None = None
 ) -> SolisDevice:
     """SolisDevice over the DeviceConfig Settings synthesizes from its own flat
     entity fields, so respx mocks built against s.charge_current_entity etc.
     line up with the entities SolisDevice actually reads/writes."""
     config = s.devices[0]
-    if control != "ha_spark":
-        config = config.model_copy(update={"control": ControlAuthority(control)})
-        seed_authority(s, "observe")
+    if authority_mode is not None:
+        seed_authority(s, authority_mode)
     return SolisDevice(config, s, rest)
 
 
 def _alpha_device(
-    s: Settings, rest: HomeAssistantRest, *, control: str = "ha_spark"
+    s: Settings, rest: HomeAssistantRest, *, authority_mode: str | None = None
 ) -> AlphaESSDevice:
     config = s.devices[0]
-    if control != "ha_spark":
-        config = config.model_copy(update={"control": ControlAuthority(control)})
-        seed_authority(s, "observe")
+    if authority_mode is not None:
+        seed_authority(s, authority_mode)
     return AlphaESSDevice(config, s, rest)
 
 
@@ -302,7 +300,7 @@ async def test_solis_current_line_names_the_hours_sized_over() -> None:
     )
     at = datetime(2026, 10, 4, 2, 30, tzinfo=UTC)  # 03:30 BST
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await _solis_device(s, rest, control="observe").apply(
+        lines = await _solis_device(s, rest, authority_mode="observe").apply(
             _intent(target_soc=70.0, soc=_soc(56.0, at))
         )
     assert any("timed charge current to 41 A over 2.0 h" in line for line in lines), lines
@@ -317,9 +315,9 @@ def test_solis_capabilities_include_rate() -> None:
 @respx.mock
 async def test_solis_observe_authority_never_writes_even_when_on() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        lines = await _solis_device(s, rest, control="observe").apply(_intent())
+        lines = await _solis_device(s, rest, authority_mode="observe").apply(_intent())
     assert posts.call_count == 0  # observe authority suppresses the write despite "on"
     assert any("[SIMULATE]" in line for line in lines)
 
@@ -329,7 +327,7 @@ async def test_apply_writes_window_block_and_current_natively() -> None:
     write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(200, json=[])
     )
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     intent = _intent()  # 23:30 -> 05:30
     expected_a = round(solis_current_a(intent, s))
     # Current is confirmed before the previously inactive slot is written.
@@ -357,7 +355,7 @@ async def test_apply_skips_writes_when_already_set() -> None:
     write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(200, json=[])
     )
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     intent = _intent()
     expected_a = round(solis_current_a(intent, s))
     # Everything already at target: no writes (register endurance).
@@ -373,7 +371,7 @@ async def test_apply_zero_guards_a_stale_nondriven_slot() -> None:
     write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(200, json=[])
     )
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     intent = _intent()
     expected_a = round(solis_current_a(intent, s))
     # Slot 1 already set (no write); slot 2 carries a stale manual window.
@@ -393,7 +391,7 @@ async def test_apply_blocks_when_grid_charge_not_permitted() -> None:
     write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(200, json=[])
     )
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     # bitfield 3 == 0b11: bit 5 (grid charge) unset -> refuse the force.
     _mock_native(bitfield="3")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
@@ -408,7 +406,7 @@ async def test_apply_blocks_when_grid_charge_not_permitted() -> None:
 @respx.mock
 async def test_simulate_makes_no_service_calls() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = _settings(proactive_mode="simulate")
+    s = _settings(authority_mode="observe")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(_intent())
     assert posts.call_count == 0
@@ -420,7 +418,7 @@ async def test_on_applies_and_verifies_read_back() -> None:
     respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(200, json=[])
     )
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     intent = _intent()
     expected_a = round(solis_current_a(intent, s))
     want = [23, 30, 5, 30, 0, 0, 0, 0]
@@ -443,7 +441,7 @@ async def test_on_applies_and_verifies_read_back() -> None:
 @respx.mock
 async def test_on_warns_when_read_back_mismatches() -> None:
     respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     intent = _intent()
     # Current applies; slot 1 remains stale after its write and exhausts the
     # bounded fresh-read attempts.
@@ -463,7 +461,7 @@ async def test_on_warns_when_read_back_read_fails() -> None:
     # Work-mode assert reads fine; the slot read-backs fail.
     _get(_sensor("work_mode_bitfield"), "35")
     respx.route(method="GET").mock(return_value=httpx.Response(500))
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(_intent())
     current_line = next(line for line in lines if "charge current" in line)
@@ -477,7 +475,7 @@ async def test_on_isolates_action_failures() -> None:
     respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(500)
     )
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     _mock_native(slot1=[0] * 8, current="0.0")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(_intent())
@@ -493,7 +491,7 @@ async def test_apply_does_not_activate_new_window_when_current_write_fails() -> 
     write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(500)
     )
-    s = _settings(proactive_mode="on", max_charge_current_a=10.0)
+    s = _settings(authority_mode="optimise", max_charge_current_a=10.0)
     _mock_native(slot1=[0] * 8, current="60.0")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(_intent(target_soc=90.0))
@@ -515,7 +513,7 @@ async def test_apply_leaves_already_active_window_when_current_verification_fail
     refresh = respx.post(
         "http://ha.test/api/services/homeassistant/update_entity"
     ).mock(return_value=httpx.Response(200, json=[]))
-    s = _settings(proactive_mode="on", max_charge_current_a=10.0)
+    s = _settings(authority_mode="optimise", max_charge_current_a=10.0)
     # Slot 1 is active at 60 A: two active pre-reads precede the write, then six
     # matching zero reads confirm it before the current transition.
     _mock_native(slot1=[23, 30, 5, 30, 0, 0, 0, 0], current="60.0")
@@ -546,7 +544,7 @@ async def test_apply_blocks_current_when_active_window_cannot_be_deactivated() -
     refresh = respx.post(
         "http://ha.test/api/services/homeassistant/update_entity"
     ).mock(return_value=httpx.Response(200, json=[]))
-    s = _settings(proactive_mode="on", max_charge_current_a=10.0)
+    s = _settings(authority_mode="optimise", max_charge_current_a=10.0)
     _mock_native(slot1=[23, 30, 5, 30, 0, 0, 0, 0], current="60.0")
     for field, value in zip(_WINDOW_FIELDS, [23, 30, 5, 30, 0, 0, 0, 0], strict=True):
         _get_seq(_sensor(field), [str(value)] * 5)
@@ -572,7 +570,7 @@ async def test_current_verification_refreshes_and_retries_after_delayed_update()
     refresh = respx.post(
         "http://ha.test/api/services/homeassistant/update_entity"
     ).mock(return_value=httpx.Response(200, json=[]))
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     _get_seq(_sensor("timed_charge_current"), ["0.0", "0.0", "40.0"])
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         line = await _solis_device(s, rest).set_charge_rate(2040.0)
@@ -609,7 +607,7 @@ async def test_current_write_is_confirmed_when_the_overlay_settles_after_five_se
     clock = _virtual_clock(monkeypatch)
     respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     _settles_after(_sensor("timed_charge_current"), clock, 5.2, "0.0", "40.0")
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         line = await _solis_device(s, rest).set_charge_rate(2040.0)
     assert line.startswith("[APPLIED]")
@@ -627,7 +625,7 @@ async def test_current_verification_is_bounded_when_overlay_stays_stale(
     refresh = respx.post(
         "http://ha.test/api/services/homeassistant/update_entity"
     ).mock(return_value=httpx.Response(200, json=[]))
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     _get(_sensor("timed_charge_current"), "0.0")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         line = await _solis_device(s, rest).set_charge_rate(2040.0)
@@ -644,7 +642,7 @@ async def test_on_blocks_all_writes_when_soc_invalid() -> None:
     # The power-switch reconcile is exempt from the SoC guard (#140); park it in
     # its desired state so this test stays about charge programming alone.
     _get("select.solisac_power_switch", "On")
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     intent = _intent(soc=_bad_soc())
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(intent)
@@ -695,7 +693,7 @@ async def test_on_blocks_writes_for_every_failed_status(
     """Any failed integrity status blocks real writes and names its own reason."""
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     _get("select.solisac_power_switch", "On")  # see #140: reconcile is exempt
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(_intent(soc=measurement))
 
@@ -718,7 +716,7 @@ async def test_alphaess_on_blocks_writes_for_a_stale_soc() -> None:
         age_s=900.0,
         max_age_s=600.0,
     )
-    s = _settings(proactive_mode="on", inverter="alphaess")
+    s = _settings(authority_mode="optimise", inverter="alphaess")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _alpha_device(s, rest).apply(_intent(soc=stale))
 
@@ -731,7 +729,7 @@ async def test_alphaess_on_blocks_writes_for_a_stale_soc() -> None:
 async def test_on_does_not_block_genuine_zero_soc() -> None:
     """A real 0% reading (soc ok) must NOT be blocked -- that's exactly
     the moment a real charge is most needed."""
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     intent = _intent(soc=_soc(0))
     _mock_native(slot1=[0] * 8, current="0.0")
     expected_a = round(solis_current_a(intent, s))
@@ -746,7 +744,7 @@ async def test_on_does_not_block_genuine_zero_soc() -> None:
 async def test_on_blocks_all_writes_when_soc_invalid_despite_a_projection() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     _get("select.solisac_power_switch", "On")
-    s = _settings(proactive_mode="on")
+    s = _settings(authority_mode="optimise")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(_expecting(40.0, soc=_bad_soc()))
     assert posts.call_count == 0
@@ -756,7 +754,7 @@ async def test_on_blocks_all_writes_when_soc_invalid_despite_a_projection() -> N
 @respx.mock
 async def test_simulate_unaffected_by_invalid_soc() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = _settings(proactive_mode="simulate")
+    s = _settings(authority_mode="observe")
     intent = _intent(soc=_bad_soc())
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(intent)
@@ -765,7 +763,7 @@ async def test_simulate_unaffected_by_invalid_soc() -> None:
 
 
 async def test_off_mode_computes_without_calls() -> None:
-    s = _settings(proactive_mode="off")
+    s = _settings(authority_mode="observe")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _solis_device(s, rest).apply(_intent())
     assert all("SIMULATE" in line or "SKIP" in line for line in lines)
@@ -833,7 +831,7 @@ async def test_set_charge_rate_writes_current_natively_and_applies() -> None:
     write = respx.post("http://ha.test/api/services/modbus/write_register").mock(
         return_value=httpx.Response(200, json=[])
     )
-    s = _settings(proactive_mode="on", battery_voltage_v=51.0)
+    s = _settings(authority_mode="optimise", battery_voltage_v=51.0)
     # 2040 W / 51 V = 40 A; decide reads 0 -> write, verify reads 40.
     _mock_refresh()
     _get_seq(_sensor("timed_charge_current"), ["0.0", "40.0"])
@@ -889,7 +887,7 @@ async def test_alphaess_apply_writes_window_and_stop_soc() -> None:
     route = respx.post("http://ha.test/api/services/alphaess/setbatterycharge").mock(
         return_value=httpx.Response(200, json=[])
     )
-    s = _settings(inverter="alphaess", proactive_mode="on", alphaess_serial="ABC123")
+    s = _settings(inverter="alphaess", authority_mode="optimise", alphaess_serial="ABC123")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _alpha_device(s, rest).apply(_intent(target_soc=80.0))
     assert route.called
@@ -907,7 +905,7 @@ async def test_alphaess_apply_writes_window_and_stop_soc() -> None:
 @respx.mock
 async def test_alphaess_apply_simulate_makes_no_call() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = _settings(inverter="alphaess", proactive_mode="simulate")
+    s = _settings(inverter="alphaess", authority_mode="observe")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _alpha_device(s, rest).apply(_intent())
     assert posts.call_count == 0
@@ -915,7 +913,7 @@ async def test_alphaess_apply_simulate_makes_no_call() -> None:
 
 
 async def test_alphaess_apply_off_mode_computes_without_calls() -> None:
-    s = _settings(inverter="alphaess", proactive_mode="off")
+    s = _settings(inverter="alphaess", authority_mode="observe")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _alpha_device(s, rest).apply(_intent())
     assert "[SIMULATE]" in lines[0]
@@ -924,7 +922,7 @@ async def test_alphaess_apply_off_mode_computes_without_calls() -> None:
 @respx.mock
 async def test_alphaess_apply_blocks_when_soc_invalid() -> None:
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
-    s = _settings(inverter="alphaess", proactive_mode="on")
+    s = _settings(inverter="alphaess", authority_mode="optimise")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _alpha_device(s, rest).apply(_intent(soc=_bad_soc()))
     assert posts.call_count == 0
@@ -933,7 +931,7 @@ async def test_alphaess_apply_blocks_when_soc_invalid() -> None:
 
 @respx.mock
 async def test_alphaess_apply_does_not_block_genuine_zero_soc() -> None:
-    s = _settings(inverter="alphaess", proactive_mode="on", alphaess_serial="SN123")
+    s = _settings(inverter="alphaess", authority_mode="optimise", alphaess_serial="SN123")
     respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _alpha_device(s, rest).apply(_intent(soc=_soc(0)))
@@ -945,7 +943,7 @@ async def test_alphaess_apply_isolates_failure() -> None:
     respx.post("http://ha.test/api/services/alphaess/setbatterycharge").mock(
         return_value=httpx.Response(500)
     )
-    s = _settings(inverter="alphaess", proactive_mode="on", alphaess_serial="ABC123")
+    s = _settings(inverter="alphaess", authority_mode="optimise", alphaess_serial="ABC123")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         lines = await _alpha_device(s, rest).apply(_intent())
     assert "[FAILED]" in lines[0]

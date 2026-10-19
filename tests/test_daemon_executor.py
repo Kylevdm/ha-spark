@@ -22,13 +22,16 @@ from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 from ha_spark.energy import scheduler
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+from tests.authority_helpers import seed_authority
 
 
 def settings_at(path: Path, **kwargs: object) -> Settings:
-    return Settings(  # type: ignore[arg-type]
+    settings = Settings(  # type: ignore[arg-type]
         ha_url="http://ha.test", ha_token="SECRET", db_path=str(path / "t.db"),
-        proactive_mode="on", agent_surface="on", agent_exposure="read_act", **kwargs,
+        agent_surface="on", agent_exposure="read_act", **kwargs,
     )
+    seed_authority(settings, "optimise")
+    return settings
 
 
 async def invoke(caller: str, settings: Settings, state: AppState) -> object:

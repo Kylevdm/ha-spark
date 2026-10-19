@@ -17,7 +17,6 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from ha_spark.devices.base import ControlAuthority
 from ha_spark.devices.inverters.alphaess import AlphaESSDevice
 from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.energy.export_store import ExportEventStore
@@ -25,7 +24,6 @@ from ha_spark.energy.models import ChargeIntent, ExportIntent
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.ha.models import EntityState
 from tests.authority_helpers import legacy_settings as Settings
-from tests.authority_helpers import seed_authority
 
 
 @pytest.fixture(autouse=True)
@@ -155,21 +153,17 @@ def _device(
     tmp_path,
     *,
     mode: str = "on",
-    control: ControlAuthority | None = None,
+    authority_mode: str | None = None,
     **settings_kw: str,
 ) -> SolisDevice:
     settings = Settings(
-        proactive_mode=mode,
+        authority_mode=authority_mode or ("optimise" if mode == "on" else "observe"),
         db_path=str(tmp_path / "events.db"),
         inverter_power_switch_entity=_SWITCH,
         timezone="Europe/London",
         **settings_kw,  # type: ignore[arg-type]
     )
     config = settings.devices[0]
-    if control is not None:
-        config = config.model_copy(update={"control": control})
-        if control != ControlAuthority.HA_SPARK:
-            seed_authority(settings, "observe")
     return SolisDevice(config, settings, rest)  # type: ignore[arg-type]
 
 
@@ -327,8 +321,8 @@ async def test_untrusted_soc_still_reconciles_but_blocks_charge_programming(tmp_
     [
         ("simulate", None),
         ("off", None),
-        # "observe": real proactive mode, but authority is not ha-spark.
-        ("on", ControlAuthority.OBSERVE),
+        # Former per-device Observe case now uses explicit site authority.
+        ("on", "observe"),
     ],
 )
 @pytest.mark.asyncio
@@ -336,7 +330,7 @@ async def test_unauthorized_modes_compute_the_reconcile_without_writing(
     tmp_path, mode, control
 ) -> None:
     rest = FakeRest(switch="On")
-    device = _device(rest, tmp_path, mode=mode, control=control)
+    device = _device(rest, tmp_path, mode=mode, authority_mode=control)
 
     lines = await _reconcile(device, _intent(holds=(_window(-10),)))
 
@@ -650,7 +644,7 @@ async def test_safe_state_in_simulate_writes_nothing(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_safe_state_under_observe_writes_nothing(tmp_path) -> None:
     rest = FakeRest(switch="Off")
-    device = _device(rest, tmp_path, control=ControlAuthority.OBSERVE)
+    device = _device(rest, tmp_path, authority_mode="observe")
 
     lines = await device.write_safe_state()
 
@@ -790,18 +784,18 @@ async def test_fallback_without_configuration_leaves_resident_program_untouched(
     [
         ("simulate", None, "[SIMULATE] Solis fallback"),
         ("off", None, "[SIMULATE] Solis fallback"),
-        ("on", ControlAuthority.SUPPLIER, "[SIMULATE] Solis fallback"),
+        ("on", "observe", "[SIMULATE] Solis fallback"),
     ],
 )
 async def test_fallback_without_write_authority_is_preview_or_skip(
-    tmp_path, mode: str, control: ControlAuthority | None, expected_prefix: str
+    tmp_path, mode: str, control: str | None, expected_prefix: str
 ) -> None:
     rest = FakeRest(switch="On")
     device = _device(
         rest,
         tmp_path,
         mode=mode,
-        control=control,
+        authority_mode=control,
         solis_fallback_current_a="45",
     )
 
@@ -917,10 +911,10 @@ async def test_verified_fallback_write_if_changed_avoids_register_churn(tmp_path
 
 @pytest.mark.parametrize(
     ("mode", "control"),
-    [("on", ControlAuthority.SUPPLIER)],
+    [("on", "observe")],
 )
-async def test_fallback_keeps_proactive_mode_and_control_ownership_gates(
-    tmp_path, mode: str, control: ControlAuthority | None
+async def test_fallback_keeps_site_operating_mode_gate(
+    tmp_path, mode: str, control: str | None
 ) -> None:
     rest = FakeRest(switch="On")
     failed_soc = replace(_soc(), status=SocStatus.STALE)
@@ -928,7 +922,7 @@ async def test_fallback_keeps_proactive_mode_and_control_ownership_gates(
         rest,
         tmp_path,
         mode=mode,
-        control=control,
+        authority_mode=control,
         solis_fallback_current_a="45",
     )
 

@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ha_spark.authority import AuthorityStore, authority_view
+from ha_spark.authority import AuthorityStore, authority_view, operating_mode
 from ha_spark.config import Settings
 from ha_spark.devices.inverters.solis import fallback_charge_current_a
 from ha_spark.energy.models import ChargePlan
@@ -60,7 +60,7 @@ def plan_to_payload(plan: ChargePlan, settings: Settings) -> list[Entity]:
     plan_status_attributes: dict[str, Any] = {
         "friendly_name": "ha-spark plan status",
         "strategy": plan.strategy,
-        "proactive_mode": settings.proactive_mode,
+        "operating_mode": operating_mode(settings),
         "soc_status": plan.soc.status.value,
         "soc_reason": plan.soc.reason,
     }
@@ -235,7 +235,7 @@ async def publish_soc_integrity(
                     ),
                     "soc_age_s": m.age_s,
                     "soc_max_age_s": m.max_age_s,
-                    "proactive_mode": settings.proactive_mode,
+                    "operating_mode": operating_mode(settings),
                     "fallback_window_start": settings.charge_window_start,
                     "fallback_window_end": settings.charge_window_end,
                     "fallback_supported": fallback_supported,
@@ -271,7 +271,7 @@ async def publish_predictions(
     """Surface the orchestrator's decisions as sensor.ha_spark_predictions (best-effort)."""
     attrs: dict[str, Any] = {
         "friendly_name": "ha-spark predictions",
-        "proactive_mode": settings.proactive_mode,
+        "operating_mode": operating_mode(settings),
         "predictions": [
             {
                 "action": d.action,

@@ -273,7 +273,7 @@ add-on, so it never uses the fallback charging schedule.
 
 **Optimise**:
 An operating mode that authorises the full automatic energy plan, subject to
-control authority and safety checks.
+safety checks. Settings and device definitions cannot grant this authority.
 
 **Temporary manual control**:
 An explicit handover of the site's controls to the owner. It expires by
