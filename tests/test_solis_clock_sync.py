@@ -7,9 +7,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from ha_spark.config import Settings
 from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.ha.models import EntityState
+from tests.authority_helpers import legacy_settings as Settings
 
 
 @pytest.fixture(autouse=True)

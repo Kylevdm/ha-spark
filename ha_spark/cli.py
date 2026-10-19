@@ -17,6 +17,7 @@ from pathlib import Path
 
 import yaml
 
+from ha_spark.authority import authority_view, load_authority
 from ha_spark.config import ConfigError, Settings, load_settings
 from ha_spark.daemon_channel import REFUSED, DaemonAlreadyRunning, Reply, submit_socket
 from ha_spark.dashboard import build_dashboard
@@ -208,7 +209,7 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
         reply = await submit_socket(settings, "apply")
         if reply is not None:
             _print_reply(reply)
-            return 0
+            return 1 if reply.error else 0
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
@@ -695,6 +696,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
+    p_mode = sub.add_parser("mode", help="Read operating-mode authority")
+    p_mode.add_subparsers(dest="mode_command", required=True).add_parser("show")
+
     p_states = sub.add_parser(
         "states",
         help="List Home Assistant entity states",
@@ -972,6 +976,14 @@ def main(argv: list[str] | None = None) -> int:
     # add-on options overlay so the configured endpoints are probed) and let the
     # checks themselves report what's wrong. Quiet logs keep the report clean —
     # failure detail is carried in each check result.
+    if args.command == "mode":
+        settings = load_settings(validate=False)
+        loaded = load_authority(settings)
+        view = authority_view(loaded.state, known=loaded.status == "known")
+        view["load_status"] = loaded.status
+        print(json.dumps(view, indent=2))
+        return 0
+
     if args.command == "health":
         settings = load_settings(validate=False)
         setup_logging("WARNING")

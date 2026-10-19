@@ -1,6 +1,6 @@
-"""Internal site authority persistence; not yet consulted by any write gate.
+"""Internal site authority persistence, owned by the daemon's write gate.
 
-Only the future daemon writer may initialise or save. Readers never create or
+Only the daemon writer may initialise or save. Readers never create or
 repair files. The separate marker binds a store UUID, not an epoch (which changes
 on ordinary saves). Neither legacy proactive_mode nor device control is authority.
 """
@@ -11,7 +11,7 @@ import os
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
@@ -113,6 +113,28 @@ def load_authority(settings: Settings) -> AuthorityLoadResult:
     return _load(directory / "authority.json", directory / "authority.marker.json")
 
 
+def authority_view(
+    state: AuthorityState | None, *, known: bool, save_failed: bool = False
+) -> dict[str, Any]:
+    """Public, secret-free authority status shared by sensors and health."""
+    transition = state.transition if state is not None else None
+    return {
+        "mode": state.committed_mode if known and state is not None else "authority_unknown",
+        "epoch": state.epoch if state is not None else None,
+        "transition": transition.model_dump(mode="json") if transition else None,
+        "transition_target": transition.target if transition else None,
+        "transition_state": "pending" if transition else None,
+        "failing_actions": list(transition.failing_actions) if transition else [],
+        "holds": [hold.model_dump(mode="json") for hold in state.holds] if state else [],
+        "fallback": state.fallback.model_dump(mode="json") if state else {
+            "active": False, "causes": [],
+        },
+        "last_changed_at": state.last_changed_at.isoformat() if state else None,
+        "requester_kind": state.requester_kind if state else None,
+        "save_failed": save_failed,
+    }
+
+
 def _durable_write(path: Path, payload: str) -> None:
     """Replace atomically, then persist the directory entry; errors propagate.
 
@@ -147,10 +169,54 @@ class AuthorityStore:
         self.store_path = directory / "authority.json"
         self.marker_path = directory / "authority.marker.json"
         self._state = _load(self.store_path, self.marker_path).state
+        self.save_failed = False
+        self._pending: AuthorityState | None = None
+        self._initialising = False
 
     @property
     def state(self) -> AuthorityState | None:
         return self._state
+
+    @property
+    def known(self) -> bool:
+        """Known only while disk holds exactly this writer's state; any divergence fails closed."""
+        if self._state is None:
+            return False
+        loaded = _load(self.store_path, self.marker_path)
+        return loaded.status == "known" and loaded.state == self._state
+
+    def start_process(self) -> None:
+        """Initialise Observe or fence work from an earlier daemon process."""
+        if self.known:
+            assert self.state is not None
+            self._pending = self.state.model_copy(update={"epoch": self.state.epoch + 1})
+            self.save(self._pending)
+        else:
+            self.initialise()
+
+    def retry_pending(self) -> None:
+        # Only this process's own failed candidate is retried; never re-initialise.
+        if self._pending is not None:
+            if self._initialising:
+                self._persist_initial(self._pending)
+            else:
+                self.save(self._pending)
+
+    def _persist_initial(self, state: AuthorityState) -> None:
+        self._pending = state
+        self._initialising = True
+        try:
+            self.store_path.parent.mkdir(parents=True, exist_ok=True)
+            _durable_write(self.store_path, state.model_dump_json())
+            marker = _Marker(schema_version=1, store_id=state.store_id)
+            _durable_write(self.marker_path, marker.model_dump_json())
+        except (OSError, ValueError):
+            self.save_failed = True
+            raise
+        self._state = state
+        self.save_failed = False
+        self._pending = None
+        self._initialising = False
 
     def initialise(self) -> AuthorityLoadResult:
         result = _load(self.store_path, self.marker_path)
@@ -162,19 +228,22 @@ class AuthorityStore:
             epoch=1, holds=(), fallback=FallbackState(), readiness_notice=ReadinessNoticeState(),
             last_changed_at=datetime.now(UTC), requester_kind="system",
         )
-        self.store_path.parent.mkdir(parents=True, exist_ok=True)
-        _durable_write(self.store_path, state.model_dump_json())
-        marker = _Marker(schema_version=1, store_id=state.store_id)
-        _durable_write(self.marker_path, marker.model_dump_json())
-        self._state = state
+        self._persist_initial(state)
         return AuthorityLoadResult(status="known", state=state)
 
     def save(self, state: AuthorityState) -> None:
         # model_copy(update=...) deliberately bypasses pydantic validation, so
         # validate even a model instance before allowing anything onto disk.
-        candidate = AuthorityState.model_validate_json(state.model_dump_json())
-        current = _load(self.store_path, self.marker_path)
-        if current.state is None or current.state.store_id != candidate.store_id:
-            raise ValueError("Cannot save unknown or mismatched authority")
-        _durable_write(self.store_path, candidate.model_dump_json())
+        self._pending = state
+        try:
+            candidate = AuthorityState.model_validate_json(state.model_dump_json())
+            current = _load(self.store_path, self.marker_path)
+            if current.state is None or current.state.store_id != candidate.store_id:
+                raise ValueError("Cannot save unknown or mismatched authority")
+            _durable_write(self.store_path, candidate.model_dump_json())
+        except (OSError, ValueError):
+            self.save_failed = True
+            raise
         self._state = candidate
+        self.save_failed = False
+        self._pending = None

@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from ha_spark.config import Settings
+from ha_spark.devices.execution import Ownership
 from ha_spark.devices.inverters.solis import (
     SolisDevice,
     _export_not_yet_armed,
@@ -17,6 +17,7 @@ from ha_spark.energy.models import ChargeIntent, ExportIntent
 from ha_spark.energy.scheduler import setpoint_changed
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.ha.models import EntityState
+from tests.authority_helpers import legacy_settings as Settings
 
 
 @pytest.fixture(autouse=True)
@@ -399,10 +400,13 @@ async def test_held_zero_slot_preread_skips_only_after_confirmation(tmp_path) ->
 @pytest.mark.asyncio
 async def test_transient_zero_generic_slot_preread_does_not_skip_write(tmp_path) -> None:
     rest = SequencedSlotBlockRest([[0] * len(_SLOT_FIELDS)])
+    device = _device(rest, tmp_path)
 
-    wrote, _zero_confirmed = await _device(rest, tmp_path)._apply_slot_block(
-        1, [0] * len(_SLOT_FIELDS)
-    )
+    # Writes happen only inside a held action, as every production caller makes them.
+    async with device._coordinator.action(
+        device._execution.gate, Ownership.CHARGING, device._config, device._settings
+    ):
+        wrote, _zero_confirmed = await device._apply_slot_block(1, [0] * len(_SLOT_FIELDS))
 
     assert wrote
     assert any(

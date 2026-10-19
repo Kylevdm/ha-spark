@@ -13,15 +13,15 @@ import socket
 import struct
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from ha_spark.authority import resolve_data_dir
+from ha_spark.authority import AuthorityStore, authority_view, resolve_data_dir
 from ha_spark.config import Settings
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 
-Op = Literal["replan", "apply", "sync_clock"]
+Op = Literal["replan", "apply", "sync_clock", "authority_status"]
 REFUSED = "[REFUSED] no ha-spark daemon running; hardware writes happen only inside the daemon"
 
 
@@ -49,6 +49,7 @@ class Reply(BaseModel):
     lines: list[Line] = Field(default_factory=list)
     plan: list[dict[str, object]] = Field(default_factory=list)
     synced: bool = False
+    authority: dict[str, Any] | None = None
     error: str | None = None
 
 
@@ -71,6 +72,7 @@ class Pending:
 class DaemonChannel:
     def __init__(self, settings: Settings) -> None:
         self.path = resolve_data_dir(settings) / "ha_spark.sock"
+        self.authority: AuthorityStore | None = None
         self.queue: asyncio.Queue[Pending] = asyncio.Queue(maxsize=64)
         self._fd: int | None = None
         self._server: asyncio.AbstractServer | None = None
@@ -117,7 +119,16 @@ class DaemonChannel:
             os.close(self._fd)
             self._fd = None
 
+    def authority_status(self) -> dict[str, Any]:
+        store = self.authority
+        return authority_view(
+            store.state if store else None, known=store.known if store else False,
+            save_failed=store.save_failed if store else False,
+        )
+
     async def submit(self, op: Op) -> Reply:
+        if op == "authority_status":
+            return Reply(authority=self.authority_status())
         if self._server is None or not self._server.is_serving():
             return Reply(error="daemon stopped")
         future = asyncio.get_running_loop().create_future()

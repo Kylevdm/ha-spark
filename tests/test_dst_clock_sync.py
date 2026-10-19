@@ -7,10 +7,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from ha_spark.config import Settings
 from ha_spark.devices.base import ControlAuthority
 from ha_spark.energy.dst_clock_sync import DstClockSync, last_clock_change
 from ha_spark.ha.models import EntityState
+from tests.authority_helpers import legacy_settings as Settings
+from tests.authority_helpers import seed_authority
 
 
 @pytest.fixture(autouse=True)
@@ -180,6 +181,7 @@ async def test_without_control_authority_it_never_writes() -> None:
     settings = _settings()
     observe = {"control": ControlAuthority.OBSERVE}
     settings.devices[0] = settings.devices[0].model_copy(update=observe)
+    seed_authority(settings, "observe")
 
     await DstClockSync().run(settings, rest, _at(0))  # type: ignore[arg-type]
 

@@ -31,6 +31,7 @@ from fastapi.routing import APIRoute
 
 from ha_spark.agent import auth, tools
 from ha_spark.agent.exposure import OPERATION_TIERS, allowed, surface_on
+from ha_spark.authority import authority_view, load_authority
 from ha_spark.config import (
     _OPTION_KEYS,
     _SECRET_OPTION_KEYS,
@@ -377,7 +378,16 @@ def build_app(
     async def health(request: Request) -> dict[str, Any]:
         """Liveness + whether a plan has been computed yet (full doctor stays in the CLI)."""
         st = _state_of(request)
-        return {"status": "ok", "plan_at": _iso(st.plan_at)}
+        if st.executor is not None:
+            authority = st.executor.authority_status()
+        else:
+            loaded = load_authority(st.settings)
+            authority = authority_view(loaded.state, known=loaded.status == "known")
+        failed = authority["mode"] == "authority_unknown" or authority["save_failed"]
+        return {
+            "status": "fail" if failed else "ok", "plan_at": _iso(st.plan_at),
+            "operating_mode": authority["mode"], "authority": authority,
+        }
 
     @app.get("/api/plan")
     async def get_plan(request: Request) -> dict[str, Any]:

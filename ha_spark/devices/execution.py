@@ -1,7 +1,7 @@
 """Process-shared permission seam and indivisible, reentrant inverter bus actions.
 
-The gate deliberately delegates to the legacy predicate: ownership is descriptive,
-not new authority. Acquire before prerequisite reads and hold through read-back.
+The daemon binds the sole authority store. Unbound callers fail closed. Planned
+epochs are checked under the bus lock before prerequisite reads and read-back.
 Factories and direct driver construction use the same default context. Coordinators
 keep loop-local locks (CLI/tests may run successive event loops); the daemon uses
 one event loop, and no lock is held across loops or shared with another process.
@@ -9,17 +9,17 @@ one event loop, and no lock is held across loops or shared with another process.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Coroutine
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, Protocol, TypeVar
 from weakref import WeakKeyDictionary
 
-from ha_spark.devices.base import effective_mode
-
 if TYPE_CHECKING:
+    from ha_spark.authority import AuthorityStore
     from ha_spark.config import DeviceConfig, Settings
 
 
@@ -30,10 +30,34 @@ class Ownership(StrEnum):
 
 
 class WriteGate:
-    """The only permission implementation; no operating-mode authority yet."""
+    """The only permission implementation; legacy keys grant nothing."""
+
+    def __init__(self, context: ExecutionContext) -> None:
+        self.context = context
 
     def mode_for(self, ownership: Ownership, config: DeviceConfig, settings: Settings) -> str:
-        return effective_mode(config.control, settings.proactive_mode)
+        store = self.context.authority
+        if store is None or store.save_failed or not store.known:
+            return "refuse:authority unknown"
+        state = store.state
+        assert state is not None
+        if state.transition is not None:
+            return "refuse:not owned"
+        if self.context.planned_epoch.get() != state.epoch:
+            return "refuse:stale authority"
+        if state.committed_mode == "observe":
+            return "simulate"
+        if state.committed_mode == "protect" and ownership == Ownership.CHARGING:
+            return "simulate"
+        return "on"
+
+    def recheck(self, ownership: Ownership, config: DeviceConfig, settings: Settings) -> str:
+        """Write-time re-evaluation under the held lock: the same rules, not a new decision."""
+        return self.mode_for(ownership, config, settings)
+
+
+class AuthorityRevoked(RuntimeError):
+    """Authority no longer permits the write this action was granted; nothing was sent."""
 
 
 @dataclass
@@ -41,6 +65,7 @@ class _BusState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     owner: asyncio.Task[Any] | None = None
     modes: list[str] = field(default_factory=list)
+    checks: list[Callable[[], str]] = field(default_factory=list)
     decisions: dict[tuple[Ownership, int, int], str] = field(default_factory=dict)
 
 
@@ -63,6 +88,20 @@ class BusCoordinator:
             raise RuntimeError("Device permission requested outside a held action")
         return state.modes[-1]
 
+    def confirm_write(self) -> None:
+        """Re-ask the gate immediately before an actuating call; raise unless still "on".
+
+        The cached decision covers presentation and prerequisite reads only. Authority
+        can change while they await (store deleted, save failed, epoch moved), so every
+        hardware write re-checks under the held lock and is never sent on a stale grant.
+        """
+        state = self._state()
+        if state.owner is not asyncio.current_task() or not state.checks:
+            raise RuntimeError("Device write requested outside a held action")
+        mode = state.checks[-1]()
+        if mode != "on" or state.modes[-1] != "on":
+            raise AuthorityRevoked(mode.removeprefix("refuse:"))
+
     @asynccontextmanager
     async def action(
         self, gate: WriteGate, ownership: Ownership, config: DeviceConfig, settings: Settings
@@ -78,9 +117,11 @@ class BusCoordinator:
             if key not in state.decisions:
                 state.decisions[key] = gate.mode_for(ownership, config, settings)
             state.modes.append(state.decisions[key])
+            state.checks.append(lambda: gate.recheck(ownership, config, settings))
             try:
                 yield
             finally:
+                state.checks.pop()
                 state.modes.pop()
         finally:
             if outer:
@@ -93,8 +134,20 @@ class ExecutionContext:
     """A gate and the coordinators shared by every construction path."""
 
     def __init__(self) -> None:
-        self.gate = WriteGate()
+        self.authority: AuthorityStore | None = None
+        self.planned_epoch: ContextVar[int | None] = ContextVar("planned_epoch", default=None)
+        self.gate = WriteGate(self)
         self._buses: dict[tuple[str, str, str], BusCoordinator] = {}
+
+    @contextmanager
+    def planning(self) -> Iterator[None]:
+        """Capture before computing work; never fill in a missing epoch at action time."""
+        state = self.authority.state if self.authority is not None else None
+        token = self.planned_epoch.set(state.epoch if state is not None else None)
+        try:
+            yield
+        finally:
+            self.planned_epoch.reset(token)
 
     def coordinator_for(self, config: DeviceConfig, settings: Settings) -> BusCoordinator:
         # All sensors/selects and slaves on a Solis Modbus hub share a bus.

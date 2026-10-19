@@ -72,6 +72,10 @@ class AlphaESSDevice:
             f"{fmt_hhmm(intent.window_start)}-{fmt_hhmm(intent.window_end)}"
         )
         mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return [ActionLine(
+                f"[REFUSED] {mode.removeprefix('refuse:')}", ActionOutcome.REFUSED
+            )]
         if mode == "on" and not intent.soc.ok:
             return [ActionLine(f"[BLOCKED] {intent.soc.reason}; not {desc}", ActionOutcome.BLOCKED)]
         if mode == "simulate":
@@ -80,6 +84,7 @@ class AlphaESSDevice:
             return [ActionLine(f"[{mode.upper()}] computed: {desc}", ActionOutcome.SIMULATED)]
         try:
             # Field names checked against the AlphaESS integration's services.yaml.
+            self._coordinator.confirm_write()
             await self._rest.call_service(
                 "alphaess",
                 "setbatterycharge",

@@ -26,11 +26,12 @@ the paid window. The inverter fires that face on its *own* clock, so arming also
 requires a fresh inverter-clock reading that agrees with the household clock
 (#161).
 
-PROACTIVE_MODE + control authority (via ``effective_mode``) gate side effects:
-``simulate``/``observe`` -> log intended writes only; ``on`` -> real
-``call_service``; ``off`` -> compute only. Each write isolates its own failure
-and reads back to confirm the device took it. The forced-charge program (window
-+ current) additionally refuses when grid charging is not permitted by the
+The shared authority gate decides side effects for each ownership class:
+``simulate`` logs intended writes, ``on`` permits real ``call_service``, and
+refused authority emits a non-verified ``[REFUSED]`` line without writing.
+Each write isolates its own failure and reads back to confirm the device took it.
+The forced-charge program (window + current) additionally refuses when grid charging
+is not permitted by the
 inverter's work mode (bit 5); the live rate-tier throttle is not so gated. The
 SoC fallback uses the same forced-charge sequence with an explicitly configured
 current ceiling and the configured cheap-rate window.
@@ -127,6 +128,10 @@ _EXPORT_CURRENT_RAW = 625
 _CLOCK_SYNC_READ_BACK = timedelta(seconds=10)
 T = TypeVar("T")
 ClockSyncOutcome = Literal["synced", "failed", "not_written"]
+
+
+def _refused(mode: str) -> ActionLine:
+    return ActionLine(f"[REFUSED] {mode.removeprefix('refuse:')}", ActionOutcome.REFUSED)
 
 
 class _ApplyResult(NamedTuple):
@@ -226,6 +231,8 @@ class SolisDevice:
             window_end=time.fromisoformat(self._settings.charge_window_end),
         )
         mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return [_refused(mode)]
         description = (
             f"Solis fallback at {current_a} A in "
             f"{fmt_hhmm(intent.window_start)}-{fmt_hhmm(intent.window_end)}"
@@ -265,6 +272,8 @@ class SolisDevice:
     @device_action(Ownership.CHARGING)
     async def _apply(self, intent: ChargeIntent, fallback_current_a: float | None) -> _ApplyResult:
         mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return _ApplyResult([_refused(mode)], False, False, False)
         # load_timezone, not ZoneInfo: a minimal container without tzdata (or a
         # typo'd option) must degrade to UTC, not raise before the reconcile and
         # the SoC guard have run and cost the daemon every device write.
@@ -515,6 +524,8 @@ class SolisDevice:
         elif kept_discharge is not None:
             desc += " and keep the verified export window"
         mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return _refused(mode)
         keeps_discharge = export_window is not None or kept_discharge is not None
         current_a = (
             solis_current_a(intent, self._settings)
@@ -617,6 +628,8 @@ class SolisDevice:
     async def _clear_discharge_window(self, desc: str) -> ActionLine:
         """Clear only Slot 1's discharge half, preserving any charge schedule."""
         mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return _refused(mode)
         safe_desc = desc.replace("set charge window", "set timed charge schedule")
         clear_desc = f"clear timed export window ({safe_desc})"
         if mode == "simulate":
@@ -664,6 +677,8 @@ class SolisDevice:
             intent, self._settings, amps, fallback=fallback
         )
         mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return False, _refused(mode)
         if blocked and mode in ("on", "simulate"):
             prefix = "[SIMULATE] " if mode == "simulate" else ""
             line = ActionLine(
@@ -692,6 +707,9 @@ class SolisDevice:
         current_desc = _charge_current_description(
             intent, self._settings, amps, fallback=fallback
         )
+        mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return False, _refused(mode), None
         zeros = [0] * len(_WINDOW_FIELDS)
         try:
             resident = await self._read_slot_block(1)
@@ -756,6 +774,8 @@ class SolisDevice:
         ``keep_discharge`` zeroes only the charge half, writing these four
         registers back as the discharge half in the same atomic block."""
         mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return False, _refused(mode)
         if mode == "simulate":
             return True, ActionLine(
                 f"[SIMULATE] would {desc} (if non-zero)", ActionOutcome.SIMULATED
@@ -795,6 +815,8 @@ class SolisDevice:
     async def _set_current_result(self, amps: float, desc: str) -> tuple[bool, ActionLine]:
         """Set current and return whether its post-write value was confirmed."""
         mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return False, _refused(mode)
         if mode == "simulate":
             log.info("[SIMULATE] would %s", desc)
             return True, ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
@@ -845,6 +867,8 @@ class SolisDevice:
         wanted = "Off" if intent.hold_active(now) else "On"
         desc = f"set inverter power switch to {wanted}"
         mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return _refused(mode)
         if mode == "simulate":
             return ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
@@ -913,6 +937,8 @@ class SolisDevice:
     async def _write_safe_power_switch(self) -> ActionLine:
         desc = "set inverter power switch to On (relinquishing control)"
         mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return _refused(mode)
         if mode == "simulate":
             return ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
@@ -958,6 +984,8 @@ class SolisDevice:
         charge = [start.hour, start.minute, end.hour, end.minute]
         desc = f"set charge window {fmt_hhmm(start)}-{fmt_hhmm(end)} (relinquishing control)"
         mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return _refused(mode)
         if mode == "simulate":
             return ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
@@ -1009,6 +1037,7 @@ class SolisDevice:
 
     async def _select_option(self, entity: str, option: str) -> str | None:
         """Write a select option and confirm it; returns the read-back mismatch."""
+        self._coordinator.confirm_write()
         await self._rest.call_service(
             "select", "select_option", {"entity_id": entity, "option": option}
         )
@@ -1019,6 +1048,8 @@ class SolisDevice:
         """Set and verify the fixed full-rate command used for paid export."""
         desc = f"set timed discharge current to {_EXPORT_CURRENT_A:g} A for export"
         mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return False, _refused(mode)
         if mode == "simulate":
             return True, ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
         if mode in ("off", "observe"):
@@ -1142,6 +1173,8 @@ class SolisDevice:
         before_text = "unreadable" if before is None else f"{describe_error(before)} {zone}"
         lines = [ActionLine(f"inverter clock before: {before_text}", ActionOutcome.UNVERIFIED)]
         mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return "not_written", [_refused(mode)]
         if mode != "on":
             lines.append(
                 ActionLine(
@@ -1369,6 +1402,7 @@ class SolisDevice:
         return f"sensor.{self._hub}_{field}"
 
     async def _write_register(self, address: int, value: int | list[int]) -> None:
+        self._coordinator.confirm_write()
         await self._rest.call_service(
             "modbus",
             "write_register",

@@ -69,11 +69,11 @@ from ha_spark.api.server import (
     serve_in_background,
     stop_server,
 )
+from ha_spark.authority import AuthorityStore
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import DaemonChannel, Reply, action_lines
 from ha_spark.devices import Capability, inverter_device
-from ha_spark.devices.base import effective_mode
-from ha_spark.devices.execution import ExecutionContext
+from ha_spark.devices.execution import ExecutionContext, Ownership, execution_context
 from ha_spark.devices.inverters.solis import SolisDevice, fallback_charge_current_a
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome, is_verified, legacy_action_line
 from ha_spark.energy.derived_base_load import (
@@ -91,6 +91,7 @@ from ha_spark.energy.orchestrator import orchestrate
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.publish import (
     plan_to_payload,
+    publish_operating_mode,
     publish_plan,
     publish_predictions,
     publish_soc_integrity,
@@ -109,6 +110,7 @@ from ha_spark.energy.supply_guard import SupplyGuard
 from ha_spark.energy.tariff import _controlled_windows
 from ha_spark.energy.tariff import _in_overnight_window as in_window
 from ha_spark.energy.v2l import run_v2l_tick, run_v2l_topup, warn_deprecated_notify_target
+from ha_spark.ha.notifier import send_notification
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -238,10 +240,11 @@ def _preview_accepted(lines: tuple[str, ...]) -> bool:
     )
 
 
-def _real_write_mode(settings: Settings) -> bool:
+def _real_write_mode(settings: Settings, execution: ExecutionContext | None = None) -> bool:
+    context = execution or execution_context()
     return any(
         device.type == "inverter"
-        and effective_mode(device.control, settings.proactive_mode) == "on"
+        and context.gate.mode_for(Ownership.CHARGING, device, settings) == "on"
         for device in settings.devices
     )
 
@@ -282,7 +285,7 @@ async def run_once(
     fallback_active: bool = False,
     execution: ExecutionContext | None = None,
 ) -> RunResult:
-    """Compute the charge plan, log it, and apply it per PROACTIVE_MODE.
+    """Compute the charge plan, log it, and apply it under site authority.
 
     ``soc`` is the daemon tick's checked measurement, reused as-is so the
     plan and its charge intent carry the exact observation the loop made
@@ -353,7 +356,7 @@ async def run_once(
             lines.extend(apply_lines)
             accepted = (
                 not _apply_failed(apply_lines)
-                if _real_write_mode(settings)
+                if _real_write_mode(settings, execution)
                 else _preview_accepted(tuple(apply_lines))
             )
             applied_plan = plan if accepted else None
@@ -814,6 +817,7 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
                 inverter is not None
                 and inverter.driver == "solis"
                 and settings.solis_fallback_current_a is not None
+                and _real_write_mode(settings)
             ):
                 requested = monitor.request_fallback()
                 if requested is not None:
@@ -959,6 +963,10 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
     try:
         await _run_forever(settings, channel, poll_seconds=poll_seconds)
     finally:
+        context = execution_context()
+        if channel.authority is not None and context.authority is channel.authority:
+            context.authority = None
+            context.planned_epoch.set(None)
         await channel.__aexit__(None, None, None)
 
 
@@ -987,6 +995,16 @@ async def _run_forever(
     # Constructing the HTTP server above does not bind it. Claim the executor
     # before starting listeners or touching hardware, including startup probes.
     await channel.__aenter__()
+    authority = AuthorityStore(settings)
+    try:
+        authority.start_process()
+    except (OSError, ValueError):
+        authority.save_failed = True
+        log.warning("Authority persistence failed; hardware writes refused")
+    context = execution_context()
+    context.authority = authority
+    channel.authority = authority
+    faults: set[str] = set()
     serve_task: asyncio.Task[None] | None = None
     try:
         serve_task = await serve_in_background(server)
@@ -1051,6 +1069,27 @@ async def _run_forever(
     try:
         while True:
             settings = state.settings  # hot-reloaded by POST /api/config
+            current_faults = set()
+            if not authority.known:
+                current_faults.add("authority unknown")
+            if authority.save_failed:
+                current_faults.add("authority save failure")
+                try:
+                    authority.retry_pending()
+                except (OSError, ValueError):
+                    log.warning("Authority save retry failed; hardware writes refused")
+            try:
+                async with HomeAssistantRest(
+                    settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+                ) as rest:
+                    for fault in current_faults - faults:
+                        log.warning("%s; hardware writes refused", fault)
+                        await send_notification(settings, rest, "ha-spark authority fault", fault)
+                    await publish_operating_mode(rest, authority)
+            except Exception:
+                log.warning("Authority publication failed")
+            faults = current_faults
+            context.planned_epoch.set(authority.state.epoch if authority.state else None)
             if settings is not last_settings:
                 if (
                     settings.charge_window_start != last_settings.charge_window_start
@@ -1167,6 +1206,13 @@ async def _run_forever(
                         pending.future.set_result(Reply(
                             text=result.text,
                             lines=action_lines(result.action_lines),
+                            error=(
+                                "device action refused"
+                                if any(
+                                    legacy_action_line(line).outcome is ActionOutcome.REFUSED
+                                    for line in result.action_lines
+                                ) else None
+                            ),
                             plan=[{"entity_id": eid, "state": value, "attributes": attrs}
                                   for eid, value, attrs in plan_to_payload(plan, settings)],
                         ))
@@ -1254,7 +1300,7 @@ async def _run_forever(
         # or every restart mid-dispatch would release the hold and drain the
         # battery into the car until the next process holds it again (#143 §1).
         # SIGKILL/OOM never reach here; that is the runbook's (#131/#134).
-        if last_plan is not None:
+        if last_plan is not None and _real_write_mode(settings):
             try:
                 shutdown_at = datetime.now(load_timezone(settings.timezone))
                 if last_trusted_holds and shutdown_at < max(
@@ -1273,3 +1319,6 @@ async def _run_forever(
                             log.info(line)
             except Exception:
                 log.exception("Writing the safe state on shutdown failed")
+        context.authority = None
+        context.planned_epoch.set(None)
+        channel.authority = None

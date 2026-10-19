@@ -62,8 +62,8 @@ def test_fallback_confirmation_does_not_trust_typed_line_prefix(
 
 @pytest.mark.parametrize("outcome", list(ActionOutcome))
 async def test_real_write_baseline_uses_outcomes(monkeypatch, outcome: ActionOutcome) -> None:
-    from ha_spark.config import Settings
     from ha_spark.energy.scheduler import run_once
+    from tests.authority_helpers import legacy_settings as Settings
     from tests.test_scheduler import _AmpsDevice, _patch_run_once_io, _plan_at
 
     settings = Settings(proactive_mode="on")
@@ -88,8 +88,8 @@ async def test_real_write_baseline_uses_outcomes(monkeypatch, outcome: ActionOut
     ],
 )
 async def test_real_write_recovery_remains_active(tmp_path, line: str) -> None:
-    from ha_spark.config import Settings
     from ha_spark.energy.scheduler import finish_recovery
+    from tests.authority_helpers import legacy_settings as Settings
 
     monitor = SocMonitor(path=tmp_path / "soc.json")
     monitor.record(_measurement(ok=False), failure_threshold=1)
@@ -126,8 +126,8 @@ async def test_production_solis_paths_emit_typed_lines(tmp_path, monkeypatch, mo
 
 
 async def test_real_write_baseline_rejects_plain_apply_results(monkeypatch) -> None:
-    from ha_spark.config import Settings
     from ha_spark.energy.scheduler import run_once
+    from tests.authority_helpers import legacy_settings as Settings
     from tests.test_scheduler import _AmpsDevice, _patch_run_once_io, _plan_at
 
     settings = Settings(proactive_mode="on")
@@ -153,8 +153,8 @@ async def test_production_refused_switch_has_a_non_verified_outcome(tmp_path) ->
 async def test_production_alphaess_emits_typed_lines(mode: str) -> None:
     from unittest.mock import AsyncMock
 
-    from ha_spark.config import Settings
     from ha_spark.devices.inverters.alphaess import AlphaESSDevice
+    from tests.authority_helpers import legacy_settings as Settings
     from tests.test_solis_power_switch import _intent
 
     settings = Settings(inverter="alphaess", proactive_mode=mode)
