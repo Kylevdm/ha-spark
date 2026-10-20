@@ -32,7 +32,7 @@ from ha_spark.devices.execution import (
     device_action,
     execution_context,
 )
-from ha_spark.devices.inverters.solis import fallback_charge_current_a
+from ha_spark.devices.inverters.solis import validated_fallback_current_a
 from ha_spark.devices.outcomes import ActionLine
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.ha.rest import HomeAssistantRest
@@ -106,7 +106,7 @@ class SupplyGuard:
             return None
 
         if fallback_active:
-            fallback_a = fallback_charge_current_a(s)
+            fallback_a = validated_fallback_current_a(s)
             if not fallback_confirmed or fallback_a is None:
                 # A persisted/requested/failed fallback is not evidence of the
                 # resident current. Reductions remain valid; increases wait for

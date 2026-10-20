@@ -17,7 +17,7 @@ from typing import Any
 
 from ha_spark.authority import AuthorityStore, authority_view, operating_mode
 from ha_spark.config import Settings
-from ha_spark.devices.inverters.solis import fallback_charge_current_a
+from ha_spark.devices.inverters.solis import validated_fallback_current_a
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.orchestrator import Decision
 from ha_spark.energy.soc_monitor import SocMonitorSnapshot
@@ -241,7 +241,7 @@ async def publish_soc_integrity(
                     "fallback_supported": fallback_supported,
                     "fallback_current_configured_a": settings.solis_fallback_current_a,
                     "fallback_current_ceiling_a": (
-                        fallback_charge_current_a(settings) if fallback_supported else None
+                        validated_fallback_current_a(settings) if fallback_supported else None
                     ),
                     "fallback_confirmed": snapshot.fallback_confirmed,
                     "hardware_confirmation": hardware_confirmation,

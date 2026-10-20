@@ -743,7 +743,10 @@ async def test_unreadable_slot_with_no_live_export_is_written_once_blind(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_fallback_writes_only_the_configured_window_and_limited_current(tmp_path) -> None:
+async def test_fallback_writes_only_the_configured_window_and_configured_current(tmp_path) -> None:
+    # #422: a configured current above a limit is blocked (see
+    # tests/test_solis_fallback.py), no longer silently clamped, so the
+    # current written here is exactly the configured one.
     rest = FakeRest(switch="On")
     failed_soc = replace(_soc(), status=SocStatus.STALE)
     device = _device(
@@ -752,7 +755,7 @@ async def test_fallback_writes_only_the_configured_window_and_limited_current(tm
         charge_window_start="01:15",
         charge_window_end="04:30",
         max_charge_current_a="35",
-        solis_fallback_current_a="45",
+        solis_fallback_current_a="35",
     )
 
     lines = await device.apply_fallback(failed_soc)

@@ -40,7 +40,20 @@ class HoldRecord(_Record):
     started_at: AwareDatetime
 
 
+# Phase 2 (#422): the only fallback cause is SoC measurement integrity. The
+# daemon's write gate is the sole writer of fallback state; the SoC monitor
+# stays the sole judge of this cause (counter, recovery, confirmation).
+FALLBACK_CAUSE_SOC_INTEGRITY = "soc_integrity"
+
+
 class FallbackState(_Record):
+    """The authority-owned fallback verdict: active plus its causes.
+
+    Written only by the daemon around the fallback apply/exit points (#422);
+    it mirrors the SoC monitor's active verdict, which remains the sole judge
+    of the cause.
+    """
+
     active: bool = False
     causes: tuple[str, ...] = ()
 
@@ -236,6 +249,27 @@ class AuthorityStore:
         )
         self._persist_initial(state)
         return AuthorityLoadResult(status="known", state=state)
+
+    def save_fallback(self, *, active: bool, cause: str | None = None) -> bool:
+        """Persist fallback active + its causes with a bumped epoch (#422).
+
+        The daemon's write gate is the only caller: it owns *when* (entry is
+        saved before the fallback write is requested; exit only after the
+        recovered plan applied and read back) while this owns the state shape.
+        Returns whether this call changed the stored state; raises as `save`
+        does (leaving `save_failed` set) when the durable write fails.
+        """
+        if self._state is None or self._state.fallback.active == active:
+            return False
+        candidate = self._state.model_copy(update={
+            "fallback": FallbackState(
+                active=active, causes=(cause,) if active else (),
+            ),
+            "epoch": self._state.epoch + 1,
+            "last_changed_at": datetime.now(UTC),
+        })
+        self.save(candidate)
+        return True
 
     def save(self, state: AuthorityState) -> None:
         # model_copy(update=...) deliberately bypasses pydantic validation, so

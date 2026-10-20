@@ -34,7 +34,10 @@ The forced-charge program (window + current) additionally refuses when grid char
 is not permitted by the
 inverter's work mode (bit 5); the live rate-tier throttle is not so gated. The
 SoC fallback uses the same forced-charge sequence with an explicitly configured
-current ceiling and the configured cheap-rate window.
+current and the configured cheap-rate window, validated as one schedule before
+every apply (#422): an above-limit current is blocked with the case named,
+never silently clamped, and the schedule it applies is charge-only through
+controls that read back.
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypeVar
 from zoneinfo import ZoneInfo
@@ -73,7 +77,7 @@ from ha_spark.energy.export_notifications import (
     send_once,
 )
 from ha_spark.energy.export_store import ExportEventStore
-from ha_spark.energy.models import ChargeIntent, window_hours
+from ha_spark.energy.models import ChargeIntent, ExportIntent, window_hours
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.logging import get_logger
 
@@ -161,17 +165,105 @@ def _discharge_half(
     return kept_discharge or [0, 0, 0, 0]
 
 
-def fallback_charge_current_a(settings: Settings) -> int | None:
-    """Configured fallback current after normal Solis and register limits."""
+@dataclass(frozen=True)
+class FallbackSchedule:
+    """A validated fallback charge schedule (#422): current and window, export off.
+
+    Export/discharge is disabled by construction and the controls are the
+    fixed read-back-capable set, so the schedule the device applies can only
+    be a bounded charge in the configured cheap window.
+    """
+
+    current_a: int
+    window_start: time
+    window_end: time
+
+
+# The fallback's own controls, each one written and read back through the
+# overlay (43141 current, 43143 window block). A control outside this set may
+# not carry a fallback: it has no verified read-back path here.
+_FALLBACK_CONTROLS = frozenset({Capability.CHARGE_WINDOW, Capability.CHARGE_RATE})
+
+
+def validate_fallback_schedule(
+    settings: Settings,
+    *,
+    export: ExportIntent | None = None,
+    controls: frozenset[Capability] = _FALLBACK_CONTROLS,
+) -> FallbackSchedule | str:
+    """Validate the fallback charge schedule; one named reason per invalid case.
+
+    Pure: settings (plus the candidate's own export and controls, which the
+    fallback's construction never varies) → either a valid schedule or the
+    named reason it is invalid, so the caller blocks with the case named
+    instead of clamping (#422). Re-run immediately before every apply against
+    the settings in force then: a limit lowered below the fallback current
+    blocks the next apply.
+    """
+    if export is not None:
+        return "the fallback schedule must not program export or discharge"
+    unsupported = sorted(str(control) for control in controls - _FALLBACK_CONTROLS)
+    if unsupported:
+        return f"fallback control {', '.join(unsupported)} has no read-back support"
     configured = settings.solis_fallback_current_a
     if configured is None:
-        return None
-    configured_max = settings.max_charge_current_a
-    if not math.isfinite(configured) or not math.isfinite(configured_max) or configured_max <= 0:
-        return 0
-    return math.floor(
-        min(configured, configured_max, _MAX_CHARGE_CURRENT_A) + 1e-9
+        return "solis_fallback_current_a is not configured"
+    if not math.isfinite(configured):
+        return "solis_fallback_current_a is not a finite current"
+    if configured < 1:
+        return "solis_fallback_current_a must be a current of at least 1 A"
+    if not math.isfinite(settings.max_charge_current_a) or settings.max_charge_current_a <= 0:
+        return "max_charge_current_a is not a positive finite limit"
+    if configured > settings.max_charge_current_a:
+        return (
+            f"solis_fallback_current_a ({configured:g} A) is above max_charge_current_a "
+            f"({settings.max_charge_current_a:g} A)"
+        )
+    if configured > _MAX_CHARGE_CURRENT_A:
+        return (
+            f"solis_fallback_current_a ({configured:g} A) is above the inverter "
+            f"register limit ({_MAX_CHARGE_CURRENT_A:g} A)"
+        )
+    if not math.isfinite(settings.battery_voltage_v) or settings.battery_voltage_v <= 0:
+        return "battery_voltage_v is not a positive finite limit"
+    if not math.isfinite(settings.supply_max_current_a) or settings.supply_max_current_a <= 0:
+        return "supply_max_current_a is not a positive finite limit"
+    if not math.isfinite(settings.supply_voltage_v) or settings.supply_voltage_v <= 0:
+        return "supply_voltage_v is not a positive finite limit"
+    charge_w = configured * settings.battery_voltage_v
+    supply_w = settings.supply_max_current_a * settings.supply_voltage_v
+    if charge_w > supply_w:
+        return (
+            f"fallback charge power ({charge_w:.0f} W) is above the site supply limit "
+            f"({supply_w:.0f} W)"
+        )
+    window: dict[str, time] = {}
+    for side, raw in (
+        ("start", settings.charge_window_start),
+        ("end", settings.charge_window_end),
+    ):
+        try:
+            parsed = time.fromisoformat(raw)
+        except ValueError:
+            return f"charge_window_{side} '{raw}' is not a valid HH:MM time"
+        # The household clock face the Slot 1 registers encode is naive whole
+        # minutes: an offset-attached or sub-minute time is not a time on it.
+        if parsed.tzinfo is not None or parsed.second or parsed.microsecond:
+            return f"charge_window_{side} '{raw}' is not a time on the household clock"
+        window[side] = parsed
+    if window["start"] == window["end"]:
+        return "the fallback charge window is zero-length"
+    return FallbackSchedule(
+        current_a=math.floor(configured + 1e-9),
+        window_start=window["start"],
+        window_end=window["end"],
     )
+
+
+def validated_fallback_current_a(settings: Settings) -> int | None:
+    """The validated fallback current, or ``None`` while the schedule is invalid."""
+    result = validate_fallback_schedule(settings)
+    return result.current_a if isinstance(result, FallbackSchedule) else None
 
 
 @register("solis")
@@ -281,38 +373,33 @@ class SolisDevice:
 
     @device_action(Ownership.CHARGING)
     async def apply_fallback(self, soc: SocMeasurement) -> list[ActionLine]:
-        """Apply the configured cheap-window fallback using the normal Solis gates.
+        """Apply the validated cheap-window fallback using the normal Solis gates.
 
         The SoC reading is carried for timing and diagnostics only. The plan
         target, plan window, and any planned export cannot affect this request.
+        The schedule is re-validated here, immediately before every apply,
+        against the settings in force now (#422): an above-limit current is
+        blocked with the case named, never clamped.
         """
-        current_a = fallback_charge_current_a(self._settings)
-        if current_a is None:
+        validated = validate_fallback_schedule(self._settings)
+        if isinstance(validated, str):
             return [
                 ActionLine(
-                    "[BLOCKED] Solis fallback current is not configured", ActionOutcome.BLOCKED
+                    f"[BLOCKED] Solis fallback invalid: {validated}", ActionOutcome.BLOCKED
                 )
             ]
-        if current_a < 1:
-            return [
-                ActionLine(
-                    "[FAILED] Solis fallback current is below 1 A after configured limits",
-                    ActionOutcome.FAILED,
-                )
-            ]
-
         intent = ChargeIntent(
             target_soc_pct=0.0,
             soc=soc,
-            window_start=time.fromisoformat(self._settings.charge_window_start),
-            window_end=time.fromisoformat(self._settings.charge_window_end),
+            window_start=validated.window_start,
+            window_end=validated.window_end,
         )
         mode = self._coordinator.mode
         if mode.startswith("refuse:"):
             return [_refused(mode)]
         description = (
-            f"Solis fallback at {current_a} A in "
-            f"{fmt_hhmm(intent.window_start)}-{fmt_hhmm(intent.window_end)}"
+            f"Solis fallback at {validated.current_a} A in "
+            f"{fmt_hhmm(validated.window_start)}-{fmt_hhmm(validated.window_end)}"
         )
         if mode == "simulate":
             return [
@@ -328,7 +415,7 @@ class SolisDevice:
                 )
             ]
 
-        result = await self._apply(intent, current_a)
+        result = await self._apply(intent, validated.current_a)
         if result.current_ok and result.window_verified and result.cleanup_ok:
             result.lines.append(
                 ActionLine(f"[FALLBACK] {description} read-back verified", ActionOutcome.VERIFIED)
