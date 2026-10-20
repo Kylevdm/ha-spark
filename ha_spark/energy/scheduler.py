@@ -38,9 +38,14 @@ failed attempts retry on the next minute. The active fallback is left in place
 on a passing observation until `soc_recovery_minutes` of stable reports make
 recovery ready (#117); each tick then computes a fresh plan from that tick's
 measurement and applies it, leaving fallback only once the apply reads back
-clean. A failed recovered apply keeps the fallback (unconfirmed) and retries.
+clean. A recovered apply that is not fully verified re-applies the fallback on
+the same tick and records its verdict (#423), so the unconfirmed or verified
+state is published at once, and the next recovery attempt waits five minutes;
+an unconfirmed re-apply is retried every minute of that wait, because the
+per-minute fallback path deliberately stays quiet while recovery is ready.
 AlphaESS has no fallback request: after the threshold it stays blocked until
-the same stable evidence qualifies a fresh plan and its apply succeeds. The
+the same stable evidence qualifies a fresh plan and its apply succeeds, and a
+failed recovered apply there still retries the next minute. The
 fallback schedule is validated as one pure schedule before every apply (#422):
 an above-limit current is blocked with the case named, never clamped. The
 authority store owns *fallback active* and its causes (phase 2: the only cause
@@ -111,7 +116,7 @@ from ha_spark.energy.publish import (
 )
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement
-from ha_spark.energy.soc_monitor import SocMonitor, observe_soc
+from ha_spark.energy.soc_monitor import SocMonitor, SocMonitorSnapshot, observe_soc
 from ha_spark.energy.sources import (
     ev_hold_status_from_read,
     parse_time,
@@ -133,6 +138,10 @@ SIGNAL_SAMPLE_INTERVAL = timedelta(minutes=30)
 
 
 REPLAN_INTERVAL = timedelta(minutes=30)
+
+# #423: after a recovered apply that is not fully verified re-applied the
+# fallback on the same tick, the next recovery attempt waits this long.
+RECOVERY_RETRY_DELAY = timedelta(minutes=5)
 
 
 def _slot_start(now: datetime) -> datetime:
@@ -870,6 +879,42 @@ async def _mirror_fallback_authority(
         await _notify_fallback_left(settings, rest)
 
 
+def _fallback_verdict_line(action_lines: list[ActionLine | str]) -> ActionLine | str:
+    """The line that speaks for a fallback attempt's resident outcome."""
+    return next(
+        (
+            line
+            for line in reversed(action_lines)
+            if isinstance(line, ActionLine)
+            or line.startswith(
+                (
+                    # Legacy fallback boundary only; production drivers
+                    # emit typed lines. Never used for normal apply.
+                    "[FALLBACK]",
+                    "[FAILED]",
+                    "[BLOCKED]",
+                    "[SIMULATE]",
+                    "[SKIP]",
+                    "[OFF]",
+                    "[OBSERVE]",
+                )
+            )
+        ),
+        ActionLine(
+            "[FAILED] Solis fallback produced no confirmation action",
+            ActionOutcome.FAILED,
+        ),
+    )
+
+
+def _log_action_lines(action_lines: list[ActionLine | str]) -> None:
+    for line in action_lines:
+        if legacy_action_line(line).outcome is ActionOutcome.FAILED:
+            log.warning(line)
+        else:
+            log.info(line)
+
+
 async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasurement | None:
     """One per-minute SoC observation: check, count once, publish. Never raises.
 
@@ -946,36 +991,9 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
                                 ActionOutcome.FAILED,
                             )
                         ]
-                    action_line = next(
-                        (
-                            line
-                            for line in reversed(action_lines)
-                            if isinstance(line, ActionLine)
-                            or line.startswith(
-                                (
-                                    # Legacy fallback boundary only; production drivers
-                                    # emit typed lines. Never used for normal apply.
-                                    "[FALLBACK]",
-                                    "[FAILED]",
-                                    "[BLOCKED]",
-                                    "[SIMULATE]",
-                                    "[SKIP]",
-                                    "[OFF]",
-                                    "[OBSERVE]",
-                                )
-                            )
-                        ),
-                        ActionLine(
-                            "[FAILED] Solis fallback produced no confirmation action",
-                            ActionOutcome.FAILED,
-                        ),
-                    )
+                    action_line = _fallback_verdict_line(action_lines)
                     snapshot = monitor.complete_fallback(action_line=action_line)
-                    for line in action_lines:
-                        if legacy_action_line(line).outcome is ActionOutcome.FAILED:
-                            log.warning(line)
-                        else:
-                            log.info(line)
+                    _log_action_lines(action_lines)
                     if entered:
                         log.info(
                             "SoC integrity: fallback entered in the authority store "
@@ -990,6 +1008,79 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
         return None
 
 
+async def _reapply_fallback(
+    settings: Settings, monitor: SocMonitor, measurement: SocMeasurement | None
+) -> bool:
+    """#423: re-apply the fallback now and publish its verdict. Never raises.
+
+    Only the recovery path calls this: ``request_fallback`` returns ``None``
+    while recovery is ready, so the per-minute path cannot re-program a
+    fallback a failed recovered apply may have disturbed. This is the same
+    device action, gate, schedule validation and read-back as entry; the
+    store is already active, so there is no epoch bump and no notice.
+    Returns whether an attempt was made (Optimise, Solis, a configured
+    fallback current): the verdict, verified or failed, is recorded and
+    published either way, and a failed attempt is retried by the next call.
+    """
+    inverter = next((device for device in settings.devices if device.type == "inverter"), None)
+    if (
+        measurement is None
+        or inverter is None
+        or inverter.driver != "solis"
+        or settings.solis_fallback_current_a is None
+        or not _real_write_mode(settings)
+    ):
+        return False
+    snapshot: SocMonitorSnapshot | None = None
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            action_lines: list[ActionLine | str]
+            device = inverter_device(settings, rest)
+            if isinstance(device, SolisDevice):
+                action_lines = list(await device.apply_fallback(measurement))
+            else:
+                log.error(
+                    "Solis fallback re-apply skipped: inverter factory returned %s",
+                    type(device).__name__,
+                )
+                action_lines = [
+                    ActionLine(
+                        "[SKIP] Solis fallback re-apply skipped: inverter factory "
+                        f"returned non-Solis device ({type(device).__name__})",
+                        ActionOutcome.SIMULATED,
+                    )
+                ]
+            snapshot = monitor.complete_fallback(action_line=_fallback_verdict_line(action_lines))
+            _log_action_lines(action_lines)
+            await publish_soc_integrity(rest, snapshot, settings)
+            return True
+    except Exception:
+        log.exception("Solis fallback re-apply failed; will retry next minute")
+    if snapshot is None:
+        # The attempt raised before recording a verdict: keep the failure
+        # visible and the fallback unconfirmed until the next retry.
+        try:
+            snapshot = monitor.complete_fallback(
+                action_line=ActionLine(
+                    "[FAILED] Solis fallback re-apply raised; unconfirmed",
+                    ActionOutcome.FAILED,
+                )
+            )
+        except Exception:
+            log.exception("Recording the failed fallback re-apply failed")
+            return True
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            await publish_soc_integrity(rest, snapshot, settings)
+    except Exception:
+        log.exception("Publishing the fallback re-apply verdict failed")
+    return True
+
+
 def recovery_verified(apply_lines: tuple[str, ...]) -> bool:
     """Whether a recovered normal apply may end the fallback (#117).
 
@@ -1000,14 +1091,23 @@ def recovery_verified(apply_lines: tuple[str, ...]) -> bool:
 
 
 async def finish_recovery(
-    settings: Settings, monitor: SocMonitor, apply_lines: tuple[str, ...] | None
-) -> None:
+    settings: Settings,
+    monitor: SocMonitor,
+    apply_lines: tuple[str, ...] | None,
+    measurement: SocMeasurement | None = None,
+) -> bool:
     """Leave fallback after a verified recovered apply, else keep it truthfully.
 
-    ``apply_lines`` is ``None`` when the recovery run raised. A failed apply may
-    have changed the resident program, so a verified fallback loses its
-    confirmation: increases stay blocked until the next minute's retry either
-    verifies the recovered plan or, if recovery is lost, re-programs the fallback.
+    ``apply_lines`` is ``None`` when the recovery run raised; ``measurement``
+    is this tick's observation, carried by the same-tick fallback re-apply.
+    A failed apply may have changed the resident program, so a verified
+    fallback loses its confirmation and is re-applied and re-verified on this
+    same tick (#423), with its verdict published; the store's fallback stays
+    active (no epoch bump, no notice). Returns whether the recovery backoff
+    started: the next recovery attempt then waits five minutes, while an
+    unconfirmed re-apply is retried every minute of that wait by the loop.
+    Sites without a Solis fallback (AlphaESS threshold block, or no charging
+    authority) keep today's behaviour: keep the block, retry next minute.
     """
     preview = (
         apply_lines is not None
@@ -1036,12 +1136,19 @@ async def finish_recovery(
             log.warning("Authority save failed; fallback exit not persisted; writes refused")
     else:
         retained = "SoC integrity block" if monitor.recovery_blocked else "fallback"
+        monitor.invalidate_fallback_confirmation()
+        if await _reapply_fallback(settings, monitor, measurement):
+            log.warning(
+                "[FAILED] recovered normal program not verified; %s kept and "
+                "re-applied on this tick; next recovery attempt in five minutes",
+                retained,
+            )
+            return True
         log.warning(
             "[FAILED] recovered normal program not verified; %s kept, retrying next minute",
             retained,
         )
-        monitor.invalidate_fallback_confirmation()
-        return
+        return False
     try:
         async with HomeAssistantRest(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
@@ -1052,6 +1159,7 @@ async def finish_recovery(
                 await _notify_fallback_left(settings, rest)
     except Exception:
         log.exception("Publishing the SoC recovery transition failed")
+    return False
 
 
 async def _planned_rate_w(settings: Settings, plan: ChargePlan) -> float | None:
@@ -1183,6 +1291,10 @@ async def _run_forever(
     target_w: float | None = None
     last_signal_at: datetime | None = None
     monitor = SocMonitor.load(settings)
+    # #423: loop-local recovery backoff — no recovery attempt before this
+    # timestamp. Not persisted: like recovery progress, downtime is not
+    # evidence; a restart already requires a fresh observation and read-back.
+    recovery_retry_not_before: datetime | None = None
     clock_sync = DstClockSync()
     pending = None
     try:
@@ -1254,6 +1366,28 @@ async def _run_forever(
                 monitor.recovery_ready
                 and (solis_fallback_active or (measurement is not None and measurement.ok))
             )
+            # #423: a failed recovered apply re-applied and re-verified the
+            # fallback on the same tick; the next recovery attempt waits five
+            # minutes instead of churning the resident program every minute.
+            # The backoff belongs to one recovery attempt: it lapses as soon as
+            # recovery is no longer ready (a new SoC failure reset progress, or
+            # the fallback left), never blocking a later episode.
+            if not monitor.recovery_ready:
+                recovery_retry_not_before = None
+            elif (
+                recovering
+                and solis_fallback_active
+                and recovery_retry_not_before is not None
+                and now < recovery_retry_not_before
+            ):
+                recovering = False
+                # `request_fallback` returns None while recovery is ready, so
+                # the scheduler itself retries an unconfirmed fallback
+                # re-apply every minute of the backoff, through the same
+                # gated, read-back-verified path. Only in Optimise.
+                if not monitor.fallback_confirmed:
+                    await _reapply_fallback(settings, monitor, measurement)
+                    fallback_confirmed = solis_fallback_active and monitor.fallback_confirmed
             # Set once `run_once` has *returned*, because it makes its own
             # reconcile pass with the plan it just computed. A run that raises
             # after that pass (`apply` or `publish_plan`) therefore falls back
@@ -1302,9 +1436,13 @@ async def _run_forever(
                     )
                     plan, last_applied_plan = result.plan, result.applied_plan
                     if recovering:
-                        await finish_recovery(settings, monitor, result.apply_lines)
+                        backed_off = await finish_recovery(
+                            settings, monitor, result.apply_lines, measurement
+                        )
                         solis_fallback_active = monitor.fallback_active
                         fallback_confirmed = solis_fallback_active and monitor.fallback_confirmed
+                        if backed_off:
+                            recovery_retry_not_before = now + RECOVERY_RETRY_DELAY
                     replanned = True
                     state.set_plan(plan)
                     last_run_slot = _slot_start(now)
@@ -1346,8 +1484,11 @@ async def _run_forever(
                     else:
                         log.exception("Scheduled plan run failed; will retry next tick")
                     if recovering:
-                        await finish_recovery(settings, monitor, None)
-                        fallback_confirmed = False
+                        backed_off = await finish_recovery(settings, monitor, None, measurement)
+                        solis_fallback_active = monitor.fallback_active
+                        fallback_confirmed = solis_fallback_active and monitor.fallback_confirmed
+                        if backed_off:
+                            recovery_retry_not_before = now + RECOVERY_RETRY_DELAY
             # The clock cadence (#143), independent of `setpoint_changed`: the
             # power switch converges within a minute, not at the next plan
             # change. Skipped when `run_once` returned, having made its own pass
