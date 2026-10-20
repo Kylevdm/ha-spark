@@ -603,6 +603,26 @@ async def gather_inputs(
     evidence_read = await read_dispatch_evidence(
         settings, rest, dispatches, live_dispatch=live_dispatch, report_times=report_times
     )
+    # #420: a dispatch picture whose source has not reported within its
+    # validated age is untrusted hold evidence — a cached HA state is not a
+    # live picture, so its windows never start or extend a hold. The plan
+    # keeps the dispatches as reported data but marks them untrusted, so the
+    # reconcile falls back to the last trusted hold set.
+    dispatch_freshness = (
+        evidence_read.freshness.get("live_dispatch")
+        if settings.tariff_provider != "octopus_intelligent"
+        else evidence_read.freshness.get("octopus_dispatch")
+    )
+    if (
+        dispatches_trusted
+        and dispatch_freshness is not None
+        and dispatch_freshness.validity != "fresh"
+    ):
+        dispatches_trusted = False
+        log.warning(
+            "Dispatch evidence not fresh (%s); holds untrusted",
+            dispatch_freshness.validity,
+        )
     if settings.ev_status_entity and not evidence_read.ev_status_trusted:
         log.warning("EV status entity %s unreadable", settings.ev_status_entity)
     ev_status = evidence_read.ev_status
