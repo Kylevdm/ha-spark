@@ -103,8 +103,13 @@ enabled, the next minute's check corrects a restart, a failed write, or a
 switch change made outside ha-spark. When ha-spark gives up control, including
 during a clean shutdown, it writes a safe state: switch `On`, the configured
 cheap charge window (default `23:30`-`05:30`), and an empty discharge window
-(`00:00`-`00:00`) unless a verified export is still running. If ha-spark can't
-trust the dispatch state, it won't open a new export window.
+(`00:00`-`00:00`) unless a verified export is still running. The switch is
+written `On` only when it reads back `On` or `Off`; otherwise that step is
+refused and logged. A clean shutdown writes only in Optimise. While an EV hold
+is recorded or a known dispatch end is still ahead, it restores the charge
+window, leaves the switch `Off`, and sends a notice; the next start reconciles
+the hold first. If ha-spark can't trust the dispatch state, it won't open a new
+export window.
 
 Before enabling Optimise, disable any Home Assistant automation or
 manual schedule that writes the same inverter or power switch, and keep them

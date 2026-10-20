@@ -1127,10 +1127,9 @@ class SolisDevice:
                 if wanted == "On":
                     # Not a benign skip: while the reads stay broken the inverter
                     # is left disabled, the house entirely on grid import. This
-                    # direction is still the safe one, but it is unbounded here
-                    # on purpose — the bound is the relinquish path (#143 §5),
-                    # which writes the safe state once ha-spark is past every
-                    # known hold end and still has no picture.
+                    # direction is still the safe one, and it is unbounded on
+                    # purpose: Q2 (#426) refuses every blind On, the relinquish
+                    # path's included, so the refusal stays visible instead.
                     log.warning("Power-switch unreadable; not releasing a hold")
                     return [ActionLine(
                         f"[WARNING] {desc} refused: state unreadable; "
@@ -1250,14 +1249,22 @@ class SolisDevice:
         a discharge window that is zeroed unless it is a verified export still
         running. The scheduler decides *when* (past every known hold end with no
         trusted picture, or a clean shutdown) and fires it once; this only writes.
-        It is the designated bound on the reconcile's refused blind release, so an
-        unreadable switch is written ``On`` here rather than refused. Retries are
-        not this method's: they belong to the read-first reconcile and ``apply``,
-        which never write blind, so broken reads cannot cost the inverter a
-        register write a minute. Each action is gated and isolated like every
-        other write; it never touches the charge or discharge current.
+        An unreadable switch is refused, not written ``On`` (Q2): every On needs a
+        readable switch, and the refusal stays visible. Retries are not this
+        method's: they belong to the read-first reconcile and ``apply``, which
+        never write blind, so broken reads cannot cost the inverter a register
+        write a minute. Each action is gated and isolated like every other write;
+        it never touches the charge or discharge current.
         """
         return [await self._write_safe_power_switch(), await self._write_safe_slot_block()]
+
+    async def write_safe_window(self) -> list[ActionLine]:
+        """The safe state's charge window alone, for a shutdown that keeps a hold (#426).
+
+        A charging-class slot write; the power switch is never touched, so it
+        cannot create an unowned protection write.
+        """
+        return [await self._write_safe_slot_block()]
 
     @device_action(Ownership.PROTECTION)
     async def _write_safe_power_switch(self) -> ActionLine:
@@ -1277,12 +1284,19 @@ class SolisDevice:
             )
         try:
             try:
-                if (await self._rest.get_state(entity)).state.strip().lower() == "on":
-                    return ActionLine(
-                        f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED
-                    )
-            except Exception:  # noqa: BLE001 - unreadable is written, not refused
-                log.warning("Power-switch pre-read failed; writing On anyway")
+                current = (await self._rest.get_state(entity)).state.strip().lower()
+            except Exception:  # noqa: BLE001 - Q2: unreadable is refused, not written
+                current = None
+            if current == "on":
+                return ActionLine(
+                    f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED
+                )
+            if current != "off":
+                log.warning("Power-switch state unreadable or not on/off; not writing On")
+                return ActionLine(
+                    f"[WARNING] {desc} refused: state unreadable or not on/off",
+                    ActionOutcome.REFUSED,
+                )
             mismatch = await self._select_option(entity, "On")
         except Exception:  # noqa: BLE001 - isolate this action's failure
             log.error("[FAILED] %s", desc)

@@ -71,6 +71,10 @@ class AlphaESSDevice:
         """No hold surface, so nothing is left steered when ha-spark lets go."""
         return []
 
+    async def write_safe_window(self) -> list[ActionLine]:
+        """No hold surface, so no shutdown keeps one."""
+        return []
+
     @device_action(Ownership.CHARGING)
     async def apply(self, intent: ChargeIntent) -> list[ActionLine]:
         stop_soc = round(intent.target_soc_pct)
