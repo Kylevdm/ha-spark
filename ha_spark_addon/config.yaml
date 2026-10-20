@@ -101,6 +101,16 @@ options:
   ev_power_entity: ""
   dispatch_grid_power_entity: ""
   dispatch_grid_power_invert: false
+  ev_status_max_age_seconds: 300
+  ev_plug_max_age_seconds: 300
+  ev_power_max_age_seconds: 300
+  live_dispatch_max_age_seconds: 300
+  adjusted_rate_max_age_seconds: 300
+  dispatch_grid_power_max_age_seconds: 300
+  battery_power_max_age_seconds: 300
+  octopus_dispatch_max_age_seconds: 2700
+  ev_liveness_entity: ""
+  dispatch_liveness_entity: ""
   consumption_energy_entity: ""
   supply_max_current_a: 75.0
   supply_voltage_v: 240.0
@@ -212,6 +222,17 @@ schema:
   ev_power_entity: str?
   dispatch_grid_power_entity: str?
   dispatch_grid_power_invert: bool
+  ev_status_max_age_seconds: float(0.001,86400)?
+  ev_plug_max_age_seconds: float(0.001,86400)?
+  ev_power_max_age_seconds: float(0.001,86400)?
+  live_dispatch_max_age_seconds: float(0.001,86400)?
+  adjusted_rate_max_age_seconds: float(0.001,86400)?
+  dispatch_grid_power_max_age_seconds: float(0.001,86400)?
+  battery_power_max_age_seconds: float(0.001,86400)?
+  octopus_dispatch_max_age_seconds: float(0.001,86400)?
+  ev_liveness_entity: str?
+  dispatch_liveness_entity: str?
+  battery_power_discharge_sign: list(positive|negative)?
   consumption_energy_entity: str?
   grid_power_entity: str?
   supply_max_current_a: float
