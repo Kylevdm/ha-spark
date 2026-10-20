@@ -452,7 +452,6 @@ async def read_dispatch_evidence(
             adjusted = raw_adjusted is True or (
                 isinstance(raw_adjusted, str) and raw_adjusted.strip().lower() == "true"
             )
-    # Additive metadata only: do not filter or reinterpret legacy evidence here.
     source_entities = {
         "ev_status": settings.ev_status_entity,
         "ev_plug": settings.ev_plug_entity,
@@ -479,6 +478,14 @@ async def read_dispatch_evidence(
             max_age_s=getattr(settings, option), option=option,
             sibling_reported_at=sibling.last_reported if sibling else None,
         )
+
+    def fresh(source: str) -> bool:
+        # A cached HA state is not a live picture: rating evidence whose source
+        # has not reported within its validated age is no evidence at all, so
+        # it can neither confirm a dispatch nor contradict (release) one.
+        check = freshness.get(source)
+        return check is not None and check.validity == "fresh"
+
     return DispatchEvidenceRead(
         freshness=freshness,
         battery_direction=battery_direction(
@@ -487,14 +494,16 @@ async def read_dispatch_evidence(
             discharge_sign=settings.battery_power_discharge_sign,
         ),
         evidence=DispatchEvidence(
-            live_dispatch=live_dispatch,
-            rate_adjusted=adjusted,
-            car_power_kw=car_power,
-            grid_import_kw=grid_power,
+            live_dispatch=live_dispatch if fresh("live_dispatch") else None,
+            rate_adjusted=adjusted if fresh("adjusted_rate") else None,
+            car_power_kw=car_power if fresh("ev_power") else None,
+            grid_import_kw=grid_power if fresh("dispatch_grid_power") else None,
             forecast_house_kw=forecast_house_kw,
-            plug_value=plug.state if plug is not None else None,
+            plug_value=plug.state if plug is not None and fresh("ev_plug") else None,
             ev_status_value=(
-                ev_status.state if ev_status is not None and ev_status_trusted else None
+                ev_status.state
+                if ev_status is not None and ev_status_trusted and fresh("ev_status")
+                else None
             ),
         ),
         ev_status=ev_status,

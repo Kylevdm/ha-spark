@@ -164,3 +164,69 @@ async def test_records_dropped_when_switch_already_reads_on(tmp_path, mode):
     await _reconcile(device, _intent())
     assert device._execution.authority.state.holds == ()
     assert _options(rest) == ["Off"]
+
+
+def _record(device, cause, *, confirmed=True, pending_release=False):
+    from datetime import UTC, datetime
+
+    from ha_spark.authority import HoldDevice, HoldRecord
+
+    return HoldRecord(
+        cause=cause, started_at=datetime.now(UTC) - timedelta(minutes=5),
+        trusted_end=datetime.now(UTC) + timedelta(hours=1) if cause == "dispatch" else None,
+        confirmed=confirmed, pending_release=pending_release,
+        device=HoldDevice(
+            driver="solis", power_switch=_SWITCH, hub=device._settings.solis_control_hub,
+            slave=device._settings.solis_modbus_slave,
+        ),
+    )
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise"])
+async def test_ev_hold_starting_under_our_dispatch_hold_is_recorded(tmp_path, mode):
+    """A second cause under ha-spark's own Off survives the first one's release."""
+    from dataclasses import replace
+
+    rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path, authority_mode=mode)
+    store = device._execution.authority
+    store.save_holds((_record(device, "dispatch"),))
+    await _reconcile(device, replace(_intent(holds=(_window(-5),)), ev_hold_active=True))
+    assert sorted(h.cause for h in store.state.holds) == ["dispatch", "ev"]
+    assert all(h.confirmed for h in store.state.holds)
+    assert _options(rest) == []
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise"])
+async def test_dispatch_starting_under_our_ev_hold_is_recorded(tmp_path, mode):
+    from dataclasses import replace
+
+    rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path, authority_mode=mode)
+    store = device._execution.authority
+    store.save_holds((_record(device, "ev", pending_release=True),))
+    await _reconcile(device, replace(_intent(holds=(_window(-5),)), ev_hold_active=False))
+    [dispatch] = [h for h in store.state.holds if h.cause == "dispatch"]
+    assert dispatch.confirmed and dispatch.trusted_end > _now()
+    assert _options(rest) == []
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise"])
+async def test_an_unconfirmed_request_never_releases_an_owner_off(tmp_path, mode):
+    """Our Off write failed before reaching HA; the owner switched Off since."""
+    rest = FakeRest()
+    device = _device(rest, tmp_path, authority_mode=mode)
+    store = device._execution.authority
+    original = rest.call_service
+
+    async def unreachable(domain, service, data=None):
+        raise RuntimeError("HA unreachable")
+
+    rest.call_service = unreachable
+    await _reconcile(device, _intent(holds=(_window(-10),)))
+    assert not store.state.holds[0].confirmed
+    rest.call_service = original
+    rest.states[_SWITCH] = "Off"  # the owner's own Off
+    lines = await _reconcile(device, _intent())
+    assert _options(rest) == []
+    assert any("[SKIP]" in line and "owner" in line for line in lines)

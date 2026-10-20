@@ -223,7 +223,8 @@ class PlannerInputs:
     # Original dispatches before evidence rating. The planner prices and sizes
     # only `dispatches`, but carries these for local per-minute hold re-rating.
     unrated_dispatches: tuple[DispatchSlot, ...] = ()
-    # Diagnostic metadata only (#419); not consumed by hold/pricing decisions.
+    # Report-time freshness per source (#419). The planner copies only the Kraken
+    # read time onto the intent; the hold gates read freshness at their own seams.
     evidence_freshness: dict[str, EvidenceFreshness] = field(default_factory=dict)
     battery_direction: str = "unknown"
     # Horizon geometry (#395): where the plan's slots fall on the clock, from

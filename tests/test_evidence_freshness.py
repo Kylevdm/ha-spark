@@ -1,4 +1,4 @@
-"""Source freshness is metadata only; it never changes existing hold trust."""
+"""Source freshness: report-time metadata, and only fresh evidence rates a dispatch."""
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from ha_spark.config import _OPTION_KEYS, Settings
 from ha_spark.energy import sources
+from ha_spark.energy.dispatch_evidence import DispatchEvidence
 from ha_spark.energy.evidence_freshness import battery_direction, check_report_time
 from ha_spark.energy.models import DispatchSlot, LoadForecast
 from ha_spark.energy.octopus import OctopusApiError
@@ -170,7 +171,10 @@ async def test_normalisation_preserves_report_times_and_legacy_evidence() -> Non
             settings, rest, (slot,), live_dispatch=live, report_times=reports,
             now=NOW + timedelta(seconds=301))
     assert trusted and live
-    assert first.evidence == later.evidence  # Freshness never rewires legacy ratings/holds.
+    # Fresh evidence rates as before; once every source is stale none of it rates
+    # (it can neither confirm nor contradict a dispatch).
+    assert first.evidence.live_dispatch is True and first.evidence.plug_value is not None
+    assert later.evidence == DispatchEvidence(forecast_house_kw=first.evidence.forecast_house_kw)
     assert first.ev_status_trusted == later.ev_status_trusted
     assert sources.ev_hold_status_from_read(first.ev_status, first.ev_status_trusted) is True
     assert first.battery_direction == "charging"

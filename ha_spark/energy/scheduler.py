@@ -933,7 +933,9 @@ async def reconcile_tick(
                 # Live state only matters when there is a window to rate.
                 if settings.dispatch_entity and fresh.unrated_holds:
                     _entity_dispatches, _entity_trusted, live_dispatch = (
-                        await read_dispatches_and_live(settings, rest)
+                        await read_dispatches_and_live(
+                            settings, rest, report_times=report_times
+                        )
                     )
                 dispatches = tuple(
                     DispatchSlot(start=start, end=end)

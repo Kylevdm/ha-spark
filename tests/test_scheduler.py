@@ -3123,7 +3123,9 @@ async def test_contradicted_dispatch_does_not_hold_during_per_minute_reconcile(
             at=now - timedelta(seconds=60),
         )
     )
-    respx.get(_EV_PLUG_URL).mock(return_value=_ev_status_state("EV Disconnected"))
+    respx.get(_EV_PLUG_URL).mock(
+        return_value=_ev_status_state("EV Disconnected", at=now - timedelta(seconds=60))
+    )
     ev_status = respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused"))
     respx.get(_OCTOPUS_RATE_URL).mock(
         return_value=httpx.Response(
@@ -3156,6 +3158,45 @@ async def test_contradicted_dispatch_does_not_hold_during_per_minute_reconcile(
     assert result.trusted_holds == ()
     assert ev_status.call_count == 1
     assert not any("Dropped contradicted dispatch" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("plug_at", [timedelta(seconds=301), None], ids=["stale", "missing"])
+@respx.mock
+async def test_a_stale_disconnected_plug_never_releases_a_per_minute_hold(
+    monkeypatch: pytest.MonkeyPatch, plug_at: timedelta | None
+) -> None:
+    """A cached "EV Disconnected" is not a live picture, so it cannot contradict."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    now = datetime(2026, 10, 3, 14, 15, tzinfo=UTC)
+    respx.get(_DISPATCH_URL).mock(
+        return_value=_dispatch_state(
+            "off",
+            [{"start": "2026-10-03T14:00:00", "end": "2026-10-03T15:00:00"}],
+            at=now - timedelta(seconds=60),
+        )
+    )
+    respx.get(_EV_PLUG_URL).mock(
+        return_value=_ev_status_state(
+            "EV Disconnected", at=None if plug_at is None else now - plug_at
+        )
+    )
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused"))
+    respx.get(_OCTOPUS_RATE_URL).mock(return_value=httpx.Response(404))
+    settings = _dispatch_settings(
+        ev_plug_entity="sensor.ev_plug",
+        ev_status_entity="sensor.ev",
+        octopus_rate_entity="sensor.octopus_rate",
+    )
+
+    result = await scheduler.reconcile_tick(
+        settings, _plan(replace(_INTENT, holds=(_HOLD,))), now, trusted_holds=(_HOLD,)
+    )
+
+    [intent] = device.intents
+    assert intent.hold_trusted is True
+    assert intent.hold_active(now) is True
+    assert result.trusted_holds == intent.holds != ()
 
 
 @pytest.mark.parametrize(
@@ -3429,7 +3470,11 @@ async def test_octopus_rerates_a_kept_dispatch_when_the_plug_disconnects(
     end = datetime(2026, 10, 3, 15, 0, tzinfo=UTC)
     now = datetime(2026, 10, 3, 14, 15, tzinfo=UTC)
     respx.get(_DISPATCH_URL).mock(return_value=_dispatch_state("off", []))
-    plug = respx.get(_EV_PLUG_URL).mock(return_value=_ev_status_state("EV Disconnected"))
+    plug = respx.get(_EV_PLUG_URL).mock(
+        return_value=_ev_status_state(
+            "EV Disconnected", at=datetime(2026, 10, 3, 14, 14, tzinfo=UTC)
+        )
+    )
     ev_status = respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused"))
     rate = respx.get(_OCTOPUS_RATE_URL).mock(
         return_value=httpx.Response(

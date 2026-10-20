@@ -1086,9 +1086,12 @@ class SolisDevice:
                     if wanted == "Off" and records and store is not None:
                         # Confirm our existing requests by this read; never open
                         # a new cause on a switch someone else already turned Off.
+                        # A confirmed record means the Off is ours, so a cause
+                        # that starts under it (EV during a dispatch, or the
+                        # reverse) is recorded and survives the other's release.
                         self._save_hold_request(
                             store, identity, intent, now, records, confirmed=True,
-                            create=False,
+                            create=any(h.confirmed for h in records),
                         )
                     elif (
                         wanted == "On" and records and store is not None
@@ -1117,9 +1120,11 @@ class SolisDevice:
                         ActionOutcome.REFUSED,
                     )
                 log.warning("Power-switch pre-read failed; writing %s anyway", wanted)
-            if wanted == "On" and not any(h.owned for h in records):
+            if wanted == "On" and not any(h.owned and h.confirmed for h in records):
+                # An unconfirmed request is not proof ha-spark turned it Off: its
+                # write may never have landed and the owner switched Off since.
                 return ActionLine(
-                    "[SKIP] owner-Off switch has no owned hold; left as-is",
+                    "[SKIP] owner-Off switch has no confirmed owned hold; left as-is",
                     ActionOutcome.UNVERIFIED,
                 )
             assert store is not None and store.state is not None
