@@ -4698,12 +4698,18 @@ async def test_loop_recovers_with_a_fresh_plan_only_after_stable_duration(
 async def test_loop_keeps_fallback_until_the_recovered_apply_verifies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """[FAILED], a [WARNING] mismatch, and a raise all keep fallback and retry."""
+    """[FAILED], a [WARNING] mismatch, and a raise all keep the fallback.
+
+    (#423) Each failed recovered apply re-applies the fallback on the same
+    tick and starts the five-minute backoff, so the next recovery attempt
+    waits instead of retrying every minute; the fourth attempt verifies and
+    leaves the fallback.
+    """
     respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
     stop, runs, settings = _patch_recovery_loop(
         tmp_path,
         monkeypatch,
-        [0, 1, 2, 3, 4, 5, 6],
+        [0, 1, 2, 7, 12, 17],
         [
             ["[FAILED] set timed charge current to 20 A"],
             ["[WARNING] set timed charge current to 20 A, but read back 18 A"],
@@ -4711,23 +4717,220 @@ async def test_loop_keeps_fallback_until_the_recovered_apply_verifies(
             ["[APPLIED] set timed charge current to 21 A over 3.4 h of the window"],
         ],
     )
+    applied_at: list[str] = []
+
+    class ReapplyWitnessDevice(_RecoveryFallbackDevice):
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            applied_at.append(soc.observed_at.isoformat())
+            return ["[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"]
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(ReapplyWitnessDevice, settings, rest),
+    )
 
     with pytest.raises(stop):
         await run_forever(settings, poll_seconds=0)
 
+    # 02:00 is a slot run held by the fallback; each recovery attempt that
+    # fails (02:02, 02:07, 02:12) re-applies the fallback on the same tick and
+    # pushes the next attempt five minutes out; 02:17 verifies and exits.
     assert [run["held"] for run in runs] == [True, False, False, False, False]
-    # Each retry is a fresh plan from that minute's own measurement.
     socs = [run["soc"] for run in runs[1:]]
     assert [s.observed_at for s in socs if isinstance(s, SocMeasurement)] == [
-        _passing_at(m).observed_at for m in (2, 3, 4, 5)
+        _passing_at(m).observed_at for m in (2, 7, 12, 17)
     ]
+    # The restored fallback is confirmed once (02:00), then re-applied on
+    # every failed recovered apply's own tick; the verified attempt applies none.
+    assert applied_at == [_passing_at(m).observed_at.isoformat() for m in (0, 2, 7, 12)]
     posts = _integrity_posts()
     states = [state for state, _ in posts]
-    # One post per tick, plus the transition post on the recovering tick (02:05).
-    assert states == ["fallback_verified"] * 6 + ["normal", "normal"]
-    # A failed recovered apply may have changed the program: never confirmed.
-    assert [attrs["fallback_confirmed"] for _, attrs in posts[2:6]] == [True, False, False, False]
+    # One post per tick, plus the re-apply verdict post on each failed
+    # attempt's tick (02:02, 02:07, 02:12) and the transition post (02:17).
+    assert states == ["fallback_verified"] * 9 + ["normal"]
+    reapply_posts = [posts[3], posts[5], posts[7]]
+    assert all(attrs["fallback_confirmed"] is True for _, attrs in reapply_posts)
+    assert all(
+        str(attrs["fallback_action"]).startswith("[FALLBACK]") for _, attrs in reapply_posts
+    )
+    assert posts[-1][1]["recovery_action"].startswith("[RECOVERED] normal programming resumed")
     assert _monitor_file(tmp_path) == {"consecutive_failures": 0, "fallback_status": "normal"}
+
+
+@respx.mock
+async def test_partial_recovered_apply_reapplies_fallback_same_tick_then_waits_five_minutes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#423) A partly-failed recovered apply re-applies and re-verifies the
+    fallback on the same tick, publishes the verdict, and no recovery attempt
+    runs before +5 minutes, where exactly one runs and completes recovery."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop, runs, settings = _patch_recovery_loop(
+        tmp_path,
+        monkeypatch,
+        [0, 1, 2, 3, 4, 5, 6, 7],
+        [
+            ["[FAILED] set timed charge current to 20 A"],
+            ["[APPLIED] set timed charge current to 21 A over 3.4 h of the window"],
+        ],
+    )
+    applied_at: list[str] = []
+
+    class ReapplyWitnessDevice(_RecoveryFallbackDevice):
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            applied_at.append(soc.observed_at.isoformat())
+            return ["[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"]
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(ReapplyWitnessDevice, settings, rest),
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    # 02:00 held by the fallback; 02:02 is the failed recovery attempt; no
+    # attempt at +1..+4 minutes (02:03-02:06); exactly one at +5 (02:07).
+    assert [run["held"] for run in runs] == [True, False, False]
+    socs = [run["soc"] for run in runs[1:]]
+    assert [s.observed_at for s in socs if isinstance(s, SocMeasurement)] == [
+        _passing_at(m).observed_at for m in (2, 7)
+    ]
+    # The fallback was re-applied on the failed attempt's own tick (02:02),
+    # through the same read-back-verified device action, and not again after.
+    assert applied_at == [_passing_at(m).observed_at.isoformat() for m in (0, 2)]
+    posts = _integrity_posts()
+    states = [state for state, _ in posts]
+    # One post per tick plus the same-tick re-apply verdict (02:02) and the
+    # recovery transition (02:07).
+    assert states == ["fallback_verified"] * 9 + ["normal"]
+    # 02:02's second post is the re-apply: verified again, published at once.
+    state, attrs = posts[3]
+    assert state == "fallback_verified"
+    assert attrs["fallback_confirmed"] is True
+    assert attrs["hardware_confirmation"] == "confirmed"
+    assert str(attrs["fallback_action"]).startswith("[FALLBACK]")
+    assert posts[-1][1]["recovery_action"].startswith("[RECOVERED] normal programming resumed")
+    # The fallback cleared only after the verified recovered apply: store
+    # cleared, epoch bumped, exactly one exit notice.
+    from ha_spark.authority import load_authority
+
+    result = load_authority(settings)
+    assert result.state is not None
+    assert result.state.fallback.active is False
+    assert result.state.fallback.causes == ()
+    assert result.state.epoch == 4
+    assert len(_fallback_notices("ha-spark fallback entered")) == 1
+    assert len(_fallback_notices("ha-spark fallback left")) == 1
+    assert _monitor_file(tmp_path) == {"consecutive_failures": 0, "fallback_status": "normal"}
+
+
+@respx.mock
+async def test_failed_fallback_reapply_stays_active_unconfirmed_and_retries_every_minute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#423) A re-apply that fails leaves the fallback active and unconfirmed
+    in the monitor and the store, publishes the [FAILED] verdict, and is
+    retried every minute of the backoff; no recovery attempt runs meanwhile."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop, runs, settings = _patch_recovery_loop(
+        tmp_path,
+        monkeypatch,
+        [0, 1, 2, 3, 4],
+        [["[FAILED] set timed charge current to 20 A"]],
+    )
+    applied_at: list[str] = []
+    results = [
+        "[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified",
+        "[FAILED] Solis fallback at 42 A unconfirmed: read back 40 A",
+    ]
+
+    class FailingReapplyDevice(_RecoveryFallbackDevice):
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            applied_at.append(soc.observed_at.isoformat())
+            return [results.pop(0)] if len(results) > 1 else [results[0]]
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(FailingReapplyDevice, settings, rest),
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    # 02:00 confirms the restored fallback; 02:02's failed recovered apply
+    # re-applies on the same tick and fails; the backoff retries it every
+    # minute (02:03, 02:04) while no recovery attempt runs.
+    assert [run["held"] for run in runs] == [True, False]
+    assert applied_at == [_passing_at(m).observed_at.isoformat() for m in (0, 2, 3, 4)]
+    posts = _integrity_posts()
+    # 02:02's second post publishes the failed re-apply: unconfirmed, [FAILED].
+    state, attrs = posts[3]
+    assert state == "fallback_failed"
+    assert attrs["fallback_confirmed"] is False
+    assert attrs["hardware_confirmation"] == "unconfirmed"
+    assert str(attrs["fallback_action"]).startswith("[FAILED]")
+    # Every later post stays in the failed, unconfirmed fallback.
+    for post_state, post_attrs in posts[4:]:
+        assert post_state == "fallback_failed"
+        assert post_attrs["fallback_confirmed"] is False
+    assert _monitor_file(tmp_path) == {
+        "consecutive_failures": 3, "fallback_status": "fallback_failed"
+    }
+    from ha_spark.authority import load_authority
+
+    result = load_authority(settings)
+    assert result.state is not None
+    assert result.state.fallback.active is True
+    assert result.state.fallback.causes == ("soc_integrity",)
+    assert _fallback_notices("ha-spark fallback left") == []
+
+
+@pytest.mark.parametrize("authority_mode", ["observe", "protect"])
+@respx.mock
+async def test_reapply_during_recovery_never_actuates_without_charging_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, authority_mode: str
+) -> None:
+    """(#423) Observe and Protect never request the fallback re-apply write:
+    a failed recovered apply there keeps today's retry-next-minute behaviour
+    with zero hardware-actuating calls."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop, runs, settings = _patch_recovery_loop(
+        tmp_path,
+        monkeypatch,
+        [0, 1, 2, 3],
+        [
+            ["[FAILED] set timed charge current to 20 A"],
+            ["[FAILED] set timed charge current to 20 A"],
+        ],
+        authority_mode=authority_mode,
+    )
+    applied_at: list[str] = []
+
+    class NeverReapplyDevice(_RecoveryFallbackDevice):
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            applied_at.append(soc.observed_at.isoformat())
+            return ["[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"]
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(NeverReapplyDevice, settings, rest),
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    # No charging authority: the fallback write is never requested, and the
+    # failed recovered apply retries the next minute as before.
+    assert applied_at == []
+    assert [run["held"] for run in runs] == [True, False, False]
+    assert _hardware_service_calls() == []
+    assert all(state == "fallback_verified" for state, _ in _integrity_posts())
+    assert _monitor_file(tmp_path)["fallback_status"] == "fallback_verified"
 
 
 @respx.mock
