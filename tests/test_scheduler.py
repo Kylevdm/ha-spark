@@ -4959,8 +4959,16 @@ async def _run_forever_until_cancelled(
         if plan is None:
             raise RuntimeError("no plan")
         if holds:
-            # Recorded during the run, so the startup reconcile has not seen them.
-            execution_context().authority.save_holds(holds)
+            # Recorded during the run, so the startup reconcile has not seen them,
+            # on the configured identity (#425 refuses a remapped one).
+            inverter = _s.devices[0]
+            identity = HoldDevice(
+                driver=inverter.driver, power_switch=inverter.entities.get("power_switch", ""),
+                hub=_s.solis_control_hub, slave=_s.solis_modbus_slave,
+            )
+            execution_context().authority.save_holds(
+                tuple(h.model_copy(update={"device": identity}) for h in holds)
+            )
         return scheduler.RunResult(plan, plan)
 
     async def cancelled_sample_signals(_s: Settings, _now: datetime) -> None:
