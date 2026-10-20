@@ -1,0 +1,159 @@
+"""Verified schedule restoration before releasing owned protection (#424/#443)."""
+from dataclasses import replace
+from datetime import timedelta
+
+import pytest
+
+from ha_spark.energy.scheduler import hold_reconcile_intent
+from tests.test_durable_holds import _record, _reload
+from tests.test_solis_power_switch import (
+    _SWITCH,
+    FakeRest,
+    _device,
+    _intent,
+    _now,
+    _options,
+    _reconcile,
+    _seed_owned_hold,
+)
+
+
+@pytest.fixture(autouse=True)
+def _skip_read_back_delays(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise"])
+async def test_release_refuses_an_unreadable_schedule(tmp_path, mode):
+    rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path, authority_mode=mode)
+    _seed_owned_hold(device)
+    rest.states["sensor.solis_control_timed_charge_start_hours"] = "unavailable"
+    if mode == "optimise":
+        rest.states["sensor.solis_control_work_mode_bitfield"] = "0"
+    records = device._execution.authority.state.holds
+    lines = await _reconcile(device, _intent())
+    assert _options(rest) == []
+    assert device._execution.authority.state.holds == records
+    assert any("[REFUSED]" in line and "schedule" in line for line in lines)
+
+
+async def test_optimise_release_verifies_plan_before_on(tmp_path):
+    rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path)
+    _seed_owned_hold(device)
+    await _reconcile(device, _intent())
+    assert _options(rest) == ["On"]
+    assert rest.calls[-1][2]["option"] == "On"
+    assert any(call[0] == "modbus" for call in rest.calls[:-1])
+    assert not device._execution.authority.state.holds
+
+
+async def test_fallback_release_verifies_fixed_schedule_not_soc_plan(tmp_path):
+    rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path, solis_fallback_current_a="35")
+    _seed_owned_hold(device)
+    device._execution.authority.save_fallback(active=True, cause="soc_integrity")
+    # The fallback transition bumps the epoch; the daemon plans under the new one.
+    device._execution.planned_epoch.set(device._execution.authority.state.epoch)
+    lines = await _reconcile(device, _intent())
+    assert _options(rest) == ["On"]
+    assert rest.states["sensor.solis_control_timed_charge_current"] == "35.0"
+    assert not device._execution.authority.state.holds
+    assert any("[APPLIED]" in line for line in lines)
+
+
+async def test_overlapping_causes_keep_both_records_until_release_verifies(tmp_path):
+    rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path, authority_mode="protect")
+    store = device._execution.authority
+    ev = _record(device, "ev", pending_release=True)
+    dispatch = _record(device, "dispatch")
+    store.save_holds((ev, dispatch))
+    await _reconcile(device, replace(_intent(), hold_trusted=False))
+    assert _options(rest) == []
+    assert {h.cause for h in store.state.holds} == {"ev", "dispatch"}
+    expired = dispatch.model_copy(update={"trusted_end": _now() - timedelta(seconds=1)})
+    store.save_holds((ev, expired))
+    await _reconcile(device, replace(_intent(), hold_trusted=False))
+    assert _options(rest) == ["On"]
+    assert not store.state.holds
+
+
+async def test_unconfirmed_dispatch_retries_off_after_restart_with_stale_evidence(tmp_path):
+    rest = FakeRest(switch="On")
+    device = _device(rest, tmp_path, authority_mode="protect")
+    device._execution.authority.save_holds((_record(device, "dispatch", confirmed=False),))
+    device._execution.authority = _reload(device)
+    intent = hold_reconcile_intent(replace(_intent(), hold_trusted=False), None)
+    assert intent is not None
+    await _reconcile(device, intent)
+    assert _options(rest) == ["Off"]
+    assert device._execution.authority.state.holds[0].confirmed
+    assert rest.states[_SWITCH] == "Off"
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise"])
+async def test_expired_unconfirmed_dispatch_never_writes_on(tmp_path, mode):
+    rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path, authority_mode=mode)
+    record = _record(device, "dispatch", confirmed=False)
+    device._execution.authority.save_holds((record.model_copy(
+        update={"trusted_end": _now() - timedelta(minutes=1)}
+    ),))
+    intent = hold_reconcile_intent(replace(_intent(), hold_trusted=False), None)
+    assert intent is not None
+    await _reconcile(device, intent)
+    assert _options(rest) == []
+    assert not any(call[0] == "modbus" for call in rest.calls)
+
+
+async def test_release_refuses_a_switch_that_is_not_on_or_off(tmp_path):
+    rest = FakeRest(switch="unavailable")
+    device = _device(rest, tmp_path)
+    _seed_owned_hold(device)
+    records = device._execution.authority.state.holds
+    lines = await _reconcile(device, _intent())
+    assert rest.calls == []
+    assert device._execution.authority.state.holds == records
+    assert any("refused" in line and "not on/off" in line for line in lines)
+
+
+async def test_protect_release_refuses_an_unreadable_resident_current(tmp_path):
+    rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path, authority_mode="protect")
+    _seed_owned_hold(device)
+    rest.states["sensor.solis_control_timed_charge_current"] = "unavailable"
+    lines = await _reconcile(device, _intent())
+    assert rest.calls == []
+    assert device._execution.authority.state.holds
+    assert any("[REFUSED]" in line and "schedule" in line for line in lines)
+
+
+async def test_protect_release_reads_the_resident_schedule_and_writes_only_the_switch(tmp_path):
+    rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path, authority_mode="protect")
+    _seed_owned_hold(device)
+    await _reconcile(device, _intent())
+    assert [call[0:2] for call in rest.calls] == [("select", "select_option")]
+    assert _options(rest) == ["On"]
+    assert not device._execution.authority.state.holds
+
+
+async def test_failed_on_read_back_keeps_the_record(tmp_path):
+    rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path, authority_mode="protect")
+    _seed_owned_hold(device)
+    original = rest.call_service
+
+    async def stuck(domain, service, data=None):
+        result = await original(domain, service, data)
+        if (domain, service) == ("select", "select_option"):
+            rest.states[_SWITCH] = "Off"
+        return result
+
+    rest.call_service = stuck
+    lines = await _reconcile(device, _intent())
+    assert _options(rest) == ["On"]
+    assert device._execution.authority.state.holds
+    assert not any(line.startswith("[APPLIED]") for line in lines)

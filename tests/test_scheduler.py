@@ -4011,6 +4011,15 @@ def _mock_power_switch(monkeypatch: pytest.MonkeyPatch, initial: str = "On") -> 
     return state
 
 
+def _restore_schedule_confirmed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Treat the release's schedule check as passed (#424; tested in test_verified_hold_release)."""
+
+    async def confirmed(*_args: object) -> tuple[list[object], None]:
+        return [], None
+
+    monkeypatch.setattr(SolisDevice, "_confirm_restore_schedule", confirmed)
+
+
 def _switch_writes() -> list[httpx.Response]:
     return [call for call in respx.calls if call.request.method == "POST"]
 
@@ -4099,6 +4108,7 @@ async def test_five_advancing_clear_reports_release_the_ev_hold(
     settings = _ev_hold_settings(authority_mode=mode)
     started = datetime(2026, 6, 10, 22, 0, tzinfo=UTC)
     switch = _mock_power_switch(monkeypatch)
+    _restore_schedule_confirmed(monkeypatch)
     reports: dict[str, object] = {"state": "Charging", "at": started}
     respx.get(_EV_STATUS_URL).mock(side_effect=lambda _r: _ev_report(reports))
     ev_state = scheduler.EvHoldState()
@@ -4545,6 +4555,7 @@ async def test_advancing_sibling_reports_release_an_unchanged_clear_status(
     """Sibling liveness proves the source is live; its reports advance the run."""
     started = datetime(2026, 6, 10, 22, 0, tzinfo=UTC)
     switch = _mock_power_switch(monkeypatch)
+    _restore_schedule_confirmed(monkeypatch)
     ev: dict[str, object] = {"state": "Charging", "at": started - timedelta(minutes=10)}
     sibling: dict[str, datetime] = {"at": started - timedelta(seconds=60)}
     respx.get(_EV_STATUS_URL).mock(side_effect=lambda _r: _ev_report(ev))

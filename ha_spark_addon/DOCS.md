@@ -637,7 +637,10 @@ notifies once per stale episode, including across restarts; fresh evidence
 re-arms it. EV hold clearance progress and the last trusted dispatch end are
 persisted, and settings reloads do not reset them. A saved request is not a
 read-back confirmation. Owner-Off switches without an owned hold are never
-released by hold reconciliation.
+released by hold reconciliation. A release writes the switch On only once the
+schedule it hands back to reads back: the resident slot-1 schedule in Protect;
+in Optimise this plan applied and verified, or the verified fallback schedule
+while fallback is active. Until then the hold stays and a refused line is logged.
 
 | Option | Source | Default |
 | --- | --- | --- |
