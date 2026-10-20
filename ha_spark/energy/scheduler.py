@@ -40,7 +40,15 @@ recovery ready (#117); each tick then computes a fresh plan from that tick's
 measurement and applies it, leaving fallback only once the apply reads back
 clean. A failed recovered apply keeps the fallback (unconfirmed) and retries.
 AlphaESS has no fallback request: after the threshold it stays blocked until
-the same stable evidence qualifies a fresh plan and its apply succeeds.
+the same stable evidence qualifies a fresh plan and its apply succeeds. The
+fallback schedule is validated as one pure schedule before every apply (#422):
+an above-limit current is blocked with the case named, never clamped. The
+authority store owns *fallback active* and its causes (phase 2: the only cause
+is SoC integrity) and is saved, with a bumped epoch, before the fallback write
+is requested; entry and exit each notify once, and exit clears the store only
+after the recovered plan applied and read back. Observe and Protect still
+count, persist and publish pending failure and threshold crossings but never
+request a fallback write.
 
 With `inverter_clock_dst_sync` on, the first tick after the household zone's
 UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
@@ -69,12 +77,16 @@ from ha_spark.api.server import (
     serve_in_background,
     stop_server,
 )
-from ha_spark.authority import AuthorityStore
+from ha_spark.authority import FALLBACK_CAUSE_SOC_INTEGRITY, AuthorityStore
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import DaemonChannel, Reply, action_lines
 from ha_spark.devices import Capability, inverter_device
 from ha_spark.devices.execution import ExecutionContext, Ownership, execution_context
-from ha_spark.devices.inverters.solis import SolisDevice, fallback_charge_current_a
+from ha_spark.devices.inverters.solis import (
+    SolisDevice,
+    validate_fallback_schedule,
+    validated_fallback_current_a,
+)
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome, is_verified, legacy_action_line
 from ha_spark.energy.derived_base_load import (
     BACKFILL_NAME,
@@ -504,7 +516,7 @@ async def guard_tick(
         if Capability.CHARGE_RATE not in charger.capabilities:
             return target_w or 0.0
         if fallback_active and fallback_confirmed:
-            fallback_a = fallback_charge_current_a(settings)
+            fallback_a = validated_fallback_current_a(settings)
             if fallback_a is not None:
                 # The fallback setting is the restoration target; a plan made
                 # while SoC was rejected is not authority for this value.
@@ -785,6 +797,79 @@ async def reconcile_tick(
     return ReconcileResult(lines, trusted_holds, relinquished)
 
 
+def _save_fallback_authority(active: bool) -> bool:
+    """Enter or leave fallback in the authority store, bumping the epoch (#422).
+
+    The store owns *fallback active* and its causes (phase 2: the only cause
+    is SoC integrity; the SoC monitor stays the sole judge of that cause and
+    keeps its counter, recovery progress and confirmation flags — the store
+    only mirrors its verdict). Returns whether this call changed the store;
+    raises (with ``save_failed`` set, so the write gate refuses every write)
+    when the durable save fails.
+    """
+    context = execution_context()
+    store = context.authority
+    if store is None:
+        return False
+    changed = store.save_fallback(active=active, cause=FALLBACK_CAUSE_SOC_INTEGRITY)
+    if changed:
+        # Work on the rest of this tick plans under the bumped epoch, so the
+        # fallback apply itself is not refused as stale; anything planned
+        # before the bump still is.
+        assert store.state is not None
+        context.planned_epoch.set(store.state.epoch)
+    return changed
+
+
+async def _notify_fallback_entered(settings: Settings, rest: HomeAssistantRest) -> None:
+    await send_notification(
+        settings, rest, "ha-spark fallback entered",
+        f"SoC integrity failure: fallback charging entered "
+        f"(cause: {FALLBACK_CAUSE_SOC_INTEGRITY}); the configured cheap window is "
+        "programmed at the configured fallback current",
+    )
+
+
+async def _notify_fallback_left(settings: Settings, rest: HomeAssistantRest) -> None:
+    await send_notification(
+        settings, rest, "ha-spark fallback left",
+        "SoC integrity recovered: fallback charging left; normal programming resumed",
+    )
+
+
+async def _mirror_fallback_authority(
+    settings: Settings, rest: HomeAssistantRest, monitor: SocMonitor, *, solis: bool
+) -> None:
+    """Mirror the monitor's fallback verdict into the authority store (#422).
+
+    Entry: a fallback-active monitor (a status persisted by an earlier process
+    reconciles into the store here, on the first tick of this version, as an
+    active cause that is not confirmed — the monitor's confirmation stays
+    false until this process reads back) is saved active before any fallback
+    write is requested. Exit: a store left active after a failed or
+    interrupted exit save is cleared here, so the store never claims a
+    fallback the monitor has already left and the next entry still bumps the
+    epoch and notifies once. One notice each way, only on the change.
+    """
+    active = monitor.fallback_active and solis
+    try:
+        changed = _save_fallback_authority(active)
+    except (OSError, ValueError):
+        log.warning("Authority save failed; fallback state not persisted; writes refused")
+        return
+    if not changed:
+        return
+    if active:
+        log.info(
+            "SoC integrity: fallback entered in the authority store (cause %s)",
+            FALLBACK_CAUSE_SOC_INTEGRITY,
+        )
+        await _notify_fallback_entered(settings, rest)
+    else:
+        log.info("SoC integrity: fallback exit persisted in the authority store")
+        await _notify_fallback_left(settings, rest)
+
+
 async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasurement | None:
     """One per-minute SoC observation: check, count once, publish. Never raises.
 
@@ -813,6 +898,9 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
             inverter = next(
                 (device for device in settings.devices if device.type == "inverter"), None
             )
+            await _mirror_fallback_authority(
+                settings, rest, monitor, solis=inverter is not None and inverter.driver == "solis"
+            )
             if (
                 inverter is not None
                 and inverter.driver == "solis"
@@ -821,6 +909,18 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
             ):
                 requested = monitor.request_fallback()
                 if requested is not None:
+                    entered = False
+                    try:
+                        # #422: the store (active + cause + bumped epoch) is
+                        # saved BEFORE the fallback write is requested from the
+                        # device; a failed save leaves ``save_failed`` set and
+                        # the gate refuses the write.
+                        entered = _save_fallback_authority(True)
+                    except (OSError, ValueError):
+                        log.warning(
+                            "Authority save failed; fallback entry not persisted; "
+                            "hardware writes refused"
+                        )
                     action_lines: list[str]
                     try:
                         device = inverter_device(settings, rest)
@@ -876,6 +976,13 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
                             log.warning(line)
                         else:
                             log.info(line)
+                    if entered:
+                        log.info(
+                            "SoC integrity: fallback entered in the authority store "
+                            "(cause %s)",
+                            FALLBACK_CAUSE_SOC_INTEGRITY,
+                        )
+                        await _notify_fallback_entered(settings, rest)
             await publish_soc_integrity(rest, snapshot, settings)
             return measurement
     except Exception:
@@ -918,6 +1025,15 @@ async def finish_recovery(
             action = f"[RECOVERED] normal programming resumed: {line}"
         log.info(action)
         snapshot = monitor.complete_recovery(action_line=action)
+        left = False
+        try:
+            # #422: the store's fallback active + cause are cleared and the
+            # epoch bumped only here, after the recovered plan applied and read
+            # back (today's exit point). A failed save is repaired by the next
+            # tick's mirror.
+            left = _save_fallback_authority(False)
+        except (OSError, ValueError):
+            log.warning("Authority save failed; fallback exit not persisted; writes refused")
     else:
         retained = "SoC integrity block" if monitor.recovery_blocked else "fallback"
         log.warning(
@@ -931,6 +1047,9 @@ async def finish_recovery(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
         ) as rest:
             await publish_soc_integrity(rest, snapshot, settings)
+            if left:
+                log.info("SoC integrity: fallback exit persisted in the authority store")
+                await _notify_fallback_left(settings, rest)
     except Exception:
         log.exception("Publishing the SoC recovery transition failed")
 
@@ -1094,8 +1213,8 @@ async def _run_forever(
                 if (
                     settings.charge_window_start != last_settings.charge_window_start
                     or settings.charge_window_end != last_settings.charge_window_end
-                    or fallback_charge_current_a(settings)
-                    != fallback_charge_current_a(last_settings)
+                    or validate_fallback_schedule(settings)
+                    != validate_fallback_schedule(last_settings)
                     or settings.devices != last_settings.devices
                     or settings.solis_control_hub != last_settings.solis_control_hub
                     or settings.solis_modbus_slave != last_settings.solis_modbus_slave

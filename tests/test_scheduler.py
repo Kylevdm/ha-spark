@@ -1941,6 +1941,297 @@ async def test_loop_reconciles_persisted_fallback_even_when_soc_passes(
     assert _integrity_posts()[0][1]["fallback_confirmed"] is True
 
 
+# --- #422: the authority store owns fallback active and its causes ---
+
+
+def _fallback_notices(title: str) -> list[dict[str, object]]:
+    """The persistent-notification bodies with ``title`` this test saw."""
+    out: list[dict[str, object]] = []
+    for call in respx.calls:
+        if call.request.url.path != "/api/services/persistent_notification/create":
+            continue
+        body = json.loads(call.request.content)
+        if body.get("title") == title:
+            out.append(body)
+    return out
+
+
+def _hardware_service_calls() -> list[str]:
+    """Hardware-actuating service calls (modbus/select/switch), never notices."""
+    return [
+        call.request.url.path
+        for call in respx.calls
+        if call.request.method == "POST"
+        and any(
+            call.request.url.path.startswith(f"/api/services/{domain}/")
+            for domain in ("modbus", "select", "switch", "alphaess")
+        )
+    ]
+
+
+@respx.mock
+async def test_loop_fallback_entry_saves_the_store_before_the_write_and_notifies_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#422) Entry: the store (active + cause + bumped epoch) is saved before
+    the fallback write is requested, the apply plans under the new epoch, and
+    one entry notice fires across the ticks."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50", "50", "50"], [stale, stale, stale])
+    apply_state: list[tuple[bool, int, int]] = []
+
+    class StoreWitnessDevice(SolisDevice):
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            from ha_spark.devices.execution import execution_context
+
+            context = execution_context()
+            store = context.authority
+            assert store is not None and store.state is not None
+            apply_state.append((
+                store.state.fallback.active,
+                store.state.epoch,
+                context.planned_epoch.get(),
+            ))
+            return ["[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"]
+
+        async def reconcile_holds(self, *_args: object, **_kwargs: object) -> list[str]:
+            return []
+
+        async def write_safe_state(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(StoreWitnessDevice, settings, rest),
+    )
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        soc_failure_threshold=2, solis_fallback_current_a=42.0, v2l_power_entity="",
+    )
+    store = seed_authority(settings, "optimise")
+    stop = _patch_monitor_loop(
+        monkeypatch,
+        [datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 22, 1),
+         datetime(2026, 6, 10, 22, 30)],
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    from ha_spark.authority import load_authority
+
+    # Saved active + cause with the epoch bumped (start_process + entry), and
+    # the fallback apply itself ran under the bumped epoch, not refused stale.
+    assert store.state is not None
+    assert apply_state == [(True, store.state.epoch + 2, store.state.epoch + 2)]
+    result = load_authority(settings)
+    assert result.state is not None
+    assert result.state.fallback.active is True
+    assert result.state.fallback.causes == ("soc_integrity",)
+    assert result.state.epoch == store.state.epoch + 2
+    assert len(_fallback_notices("ha-spark fallback entered")) == 1
+    assert _fallback_notices("ha-spark fallback left") == []
+
+
+@respx.mock
+async def test_loop_fallback_exit_clears_the_store_and_notifies_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#422) Exit: the store's fallback active + cause clear and the epoch
+    bumps only after the recovered plan applied and read back, with one exit
+    notice."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop, _runs, settings = _patch_recovery_loop(
+        tmp_path, monkeypatch, [0, 1, 2, 3],
+        [["[APPLIED] set timed charge current to 20 A over 3.5 h of the window"]],
+    )
+    from ha_spark.authority import load_authority
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    result = load_authority(settings)
+    assert result.state is not None
+    assert result.state.fallback.active is False
+    assert result.state.fallback.causes == ()
+    # Seed + start_process + first-boot reconciliation entry + exit.
+    assert result.state.epoch == 4
+    assert len(_fallback_notices("ha-spark fallback entered")) == 1
+    assert len(_fallback_notices("ha-spark fallback left")) == 1
+
+
+@pytest.mark.parametrize("mode", ["observe", "protect"])
+@respx.mock
+async def test_loop_sustained_failure_without_charging_authority_never_requests_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """(#422) Observe/Protect: pending failure and the threshold crossing are
+    counted, persisted and published, but `request_fallback`/`apply_fallback`
+    are never called and zero fallback writes happen."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50", "50", "50"], [stale, stale, stale])
+    requests: list[object] = []
+    applies: list[object] = []
+
+    def forbid_request(self: SocMonitor) -> object:
+        requests.append(self)
+        raise AssertionError(f"{mode} requested a fallback")
+
+    async def forbid_apply(self: SolisDevice, soc: SocMeasurement) -> list[str]:
+        applies.append(soc)
+        raise AssertionError(f"{mode} applied a fallback")
+
+    monkeypatch.setattr(SocMonitor, "request_fallback", forbid_request)
+    monkeypatch.setattr(SolisDevice, "apply_fallback", forbid_apply)
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        authority_mode=mode,  # type: ignore[arg-type]
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        soc_failure_threshold=2, solis_fallback_current_a=42.0, v2l_power_entity="",
+    )
+    stop = _patch_monitor_loop(
+        monkeypatch,
+        [datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 22, 1),
+         datetime(2026, 6, 10, 22, 2)],
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    from ha_spark.authority import load_authority
+
+    assert requests == [] and applies == []
+    # Counted, persisted and published — but never written.
+    assert [state for state, _ in _integrity_posts()] == [
+        "pending_failure", "fallback_threshold", "fallback_threshold",
+    ]
+    assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
+        "consecutive_failures": 3, "fallback_status": "fallback_threshold",
+    }
+    result = load_authority(settings)
+    assert result.state is not None
+    assert result.state.fallback.active is False
+    assert result.state.epoch == 2  # only start_process; entry never happened
+    assert _fallback_notices("ha-spark fallback entered") == []
+    assert _hardware_service_calls() == []
+
+
+@respx.mock
+async def test_first_boot_reconciles_monitor_fallback_into_the_store_unconfirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#422) First boot of this version: a monitor-persisted fallback status
+    is reconciled into the store as an active cause that is not confirmed (the
+    monitor's confirmation stays false until read-back), and a restart does
+    not notify again."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    now = datetime.now(UTC)
+    _soc_get(["55"], [now])
+    (tmp_path / "ha_spark_soc_monitor.json").write_text(
+        json.dumps({"consecutive_failures": 2, "fallback_status": "fallback_verified"}),
+        encoding="utf-8",
+    )
+
+    class UnconfirmedFallbackDevice(SolisDevice):
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            return ["[FAILED] Solis fallback at 42 A in 23:30-05:30 unconfirmed: read-back"]
+
+        def planned_rate_w(self, _intent: object) -> float:
+            return 0.0
+
+        async def reconcile_holds(self, *_args: object, **_kwargs: object) -> list[str]:
+            return []
+
+        async def write_safe_state(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(UnconfirmedFallbackDevice, settings, rest),
+    )
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        authority_mode="optimise",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        soc_failure_threshold=2, solis_fallback_current_a=42.0, v2l_power_entity="",
+    )
+    stop = _patch_monitor_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0)])
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    from ha_spark.authority import load_authority
+
+    result = load_authority(settings)
+    assert result.state is not None
+    assert result.state.fallback.active is True
+    assert result.state.fallback.causes == ("soc_integrity",)
+    assert len(_fallback_notices("ha-spark fallback entered")) == 1
+    # Unconfirmed: the reconcile attempt failed, so the cause is active but the
+    # fallback is not hardware-confirmed; it retries next minute.
+    state, attrs = _integrity_posts()[0]
+    assert state == "fallback_failed"
+    assert attrs["fallback_confirmed"] is False
+    assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
+        "consecutive_failures": 2, "fallback_status": "fallback_failed",
+    }
+
+    # A restart: the store already says active, so no second entry or notice.
+    _soc_get(["55"], [now])
+    stop = _patch_monitor_loop(monkeypatch, [datetime(2026, 6, 10, 22, 1)])
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert len(_fallback_notices("ha-spark fallback entered")) == 1
+    assert load_authority(settings).state is not None
+    assert load_authority(settings).state.fallback.active is True
+
+
+@respx.mock
+async def test_fallback_entry_save_failure_refuses_the_fallback_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """(#422) If the entry save fails, no fallback write runs: `save_failed`
+    makes the gate refuse, and the attempt stays retryable next minute."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50"], [stale])
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t",
+        authority_mode="optimise",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        soc_failure_threshold=1, solis_fallback_current_a=42.0, v2l_power_entity="",
+    )
+
+    def boom(path: object, payload: str) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("ha_spark.authority._durable_write", boom)
+    monitor = SocMonitor(path=tmp_path / "ha_spark_soc_monitor.json")
+    with caplog.at_level("WARNING"):
+        await scheduler.soc_monitor_tick(settings, monitor)
+
+    from ha_spark.authority import load_authority
+
+    assert _hardware_service_calls() == []
+    assert "fallback entry not persisted" in caplog.text
+    state, attrs = _integrity_posts()[0]
+    assert state == "fallback_failed"
+    assert attrs["fallback_confirmed"] is False
+    assert attrs["fallback_action"].startswith("[FAILED] Solis fallback unconfirmed: [REFUSED]")
+    assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
+        "consecutive_failures": 1, "fallback_status": "fallback_failed",
+    }
+    result = load_authority(settings)
+    assert result.state is not None
+    assert result.state.fallback.active is False  # the entry never persisted
+
+
 @respx.mock
 async def test_loop_caps_verified_fallback_guard_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
