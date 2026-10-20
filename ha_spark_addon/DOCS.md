@@ -44,6 +44,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `ha_template_charge_needed_entity` | Optional HA template sensor; the plan report shows its value next to ha-spark's for comparison |
 | `inverter` | Which inverter ha-spark controls: `solis` (default) or `alphaess` |
 | `solis_control_hub` | Name of the HA `modbus:` overlay hub that ha-spark uses to write the Solis timed-slot registers (default `solis_control`; see [`docs/solis-control-modbus-overlay.yaml`](../docs/solis-control-modbus-overlay.yaml)) |
+| `solis_model_confirmed` | Boolean, default `false`. Owner confirmation that the inverter is the validated reference (33000 = `0x0026` AND 35000 = `0x2031`) when identity sensors cannot be read. Readable mismatches always override confirmation; V2 TOU (`33289 = 0xAA55`) is not validated. This setting grants no write authority |
 | `solis_modbus_slave` | Modbus slave/unit id on that hub (default `1`) |
 | `inverter_clock_tolerance_minutes` | How far the Solis inverter clock may drift from the household clock (`timezone`) before ha-spark refuses to arm an export window and `health` warns (default `5`). Fix drift with `python -m ha_spark solis sync-clock` |
 | `inverter_clock_dst_sync` | Off by default. When on, ha-spark syncs the Solis inverter clock from the household clock after a daylight-saving change, as `sync-clock` does. It writes only when the site operating mode authorises clock changes; in Observe it logs "would sync". It can sync at any point in the six hours after the change, so a restart or an authorised mode change in that time still syncs, and it retries each minute. It notifies through `notify_service` on success, or if the sync is still failing after 30 minutes. It never corrects ordinary drift |
@@ -52,6 +53,25 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `heatpump_energy_entity` | Optional dedicated heat-pump energy sensor (kWh) for signal recording |
 | `outdoor_weather_entity` | Weather entity with a `temperature` attribute (default `weather.home`) for signal recording |
 | `v2l_power_entity` | Optional V2L discharge-power sensor (W); enables the V2L tally (see "V2L" below) |
+
+### Read-only inverter diagnostic
+
+Run `python -m ha_spark inverter show` to read each configured inverter's model
+identity, validation reason, declared hold contract, and resident slot-1 charge
+window, charge current (43141) and configured power-switch state. Identity words
+are shown as raw integers, keyed by register address; `null` means unreadable.
+Resident readings show `unknown` when unreadable, never a configured substitute.
+This command uses only HA REST GETs: no register writes, select/switch service
+calls, clock writes, refresh service calls, or authority-store writes. It works
+in Observe as well as Protect/Optimise and does not change any existing write gate.
+
+Add the three slow-polling input sensors from the overlay document to enable
+identity reads (`model_word`, `inverter_type_definition`, `tou_version`). Only
+the two-word reference identity is validated, not Solis in general. If identity
+cannot be read, leave `solis_model_confirmed: false` unless you have independently
+confirmed that reference identity. AlphaESS declares no validated hold surface
+(#196). The contract declaration is for future protection preconditions; this
+diagnostic does not itself establish fresh protection evidence.
 
 ### Solis control
 
@@ -599,6 +619,93 @@ every hardware decision.
    simulated decisions look right, disable conflicting automations, confirm
    the Solis overlay and entity reads are healthy before enabling Optimise.
    Follow the handover procedure linked above.
+
+## Hold evidence freshness and durable ownership
+
+Only fresh EV/dispatch evidence can start a new hold. A confirmed EV hold
+survives stale evidence and restarts, and clears after five strictly advancing
+fresh not-charging reports. Stale or backwards reports reset that clearance
+sequence; equal report times do not advance it. A dispatch hold ends at its
+last trusted end; stale updates cannot extend it. Unreadable schedules remain
+untrusted, not trusted-empty; dispatch evidence filtering still happens before pricing.
+
+Each configured source has its own maximum age in seconds:
+
+`hold_degraded_minutes` (default **60**, range **5–1440**) controls when a
+retained owned hold without fresh evidence raises a degraded notification. It
+notifies once per stale episode, including across restarts; fresh evidence
+re-arms it. EV hold clearance progress and the last trusted dispatch end are
+persisted, and settings reloads do not reset them. A saved request is not a
+read-back confirmation. Owner-Off switches without an owned hold are never
+released by hold reconciliation.
+
+| Option | Source | Default |
+| --- | --- | --- |
+| `ev_status_max_age_seconds` | `ev_status_entity` charging status | 300 |
+| `ev_plug_max_age_seconds` | `ev_plug_entity` plug status | 300 |
+| `ev_power_max_age_seconds` | `ev_power_entity` car power | 300 |
+| `live_dispatch_max_age_seconds` | `dispatch_entity` live state | 300 |
+| `adjusted_rate_max_age_seconds` | `octopus_rate_entity` adjusted-rate flag | 300 |
+| `dispatch_grid_power_max_age_seconds` | `dispatch_grid_power_entity` grid power | 300 |
+| `battery_power_max_age_seconds` | `battery_power_entity` direction evidence | 300 |
+| `octopus_dispatch_max_age_seconds` | Octopus API dispatch windows | 2700 |
+
+Settings require `0 < max_age_seconds <= 86400` (the add-on form accepts
+0.001–86400). An explicitly unset/`None` limit is **unknown**, with
+`no validated max-age; set <option>`; no unmeasured source should acquire a
+guessed default.
+
+**How defaults were measured:** read-only sampling of HA `/api/states` every
+10 seconds for 30 minutes on the reference household, 2026-10-19
+23:00–23:30 UTC. All sampled entities advanced HA's top-level `last_reported`
+only when their value changed. EV charger status, plug and charging power
+(one charger integration), and supplier live-dispatch/current-rate entities
+had zero reports (their previous reports were hours old): change-only sources.
+Charger-integration grid power (same device as EV status) had 28 reports,
+median gap 61 s, maximum 122 s. Inverter battery power had 53 reports,
+median gap 15 s, maximum 165 s. The 300 s power limit is approximately twice
+the largest observed gap, rounded. Change-only sources use the same 300 s
+limit for sibling liveness. Octopus API windows use ha-spark's own successful
+fetch time in `gather_inputs`, on each half-hourly replan; 2700 s (45 min)
+is one replan interval plus margin, not a measured HA reporting cadence.
+
+**Configure siblings for change-only sources:** `ev_liveness_entity` covers EV
+status, plug and EV power; `dispatch_liveness_entity` covers live dispatch and
+adjusted rate. Both default empty. Choose an entity from the **same integration
+and device** that reports regularly (for example the reference charger's grid
+power). Without a sibling, unchanged values such as “Paused” or dispatch “off”
+go stale 300 seconds after each change. Set the sibling rather than assuming
+repeated reads establish liveness.
+
+An own report is fresh when present, timezone-aware, non-future and within its
+source's limit. Otherwise a recent non-future sibling report within that same
+limit proves liveness, provided the own report is known, non-future and no more
+than `MAX_UNCHANGED` (12 hours) old. Fresh own reports take precedence. When
+liveness comes from the sibling, the **effective report time is the sibling's
+report time**; otherwise it is the own report time. Known old reports are stale,
+future own reports are future, and missing/unparseable/timezone-less own times
+are unknown. Only HA top-level `last_reported` counts: never polling time,
+`last_updated`, `last_changed` or attribute timestamps. Re-reading a cached
+state preserves its report time and only increases its age.
+
+**Battery direction:** `battery_power_entity` must report an explicit `W` unit.
+Set `battery_power_discharge_sign: positive|negative`; there is deliberately no
+default. With `positive`, positive W means discharging and negative W charging;
+`negative` reverses that mapping. Absolute power below 50 W is idle. Missing
+sign, non-finite/malformed power or any non-W/missing unit means unknown
+direction. On the reference install the inverter read **−2851 W** while the
+house imported about **4.0 kW** against about **1.0 kW** consumption: negative
+was charging, so this household sets **`positive`**. Do not infer the sign
+from another manufacturer's convention. Direction and time validity are
+reported separately; a known direction does not imply fresh evidence.
+
+`python -m ha_spark health` includes an `Evidence <source>` row for each
+configured source: fresh/stale/future/unknown, effective report time, age,
+maximum age and whether liveness came from the sibling, plus battery direction.
+The evidence section is read-only: no hardware or authority-store writes.
+For the supplier row it makes its own read-only fetch and reports that fetch's
+validity, not the age of the daemon's last plan. The daemon's planner inputs
+retain their original `gather_inputs` fetch time.
 
 ## Data
 

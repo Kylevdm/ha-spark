@@ -34,7 +34,10 @@ The forced-charge program (window + current) additionally refuses when grid char
 is not permitted by the
 inverter's work mode (bit 5); the live rate-tier throttle is not so gated. The
 SoC fallback uses the same forced-charge sequence with an explicitly configured
-current ceiling and the configured cheap-rate window.
+current and the configured cheap-rate window, validated as one schedule before
+every apply (#422): an above-limit current is blocked with the case named,
+never silently clamped, and the schedule it applies is charge-only through
+controls that read back.
 """
 
 from __future__ import annotations
@@ -42,11 +45,15 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypeVar
 from zoneinfo import ZoneInfo
 
-from ha_spark.devices.base import Capability, fmt_hhmm
+import httpx
+
+from ha_spark.authority import AuthorityStore, HoldDevice, HoldRecord
+from ha_spark.devices.base import Capability, HoldContract, HoldValidation, fmt_hhmm
 from ha_spark.devices.execution import (
     ExecutionContext,
     Ownership,
@@ -71,7 +78,7 @@ from ha_spark.energy.export_notifications import (
     send_once,
 )
 from ha_spark.energy.export_store import ExportEventStore
-from ha_spark.energy.models import ChargeIntent, window_hours
+from ha_spark.energy.models import ChargeIntent, ExportIntent, window_hours
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.logging import get_logger
 
@@ -159,17 +166,105 @@ def _discharge_half(
     return kept_discharge or [0, 0, 0, 0]
 
 
-def fallback_charge_current_a(settings: Settings) -> int | None:
-    """Configured fallback current after normal Solis and register limits."""
+@dataclass(frozen=True)
+class FallbackSchedule:
+    """A validated fallback charge schedule (#422): current and window, export off.
+
+    Export/discharge is disabled by construction and the controls are the
+    fixed read-back-capable set, so the schedule the device applies can only
+    be a bounded charge in the configured cheap window.
+    """
+
+    current_a: int
+    window_start: time
+    window_end: time
+
+
+# The fallback's own controls, each one written and read back through the
+# overlay (43141 current, 43143 window block). A control outside this set may
+# not carry a fallback: it has no verified read-back path here.
+_FALLBACK_CONTROLS = frozenset({Capability.CHARGE_WINDOW, Capability.CHARGE_RATE})
+
+
+def validate_fallback_schedule(
+    settings: Settings,
+    *,
+    export: ExportIntent | None = None,
+    controls: frozenset[Capability] = _FALLBACK_CONTROLS,
+) -> FallbackSchedule | str:
+    """Validate the fallback charge schedule; one named reason per invalid case.
+
+    Pure: settings (plus the candidate's own export and controls, which the
+    fallback's construction never varies) → either a valid schedule or the
+    named reason it is invalid, so the caller blocks with the case named
+    instead of clamping (#422). Re-run immediately before every apply against
+    the settings in force then: a limit lowered below the fallback current
+    blocks the next apply.
+    """
+    if export is not None:
+        return "the fallback schedule must not program export or discharge"
+    unsupported = sorted(str(control) for control in controls - _FALLBACK_CONTROLS)
+    if unsupported:
+        return f"fallback control {', '.join(unsupported)} has no read-back support"
     configured = settings.solis_fallback_current_a
     if configured is None:
-        return None
-    configured_max = settings.max_charge_current_a
-    if not math.isfinite(configured) or not math.isfinite(configured_max) or configured_max <= 0:
-        return 0
-    return math.floor(
-        min(configured, configured_max, _MAX_CHARGE_CURRENT_A) + 1e-9
+        return "solis_fallback_current_a is not configured"
+    if not math.isfinite(configured):
+        return "solis_fallback_current_a is not a finite current"
+    if configured < 1:
+        return "solis_fallback_current_a must be a current of at least 1 A"
+    if not math.isfinite(settings.max_charge_current_a) or settings.max_charge_current_a <= 0:
+        return "max_charge_current_a is not a positive finite limit"
+    if configured > settings.max_charge_current_a:
+        return (
+            f"solis_fallback_current_a ({configured:g} A) is above max_charge_current_a "
+            f"({settings.max_charge_current_a:g} A)"
+        )
+    if configured > _MAX_CHARGE_CURRENT_A:
+        return (
+            f"solis_fallback_current_a ({configured:g} A) is above the inverter "
+            f"register limit ({_MAX_CHARGE_CURRENT_A:g} A)"
+        )
+    if not math.isfinite(settings.battery_voltage_v) or settings.battery_voltage_v <= 0:
+        return "battery_voltage_v is not a positive finite limit"
+    if not math.isfinite(settings.supply_max_current_a) or settings.supply_max_current_a <= 0:
+        return "supply_max_current_a is not a positive finite limit"
+    if not math.isfinite(settings.supply_voltage_v) or settings.supply_voltage_v <= 0:
+        return "supply_voltage_v is not a positive finite limit"
+    charge_w = configured * settings.battery_voltage_v
+    supply_w = settings.supply_max_current_a * settings.supply_voltage_v
+    if charge_w > supply_w:
+        return (
+            f"fallback charge power ({charge_w:.0f} W) is above the site supply limit "
+            f"({supply_w:.0f} W)"
+        )
+    window: dict[str, time] = {}
+    for side, raw in (
+        ("start", settings.charge_window_start),
+        ("end", settings.charge_window_end),
+    ):
+        try:
+            parsed = time.fromisoformat(raw)
+        except ValueError:
+            return f"charge_window_{side} '{raw}' is not a valid HH:MM time"
+        # The household clock face the Slot 1 registers encode is naive whole
+        # minutes: an offset-attached or sub-minute time is not a time on it.
+        if parsed.tzinfo is not None or parsed.second or parsed.microsecond:
+            return f"charge_window_{side} '{raw}' is not a time on the household clock"
+        window[side] = parsed
+    if window["start"] == window["end"]:
+        return "the fallback charge window is zero-length"
+    return FallbackSchedule(
+        current_a=math.floor(configured + 1e-9),
+        window_start=window["start"],
+        window_end=window["end"],
     )
+
+
+def validated_fallback_current_a(settings: Settings) -> int | None:
+    """The validated fallback current, or ``None`` while the schedule is invalid."""
+    result = validate_fallback_schedule(settings)
+    return result.current_a if isinstance(result, FallbackSchedule) else None
 
 
 @register("solis")
@@ -195,6 +290,93 @@ class SolisDevice:
         self._hub = settings.solis_control_hub
         self._slave = settings.solis_modbus_slave
 
+    async def _diagnostic_number(self, field: str) -> float | None:
+        """Read an overlay value without refreshing, writing, or substituting config."""
+        try:
+            state = await self._rest.get_state(self._sensor(field))
+            value = float(state.state)
+            return value if math.isfinite(value) else None
+        except (httpx.HTTPError, ValueError, TypeError):
+            return None
+
+    async def hold_validation(self) -> HoldValidation:
+        """Qualify this model, never the Solis driver family as a whole."""
+        identity: dict[str, int | None] = {}
+        for address, field in ((33000, "model_word"), (35000, "inverter_type_definition"),
+                               (33289, "tou_version")):
+            value = await self._diagnostic_number(field)
+            identity[str(address)] = (
+                int(value) if value is not None and value.is_integer() and 0 <= value <= 65535
+                else None
+            )
+        words = ", ".join(
+            f"{address}=0x{value:04X}" if value is not None else f"{address}=unknown"
+            for address, value in identity.items()
+        )
+        source = "inverter read"
+        reason = "validated reference identity"
+        mismatch = any(identity[key] is not None and identity[key] != expected
+                       for key, expected in (("33000", 0x0026), ("35000", 0x2031)))
+        if mismatch:
+            reason = f"not validated: Solis model differs from reference ({words})"
+        elif identity["33289"] == 0xAA55:
+            reason = f"not validated: V2 TOU is incompatible with V1 slots ({words})"
+        elif identity["33000"] is None or identity["35000"] is None:
+            source = "owner confirmation" if self._settings.solis_model_confirmed else "unreadable"
+            reason = ("validated reference identity by owner confirmation" if
+                      self._settings.solis_model_confirmed else
+                      f"not validated: identity unreadable, no owner confirmation ({words})")
+        contract = None
+        readable = identity["33000"] is not None and identity["35000"] is not None
+        if (not mismatch and identity["33289"] != 0xAA55
+                and (readable or self._settings.solis_model_confirmed)):
+            contract = HoldContract(
+                hold="whole-inverter power switch Off; preserve resident schedule",
+                release="power switch On only after readable pre-read; restore confirmed schedule",
+                read_back="verify switch, slot 1 and charge current through HA",
+                evidence_freshness=(
+                    "fresh source reports required; cached state alone is insufficient"
+                ),
+            )
+        return HoldValidation(identity, source, contract, reason)
+
+    async def resident_charge_window(self) -> tuple[time, time] | None:
+        """The resident slot-1 charge window read back; unknown ⇒ ``None``.
+
+        The same overlay GETs ``resident_diagnostic`` makes (#418): no refresh,
+        no write, and the configured window is never substituted for the
+        resident one. ``None`` is "unknown", and unknown is not verified (#420).
+        """
+        parts: list[int] = []
+        for index, field in enumerate(_WINDOW_FIELDS[:4]):
+            value = await self._diagnostic_number(field)
+            maximum = 23 if index % 2 == 0 else 59
+            if value is None or not value.is_integer() or not 0 <= value <= maximum:
+                return None
+            parts.append(int(value))
+        return (time(parts[0], parts[1]), time(parts[2], parts[3]))
+
+    async def resident_diagnostic(self) -> dict[str, object]:
+        """Read slot 1, 43141 and the configured switch; unknown never means configured."""
+        window = await self.resident_charge_window()
+        current = await self._diagnostic_number("timed_charge_current")
+        switch = "unknown"
+        entity = self._config.entities.get("power_switch", "")
+        if entity:
+            try:
+                state = (await self._rest.get_state(entity)).state.strip().lower()
+                if state in {"on", "off"}:
+                    switch = state
+            except httpx.HTTPError:
+                pass
+        return {
+            "charge_window": (
+                f"{fmt_hhmm(window[0])}–{fmt_hhmm(window[1])}" if window else "unknown"
+            ),
+            "charge_current_a": current if current is not None and current >= 0 else "unknown",
+            "power_switch": switch,
+        }
+
     # --- planning ---
 
     def planned_rate_w(self, intent: ChargeIntent) -> float:
@@ -204,38 +386,33 @@ class SolisDevice:
 
     @device_action(Ownership.CHARGING)
     async def apply_fallback(self, soc: SocMeasurement) -> list[ActionLine]:
-        """Apply the configured cheap-window fallback using the normal Solis gates.
+        """Apply the validated cheap-window fallback using the normal Solis gates.
 
         The SoC reading is carried for timing and diagnostics only. The plan
         target, plan window, and any planned export cannot affect this request.
+        The schedule is re-validated here, immediately before every apply,
+        against the settings in force now (#422): an above-limit current is
+        blocked with the case named, never clamped.
         """
-        current_a = fallback_charge_current_a(self._settings)
-        if current_a is None:
+        validated = validate_fallback_schedule(self._settings)
+        if isinstance(validated, str):
             return [
                 ActionLine(
-                    "[BLOCKED] Solis fallback current is not configured", ActionOutcome.BLOCKED
+                    f"[BLOCKED] Solis fallback invalid: {validated}", ActionOutcome.BLOCKED
                 )
             ]
-        if current_a < 1:
-            return [
-                ActionLine(
-                    "[FAILED] Solis fallback current is below 1 A after configured limits",
-                    ActionOutcome.FAILED,
-                )
-            ]
-
         intent = ChargeIntent(
             target_soc_pct=0.0,
             soc=soc,
-            window_start=time.fromisoformat(self._settings.charge_window_start),
-            window_end=time.fromisoformat(self._settings.charge_window_end),
+            window_start=validated.window_start,
+            window_end=validated.window_end,
         )
         mode = self._coordinator.mode
         if mode.startswith("refuse:"):
             return [_refused(mode)]
         description = (
-            f"Solis fallback at {current_a} A in "
-            f"{fmt_hhmm(intent.window_start)}-{fmt_hhmm(intent.window_end)}"
+            f"Solis fallback at {validated.current_a} A in "
+            f"{fmt_hhmm(validated.window_start)}-{fmt_hhmm(validated.window_end)}"
         )
         if mode == "simulate":
             return [
@@ -251,7 +428,7 @@ class SolisDevice:
                 )
             ]
 
-        result = await self._apply(intent, current_a)
+        result = await self._apply(intent, validated.current_a)
         if result.current_ok and result.window_verified and result.cleanup_ok:
             result.lines.append(
                 ActionLine(f"[FALLBACK] {description} read-back verified", ActionOutcome.VERIFIED)
@@ -840,10 +1017,11 @@ class SolisDevice:
     async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[ActionLine]:
         """Converge the whole-inverter enable on the state the clock implies (#140).
 
-        Desired state is a pure function of ``now`` and ``intent.holds``: ``Off``
-        while a hold is active, ``On`` otherwise. Nothing is remembered, so a
-        restart or a crash mid-hold converges on the next tick, and ha-spark owns
-        both edges rather than only ever subtracting (ADR-0003).
+        Desired state includes durable owned holds as well as the fresh intent.
+        Persist a request before writing Off, and confirmation only after read-back.
+        An already-Off switch without a record belongs to the owner: this seam
+        neither claims it nor turns it On. Unconfirmed requests are re-read, not
+        treated as proof that a write landed.
 
         Read-first, and deliberately cheap enough for the per-minute cadence it
         is driven at (#143): steady state is one *cached* ``GET`` of the select
@@ -864,7 +1042,22 @@ class SolisDevice:
 
     @device_action(Ownership.PROTECTION)
     async def _reconcile_power_switch(self, intent: ChargeIntent, now: datetime) -> ActionLine:
-        wanted = "Off" if intent.hold_active(now) else "On"
+        store = self._execution.authority
+        identity = HoldDevice(
+            driver=self._config.driver,
+            power_switch=self._config.entities.get("power_switch", ""),
+            hub=self._settings.solis_control_hub, slave=self._settings.solis_modbus_slave,
+        )
+        records = tuple(h for h in store.state.holds if h.device == identity) if (
+            store is not None and store.state is not None
+        ) else ()
+        retained = any(
+            h.cause == "ev" and h.confirmed and not h.pending_release
+            or h.cause == "dispatch" and h.trusted_end is not None and now < h.trusted_end
+            and h.confirmed and not intent.hold_trusted
+            for h in records
+        )
+        wanted = "Off" if intent.hold_active(now) or retained else "On"
         desc = f"set inverter power switch to {wanted}"
         mode = self._coordinator.mode
         if mode.startswith("refuse:"):
@@ -888,7 +1081,27 @@ class SolisDevice:
             # 60 blind, unverifiable releases an hour through an HA outage, each
             # one freeing a battery ha-spark can no longer see to discharge.
             try:
-                if (await self._rest.get_state(entity)).state.strip().lower() == wanted.lower():
+                current = (await self._rest.get_state(entity)).state.strip().lower()
+                if current == wanted.lower():
+                    if wanted == "Off" and records and store is not None:
+                        # Confirm our existing requests by this read; never open
+                        # a new cause on a switch someone else already turned Off.
+                        # A confirmed record means the Off is ours, so a cause
+                        # that starts under it (EV during a dispatch, or the
+                        # reverse) is recorded and survives the other's release.
+                        self._save_hold_request(
+                            store, identity, intent, now, records, confirmed=True,
+                            create=any(h.confirmed for h in records),
+                        )
+                    elif (
+                        wanted == "On" and records and store is not None
+                        and store.state is not None
+                    ):
+                        # Nothing retains these holds and the switch already reads
+                        # On: they no longer hold anything, so drop them (no write).
+                        store.save_holds(
+                            tuple(h for h in store.state.holds if h.device != identity)
+                        )
                     return ActionLine(
                         f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED
                     )
@@ -907,7 +1120,29 @@ class SolisDevice:
                         ActionOutcome.REFUSED,
                     )
                 log.warning("Power-switch pre-read failed; writing %s anyway", wanted)
+            if wanted == "On" and not any(h.owned and h.confirmed for h in records):
+                # An unconfirmed request is not proof ha-spark turned it Off: its
+                # write may never have landed and the owner switched Off since.
+                return ActionLine(
+                    "[SKIP] owner-Off switch has no confirmed owned hold; left as-is",
+                    ActionOutcome.UNVERIFIED,
+                )
+            assert store is not None and store.state is not None
+            if wanted == "Off":
+                self._save_hold_request(store, identity, intent, now, records, confirmed=False)
+            else:
+                store.save_holds(tuple(
+                    h.model_copy(update={"pending_release": True}) if h.device == identity else h
+                    for h in store.state.holds
+                ))
             mismatch = await self._select_option(entity, wanted)
+            if not mismatch and store is not None and store.state is not None:
+                if wanted == "Off":
+                    self._save_hold_request(
+                        store, identity, intent, now, store.state.holds, confirmed=True
+                    )
+                else:
+                    store.save_holds(tuple(h for h in store.state.holds if h.device != identity))
         except Exception:  # noqa: BLE001 - isolate this action's failure
             log.error("[FAILED] %s", desc)
             return ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)
@@ -915,6 +1150,30 @@ class SolisDevice:
             ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED)
             if mismatch
             else ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)
+        )
+
+    def _save_hold_request(
+        self, store: AuthorityStore, identity: HoldDevice, intent: ChargeIntent,
+        now: datetime, records: tuple[HoldRecord, ...], *, confirmed: bool,
+        create: bool = True,
+    ) -> None:
+        assert store.state is not None
+        existing = {h.cause: h for h in records if h.device == identity}
+        if create and intent.ev_hold_active and "ev" not in existing:
+            existing["ev"] = HoldRecord(cause="ev", started_at=now, device=identity)
+        ends = [end if end.tzinfo else end.replace(tzinfo=now.tzinfo)
+                for start, end in intent.holds
+                if (start if start.tzinfo else start.replace(tzinfo=now.tzinfo)) <= now
+                < (end if end.tzinfo else end.replace(tzinfo=now.tzinfo))]
+        if ends and intent.hold_trusted and (create or "dispatch" in existing):
+            previous = existing.get("dispatch")
+            existing["dispatch"] = (
+                previous.model_copy(update={"trusted_end": max(ends)}) if previous else
+                HoldRecord(cause="dispatch", started_at=now, device=identity, trusted_end=max(ends))
+            )
+        store.save_holds(
+            tuple(h for h in store.state.holds if h.device != identity)
+            + tuple(h.model_copy(update={"confirmed": confirmed}) for h in existing.values())
         )
 
     async def write_safe_state(self) -> list[ActionLine]:

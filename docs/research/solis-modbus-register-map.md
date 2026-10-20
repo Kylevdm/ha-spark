@@ -94,8 +94,11 @@ this repo's own live-fire measurements.
    has to live in the new integration. Neither integration supplies it.
 5. **Firmware variance is real and readable at runtime.** The integration
    should read four identity registers at startup:
-   - 33000: protocol version and model code (`0x31` = 1-phase LV AC-coupled);
-   - 35000: inverter type definition;
+   - 33000: protocol/model word; reference reads **0x0026**, not a low-byte
+     model code of 0x31;
+   - 35000: inverter type definition; reference reads **0x2031**, whose low
+     byte **0x31** means single-phase LV AC-coupled (read-only FC04 probe,
+     unit 1, **2026-10-19**). The validated reference requires both words;
    - 33289: TOU function version (`0xAA55` = V2);
    - 34502: Remote Dispatch capability (`0xAA55`).
 
@@ -129,7 +132,7 @@ raw to engineering units. **Need** has three values:
 
 | Range | Contents | Scale / notes | solis_modbus poll | Need |
 |---|---|---|---|---|
-| 33000–33019 | Model code (hi = protocol ver, lo = model), DSP ver, HMI ver, protocol ver, serial (16 words) | `decode_inverter_model` in `helpers.py` | once | **today (new)**: identity and variance gate |
+| 33000–33019 | Protocol/model word (reference 0x0026), DSP ver, HMI ver, protocol ver, serial (16 words) | `decode_inverter_model` in `helpers.py` | once | **today (new)**: identity and variance gate |
 | 35000 | Inverter type definition | | once | **today (new)**: variance gate |
 | 33022–33027 | RTC yy, mm, dd, hh, mi, ss | read as one frame (#161) | slow | **today** (overlay clock) |
 | 33029–33040 | PV energy totals, today, month, year | U32 pairs, 0.1 kWh for today | slow | parity (PV models) |
@@ -224,8 +227,8 @@ one contiguous 30-register read.
   six charge and six discharge periods. **This is the single biggest
   firmware-variance risk for a "new households" integration** (map #247). An
   S6 household on V2 firmware would see ha-spark's slot-1 writes land and read
-  back correctly while the inverter ignores them. The household's 33289 value
-  has not been recorded. Read it before building.
+  back correctly while the inverter ignores them. The reference's 33289 value
+  is 0x0000 (V1), recorded by read-only probe on 2026-10-19.
 - **Flash wear**: still unconfirmed (#109). Nothing in either integration's
   source mentions it. #46's write-if-changed rule remains the mitigation.
 
@@ -390,8 +393,8 @@ a write. Those gaps have three consequences:
 
 | Signal | Where | Use |
 |---|---|---|
-| Model code | 33000 (hi = protocol version, lo = model; `0x31` = 1P LV AC-coupled, `0x30` = 1P LV hybrid, `0x9x` = S6) | pick the register profile |
-| Inverter type definition | 35000 | cross-check |
+| Protocol/model word | 33000 (reference `0x0026`, read-only probe 2026-10-19) | require together with 35000 |
+| Inverter type definition | 35000 (reference `0x2031`; low byte `0x31` = 1P LV AC-coupled, same probe) | require together with 33000 |
 | Serial prefix | 33004–33019 | how solax picks a type; unrecognised prefixes get no entities |
 | TOU version | 33289 (`0xAA55` = V2) | V1 slots (43143..) versus V2 slots (43707..) |
 | Remote Dispatch | 34502 (`0xAA55`) | whether 44100.. exists |
@@ -400,13 +403,17 @@ a write. Those gaps have three consequences:
 
 The household's AC-coupled RAI-class unit appears in solis_modbus as
 `RAI-3K-48ES-5G` (type HYBRID). solax detects it by serial prefix. #83 check 7
-left the exact model label unconfirmed. Reading 33000/35000 natively settles
-it.
+left the exact model label unconfirmed. The read-only probe on 2026-10-19
+establishes the validated register identity (33000 = 0x0026 AND 35000 =
+0x2031), rather than relying on a marketing label or driver name.
 
 ## Open questions
 
-1. **33289 on the household inverter.** Is it V1 or V2 TOU? This decides
-   whether the shipped slot path is portable as-is. It is a read-only check.
+1. **Answered: 33289 on the reference inverter.** Read-only FC04 probe,
+   unit 1, **2026-10-19**: **0x0000 = V1 TOU**, confirming the shipped
+   43143 timed-slot surface for this reference. This does not validate other
+   Solis models. The same probe read DSP 0x10, HMI 0x12, protocol 0x1
+   (33001–33003), and 34502 = 0x0000 (no Remote Dispatch).
 2. **43135 value semantics**: the conflict in 2b. Bench test, own sitting.
 3. **Partial FC16 into the slot block.** Does a 2-word h/m write take effect on
    this firmware, or only the 8-word block? This matters only if the

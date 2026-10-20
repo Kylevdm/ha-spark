@@ -12,6 +12,7 @@ import asyncio
 import json
 import signal
 import sys
+from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from ha_spark.authority import authority_view, load_authority
 from ha_spark.config import ConfigError, Settings, load_settings
 from ha_spark.daemon_channel import REFUSED, DaemonAlreadyRunning, Reply, submit_socket
 from ha_spark.dashboard import build_dashboard
+from ha_spark.devices import get_device
 from ha_spark.devices.inverters.solis_clock import clock_entity, clock_error, describe_error
 from ha_spark.energy import habits
 from ha_spark.energy.backtest import backtest_cost, format_backtest
@@ -696,6 +698,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
+    p_inverter = sub.add_parser("inverter", help="Read model identity and resident schedule")
+    p_inverter.add_subparsers(dest="inverter_command", required=True).add_parser("show")
+
     p_mode = sub.add_parser("mode", help="Read operating-mode authority")
     p_mode.add_subparsers(dest="mode_command", required=True).add_parser("show")
 
@@ -966,6 +971,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+async def _cmd_inverter_show(settings: Settings) -> int:
+    """Only HA GETs: no execution, authority-store access, or entity refresh service."""
+    diagnostics = []
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        for config in settings.devices:
+            if config.type != "inverter":
+                continue
+            device = get_device(config, settings, rest)
+            validation = await device.hold_validation()
+            diagnostics.append({
+                "driver": config.driver,
+                **asdict(validation),
+                "validated": validation.validated,
+                "resident": await device.resident_diagnostic(),
+            })
+    print(json.dumps(diagnostics, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -994,6 +1018,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
     setup_logging(settings.log_level)
+
+    if args.command == "inverter":
+        return asyncio.run(_cmd_inverter_show(settings))
 
     if args.command == "states":
         return asyncio.run(_cmd_states(settings, domain=args.domain, watch=args.watch))

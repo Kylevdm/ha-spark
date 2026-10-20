@@ -38,9 +38,22 @@ failed attempts retry on the next minute. The active fallback is left in place
 on a passing observation until `soc_recovery_minutes` of stable reports make
 recovery ready (#117); each tick then computes a fresh plan from that tick's
 measurement and applies it, leaving fallback only once the apply reads back
-clean. A failed recovered apply keeps the fallback (unconfirmed) and retries.
+clean. A recovered apply that is not fully verified re-applies the fallback on
+the same tick and records its verdict (#423), so the unconfirmed or verified
+state is published at once, and the next recovery attempt waits five minutes;
+an unconfirmed re-apply is retried every minute of that wait, because the
+per-minute fallback path deliberately stays quiet while recovery is ready.
 AlphaESS has no fallback request: after the threshold it stays blocked until
-the same stable evidence qualifies a fresh plan and its apply succeeds.
+the same stable evidence qualifies a fresh plan and its apply succeeds, and a
+failed recovered apply there still retries the next minute. The
+fallback schedule is validated as one pure schedule before every apply (#422):
+an above-limit current is blocked with the case named, never clamped. The
+authority store owns *fallback active* and its causes (phase 2: the only cause
+is SoC integrity) and is saved, with a bumped epoch, before the fallback write
+is requested; entry and exit each notify once, and exit clears the store only
+after the recovered plan applied and read back. Observe and Protect still
+count, persist and publish pending failure and threshold crossings but never
+request a fallback write.
 
 With `inverter_clock_dst_sync` on, the first tick after the household zone's
 UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
@@ -49,7 +62,7 @@ UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
 from typing import NamedTuple
@@ -69,12 +82,16 @@ from ha_spark.api.server import (
     serve_in_background,
     stop_server,
 )
-from ha_spark.authority import AuthorityStore
+from ha_spark.authority import FALLBACK_CAUSE_SOC_INTEGRITY, AuthorityStore
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import DaemonChannel, Reply, action_lines
-from ha_spark.devices import Capability, inverter_device
+from ha_spark.devices import Capability, Device, inverter_device
 from ha_spark.devices.execution import ExecutionContext, Ownership, execution_context
-from ha_spark.devices.inverters.solis import SolisDevice, fallback_charge_current_a
+from ha_spark.devices.inverters.solis import (
+    SolisDevice,
+    validate_fallback_schedule,
+    validated_fallback_current_a,
+)
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome, is_verified, legacy_action_line
 from ha_spark.energy.derived_base_load import (
     BACKFILL_NAME,
@@ -84,6 +101,7 @@ from ha_spark.energy.derived_base_load import (
 )
 from ha_spark.energy.dispatch_evidence import partition_dispatches
 from ha_spark.energy.dst_clock_sync import DstClockSync
+from ha_spark.energy.evidence_freshness import EvidenceFreshness, check_report_time
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
@@ -98,8 +116,8 @@ from ha_spark.energy.publish import (
     republish_last,
 )
 from ha_spark.energy.report import format_plan
-from ha_spark.energy.soc_integrity import SocMeasurement
-from ha_spark.energy.soc_monitor import SocMonitor, observe_soc
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+from ha_spark.energy.soc_monitor import SocMonitor, SocMonitorSnapshot, observe_soc
 from ha_spark.energy.sources import (
     ev_hold_status_from_read,
     parse_time,
@@ -121,6 +139,10 @@ SIGNAL_SAMPLE_INTERVAL = timedelta(minutes=30)
 
 
 REPLAN_INTERVAL = timedelta(minutes=30)
+
+# #423: after a recovered apply that is not fully verified re-applied the
+# fallback on the same tick, the next recovery attempt waits this long.
+RECOVERY_RETRY_DELAY = timedelta(minutes=5)
 
 
 def _slot_start(now: datetime) -> datetime:
@@ -317,12 +339,15 @@ async def run_once(
         )
         ev_hold_state = ev_hold_state or EvHoldState()
         now = datetime.now(load_timezone(settings.timezone))
-        ev_hold_active = _observe_ev_hold(
+        evidence_freshness = getattr(inputs, "evidence_freshness", None) or {}
+        ev_hold_active = await _observe_ev_hold(
             ev_hold_state,
             inputs.ev_hold_charging,
-            now,
-            parse_time(settings.charge_window_start),
-            parse_time(settings.charge_window_end),
+            evidence_freshness.get("ev_status"),
+            now=now,
+            device=device,
+            battery_freshness=evidence_freshness.get("battery_power"),
+            battery_direction_value=getattr(inputs, "battery_direction", "unknown"),
         )
         intent = replace(intent, ev_hold_active=ev_hold_active)
         # One reconcile pass before anything else, on every device-driving
@@ -504,7 +529,7 @@ async def guard_tick(
         if Capability.CHARGE_RATE not in charger.capabilities:
             return target_w or 0.0
         if fallback_active and fallback_confirmed:
-            fallback_a = fallback_charge_current_a(settings)
+            fallback_a = validated_fallback_current_a(settings)
             if fallback_a is not None:
                 # The fallback setting is the restoration target; a plan made
                 # while SoC was rejected is not authority for this value.
@@ -525,6 +550,7 @@ UNTRUSTED_HOLDS_LINE = (
     "[SKIP] hold data untrusted and no trusted hold set yet; power switch left as-is"
 )
 UNREADABLE_DISPATCH_LINE = "[SKIP] dispatch entity unreadable; using the last trusted holds"
+STALE_DISPATCH_LINE = "[SKIP] dispatch evidence not fresh; using the last trusted holds"
 UNREADABLE_EV_STATUS_LINE = "[SKIP] EV status unreadable; no EV hold evidence"
 UNTRUSTED_EV_RELINQUISH_LINE = (
     "[SKIP] dispatch holds ended, but EV status is unreadable; inverter state left unchanged"
@@ -534,51 +560,207 @@ EV_RELEASE_CONFIRMATION_PASSES = 5
 
 @dataclass
 class EvHoldState:
-    """Per-process EV hold debounce state shared by plan and minute passes."""
+    """EV hold snapshot shared by plan and minute passes (#420/#421).
+
+    Small and serialisable on purpose: ``active``, the strictly advancing
+    clear-report count, and the last counted effective report time. #421
+    persists it in the authority store, so it must stay free of behaviour.
+    """
 
     active: bool = False
-    not_charging_since: datetime | None = None
+    clear_count: int = 0
+    last_clear_report_at: datetime | None = None
+
+
+def ev_hold_overnight_exception(
+    now: datetime,
+    resident_window: tuple[time, time] | None,
+    battery_validity: str,
+    battery_direction_value: str,
+) -> bool:
+    """Q4: whether the overnight exception stops a *new* EV hold from starting.
+
+    It applies only when all of: ``now`` is inside the *resident* slot-1
+    charge window read back from the inverter (unknown is not verified, so it
+    means no exception), the battery-direction evidence is fresh, and the
+    direction shows no discharge (``charging`` or ``idle``). Missing, stale or
+    unknown direction, or ``discharging``, means the hold applies. A confirmed
+    EV hold is unaffected by the window: this predicate only gates a hold
+    *start*, never a release.
+    """
+    if resident_window is None:
+        return False
+    if battery_validity != "fresh":
+        return False
+    if battery_direction_value not in ("charging", "idle"):
+        return False
+    return in_window(now.time(), resident_window[0], resident_window[1])
 
 
 def next_ev_hold_state(
     previous: EvHoldState,
     charging: bool | None,
-    now: datetime,
-    window_start: time,
-    window_end: time,
+    evidence: EvidenceFreshness | None,
+    *,
+    overnight_exception: bool = False,
 ) -> EvHoldState:
-    """Advance the EV hold after one trusted status read.
+    """Advance the EV hold state machine by one status read (#420).
 
-    Five one-minute clear reads release the hold. The first clear read starts
-    the run, so the fifth read arrives four minutes later. Missing/untrusted
-    status is no evidence and clears only the EV hold state.
+    Only fresh evidence decides. Stale, future, unknown, unavailable or
+    unreadable evidence never starts a hold and never releases one, and it
+    resets the clearance run (Q5). Fresh charging starts (or keeps) the hold
+    and resets the clearance run — except that the overnight exception (Q4)
+    stops a *new* hold; a confirmed hold is never released by the window.
+    Fresh not-charging advances a run of strictly advancing effective report
+    times: the fifth counted report releases, an equal report time neither
+    advances nor resets, and a backwards one resets the run (Q5).
     """
-    if in_window(now.time(), window_start, window_end) or charging is None:
-        return EvHoldState()
+    if evidence is None or evidence.validity != "fresh" or charging is None:
+        return EvHoldState(active=previous.active)
     if charging:
-        return EvHoldState(active=True)
+        if previous.active or not overnight_exception:
+            return EvHoldState(active=True)
+        return EvHoldState()
     if not previous.active:
         return EvHoldState()
-    if previous.not_charging_since is None:
-        return EvHoldState(active=True, not_charging_since=now)
-    clear_reads_elapsed = now - previous.not_charging_since
-    if clear_reads_elapsed >= timedelta(minutes=EV_RELEASE_CONFIRMATION_PASSES - 1):
+    reported_at = evidence.reported_at
+    if reported_at is None:
+        return EvHoldState(active=True)
+    last = previous.last_clear_report_at
+    if last is None:
+        return EvHoldState(active=True, clear_count=1, last_clear_report_at=reported_at)
+    if reported_at < last:
+        # A backwards report resets the run; the hold stays until clear evidence.
+        return EvHoldState(active=True)
+    if reported_at == last:
+        # Equal does not advance and does not reset: repeated GETs of one
+        # cached report never manufacture five distinct clear reports.
+        return EvHoldState(
+            active=True, clear_count=previous.clear_count, last_clear_report_at=last
+        )
+    count = previous.clear_count + 1
+    if count >= EV_RELEASE_CONFIRMATION_PASSES:
         return EvHoldState()
-    return EvHoldState(active=True, not_charging_since=previous.not_charging_since)
+    return EvHoldState(active=True, clear_count=count, last_clear_report_at=reported_at)
 
 
-def _observe_ev_hold(
+async def _resident_charge_window(device: Device) -> tuple[time, time] | None:
+    """The resident slot-1 charge window read back from the inverter (#420).
+
+    Reuses #418's overlay reads (GETs only, no refresh, no write). ``None``
+    means unknown or unsupported: unknown is not verified, so the overnight
+    exception never applies on a ``None`` read.
+    """
+    reader: Callable[[], Awaitable[tuple[time, time] | None]] | None = getattr(
+        device, "resident_charge_window", None
+    )
+    if reader is None:
+        return None
+    try:
+        return await reader()
+    except Exception:  # noqa: BLE001 - an unreadable window is not verified
+        log.debug("Resident charge-window read failed; the overnight exception is off")
+        return None
+
+
+async def _observe_ev_hold(
     state: EvHoldState,
     charging: bool | None,
+    evidence: EvidenceFreshness | None,
+    *,
     now: datetime,
-    window_start: time,
-    window_end: time,
+    device: Device,
+    battery_freshness: EvidenceFreshness | None,
+    battery_direction_value: str,
 ) -> bool:
-    """Update the caller-owned state and return whether the EV hold is active."""
-    next_state = next_ev_hold_state(state, charging, now, window_start, window_end)
+    """Update the caller-owned state and return whether the EV hold is active.
+
+    The resident window is read back only where the exception can matter: a
+    *new* hold on fresh charging evidence. Every other pass keeps the steady
+    state of one cached ``GET`` and zero extra reads.
+    """
+    exception = False
+    if (
+        charging is True
+        and not state.active
+        and evidence is not None
+        and evidence.validity == "fresh"
+    ):
+        resident = await _resident_charge_window(device)
+        exception = ev_hold_overnight_exception(
+            now,
+            resident,
+            battery_freshness.validity if battery_freshness is not None else "unknown",
+            battery_direction_value,
+        )
+    context = execution_context()
+    store = context.authority
+    record = next((h for h in store.state.holds if h.cause == "ev"), None) if (
+        store is not None and store.state is not None
+    ) else None
+    if record is not None:
+        state.active = record.confirmed and not record.pending_release
+        state.clear_count = record.clear_count
+        state.last_clear_report_at = record.last_clear_report_at
+    next_state = next_ev_hold_state(state, charging, evidence, overnight_exception=exception)
+    if record is not None and store is not None and store.state is not None:
+        # Every EV record follows the one EV evidence stream, so a record left
+        # under an older device identity can never outlive the clearance.
+        store.save_holds(tuple(
+            h.model_copy(update={
+                "clear_count": next_state.clear_count,
+                "last_clear_report_at": next_state.last_clear_report_at,
+                "pending_release": not next_state.active if h.confirmed else h.pending_release,
+            }) if h.cause == "ev" else h
+            for h in store.state.holds
+        ))
     state.active = next_state.active
-    state.not_charging_since = next_state.not_charging_since
+    state.clear_count = next_state.clear_count
+    state.last_clear_report_at = next_state.last_clear_report_at
     return state.active
+
+
+async def _hold_degraded_notice(
+    settings: Settings, rest: HomeAssistantRest,
+    freshness: dict[str, EvidenceFreshness], now: datetime, *, dispatch_trusted: bool,
+) -> None:
+    store = execution_context().authority
+    if store is None or store.state is None:
+        return
+    records = []
+    notices = []
+    ev = freshness.get("ev_status")
+    for record in store.state.holds:
+        # A hold that no longer holds anything is not retained, so never degraded.
+        holding = not record.pending_release and (
+            record.trusted_end is None or now < record.trusted_end
+        )
+        # Dispatch evidence is whatever this pass trusts for holds: the fresh
+        # HA dispatch entity, or the plan's freshness-gated Kraken fetch.
+        fresh = not holding or (
+            ev is not None and ev.validity == "fresh" if record.cause == "ev"
+            else dispatch_trusted
+        )
+        since = None if fresh else record.evidence_stale_since or now
+        notified = False if fresh else record.degraded_notified
+        if since is not None and not notified and (
+            now - since >= timedelta(minutes=settings.hold_degraded_minutes)
+        ):
+            notified = True
+            notices.append(record.cause)
+        records.append(record.model_copy(update={
+            "evidence_stale_since": since, "degraded_notified": notified,
+        }))
+    # Persist the once-only notice before sending, including across restarts.
+    store.save_holds(tuple(records))
+    for cause in notices:
+        try:
+            await send_notification(
+                settings, rest, "ha-spark degraded hold",
+                f"Retaining {cause} hold without fresh evidence; check its source.",
+            )
+        except Exception:  # noqa: BLE001 - notice failure must not block protection
+            log.warning("Degraded hold notification failed")
 
 
 def hold_reconcile_intent(
@@ -590,13 +772,22 @@ def hold_reconcile_intent(
     used as-is. An untrusted one, whose empty holds mean "unreadable" rather than
     "no dispatch", is evaluated against the last trusted hold set instead, so a
     hold still ends on its own known end time: no expiry timer, no stuck ``Off``.
-    With no trusted set yet (boot into a failed read, a hot reload, the CLI)
-    there is no picture, and no picture never writes ``On``.
+    With no trusted set yet, durable records provide the dispatch end or an
+    already-cleared owned release. No picture and no record never writes On.
     """
     if intent.hold_trusted:
         return intent
     if trusted_holds is None:
-        if not intent.ev_hold_active:
+        store = execution_context().authority
+        records = store.state.holds if store is not None and store.state is not None else ()
+        recorded_dispatch = tuple(
+            (h.started_at, h.trusted_end) for h in records
+            if h.cause == "dispatch" and h.confirmed and h.trusted_end is not None
+        )
+        if recorded_dispatch:
+            return replace(intent, holds=recorded_dispatch)
+        owned_release = any(h.owned and h.confirmed and h.pending_release for h in records)
+        if not intent.ev_hold_active and not owned_release:
             return None
         # EV charging is independent evidence. It may close a hold while the
         # dispatch picture is absent, but keeps dispatch trust false for export.
@@ -663,7 +854,8 @@ async def reconcile_tick(
     path re-rates the last plan's original daytime dispatch windows each minute
     from fresh local evidence. It reads the HA dispatch entity only for its live
     state, never for planned windows; an untrusted plan keeps the existing
-    last-trusted-holds behavior.
+    last-trusted-holds behavior, and so does a plan whose Kraken read is older
+    than ``octopus_dispatch_max_age_seconds`` (or has no read time at all).
 
     Relinquishing control (#143 §5): once the clock is past every known hold end
     and the hold data is *still* untrusted, ha-spark has no picture left to steer
@@ -683,10 +875,31 @@ async def reconcile_tick(
         async with HomeAssistantRest(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
         ) as rest:
+            # Read the device before evidence, including re-verification of a
+            # durable request whose process died between write and read-back.
+            store = execution_context().authority
+            if store is not None and store.state is not None:
+                verified = []
+                for record in store.state.holds:
+                    try:
+                        switch = await rest.get_state(record.device.power_switch)
+                        if switch.state.strip().lower() == "off" and not record.confirmed:
+                            record = record.model_copy(update={"confirmed": True})
+                    except Exception:  # noqa: BLE001 - no inferred confirmation
+                        pass
+                    verified.append(record)
+                store.save_holds(tuple(verified))
+                if trusted_holds is None:
+                    recorded = tuple(
+                        (h.started_at, h.trusted_end) for h in store.state.holds
+                        if h.cause == "dispatch" and h.confirmed and h.trusted_end is not None
+                    )
+                    trusted_holds = recorded or None
             fresh = plan.charge_intent
             read_lines: list[str] = []
             dispatches: tuple[DispatchSlot, ...] = ()
             live_dispatch: bool | None = None
+            report_times: dict[str, datetime | None] = {}
             refresh_dispatches = (
                 settings.tariff_provider != "octopus_intelligent"
                 and bool(settings.dispatch_entity)
@@ -694,10 +907,24 @@ async def reconcile_tick(
             rerate_octopus_dispatches = (
                 settings.tariff_provider == "octopus_intelligent" and fresh.hold_trusted
             )
+            if rerate_octopus_dispatches:
+                # The plan's Kraken read is the only source of these windows,
+                # and the reconcile never re-polls Kraken, so the plan's trust
+                # lasts only as long as that read's validated age.
+                kraken = check_report_time(
+                    fresh.octopus_dispatch_reported_at,
+                    now=now,
+                    max_age_s=settings.octopus_dispatch_max_age_seconds,
+                    option="octopus_dispatch_max_age_seconds",
+                )
+                if kraken.validity != "fresh":
+                    rerate_octopus_dispatches = False
+                    fresh = replace(fresh, hold_trusted=False)
+                    read_lines = [STALE_DISPATCH_LINE]
             dispatch_trusted = True
             if refresh_dispatches:
                 dispatches, dispatch_trusted, live_dispatch = await read_dispatches_and_live(
-                    settings, rest
+                    settings, rest, report_times=report_times
                 )
                 if not dispatch_trusted:
                     fresh = replace(fresh, hold_trusted=False)
@@ -706,7 +933,9 @@ async def reconcile_tick(
                 # Live state only matters when there is a window to rate.
                 if settings.dispatch_entity and fresh.unrated_holds:
                     _entity_dispatches, _entity_trusted, live_dispatch = (
-                        await read_dispatches_and_live(settings, rest)
+                        await read_dispatches_and_live(
+                            settings, rest, report_times=report_times
+                        )
                     )
                 dispatches = tuple(
                     DispatchSlot(start=start, end=end)
@@ -721,7 +950,21 @@ async def reconcile_tick(
                 dispatches if should_rate_dispatches else (),
                 live_dispatch=live_dispatch,
                 forecast_house_kw=plan.load_kwh / 24,
+                report_times=report_times,
+                now=now,
             )
+            if refresh_dispatches and dispatch_trusted:
+                live_freshness = evidence_read.freshness.get("live_dispatch")
+                if live_freshness is None or live_freshness.validity != "fresh":
+                    # #420: a dispatch picture whose source has not reported
+                    # within its validated age is untrusted evidence — a
+                    # cached HA state is not a live picture. The last trusted
+                    # hold set stands and ends on its own known end; a stale
+                    # read is never turned into a trusted-empty schedule.
+                    dispatch_trusted = False
+                    should_rate_dispatches = False
+                    fresh = replace(fresh, hold_trusted=False)
+                    read_lines = read_lines + [STALE_DISPATCH_LINE]
             if should_rate_dispatches:
                 dispatches, _dropped = partition_dispatches(
                     dispatches, evidence_read.evidence, now
@@ -730,17 +973,23 @@ async def reconcile_tick(
                     dispatches, fresh.window_start, fresh.window_end
                 )
                 fresh = replace(fresh, holds=trusted_holds, hold_trusted=True)
+            await _hold_degraded_notice(
+                settings, rest, evidence_read.freshness, now, dispatch_trusted=fresh.hold_trusted
+            )
             ev_charging = ev_hold_status_from_read(
                 evidence_read.ev_status, evidence_read.ev_status_trusted
             )
             if settings.ev_status_entity and ev_charging is None:
                 read_lines.append(UNREADABLE_EV_STATUS_LINE)
-            ev_hold_active = _observe_ev_hold(
+            device = inverter_device(settings, rest)
+            ev_hold_active = await _observe_ev_hold(
                 ev_hold_state,
                 ev_charging,
-                now,
-                parse_time(settings.charge_window_start),
-                parse_time(settings.charge_window_end),
+                evidence_read.freshness.get("ev_status"),
+                now=now,
+                device=device,
+                battery_freshness=evidence_read.freshness.get("battery_power"),
+                battery_direction_value=evidence_read.battery_direction,
             )
             fresh = replace(fresh, ev_hold_active=ev_hold_active)
             intent = hold_reconcile_intent(fresh, trusted_holds)
@@ -769,11 +1018,9 @@ async def reconcile_tick(
                 )
                 relinquished = True
                 trusted_holds = ()
-                lines = read_lines + list(await inverter_device(settings, rest).write_safe_state())
+                lines = read_lines + list(await device.write_safe_state())
             else:
-                lines = read_lines + list(
-                    await inverter_device(settings, rest).reconcile_holds(intent, now)
-                )
+                lines = read_lines + list(await device.reconcile_holds(intent, now))
     except Exception:
         log.exception("Hold reconcile tick failed; will retry next minute")
         return ReconcileResult([], trusted_holds, relinquished)
@@ -783,6 +1030,115 @@ async def reconcile_tick(
         else:
             log.info(line)
     return ReconcileResult(lines, trusted_holds, relinquished)
+
+
+def _save_fallback_authority(active: bool) -> bool:
+    """Enter or leave fallback in the authority store, bumping the epoch (#422).
+
+    The store owns *fallback active* and its causes (phase 2: the only cause
+    is SoC integrity; the SoC monitor stays the sole judge of that cause and
+    keeps its counter, recovery progress and confirmation flags — the store
+    only mirrors its verdict). Returns whether this call changed the store;
+    raises (with ``save_failed`` set, so the write gate refuses every write)
+    when the durable save fails.
+    """
+    context = execution_context()
+    store = context.authority
+    if store is None:
+        return False
+    changed = store.save_fallback(active=active, cause=FALLBACK_CAUSE_SOC_INTEGRITY)
+    if changed:
+        # Work on the rest of this tick plans under the bumped epoch, so the
+        # fallback apply itself is not refused as stale; anything planned
+        # before the bump still is.
+        assert store.state is not None
+        context.planned_epoch.set(store.state.epoch)
+    return changed
+
+
+async def _notify_fallback_entered(settings: Settings, rest: HomeAssistantRest) -> None:
+    await send_notification(
+        settings, rest, "ha-spark fallback entered",
+        f"SoC integrity failure: fallback charging entered "
+        f"(cause: {FALLBACK_CAUSE_SOC_INTEGRITY}); the configured cheap window is "
+        "programmed at the configured fallback current",
+    )
+
+
+async def _notify_fallback_left(settings: Settings, rest: HomeAssistantRest) -> None:
+    await send_notification(
+        settings, rest, "ha-spark fallback left",
+        "SoC integrity recovered: fallback charging left; normal programming resumed",
+    )
+
+
+async def _mirror_fallback_authority(
+    settings: Settings, rest: HomeAssistantRest, monitor: SocMonitor, *, solis: bool
+) -> None:
+    """Mirror the monitor's fallback verdict into the authority store (#422).
+
+    Entry: a fallback-active monitor (a status persisted by an earlier process
+    reconciles into the store here, on the first tick of this version, as an
+    active cause that is not confirmed — the monitor's confirmation stays
+    false until this process reads back) is saved active before any fallback
+    write is requested. Exit: a store left active after a failed or
+    interrupted exit save is cleared here, so the store never claims a
+    fallback the monitor has already left and the next entry still bumps the
+    epoch and notifies once. One notice each way, only on the change.
+    """
+    active = monitor.fallback_active and solis
+    try:
+        changed = _save_fallback_authority(active)
+    except (OSError, ValueError):
+        log.warning("Authority save failed; fallback state not persisted; writes refused")
+        return
+    if not changed:
+        return
+    if active:
+        log.info(
+            "SoC integrity: fallback entered in the authority store (cause %s)",
+            FALLBACK_CAUSE_SOC_INTEGRITY,
+        )
+        await _notify_fallback_entered(settings, rest)
+    else:
+        log.info("SoC integrity: fallback exit persisted in the authority store")
+        await _notify_fallback_left(settings, rest)
+
+
+def _fallback_verdict_line(action_lines: list[ActionLine | str]) -> ActionLine | str:
+    """The line that speaks for a fallback attempt's resident outcome."""
+    return next(
+        (
+            line
+            for line in reversed(action_lines)
+            if isinstance(line, ActionLine)
+            or line.startswith(
+                (
+                    # Legacy fallback boundary only; production drivers
+                    # emit typed lines. Never used for normal apply.
+                    "[FALLBACK]",
+                    "[FAILED]",
+                    "[BLOCKED]",
+                    "[SIMULATE]",
+                    "[SKIP]",
+                    "[OFF]",
+                    "[OBSERVE]",
+                )
+            )
+        ),
+        ActionLine(
+            "[FAILED] Solis fallback produced no confirmation action",
+            ActionOutcome.FAILED,
+        ),
+    )
+
+
+def _log_action_lines(action_lines: list[ActionLine | str]) -> None:
+    for line in action_lines:
+        if legacy_action_line(line).outcome is ActionOutcome.FAILED:
+            log.warning(line)
+        else:
+            log.info(line)
 
 
 async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasurement | None:
@@ -813,6 +1169,9 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
             inverter = next(
                 (device for device in settings.devices if device.type == "inverter"), None
             )
+            await _mirror_fallback_authority(
+                settings, rest, monitor, solis=inverter is not None and inverter.driver == "solis"
+            )
             if (
                 inverter is not None
                 and inverter.driver == "solis"
@@ -821,6 +1180,18 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
             ):
                 requested = monitor.request_fallback()
                 if requested is not None:
+                    entered = False
+                    try:
+                        # #422: the store (active + cause + bumped epoch) is
+                        # saved BEFORE the fallback write is requested from the
+                        # device; a failed save leaves ``save_failed`` set and
+                        # the gate refuses the write.
+                        entered = _save_fallback_authority(True)
+                    except (OSError, ValueError):
+                        log.warning(
+                            "Authority save failed; fallback entry not persisted; "
+                            "hardware writes refused"
+                        )
                     action_lines: list[str]
                     try:
                         device = inverter_device(settings, rest)
@@ -846,41 +1217,94 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
                                 ActionOutcome.FAILED,
                             )
                         ]
-                    action_line = next(
-                        (
-                            line
-                            for line in reversed(action_lines)
-                            if isinstance(line, ActionLine)
-                            or line.startswith(
-                                (
-                                    # Legacy fallback boundary only; production drivers
-                                    # emit typed lines. Never used for normal apply.
-                                    "[FALLBACK]",
-                                    "[FAILED]",
-                                    "[BLOCKED]",
-                                    "[SIMULATE]",
-                                    "[SKIP]",
-                                    "[OFF]",
-                                    "[OBSERVE]",
-                                )
-                            )
-                        ),
-                        ActionLine(
-                            "[FAILED] Solis fallback produced no confirmation action",
-                            ActionOutcome.FAILED,
-                        ),
-                    )
+                    action_line = _fallback_verdict_line(action_lines)
                     snapshot = monitor.complete_fallback(action_line=action_line)
-                    for line in action_lines:
-                        if legacy_action_line(line).outcome is ActionOutcome.FAILED:
-                            log.warning(line)
-                        else:
-                            log.info(line)
+                    _log_action_lines(action_lines)
+                    if entered:
+                        log.info(
+                            "SoC integrity: fallback entered in the authority store "
+                            "(cause %s)",
+                            FALLBACK_CAUSE_SOC_INTEGRITY,
+                        )
+                        await _notify_fallback_entered(settings, rest)
             await publish_soc_integrity(rest, snapshot, settings)
             return measurement
     except Exception:
         log.exception("SoC monitor tick failed; will retry next minute")
         return None
+
+
+async def _reapply_fallback(
+    settings: Settings, monitor: SocMonitor, measurement: SocMeasurement | None
+) -> bool:
+    """#423: re-apply the fallback now and publish its verdict. Never raises.
+
+    Only the recovery path calls this: ``request_fallback`` returns ``None``
+    while recovery is ready, so the per-minute path cannot re-program a
+    fallback a failed recovered apply may have disturbed. This is the same
+    device action, gate, schedule validation and read-back as entry; the
+    store is already active, so there is no epoch bump and no notice.
+    Returns whether an attempt was made (Optimise, Solis, a configured
+    fallback current): the verdict, verified or failed, is recorded and
+    published either way, and a failed attempt is retried by the next call.
+    """
+    inverter = next((device for device in settings.devices if device.type == "inverter"), None)
+    if (
+        measurement is None
+        or inverter is None
+        or inverter.driver != "solis"
+        or settings.solis_fallback_current_a is None
+        or not _real_write_mode(settings)
+    ):
+        return False
+    snapshot: SocMonitorSnapshot | None = None
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            action_lines: list[ActionLine | str]
+            device = inverter_device(settings, rest)
+            if isinstance(device, SolisDevice):
+                action_lines = list(await device.apply_fallback(measurement))
+            else:
+                log.error(
+                    "Solis fallback re-apply skipped: inverter factory returned %s",
+                    type(device).__name__,
+                )
+                action_lines = [
+                    ActionLine(
+                        "[SKIP] Solis fallback re-apply skipped: inverter factory "
+                        f"returned non-Solis device ({type(device).__name__})",
+                        ActionOutcome.SIMULATED,
+                    )
+                ]
+            snapshot = monitor.complete_fallback(action_line=_fallback_verdict_line(action_lines))
+            _log_action_lines(action_lines)
+            await publish_soc_integrity(rest, snapshot, settings)
+            return True
+    except Exception:
+        log.exception("Solis fallback re-apply failed; will retry next minute")
+    if snapshot is None:
+        # The attempt raised before recording a verdict: keep the failure
+        # visible and the fallback unconfirmed until the next retry.
+        try:
+            snapshot = monitor.complete_fallback(
+                action_line=ActionLine(
+                    "[FAILED] Solis fallback re-apply raised; unconfirmed",
+                    ActionOutcome.FAILED,
+                )
+            )
+        except Exception:
+            log.exception("Recording the failed fallback re-apply failed")
+            return True
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            await publish_soc_integrity(rest, snapshot, settings)
+    except Exception:
+        log.exception("Publishing the fallback re-apply verdict failed")
+    return True
 
 
 def recovery_verified(apply_lines: tuple[str, ...]) -> bool:
@@ -893,14 +1317,23 @@ def recovery_verified(apply_lines: tuple[str, ...]) -> bool:
 
 
 async def finish_recovery(
-    settings: Settings, monitor: SocMonitor, apply_lines: tuple[str, ...] | None
-) -> None:
+    settings: Settings,
+    monitor: SocMonitor,
+    apply_lines: tuple[str, ...] | None,
+    measurement: SocMeasurement | None = None,
+) -> bool:
     """Leave fallback after a verified recovered apply, else keep it truthfully.
 
-    ``apply_lines`` is ``None`` when the recovery run raised. A failed apply may
-    have changed the resident program, so a verified fallback loses its
-    confirmation: increases stay blocked until the next minute's retry either
-    verifies the recovered plan or, if recovery is lost, re-programs the fallback.
+    ``apply_lines`` is ``None`` when the recovery run raised; ``measurement``
+    is this tick's observation, carried by the same-tick fallback re-apply.
+    A failed apply may have changed the resident program, so a verified
+    fallback loses its confirmation and is re-applied and re-verified on this
+    same tick (#423), with its verdict published; the store's fallback stays
+    active (no epoch bump, no notice). Returns whether the recovery backoff
+    started: the next recovery attempt then waits five minutes, while an
+    unconfirmed re-apply is retried every minute of that wait by the loop.
+    Sites without a Solis fallback (AlphaESS threshold block, or no charging
+    authority) keep today's behaviour: keep the block, retry next minute.
     """
     preview = (
         apply_lines is not None
@@ -918,21 +1351,41 @@ async def finish_recovery(
             action = f"[RECOVERED] normal programming resumed: {line}"
         log.info(action)
         snapshot = monitor.complete_recovery(action_line=action)
+        left = False
+        try:
+            # #422: the store's fallback active + cause are cleared and the
+            # epoch bumped only here, after the recovered plan applied and read
+            # back (today's exit point). A failed save is repaired by the next
+            # tick's mirror.
+            left = _save_fallback_authority(False)
+        except (OSError, ValueError):
+            log.warning("Authority save failed; fallback exit not persisted; writes refused")
     else:
         retained = "SoC integrity block" if monitor.recovery_blocked else "fallback"
+        monitor.invalidate_fallback_confirmation()
+        if await _reapply_fallback(settings, monitor, measurement):
+            log.warning(
+                "[FAILED] recovered normal program not verified; %s kept and "
+                "re-applied on this tick; next recovery attempt in five minutes",
+                retained,
+            )
+            return True
         log.warning(
             "[FAILED] recovered normal program not verified; %s kept, retrying next minute",
             retained,
         )
-        monitor.invalidate_fallback_confirmation()
-        return
+        return False
     try:
         async with HomeAssistantRest(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
         ) as rest:
             await publish_soc_integrity(rest, snapshot, settings)
+            if left:
+                log.info("SoC integrity: fallback exit persisted in the authority store")
+                await _notify_fallback_left(settings, rest)
     except Exception:
         log.exception("Publishing the SoC recovery transition failed")
+    return False
 
 
 async def _planned_rate_w(settings: Settings, plan: ChargePlan) -> float | None:
@@ -1064,8 +1517,13 @@ async def _run_forever(
     target_w: float | None = None
     last_signal_at: datetime | None = None
     monitor = SocMonitor.load(settings)
+    # #423: loop-local recovery backoff — no recovery attempt before this
+    # timestamp. Not persisted: like recovery progress, downtime is not
+    # evidence; a restart already requires a fresh observation and read-back.
+    recovery_retry_not_before: datetime | None = None
     clock_sync = DstClockSync()
     pending = None
+    startup_reconciled = False
     try:
         while True:
             settings = state.settings  # hot-reloaded by POST /api/config
@@ -1094,8 +1552,8 @@ async def _run_forever(
                 if (
                     settings.charge_window_start != last_settings.charge_window_start
                     or settings.charge_window_end != last_settings.charge_window_end
-                    or fallback_charge_current_a(settings)
-                    != fallback_charge_current_a(last_settings)
+                    or validate_fallback_schedule(settings)
+                    != validate_fallback_schedule(last_settings)
                     or settings.devices != last_settings.devices
                     or settings.solis_control_hub != last_settings.solis_control_hub
                     or settings.solis_modbus_slave != last_settings.solis_modbus_slave
@@ -1105,7 +1563,6 @@ async def _run_forever(
                 last_plan = None
                 last_applied_plan = None
                 last_trusted_holds = None
-                ev_hold_state = EvHoldState()
                 target_w = None
                 last_settings = settings
             tz = load_timezone(settings.timezone)
@@ -1117,6 +1574,37 @@ async def _run_forever(
                     await _charger_supports_live_rate(settings)
                 )
             now = datetime.now(tz)
+            if not startup_reconciled:
+                startup_reconciled = True
+                # No planner or fallback write may precede restart reconciliation.
+                if authority.state is not None and (
+                    authority.state.holds or authority.state.committed_mode != "observe"
+                ):
+                    if not authority.state.holds:
+                        async with HomeAssistantRest(
+                            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+                        ) as rest:
+                            for config in settings.devices:
+                                entity = config.entities.get("power_switch", "")
+                                if config.type == "inverter" and entity:
+                                    try:
+                                        await rest.get_state(entity)
+                                    except Exception:  # noqa: BLE001 - direction decides later
+                                        pass
+                    unknown_soc = SocMeasurement(SocStatus.UNAVAILABLE, now)
+                    startup_plan = ChargePlan(
+                        soc=unknown_soc, capacity_kwh=0, solar_kwh=0, effective_solar_kwh=0,
+                        load_kwh=0, cheap_covered_kwh=0, usable_now_kwh=0, deficit_kwh=0,
+                        buffer_pct=0, required_kwh=0, target_soc=0, window_hours=0,
+                        ev_charging=False, ha_template_needed=None,
+                        charge_intent=ChargeIntent(
+                            0, unknown_soc, window_start, window_end, hold_trusted=False,
+                        ),
+                    )
+                    startup_result = await reconcile_tick(
+                        settings, startup_plan, now, ev_hold_state=ev_hold_state,
+                    )
+                    last_reconcile_lines, last_trusted_holds = startup_result[:2]
             # Sole SoC observation cadence (#114): one checked measurement per
             # minute in every operating state, reused by everything below.
             measurement = await soc_monitor_tick(settings, monitor)
@@ -1135,6 +1623,28 @@ async def _run_forever(
                 monitor.recovery_ready
                 and (solis_fallback_active or (measurement is not None and measurement.ok))
             )
+            # #423: a failed recovered apply re-applied and re-verified the
+            # fallback on the same tick; the next recovery attempt waits five
+            # minutes instead of churning the resident program every minute.
+            # The backoff belongs to one recovery attempt: it lapses as soon as
+            # recovery is no longer ready (a new SoC failure reset progress, or
+            # the fallback left), never blocking a later episode.
+            if not monitor.recovery_ready:
+                recovery_retry_not_before = None
+            elif (
+                recovering
+                and solis_fallback_active
+                and recovery_retry_not_before is not None
+                and now < recovery_retry_not_before
+            ):
+                recovering = False
+                # `request_fallback` returns None while recovery is ready, so
+                # the scheduler itself retries an unconfirmed fallback
+                # re-apply every minute of the backoff, through the same
+                # gated, read-back-verified path. Only in Optimise.
+                if not monitor.fallback_confirmed:
+                    await _reapply_fallback(settings, monitor, measurement)
+                    fallback_confirmed = solis_fallback_active and monitor.fallback_confirmed
             # Set once `run_once` has *returned*, because it makes its own
             # reconcile pass with the plan it just computed. A run that raises
             # after that pass (`apply` or `publish_plan`) therefore falls back
@@ -1183,9 +1693,13 @@ async def _run_forever(
                     )
                     plan, last_applied_plan = result.plan, result.applied_plan
                     if recovering:
-                        await finish_recovery(settings, monitor, result.apply_lines)
+                        backed_off = await finish_recovery(
+                            settings, monitor, result.apply_lines, measurement
+                        )
                         solis_fallback_active = monitor.fallback_active
                         fallback_confirmed = solis_fallback_active and monitor.fallback_confirmed
+                        if backed_off:
+                            recovery_retry_not_before = now + RECOVERY_RETRY_DELAY
                     replanned = True
                     state.set_plan(plan)
                     last_run_slot = _slot_start(now)
@@ -1227,8 +1741,11 @@ async def _run_forever(
                     else:
                         log.exception("Scheduled plan run failed; will retry next tick")
                     if recovering:
-                        await finish_recovery(settings, monitor, None)
-                        fallback_confirmed = False
+                        backed_off = await finish_recovery(settings, monitor, None, measurement)
+                        solis_fallback_active = monitor.fallback_active
+                        fallback_confirmed = solis_fallback_active and monitor.fallback_confirmed
+                        if backed_off:
+                            recovery_retry_not_before = now + RECOVERY_RETRY_DELAY
             # The clock cadence (#143), independent of `setpoint_changed`: the
             # power switch converges within a minute, not at the next plan
             # change. Skipped when `run_once` returned, having made its own pass

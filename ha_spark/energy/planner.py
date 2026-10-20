@@ -1120,6 +1120,11 @@ def compute_plan(
         export=export,
         hold_trusted=inputs.dispatches_trusted,
         export_trusted=inputs.flexibility_event_trusted,
+        octopus_dispatch_reported_at=(
+            octopus.own_reported_at
+            if (octopus := inputs.evidence_freshness.get("octopus_dispatch")) is not None
+            else None
+        ),
         # Inputs built outside gather_inputs (backtest, tests) set no unrated list;
         # their dispatches were never rated, so they are the unrated set.
         unrated_holds=_controlled_windows(

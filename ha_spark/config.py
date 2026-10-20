@@ -120,6 +120,18 @@ _OPTION_KEYS = frozenset(
         "ev_power_entity",
         "dispatch_grid_power_entity",
         "dispatch_grid_power_invert",
+        "hold_degraded_minutes",
+        "ev_status_max_age_seconds",
+        "ev_plug_max_age_seconds",
+        "ev_power_max_age_seconds",
+        "live_dispatch_max_age_seconds",
+        "adjusted_rate_max_age_seconds",
+        "dispatch_grid_power_max_age_seconds",
+        "battery_power_max_age_seconds",
+        "octopus_dispatch_max_age_seconds",
+        "ev_liveness_entity",
+        "dispatch_liveness_entity",
+        "battery_power_discharge_sign",
         "consumption_energy_entity",
         "grid_power_entity",
         "supply_max_current_a",
@@ -129,6 +141,7 @@ _OPTION_KEYS = frozenset(
         "ha_template_charge_needed_entity",
         # Inverter selector + AlphaESS control (Task 3).
         "inverter",
+        "solis_model_confirmed",
         "solis_control_hub",
         "solis_modbus_slave",
         "inverter_clock_tolerance_minutes",
@@ -493,6 +506,20 @@ class Settings(BaseSettings):
     ev_power_entity: str = Field(default="")  # direct car draw, W or kW
     dispatch_grid_power_entity: str = Field(default="")  # independent import evidence
     dispatch_grid_power_invert: bool = Field(default=False)
+
+    # Freshness metadata only; hold consumers are deliberately unchanged (#419).
+    hold_degraded_minutes: int = Field(default=60, ge=5, le=1440)
+    ev_status_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
+    ev_plug_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
+    ev_power_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
+    live_dispatch_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
+    adjusted_rate_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
+    dispatch_grid_power_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
+    battery_power_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
+    octopus_dispatch_max_age_seconds: float | None = Field(default=2700, gt=0, le=86400)
+    ev_liveness_entity: str = ""
+    dispatch_liveness_entity: str = ""
+    battery_power_discharge_sign: Literal["positive", "negative"] | None = None
     # True house load excluding battery/EV.
     consumption_energy_entity: str = Field(default="")
     # Live supply guard: throttle battery charging while whole-house AC draw
@@ -510,6 +537,7 @@ class Settings(BaseSettings):
     # writes the timed-slot registers through (`modbus.write_register`) and reads
     # back via its `sensor.<hub>_*` entities. The window/current/work-mode
     # registers are fixed in the driver (docs/solis-control-modbus-overlay.yaml).
+    solis_model_confirmed: bool = False
     solis_control_hub: str = Field(default="solis_control")
     solis_modbus_slave: int = Field(default=1)
     # How far the inverter clock may disagree with the household clock before

@@ -1314,6 +1314,26 @@ async def test_a_readable_dispatch_entity_with_no_dispatches_is_trusted(
     assert inputs.dispatches_trusted is True
 
 
+async def test_a_stale_dispatch_entity_is_untrusted_in_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#420: a cached HA state is not a live picture; its holds never act."""
+    stale = (datetime.now(UTC) - timedelta(seconds=301)).isoformat()
+    inputs = await _gather_with_dispatch(
+        monkeypatch,
+        _state(
+            "binary_sensor.dispatch",
+            "on",
+            {"planned_dispatches": [{"start": "2026-06-10T22:00:00+01:00",
+                                     "end": "2026-06-10T23:00:00+01:00"}]},
+            last_reported=stale,
+        ),
+    )
+
+    assert len(inputs.dispatches) == 1  # reported data, kept
+    assert inputs.dispatches_trusted is False  # ...but never trusted hold evidence
+
+
 async def test_a_missing_dispatch_entity_is_untrusted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

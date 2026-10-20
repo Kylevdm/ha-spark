@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from ha_spark.energy.evidence_freshness import EvidenceFreshness
 from ha_spark.energy.horizon import compute_horizon_geometry
 from ha_spark.energy.models import DispatchSlot, FlexibilityEvent, PlannerConfig, PlannerInputs
 from ha_spark.energy.planner import compute_plan
@@ -206,6 +207,18 @@ def test_hold_trust_travels_from_inputs_onto_the_intent(trusted: bool) -> None:
         dispatches_trusted=trusted,
     )
     assert _plan(inp, cfg()).charge_intent.hold_trusted is trusted
+
+
+def test_the_kraken_read_time_travels_onto_the_intent() -> None:
+    """The reconcile re-checks the plan's Kraken age, so the intent carries the own report time."""
+    read_at = datetime(2026, 10, 3, 13, 50, tzinfo=UTC)
+    freshness = EvidenceFreshness("fresh", read_at, 0.0, 2700, read_at)
+    inp = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2,
+        evidence_freshness={"octopus_dispatch": freshness},
+    )
+    assert _plan(inp, cfg()).charge_intent.octopus_dispatch_reported_at == read_at
+    bare = PlannerInputs(soc=_soc(30), solar_tomorrow_kwh=8.75, predicted_home_load_kwh=24.2)
+    assert _plan(bare, cfg()).charge_intent.octopus_dispatch_reported_at is None
 
 
 def test_axle_export_reserves_a_full_event_and_the_post_event_cheap_slot() -> None:

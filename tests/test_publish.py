@@ -372,14 +372,14 @@ async def test_publish_soc_integrity_reports_fallback_confirmation_not_request()
     monitor.record(failed, failure_threshold=1)
     assert monitor.request_fallback() is not None
     snapshot = monitor.complete_fallback(action_line="[FALLBACK] Solis fallback verified")
-    settings = Settings(solis_fallback_current_a=45.0, max_charge_current_a=35.0)
+    settings = Settings(solis_fallback_current_a=35.0, max_charge_current_a=35.0)
 
     async with HomeAssistantRest(BASE, "t") as rest:
         await publish_soc_integrity(rest, snapshot, settings)
 
     body = json.loads(push.calls[0].request.content)
     assert body["state"] == "fallback_verified"
-    assert body["attributes"]["fallback_current_configured_a"] == 45.0
+    assert body["attributes"]["fallback_current_configured_a"] == 35.0
     assert body["attributes"]["fallback_current_ceiling_a"] == 35
     assert body["attributes"]["fallback_confirmed"] is True
     assert body["attributes"]["fallback_action"] == "[FALLBACK] Solis fallback verified"

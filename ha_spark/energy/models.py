@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from typing import TYPE_CHECKING
 
+from ha_spark.energy.evidence_freshness import EvidenceFreshness
 from ha_spark.energy.soc_integrity import SocMeasurement
 
 if TYPE_CHECKING:
@@ -222,6 +223,10 @@ class PlannerInputs:
     # Original dispatches before evidence rating. The planner prices and sizes
     # only `dispatches`, but carries these for local per-minute hold re-rating.
     unrated_dispatches: tuple[DispatchSlot, ...] = ()
+    # Report-time freshness per source (#419). The planner copies only the Kraken
+    # read time onto the intent; the hold gates read freshness at their own seams.
+    evidence_freshness: dict[str, EvidenceFreshness] = field(default_factory=dict)
+    battery_direction: str = "unknown"
     # Horizon geometry (#395): where the plan's slots fall on the clock, from
     # the current half-hour. ``None`` on inputs built without one (hand-built
     # tests, the backtest, the v1 daily path); read it through
@@ -291,6 +296,10 @@ class ChargeIntent:
     unrated_holds: tuple[tuple[datetime, datetime], ...] = ()
     # Sizing projection only; never replaces the checked SoC measurement.
     expected_window_start_soc: float | None = None
+    # When the plan's Kraken dispatch read succeeded (octopus_intelligent only).
+    # The per-minute reconcile re-checks its age before trusting `unrated_holds`;
+    # None is no evidence, never "fresh".
+    octopus_dispatch_reported_at: datetime | None = None
 
     @property
     def soc_now(self) -> float:

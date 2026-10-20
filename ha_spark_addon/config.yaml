@@ -101,6 +101,17 @@ options:
   ev_power_entity: ""
   dispatch_grid_power_entity: ""
   dispatch_grid_power_invert: false
+  hold_degraded_minutes: 60
+  ev_status_max_age_seconds: 300
+  ev_plug_max_age_seconds: 300
+  ev_power_max_age_seconds: 300
+  live_dispatch_max_age_seconds: 300
+  adjusted_rate_max_age_seconds: 300
+  dispatch_grid_power_max_age_seconds: 300
+  battery_power_max_age_seconds: 300
+  octopus_dispatch_max_age_seconds: 2700
+  ev_liveness_entity: ""
+  dispatch_liveness_entity: ""
   consumption_energy_entity: ""
   supply_max_current_a: 75.0
   supply_voltage_v: 240.0
@@ -108,6 +119,7 @@ options:
   inverter_power_switch_entity: ""
   ha_template_charge_needed_entity: ""
   inverter: solis
+  solis_model_confirmed: false
   solis_control_hub: "solis_control"
   solis_modbus_slave: 1
   inverter_clock_tolerance_minutes: 5.0
@@ -211,6 +223,18 @@ schema:
   ev_power_entity: str?
   dispatch_grid_power_entity: str?
   dispatch_grid_power_invert: bool
+  hold_degraded_minutes: int(5,1440)?
+  ev_status_max_age_seconds: float(0.001,86400)?
+  ev_plug_max_age_seconds: float(0.001,86400)?
+  ev_power_max_age_seconds: float(0.001,86400)?
+  live_dispatch_max_age_seconds: float(0.001,86400)?
+  adjusted_rate_max_age_seconds: float(0.001,86400)?
+  dispatch_grid_power_max_age_seconds: float(0.001,86400)?
+  battery_power_max_age_seconds: float(0.001,86400)?
+  octopus_dispatch_max_age_seconds: float(0.001,86400)?
+  ev_liveness_entity: str?
+  dispatch_liveness_entity: str?
+  battery_power_discharge_sign: list(positive|negative)?
   consumption_energy_entity: str?
   grid_power_entity: str?
   supply_max_current_a: float
@@ -219,6 +243,7 @@ schema:
   inverter_power_switch_entity: str?
   ha_template_charge_needed_entity: str?
   inverter: list(solis|alphaess)
+  solis_model_confirmed: bool?
   solis_control_hub: str?
   solis_modbus_slave: int
   inverter_clock_tolerance_minutes: float(0.1,29.9)

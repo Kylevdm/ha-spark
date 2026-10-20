@@ -20,6 +20,7 @@ from ha_spark.config import Settings as ConfigSettings
 from ha_spark.devices import Capability, inverter_device
 from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.energy import scheduler, sources
+from ha_spark.energy.evidence_freshness import EvidenceFreshness
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import (
@@ -1941,6 +1942,297 @@ async def test_loop_reconciles_persisted_fallback_even_when_soc_passes(
     assert _integrity_posts()[0][1]["fallback_confirmed"] is True
 
 
+# --- #422: the authority store owns fallback active and its causes ---
+
+
+def _fallback_notices(title: str) -> list[dict[str, object]]:
+    """The persistent-notification bodies with ``title`` this test saw."""
+    out: list[dict[str, object]] = []
+    for call in respx.calls:
+        if call.request.url.path != "/api/services/persistent_notification/create":
+            continue
+        body = json.loads(call.request.content)
+        if body.get("title") == title:
+            out.append(body)
+    return out
+
+
+def _hardware_service_calls() -> list[str]:
+    """Hardware-actuating service calls (modbus/select/switch), never notices."""
+    return [
+        call.request.url.path
+        for call in respx.calls
+        if call.request.method == "POST"
+        and any(
+            call.request.url.path.startswith(f"/api/services/{domain}/")
+            for domain in ("modbus", "select", "switch", "alphaess")
+        )
+    ]
+
+
+@respx.mock
+async def test_loop_fallback_entry_saves_the_store_before_the_write_and_notifies_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#422) Entry: the store (active + cause + bumped epoch) is saved before
+    the fallback write is requested, the apply plans under the new epoch, and
+    one entry notice fires across the ticks."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50", "50", "50"], [stale, stale, stale])
+    apply_state: list[tuple[bool, int, int]] = []
+
+    class StoreWitnessDevice(SolisDevice):
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            from ha_spark.devices.execution import execution_context
+
+            context = execution_context()
+            store = context.authority
+            assert store is not None and store.state is not None
+            apply_state.append((
+                store.state.fallback.active,
+                store.state.epoch,
+                context.planned_epoch.get(),
+            ))
+            return ["[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"]
+
+        async def reconcile_holds(self, *_args: object, **_kwargs: object) -> list[str]:
+            return []
+
+        async def write_safe_state(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(StoreWitnessDevice, settings, rest),
+    )
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        soc_failure_threshold=2, solis_fallback_current_a=42.0, v2l_power_entity="",
+    )
+    store = seed_authority(settings, "optimise")
+    stop = _patch_monitor_loop(
+        monkeypatch,
+        [datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 22, 1),
+         datetime(2026, 6, 10, 22, 30)],
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    from ha_spark.authority import load_authority
+
+    # Saved active + cause with the epoch bumped (start_process + entry), and
+    # the fallback apply itself ran under the bumped epoch, not refused stale.
+    assert store.state is not None
+    assert apply_state == [(True, store.state.epoch + 2, store.state.epoch + 2)]
+    result = load_authority(settings)
+    assert result.state is not None
+    assert result.state.fallback.active is True
+    assert result.state.fallback.causes == ("soc_integrity",)
+    assert result.state.epoch == store.state.epoch + 2
+    assert len(_fallback_notices("ha-spark fallback entered")) == 1
+    assert _fallback_notices("ha-spark fallback left") == []
+
+
+@respx.mock
+async def test_loop_fallback_exit_clears_the_store_and_notifies_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#422) Exit: the store's fallback active + cause clear and the epoch
+    bumps only after the recovered plan applied and read back, with one exit
+    notice."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop, _runs, settings = _patch_recovery_loop(
+        tmp_path, monkeypatch, [0, 1, 2, 3],
+        [["[APPLIED] set timed charge current to 20 A over 3.5 h of the window"]],
+    )
+    from ha_spark.authority import load_authority
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    result = load_authority(settings)
+    assert result.state is not None
+    assert result.state.fallback.active is False
+    assert result.state.fallback.causes == ()
+    # Seed + start_process + first-boot reconciliation entry + exit.
+    assert result.state.epoch == 4
+    assert len(_fallback_notices("ha-spark fallback entered")) == 1
+    assert len(_fallback_notices("ha-spark fallback left")) == 1
+
+
+@pytest.mark.parametrize("mode", ["observe", "protect"])
+@respx.mock
+async def test_loop_sustained_failure_without_charging_authority_never_requests_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """(#422) Observe/Protect: pending failure and the threshold crossing are
+    counted, persisted and published, but `request_fallback`/`apply_fallback`
+    are never called and zero fallback writes happen."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50", "50", "50"], [stale, stale, stale])
+    requests: list[object] = []
+    applies: list[object] = []
+
+    def forbid_request(self: SocMonitor) -> object:
+        requests.append(self)
+        raise AssertionError(f"{mode} requested a fallback")
+
+    async def forbid_apply(self: SolisDevice, soc: SocMeasurement) -> list[str]:
+        applies.append(soc)
+        raise AssertionError(f"{mode} applied a fallback")
+
+    monkeypatch.setattr(SocMonitor, "request_fallback", forbid_request)
+    monkeypatch.setattr(SolisDevice, "apply_fallback", forbid_apply)
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        authority_mode=mode,  # type: ignore[arg-type]
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        soc_failure_threshold=2, solis_fallback_current_a=42.0, v2l_power_entity="",
+    )
+    stop = _patch_monitor_loop(
+        monkeypatch,
+        [datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 22, 1),
+         datetime(2026, 6, 10, 22, 2)],
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    from ha_spark.authority import load_authority
+
+    assert requests == [] and applies == []
+    # Counted, persisted and published — but never written.
+    assert [state for state, _ in _integrity_posts()] == [
+        "pending_failure", "fallback_threshold", "fallback_threshold",
+    ]
+    assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
+        "consecutive_failures": 3, "fallback_status": "fallback_threshold",
+    }
+    result = load_authority(settings)
+    assert result.state is not None
+    assert result.state.fallback.active is False
+    assert result.state.epoch == 2  # only start_process; entry never happened
+    assert _fallback_notices("ha-spark fallback entered") == []
+    assert _hardware_service_calls() == []
+
+
+@respx.mock
+async def test_first_boot_reconciles_monitor_fallback_into_the_store_unconfirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#422) First boot of this version: a monitor-persisted fallback status
+    is reconciled into the store as an active cause that is not confirmed (the
+    monitor's confirmation stays false until read-back), and a restart does
+    not notify again."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    now = datetime.now(UTC)
+    _soc_get(["55"], [now])
+    (tmp_path / "ha_spark_soc_monitor.json").write_text(
+        json.dumps({"consecutive_failures": 2, "fallback_status": "fallback_verified"}),
+        encoding="utf-8",
+    )
+
+    class UnconfirmedFallbackDevice(SolisDevice):
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            return ["[FAILED] Solis fallback at 42 A in 23:30-05:30 unconfirmed: read-back"]
+
+        def planned_rate_w(self, _intent: object) -> float:
+            return 0.0
+
+        async def reconcile_holds(self, *_args: object, **_kwargs: object) -> list[str]:
+            return []
+
+        async def write_safe_state(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(UnconfirmedFallbackDevice, settings, rest),
+    )
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        authority_mode="optimise",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        soc_failure_threshold=2, solis_fallback_current_a=42.0, v2l_power_entity="",
+    )
+    stop = _patch_monitor_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0)])
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    from ha_spark.authority import load_authority
+
+    result = load_authority(settings)
+    assert result.state is not None
+    assert result.state.fallback.active is True
+    assert result.state.fallback.causes == ("soc_integrity",)
+    assert len(_fallback_notices("ha-spark fallback entered")) == 1
+    # Unconfirmed: the reconcile attempt failed, so the cause is active but the
+    # fallback is not hardware-confirmed; it retries next minute.
+    state, attrs = _integrity_posts()[0]
+    assert state == "fallback_failed"
+    assert attrs["fallback_confirmed"] is False
+    assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
+        "consecutive_failures": 2, "fallback_status": "fallback_failed",
+    }
+
+    # A restart: the store already says active, so no second entry or notice.
+    _soc_get(["55"], [now])
+    stop = _patch_monitor_loop(monkeypatch, [datetime(2026, 6, 10, 22, 1)])
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert len(_fallback_notices("ha-spark fallback entered")) == 1
+    assert load_authority(settings).state is not None
+    assert load_authority(settings).state.fallback.active is True
+
+
+@respx.mock
+async def test_fallback_entry_save_failure_refuses_the_fallback_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """(#422) If the entry save fails, no fallback write runs: `save_failed`
+    makes the gate refuse, and the attempt stays retryable next minute."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50"], [stale])
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t",
+        authority_mode="optimise",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        soc_failure_threshold=1, solis_fallback_current_a=42.0, v2l_power_entity="",
+    )
+
+    def boom(path: object, payload: str) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("ha_spark.authority._durable_write", boom)
+    monitor = SocMonitor(path=tmp_path / "ha_spark_soc_monitor.json")
+    with caplog.at_level("WARNING"):
+        await scheduler.soc_monitor_tick(settings, monitor)
+
+    from ha_spark.authority import load_authority
+
+    assert _hardware_service_calls() == []
+    assert "fallback entry not persisted" in caplog.text
+    state, attrs = _integrity_posts()[0]
+    assert state == "fallback_failed"
+    assert attrs["fallback_confirmed"] is False
+    assert attrs["fallback_action"].startswith("[FAILED] Solis fallback unconfirmed: [REFUSED]")
+    assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
+        "consecutive_failures": 1, "fallback_status": "fallback_failed",
+    }
+    result = load_authority(settings)
+    assert result.state is not None
+    assert result.state.fallback.active is False  # the entry never persisted
+
+
 @respx.mock
 async def test_loop_caps_verified_fallback_guard_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2696,7 +2988,7 @@ async def test_run_forever_remembers_holds_only_from_trusted_plans(
     assert reconcile_saw == [(_HOLD,), (_HOLD,)]
 
 
-async def test_run_forever_forgets_trusted_holds_on_hot_reload(
+async def test_run_forever_keeps_ev_state_but_drops_dispatch_picture_on_hot_reload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A reload may change the dispatch source; the old picture is not evidence."""
@@ -2714,7 +3006,8 @@ async def test_run_forever_forgets_trusted_holds_on_hot_reload(
         assert isinstance(state, scheduler.EvHoldState)
         ev_states.append(state)
         state.active = True
-        state.not_charging_since = datetime(2026, 6, 10, 21, 55)
+        state.clear_count = 2
+        state.last_clear_report_at = datetime(2026, 6, 10, 21, 55)
         plan = _plan(replace(_INTENT, holds=(_HOLD,)))
         return scheduler.RunResult(plan, plan)
 
@@ -2731,12 +3024,9 @@ async def test_run_forever_forgets_trusted_holds_on_hot_reload(
         reconcile_saw.append(trusted_holds)
         assert ev_hold_state is not None
         ev_states.append(ev_hold_state)
-        if len(reconcile_saw) == 1:
-            assert ev_hold_state.active is True
-            assert ev_hold_state.not_charging_since == datetime(2026, 6, 10, 21, 55)
-        else:
-            assert ev_hold_state.active is False
-            assert ev_hold_state.not_charging_since is None
+        assert ev_hold_state.active is True
+        assert ev_hold_state.clear_count == 2
+        assert ev_hold_state.last_clear_report_at == datetime(2026, 6, 10, 21, 55)
         captured[0].settings = Settings(
             ha_url="http://ha.test", ha_token="t", plan_run_time="22:00"
         )
@@ -2764,7 +3054,7 @@ async def test_run_forever_forgets_trusted_holds_on_hot_reload(
 
     assert reconcile_saw == [(_HOLD,), None]
     assert ev_states[0] is ev_states[1]
-    assert ev_states[2] is not ev_states[1]
+    assert ev_states[2] is ev_states[1]
 
 
 # --- #140/#143 §4: the per-minute pass tracks Dave's poll on the HA-entity path ---
@@ -2775,22 +3065,32 @@ _EV_PLUG_URL = "http://ha.test/api/states/sensor.ev_plug"
 _OCTOPUS_RATE_URL = "http://ha.test/api/states/sensor.octopus_rate"
 
 
-def _dispatch_state(state: str, dispatches: list[dict[str, str]] | None = None) -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={
-            "entity_id": "binary_sensor.dispatch",
-            "state": state,
-            "attributes": {"planned_dispatches": dispatches or []},
-        },
-    )
+def _dispatch_state(
+    state: str,
+    dispatches: list[dict[str, str]] | None = None,
+    *,
+    at: datetime | None = None,
+) -> httpx.Response:
+    """A dispatch entity payload; ``at`` is its top-level ``last_reported``.
+
+    #420 made report times hold evidence: a payload without one reads as
+    unknown freshness, which never starts or extends a hold.
+    """
+    body: dict[str, object] = {
+        "entity_id": "binary_sensor.dispatch",
+        "state": state,
+        "attributes": {"planned_dispatches": dispatches or []},
+    }
+    if at is not None:
+        body["last_reported"] = at.isoformat()
+    return httpx.Response(200, json=body)
 
 
-def _ev_status_state(state: str) -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={"entity_id": "sensor.ev", "state": state, "attributes": {}},
-    )
+def _ev_status_state(state: str, *, at: datetime | None = None) -> httpx.Response:
+    body: dict[str, object] = {"entity_id": "sensor.ev", "state": state, "attributes": {}}
+    if at is not None:
+        body["last_reported"] = at.isoformat()
+    return httpx.Response(200, json=body)
 
 
 def _dispatch_settings(**kw: object) -> Settings:
@@ -2801,6 +3101,13 @@ def _dispatch_settings(**kw: object) -> Settings:
     return Settings(**base)  # type: ignore[arg-type]
 
 
+def _fresh(at: datetime, validity: str = "fresh") -> EvidenceFreshness:
+    """Hold evidence as #419 reads it: a validity and an effective report time."""
+    return EvidenceFreshness(
+        validity=validity, reported_at=at, age_s=0.0, max_age_s=300.0, own_reported_at=at,
+    )
+
+
 @respx.mock
 async def test_contradicted_dispatch_does_not_hold_during_per_minute_reconcile(
     monkeypatch: pytest.MonkeyPatch,
@@ -2808,13 +3115,17 @@ async def test_contradicted_dispatch_does_not_hold_during_per_minute_reconcile(
 ) -> None:
     device = _IntentRecordingDevice()
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    now = datetime(2026, 10, 3, 14, 15, tzinfo=UTC)
     respx.get(_DISPATCH_URL).mock(
         return_value=_dispatch_state(
             "off",
             [{"start": "2026-10-03T14:00:00", "end": "2026-10-03T15:00:00"}],
+            at=now - timedelta(seconds=60),
         )
     )
-    respx.get(_EV_PLUG_URL).mock(return_value=_ev_status_state("EV Disconnected"))
+    respx.get(_EV_PLUG_URL).mock(
+        return_value=_ev_status_state("EV Disconnected", at=now - timedelta(seconds=60))
+    )
     ev_status = respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused"))
     respx.get(_OCTOPUS_RATE_URL).mock(
         return_value=httpx.Response(
@@ -2826,7 +3137,6 @@ async def test_contradicted_dispatch_does_not_hold_during_per_minute_reconcile(
             },
         )
     )
-    now = datetime(2026, 10, 3, 14, 15)
     settings = _dispatch_settings(
         ev_plug_entity="sensor.ev_plug",
         ev_status_entity="sensor.ev",
@@ -2850,6 +3160,45 @@ async def test_contradicted_dispatch_does_not_hold_during_per_minute_reconcile(
     assert not any("Dropped contradicted dispatch" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize("plug_at", [timedelta(seconds=301), None], ids=["stale", "missing"])
+@respx.mock
+async def test_a_stale_disconnected_plug_never_releases_a_per_minute_hold(
+    monkeypatch: pytest.MonkeyPatch, plug_at: timedelta | None
+) -> None:
+    """A cached "EV Disconnected" is not a live picture, so it cannot contradict."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    now = datetime(2026, 10, 3, 14, 15, tzinfo=UTC)
+    respx.get(_DISPATCH_URL).mock(
+        return_value=_dispatch_state(
+            "off",
+            [{"start": "2026-10-03T14:00:00", "end": "2026-10-03T15:00:00"}],
+            at=now - timedelta(seconds=60),
+        )
+    )
+    respx.get(_EV_PLUG_URL).mock(
+        return_value=_ev_status_state(
+            "EV Disconnected", at=None if plug_at is None else now - plug_at
+        )
+    )
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused"))
+    respx.get(_OCTOPUS_RATE_URL).mock(return_value=httpx.Response(404))
+    settings = _dispatch_settings(
+        ev_plug_entity="sensor.ev_plug",
+        ev_status_entity="sensor.ev",
+        octopus_rate_entity="sensor.octopus_rate",
+    )
+
+    result = await scheduler.reconcile_tick(
+        settings, _plan(replace(_INTENT, holds=(_HOLD,))), now, trusted_holds=(_HOLD,)
+    )
+
+    [intent] = device.intents
+    assert intent.hold_trusted is True
+    assert intent.hold_active(now) is True
+    assert result.trusted_holds == intent.holds != ()
+
+
 @pytest.mark.parametrize(
     ("dispatch_state", "plug_state"),
     [("on", "EV Disconnected"), ("off", "unavailable")],
@@ -2861,10 +3210,12 @@ async def test_live_or_uncorroborated_dispatch_keeps_per_minute_hold(
 ) -> None:
     device = _IntentRecordingDevice()
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    now = datetime(2026, 10, 3, 14, 15, tzinfo=UTC)
     respx.get(_DISPATCH_URL).mock(
         return_value=_dispatch_state(
             dispatch_state,
             [{"start": "2026-10-03T14:00:00", "end": "2026-10-03T15:00:00"}],
+            at=now - timedelta(seconds=60),
         )
     )
     respx.get(_EV_PLUG_URL).mock(
@@ -2884,7 +3235,6 @@ async def test_live_or_uncorroborated_dispatch_keeps_per_minute_hold(
             },
         )
     )
-    now = datetime(2026, 10, 3, 14, 15)
     settings = _dispatch_settings(
         ev_plug_entity="sensor.ev_plug",
         ev_status_entity="sensor.ev",
@@ -2947,12 +3297,14 @@ async def test_a_dispatch_published_mid_slot_is_honoured_on_the_next_minute(
     """Published *and* started inside one slot: the next minute holds, without a replan."""
     device = _IntentRecordingDevice()
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    inside = datetime(2026, 6, 10, 22, 15, tzinfo=UTC)
     respx.get(_DISPATCH_URL).mock(
         return_value=_dispatch_state(
-            "on", [{"start": "2026-06-10T22:00:00", "end": "2026-06-10T23:00:00"}]
+            "on",
+            [{"start": "2026-06-10T22:00:00", "end": "2026-06-10T23:00:00"}],
+            at=inside - timedelta(seconds=60),
         )
     )
-    inside = datetime(2026, 6, 10, 22, 15)
 
     result = await scheduler.reconcile_tick(
         _dispatch_settings(), _plan(replace(_INTENT, holds=())), inside, trusted_holds=()
@@ -2972,14 +3324,17 @@ async def test_a_fresh_overnight_dispatch_is_not_a_hold(
     ``Off`` during the cheap overnight charge would waste it."""
     device = _IntentRecordingDevice()
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    inside = datetime(2026, 6, 11, 1, 15, tzinfo=UTC)
     respx.get(_DISPATCH_URL).mock(
         return_value=_dispatch_state(
-            "on", [{"start": "2026-06-11T01:00:00", "end": "2026-06-11T02:00:00"}]
+            "on",
+            [{"start": "2026-06-11T01:00:00", "end": "2026-06-11T02:00:00"}],
+            at=inside - timedelta(seconds=60),
         )
     )
 
     result = await scheduler.reconcile_tick(
-        _dispatch_settings(), _plan(), datetime(2026, 6, 11, 1, 15), trusted_holds=()
+        _dispatch_settings(), _plan(), inside, trusted_holds=()
     )
 
     [intent] = device.intents
@@ -3027,7 +3382,15 @@ async def test_the_octopus_path_never_polls_kraken_per_minute(
     octopus = respx.route(url__startswith="http://octo.test").mock(
         return_value=httpx.Response(500)
     )
-    plan = _plan(replace(_INTENT, holds=(_HOLD,), unrated_holds=(_HOLD,)))
+    now = datetime(2026, 6, 10, 22, 15, tzinfo=UTC)
+    plan = _plan(
+        replace(
+            _INTENT,
+            holds=(_HOLD,),
+            unrated_holds=(_HOLD,),
+            octopus_dispatch_reported_at=now - timedelta(minutes=10),
+        )
+    )
 
     result = await scheduler.reconcile_tick(
         _dispatch_settings(
@@ -3037,7 +3400,7 @@ async def test_the_octopus_path_never_polls_kraken_per_minute(
             octopus_account_number="A-1234ABCD",
         ),
         plan,
-        datetime(2026, 6, 10, 22, 15),
+        now,
         trusted_holds=(_HOLD,),
     )
 
@@ -3053,8 +3416,9 @@ async def test_octopus_rerates_a_dropped_dispatch_when_the_plug_connects(
 ) -> None:
     device = _IntentRecordingDevice()
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
-    start = datetime(2026, 10, 3, 14, 0)
-    end = datetime(2026, 10, 3, 15, 0)
+    start = datetime(2026, 10, 3, 14, 0, tzinfo=UTC)
+    end = datetime(2026, 10, 3, 15, 0, tzinfo=UTC)
+    now = datetime(2026, 10, 3, 14, 15, tzinfo=UTC)
     respx.get(_DISPATCH_URL).mock(return_value=_dispatch_state("off", []))
     respx.get(_EV_PLUG_URL).mock(return_value=_ev_status_state("EV Connected"))
     ev_status = respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused"))
@@ -3073,6 +3437,7 @@ async def test_octopus_rerates_a_dropped_dispatch_when_the_plug_connects(
         holds=(),
         hold_trusted=True,
         unrated_holds=((start, end),),
+        octopus_dispatch_reported_at=now - timedelta(minutes=10),
     )
     settings = _dispatch_settings(
         tariff_provider="octopus_intelligent",
@@ -3084,13 +3449,13 @@ async def test_octopus_rerates_a_dropped_dispatch_when_the_plug_connects(
     result = await scheduler.reconcile_tick(
         settings,
         _plan(intent),
-        datetime(2026, 10, 3, 14, 15),
+        now,
         trusted_holds=(),
     )
 
     [fresh] = device.intents
     assert fresh.holds == ((start, end),)
-    assert fresh.hold_active(datetime(2026, 10, 3, 14, 15)) is True
+    assert fresh.hold_active(now) is True
     assert result.trusted_holds == ((start, end),)
     assert ev_status.call_count == 1
 
@@ -3101,10 +3466,15 @@ async def test_octopus_rerates_a_kept_dispatch_when_the_plug_disconnects(
 ) -> None:
     device = _IntentRecordingDevice()
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
-    start = datetime(2026, 10, 3, 14, 0)
-    end = datetime(2026, 10, 3, 15, 0)
+    start = datetime(2026, 10, 3, 14, 0, tzinfo=UTC)
+    end = datetime(2026, 10, 3, 15, 0, tzinfo=UTC)
+    now = datetime(2026, 10, 3, 14, 15, tzinfo=UTC)
     respx.get(_DISPATCH_URL).mock(return_value=_dispatch_state("off", []))
-    plug = respx.get(_EV_PLUG_URL).mock(return_value=_ev_status_state("EV Disconnected"))
+    plug = respx.get(_EV_PLUG_URL).mock(
+        return_value=_ev_status_state(
+            "EV Disconnected", at=datetime(2026, 10, 3, 14, 14, tzinfo=UTC)
+        )
+    )
     ev_status = respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused"))
     rate = respx.get(_OCTOPUS_RATE_URL).mock(
         return_value=httpx.Response(
@@ -3121,6 +3491,7 @@ async def test_octopus_rerates_a_kept_dispatch_when_the_plug_disconnects(
         holds=((start, end),),
         hold_trusted=True,
         unrated_holds=((start, end),),
+        octopus_dispatch_reported_at=now - timedelta(minutes=10),
     )
     settings = _dispatch_settings(
         tariff_provider="octopus_intelligent",
@@ -3132,17 +3503,67 @@ async def test_octopus_rerates_a_kept_dispatch_when_the_plug_disconnects(
     result = await scheduler.reconcile_tick(
         settings,
         _plan(intent),
-        datetime(2026, 10, 3, 14, 15),
+        now,
         trusted_holds=((start, end),),
     )
 
     [fresh] = device.intents
     assert fresh.holds == ()
-    assert fresh.hold_active(datetime(2026, 10, 3, 14, 15)) is False
+    assert fresh.hold_active(now) is False
     assert result.trusted_holds == ()
     assert ev_status.call_count == 1
     assert plug.call_count == 1
     assert rate.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "reported_ago", [timedelta(seconds=2701), None], ids=["stale", "missing"]
+)
+@respx.mock
+async def test_octopus_does_not_rerate_a_plan_whose_kraken_read_is_not_fresh(
+    monkeypatch: pytest.MonkeyPatch, reported_ago: timedelta | None
+) -> None:
+    """A trusted plan's Kraken picture expires; the reconcile never re-polls it.
+
+    Without the age check an old plan's windows would keep being re-rated as
+    trusted, so a dispatch Kraken later added could be released.
+    """
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    respx.get(_DISPATCH_URL).mock(return_value=_dispatch_state("off", []))
+    plug = respx.get(_EV_PLUG_URL).mock(return_value=_ev_status_state("EV Disconnected"))
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused"))
+    rate = respx.get(_OCTOPUS_RATE_URL).mock(return_value=httpx.Response(404))
+    start = datetime(2026, 10, 3, 14, 0, tzinfo=UTC)
+    end = datetime(2026, 10, 3, 15, 0, tzinfo=UTC)
+    now = datetime(2026, 10, 3, 14, 15, tzinfo=UTC)
+    intent = replace(
+        _INTENT,
+        holds=(),
+        hold_trusted=True,
+        unrated_holds=(),
+        octopus_dispatch_reported_at=None if reported_ago is None else now - reported_ago,
+    )
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(
+            tariff_provider="octopus_intelligent",
+            ev_plug_entity="sensor.ev_plug",
+            ev_status_entity="sensor.ev",
+            octopus_rate_entity="sensor.octopus_rate",
+        ),
+        _plan(intent),
+        now,
+        trusted_holds=((start, end),),
+    )
+
+    [fresh] = device.intents
+    assert fresh.hold_trusted is False
+    assert fresh.hold_active(now) is True
+    assert result.trusted_holds == ((start, end),)
+    assert scheduler.STALE_DISPATCH_LINE in result.lines
+    assert plug.called is False
+    assert rate.called is False
 
 
 @respx.mock
@@ -3220,8 +3641,8 @@ async def test_active_ev_status_holds_the_inverter_without_a_dispatch(
 ) -> None:
     device = _IntentRecordingDevice()
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
-    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state(status))
-    now = datetime(2026, 6, 10, 22, 15)
+    now = datetime(2026, 6, 10, 22, 15, tzinfo=UTC)
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state(status, at=now))
 
     await scheduler.reconcile_tick(
         _dispatch_settings(dispatch_entity="", ev_status_entity="sensor.ev"),
@@ -3241,7 +3662,8 @@ async def test_ev_hold_uses_the_real_solis_switch_path(
     monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
-    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Boosting"))
+    now = datetime(2026, 6, 10, 22, 15, tzinfo=UTC)
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Boosting", at=now))
     switch_url = "http://ha.test/api/states/select.solisac_power_switch"
     switch_reads = iter(("On", "Off"))
     respx.get(switch_url).mock(
@@ -3267,7 +3689,7 @@ async def test_ev_hold_uses_the_real_solis_switch_path(
     result = await scheduler.reconcile_tick(
         settings,
         _plan(replace(_INTENT, holds=())),
-        datetime(2026, 6, 10, 22, 15),
+        now,
         ev_hold_state=scheduler.EvHoldState(),
     )
 
@@ -3287,8 +3709,9 @@ async def test_ev_hold_uses_the_real_solis_switch_path(
 
 @respx.mock
 async def test_ev_hold_does_not_invent_an_alphaess_hold_write() -> None:
+    now = datetime(2026, 6, 10, 22, 15, tzinfo=UTC)
     ev_status = respx.get(_EV_STATUS_URL).mock(
-        return_value=_ev_status_state("Charging")
+        return_value=_ev_status_state("Charging", at=now)
     )
 
     result = await scheduler.reconcile_tick(
@@ -3298,7 +3721,7 @@ async def test_ev_hold_does_not_invent_an_alphaess_hold_write() -> None:
             ev_status_entity="sensor.ev",
         ),
         _plan(replace(_INTENT, holds=())),
-        datetime(2026, 6, 10, 22, 15),
+        now,
         ev_hold_state=scheduler.EvHoldState(),
     )
 
@@ -3323,7 +3746,11 @@ async def test_run_once_applies_the_ev_hold_on_a_replan_tick(
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
         return SimpleNamespace(
             plan=plan,
-            inputs=SimpleNamespace(ev_hold_charging=True),
+            inputs=SimpleNamespace(
+                ev_hold_charging=True,
+                evidence_freshness={"ev_status": _fresh(datetime(2026, 6, 10, 12, 0, tzinfo=UTC))},
+                battery_direction="unknown",
+            ),
             load_source="test",
             tz=None,
             forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
@@ -3392,58 +3819,770 @@ async def test_ev_diversion_does_not_start_a_hold(
     assert intent.hold_active(now) is False
 
 
-def test_ev_hold_releases_on_the_fifth_clear_minute() -> None:
-    started = datetime(2026, 6, 10, 22, 0)
-    state = scheduler.EvHoldState()
-    state = scheduler.next_ev_hold_state(state, True, started, time(23, 30), time(5, 30))
+# --- #420: fresh-evidence hold policy and EV clearance (pure state machine) ---
 
-    for minute in range(1, 5):
+def _fresh_hold(at: datetime, *, overnight_exception: bool = False) -> scheduler.EvHoldState:
+    """An EV hold confirmed by fresh charging evidence at ``at``."""
+    state = scheduler.next_ev_hold_state(
+        scheduler.EvHoldState(), True, _fresh(at), overnight_exception=overnight_exception
+    )
+    assert state.active is True
+    return state
+
+
+def test_ev_hold_releases_on_the_fifth_advancing_clear_report() -> None:
+    started = datetime(2026, 6, 10, 22, 0)
+    state = _fresh_hold(started)
+
+    for index in range(1, 5):
         state = scheduler.next_ev_hold_state(
-            state, False, started + timedelta(minutes=minute), time(23, 30), time(5, 30)
+            state, False, _fresh(started + timedelta(minutes=index))
         )
         assert state.active is True
+        assert state.clear_count == index
 
-    state = scheduler.next_ev_hold_state(
-        state, False, started + timedelta(minutes=5), time(23, 30), time(5, 30)
-    )
+    state = scheduler.next_ev_hold_state(state, False, _fresh(started + timedelta(minutes=5)))
     assert state.active is False
+    assert state.clear_count == 0
+    assert state.last_clear_report_at is None
 
 
-def test_ev_charging_resets_the_clear_run() -> None:
+def test_repeated_gets_of_one_clear_report_never_release() -> None:
+    """Five reads of one cached report are one report, not five distinct ones."""
     started = datetime(2026, 6, 10, 22, 0)
-    state = scheduler.next_ev_hold_state(
-        scheduler.EvHoldState(), True, started, time(23, 30), time(5, 30)
-    )
-    for minute in (1, 2):
-        state = scheduler.next_ev_hold_state(
-            state, False, started + timedelta(minutes=minute), time(23, 30), time(5, 30)
-        )
-    state = scheduler.next_ev_hold_state(
-        state, True, started + timedelta(minutes=3), time(23, 30), time(5, 30)
-    )
-    assert state.not_charging_since is None
+    state = _fresh_hold(started)
 
-    for minute in range(4, 8):
+    for _ in range(8):
+        state = scheduler.next_ev_hold_state(state, False, _fresh(started + timedelta(minutes=1)))
+        assert state.active is True
+        assert state.clear_count == 1
+        assert state.last_clear_report_at == started + timedelta(minutes=1)
+
+
+def test_a_backwards_clear_report_resets_the_clearance_run() -> None:
+    started = datetime(2026, 6, 10, 22, 0)
+    state = _fresh_hold(started)
+    state = scheduler.next_ev_hold_state(state, False, _fresh(started + timedelta(minutes=3)))
+    assert state.clear_count == 1
+
+    state = scheduler.next_ev_hold_state(state, False, _fresh(started + timedelta(minutes=2)))
+    assert state.active is True
+    assert state.clear_count == 0
+    assert state.last_clear_report_at is None
+
+    # The run restarts from the backwards reset, not from where it left off.
+    for index in range(1, 5):
         state = scheduler.next_ev_hold_state(
-            state, False, started + timedelta(minutes=minute), time(23, 30), time(5, 30)
+            state, False, _fresh(started + timedelta(minutes=10 + index))
         )
         assert state.active is True
     state = scheduler.next_ev_hold_state(
-        state, False, started + timedelta(minutes=8), time(23, 30), time(5, 30)
+        state, False, _fresh(started + timedelta(minutes=16))
     )
     assert state.active is False
 
 
-def test_ev_hold_is_suppressed_inside_the_overnight_charge_window() -> None:
+@pytest.mark.parametrize("validity", ["stale", "future", "unknown"])
+@pytest.mark.parametrize("charging", [True, False, None], ids=["charging", "clear", "unreadable"])
+def test_bad_evidence_never_starts_and_never_releases_a_hold(
+    validity: str, charging: bool | None
+) -> None:
+    """Unknown, stale or future evidence is no evidence (Q5): no start, no release."""
+    at = datetime(2026, 6, 10, 22, 0)
+    inactive = scheduler.next_ev_hold_state(
+        scheduler.EvHoldState(), charging, _fresh(at, validity)
+    )
+    assert inactive.active is False
+    assert inactive.clear_count == 0
+
+    active = _fresh_hold(at - timedelta(minutes=30))
+    for _ in range(3):  # a partial clearance run that bad evidence must reset
+        active = scheduler.next_ev_hold_state(
+            active, False, _fresh(at - timedelta(minutes=10))
+        )
+    assert active.clear_count == 1
+    held = scheduler.next_ev_hold_state(active, charging, _fresh(at, validity))
+    assert held.active is True
+    assert held.clear_count == 0
+    assert held.last_clear_report_at is None
+
+
+def test_fresh_charging_resets_the_clearance_run() -> None:
+    started = datetime(2026, 6, 10, 22, 0)
+    state = _fresh_hold(started)
+    state = scheduler.next_ev_hold_state(state, False, _fresh(started + timedelta(minutes=1)))
+    state = scheduler.next_ev_hold_state(state, False, _fresh(started + timedelta(minutes=2)))
+    assert state.clear_count == 2
+
+    state = scheduler.next_ev_hold_state(state, True, _fresh(started + timedelta(minutes=3)))
+    assert state.active is True
+    assert state.clear_count == 0
+    assert state.last_clear_report_at is None
+
+    for index in range(4, 8):
+        state = scheduler.next_ev_hold_state(
+            state, False, _fresh(started + timedelta(minutes=index))
+        )
+        assert state.active is True
+    state = scheduler.next_ev_hold_state(state, False, _fresh(started + timedelta(minutes=8)))
+    assert state.active is False
+
+
+def test_a_new_ev_hold_is_suppressed_by_the_overnight_exception() -> None:
+    """Q4: inside a verified resident window with no discharge, no *new* hold."""
     state = scheduler.next_ev_hold_state(
-        scheduler.EvHoldState(),
-        True,
-        datetime(2026, 6, 11, 1, 15),
-        time(23, 30),
-        time(5, 30),
+        scheduler.EvHoldState(), True, _fresh(datetime(2026, 6, 11, 1, 15)),
+        overnight_exception=True,
+    )
+    assert state.active is False
+    assert state.clear_count == 0
+
+
+def test_a_confirmed_ev_hold_survives_the_overnight_exception() -> None:
+    """Q4: the exception stops only a *new* hold; a confirmed one clears only
+    by five advancing clear reports or an explicit handover."""
+    started = datetime(2026, 6, 10, 12, 0)
+    state = _fresh_hold(started)
+    state = scheduler.next_ev_hold_state(
+        state, True, _fresh(started + timedelta(hours=13)), overnight_exception=True
+    )
+    assert state.active is True
+
+
+@pytest.mark.parametrize(
+    ("window", "at", "validity", "direction", "expected"),
+    [
+        ((time(23, 30), time(5, 30)), "01:15", "fresh", "idle", True),
+        ((time(23, 30), time(5, 30)), "01:15", "fresh", "charging", True),
+        ((time(23, 30), time(5, 30)), "01:15", "fresh", "discharging", False),
+        ((time(23, 30), time(5, 30)), "01:15", "fresh", "unknown", False),
+        ((time(23, 30), time(5, 30)), "01:15", "stale", "idle", False),
+        ((time(23, 30), time(5, 30)), "01:15", "unknown", "idle", False),
+        (None, "01:15", "fresh", "idle", False),
+        ((time(23, 30), time(5, 30)), "12:15", "fresh", "idle", False),
+        ((time(0, 0), time(0, 0)), "01:15", "fresh", "idle", False),
+    ],
+)
+def test_ev_hold_overnight_exception_requires_a_resident_window_and_no_discharge(
+    window: tuple[time, time] | None,
+    at: str,
+    validity: str,
+    direction: str,
+    expected: bool,
+) -> None:
+    """Unknown window or direction, or discharge, means the hold applies."""
+    hour, minute = (int(part) for part in at.split(":"))
+    now = datetime(2026, 6, 11, hour, minute, tzinfo=UTC)
+    assert (
+        scheduler.ev_hold_overnight_exception(now, window, validity, direction) is expected
     )
 
-    assert state.active is False
+
+# --- #420: fresh-evidence hold policy, driven through the reconcile/plan seams ---
+
+_SWITCH_URL = "http://ha.test/api/states/select.solisac_power_switch"
+_SWITCH_WRITE_URL = "http://ha.test/api/services/select/select_option"
+_RESIDENT_FIELDS = (
+    "timed_charge_start_hours",
+    "timed_charge_start_minutes",
+    "timed_charge_end_hours",
+    "timed_charge_end_minutes",
+)
+
+
+def _mock_power_switch(monkeypatch: pytest.MonkeyPatch, initial: str = "On") -> dict[str, str]:
+    """A Solis power switch that reads back what was last written to it."""
+    monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
+    state = {"option": initial}
+
+    def read(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "entity_id": "select.solisac_power_switch",
+            "state": state["option"],
+            "attributes": {},
+        })
+
+    def write(request: httpx.Request) -> httpx.Response:
+        state["option"] = json.loads(request.content)["option"]
+        return httpx.Response(200, json=[])
+
+    respx.get(_SWITCH_URL).mock(side_effect=read)
+    respx.post(_SWITCH_WRITE_URL).mock(side_effect=write)
+    return state
+
+
+def _switch_writes() -> list[httpx.Response]:
+    return [call for call in respx.calls if call.request.method == "POST"]
+
+
+def _mock_resident_window(start: time, end: time) -> None:
+    """The resident slot-1 charge window as #418 reads it back (GETs only)."""
+    values = dict(zip(
+        _RESIDENT_FIELDS, (start.hour, start.minute, end.hour, end.minute), strict=True
+    ))
+    for field, value in values.items():
+        respx.get(f"http://ha.test/api/states/sensor.solis_control_{field}").mock(
+            return_value=httpx.Response(200, json={
+                "entity_id": f"sensor.solis_control_{field}",
+                "state": str(value),
+                "attributes": {},
+            })
+        )
+
+
+def _mock_battery_power(state: str, at: datetime) -> None:
+    respx.get("http://ha.test/api/states/sensor.battery_power").mock(
+        return_value=httpx.Response(200, json={
+            "entity_id": "sensor.battery_power",
+            "state": state,
+            "attributes": {"unit_of_measurement": "W"},
+            "last_reported": at.isoformat(),
+        })
+    )
+
+
+def _ev_hold_settings(**kw: object) -> Settings:
+    base: dict[str, object] = dict(
+        dispatch_entity="",
+        ev_status_entity="sensor.ev",
+        inverter_power_switch_entity="select.solisac_power_switch",
+    )
+    base.update(kw)
+    return _dispatch_settings(**base)
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise", "observe"])
+@respx.mock
+async def test_fresh_ev_charging_report_holds_and_writes_the_switch_off(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    now = datetime(2026, 6, 10, 22, 15, tzinfo=UTC)
+    switch = _mock_power_switch(monkeypatch)
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Charging", at=now))
+
+    result = await scheduler.reconcile_tick(
+        _ev_hold_settings(authority_mode=mode),
+        _plan(replace(_INTENT, holds=())),
+        now,
+        ev_hold_state=scheduler.EvHoldState(),
+    )
+
+    if mode == "observe":
+        assert switch["option"] == "On"
+        assert any(
+            "[SIMULATE] would set inverter power switch to Off" in line for line in result.lines
+        )
+        assert all(call.request.method == "GET" for call in respx.calls)
+    else:
+        assert switch["option"] == "Off"
+        assert any(
+            "[APPLIED] set inverter power switch to Off" in line for line in result.lines
+        )
+        assert all(
+            call.request.url.path != "/api/services/modbus/write_register"
+            for call in respx.calls
+        )
+
+
+def _ev_report(reports: dict[str, object]) -> httpx.Response:
+    """The EV status entity as its source last reported it (a cached GET)."""
+    at = reports["at"]
+    return _ev_status_state(str(reports["state"]), at=at if at else None)
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise", "observe"])
+@respx.mock
+async def test_five_advancing_clear_reports_release_the_ev_hold(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    # Reuse the store, not a newly seeded empty authority on every report.
+    settings = _ev_hold_settings(authority_mode=mode)
+    started = datetime(2026, 6, 10, 22, 0, tzinfo=UTC)
+    switch = _mock_power_switch(monkeypatch)
+    reports: dict[str, object] = {"state": "Charging", "at": started}
+    respx.get(_EV_STATUS_URL).mock(side_effect=lambda _r: _ev_report(reports))
+    ev_state = scheduler.EvHoldState()
+
+    await scheduler.reconcile_tick(
+        settings,
+        _plan(replace(_INTENT, holds=())),
+        started,
+        ev_hold_state=ev_state,
+    )
+    assert ev_state.active is True
+    if mode != "observe":
+        assert switch["option"] == "Off"
+
+    for minute in range(1, 5):  # four advancing clear reports: not enough
+        reports["state"] = "Paused"
+        reports["at"] = started + timedelta(minutes=minute)
+        await scheduler.reconcile_tick(
+            settings,
+            _plan(replace(_INTENT, holds=())),
+            started + timedelta(minutes=minute),
+            ev_hold_state=ev_state,
+        )
+        assert ev_state.active is True
+        assert ev_state.clear_count == minute
+
+    reports["at"] = started + timedelta(minutes=5)  # the fifth advancing report
+    await scheduler.reconcile_tick(
+        settings,
+        _plan(replace(_INTENT, holds=())),
+        started + timedelta(minutes=5),
+        ev_hold_state=ev_state,
+    )
+    assert ev_state.active is False
+    if mode == "observe":
+        assert all(call.request.method == "GET" for call in respx.calls)
+    else:
+        assert switch["option"] == "On"
+        assert [json.loads(w.request.content)["option"] for w in _switch_writes()] == [
+            "Off", "On",
+        ]
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise", "observe"])
+@respx.mock
+async def test_repeated_gets_of_one_clear_report_never_release_the_ev_hold(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """One cached report, however often it is read back, is one report (Q5)."""
+    started = datetime(2026, 6, 10, 22, 0, tzinfo=UTC)
+    switch = _mock_power_switch(monkeypatch)
+    reports: dict[str, object] = {"state": "Charging", "at": started}
+    respx.get(_EV_STATUS_URL).mock(side_effect=lambda _r: _ev_report(reports))
+    ev_state = scheduler.EvHoldState()
+
+    await scheduler.reconcile_tick(
+        _ev_hold_settings(authority_mode=mode),
+        _plan(replace(_INTENT, holds=())),
+        started,
+        ev_hold_state=ev_state,
+    )
+    assert ev_state.active is True
+
+    reports["state"] = "Paused"
+    reports["at"] = started + timedelta(minutes=1)
+    # Eight passes over one cached report, each still inside its max age:
+    # equal report times advance nothing, so the hold never releases.
+    for tick in range(8):
+        await scheduler.reconcile_tick(
+            _ev_hold_settings(authority_mode=mode),
+            _plan(replace(_INTENT, holds=())),
+            started + timedelta(minutes=1, seconds=10 * tick),
+            ev_hold_state=ev_state,
+        )
+        assert ev_state.active is True
+        assert ev_state.clear_count == 1
+
+    assert all(call.request.method == "GET" for call in respx.calls) or switch["option"] == "Off"
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise", "observe"])
+@pytest.mark.parametrize(
+    "evidence", ["stale", "future", "unavailable"], ids=["stale", "future", "down"]
+)
+@respx.mock
+async def test_bad_ev_evidence_starts_no_hold_and_writes_nothing_off(
+    monkeypatch: pytest.MonkeyPatch, mode: str, evidence: str
+) -> None:
+    """Unknown, stale or future evidence never starts a hold (#409 11/27)."""
+    now = datetime(2026, 6, 10, 22, 15, tzinfo=UTC)
+    switch = _mock_power_switch(monkeypatch)
+    if evidence == "stale":
+        respx.get(_EV_STATUS_URL).mock(
+            return_value=_ev_status_state("Charging", at=now - timedelta(minutes=10))
+        )
+    elif evidence == "future":
+        respx.get(_EV_STATUS_URL).mock(
+            return_value=_ev_status_state("Charging", at=now + timedelta(minutes=5))
+        )
+    else:
+        respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("unavailable"))
+    ev_state = scheduler.EvHoldState()
+
+    result = await scheduler.reconcile_tick(
+        _ev_hold_settings(authority_mode=mode),
+        _plan(replace(_INTENT, holds=())),
+        now,
+        ev_hold_state=ev_state,
+    )
+
+    assert ev_state.active is False
+    assert switch["option"] == "On"
+    assert all(
+        call.request.url.path != "/api/services/modbus/write_register" for call in respx.calls
+    )
+    assert not any("power switch to Off" in line for line in result.lines if "[SKIP]" not in line)
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise", "observe"])
+@pytest.mark.parametrize(
+    "evidence", ["stale", "future", "unavailable"], ids=["stale", "future", "down"]
+)
+@respx.mock
+async def test_bad_ev_evidence_releases_nothing(
+    monkeypatch: pytest.MonkeyPatch, mode: str, evidence: str
+) -> None:
+    """An active hold stays active on unknown, stale or future evidence (Q5)."""
+    started = datetime(2026, 6, 10, 22, 0, tzinfo=UTC)
+    switch = _mock_power_switch(monkeypatch)
+    reports: dict[str, object] = {"state": "Charging", "at": started}
+    respx.get(_EV_STATUS_URL).mock(side_effect=lambda _r: _ev_report(reports))
+    ev_state = scheduler.EvHoldState()
+
+    await scheduler.reconcile_tick(
+        _ev_hold_settings(authority_mode=mode),
+        _plan(replace(_INTENT, holds=())),
+        started,
+        ev_hold_state=ev_state,
+    )
+    assert ev_state.active is True
+
+    if evidence == "stale":
+        # A clear report last made a minute ago: older than max age at every
+        # later tick, so it is stale evidence and never a release.
+        respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state(
+            "Paused", at=started + timedelta(minutes=1)
+        ))
+        # ticks below start at +7 min: a 300 s max age is inclusive, so the
+        # +6 min tick still reads the report as fresh.
+    elif evidence == "future":
+        respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state(
+            "Paused", at=started + timedelta(hours=1)
+        ))
+    else:
+        respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("unavailable"))
+
+    for minute in range(7, 12):
+        result = await scheduler.reconcile_tick(
+            _ev_hold_settings(authority_mode=mode),
+            _plan(replace(_INTENT, holds=())),
+            started + timedelta(minutes=minute),
+            ev_hold_state=ev_state,
+        )
+        assert ev_state.active is True
+        assert ev_state.clear_count == 0
+
+    assert not any("power switch to On" in line for line in result.lines)
+    if mode == "observe":
+        assert all(call.request.method == "GET" for call in respx.calls)
+    else:
+        assert switch["option"] == "Off"
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise", "observe"])
+@respx.mock
+async def test_overnight_exception_blocks_a_new_hold_inside_a_resident_window(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Q4: fresh charging inside a verified resident window, no discharge."""
+    now = datetime(2026, 6, 11, 1, 15, tzinfo=UTC)
+    switch = _mock_power_switch(monkeypatch, initial="Off")
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Charging", at=now))
+    _mock_resident_window(time(23, 30), time(5, 30))
+    _mock_battery_power("-2851", now)
+    ev_state = scheduler.EvHoldState()
+
+    result = await scheduler.reconcile_tick(
+        _ev_hold_settings(
+            authority_mode=mode,
+            battery_power_entity="sensor.battery_power",
+            battery_power_discharge_sign="positive",
+        ),
+        _plan(replace(_INTENT, holds=())),
+        now,
+        ev_hold_state=ev_state,
+    )
+
+    assert ev_state.active is False
+    if mode == "observe":
+        assert all(call.request.method == "GET" for call in respx.calls)
+        assert any(
+            "[SIMULATE] would set inverter power switch to On" in line for line in result.lines
+        )
+    else:
+        # No owned record: the overnight exception must not release owner-Off.
+        assert switch["option"] == "Off"
+        assert _switch_writes() == []
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise", "observe"])
+@pytest.mark.parametrize(
+    ("scenario", "discharging"),
+    [
+        ("discharging", "100"),
+        ("idle-but-stale", "-2851"),
+        ("direction-unavailable", "0.5"),
+        ("no-direction-entity", None),
+        ("window-unknown", "-2851"),
+    ],
+)
+@respx.mock
+async def test_overnight_exception_holds_when_direction_or_window_is_not_verified(
+    monkeypatch: pytest.MonkeyPatch, mode: str, scenario: str, discharging: str | None
+) -> None:
+    """Missing, stale or unknown direction, or discharge: the hold applies (Q4)."""
+    now = datetime(2026, 6, 11, 1, 15, tzinfo=UTC)
+    switch = _mock_power_switch(monkeypatch)
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Charging", at=now))
+    if scenario != "window-unknown":
+        _mock_resident_window(time(23, 30), time(5, 30))
+    else:
+        for field in _RESIDENT_FIELDS:  # the resident read fails: not verified
+            respx.get(f"http://ha.test/api/states/sensor.solis_control_{field}").mock(
+                return_value=httpx.Response(404)
+            )
+    settings_kw: dict[str, object] = {"battery_power_discharge_sign": "positive"}
+    if scenario == "discharging":
+        _mock_battery_power(discharging, now)
+        settings_kw["battery_power_entity"] = "sensor.battery_power"
+    elif scenario == "idle-but-stale":
+        _mock_battery_power(discharging, now - timedelta(minutes=10))
+        settings_kw["battery_power_entity"] = "sensor.battery_power"
+    elif scenario == "direction-unavailable":
+        respx.get("http://ha.test/api/states/sensor.battery_power").mock(
+            return_value=httpx.Response(200, json={
+                "entity_id": "sensor.battery_power",
+                "state": discharging,
+                "attributes": {"unit_of_measurement": "kW"},
+                "last_reported": now.isoformat(),
+            })
+        )
+        settings_kw["battery_power_entity"] = "sensor.battery_power"
+    elif scenario == "no-direction-entity":
+        pass  # no battery_power_entity: the direction evidence is missing
+    ev_state = scheduler.EvHoldState()
+
+    result = await scheduler.reconcile_tick(
+        _ev_hold_settings(authority_mode=mode, **settings_kw),
+        _plan(replace(_INTENT, holds=())),
+        now,
+        ev_hold_state=ev_state,
+    )
+
+    assert ev_state.active is True
+    if mode == "observe":
+        assert all(call.request.method == "GET" for call in respx.calls)
+        assert any(
+            "[SIMULATE] would set inverter power switch to Off" in line for line in result.lines
+        )
+    else:
+        assert switch["option"] == "Off"
+        assert any(
+            "[APPLIED] set inverter power switch to Off" in line for line in result.lines
+        )
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise", "observe"])
+@respx.mock
+async def test_a_confirmed_ev_hold_persists_into_the_resident_window(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Q4: the exception stops only a *new* hold; a confirmed one keeps going."""
+    midday = datetime(2026, 6, 10, 12, 0, tzinfo=UTC)
+    night = datetime(2026, 6, 11, 1, 15, tzinfo=UTC)
+    switch = _mock_power_switch(monkeypatch)
+    reports: dict[str, object] = {"state": "Charging", "at": midday}
+    respx.get(_EV_STATUS_URL).mock(side_effect=lambda _r: _ev_report(reports))
+    _mock_resident_window(time(23, 30), time(5, 30))
+    settings = _ev_hold_settings(
+        authority_mode=mode,
+        battery_power_entity="sensor.battery_power",
+        battery_power_discharge_sign="positive",
+    )
+    ev_state = scheduler.EvHoldState()
+
+    await scheduler.reconcile_tick(
+        settings, _plan(replace(_INTENT, holds=())), midday, ev_hold_state=ev_state
+    )
+    assert ev_state.active is True
+    if mode != "observe":
+        assert switch["option"] == "Off"
+
+    reports["at"] = night
+    _mock_battery_power("-2851", night)
+    await scheduler.reconcile_tick(
+        settings, _plan(replace(_INTENT, holds=())), night, ev_hold_state=ev_state
+    )
+
+    assert ev_state.active is True
+    if mode == "observe":
+        assert all(call.request.method == "GET" for call in respx.calls)
+    else:
+        assert switch["option"] == "Off"
+        assert [json.loads(w.request.content)["option"] for w in _switch_writes()] == ["Off"]
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise", "observe"])
+@respx.mock
+async def test_invalid_soc_never_blocks_the_ev_hold_switch_write(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """An invalid SoC blocks charging writes, never the discharge-only hold."""
+    monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
+    at = datetime(2026, 6, 10, 12, 0, tzinfo=UTC)
+    failed = SocMeasurement(
+        status=SocStatus.STALE,
+        observed_at=at,
+        value=30.0,
+        raw_state="30",
+        reported_at=at - timedelta(hours=1),
+        age_s=3600.0,
+        max_age_s=600.0,
+    )
+    plan = _plan(ChargeIntent(
+        target_soc_pct=77.0, soc=failed, window_start=time(23, 30), window_end=time(5, 30),
+    ))
+
+    async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
+        return SimpleNamespace(
+            plan=plan,
+            inputs=SimpleNamespace(
+                ev_hold_charging=True,
+                evidence_freshness={"ev_status": _fresh(at)},
+                battery_direction="unknown",
+            ),
+            load_source="test",
+            tz=None,
+            forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
+        )
+
+    async def noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
+    monkeypatch.setattr(scheduler, "publish_plan", noop)
+    monkeypatch.setattr(scheduler, "_record_forecast", noop)
+    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
+    monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
+    switch = _mock_power_switch(monkeypatch)
+
+    result = await run_once(
+        _ev_hold_settings(authority_mode=mode),
+        ev_hold_state=scheduler.EvHoldState(),
+    )
+
+    assert any("[BLOCKED]" in line and "not charging to" in line for line in result.action_lines)
+    if mode == "observe":
+        assert switch["option"] == "On"
+        assert all(call.request.method == "GET" for call in respx.calls)
+        assert any(
+            "[SIMULATE] would set inverter power switch to Off" in line
+            for line in result.action_lines
+        )
+    else:
+        assert switch["option"] == "Off"
+        assert any(
+            "[APPLIED] set inverter power switch to Off" in line for line in result.action_lines
+        )
+
+
+@respx.mock
+async def test_a_stale_dispatch_entity_read_falls_back_to_the_last_trusted_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#420: a cached dispatch picture is untrusted; the last trusted set stands."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    now = datetime(2026, 10, 3, 14, 15, tzinfo=UTC)
+    trusted = (
+        (datetime(2026, 10, 3, 14, 0, tzinfo=UTC), datetime(2026, 10, 3, 15, 0, tzinfo=UTC)),
+    )
+    respx.get(_DISPATCH_URL).mock(return_value=_dispatch_state(
+        "off", [{"start": "2026-10-03T14:00:00", "end": "2026-10-03T15:00:00"}],
+        at=now - timedelta(minutes=10),
+    ))
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused", at=now))
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(ev_status_entity="sensor.ev"),
+        _untrusted_plan(),
+        now,
+        trusted_holds=trusted,
+    )
+
+    [intent] = device.intents
+    assert intent.holds == trusted
+    assert intent.hold_active(now) is True
+    assert result.trusted_holds == trusted
+    assert any(scheduler.STALE_DISPATCH_LINE in line for line in result.lines)
+
+
+@respx.mock
+async def test_a_stale_dispatch_read_never_becomes_a_trusted_empty_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A readable-but-stale entity with no dispatches is not a no-holds picture."""
+    device = _IntentRecordingDevice()
+    monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    now = datetime(2026, 10, 3, 14, 15, tzinfo=UTC)
+    trusted = (
+        (datetime(2026, 10, 3, 14, 0, tzinfo=UTC), datetime(2026, 10, 3, 15, 0, tzinfo=UTC)),
+    )
+    respx.get(_DISPATCH_URL).mock(return_value=_dispatch_state(
+        "off", [], at=now - timedelta(minutes=10)
+    ))
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused", at=now))
+
+    result = await scheduler.reconcile_tick(
+        _dispatch_settings(ev_status_entity="sensor.ev"),
+        _untrusted_plan(),
+        now,
+        trusted_holds=trusted,
+    )
+
+    [intent] = device.intents
+    assert intent.hold_active(now) is True
+    assert result.trusted_holds == trusted
+
+
+@respx.mock
+async def test_advancing_sibling_reports_release_an_unchanged_clear_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sibling liveness proves the source is live; its reports advance the run."""
+    started = datetime(2026, 6, 10, 22, 0, tzinfo=UTC)
+    switch = _mock_power_switch(monkeypatch)
+    ev: dict[str, object] = {"state": "Charging", "at": started - timedelta(minutes=10)}
+    sibling: dict[str, datetime] = {"at": started - timedelta(seconds=60)}
+    respx.get(_EV_STATUS_URL).mock(side_effect=lambda _r: _ev_report(ev))
+    respx.get("http://ha.test/api/states/sensor.ev_live").mock(
+        side_effect=lambda _r: httpx.Response(200, json={
+            "entity_id": "sensor.ev_live",
+            "state": "ok",
+            "attributes": {},
+            "last_reported": sibling["at"].isoformat(),
+        })
+    )
+    settings = _ev_hold_settings(
+        authority_mode="optimise", ev_liveness_entity="sensor.ev_live"
+    )
+    ev_state = scheduler.EvHoldState()
+
+    await scheduler.reconcile_tick(
+        settings, _plan(replace(_INTENT, holds=())), started, ev_hold_state=ev_state
+    )
+    assert ev_state.active is True
+    assert switch["option"] == "Off"
+
+    ev["state"] = "Paused"  # the EV status itself never reports again
+    for second in range(50, 11, -10):  # five advancing sibling reports
+        sibling["at"] = started - timedelta(seconds=second)
+        await scheduler.reconcile_tick(
+            settings, _plan(replace(_INTENT, holds=())), started, ev_hold_state=ev_state
+        )
+        assert ev_state.active is True
+
+    sibling["at"] = started - timedelta(seconds=5)
+    await scheduler.reconcile_tick(
+        settings, _plan(replace(_INTENT, holds=())), started, ev_hold_state=ev_state
+    )
+
+    assert ev_state.active is False
+    assert switch["option"] == "On"
+    assert [json.loads(w.request.content)["option"] for w in _switch_writes()] == ["Off", "On"]
 
 
 @respx.mock
@@ -3452,14 +4591,17 @@ async def test_trusted_ev_hold_prevents_relinquishing_after_dispatch_hold_ends(
 ) -> None:
     device = _RelinquishRecordingDevice()
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
+    now = datetime(2026, 6, 10, 23, 15, tzinfo=UTC)
     respx.get(_DISPATCH_URL).mock(return_value=httpx.Response(404))
-    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Boosting"))
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Boosting", at=now))
 
     result = await scheduler.reconcile_tick(
         _dispatch_settings(ev_status_entity="sensor.ev"),
         _untrusted_plan(),
-        datetime(2026, 6, 10, 23, 15),
-        trusted_holds=(_HOLD,),
+        now,
+        trusted_holds=(
+            (datetime(2026, 6, 10, 22, 0, tzinfo=UTC), datetime(2026, 6, 10, 23, 0, tzinfo=UTC)),
+        ),
         ev_hold_state=scheduler.EvHoldState(),
     )
 
@@ -3467,7 +4609,9 @@ async def test_trusted_ev_hold_prevents_relinquishing_after_dispatch_hold_ends(
     assert device.safe_states == 0
     assert len(device.reconciled) == 1
     assert device.reconciled[0].ev_hold_active is True
-    assert result.trusted_holds == (_HOLD,)
+    assert result.trusted_holds == (
+        (datetime(2026, 6, 10, 22, 0, tzinfo=UTC), datetime(2026, 6, 10, 23, 0, tzinfo=UTC)),
+    )
 
 
 @pytest.mark.parametrize("failure", ["404", "exception", "unavailable", "unknown"])
@@ -3484,22 +4628,28 @@ async def test_untrusted_ev_status_never_relinquishes_after_dispatch_end(
     else:
         respx.get(_EV_STATUS_URL).mock(return_value=httpx.Response(404))
     respx.get(_DISPATCH_URL).mock(return_value=httpx.Response(404))
-    now = datetime(2026, 6, 10, 23, 15)
+    now = datetime(2026, 6, 10, 23, 15, tzinfo=UTC)
     ev_state = scheduler.EvHoldState(active=True)
 
     result = await scheduler.reconcile_tick(
         _dispatch_settings(ev_status_entity="sensor.ev"),
         _untrusted_plan(),
         now,
-        trusted_holds=(_HOLD,),
+        trusted_holds=(
+            (datetime(2026, 6, 10, 22, 0, tzinfo=UTC), datetime(2026, 6, 10, 23, 0, tzinfo=UTC)),
+        ),
         ev_hold_state=ev_state,
     )
 
-    assert result.trusted_holds == (_HOLD,)
+    assert result.trusted_holds == (
+        (datetime(2026, 6, 10, 22, 0, tzinfo=UTC), datetime(2026, 6, 10, 23, 0, tzinfo=UTC)),
+    )
     assert result.relinquished is False
     assert device.safe_states == 0
     assert device.reconciled == []
-    assert ev_state.active is False
+    # #420: unreadable EV evidence is no evidence, so an active hold stays
+    # active instead of the old unreadable-status-clears-the-hold rule.
+    assert ev_state.active is True
 
 
 @respx.mock
@@ -3509,8 +4659,10 @@ async def test_octopus_tariff_still_reads_ev_status_each_minute(
     device = _IntentRecordingDevice()
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_a: device)
     dispatch = respx.get(_DISPATCH_URL).mock(return_value=_dispatch_state("off"))
-    ev_status = respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Charging"))
-    now = datetime(2026, 6, 10, 22, 15)
+    now = datetime(2026, 6, 10, 22, 15, tzinfo=UTC)
+    ev_status = respx.get(_EV_STATUS_URL).mock(
+        return_value=_ev_status_state("Charging", at=now)
+    )
 
     await scheduler.reconcile_tick(
         _dispatch_settings(
@@ -4407,12 +5559,18 @@ async def test_loop_recovers_with_a_fresh_plan_only_after_stable_duration(
 async def test_loop_keeps_fallback_until_the_recovered_apply_verifies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """[FAILED], a [WARNING] mismatch, and a raise all keep fallback and retry."""
+    """[FAILED], a [WARNING] mismatch, and a raise all keep the fallback.
+
+    (#423) Each failed recovered apply re-applies the fallback on the same
+    tick and starts the five-minute backoff, so the next recovery attempt
+    waits instead of retrying every minute; the fourth attempt verifies and
+    leaves the fallback.
+    """
     respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
     stop, runs, settings = _patch_recovery_loop(
         tmp_path,
         monkeypatch,
-        [0, 1, 2, 3, 4, 5, 6],
+        [0, 1, 2, 7, 12, 17],
         [
             ["[FAILED] set timed charge current to 20 A"],
             ["[WARNING] set timed charge current to 20 A, but read back 18 A"],
@@ -4420,23 +5578,220 @@ async def test_loop_keeps_fallback_until_the_recovered_apply_verifies(
             ["[APPLIED] set timed charge current to 21 A over 3.4 h of the window"],
         ],
     )
+    applied_at: list[str] = []
+
+    class ReapplyWitnessDevice(_RecoveryFallbackDevice):
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            applied_at.append(soc.observed_at.isoformat())
+            return ["[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"]
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(ReapplyWitnessDevice, settings, rest),
+    )
 
     with pytest.raises(stop):
         await run_forever(settings, poll_seconds=0)
 
+    # 02:00 is a slot run held by the fallback; each recovery attempt that
+    # fails (02:02, 02:07, 02:12) re-applies the fallback on the same tick and
+    # pushes the next attempt five minutes out; 02:17 verifies and exits.
     assert [run["held"] for run in runs] == [True, False, False, False, False]
-    # Each retry is a fresh plan from that minute's own measurement.
     socs = [run["soc"] for run in runs[1:]]
     assert [s.observed_at for s in socs if isinstance(s, SocMeasurement)] == [
-        _passing_at(m).observed_at for m in (2, 3, 4, 5)
+        _passing_at(m).observed_at for m in (2, 7, 12, 17)
     ]
+    # The restored fallback is confirmed once (02:00), then re-applied on
+    # every failed recovered apply's own tick; the verified attempt applies none.
+    assert applied_at == [_passing_at(m).observed_at.isoformat() for m in (0, 2, 7, 12)]
     posts = _integrity_posts()
     states = [state for state, _ in posts]
-    # One post per tick, plus the transition post on the recovering tick (02:05).
-    assert states == ["fallback_verified"] * 6 + ["normal", "normal"]
-    # A failed recovered apply may have changed the program: never confirmed.
-    assert [attrs["fallback_confirmed"] for _, attrs in posts[2:6]] == [True, False, False, False]
+    # One post per tick, plus the re-apply verdict post on each failed
+    # attempt's tick (02:02, 02:07, 02:12) and the transition post (02:17).
+    assert states == ["fallback_verified"] * 9 + ["normal"]
+    reapply_posts = [posts[3], posts[5], posts[7]]
+    assert all(attrs["fallback_confirmed"] is True for _, attrs in reapply_posts)
+    assert all(
+        str(attrs["fallback_action"]).startswith("[FALLBACK]") for _, attrs in reapply_posts
+    )
+    assert posts[-1][1]["recovery_action"].startswith("[RECOVERED] normal programming resumed")
     assert _monitor_file(tmp_path) == {"consecutive_failures": 0, "fallback_status": "normal"}
+
+
+@respx.mock
+async def test_partial_recovered_apply_reapplies_fallback_same_tick_then_waits_five_minutes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#423) A partly-failed recovered apply re-applies and re-verifies the
+    fallback on the same tick, publishes the verdict, and no recovery attempt
+    runs before +5 minutes, where exactly one runs and completes recovery."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop, runs, settings = _patch_recovery_loop(
+        tmp_path,
+        monkeypatch,
+        [0, 1, 2, 3, 4, 5, 6, 7],
+        [
+            ["[FAILED] set timed charge current to 20 A"],
+            ["[APPLIED] set timed charge current to 21 A over 3.4 h of the window"],
+        ],
+    )
+    applied_at: list[str] = []
+
+    class ReapplyWitnessDevice(_RecoveryFallbackDevice):
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            applied_at.append(soc.observed_at.isoformat())
+            return ["[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"]
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(ReapplyWitnessDevice, settings, rest),
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    # 02:00 held by the fallback; 02:02 is the failed recovery attempt; no
+    # attempt at +1..+4 minutes (02:03-02:06); exactly one at +5 (02:07).
+    assert [run["held"] for run in runs] == [True, False, False]
+    socs = [run["soc"] for run in runs[1:]]
+    assert [s.observed_at for s in socs if isinstance(s, SocMeasurement)] == [
+        _passing_at(m).observed_at for m in (2, 7)
+    ]
+    # The fallback was re-applied on the failed attempt's own tick (02:02),
+    # through the same read-back-verified device action, and not again after.
+    assert applied_at == [_passing_at(m).observed_at.isoformat() for m in (0, 2)]
+    posts = _integrity_posts()
+    states = [state for state, _ in posts]
+    # One post per tick plus the same-tick re-apply verdict (02:02) and the
+    # recovery transition (02:07).
+    assert states == ["fallback_verified"] * 9 + ["normal"]
+    # 02:02's second post is the re-apply: verified again, published at once.
+    state, attrs = posts[3]
+    assert state == "fallback_verified"
+    assert attrs["fallback_confirmed"] is True
+    assert attrs["hardware_confirmation"] == "confirmed"
+    assert str(attrs["fallback_action"]).startswith("[FALLBACK]")
+    assert posts[-1][1]["recovery_action"].startswith("[RECOVERED] normal programming resumed")
+    # The fallback cleared only after the verified recovered apply: store
+    # cleared, epoch bumped, exactly one exit notice.
+    from ha_spark.authority import load_authority
+
+    result = load_authority(settings)
+    assert result.state is not None
+    assert result.state.fallback.active is False
+    assert result.state.fallback.causes == ()
+    assert result.state.epoch == 4
+    assert len(_fallback_notices("ha-spark fallback entered")) == 1
+    assert len(_fallback_notices("ha-spark fallback left")) == 1
+    assert _monitor_file(tmp_path) == {"consecutive_failures": 0, "fallback_status": "normal"}
+
+
+@respx.mock
+async def test_failed_fallback_reapply_stays_active_unconfirmed_and_retries_every_minute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#423) A re-apply that fails leaves the fallback active and unconfirmed
+    in the monitor and the store, publishes the [FAILED] verdict, and is
+    retried every minute of the backoff; no recovery attempt runs meanwhile."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop, runs, settings = _patch_recovery_loop(
+        tmp_path,
+        monkeypatch,
+        [0, 1, 2, 3, 4],
+        [["[FAILED] set timed charge current to 20 A"]],
+    )
+    applied_at: list[str] = []
+    results = [
+        "[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified",
+        "[FAILED] Solis fallback at 42 A unconfirmed: read back 40 A",
+    ]
+
+    class FailingReapplyDevice(_RecoveryFallbackDevice):
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            applied_at.append(soc.observed_at.isoformat())
+            return [results.pop(0)] if len(results) > 1 else [results[0]]
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(FailingReapplyDevice, settings, rest),
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    # 02:00 confirms the restored fallback; 02:02's failed recovered apply
+    # re-applies on the same tick and fails; the backoff retries it every
+    # minute (02:03, 02:04) while no recovery attempt runs.
+    assert [run["held"] for run in runs] == [True, False]
+    assert applied_at == [_passing_at(m).observed_at.isoformat() for m in (0, 2, 3, 4)]
+    posts = _integrity_posts()
+    # 02:02's second post publishes the failed re-apply: unconfirmed, [FAILED].
+    state, attrs = posts[3]
+    assert state == "fallback_failed"
+    assert attrs["fallback_confirmed"] is False
+    assert attrs["hardware_confirmation"] == "unconfirmed"
+    assert str(attrs["fallback_action"]).startswith("[FAILED]")
+    # Every later post stays in the failed, unconfirmed fallback.
+    for post_state, post_attrs in posts[4:]:
+        assert post_state == "fallback_failed"
+        assert post_attrs["fallback_confirmed"] is False
+    assert _monitor_file(tmp_path) == {
+        "consecutive_failures": 3, "fallback_status": "fallback_failed"
+    }
+    from ha_spark.authority import load_authority
+
+    result = load_authority(settings)
+    assert result.state is not None
+    assert result.state.fallback.active is True
+    assert result.state.fallback.causes == ("soc_integrity",)
+    assert _fallback_notices("ha-spark fallback left") == []
+
+
+@pytest.mark.parametrize("authority_mode", ["observe", "protect"])
+@respx.mock
+async def test_reapply_during_recovery_never_actuates_without_charging_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, authority_mode: str
+) -> None:
+    """(#423) Observe and Protect never request the fallback re-apply write:
+    a failed recovered apply there keeps today's retry-next-minute behaviour
+    with zero hardware-actuating calls."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    stop, runs, settings = _patch_recovery_loop(
+        tmp_path,
+        monkeypatch,
+        [0, 1, 2, 3],
+        [
+            ["[FAILED] set timed charge current to 20 A"],
+            ["[FAILED] set timed charge current to 20 A"],
+        ],
+        authority_mode=authority_mode,
+    )
+    applied_at: list[str] = []
+
+    class NeverReapplyDevice(_RecoveryFallbackDevice):
+        async def apply_fallback(self, soc: SocMeasurement) -> list[str]:
+            applied_at.append(soc.observed_at.isoformat())
+            return ["[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"]
+
+    monkeypatch.setattr(
+        scheduler,
+        "inverter_device",
+        lambda settings, rest: _fake_solis_device(NeverReapplyDevice, settings, rest),
+    )
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    # No charging authority: the fallback write is never requested, and the
+    # failed recovered apply retries the next minute as before.
+    assert applied_at == []
+    assert [run["held"] for run in runs] == [True, False, False]
+    assert _hardware_service_calls() == []
+    assert all(state == "fallback_verified" for state, _ in _integrity_posts())
+    assert _monitor_file(tmp_path)["fallback_status"] == "fallback_verified"
 
 
 @respx.mock
