@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from ha_spark.authority import HoldDevice, HoldRecord
 from ha_spark.devices.inverters.alphaess import AlphaESSDevice
 from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.energy.export_store import ExportEventStore
@@ -167,6 +168,20 @@ def _device(
     return SolisDevice(config, settings, rest)  # type: ignore[arg-type]
 
 
+def _seed_owned_hold(device: SolisDevice) -> None:
+    """An Off switch alone no longer implies ownership (#421)."""
+    store = device._execution.authority
+    assert store is not None
+    store.save_holds((HoldRecord(
+        cause="dispatch", started_at=datetime.now(UTC) - timedelta(hours=2),
+        trusted_end=datetime.now(UTC) - timedelta(hours=1), confirmed=True,
+        device=HoldDevice(
+            driver="solis", power_switch=_SWITCH, hub=device._settings.solis_control_hub,
+            slave=device._settings.solis_modbus_slave,
+        ),
+    ),))
+
+
 def _now() -> datetime:
     return datetime.now(_LONDON)
 
@@ -204,7 +219,9 @@ async def test_active_hold_switches_off_and_verifies_read_back(tmp_path) -> None
 @pytest.mark.asyncio
 async def test_no_active_hold_switches_the_inverter_back_on(tmp_path) -> None:
     rest = FakeRest(switch="Off")
-    lines = await _reconcile(_device(rest, tmp_path), _intent(holds=(_window(-180),)))
+    device = _device(rest, tmp_path)
+    _seed_owned_hold(device)
+    lines = await _reconcile(device, _intent(holds=(_window(-180),)))
 
     assert _options(rest) == ["On"]
     assert any(line.startswith("[APPLIED]") and "On" in line for line in lines)
@@ -295,6 +312,7 @@ async def test_export_is_programmed_on_the_tick_the_reconcile_turns_the_switch_o
     """
     rest = FakeRest(switch="Off")
     device = _device(rest, tmp_path)
+    _seed_owned_hold(device)
     intent = _intent(holds=(_window(-40),), export=_export())
     lines = await _reconcile(device, intent) + await device.apply(intent)
 
@@ -307,6 +325,7 @@ async def test_export_is_programmed_on_the_tick_the_reconcile_turns_the_switch_o
 async def test_untrusted_soc_still_reconciles_but_blocks_charge_programming(tmp_path) -> None:
     rest = FakeRest(switch="Off")
     device = _device(rest, tmp_path)
+    _seed_owned_hold(device)
     bad_soc = replace(_soc(), status=SocStatus.UNAVAILABLE, value=None, raw_state="unavailable")
     intent = _intent(soc=bad_soc)
     lines = await _reconcile(device, intent) + await device.apply(intent)

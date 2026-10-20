@@ -11,10 +11,10 @@ import os
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 from uuid import UUID, uuid4
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from ha_spark.config import Settings
 
@@ -33,11 +33,36 @@ class Transition(_Record):
     failing_actions: tuple[str, ...] = ()
 
 
-class HoldRecord(_Record):
-    """Minimal hold intent; evidence and release details land in later tickets."""
+class HoldDevice(_Record):
+    driver: str
+    power_switch: str
+    hub: str
+    slave: int
 
-    cause: str
+
+class HoldRecord(_Record):
+    """A durable request, never proof of a device write without read-back."""
+
+    cause: Literal["ev", "dispatch"]
     started_at: AwareDatetime
+    trusted_end: AwareDatetime | None = None
+    device: HoldDevice
+    requested: Literal["off"] = "off"
+    confirmed: bool = False
+    owned: bool = True
+    pending_release: bool = False
+    clear_count: int = Field(default=0, ge=0, le=5)
+    last_clear_report_at: AwareDatetime | None = None
+    evidence_stale_since: AwareDatetime | None = None
+    degraded_notified: bool = False
+
+    @model_validator(mode="after")
+    def validate_cause_fields(self) -> Self:
+        if (self.cause == "dispatch") != (self.trusted_end is not None):
+            raise ValueError("trusted_end is required for dispatch only")
+        if self.cause == "dispatch" and (self.clear_count or self.last_clear_report_at is not None):
+            raise ValueError("Only EV holds have a clearance sequence")
+        return self
 
 
 # Phase 2 (#422): the only fallback cause is SoC measurement integrity. The
@@ -249,6 +274,20 @@ class AuthorityStore:
         )
         self._persist_initial(state)
         return AuthorityLoadResult(status="known", state=state)
+
+    def save_holds(self, holds: tuple[HoldRecord, ...]) -> None:
+        """Persist before acting; failed saves leave the gate closed.
+
+        Hold progress does not change mode permission or fence already planned
+        work, so unlike a mode/fallback transition it keeps the current epoch.
+        """
+        if self._state is not None and holds == self._state.holds:
+            return
+        if self._state is None or self.save_failed or not self.known:
+            raise ValueError("Cannot save holds without known, durable authority")
+        self.save(self._state.model_copy(update={
+            "holds": holds, "last_changed_at": datetime.now(UTC),
+        }))
 
     def save_fallback(self, *, active: bool, cause: str | None = None) -> bool:
         """Persist fallback active + its causes with a bumped epoch (#422).

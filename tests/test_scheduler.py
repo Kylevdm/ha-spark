@@ -2988,7 +2988,7 @@ async def test_run_forever_remembers_holds_only_from_trusted_plans(
     assert reconcile_saw == [(_HOLD,), (_HOLD,)]
 
 
-async def test_run_forever_forgets_trusted_holds_on_hot_reload(
+async def test_run_forever_keeps_ev_state_but_drops_dispatch_picture_on_hot_reload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A reload may change the dispatch source; the old picture is not evidence."""
@@ -3024,14 +3024,9 @@ async def test_run_forever_forgets_trusted_holds_on_hot_reload(
         reconcile_saw.append(trusted_holds)
         assert ev_hold_state is not None
         ev_states.append(ev_hold_state)
-        if len(reconcile_saw) == 1:
-            assert ev_hold_state.active is True
-            assert ev_hold_state.clear_count == 2
-            assert ev_hold_state.last_clear_report_at == datetime(2026, 6, 10, 21, 55)
-        else:
-            assert ev_hold_state.active is False
-            assert ev_hold_state.clear_count == 0
-            assert ev_hold_state.last_clear_report_at is None
+        assert ev_hold_state.active is True
+        assert ev_hold_state.clear_count == 2
+        assert ev_hold_state.last_clear_report_at == datetime(2026, 6, 10, 21, 55)
         captured[0].settings = Settings(
             ha_url="http://ha.test", ha_token="t", plan_run_time="22:00"
         )
@@ -3059,7 +3054,7 @@ async def test_run_forever_forgets_trusted_holds_on_hot_reload(
 
     assert reconcile_saw == [(_HOLD,), None]
     assert ev_states[0] is ev_states[1]
-    assert ev_states[2] is not ev_states[1]
+    assert ev_states[2] is ev_states[1]
 
 
 # --- #140/#143 §4: the per-minute pass tracks Dave's poll on the HA-entity path ---
@@ -3993,6 +3988,8 @@ def _ev_report(reports: dict[str, object]) -> httpx.Response:
 async def test_five_advancing_clear_reports_release_the_ev_hold(
     monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
+    # Reuse the store, not a newly seeded empty authority on every report.
+    settings = _ev_hold_settings(authority_mode=mode)
     started = datetime(2026, 6, 10, 22, 0, tzinfo=UTC)
     switch = _mock_power_switch(monkeypatch)
     reports: dict[str, object] = {"state": "Charging", "at": started}
@@ -4000,7 +3997,7 @@ async def test_five_advancing_clear_reports_release_the_ev_hold(
     ev_state = scheduler.EvHoldState()
 
     await scheduler.reconcile_tick(
-        _ev_hold_settings(authority_mode=mode),
+        settings,
         _plan(replace(_INTENT, holds=())),
         started,
         ev_hold_state=ev_state,
@@ -4013,7 +4010,7 @@ async def test_five_advancing_clear_reports_release_the_ev_hold(
         reports["state"] = "Paused"
         reports["at"] = started + timedelta(minutes=minute)
         await scheduler.reconcile_tick(
-            _ev_hold_settings(authority_mode=mode),
+            settings,
             _plan(replace(_INTENT, holds=())),
             started + timedelta(minutes=minute),
             ev_hold_state=ev_state,
@@ -4023,7 +4020,7 @@ async def test_five_advancing_clear_reports_release_the_ev_hold(
 
     reports["at"] = started + timedelta(minutes=5)  # the fifth advancing report
     await scheduler.reconcile_tick(
-        _ev_hold_settings(authority_mode=mode),
+        settings,
         _plan(replace(_INTENT, holds=())),
         started + timedelta(minutes=5),
         ev_hold_state=ev_state,
@@ -4199,9 +4196,9 @@ async def test_overnight_exception_blocks_a_new_hold_inside_a_resident_window(
             "[SIMULATE] would set inverter power switch to On" in line for line in result.lines
         )
     else:
-        # The tick restores the switch On rather than holding it Off.
-        assert switch["option"] == "On"
-        assert [json.loads(w.request.content)["option"] for w in _switch_writes()] == ["On"]
+        # No owned record: the overnight exception must not release owner-Off.
+        assert switch["option"] == "Off"
+        assert _switch_writes() == []
 
 
 @pytest.mark.parametrize("mode", ["protect", "optimise", "observe"])
