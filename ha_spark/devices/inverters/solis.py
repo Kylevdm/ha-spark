@@ -339,17 +339,25 @@ class SolisDevice:
             )
         return HoldValidation(identity, source, contract, reason)
 
-    async def resident_diagnostic(self) -> dict[str, object]:
-        """Read slot 1, 43141 and the configured switch; unknown never means configured."""
+    async def resident_charge_window(self) -> tuple[time, time] | None:
+        """The resident slot-1 charge window read back; unknown ⇒ ``None``.
+
+        The same overlay GETs ``resident_diagnostic`` makes (#418): no refresh,
+        no write, and the configured window is never substituted for the
+        resident one. ``None`` is "unknown", and unknown is not verified (#420).
+        """
         parts: list[int] = []
         for index, field in enumerate(_WINDOW_FIELDS[:4]):
             value = await self._diagnostic_number(field)
             maximum = 23 if index % 2 == 0 else 59
             if value is None or not value.is_integer() or not 0 <= value <= maximum:
-                break
+                return None
             parts.append(int(value))
-        window = (f"{parts[0]:02d}:{parts[1]:02d}–{parts[2]:02d}:{parts[3]:02d}"
-                  if len(parts) == 4 else "unknown")
+        return (time(parts[0], parts[1]), time(parts[2], parts[3]))
+
+    async def resident_diagnostic(self) -> dict[str, object]:
+        """Read slot 1, 43141 and the configured switch; unknown never means configured."""
+        window = await self.resident_charge_window()
         current = await self._diagnostic_number("timed_charge_current")
         switch = "unknown"
         entity = self._config.entities.get("power_switch", "")
@@ -360,9 +368,13 @@ class SolisDevice:
                     switch = state
             except httpx.HTTPError:
                 pass
-        return {"charge_window": window,
-                "charge_current_a": current if current is not None and current >= 0 else "unknown",
-                "power_switch": switch}
+        return {
+            "charge_window": (
+                f"{fmt_hhmm(window[0])}–{fmt_hhmm(window[1])}" if window else "unknown"
+            ),
+            "charge_current_a": current if current is not None and current >= 0 else "unknown",
+            "power_switch": switch,
+        }
 
     # --- planning ---
 

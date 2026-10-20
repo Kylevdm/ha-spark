@@ -62,7 +62,7 @@ UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
 from typing import NamedTuple
@@ -85,7 +85,7 @@ from ha_spark.api.server import (
 from ha_spark.authority import FALLBACK_CAUSE_SOC_INTEGRITY, AuthorityStore
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import DaemonChannel, Reply, action_lines
-from ha_spark.devices import Capability, inverter_device
+from ha_spark.devices import Capability, Device, inverter_device
 from ha_spark.devices.execution import ExecutionContext, Ownership, execution_context
 from ha_spark.devices.inverters.solis import (
     SolisDevice,
@@ -101,6 +101,7 @@ from ha_spark.energy.derived_base_load import (
 )
 from ha_spark.energy.dispatch_evidence import partition_dispatches
 from ha_spark.energy.dst_clock_sync import DstClockSync
+from ha_spark.energy.evidence_freshness import EvidenceFreshness
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
@@ -338,12 +339,15 @@ async def run_once(
         )
         ev_hold_state = ev_hold_state or EvHoldState()
         now = datetime.now(load_timezone(settings.timezone))
-        ev_hold_active = _observe_ev_hold(
+        evidence_freshness = getattr(inputs, "evidence_freshness", None) or {}
+        ev_hold_active = await _observe_ev_hold(
             ev_hold_state,
             inputs.ev_hold_charging,
-            now,
-            parse_time(settings.charge_window_start),
-            parse_time(settings.charge_window_end),
+            evidence_freshness.get("ev_status"),
+            now=now,
+            device=device,
+            battery_freshness=evidence_freshness.get("battery_power"),
+            battery_direction_value=getattr(inputs, "battery_direction", "unknown"),
         )
         intent = replace(intent, ev_hold_active=ev_hold_active)
         # One reconcile pass before anything else, on every device-driving
@@ -546,6 +550,7 @@ UNTRUSTED_HOLDS_LINE = (
     "[SKIP] hold data untrusted and no trusted hold set yet; power switch left as-is"
 )
 UNREADABLE_DISPATCH_LINE = "[SKIP] dispatch entity unreadable; using the last trusted holds"
+STALE_DISPATCH_LINE = "[SKIP] dispatch evidence not fresh; using the last trusted holds"
 UNREADABLE_EV_STATUS_LINE = "[SKIP] EV status unreadable; no EV hold evidence"
 UNTRUSTED_EV_RELINQUISH_LINE = (
     "[SKIP] dispatch holds ended, but EV status is unreadable; inverter state left unchanged"
@@ -555,50 +560,143 @@ EV_RELEASE_CONFIRMATION_PASSES = 5
 
 @dataclass
 class EvHoldState:
-    """Per-process EV hold debounce state shared by plan and minute passes."""
+    """Per-process EV hold state shared by plan and minute passes (#420).
+
+    Small and serialisable on purpose: ``active``, the strictly advancing
+    clear-report count, and the last counted effective report time. #421
+    persists it in the authority store, so it must stay free of behaviour.
+    """
 
     active: bool = False
-    not_charging_since: datetime | None = None
+    clear_count: int = 0
+    last_clear_report_at: datetime | None = None
+
+
+def ev_hold_overnight_exception(
+    now: datetime,
+    resident_window: tuple[time, time] | None,
+    battery_validity: str,
+    battery_direction_value: str,
+) -> bool:
+    """Q4: whether the overnight exception stops a *new* EV hold from starting.
+
+    It applies only when all of: ``now`` is inside the *resident* slot-1
+    charge window read back from the inverter (unknown is not verified, so it
+    means no exception), the battery-direction evidence is fresh, and the
+    direction shows no discharge (``charging`` or ``idle``). Missing, stale or
+    unknown direction, or ``discharging``, means the hold applies. A confirmed
+    EV hold is unaffected by the window: this predicate only gates a hold
+    *start*, never a release.
+    """
+    if resident_window is None:
+        return False
+    if battery_validity != "fresh":
+        return False
+    if battery_direction_value not in ("charging", "idle"):
+        return False
+    return in_window(now.time(), resident_window[0], resident_window[1])
 
 
 def next_ev_hold_state(
     previous: EvHoldState,
     charging: bool | None,
-    now: datetime,
-    window_start: time,
-    window_end: time,
+    evidence: EvidenceFreshness | None,
+    *,
+    overnight_exception: bool = False,
 ) -> EvHoldState:
-    """Advance the EV hold after one trusted status read.
+    """Advance the EV hold state machine by one status read (#420).
 
-    Five one-minute clear reads release the hold. The first clear read starts
-    the run, so the fifth read arrives four minutes later. Missing/untrusted
-    status is no evidence and clears only the EV hold state.
+    Only fresh evidence decides. Stale, future, unknown, unavailable or
+    unreadable evidence never starts a hold and never releases one, and it
+    resets the clearance run (Q5). Fresh charging starts (or keeps) the hold
+    and resets the clearance run — except that the overnight exception (Q4)
+    stops a *new* hold; a confirmed hold is never released by the window.
+    Fresh not-charging advances a run of strictly advancing effective report
+    times: the fifth counted report releases, an equal report time neither
+    advances nor resets, and a backwards one resets the run (Q5).
     """
-    if in_window(now.time(), window_start, window_end) or charging is None:
-        return EvHoldState()
+    if evidence is None or evidence.validity != "fresh" or charging is None:
+        return EvHoldState(active=previous.active)
     if charging:
-        return EvHoldState(active=True)
+        if previous.active or not overnight_exception:
+            return EvHoldState(active=True)
+        return EvHoldState()
     if not previous.active:
         return EvHoldState()
-    if previous.not_charging_since is None:
-        return EvHoldState(active=True, not_charging_since=now)
-    clear_reads_elapsed = now - previous.not_charging_since
-    if clear_reads_elapsed >= timedelta(minutes=EV_RELEASE_CONFIRMATION_PASSES - 1):
+    reported_at = evidence.reported_at
+    if reported_at is None:
+        return EvHoldState(active=True)
+    last = previous.last_clear_report_at
+    if last is None:
+        return EvHoldState(active=True, clear_count=1, last_clear_report_at=reported_at)
+    if reported_at < last:
+        # A backwards report resets the run; the hold stays until clear evidence.
+        return EvHoldState(active=True)
+    if reported_at == last:
+        # Equal does not advance and does not reset: repeated GETs of one
+        # cached report never manufacture five distinct clear reports.
+        return EvHoldState(
+            active=True, clear_count=previous.clear_count, last_clear_report_at=last
+        )
+    count = previous.clear_count + 1
+    if count >= EV_RELEASE_CONFIRMATION_PASSES:
         return EvHoldState()
-    return EvHoldState(active=True, not_charging_since=previous.not_charging_since)
+    return EvHoldState(active=True, clear_count=count, last_clear_report_at=reported_at)
 
 
-def _observe_ev_hold(
+async def _resident_charge_window(device: Device) -> tuple[time, time] | None:
+    """The resident slot-1 charge window read back from the inverter (#420).
+
+    Reuses #418's overlay reads (GETs only, no refresh, no write). ``None``
+    means unknown or unsupported: unknown is not verified, so the overnight
+    exception never applies on a ``None`` read.
+    """
+    reader: Callable[[], Awaitable[tuple[time, time] | None]] | None = getattr(
+        device, "resident_charge_window", None
+    )
+    if reader is None:
+        return None
+    try:
+        return await reader()
+    except Exception:  # noqa: BLE001 - an unreadable window is not verified
+        log.debug("Resident charge-window read failed; the overnight exception is off")
+        return None
+
+
+async def _observe_ev_hold(
     state: EvHoldState,
     charging: bool | None,
+    evidence: EvidenceFreshness | None,
+    *,
     now: datetime,
-    window_start: time,
-    window_end: time,
+    device: Device,
+    battery_freshness: EvidenceFreshness | None,
+    battery_direction_value: str,
 ) -> bool:
-    """Update the caller-owned state and return whether the EV hold is active."""
-    next_state = next_ev_hold_state(state, charging, now, window_start, window_end)
+    """Update the caller-owned state and return whether the EV hold is active.
+
+    The resident window is read back only where the exception can matter: a
+    *new* hold on fresh charging evidence. Every other pass keeps the steady
+    state of one cached ``GET`` and zero extra reads.
+    """
+    exception = False
+    if (
+        charging is True
+        and not state.active
+        and evidence is not None
+        and evidence.validity == "fresh"
+    ):
+        resident = await _resident_charge_window(device)
+        exception = ev_hold_overnight_exception(
+            now,
+            resident,
+            battery_freshness.validity if battery_freshness is not None else "unknown",
+            battery_direction_value,
+        )
+    next_state = next_ev_hold_state(state, charging, evidence, overnight_exception=exception)
     state.active = next_state.active
-    state.not_charging_since = next_state.not_charging_since
+    state.clear_count = next_state.clear_count
+    state.last_clear_report_at = next_state.last_clear_report_at
     return state.active
 
 
@@ -708,6 +806,7 @@ async def reconcile_tick(
             read_lines: list[str] = []
             dispatches: tuple[DispatchSlot, ...] = ()
             live_dispatch: bool | None = None
+            report_times: dict[str, datetime | None] = {}
             refresh_dispatches = (
                 settings.tariff_provider != "octopus_intelligent"
                 and bool(settings.dispatch_entity)
@@ -718,7 +817,7 @@ async def reconcile_tick(
             dispatch_trusted = True
             if refresh_dispatches:
                 dispatches, dispatch_trusted, live_dispatch = await read_dispatches_and_live(
-                    settings, rest
+                    settings, rest, report_times=report_times
                 )
                 if not dispatch_trusted:
                     fresh = replace(fresh, hold_trusted=False)
@@ -742,7 +841,21 @@ async def reconcile_tick(
                 dispatches if should_rate_dispatches else (),
                 live_dispatch=live_dispatch,
                 forecast_house_kw=plan.load_kwh / 24,
+                report_times=report_times,
+                now=now,
             )
+            if refresh_dispatches and dispatch_trusted:
+                live_freshness = evidence_read.freshness.get("live_dispatch")
+                if live_freshness is None or live_freshness.validity != "fresh":
+                    # #420: a dispatch picture whose source has not reported
+                    # within its validated age is untrusted evidence — a
+                    # cached HA state is not a live picture. The last trusted
+                    # hold set stands and ends on its own known end; a stale
+                    # read is never turned into a trusted-empty schedule.
+                    dispatch_trusted = False
+                    should_rate_dispatches = False
+                    fresh = replace(fresh, hold_trusted=False)
+                    read_lines = read_lines + [STALE_DISPATCH_LINE]
             if should_rate_dispatches:
                 dispatches, _dropped = partition_dispatches(
                     dispatches, evidence_read.evidence, now
@@ -756,12 +869,15 @@ async def reconcile_tick(
             )
             if settings.ev_status_entity and ev_charging is None:
                 read_lines.append(UNREADABLE_EV_STATUS_LINE)
-            ev_hold_active = _observe_ev_hold(
+            device = inverter_device(settings, rest)
+            ev_hold_active = await _observe_ev_hold(
                 ev_hold_state,
                 ev_charging,
-                now,
-                parse_time(settings.charge_window_start),
-                parse_time(settings.charge_window_end),
+                evidence_read.freshness.get("ev_status"),
+                now=now,
+                device=device,
+                battery_freshness=evidence_read.freshness.get("battery_power"),
+                battery_direction_value=evidence_read.battery_direction,
             )
             fresh = replace(fresh, ev_hold_active=ev_hold_active)
             intent = hold_reconcile_intent(fresh, trusted_holds)
@@ -790,11 +906,9 @@ async def reconcile_tick(
                 )
                 relinquished = True
                 trusted_holds = ()
-                lines = read_lines + list(await inverter_device(settings, rest).write_safe_state())
+                lines = read_lines + list(await device.write_safe_state())
             else:
-                lines = read_lines + list(
-                    await inverter_device(settings, rest).reconcile_holds(intent, now)
-                )
+                lines = read_lines + list(await device.reconcile_holds(intent, now))
     except Exception:
         log.exception("Hold reconcile tick failed; will retry next minute")
         return ReconcileResult([], trusted_holds, relinquished)
