@@ -641,7 +641,13 @@ retained owned hold without fresh evidence raises a degraded notification. It
 notifies once per stale episode, including across restarts; fresh evidence
 re-arms it. EV hold clearance progress and the last trusted dispatch end are
 persisted, and settings reloads do not reset them. A saved request is not a
-read-back confirmation. Owner-Off switches without an owned hold are never
+read-back confirmation. In Optimise, a settings save is refused before persistence
+if it would invalidate the fallback charging schedule (including its current,
+window or limits). Remapping a held switch retains the original hold and raises
+a degraded notice; move to Observe before the replacement mapping can act. A
+release is never redirected to the replacement entity.
+
+Owner-Off switches without an owned hold are never
 released by hold reconciliation. A release writes the switch On only once the
 schedule it hands back to reads back: the resident slot-1 schedule in Protect;
 in Optimise this plan applied and verified, or the verified fallback schedule

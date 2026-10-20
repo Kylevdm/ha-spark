@@ -1,7 +1,8 @@
 """Process-shared permission seam and indivisible, reentrant inverter bus actions.
 
 The daemon binds the sole authority store. Unbound callers fail closed. Planned
-epochs are checked under the bus lock before prerequisite reads and read-back.
+epochs and config generations are checked under the bus lock and again at each
+actuating call. Remapped held identities never grant authority to a replacement.
 Factories and direct driver construction use the same default context. Coordinators
 keep loop-local locks (CLI/tests may run successive event loops); the daemon uses
 one event loop, and no lock is held across loops or shared with another process.
@@ -18,9 +19,19 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, Protocol, TypeVar
 from weakref import WeakKeyDictionary
 
+from ha_spark.authority import HoldDevice
+
 if TYPE_CHECKING:
     from ha_spark.authority import AuthorityStore
     from ha_spark.config import DeviceConfig, Settings
+
+
+def held_identity_remapped(device: HoldDevice, config: DeviceConfig, settings: Settings) -> bool:
+    """An existing hold must never authorise a replacement control on the same driver."""
+    return device.driver == config.driver and device != HoldDevice(
+        driver=config.driver, power_switch=config.entities.get("power_switch", ""),
+        hub=settings.solis_control_hub, slave=settings.solis_modbus_slave,
+    )
 
 
 class Ownership(StrEnum):
@@ -45,8 +56,12 @@ class WriteGate:
             return "refuse:not owned"
         if self.context.planned_epoch.get() != state.epoch:
             return "refuse:stale authority"
+        if self.context.planned_generation.get() != self.context.config_generation:
+            return "refuse:stale config"
         if state.committed_mode == "observe":
             return "simulate"
+        if any(held_identity_remapped(h.device, config, settings) for h in state.holds):
+            return "refuse:held identity remapped"
         if state.committed_mode == "protect" and ownership == Ownership.CHARGING:
             return "simulate"
         return "on"
@@ -136,18 +151,24 @@ class ExecutionContext:
     def __init__(self) -> None:
         self.authority: AuthorityStore | None = None
         self.planned_epoch: ContextVar[int | None] = ContextVar("planned_epoch", default=None)
+        self.config_generation = 0
+        self.planned_generation: ContextVar[int | None] = ContextVar(
+            "planned_generation", default=None
+        )
         self.gate = WriteGate(self)
         self._buses: dict[tuple[str, str, str], BusCoordinator] = {}
 
     @contextmanager
     def planning(self) -> Iterator[None]:
-        """Capture before computing work; never fill in a missing epoch at action time."""
+        """Capture before computing work; never fill missing fences at action time."""
         state = self.authority.state if self.authority is not None else None
         token = self.planned_epoch.set(state.epoch if state is not None else None)
+        generation_token = self.planned_generation.set(self.config_generation)
         try:
             yield
         finally:
             self.planned_epoch.reset(token)
+            self.planned_generation.reset(generation_token)
 
     def coordinator_for(self, config: DeviceConfig, settings: Settings) -> BusCoordinator:
         # All sensors/selects and slaves on a Solis Modbus hub share a bus.

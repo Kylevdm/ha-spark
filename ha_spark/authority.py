@@ -55,6 +55,7 @@ class HoldRecord(_Record):
     last_clear_report_at: AwareDatetime | None = None
     evidence_stale_since: AwareDatetime | None = None
     degraded_notified: bool = False
+    remap_notified: bool = False
 
     @model_validator(mode="after")
     def validate_cause_fields(self) -> Self:

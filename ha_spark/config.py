@@ -723,6 +723,19 @@ def _validated_settings(settings: Settings) -> Settings:
     return settings
 
 
+def actuation_settings_changed(previous: Settings, current: Settings) -> bool:
+    """Whether accepted settings fence work planned under the previous mapping/limits."""
+    fields = {
+        "devices", "charge_window_start", "charge_window_end", "timezone",
+        "solis_control_hub", "solis_modbus_slave", "solis_fallback_current_a",
+        "max_charge_current_a", "battery_voltage_v", "battery_discharge_ceiling_kw",
+        "dno_export_limit_kw", "supply_max_current_a", "supply_voltage_v",
+        "min_soc", "target_soc_cap", "alphaess_serial", "ha_url",
+    }
+    fields.update(name for name in Settings.model_fields if name.endswith("_entity"))
+    return any(getattr(previous, name) != getattr(current, name) for name in fields)
+
+
 def validate_options_document(options: dict[str, Any]) -> Settings:
     """Build complete :class:`Settings` from a candidate options document and validate it.
 
