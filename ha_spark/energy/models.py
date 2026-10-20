@@ -295,6 +295,10 @@ class ChargeIntent:
     unrated_holds: tuple[tuple[datetime, datetime], ...] = ()
     # Sizing projection only; never replaces the checked SoC measurement.
     expected_window_start_soc: float | None = None
+    # When the plan's Kraken dispatch read succeeded (octopus_intelligent only).
+    # The per-minute reconcile re-checks its age before trusting `unrated_holds`;
+    # None is no evidence, never "fresh".
+    octopus_dispatch_reported_at: datetime | None = None
 
     @property
     def soc_now(self) -> float:

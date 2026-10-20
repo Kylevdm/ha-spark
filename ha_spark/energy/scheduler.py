@@ -101,7 +101,7 @@ from ha_spark.energy.derived_base_load import (
 )
 from ha_spark.energy.dispatch_evidence import partition_dispatches
 from ha_spark.energy.dst_clock_sync import DstClockSync
-from ha_spark.energy.evidence_freshness import EvidenceFreshness
+from ha_spark.energy.evidence_freshness import EvidenceFreshness, check_report_time
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
@@ -854,7 +854,8 @@ async def reconcile_tick(
     path re-rates the last plan's original daytime dispatch windows each minute
     from fresh local evidence. It reads the HA dispatch entity only for its live
     state, never for planned windows; an untrusted plan keeps the existing
-    last-trusted-holds behavior.
+    last-trusted-holds behavior, and so does a plan whose Kraken read is older
+    than ``octopus_dispatch_max_age_seconds`` (or has no read time at all).
 
     Relinquishing control (#143 §5): once the clock is past every known hold end
     and the hold data is *still* untrusted, ha-spark has no picture left to steer
@@ -906,6 +907,20 @@ async def reconcile_tick(
             rerate_octopus_dispatches = (
                 settings.tariff_provider == "octopus_intelligent" and fresh.hold_trusted
             )
+            if rerate_octopus_dispatches:
+                # The plan's Kraken read is the only source of these windows,
+                # and the reconcile never re-polls Kraken, so the plan's trust
+                # lasts only as long as that read's validated age.
+                kraken = check_report_time(
+                    fresh.octopus_dispatch_reported_at,
+                    now=now,
+                    max_age_s=settings.octopus_dispatch_max_age_seconds,
+                    option="octopus_dispatch_max_age_seconds",
+                )
+                if kraken.validity != "fresh":
+                    rerate_octopus_dispatches = False
+                    fresh = replace(fresh, hold_trusted=False)
+                    read_lines = [STALE_DISPATCH_LINE]
             dispatch_trusted = True
             if refresh_dispatches:
                 dispatches, dispatch_trusted, live_dispatch = await read_dispatches_and_live(
