@@ -36,7 +36,11 @@ from ha_spark.energy.octopus import (
     fetch_standard_unit_rates,
 )
 from ha_spark.energy.profile import history_coverage
-from ha_spark.energy.sources import read_ev_hold_status
+from ha_spark.energy.sources import (
+    read_dispatch_evidence,
+    read_dispatches_and_live,
+    read_ev_hold_status,
+)
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.statistics import statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
@@ -416,6 +420,50 @@ async def check_operating_mode(settings: Settings) -> CheckResult:
     return CheckResult("Operating mode", Status.OK, result.state.committed_mode)
 
 
+async def check_evidence_freshness(settings: Settings) -> list[CheckResult]:
+    """Read-only source validity; no hardware or authority-store writes.
+
+    Supplier validity describes this diagnostic's own fetch, not a cached
+    planner fetch. PlannerInputs separately retains the gather_inputs fetch time.
+    """
+    reports: dict[str, datetime | None] = {}
+    async with HomeAssistantRest(
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+    ) as rest:
+        dispatches, _trusted, live = await read_dispatches_and_live(
+            settings, rest, report_times=reports
+        )
+        if settings.tariff_provider == "octopus_intelligent":
+            try:
+                await fetch_planned_dispatches(settings)
+                reports["octopus_dispatch"] = datetime.now(UTC)
+            except OctopusApiError:
+                pass  # Unknown, never a trusted-empty schedule.
+        snapshot = await read_dispatch_evidence(
+            settings, rest, dispatches, live_dispatch=live,
+            report_times=reports, read_all=True,
+        )
+    results = []
+    for source, evidence in snapshot.freshness.items():
+        detail = (
+            f"{evidence.validity}; effective report={evidence.reported_at}; "
+            f"age={evidence.age_s}s; max-age={evidence.max_age_s}s; "
+            f"sibling={'yes' if evidence.via_sibling else 'no'}"
+        )
+        if evidence.reason:
+            detail += f"; {evidence.reason}"
+        if source == "battery_power":
+            detail += f"; direction={snapshot.battery_direction}"
+            if settings.battery_power_discharge_sign is None:
+                detail += "; set battery_power_discharge_sign"
+        results.append(CheckResult(
+            f"Evidence {source}",
+            Status.OK if evidence.validity == "fresh" else Status.WARN,
+            detail,
+        ))
+    return results
+
+
 async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
     results = await asyncio.gather(
@@ -433,7 +481,13 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         *([check_ev_status(settings)] if settings.ev_status_entity else []),
         *([check_inverter_clock(settings)] if settings.inverter == "solis" else []),
     )
-    return [*results, check_entity_config(settings)]
+    try:
+        evidence = await check_evidence_freshness(settings)
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must never abort health
+        evidence = [CheckResult(
+            "Evidence freshness", Status.WARN, f"could not read ({type(exc).__name__})"
+        )]
+    return [*results, check_entity_config(settings), *evidence]
 
 
 def format_report(results: list[CheckResult]) -> str:

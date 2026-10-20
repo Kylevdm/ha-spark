@@ -7,7 +7,7 @@ solar uses each slot's calendar date. The planner prorates slot 0's energy.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from math import isfinite
 from typing import Any, NamedTuple
@@ -18,6 +18,11 @@ from ha_spark.energy.axle import AxleApiError, read_axle_event
 from ha_spark.energy.dispatch_evidence import (
     DispatchEvidence,
     partition_dispatches,
+)
+from ha_spark.energy.evidence_freshness import (
+    EvidenceFreshness,
+    battery_direction,
+    check_report_time,
 )
 from ha_spark.energy.forecast import load_timezone, predict_home_load
 from ha_spark.energy.horizon import compute_horizon_geometry
@@ -333,13 +338,16 @@ async def read_dispatches(
 
 
 async def read_dispatches_and_live(
-    settings: Settings, rest: HomeAssistantRest
+    settings: Settings, rest: HomeAssistantRest,
+    *, report_times: dict[str, datetime | None] | None = None,
 ) -> tuple[tuple[DispatchSlot, ...], bool, bool | None]:
     """Read planned and live dispatch state from the same HA entity request.
 
     ``live`` is ``None`` when the source is unset or unreadable, and otherwise
     is true only while the dispatch entity is ``on``.
     """
+    if report_times is not None:
+        report_times["live_dispatch"] = None
     if not settings.dispatch_entity:
         return (), True, None
     try:
@@ -347,6 +355,8 @@ async def read_dispatches_and_live(
     except Exception as exc:  # noqa: BLE001 - a missing entity must not crash the plan
         log.debug("Could not read %s (%s)", settings.dispatch_entity, exc)
         return (), False, None
+    if report_times is not None:
+        report_times["live_dispatch"] = dispatch.last_reported
     state_value = str(dispatch.state).strip().lower()
     if state_value in ("unavailable", "unknown"):
         return (), False, None
@@ -364,6 +374,8 @@ class DispatchEvidenceRead:
     evidence: DispatchEvidence
     ev_status: EntityState | None
     ev_status_trusted: bool
+    freshness: dict[str, EvidenceFreshness] = field(default_factory=dict)
+    battery_direction: str = "unknown"
 
 
 async def _read_evidence_entity(
@@ -389,6 +401,9 @@ async def read_dispatch_evidence(
     *,
     live_dispatch: bool | None = None,
     forecast_house_kw: float | None = None,
+    report_times: dict[str, datetime | None] | None = None,
+    now: datetime | None = None,
+    read_all: bool = False,
 ) -> DispatchEvidenceRead:
     """Read the EV status once and plug/rate only when slots need rating.
 
@@ -397,18 +412,27 @@ async def read_dispatch_evidence(
     never affect dispatch-source trust. EV status is also returned for the
     existing active-EV hold, avoiding a second request.
     """
+    reports = dict(report_times or {})
     ev_status, ev_status_trusted = await read_ev_status(settings, rest)
+    reports["ev_status"] = ev_status.last_reported if ev_status else None
+    ev_sibling = await _read_evidence_entity(settings.ev_liveness_entity, rest)
+    dispatch_sibling = await _read_evidence_entity(settings.dispatch_liveness_entity, rest)
+    battery = await _read_evidence_entity(settings.battery_power_entity, rest)
+    reports["battery_power"] = battery.last_reported if battery else None
     plug: EntityState | None = None
     rate: EntityState | None = None
-    if planned_dispatches:
+    if planned_dispatches or read_all:
         plug = await _read_evidence_entity(settings.ev_plug_entity, rest)
         rate = await _read_evidence_entity(settings.octopus_rate_entity, rest)
+    reports["ev_plug"] = plug.last_reported if plug else None
+    reports["adjusted_rate"] = rate.last_reported if rate else None
     car_power: float | None = None
     grid_power: float | None = None
-    if planned_dispatches:
+    if planned_dispatches or read_all:
 
-        async def power(entity: str) -> float | None:
+        async def power(entity: str, source: str) -> float | None:
             reading = await _read_evidence_entity(entity, rest)
+            reports[source] = reading.last_reported if reading else None
             if reading is None:
                 return None
             value = _opt_float(reading.state)
@@ -417,8 +441,8 @@ async def read_dispatch_evidence(
                 return None
             return value / 1000 if unit == "W" else value
 
-        car_power = await power(settings.ev_power_entity)
-        grid_power = await power(settings.dispatch_grid_power_entity)
+        car_power = await power(settings.ev_power_entity, "ev_power")
+        grid_power = await power(settings.dispatch_grid_power_entity, "dispatch_grid_power")
         if grid_power is not None and settings.dispatch_grid_power_invert:
             grid_power = -grid_power
     adjusted = None
@@ -428,7 +452,40 @@ async def read_dispatch_evidence(
             adjusted = raw_adjusted is True or (
                 isinstance(raw_adjusted, str) and raw_adjusted.strip().lower() == "true"
             )
+    # Additive metadata only: do not filter or reinterpret legacy evidence here.
+    source_entities = {
+        "ev_status": settings.ev_status_entity,
+        "ev_plug": settings.ev_plug_entity,
+        "ev_power": settings.ev_power_entity,
+        "live_dispatch": settings.dispatch_entity,
+        "adjusted_rate": settings.octopus_rate_entity,
+        "dispatch_grid_power": settings.dispatch_grid_power_entity,
+        "battery_power": settings.battery_power_entity,
+        "octopus_dispatch": settings.tariff_provider == "octopus_intelligent",
+    }
+    observed_at = now if now is not None else datetime.now(UTC)
+    freshness: dict[str, EvidenceFreshness] = {}
+    for source, configured in source_entities.items():
+        if not configured:
+            continue
+        sibling = (
+            ev_sibling if source in ("ev_status", "ev_plug", "ev_power")
+            else dispatch_sibling if source in ("live_dispatch", "adjusted_rate")
+            else None
+        )
+        option = f"{source}_max_age_seconds"
+        freshness[source] = check_report_time(
+            reports.get(source), now=observed_at,
+            max_age_s=getattr(settings, option), option=option,
+            sibling_reported_at=sibling.last_reported if sibling else None,
+        )
     return DispatchEvidenceRead(
+        freshness=freshness,
+        battery_direction=battery_direction(
+            battery.state if battery else None,
+            unit=battery.attributes.get("unit_of_measurement") if battery else None,
+            discharge_sign=settings.battery_power_discharge_sign,
+        ),
         evidence=DispatchEvidence(
             live_dispatch=live_dispatch,
             rate_adjusted=adjusted,
@@ -517,6 +574,7 @@ async def gather_inputs(
             log.warning("Could not read Axle event: %s", exc)
             flexibility_event_trusted = False
 
+    report_times: dict[str, datetime | None] = {}
     dispatches: tuple[DispatchSlot, ...]
     live_dispatch: bool | None = None
     # Whether an empty `dispatches` means "none" or "unreadable" (#143 §3).
@@ -527,22 +585,23 @@ async def gather_inputs(
         # planned windows or changes Kraken read trust.
         try:
             dispatches = await fetch_planned_dispatches(settings)
+            report_times["octopus_dispatch"] = datetime.now(UTC)
         except OctopusApiError as exc:
             log.warning("Could not read Octopus planned dispatches (%s)", exc)
             dispatches = ()
             dispatches_trusted = False
         if settings.dispatch_entity:
             _ha_dispatches, _ha_trusted, live_dispatch = await read_dispatches_and_live(
-                settings, rest
+                settings, rest, report_times=report_times
             )
     else:
         dispatches, dispatches_trusted, live_dispatch = await read_dispatches_and_live(
-            settings, rest
+            settings, rest, report_times=report_times
         )
         if not dispatches_trusted:
             log.warning("Dispatch entity %s unreadable; holds untrusted", settings.dispatch_entity)
     evidence_read = await read_dispatch_evidence(
-        settings, rest, dispatches, live_dispatch=live_dispatch
+        settings, rest, dispatches, live_dispatch=live_dispatch, report_times=report_times
     )
     if settings.ev_status_entity and not evidence_read.ev_status_trusted:
         log.warning("EV status entity %s unreadable", settings.ev_status_entity)
@@ -662,6 +721,8 @@ async def gather_inputs(
         now=now,
         dynamic_prices=dynamic_prices,
         unrated_dispatches=unrated_dispatches,
+        evidence_freshness=evidence_read.freshness,
+        battery_direction=evidence_read.battery_direction,
     )
     # Dynamic buffer: when the quantile ML forecast drives the plan, replace the
     # fixed margin with the model's own uncertainty, (P90 - P50) / P50.
