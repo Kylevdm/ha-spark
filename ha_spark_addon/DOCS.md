@@ -620,14 +620,24 @@ every hardware decision.
    the Solis overlay and entity reads are healthy before enabling Optimise.
    Follow the handover procedure linked above.
 
-## Hold evidence freshness (diagnostic metadata)
+## Hold evidence freshness and durable ownership
 
-Freshness is carried alongside the existing EV/dispatch evidence. This release
-only classifies it: it does **not** change hold start/release, dispatch trust,
-reconcile or pricing decisions. Unreadable schedules remain untrusted, not
-trusted-empty; dispatch evidence filtering still happens before pricing.
+Only fresh EV/dispatch evidence can start a new hold. A confirmed EV hold
+survives stale evidence and restarts, and clears after five strictly advancing
+fresh not-charging reports. Stale or backwards reports reset that clearance
+sequence; equal report times do not advance it. A dispatch hold ends at its
+last trusted end; stale updates cannot extend it. Unreadable schedules remain
+untrusted, not trusted-empty; dispatch evidence filtering still happens before pricing.
 
 Each configured source has its own maximum age in seconds:
+
+`hold_degraded_minutes` (default **60**, range **5–1440**) controls when a
+retained owned hold without fresh evidence raises a degraded notification. It
+notifies once per stale episode, including across restarts; fresh evidence
+re-arms it. EV hold clearance progress and the last trusted dispatch end are
+persisted, and settings reloads do not reset them. A saved request is not a
+read-back confirmation. Owner-Off switches without an owned hold are never
+released by hold reconciliation.
 
 | Option | Source | Default |
 | --- | --- | --- |

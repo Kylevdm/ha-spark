@@ -120,6 +120,7 @@ _OPTION_KEYS = frozenset(
         "ev_power_entity",
         "dispatch_grid_power_entity",
         "dispatch_grid_power_invert",
+        "hold_degraded_minutes",
         "ev_status_max_age_seconds",
         "ev_plug_max_age_seconds",
         "ev_power_max_age_seconds",
@@ -507,6 +508,7 @@ class Settings(BaseSettings):
     dispatch_grid_power_invert: bool = Field(default=False)
 
     # Freshness metadata only; hold consumers are deliberately unchanged (#419).
+    hold_degraded_minutes: int = Field(default=60, ge=5, le=1440)
     ev_status_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
     ev_plug_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
     ev_power_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)

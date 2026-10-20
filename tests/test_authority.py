@@ -143,7 +143,9 @@ def test_save_roundtrips_all_state_and_validates_candidates(tmp_path):
         committed_mode="protect", epoch=2, last_changed_at=now, requester_kind="cli",
         transition={"target": "optimise", "started_at": now,
                     "steps": ["handover"], "failing_actions": ["readback"]},
-        holds=[{"cause": "ev", "started_at": now}],
+        holds=[{"cause": "ev", "started_at": now, "device": {
+            "driver": "solis", "power_switch": "select.power", "hub": "solis", "slave": 1,
+        }}],
         fallback={"active": True, "causes": ["soc_integrity"]},
         readiness_notice={"notified": True},
     )

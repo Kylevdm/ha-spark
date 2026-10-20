@@ -14,7 +14,14 @@ from fastapi.testclient import TestClient
 
 from ha_spark import cli
 from ha_spark.api.server import AppState, build_app
-from ha_spark.authority import AuthorityStore, FallbackState, HoldRecord, Transition, load_authority
+from ha_spark.authority import (
+    AuthorityStore,
+    FallbackState,
+    HoldDevice,
+    HoldRecord,
+    Transition,
+    load_authority,
+)
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import DaemonChannel
 from ha_spark.devices import inverter_device
@@ -560,7 +567,9 @@ async def test_mode_sensor_preserves_authority_details_without_secrets(settings,
     store.save(store.state.model_copy(update={
         "transition": Transition(target="optimise", started_at=now,
                                  steps=("pending",), failing_actions=("charge window",)),
-        "holds": (HoldRecord(cause="EV charging", started_at=now),),
+        "holds": (HoldRecord(cause="ev", started_at=now, device=HoldDevice(
+            driver="solis", power_switch="select.power", hub="solis", slave=1,
+        )),),
         "fallback": FallbackState(active=True, causes=("SoC integrity",)),
         "requester_kind": "cli",
     }))
@@ -573,7 +582,11 @@ async def test_mode_sensor_preserves_authority_details_without_secrets(settings,
     assert attrs["transition_target"] == "optimise"
     assert attrs["transition_state"] == "pending"
     assert attrs["failing_actions"] == ["charge window"]
-    assert attrs["holds"][0]["cause"] == "EV charging"
+    assert attrs["holds"][0]["cause"] == "ev"
+    assert attrs["holds"][0]["confirmed"] is False
+    assert attrs["holds"][0]["owned"] is True
+    assert attrs["holds"][0]["pending_release"] is False
+    assert attrs["holds"][0]["trusted_end"] is None
     assert attrs["fallback"] == {"active": True, "causes": ["SoC integrity"]}
     assert attrs["epoch"] == 9
     assert attrs["requester_kind"] == "cli"

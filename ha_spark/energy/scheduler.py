@@ -116,7 +116,7 @@ from ha_spark.energy.publish import (
     republish_last,
 )
 from ha_spark.energy.report import format_plan
-from ha_spark.energy.soc_integrity import SocMeasurement
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor, SocMonitorSnapshot, observe_soc
 from ha_spark.energy.sources import (
     ev_hold_status_from_read,
@@ -560,7 +560,7 @@ EV_RELEASE_CONFIRMATION_PASSES = 5
 
 @dataclass
 class EvHoldState:
-    """Per-process EV hold state shared by plan and minute passes (#420).
+    """EV hold snapshot shared by plan and minute passes (#420/#421).
 
     Small and serialisable on purpose: ``active``, the strictly advancing
     clear-report count, and the last counted effective report time. #421
@@ -693,11 +693,63 @@ async def _observe_ev_hold(
             battery_freshness.validity if battery_freshness is not None else "unknown",
             battery_direction_value,
         )
+    context = execution_context()
+    store = context.authority
+    record = next((h for h in store.state.holds if h.cause == "ev"), None) if (
+        store is not None and store.state is not None
+    ) else None
+    if record is not None:
+        state.active = record.confirmed and not record.pending_release
+        state.clear_count = record.clear_count
+        state.last_clear_report_at = record.last_clear_report_at
     next_state = next_ev_hold_state(state, charging, evidence, overnight_exception=exception)
+    if record is not None and store is not None and store.state is not None:
+        updated = record.model_copy(update={
+            "clear_count": next_state.clear_count,
+            "last_clear_report_at": next_state.last_clear_report_at,
+            "pending_release": (
+                not next_state.active if record.confirmed else record.pending_release
+            ),
+        })
+        store.save_holds(tuple(updated if h == record else h for h in store.state.holds))
     state.active = next_state.active
     state.clear_count = next_state.clear_count
     state.last_clear_report_at = next_state.last_clear_report_at
     return state.active
+
+
+async def _hold_degraded_notice(
+    settings: Settings, rest: HomeAssistantRest,
+    freshness: dict[str, EvidenceFreshness], now: datetime,
+) -> None:
+    store = execution_context().authority
+    if store is None or store.state is None:
+        return
+    records = []
+    notices = []
+    for record in store.state.holds:
+        evidence = freshness.get("ev_status" if record.cause == "ev" else "live_dispatch")
+        fresh = evidence is not None and evidence.validity == "fresh"
+        since = None if fresh else record.evidence_stale_since or now
+        notified = False if fresh else record.degraded_notified
+        if since is not None and not notified and (
+            now - since >= timedelta(minutes=settings.hold_degraded_minutes)
+        ):
+            notified = True
+            notices.append(record.cause)
+        records.append(record.model_copy(update={
+            "evidence_stale_since": since, "degraded_notified": notified,
+        }))
+    # Persist the once-only notice before sending, including across restarts.
+    store.save_holds(tuple(records))
+    for cause in notices:
+        try:
+            await send_notification(
+                settings, rest, "ha-spark degraded hold",
+                f"Retaining {cause} hold without fresh evidence; check its source.",
+            )
+        except Exception:  # noqa: BLE001 - notice failure must not block protection
+            log.warning("Degraded hold notification failed")
 
 
 def hold_reconcile_intent(
@@ -709,13 +761,22 @@ def hold_reconcile_intent(
     used as-is. An untrusted one, whose empty holds mean "unreadable" rather than
     "no dispatch", is evaluated against the last trusted hold set instead, so a
     hold still ends on its own known end time: no expiry timer, no stuck ``Off``.
-    With no trusted set yet (boot into a failed read, a hot reload, the CLI)
-    there is no picture, and no picture never writes ``On``.
+    With no trusted set yet, durable records provide the dispatch end or an
+    already-cleared owned release. No picture and no record never writes On.
     """
     if intent.hold_trusted:
         return intent
     if trusted_holds is None:
-        if not intent.ev_hold_active:
+        store = execution_context().authority
+        records = store.state.holds if store is not None and store.state is not None else ()
+        recorded_dispatch = tuple(
+            (h.started_at, h.trusted_end) for h in records
+            if h.cause == "dispatch" and h.confirmed and h.trusted_end is not None
+        )
+        if recorded_dispatch:
+            return replace(intent, holds=recorded_dispatch)
+        owned_release = any(h.owned and h.confirmed and h.pending_release for h in records)
+        if not intent.ev_hold_active and not owned_release:
             return None
         # EV charging is independent evidence. It may close a hold while the
         # dispatch picture is absent, but keeps dispatch trust false for export.
@@ -802,6 +863,26 @@ async def reconcile_tick(
         async with HomeAssistantRest(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
         ) as rest:
+            # Read the device before evidence, including re-verification of a
+            # durable request whose process died between write and read-back.
+            store = execution_context().authority
+            if store is not None and store.state is not None:
+                verified = []
+                for record in store.state.holds:
+                    try:
+                        switch = await rest.get_state(record.device.power_switch)
+                        if switch.state.strip().lower() == "off" and not record.confirmed:
+                            record = record.model_copy(update={"confirmed": True})
+                    except Exception:  # noqa: BLE001 - no inferred confirmation
+                        pass
+                    verified.append(record)
+                store.save_holds(tuple(verified))
+                if trusted_holds is None:
+                    recorded = tuple(
+                        (h.started_at, h.trusted_end) for h in store.state.holds
+                        if h.cause == "dispatch" and h.confirmed and h.trusted_end is not None
+                    )
+                    trusted_holds = recorded or None
             fresh = plan.charge_intent
             read_lines: list[str] = []
             dispatches: tuple[DispatchSlot, ...] = ()
@@ -864,6 +945,7 @@ async def reconcile_tick(
                     dispatches, fresh.window_start, fresh.window_end
                 )
                 fresh = replace(fresh, holds=trusted_holds, hold_trusted=True)
+            await _hold_degraded_notice(settings, rest, evidence_read.freshness, now)
             ev_charging = ev_hold_status_from_read(
                 evidence_read.ev_status, evidence_read.ev_status_trusted
             )
@@ -1411,6 +1493,7 @@ async def _run_forever(
     recovery_retry_not_before: datetime | None = None
     clock_sync = DstClockSync()
     pending = None
+    startup_reconciled = False
     try:
         while True:
             settings = state.settings  # hot-reloaded by POST /api/config
@@ -1450,7 +1533,6 @@ async def _run_forever(
                 last_plan = None
                 last_applied_plan = None
                 last_trusted_holds = None
-                ev_hold_state = EvHoldState()
                 target_w = None
                 last_settings = settings
             tz = load_timezone(settings.timezone)
@@ -1462,6 +1544,37 @@ async def _run_forever(
                     await _charger_supports_live_rate(settings)
                 )
             now = datetime.now(tz)
+            if not startup_reconciled:
+                startup_reconciled = True
+                # No planner or fallback write may precede restart reconciliation.
+                if authority.state is not None and (
+                    authority.state.holds or authority.state.committed_mode != "observe"
+                ):
+                    if not authority.state.holds:
+                        async with HomeAssistantRest(
+                            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+                        ) as rest:
+                            for config in settings.devices:
+                                entity = config.entities.get("power_switch", "")
+                                if config.type == "inverter" and entity:
+                                    try:
+                                        await rest.get_state(entity)
+                                    except Exception:  # noqa: BLE001 - direction decides later
+                                        pass
+                    unknown_soc = SocMeasurement(SocStatus.UNAVAILABLE, now)
+                    startup_plan = ChargePlan(
+                        soc=unknown_soc, capacity_kwh=0, solar_kwh=0, effective_solar_kwh=0,
+                        load_kwh=0, cheap_covered_kwh=0, usable_now_kwh=0, deficit_kwh=0,
+                        buffer_pct=0, required_kwh=0, target_soc=0, window_hours=0,
+                        ev_charging=False, ha_template_needed=None,
+                        charge_intent=ChargeIntent(
+                            0, unknown_soc, window_start, window_end, hold_trusted=False,
+                        ),
+                    )
+                    startup_result = await reconcile_tick(
+                        settings, startup_plan, now, ev_hold_state=ev_hold_state,
+                    )
+                    last_reconcile_lines, last_trusted_holds = startup_result[:2]
             # Sole SoC observation cadence (#114): one checked measurement per
             # minute in every operating state, reused by everything below.
             measurement = await soc_monitor_tick(settings, monitor)

@@ -101,6 +101,7 @@ options:
   ev_power_entity: ""
   dispatch_grid_power_entity: ""
   dispatch_grid_power_invert: false
+  hold_degraded_minutes: 60
   ev_status_max_age_seconds: 300
   ev_plug_max_age_seconds: 300
   ev_power_max_age_seconds: 300
@@ -222,6 +223,7 @@ schema:
   ev_power_entity: str?
   dispatch_grid_power_entity: str?
   dispatch_grid_power_invert: bool
+  hold_degraded_minutes: int(5,1440)?
   ev_status_max_age_seconds: float(0.001,86400)?
   ev_plug_max_age_seconds: float(0.001,86400)?
   ev_power_max_age_seconds: float(0.001,86400)?

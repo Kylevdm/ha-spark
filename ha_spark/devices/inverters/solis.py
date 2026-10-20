@@ -52,6 +52,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from ha_spark.authority import AuthorityStore, HoldDevice, HoldRecord
 from ha_spark.devices.base import Capability, HoldContract, HoldValidation, fmt_hhmm
 from ha_spark.devices.execution import (
     ExecutionContext,
@@ -1016,10 +1017,11 @@ class SolisDevice:
     async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[ActionLine]:
         """Converge the whole-inverter enable on the state the clock implies (#140).
 
-        Desired state is a pure function of ``now`` and ``intent.holds``: ``Off``
-        while a hold is active, ``On`` otherwise. Nothing is remembered, so a
-        restart or a crash mid-hold converges on the next tick, and ha-spark owns
-        both edges rather than only ever subtracting (ADR-0003).
+        Desired state includes durable owned holds as well as the fresh intent.
+        Persist a request before writing Off, and confirmation only after read-back.
+        An already-Off switch without a record belongs to the owner: this seam
+        neither claims it nor turns it On. Unconfirmed requests are re-read, not
+        treated as proof that a write landed.
 
         Read-first, and deliberately cheap enough for the per-minute cadence it
         is driven at (#143): steady state is one *cached* ``GET`` of the select
@@ -1040,7 +1042,22 @@ class SolisDevice:
 
     @device_action(Ownership.PROTECTION)
     async def _reconcile_power_switch(self, intent: ChargeIntent, now: datetime) -> ActionLine:
-        wanted = "Off" if intent.hold_active(now) else "On"
+        store = self._execution.authority
+        identity = HoldDevice(
+            driver=self._config.driver,
+            power_switch=self._config.entities.get("power_switch", ""),
+            hub=self._settings.solis_control_hub, slave=self._settings.solis_modbus_slave,
+        )
+        records = tuple(h for h in store.state.holds if h.device == identity) if (
+            store is not None and store.state is not None
+        ) else ()
+        retained = any(
+            h.cause == "ev" and h.confirmed and not h.pending_release
+            or h.cause == "dispatch" and h.trusted_end is not None and now < h.trusted_end
+            and h.confirmed and not intent.hold_trusted
+            for h in records
+        )
+        wanted = "Off" if intent.hold_active(now) or retained else "On"
         desc = f"set inverter power switch to {wanted}"
         mode = self._coordinator.mode
         if mode.startswith("refuse:"):
@@ -1064,7 +1081,12 @@ class SolisDevice:
             # 60 blind, unverifiable releases an hour through an HA outage, each
             # one freeing a battery ha-spark can no longer see to discharge.
             try:
-                if (await self._rest.get_state(entity)).state.strip().lower() == wanted.lower():
+                current = (await self._rest.get_state(entity)).state.strip().lower()
+                if current == wanted.lower():
+                    if wanted == "Off" and records and store is not None:
+                        self._save_hold_request(
+                            store, identity, intent, now, records, confirmed=True
+                        )
                     return ActionLine(
                         f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED
                     )
@@ -1083,7 +1105,27 @@ class SolisDevice:
                         ActionOutcome.REFUSED,
                     )
                 log.warning("Power-switch pre-read failed; writing %s anyway", wanted)
+            if wanted == "On" and not any(h.owned for h in records):
+                return ActionLine(
+                    "[SKIP] owner-Off switch has no owned hold; left as-is",
+                    ActionOutcome.UNVERIFIED,
+                )
+            assert store is not None and store.state is not None
+            if wanted == "Off":
+                self._save_hold_request(store, identity, intent, now, records, confirmed=False)
+            else:
+                store.save_holds(tuple(
+                    h.model_copy(update={"pending_release": True}) if h.device == identity else h
+                    for h in store.state.holds
+                ))
             mismatch = await self._select_option(entity, wanted)
+            if not mismatch and store is not None and store.state is not None:
+                if wanted == "Off":
+                    self._save_hold_request(
+                        store, identity, intent, now, store.state.holds, confirmed=True
+                    )
+                else:
+                    store.save_holds(tuple(h for h in store.state.holds if h.device != identity))
         except Exception:  # noqa: BLE001 - isolate this action's failure
             log.error("[FAILED] %s", desc)
             return ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)
@@ -1091,6 +1133,29 @@ class SolisDevice:
             ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED)
             if mismatch
             else ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)
+        )
+
+    def _save_hold_request(
+        self, store: AuthorityStore, identity: HoldDevice, intent: ChargeIntent,
+        now: datetime, records: tuple[HoldRecord, ...], *, confirmed: bool,
+    ) -> None:
+        assert store.state is not None
+        existing = {h.cause: h for h in records if h.device == identity}
+        if intent.ev_hold_active and "ev" not in existing:
+            existing["ev"] = HoldRecord(cause="ev", started_at=now, device=identity)
+        ends = [end if end.tzinfo else end.replace(tzinfo=now.tzinfo)
+                for start, end in intent.holds
+                if (start if start.tzinfo else start.replace(tzinfo=now.tzinfo)) <= now
+                < (end if end.tzinfo else end.replace(tzinfo=now.tzinfo))]
+        if ends and intent.hold_trusted:
+            previous = existing.get("dispatch")
+            existing["dispatch"] = (
+                previous.model_copy(update={"trusted_end": max(ends)}) if previous else
+                HoldRecord(cause="dispatch", started_at=now, device=identity, trusted_end=max(ends))
+            )
+        store.save_holds(
+            tuple(h for h in store.state.holds if h.device != identity)
+            + tuple(h.model_copy(update={"confirmed": confirmed}) for h in existing.values())
         )
 
     async def write_safe_state(self) -> list[ActionLine]:
