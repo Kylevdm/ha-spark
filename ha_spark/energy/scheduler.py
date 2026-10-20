@@ -704,14 +704,16 @@ async def _observe_ev_hold(
         state.last_clear_report_at = record.last_clear_report_at
     next_state = next_ev_hold_state(state, charging, evidence, overnight_exception=exception)
     if record is not None and store is not None and store.state is not None:
-        updated = record.model_copy(update={
-            "clear_count": next_state.clear_count,
-            "last_clear_report_at": next_state.last_clear_report_at,
-            "pending_release": (
-                not next_state.active if record.confirmed else record.pending_release
-            ),
-        })
-        store.save_holds(tuple(updated if h == record else h for h in store.state.holds))
+        # Every EV record follows the one EV evidence stream, so a record left
+        # under an older device identity can never outlive the clearance.
+        store.save_holds(tuple(
+            h.model_copy(update={
+                "clear_count": next_state.clear_count,
+                "last_clear_report_at": next_state.last_clear_report_at,
+                "pending_release": not next_state.active if h.confirmed else h.pending_release,
+            }) if h.cause == "ev" else h
+            for h in store.state.holds
+        ))
     state.active = next_state.active
     state.clear_count = next_state.clear_count
     state.last_clear_report_at = next_state.last_clear_report_at
@@ -720,16 +722,25 @@ async def _observe_ev_hold(
 
 async def _hold_degraded_notice(
     settings: Settings, rest: HomeAssistantRest,
-    freshness: dict[str, EvidenceFreshness], now: datetime,
+    freshness: dict[str, EvidenceFreshness], now: datetime, *, dispatch_trusted: bool,
 ) -> None:
     store = execution_context().authority
     if store is None or store.state is None:
         return
     records = []
     notices = []
+    ev = freshness.get("ev_status")
     for record in store.state.holds:
-        evidence = freshness.get("ev_status" if record.cause == "ev" else "live_dispatch")
-        fresh = evidence is not None and evidence.validity == "fresh"
+        # A hold that no longer holds anything is not retained, so never degraded.
+        holding = not record.pending_release and (
+            record.trusted_end is None or now < record.trusted_end
+        )
+        # Dispatch evidence is whatever this pass trusts for holds: the fresh
+        # HA dispatch entity, or the plan's freshness-gated Kraken fetch.
+        fresh = not holding or (
+            ev is not None and ev.validity == "fresh" if record.cause == "ev"
+            else dispatch_trusted
+        )
         since = None if fresh else record.evidence_stale_since or now
         notified = False if fresh else record.degraded_notified
         if since is not None and not notified and (
@@ -945,7 +956,9 @@ async def reconcile_tick(
                     dispatches, fresh.window_start, fresh.window_end
                 )
                 fresh = replace(fresh, holds=trusted_holds, hold_trusted=True)
-            await _hold_degraded_notice(settings, rest, evidence_read.freshness, now)
+            await _hold_degraded_notice(
+                settings, rest, evidence_read.freshness, now, dispatch_trusted=fresh.hold_trusted
+            )
             ev_charging = ev_hold_status_from_read(
                 evidence_read.ev_status, evidence_read.ev_status_trusted
             )

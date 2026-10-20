@@ -253,3 +253,46 @@ async def test_daemon_reload_keeps_durable_ev_clearance(tmp_path, monkeypatch, m
     assert len(seen) == 2
     assert seen[0] is seen[1]
     assert AuthorityStore(settings).state.holds[0].clear_count == 3
+
+
+@respx.mock
+async def test_degraded_notice_trusts_the_pass_dispatch_picture(tmp_path, monkeypatch):
+    """F2: a dispatch hold whose picture this pass trusts is never degraded."""
+    settings, store = episode(tmp_path, "protect", cause="dispatch")
+    settings = settings.model_copy(update={"dispatch_entity": ""})
+    _mock_power_switch(monkeypatch, initial="Off")
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused", at=NOW))
+    notices = []
+
+    async def notify(*args):
+        notices.append(args)
+
+    monkeypatch.setattr(scheduler, "send_notification", notify)
+    window = (NOW - timedelta(minutes=20), NOW + timedelta(minutes=30))
+    plan = _plan(replace(_INTENT, holds=(window,)))
+    for minute in (0, 6, 12):
+        await scheduler.reconcile_tick(settings, plan, NOW + timedelta(minutes=minute))
+    assert notices == []
+
+
+@respx.mock
+async def test_ev_clearance_updates_every_ev_record(tmp_path, monkeypatch):
+    """F1: a record under an older device identity follows the same clearance."""
+    settings, store = episode(tmp_path, "protect")
+    old = store.state.holds[0]
+    store.save_holds((old, old.model_copy(update={
+        "device": old.device.model_copy(update={"power_switch": "select.old_switch"}),
+    })))
+    monkeypatch.setattr(execution_context(), "authority", store)
+    state = scheduler.EvHoldState()
+    for minute in range(5):
+        evidence = scheduler.EvidenceFreshness(
+            "fresh", NOW + timedelta(minutes=minute), 0.0, 300.0,
+            NOW + timedelta(minutes=minute),
+        )
+        await scheduler._observe_ev_hold(
+            state, False, evidence, now=NOW + timedelta(minutes=minute), device=object(),
+            battery_freshness=None, battery_direction_value="unknown",
+        )
+    assert not state.active
+    assert all(h.pending_release for h in store.state.holds)

@@ -1084,8 +1084,20 @@ class SolisDevice:
                 current = (await self._rest.get_state(entity)).state.strip().lower()
                 if current == wanted.lower():
                     if wanted == "Off" and records and store is not None:
+                        # Confirm our existing requests by this read; never open
+                        # a new cause on a switch someone else already turned Off.
                         self._save_hold_request(
-                            store, identity, intent, now, records, confirmed=True
+                            store, identity, intent, now, records, confirmed=True,
+                            create=False,
+                        )
+                    elif (
+                        wanted == "On" and records and store is not None
+                        and store.state is not None
+                    ):
+                        # Nothing retains these holds and the switch already reads
+                        # On: they no longer hold anything, so drop them (no write).
+                        store.save_holds(
+                            tuple(h for h in store.state.holds if h.device != identity)
                         )
                     return ActionLine(
                         f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED
@@ -1138,16 +1150,17 @@ class SolisDevice:
     def _save_hold_request(
         self, store: AuthorityStore, identity: HoldDevice, intent: ChargeIntent,
         now: datetime, records: tuple[HoldRecord, ...], *, confirmed: bool,
+        create: bool = True,
     ) -> None:
         assert store.state is not None
         existing = {h.cause: h for h in records if h.device == identity}
-        if intent.ev_hold_active and "ev" not in existing:
+        if create and intent.ev_hold_active and "ev" not in existing:
             existing["ev"] = HoldRecord(cause="ev", started_at=now, device=identity)
         ends = [end if end.tzinfo else end.replace(tzinfo=now.tzinfo)
                 for start, end in intent.holds
                 if (start if start.tzinfo else start.replace(tzinfo=now.tzinfo)) <= now
                 < (end if end.tzinfo else end.replace(tzinfo=now.tzinfo))]
-        if ends and intent.hold_trusted:
+        if ends and intent.hold_trusted and (create or "dispatch" in existing):
             previous = existing.get("dispatch")
             existing["dispatch"] = (
                 previous.model_copy(update={"trusted_end": max(ends)}) if previous else

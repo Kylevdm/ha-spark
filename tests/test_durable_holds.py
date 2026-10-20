@@ -5,6 +5,7 @@ import pytest
 
 from ha_spark.authority import AuthorityStore
 from tests.test_solis_power_switch import (
+    _SWITCH,
     FakeRest,
     _device,
     _intent,
@@ -125,3 +126,41 @@ def test_unchanged_holds_save_is_a_no_op_even_without_known_authority(tmp_path) 
     store.save_failed = True
     store.save_holds(())  # unchanged: nothing to persist, nothing raised
     assert store.save_failed is True
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise"])
+async def test_already_off_switch_never_opens_a_new_owned_cause(tmp_path, mode):
+    """F4: confirming our request by read never creates a cause we didn't write."""
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    from ha_spark.authority import HoldDevice, HoldRecord
+
+    rest = FakeRest(switch="Off")  # the owner turned it Off after our write failed
+    device = _device(rest, tmp_path, authority_mode=mode)
+    store = device._execution.authority
+    store.save_holds((HoldRecord(
+        cause="dispatch", started_at=datetime.now(UTC) - timedelta(minutes=5),
+        trusted_end=datetime.now(UTC) + timedelta(hours=1),
+        device=HoldDevice(
+            driver="solis", power_switch=_SWITCH, hub=device._settings.solis_control_hub,
+            slave=device._settings.solis_modbus_slave,
+        ),
+    ),))
+    await _reconcile(device, replace(_intent(holds=(_window(-5),)), ev_hold_active=True))
+    assert [h.cause for h in store.state.holds] == ["dispatch"]
+    assert store.state.holds[0].confirmed  # our request, re-verified by read
+    assert _options(rest) == []
+
+
+@pytest.mark.parametrize("mode", ["protect", "optimise"])
+async def test_records_dropped_when_switch_already_reads_on(tmp_path, mode):
+    """F3: an ended hold whose switch already reads On is cleared without a write."""
+    rest = FakeRest()
+    device = _device(rest, tmp_path, authority_mode=mode)
+    await _reconcile(device, _intent(holds=(_window(-10),)))
+    assert device._execution.authority.state.holds
+    rest.states[_SWITCH] = "On"  # released elsewhere (e.g. the relinquish safe state)
+    await _reconcile(device, _intent())
+    assert device._execution.authority.state.holds == ()
+    assert _options(rest) == ["Off"]
