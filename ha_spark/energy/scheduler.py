@@ -83,13 +83,17 @@ from ha_spark.api.server import (
     stop_server,
 )
 from ha_spark.authority import FALLBACK_CAUSE_SOC_INTEGRITY, AuthorityStore
-from ha_spark.config import Settings
+from ha_spark.config import Settings, actuation_settings_changed
 from ha_spark.daemon_channel import DaemonChannel, Reply, action_lines
 from ha_spark.devices import Capability, Device, inverter_device
-from ha_spark.devices.execution import ExecutionContext, Ownership, execution_context
+from ha_spark.devices.execution import (
+    ExecutionContext,
+    Ownership,
+    execution_context,
+    held_identity_remapped,
+)
 from ha_spark.devices.inverters.solis import (
     SolisDevice,
-    validate_fallback_schedule,
     validated_fallback_current_a,
 )
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome, is_verified, legacy_action_line
@@ -718,6 +722,33 @@ async def _observe_ev_hold(
     state.clear_count = next_state.clear_count
     state.last_clear_report_at = next_state.last_clear_report_at
     return state.active
+
+
+async def notify_remapped_holds(settings: Settings, rest: HomeAssistantRest) -> None:
+    """Keep old identities and persist one degraded notice per mapping mismatch episode."""
+    store = execution_context().authority
+    if store is None or not store.known or store.save_failed or store.state is None:
+        return
+    records = []
+    notify = False
+    for record in store.state.holds:
+        remapped = any(
+            held_identity_remapped(record.device, config, settings)
+            for config in settings.devices
+        )
+        notify |= remapped and not record.remap_notified
+        records.append(record.model_copy(update={"remap_notified": remapped}))
+    if tuple(records) != store.state.holds:
+        store.save_holds(tuple(records))
+    if notify:
+        try:
+            await send_notification(
+                settings, rest, "ha-spark degraded hold",
+                "Held control mapping changed; the original hold is retained. "
+                "Move to Observe before using the replacement mapping.",
+            )
+        except Exception:  # noqa: BLE001 - notification failure must not block protection
+            log.warning("Remapped hold notification failed")
 
 
 async def _hold_degraded_notice(
@@ -1529,6 +1560,8 @@ async def _run_forever(
     try:
         while True:
             settings = state.settings  # hot-reloaded by POST /api/config
+            # Capture with the settings snapshot, before any I/O can accept a save.
+            context.planned_generation.set(context.config_generation)
             current_faults = set()
             if not authority.known:
                 current_faults.add("authority unknown")
@@ -1545,21 +1578,14 @@ async def _run_forever(
                     for fault in current_faults - faults:
                         log.warning("%s; hardware writes refused", fault)
                         await send_notification(settings, rest, "ha-spark authority fault", fault)
+                    await notify_remapped_holds(settings, rest)
                     await publish_operating_mode(rest, authority)
             except Exception:
                 log.warning("Authority publication failed")
             faults = current_faults
             context.planned_epoch.set(authority.state.epoch if authority.state else None)
             if settings is not last_settings:
-                if (
-                    settings.charge_window_start != last_settings.charge_window_start
-                    or settings.charge_window_end != last_settings.charge_window_end
-                    or validate_fallback_schedule(settings)
-                    != validate_fallback_schedule(last_settings)
-                    or settings.devices != last_settings.devices
-                    or settings.solis_control_hub != last_settings.solis_control_hub
-                    or settings.solis_modbus_slave != last_settings.solis_modbus_slave
-                ):
+                if actuation_settings_changed(last_settings, settings):
                     monitor.invalidate_fallback_confirmation()
                 # Never reuse a previous plan's command across a hot reload.
                 last_plan = None

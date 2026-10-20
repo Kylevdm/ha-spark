@@ -37,6 +37,7 @@ def seed_authority(
     target = context or execution_context()
     target.authority = store
     target.planned_epoch.set(epoch)
+    target.planned_generation.set(target.config_generation)
     _contexts.append(target)
     return store
 
@@ -59,6 +60,8 @@ def seeded_execution(settings: Settings) -> ExecutionContext:
     source = execution_context()
     context.authority = source.authority
     context.planned_epoch.set(source.planned_epoch.get())
+    context.config_generation = source.config_generation
+    context.planned_generation.set(source.planned_generation.get())
     _contexts.append(context)
     return context
 
@@ -67,6 +70,8 @@ def cleanup_authority() -> None:
     for context in _contexts:
         context.authority = None
         context.planned_epoch.set(None)
+        context.planned_generation.set(None)
+        context.config_generation = 0
     _contexts.clear()
     for directory in _directories:
         directory.cleanup()

@@ -43,6 +43,7 @@ async def test_retired_options_load_once_without_grant(tmp_path, monkeypatch, ca
     context = ExecutionContext()
     context.authority = store
     context.planned_epoch.set(store.state.epoch)
+    context.planned_generation.set(context.config_generation)
     assert context.gate.mode_for(Ownership.CHARGING, settings.devices[0], settings) == "simulate"
     assert store.state.committed_mode == "observe"
 
