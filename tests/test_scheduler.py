@@ -15,9 +15,11 @@ import pytest
 import respx
 
 from ha_spark.api.server import AppState
+from ha_spark.authority import HoldDevice, HoldRecord
 from ha_spark.config import DeviceConfig
 from ha_spark.config import Settings as ConfigSettings
 from ha_spark.devices import Capability, inverter_device
+from ha_spark.devices.execution import execution_context
 from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.energy import scheduler, sources
 from ha_spark.energy.evidence_freshness import EvidenceFreshness
@@ -4836,6 +4838,7 @@ class _RelinquishRecordingDevice:
     def __init__(self) -> None:
         self.reconciled: list[ChargeIntent] = []
         self.safe_states = 0
+        self.safe_windows = 0
 
     def planned_rate_w(self, intent: ChargeIntent) -> float:
         return 0.0
@@ -4847,6 +4850,10 @@ class _RelinquishRecordingDevice:
     async def write_safe_state(self) -> list[str]:
         self.safe_states += 1
         return ["[APPLIED] set inverter power switch to On (relinquishing control)"]
+
+    async def write_safe_window(self) -> list[str]:
+        self.safe_windows += 1
+        return ["[APPLIED] set charge window 23:30-05:30 (relinquishing control)"]
 
 
 async def test_untrusted_reads_inside_a_known_hold_never_relinquish(
@@ -4936,13 +4943,24 @@ async def _run_forever_until_cancelled(
     *,
     plan: ChargePlan | None,
     shutdown_at: datetime = datetime(2026, 6, 10, 23, 5),
-) -> None:
+    authority_mode: str = "optimise",
+    holds: tuple[HoldRecord, ...] = (),
+) -> list[tuple[object, ...]]:
     """One slot tick, then a cancel (as SIGTERM delivers it) with ``shutdown_at`` left
-    on the clock for the ``finally``."""
+    on the clock for the ``finally``. Returns the notifications sent."""
+    notices: list[tuple[object, ...]] = []
+
+    async def notify(*args: object) -> None:
+        notices.append(args)
+
+    monkeypatch.setattr(scheduler, "send_notification", notify)
 
     async def fake_run_once(_s: Settings, **_kw: object) -> scheduler.RunResult:
         if plan is None:
             raise RuntimeError("no plan")
+        if holds:
+            # Recorded during the run, so the startup reconcile has not seen them.
+            execution_context().authority.save_holds(holds)
         return scheduler.RunResult(plan, plan)
 
     async def cancelled_sample_signals(_s: Settings, _now: datetime) -> None:
@@ -4954,10 +4972,12 @@ async def _run_forever_until_cancelled(
     _patch_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0), shutdown_at])
 
     s = Settings(
-        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00", authority_mode="optimise"
+        ha_url="http://ha.test", ha_token="t", plan_run_time="22:00",
+        authority_mode=authority_mode,
     )
     with pytest.raises(asyncio.CancelledError):
         await run_forever(s, poll_seconds=0)
+    return notices
 
 
 async def test_run_forever_writes_the_safe_state_once_on_shutdown(
@@ -4989,7 +5009,7 @@ async def test_shutdown_inside_a_known_hold_leaves_the_hold_in_place(
     next process picks the hold up within a minute.
     """
     device = _RelinquishRecordingDevice()
-    await _run_forever_until_cancelled(
+    notices = await _run_forever_until_cancelled(
         monkeypatch,
         device,
         plan=_plan(replace(_INTENT, holds=(_HOLD,))),
@@ -4997,6 +5017,39 @@ async def test_shutdown_inside_a_known_hold_leaves_the_hold_in_place(
     )
 
     assert device.safe_states == 0
+    assert device.safe_windows == 1
+    assert len(notices) == 1 and "dispatch" in str(notices[0][3])
+
+
+async def test_shutdown_with_an_ev_hold_keeps_the_switch_off_and_restores_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#426: Optimise + EV hold, no dispatch: window only, and a notice naming why."""
+    device = _RelinquishRecordingDevice()
+    ev = HoldRecord(
+        cause="ev", started_at=datetime(2026, 6, 10, 21, 0, tzinfo=UTC), confirmed=True,
+        device=HoldDevice(driver="solis", power_switch="select.x", hub="h", slave=1),
+    )
+    notices = await _run_forever_until_cancelled(
+        monkeypatch, device, plan=_plan(), holds=(ev,)
+    )
+
+    assert (device.safe_states, device.safe_windows) == (0, 1)
+    assert len(notices) == 1 and "EV" in str(notices[0][3])
+
+
+@pytest.mark.parametrize("mode", ["protect", "observe"])
+async def test_shutdown_outside_optimise_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    device = _RelinquishRecordingDevice()
+    notices = await _run_forever_until_cancelled(
+        monkeypatch, device, plan=_plan(replace(_INTENT, holds=(_HOLD,))),
+        authority_mode=mode,
+    )
+
+    assert (device.safe_states, device.safe_windows) == (0, 0)
+    assert notices == []
 
 
 async def test_a_relinquish_is_reported_so_the_loop_can_reapply(

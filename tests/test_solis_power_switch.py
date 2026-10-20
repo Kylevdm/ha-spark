@@ -647,12 +647,28 @@ async def test_safe_state_already_in_place_writes_nothing(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_safe_state_releases_the_switch_even_when_it_is_unreadable(tmp_path) -> None:
-    """The bound on the reconcile's refused blind release: relinquishing writes ``On``."""
-    rest = _UnreadableSwitchRest(switch="Off")
-    await _device(rest, tmp_path).write_safe_state()
+@pytest.mark.parametrize("rest_type", ["unreadable", "unavailable"])
+async def test_safe_state_refuses_on_for_an_unreadable_switch(tmp_path, rest_type) -> None:
+    """Q2 (#426): every On needs a readable switch; the window is still restored."""
+    rest = (
+        _UnreadableSwitchRest(switch="Off") if rest_type == "unreadable"
+        else FakeRest(switch="unavailable")
+    )
+    lines = await _device(rest, tmp_path).write_safe_state()
 
-    assert _options(rest) == ["On"]
+    assert _options(rest) == []
+    assert lines[0].startswith("[WARNING]") and "refused" in lines[0]
+    assert lines[1].startswith("[APPLIED]")
+
+
+@pytest.mark.asyncio
+async def test_safe_window_writes_only_the_charge_window(tmp_path) -> None:
+    rest = FakeRest(switch="Off")
+    lines = await _device(rest, tmp_path).write_safe_window()
+
+    assert _options(rest) == []
+    assert _register_writes(rest) == [(43143, _SAFE_BLOCK)]
+    assert len(lines) == 1 and lines[0].startswith("[APPLIED]")
 
 
 @pytest.mark.asyncio

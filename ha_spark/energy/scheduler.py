@@ -797,6 +797,22 @@ def hold_reconcile_intent(
     return replace(intent, holds=trusted_holds)
 
 
+def _shutdown_hold_reason(
+    trusted_holds: tuple[tuple[datetime, datetime], ...] | None, now: datetime
+) -> str | None:
+    """Why a clean shutdown must leave the switch Off, or ``None`` to relinquish (#426)."""
+    store = execution_context().authority
+    records = store.state.holds if store is not None and store.state is not None else ()
+    if any(h.cause == "ev" and not h.pending_release for h in records):
+        return "an EV hold is recorded"
+    ends = [end for _, end in trusted_holds or ()] + [
+        h.trusted_end for h in records if h.cause == "dispatch" and h.trusted_end is not None
+    ]
+    if any(now < end for end in ends):
+        return "a known dispatch hold is still ahead"
+    return None
+
+
 class ReconcileResult(NamedTuple):
     """One reconcile pass: its action lines, the caller's trusted hold set after it,
     and whether it relinquished control (so the next replan re-applies the plan)."""
@@ -1813,29 +1829,43 @@ async def _run_forever(
             await stop_server(server, serve_task)
         if port_server is not None and port_task is not None:
             await stop_server(port_server, port_task)
-        # One best-effort relinquish on a clean shutdown (#143 §5). No plan means
-        # ha-spark never steered, so there is nothing to hand back. Same rule as
-        # the per-minute relinquish: never while a known hold end is still ahead,
-        # or every restart mid-dispatch would release the hold and drain the
-        # battery into the car until the next process holds it again (#143 §1).
+        # One best-effort relinquish on a clean shutdown (#143 §5), in Optimise
+        # only: the charging gate is "on" in no other mode, so Protect, Observe
+        # and unknown authority write nothing (#426). No plan means ha-spark never
+        # steered, so there is nothing to hand back. A held switch stays Off while
+        # an EV hold is recorded or a known dispatch end is still ahead, or every
+        # restart mid-hold would drain the battery into the car until the next
+        # process holds it again (#143 §1); only the charge window is restored,
+        # and the next start reconciles the hold first.
         # SIGKILL/OOM never reach here; that is the runbook's (#131/#134).
         if last_plan is not None and _real_write_mode(settings):
             try:
                 shutdown_at = datetime.now(load_timezone(settings.timezone))
-                if last_trusted_holds and shutdown_at < max(
-                    end for _, end in last_trusted_holds
-                ):
-                    log.warning(
-                        "Not relinquishing control on shutdown: a known dispatch hold "
-                        "is still ahead"
-                    )
-                else:
-                    async with HomeAssistantRest(
-                        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
-                    ) as rest:
+                kept = _shutdown_hold_reason(last_trusted_holds, shutdown_at)
+                async with HomeAssistantRest(
+                    settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+                ) as rest:
+                    device = inverter_device(settings, rest)
+                    if kept is not None:
+                        log.warning(
+                            "[WARNING] keeping the hold on shutdown: %s; restoring the "
+                            "charge window only", kept,
+                        )
+                        lines = await device.write_safe_window()
+                    else:
                         log.warning("[WARNING] relinquishing control on shutdown")
-                        for line in await inverter_device(settings, rest).write_safe_state():
-                            log.info(line)
+                        lines = await device.write_safe_state()
+                    for line in lines:
+                        log.info(line)
+                    if kept is not None:
+                        try:
+                            await send_notification(
+                                settings, rest, "ha-spark hold kept on shutdown",
+                                f"ha-spark stopped with the inverter held Off: {kept}. "
+                                "It is reconciled on the next start.",
+                            )
+                        except Exception:  # noqa: BLE001 - a notice never blocks shutdown
+                            log.warning("Shutdown hold notification failed")
             except Exception:
                 log.exception("Writing the safe state on shutdown failed")
         context.authority = None
