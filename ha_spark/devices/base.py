@@ -1,6 +1,7 @@
 """Device-driver core: capabilities and the device protocol."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, time
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -19,6 +20,28 @@ class Capability(StrEnum):
     CHARGE_WINDOW = "charge_window"   # write window + target SOC (floor)
     CHARGE_RATE = "charge_rate"       # settable live charge power (W) — rate tier
     STOP_DISCHARGE = "stop_discharge" # hold/stop-discharge during a dispatch
+
+
+@dataclass(frozen=True)
+class HoldContract:
+    """Model-qualified hold semantics; evidence policy is implemented by later tickets."""
+
+    hold: str
+    release: str
+    read_back: str
+    evidence_freshness: str
+
+
+@dataclass(frozen=True)
+class HoldValidation:
+    identity: dict[str, int | None]
+    identity_source: str
+    contract: HoldContract | None
+    reason: str
+
+    @property
+    def validated(self) -> bool:
+        return self.contract is not None
 
 
 @runtime_checkable
@@ -40,6 +63,8 @@ class Device(Protocol):
 
     capabilities: frozenset[Capability]
 
+    async def hold_validation(self) -> HoldValidation: ...
+    async def resident_diagnostic(self) -> dict[str, object]: ...
     async def apply(self, intent: ChargeIntent) -> list[ActionLine]: ...
     async def reconcile_holds(self, intent: ChargeIntent, now: datetime) -> list[ActionLine]: ...
     async def write_safe_state(self) -> list[ActionLine]: ...

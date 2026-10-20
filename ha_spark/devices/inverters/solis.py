@@ -46,7 +46,9 @@ from datetime import UTC, datetime, time, timedelta
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypeVar
 from zoneinfo import ZoneInfo
 
-from ha_spark.devices.base import Capability, fmt_hhmm
+import httpx
+
+from ha_spark.devices.base import Capability, HoldContract, HoldValidation, fmt_hhmm
 from ha_spark.devices.execution import (
     ExecutionContext,
     Ownership,
@@ -194,6 +196,81 @@ class SolisDevice:
         self._rest = rest
         self._hub = settings.solis_control_hub
         self._slave = settings.solis_modbus_slave
+
+    async def _diagnostic_number(self, field: str) -> float | None:
+        """Read an overlay value without refreshing, writing, or substituting config."""
+        try:
+            state = await self._rest.get_state(self._sensor(field))
+            value = float(state.state)
+            return value if math.isfinite(value) else None
+        except (httpx.HTTPError, ValueError, TypeError):
+            return None
+
+    async def hold_validation(self) -> HoldValidation:
+        """Qualify this model, never the Solis driver family as a whole."""
+        identity: dict[str, int | None] = {}
+        for address, field in ((33000, "model_word"), (35000, "inverter_type_definition"),
+                               (33289, "tou_version")):
+            value = await self._diagnostic_number(field)
+            identity[str(address)] = (
+                int(value) if value is not None and value.is_integer() and 0 <= value <= 65535
+                else None
+            )
+        words = ", ".join(
+            f"{address}=0x{value:04X}" if value is not None else f"{address}=unknown"
+            for address, value in identity.items()
+        )
+        source = "inverter read"
+        reason = "validated reference identity"
+        mismatch = any(identity[key] is not None and identity[key] != expected
+                       for key, expected in (("33000", 0x0026), ("35000", 0x2031)))
+        if mismatch:
+            reason = f"not validated: Solis model differs from reference ({words})"
+        elif identity["33289"] == 0xAA55:
+            reason = f"not validated: V2 TOU is incompatible with V1 slots ({words})"
+        elif identity["33000"] is None or identity["35000"] is None:
+            source = "owner confirmation" if self._settings.solis_model_confirmed else "unreadable"
+            reason = ("validated reference identity by owner confirmation" if
+                      self._settings.solis_model_confirmed else
+                      f"not validated: identity unreadable, no owner confirmation ({words})")
+        contract = None
+        readable = identity["33000"] is not None and identity["35000"] is not None
+        if (not mismatch and identity["33289"] != 0xAA55
+                and (readable or self._settings.solis_model_confirmed)):
+            contract = HoldContract(
+                hold="whole-inverter power switch Off; preserve resident schedule",
+                release="power switch On only after readable pre-read; restore confirmed schedule",
+                read_back="verify switch, slot 1 and charge current through HA",
+                evidence_freshness=(
+                    "fresh source reports required; cached state alone is insufficient"
+                ),
+            )
+        return HoldValidation(identity, source, contract, reason)
+
+    async def resident_diagnostic(self) -> dict[str, object]:
+        """Read slot 1, 43141 and the configured switch; unknown never means configured."""
+        parts: list[int] = []
+        for index, field in enumerate(_WINDOW_FIELDS[:4]):
+            value = await self._diagnostic_number(field)
+            maximum = 23 if index % 2 == 0 else 59
+            if value is None or not value.is_integer() or not 0 <= value <= maximum:
+                break
+            parts.append(int(value))
+        window = (f"{parts[0]:02d}:{parts[1]:02d}–{parts[2]:02d}:{parts[3]:02d}"
+                  if len(parts) == 4 else "unknown")
+        current = await self._diagnostic_number("timed_charge_current")
+        switch = "unknown"
+        entity = self._config.entities.get("power_switch", "")
+        if entity:
+            try:
+                state = (await self._rest.get_state(entity)).state.strip().lower()
+                if state in {"on", "off"}:
+                    switch = state
+            except httpx.HTTPError:
+                pass
+        return {"charge_window": window,
+                "charge_current_a": current if current is not None and current >= 0 else "unknown",
+                "power_switch": switch}
 
     # --- planning ---
 

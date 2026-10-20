@@ -35,6 +35,30 @@ modbus:
     # refresh and observes the overlay with a fixed, bounded retry window before
     # it reports success or failure. 5 s is a reasonable balance against bus load.
     sensors:
+      # --- Model identity: FC04, unit 1 (set slave to your configured unit).
+      # Read-only probe 2026-10-19: reference requires BOTH 0x0026 / 0x2031.
+      # Raw integers; identity changes rarely, so poll slowly.
+      - name: Solis Control Model Word
+        slave: 1
+        address: 33000
+        input_type: input
+        data_type: uint16
+        scan_interval: 3600
+
+      - name: Solis Control Inverter Type Definition
+        slave: 1
+        address: 35000
+        input_type: input
+        data_type: uint16
+        scan_interval: 3600
+
+      - name: Solis Control TOU Version
+        slave: 1
+        address: 33289
+        input_type: input
+        data_type: uint16
+        scan_interval: 3600
+
       # --- Work mode: read-only input register. Bit 5 (mask 32) == grid
       # charging permitted. ha-spark asserts this before a forced charge and
       # NEVER writes 33132.

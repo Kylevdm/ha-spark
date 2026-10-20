@@ -129,6 +129,7 @@ _OPTION_KEYS = frozenset(
         "ha_template_charge_needed_entity",
         # Inverter selector + AlphaESS control (Task 3).
         "inverter",
+        "solis_model_confirmed",
         "solis_control_hub",
         "solis_modbus_slave",
         "inverter_clock_tolerance_minutes",
@@ -510,6 +511,7 @@ class Settings(BaseSettings):
     # writes the timed-slot registers through (`modbus.write_register`) and reads
     # back via its `sensor.<hub>_*` entities. The window/current/work-mode
     # registers are fixed in the driver (docs/solis-control-modbus-overlay.yaml).
+    solis_model_confirmed: bool = False
     solis_control_hub: str = Field(default="solis_control")
     solis_modbus_slave: int = Field(default=1)
     # How far the inverter clock may disagree with the household clock before

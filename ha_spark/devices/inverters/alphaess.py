@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from ha_spark.devices.base import Capability, fmt_hhmm
+from ha_spark.devices.base import Capability, HoldValidation, fmt_hhmm
 from ha_spark.devices.execution import (
     ExecutionContext,
     Ownership,
@@ -46,6 +46,13 @@ class AlphaESSDevice:
         self._config = config
         self._settings = settings
         self._rest = rest
+
+    async def hold_validation(self) -> HoldValidation:
+        return HoldValidation({}, "unreadable", None, "no validated hold surface (#196)")
+
+    async def resident_diagnostic(self) -> dict[str, object]:
+        return {"charge_window": "unknown", "charge_current_a": "unknown",
+                "power_switch": "unknown"}
 
     def planned_rate_w(self, intent: ChargeIntent) -> float:
         return 0.0  # no rate control; the inverter self-regulates to the SOC target
