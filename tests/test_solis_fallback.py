@@ -81,6 +81,14 @@ def test_invalid_fallback_case_is_named(case: str, overrides: dict, expected: st
     assert expected in _reason(**overrides)
 
 
+@pytest.mark.parametrize("raw", ["24:00", "24:00:00", "2400", "T24:00"])
+def test_hour_24_is_not_midnight(raw: str) -> None:
+    """Python 3.14 parses hour 24 as 00:00; the validator must still refuse it."""
+    assert _reason(charge_window_start=raw) == (
+        f"charge_window_start '{raw}' is not a valid HH:MM time"
+    )
+
+
 def test_fallback_schedule_with_export_is_invalid() -> None:
     """The fallback must clear/never program discharge: export is refused."""
     result = validate_fallback_schedule(

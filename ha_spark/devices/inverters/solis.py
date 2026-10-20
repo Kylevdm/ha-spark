@@ -247,6 +247,9 @@ def validate_fallback_schedule(
             parsed = time.fromisoformat(raw)
         except ValueError:
             return f"charge_window_{side} '{raw}' is not a valid HH:MM time"
+        # Python 3.14 reads hour 24 as midnight; the clock face has no 24:00.
+        if raw.removeprefix("T").startswith("24"):
+            return f"charge_window_{side} '{raw}' is not a valid HH:MM time"
         # The household clock face the Slot 1 registers encode is naive whole
         # minutes: an offset-attached or sub-minute time is not a time on it.
         if parsed.tzinfo is not None or parsed.second or parsed.microsecond:
