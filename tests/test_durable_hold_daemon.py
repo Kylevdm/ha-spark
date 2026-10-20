@@ -21,6 +21,7 @@ from tests.test_scheduler import (
     _ev_status_state,
     _mock_power_switch,
     _plan,
+    _restore_schedule_confirmed,
 )
 
 NOW = datetime(2026, 6, 10, 21, 0, tzinfo=UTC)
@@ -111,6 +112,7 @@ async def test_ev_clearance_sequence_survives_restart_and_stale_resets_it(
 ):
     settings, store = episode(tmp_path, mode)
     switch = _mock_power_switch(monkeypatch, initial="Off")
+    _restore_schedule_confirmed(monkeypatch)
     reports = {"at": NOW}
     respx.get(_EV_STATUS_URL).mock(side_effect=lambda _: _ev_status_state(
         "Paused", at=reports["at"],
@@ -141,15 +143,17 @@ async def test_ev_clearance_sequence_survives_restart_and_stale_resets_it(
 
 @pytest.mark.parametrize("confirmed", [False, True])
 @respx.mock
-async def test_unconfirmed_on_is_not_retried_on_stale_dispatch(tmp_path, monkeypatch, confirmed):
+async def test_recorded_dispatch_retries_off_on_stale_dispatch(tmp_path, monkeypatch, confirmed):
+    """#443: an unconfirmed request retries its Off too; read-back confirms it."""
     settings, store = episode(tmp_path, "protect", "dispatch", confirmed=confirmed)
     switch = _mock_power_switch(monkeypatch, initial="On")
     stale_evidence()
     await scheduler.reconcile_tick(
         settings, _plan(replace(_INTENT, holds=(), hold_trusted=False)), NOW,
     )
-    assert switch["option"] == ("Off" if confirmed else "On")
-    assert store.state.holds[0].confirmed is confirmed
+    assert switch["option"] == "Off"
+    assert store.state.holds[0].confirmed
+
 
 
 @respx.mock

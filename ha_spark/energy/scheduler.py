@@ -773,7 +773,9 @@ def hold_reconcile_intent(
     "no dispatch", is evaluated against the last trusted hold set instead, so a
     hold still ends on its own known end time: no expiry timer, no stuck ``Off``.
     With no trusted set yet, durable records provide the dispatch end or an
-    already-cleared owned release. No picture and no record never writes On.
+    already-cleared owned release. An unconfirmed dispatch request counts here
+    (#443): its window can only retry the Off, because a release still needs a
+    confirmed owned record. No picture and no record never writes On.
     """
     if intent.hold_trusted:
         return intent
@@ -782,7 +784,7 @@ def hold_reconcile_intent(
         records = store.state.holds if store is not None and store.state is not None else ()
         recorded_dispatch = tuple(
             (h.started_at, h.trusted_end) for h in records
-            if h.cause == "dispatch" and h.confirmed and h.trusted_end is not None
+            if h.cause == "dispatch" and h.trusted_end is not None
         )
         if recorded_dispatch:
             return replace(intent, holds=recorded_dispatch)

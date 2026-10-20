@@ -322,17 +322,32 @@ async def test_export_is_programmed_on_the_tick_the_reconcile_turns_the_switch_o
 
 
 @pytest.mark.asyncio
-async def test_untrusted_soc_still_reconciles_but_blocks_charge_programming(tmp_path) -> None:
+async def test_untrusted_soc_still_holds_but_blocks_charge_programming(tmp_path) -> None:
+    rest = FakeRest(switch="On")
+    device = _device(rest, tmp_path)
+    bad_soc = replace(_soc(), status=SocStatus.UNAVAILABLE, value=None, raw_state="unavailable")
+    intent = _intent(soc=bad_soc, holds=(_window(-10),))
+    lines = await _reconcile(device, intent) + await device.apply(intent)
+
+    assert _options(rest) == ["Off"]
+    assert not any(call[0] == "modbus" for call in rest.calls)
+    assert any(line.startswith("[BLOCKED]") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_untrusted_soc_keeps_an_optimise_hold_until_the_plan_verifies(tmp_path) -> None:
+    """#424: an Optimise release restores a verified plan; a dead SoC can't give one."""
     rest = FakeRest(switch="Off")
     device = _device(rest, tmp_path)
     _seed_owned_hold(device)
+    records = device._execution.authority.state.holds
     bad_soc = replace(_soc(), status=SocStatus.UNAVAILABLE, value=None, raw_state="unavailable")
-    intent = _intent(soc=bad_soc)
-    lines = await _reconcile(device, intent) + await device.apply(intent)
+    lines = await _reconcile(device, _intent(soc=bad_soc))
 
-    assert _options(rest) == ["On"]
+    assert _options(rest) == []
     assert not any(call[0] == "modbus" for call in rest.calls)
-    assert any(line.startswith("[BLOCKED]") for line in lines)
+    assert device._execution.authority.state.holds == records
+    assert any(line.startswith("[REFUSED]") and "SoC" in line for line in lines)
 
 
 @pytest.mark.parametrize(
