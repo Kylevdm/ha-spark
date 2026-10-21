@@ -980,7 +980,7 @@ async def reconcile_tick(
     ``previous``: only lines that changed since the last pass are logged. A
     per-minute pass that logged unconditionally would put 1440 identical lines a
     day into the add-on log — most of them ``[SKIP] ... (already set)``, or in
-    the default ``simulate`` mode a write that never happens — and bury the plan
+    Observe a write that never happens — and bury the plan
     and guard activity an operator actually reads it for.
 
     ``trusted_holds`` is the caller's last trusted dispatch hold set, substituted

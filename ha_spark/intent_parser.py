@@ -31,7 +31,7 @@ Offline, I can answer questions containing:
   soc / battery / state of charge       current battery state of charge
   solar / forecast                      served-day solar forecast
   strategy                              the configured charge strategy
-  mode / proactive                      the site operating mode
+  mode                                  the site operating mode
   window                                the off-peak charge window"""
 
 
