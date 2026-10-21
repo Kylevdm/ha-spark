@@ -4497,6 +4497,33 @@ async def test_overnight_exception_needs_fresh_resident_window_reports(
     assert ev_state.active is not excepted
 
 
+@respx.mock
+async def test_overnight_exception_caps_own_window_reports_at_12_hours(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#444: a max-age above 12 h never makes a 13 h old window field fresh."""
+    now = _WINDOW_NOW
+    _mock_power_switch(monkeypatch)
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Charging", at=now))
+    _mock_resident_window(time(23, 30), time(5, 30), at=now - timedelta(hours=13), clock_at=now)
+    _mock_battery_power("-2851", now)
+    ev_state = scheduler.EvHoldState()
+
+    await scheduler.reconcile_tick(
+        _ev_hold_settings(
+            authority_mode="observe",
+            battery_power_entity="sensor.battery_power",
+            battery_power_discharge_sign="positive",
+            battery_power_max_age_seconds=86400,
+        ),
+        _plan(replace(_INTENT, holds=())),
+        now,
+        ev_hold_state=ev_state,
+    )
+
+    assert ev_state.active is True
+
+
 @pytest.mark.parametrize("bad", ["unavailable", "future", "clock-unavailable"])
 @respx.mock
 async def test_overnight_exception_off_when_one_window_report_is_unusable(

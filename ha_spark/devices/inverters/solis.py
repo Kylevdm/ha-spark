@@ -80,7 +80,7 @@ from ha_spark.energy.export_notifications import (
 )
 from ha_spark.energy.export_store import ExportEventStore
 from ha_spark.energy.models import ChargeIntent, ExportIntent, window_hours
-from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+from ha_spark.energy.soc_integrity import MAX_UNCHANGED, SocMeasurement, SocStatus
 from ha_spark.logging import get_logger
 
 if TYPE_CHECKING:  # avoid an import cycle: config imports devices.base at runtime
@@ -380,6 +380,8 @@ class SolisDevice:
         max_age = self._settings.battery_power_max_age_seconds
         if max_age is None:
             return None
+        # A field older than MAX_UNCHANGED is stale even under a longer max-age.
+        max_age = min(max_age, MAX_UNCHANGED.total_seconds())
         sibling: datetime | None = None
         try:
             clock = await self._rest.get_state(clock_entity(self._hub))

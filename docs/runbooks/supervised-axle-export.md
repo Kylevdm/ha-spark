@@ -4,7 +4,7 @@ Human-present procedure for the first production-path Axle export event. This
 runbook covers the prototype in [#128](https://github.com/Kylevdm/ha-spark/issues/128)
 and the implementation in [#133](https://github.com/Kylevdm/ha-spark/issues/133).
 
-This is supervised hardware control. The operator enables real control shortly
+This is supervised hardware control. The operator requests Optimise shortly
 before the event, watches the inverter and household telemetry throughout, and
 returns ha-spark to Observe after verified cleanup. Do not use a parallel HA
 automation or enter an event window by hand.
@@ -20,7 +20,7 @@ automation or enter an event window by hand.
 - [ ] The incumbent automations that write the Solis power switch or timed
       discharge window are disabled for this run.
 - [ ] Clock check steps 1 to 3 pass in Observe. The sync (steps 4 and 5)
-      runs right after real control is enabled, before the window arms (see
+      runs right after Optimise is requested, before the window arms (see
       [Clock check](#clock-check)). The configured `timezone` is the
       **household clock**, and everything else is checked against it. Slot 1
       stores a local wall-clock window with no date, which the inverter fires
@@ -159,8 +159,8 @@ notice is not evidence that cleanup succeeded; verify the Slot 1 read-back.
   the next trusted plan either continues it or performs verified cleanup.
 - If the process is intentionally stopped after the event, keep writes
   authorised long enough to verify the safe state. A forced process kill may
-  skip cleanup, so a person must check the overlay before real control is
-  enabled again.
+  skip cleanup, so a person must check the overlay before requesting Optimise
+  again.
 
 ## Evidence record
 

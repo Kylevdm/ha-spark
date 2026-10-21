@@ -731,7 +731,7 @@ every hardware decision.
    successful command only confirms Home Assistant accepted the send.
 5. `ha-spark plan` prints tonight's plan without applying it.
 6. Leave the add-on running; it recomputes the plan every half-hour. When the
-   simulated decisions look right, disable conflicting automations, confirm
+   Observe plan looks right, disable conflicting automations, confirm
    the Solis overlay and entity reads are healthy before enabling Optimise.
    Follow the handover procedure linked above.
 
