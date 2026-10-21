@@ -446,6 +446,27 @@ signals: `occupancy_home_frac` (from `person_entities`), `heatpump_kwh` (from
 Each is optional; leave its entity unset to skip it. If an entity can't be
 read, ha-spark logs a warning and skips that signal only.
 
+### Readiness recording
+
+The daemon captures half-hour slot intent and the import, export and event rates
+from the plan revision in force on the boundary tick. The ledger includes the
+operating mode, forecast model and config generation, battery parameters, checked
+start energy, charge-window fraction and current, export, hold intent and V2L
+availability. Untrusted hold evidence is recorded as unknown; an untrusted SoC
+leaves the energy estimate missing, never zero.
+
+Records are write-once in the existing SQLite database. Mid-slot replans do not
+replace them. The first daemon tick in a slot can capture it only during its
+first minute; a missed boundary, absent plan or missing horizon slot stays a gap,
+including after a restart. Guard samples are recorded only inside the charging
+window in Observe, with invalid reads retained for coverage. Recording uses reads
+only, never changes authority, and failures do not interrupt control-loop work.
+
+`ha-spark readiness slots [--days N]` lists recorded starts and gaps by household-local
+day (default: seven days including today, through the current slot). The diagnostic
+is read-only and does not require a running daemon or HA connection. Readiness
+recording is evidence collection, not permission to change the operating mode.
+
 ### Tariff
 
 `rate_offpeak_gbp_kwh`, `rate_peak_gbp_kwh`, `rate_export_gbp_kwh`: the rates

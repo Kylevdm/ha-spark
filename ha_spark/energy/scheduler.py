@@ -64,6 +64,10 @@ releases owned holds only for Observe before committing the target mode.
 
 With `inverter_clock_dst_sync` on, the first tick after the household zone's
 UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
+
+Readiness captures the revision and rates in force on each boundary tick, in
+all modes, and separate read-only guard evidence in Observe. Missed boundaries
+stay gaps; mid-slot requests never rewrite a slot. Recording failures are isolated.
 """
 
 from __future__ import annotations
@@ -74,6 +78,7 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
 from typing import NamedTuple
+from uuid import uuid4
 
 import httpx
 import uvicorn
@@ -133,6 +138,7 @@ from ha_spark.energy.publish import (
     publish_soc_integrity,
     republish_last,
 )
+from ha_spark.energy.readiness_ledger import PlanRevision, record_guard, record_slot, slot_start
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor, SocMonitorSnapshot, observe_soc
@@ -259,6 +265,7 @@ class RunResult(NamedTuple):
     apply_lines: tuple[str, ...] = ()
     text: str = ""
     action_lines: tuple[str, ...] = ()
+    revision: PlanRevision | None = None
 
 
 def _apply_failed(lines: list[str]) -> bool:
@@ -348,6 +355,10 @@ async def run_once(
     guard, reconcile, fallback, DST and shutdown entry points. Per-call REST
     clients and driver instances therefore never create independent bus locks.
     """
+    context = execution or execution_context()
+    generation = context.planned_generation.get()
+    if generation is None:
+        generation = context.config_generation
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
@@ -363,8 +374,18 @@ async def run_once(
             inverter_device(settings, rest) if execution is None
             else inverter_device(settings, rest, execution=execution)
         )
-        ev_hold_state = ev_hold_state or EvHoldState()
         now = datetime.now(load_timezone(settings.timezone))
+        revision = None
+        try:
+            revision = PlanRevision(
+                uuid4().hex, now.astimezone(UTC), run,
+                device.planned_rate_w(plan.charge_intent)
+                if Capability.CHARGE_RATE in device.capabilities else None,
+                generation,
+            )
+        except Exception:
+            log.exception("Readiness plan provenance unavailable")
+        ev_hold_state = ev_hold_state or EvHoldState()
         evidence_freshness = getattr(inputs, "evidence_freshness", None) or {}
         ev_hold_active = await _observe_ev_hold(
             ev_hold_state,
@@ -428,6 +449,7 @@ async def run_once(
         plan, applied_plan, tuple(apply_lines),
         format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz),
         tuple(lines),
+        revision,
     )
 
 
@@ -1826,6 +1848,8 @@ async def _run_forever(
         log.exception("Republishing last known states failed")
     last_run_slot: datetime | None = None
     last_plan: ChargePlan | None = None
+    last_revision: PlanRevision | None = None
+    last_readiness_slot: datetime | None = None
     # The plan known resident on the device: the baseline `needs_apply`
     # compares against, `None` when unknown after a failed apply or run (#168).
     # `last_plan` is the latest computed plan, applied or skipped.
@@ -1885,6 +1909,7 @@ async def _run_forever(
                     monitor.invalidate_fallback_confirmation()
                 # Never reuse a previous plan's command across a hot reload.
                 last_plan = None
+                last_revision = None
                 last_applied_plan = None
                 last_trusted_holds = None
                 target_w = None
@@ -2082,6 +2107,7 @@ async def _run_forever(
                     state.set_plan(plan)
                     last_run_slot = _slot_start(now)
                     last_plan = plan
+                    last_revision = result.revision
                     reapply = False
                     if plan.charge_intent is not None and plan.charge_intent.hold_trusted:
                         last_trusted_holds = plan.charge_intent.holds
@@ -2158,7 +2184,21 @@ async def _run_forever(
                     )
                 last_reconcile_lines, last_trusted_holds = reconciled[:2]
                 reapply = reapply or reconciled.relinquished
+            if slot_start(now) != last_readiness_slot:
+                last_readiness_slot = slot_start(now)
+                await record_slot(
+                    settings.db_path, now, last_revision,
+                    authority.state.committed_mode
+                    if authority.known and authority.state is not None else "authority_unknown",
+                    measurement,
+                    ev_hold_active=ev_hold_state.active,
+                )
             if guard_enabled and in_window(now.time(), window_start, window_end):
+                await record_guard(
+                    settings, now, last_revision,
+                    authority.state.committed_mode
+                    if authority.known and authority.state is not None else "authority_unknown",
+                )
                 try:
                     # While activating, a fresh plan may already be charging: the
                     # guard's reductions run under the activation's charging grant.
