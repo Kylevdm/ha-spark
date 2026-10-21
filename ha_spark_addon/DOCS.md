@@ -122,13 +122,21 @@ other processes or external Home Assistant automations.
 On the Solis, ha-spark re-reads the dispatch state and checks
 `inverter_power_switch_entity` every minute, separately from the half-hourly
 plan. It turns the switch `Off` during an active dispatch hold and back `On`
-only to release a hold it recorded itself. When `ev_status_entity` is configured, Charging, Boosting and
-Delivering also hold the switch `Off` outside the overnight charge window,
-even without a matching dispatch. Five consecutive clear reads release that
-hold; eco+ Diverting does not start one. Unreadable EV status is ignored for
-the hold and appears as a warning in `ha-spark health`. With real control
-enabled, the next minute's check corrects a restart, a failed write, or a
-switch change made outside ha-spark. When ha-spark gives up control, including
+only to release a hold it recorded itself. When `ev_status_entity` is configured, a fresh
+Charging, Boosting or Delivering report also holds the switch `Off`, even
+without a matching dispatch. Inside the overnight charge window a new EV hold
+doesn't start when fresh `battery_power_entity` evidence shows the battery
+charging or idle and the inverter's resident slot-1 charge window reads back
+fresh. The window's overlay sensors report only on change, so an unchanged
+window counts as fresh while the hub's `sensor.<hub>_inverter_clock` reports
+within `battery_power_max_age_seconds` (for up to 12 hours since the window
+last reported). Without that clock sensor, or with a stale window, the hold
+applies. Five advancing fresh not-charging reports release an EV hold, and
+the overnight window never releases one; eco+ Diverting does not start one.
+Stale or unreadable EV status neither starts nor releases a hold and appears
+as a warning in `ha-spark health`. In Protect or Optimise, the next minute's
+check corrects a restart, a failed write, or a switch change made outside
+ha-spark. When ha-spark gives up control, including
 during a clean shutdown, it writes a safe state: switch `On`, the configured
 cheap charge window (default `23:30`-`05:30`), and an empty discharge window
 (`00:00`-`00:00`) unless a verified export is still running. The switch is

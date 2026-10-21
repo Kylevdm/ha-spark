@@ -1,5 +1,6 @@
 """Read-only model qualification and resident schedule diagnostics (#418)."""
 import json
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -89,8 +90,9 @@ async def test_resident_readback_and_independent_unknowns():
         "select.power": "Off",
     }
     _, resident = await inspect(values)
-    assert resident == {"charge_window": "01:15–04:45", "charge_current_a": 12.3,
-                        "power_switch": "off"}
+    # No report times: the window reads back but is not fresh (#444).
+    assert resident == {"charge_window": "01:15–04:45", "charge_window_fresh": "no",
+                        "charge_current_a": 12.3, "power_switch": "off"}
     values["sensor.solis_control_timed_charge_start_minutes"] = "unavailable"
     values["sensor.solis_control_timed_charge_current"] = "NaN"
     values["select.power"] = "unavailable"
@@ -162,3 +164,24 @@ async def test_transport_error_reads_as_unknown():
             resident = await device.resident_diagnostic()
     assert not validation.validated
     assert set(resident.values()) == {"unknown"}
+
+
+async def test_resident_diagnostic_says_when_the_window_reports_fresh():
+    """#444: the diagnostic may show a cached window, but says whether it is fresh."""
+    now = datetime.now(UTC).isoformat()
+    window = {"timed_charge_start_hours": 1, "timed_charge_start_minutes": 15,
+              "timed_charge_end_hours": 4, "timed_charge_end_minutes": 45,
+              "inverter_clock": "2026-06-11 01:15:00"}
+    settings = Settings(ha_url="http://ha.test", ha_token="fixture", inverter="solis")
+    with respx.mock(assert_all_called=False) as mock:
+        for field, value in window.items():
+            mock.get(f"http://ha.test/api/states/sensor.solis_control_{field}").mock(
+                return_value=httpx.Response(200, json={
+                    "entity_id": field, "state": str(value), "last_reported": now,
+                }))
+        mock.get(url__regex=r"http://ha.test/api/states/.*").mock(
+            return_value=httpx.Response(404))
+        async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+            resident = await inverter_device(settings, rest).resident_diagnostic()
+    assert resident["charge_window"] == "01:15–04:45"
+    assert resident["charge_window_fresh"] == "yes"
