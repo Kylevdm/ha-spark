@@ -208,7 +208,7 @@ async def test_hourly_only_spread_is_flagged(measured, monkeypatch):
     day = await snapshot_day(settings, START.date())
     assert day.qualifying, day.reasons
     for row in day.slots[:2]:
-        assert row.components["grid_import"].kwh == 1
+        assert row.components["grid_import"].kwh == pytest.approx(1)
         assert row.components["grid_import"].provenance == "hourly_spread"
 
 
