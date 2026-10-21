@@ -10,25 +10,20 @@ import respx
 
 from ha_spark.api.server import AppState
 from ha_spark.authority import AuthorityStore, HoldDevice, HoldRecord, Transition
-from ha_spark.config import ConfigError, validate_options_document
+from ha_spark.config import ConfigError
 from ha_spark.devices import inverter_device
 from ha_spark.devices.execution import Ownership, WriteGate, execution_context
 from ha_spark.energy.scheduler import notify_remapped_holds
 from ha_spark.ha.rest import HomeAssistantRest
-from tests.authority_helpers import seed_authority
+from tests.authority_helpers import seed_authority, seed_settings
 from tests.test_solis_power_switch import FakeRest, _intent, _now, _window
 
 
 def app_state(tmp_path):
-    path = tmp_path / "options.json"
-    path.write_text(json.dumps({
+    service = seed_settings(tmp_path, {
         "solis_fallback_current_a": 20, "inverter_power_switch_entity": "select.old",
-    }))
-
-    def reload():
-        return validate_options_document(json.loads(path.read_text()))
-
-    return AppState(reload(), path, reload=reload)
+    })
+    return AppState(service.settings, service.options_path, settings_service=service)
 
 
 async def test_device_save_fences_previously_planned_action(tmp_path):
@@ -37,7 +32,7 @@ async def test_device_save_fences_previously_planned_action(tmp_path):
     seed_authority(state.settings, "optimise")
     rest = FakeRest()
     device = inverter_device(state.settings, rest)
-    state.apply_options({"solis_modbus_slave": 2})
+    state.apply_options({"solis_modbus_slave": 2}, state.settings_service.revision, "seed")
     line = await device.set_charge_rate(1000)
     assert line.startswith("[REFUSED] stale config")
     assert not rest.calls
@@ -52,7 +47,7 @@ async def test_non_fencing_save_keeps_planned_action(tmp_path):
     seed_authority(state.settings, "optimise")
     rest = FakeRest()
     device = inverter_device(state.settings, rest)
-    state.apply_options({"notify_service": "notify.phone"})
+    state.apply_options({"notify_service": "notify.phone"}, state.settings_service.revision, "seed")
     line = await device.set_charge_rate(1000)
     assert not line.startswith("[REFUSED]")
     assert rest.calls
@@ -73,26 +68,22 @@ def test_fallback_invalid_save_is_rejected_only_when_required(tmp_path, updates,
     settings = state.settings
     if mode in {"optimise", "unknown"}:
         with pytest.raises(ConfigError):
-            state.apply_options(updates)
+            state.apply_options(updates, state.settings_service.revision, "seed")
         assert state.options_path.read_bytes() == original
         assert state.settings is settings
     else:
-        state.apply_options(updates)
+        state.apply_options(updates, state.settings_service.revision, "seed")
         assert state.options_path.read_bytes() != original
 
 
 def test_unknown_authority_still_saves_an_install_without_a_fallback(tmp_path):
-    path = tmp_path / "options.json"
-    path.write_text(json.dumps({"inverter_power_switch_entity": "select.old"}))
-
-    def reload():
-        return validate_options_document(json.loads(path.read_text()))
-
-    state = AppState(reload(), path, reload=reload)
+    service = seed_settings(tmp_path, {"inverter_power_switch_entity": "select.old"})
+    path = service.data_dir / "ha_spark_config.json"
+    state = AppState(service.settings, service.options_path, settings_service=service)
     store = seed_authority(state.settings, "observe")
     store.store_path.unlink()
-    state.apply_options({"notify_service": "notify.phone"})
-    assert json.loads(path.read_text())["notify_service"] == "notify.phone"
+    state.apply_options({"notify_service": "notify.phone"}, state.settings_service.revision, "seed")
+    assert json.loads(path.read_text())["settings"]["notify_service"] == "notify.phone"
 
 
 async def test_remapped_hold_keeps_identity_and_blocks_new_mapping(tmp_path):
@@ -104,7 +95,8 @@ async def test_remapped_hold_keeps_identity_and_blocks_new_mapping(tmp_path):
     record = HoldRecord(cause="ev", started_at=datetime.now(UTC), device=identity,
                         confirmed=True)
     store.save_holds((record,))
-    state.apply_options({"inverter_power_switch_entity": "select.new"})
+    state.apply_options({"inverter_power_switch_entity": "select.new"},
+                        state.settings_service.revision, "seed")
     rest = FakeRest()
     with execution_context().planning():
         line = await inverter_device(state.settings, rest).set_charge_rate(1000)
@@ -142,7 +134,7 @@ async def test_save_during_prerequisite_read_fences_write(tmp_path):
     class SavingRest(FakeRest):
         async def get_state(self, entity_id):
             result = await super().get_state(entity_id)
-            state.apply_options({"solis_modbus_slave": 2})
+            state.apply_options({"solis_modbus_slave": 2}, state.settings_service.revision, "seed")
             return result
 
     rest = SavingRest()
@@ -160,7 +152,9 @@ def test_activating_optimise_also_validates_fallback(tmp_path):
     )}))
     original = state.options_path.read_bytes()
     with pytest.raises(ConfigError, match="solis_fallback_current_a"):
-        state.apply_options({"solis_fallback_current_a": None})
+        state.apply_options(
+            {"solis_fallback_current_a": None}, state.settings_service.revision, "seed",
+        )
     assert state.options_path.read_bytes() == original
 
 
@@ -174,7 +168,8 @@ async def test_remap_notice_once_across_restart(tmp_path):
                           hub=state.settings.solis_control_hub,
                           slave=state.settings.solis_modbus_slave),
     ),))
-    state.apply_options({"inverter_power_switch_entity": "select.new"})
+    state.apply_options({"inverter_power_switch_entity": "select.new"},
+                        state.settings_service.revision, "seed")
     route = respx.post("http://ha.test/api/services/persistent_notification/create").mock(
         return_value=httpx.Response(200, json=[])
     )
@@ -202,10 +197,10 @@ def test_optimise_rejects_a_save_that_drops_the_fallback_inverter(tmp_path, mode
     original = state.options_path.read_bytes()
     if mode == "optimise":
         with pytest.raises(ConfigError, match="inverter configuration"):
-            state.apply_options({"inverter": "alphaess"})
+            state.apply_options({"inverter": "alphaess"}, state.settings_service.revision, "seed")
         assert state.options_path.read_bytes() == original
     else:
-        state.apply_options({"inverter": "alphaess"})
+        state.apply_options({"inverter": "alphaess"}, state.settings_service.revision, "seed")
         assert state.settings.devices[0].driver == "alphaess"
 
 
@@ -219,7 +214,7 @@ async def test_replacing_the_held_driver_counts_as_a_remap(tmp_path):
                           hub=state.settings.solis_control_hub,
                           slave=state.settings.solis_modbus_slave),
     ),))
-    state.apply_options({"inverter": "alphaess"})
+    state.apply_options({"inverter": "alphaess"}, state.settings_service.revision, "seed")
     gate = WriteGate(execution_context())
     with execution_context().planning():
         mode = gate.mode_for(Ownership.PROTECTION, state.settings.devices[0], state.settings)

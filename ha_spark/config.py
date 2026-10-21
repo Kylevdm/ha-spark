@@ -3,13 +3,14 @@
 ha-spark targets the Home Assistant add-on runtime. In add-on mode the HA REST
 and WebSocket endpoints are reached through the Supervisor proxy
 (``http://supervisor/core/api`` / ``ws://supervisor/core/websocket``) and
-authenticated with ``SUPERVISOR_TOKEN``; user-exposed options come from
-``/data/options.json``. For local development a standalone escape hatch is kept:
+authenticated with ``SUPERVISOR_TOKEN``; owner inputs come from the committed
+settings document and secrets file. For local development a standalone escape hatch is kept:
 set ``HA_URL`` + ``HA_TOKEN`` and the same code paths talk to an HA instance
 directly.
 
-Settings load (in precedence order) from add-on options (``/data/options.json``),
-environment variables, a local ``.env`` file, and built-in defaults.
+The settings service loads the committed pair, or previews legacy options on
+first start. Environment variables and a local ``.env`` still supply bootstrap
+values and defaults until the field-classification cutover.
 """
 
 from __future__ import annotations
@@ -723,7 +724,7 @@ def actuation_settings_changed(previous: Settings, current: Settings) -> bool:
         "solis_control_hub", "solis_modbus_slave", "solis_fallback_current_a",
         "max_charge_current_a", "battery_voltage_v", "battery_discharge_ceiling_kw",
         "dno_export_limit_kw", "supply_max_current_a", "supply_voltage_v",
-        "min_soc", "target_soc_cap", "alphaess_serial", "ha_url", "db_path",
+        "min_soc", "target_soc_cap", "alphaess_serial", "ha_url",
     }
     fields.update(name for name in Settings.model_fields if name.endswith("_entity"))
     return any(getattr(previous, name) != getattr(current, name) for name in fields)
@@ -750,15 +751,10 @@ def validate_options_document(options: dict[str, Any]) -> Settings:
 
 
 def load_settings(*, validate: bool = True) -> Settings:
-    """Build :class:`Settings`, overlaying add-on options, and validate.
+    """Read configuration without writing; only the daemon initialises the store.
 
-    Add-on options (``/data/options.json``) take precedence over environment
-    variables. In add-on mode a ``SUPERVISOR_TOKEN`` is required; standalone/dev
-    mode (``HA_URL`` + ``HA_TOKEN`` set) bypasses that requirement.
-
-    ``validate=False`` skips the credential check (but keeps the options
-    overlay) for diagnostic paths like ``ha-spark health`` that must run and
-    report rather than fail fast.
+    ``validate=False`` skips credential and cross-field tariff checks for
+    diagnostics. Invalid persisted field values always raise a safe ConfigError.
     """
     from ha_spark.settings_service import SettingsService
 

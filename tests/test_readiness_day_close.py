@@ -8,7 +8,7 @@ import respx
 
 from ha_spark.energy import scheduler
 from ha_spark.energy.readiness_measurements import ReadinessDays
-from tests.authority_helpers import seed_authority
+from tests.authority_helpers import run_daemon, seed_authority
 from tests.test_authority_gate import daemon_ticks as control_ticks
 from tests.test_readiness_ledger import START, revision
 from tests.test_readiness_measurements import measured, seed  # noqa: F401
@@ -63,7 +63,7 @@ async def test_daemon_snapshots_previous_day_and_writes_no_hardware(
     respx.post(url__regex=r"http://ha.test/api/states/.*").respond(200, json={})
     stop = daemon_ticks(monkeypatch, [START + timedelta(days=1, hours=1)])
     with pytest.raises(stop):
-        await scheduler.run_forever(settings, poll_seconds=123)
+        await run_daemon(settings, poll_seconds=123)
     (day,) = await ReadinessDays(settings.db_path).days()
     assert day.local_date == START.date()
     assert day.qualifying, day.reasons
@@ -102,7 +102,7 @@ async def test_daemon_tick_survives_a_raising_day_close_ledger(
     respx.post(url__regex=r"http://ha.test/api/states/.*").respond(200, json={})
     stop = daemon_ticks(monkeypatch, [START + timedelta(days=1, hours=1)])
     with pytest.raises(stop):
-        await scheduler.run_forever(settings, poll_seconds=123)
+        await run_daemon(settings, poll_seconds=123)
     assert await ReadinessDays(settings.db_path).days() == []
     assert not any("/api/services/" in str(call.request.url) for call in respx.calls)
 
@@ -144,7 +144,7 @@ async def test_day_close_join_never_delays_the_guard_tick(
     respx.post(url__regex=r"http://ha.test/api/states/.*").respond(200, json={})
     stop = daemon_ticks(monkeypatch, [START + timedelta(days=1, hours=1)])
     with pytest.raises(stop):
-        await scheduler.run_forever(settings, poll_seconds=123)
+        await run_daemon(settings, poll_seconds=123)
     assert order == ["guard", "day_close"]
     (day,) = await ReadinessDays(settings.db_path).days()
     assert day.qualifying, day.reasons

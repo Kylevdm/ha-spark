@@ -7,7 +7,7 @@ import pytest
 from ha_spark.authority import load_authority
 from ha_spark.energy import scheduler, sources
 from ha_spark.energy.models import LoadForecast
-from tests.authority_helpers import seed_authority
+from tests.authority_helpers import run_daemon, seed_authority
 from tests.test_authority_gate import daemon_ticks, hardware_calls
 from tests.test_authority_gate import ha as ha
 from tests.test_authority_gate import settings as settings
@@ -29,7 +29,7 @@ async def test_protect_sustained_soc_failure_only_allows_clock(
     monkeypatch.setattr(scheduler, "sample_signals", AsyncMock())
     monkeypatch.setattr(scheduler.DstClockSync, "due", lambda *_: datetime.now(UTC))
     with pytest.raises(stop):
-        await scheduler.run_forever(settings, poll_seconds=123)
+        await run_daemon(settings, poll_seconds=123)
     writes = hardware_calls(ha)
     assert writes
     assert all(domain == "modbus" and service == "write_register" and data["address"] == 43000

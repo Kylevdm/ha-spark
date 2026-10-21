@@ -12,7 +12,7 @@ from ha_spark.config import Settings
 from ha_spark.daemon_channel import DaemonChannel, Pending, Request
 from ha_spark.energy import scheduler
 from ha_spark.energy.readiness_ledger import ReadinessLedger
-from tests.authority_helpers import seed_authority
+from tests.authority_helpers import run_daemon, seed_authority
 from tests.test_authority_gate import daemon_ticks
 from tests.test_readiness_ledger import START, revision
 
@@ -60,7 +60,7 @@ async def test_blocked_readiness_does_not_delay_next_guard_or_reconcile(tmp_path
     respx.post(url__regex=r"http://ha.test/api/states/.*").respond(200, json={})
     stop = daemon_ticks(monkeypatch, [START + timedelta(minutes=m) for m in (0, 1, 2)])
     with pytest.raises(stop):
-        await asyncio.wait_for(scheduler.run_forever(settings, poll_seconds=123), timeout=2)
+        await asyncio.wait_for(run_daemon(settings, poll_seconds=123), timeout=2)
     assert started.is_set()
     assert cancelled.is_set()
     assert calls.count("recorder") == 1
@@ -96,7 +96,7 @@ async def test_background_readiness_failure_is_logged_and_isolated(tmp_path, mon
     respx.post(url__regex=r"http://ha.test/api/states/.*").respond(200, json={})
     stop = daemon_ticks(monkeypatch, [START + timedelta(minutes=m) for m in (0, 1, 2)])
     with pytest.raises(stop):
-        await scheduler.run_forever(settings, poll_seconds=123)
+        await run_daemon(settings, poll_seconds=123)
     assert len(calls) >= 4  # a failed evaluation does not stop later background attempts
     for i in range(0, len(calls), 2):
         assert calls[i][0] == "record"
@@ -153,7 +153,7 @@ async def test_daemon_records_in_force_revision_after_mid_slot_request_and_faile
     ticks = [START + timedelta(minutes=m) for m in (0, 10, 30, 60)]
     stop = daemon_ticks(monkeypatch, [t.astimezone(ZoneInfo(settings.timezone)) for t in ticks])
     with pytest.raises(stop):
-        await scheduler.run_forever(settings, poll_seconds=123)
+        await run_daemon(settings, poll_seconds=123)
     rows = await ReadinessLedger(settings.db_path).slots(START, START + timedelta(hours=2))
     assert len(rows) == 3
     assert rows[0].issued_at == START

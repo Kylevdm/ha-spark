@@ -82,7 +82,10 @@ async def test_config_post_drops_retired_key_and_sidecar(tmp_path: Path, surface
     }
     if existing:
         path.write_text(json.dumps(legacy))
-    state = AppState(settings, path, reload=lambda: settings)
+    from tests.authority_helpers import seed_settings
+
+    service = seed_settings(tmp_path, settings=settings)
+    state = AppState(service.settings, path, settings_service=service)
     if surface == "mcp":
         from mcp.server.fastmcp.exceptions import ToolError
 
@@ -97,14 +100,13 @@ async def test_config_post_drops_retired_key_and_sidecar(tmp_path: Path, surface
         assert response.status_code == 409
     else:
         with owner_client(state) as client:
-            response = client.post(surface, json={"proactive_mode": "on"})
-        assert response.status_code == 200
-        assert "proactive_mode" not in response.json()
+            response = client.post(surface, json={"expected_revision": service.revision,
+                                                  "changes": {"proactive_mode": "on"}})
+        assert response.status_code == 400
+        assert "retired: use the operating mode" in response.json()["error"]
     assert store.store_path.read_bytes() == before
     if existing:
         assert json.loads(path.read_text()) == legacy
-    elif surface == "/api/config":
-        assert "proactive_mode" not in json.loads(path.read_text())
     else:
         assert not path.exists()
     assert not (tmp_path / "proactive_mode.txt").exists()

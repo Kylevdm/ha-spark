@@ -2,7 +2,8 @@
 
 Reads live state over the HA REST/WebSocket APIs, plans the overnight battery
 charge deterministically, and (per the site operating mode) applies it to the inverter.
-Configure via .env / add-on options; see .env.example for every setting.
+Runtime owner inputs live in the settings document and secrets file. Bootstrap
+credentials and the development data path come from the environment.
 """
 
 from __future__ import annotations
@@ -346,6 +347,10 @@ async def _cmd_run(settings: Settings, *, once: bool) -> int:
     except DaemonAlreadyRunning:
         print("[REFUSED] ha-spark daemon already running", file=sys.stderr)
         return 1
+    except ConfigError as exc:
+        # The daemon loads again under its executor lock before initialising.
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
     finally:
         loop.remove_signal_handler(signal.SIGTERM)
     return 0
