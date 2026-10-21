@@ -33,6 +33,52 @@ def test_five_minute_units_invert_and_partial_coverage(unit, value):
     assert measurement_series(rows[:-1], hourly, unit) == {}
 
 
+async def test_invalid_timezone_day_close_uses_utc_fallback(measured):
+    settings, _ = measured
+    settings.timezone = "Invalid/Zone"
+    await seed(settings)
+    await record_closed_days(settings, START + timedelta(days=1, hours=1))
+    (saved,) = await ReadinessDays(settings.db_path).days()
+    assert saved.local_date == START.date()
+    assert saved.qualifying, saved.reasons
+    assert saved.slots[0].slot_start == START
+
+
+def test_kathmandu_hourly_measurements_join_across_recorder_hours():
+    rows = [{"start": (START + timedelta(hours=i)).timestamp() * 1000,
+             "change": 1.2} for i in range(2)]
+    result = measurement_series([], rows, "kWh", timezone="Asia/Kathmandu")
+    start = START + timedelta(minutes=45)
+    assert result[start].kwh == pytest.approx(0.6)
+    assert result[start].provenance == "hourly_spread"
+
+
+async def test_kathmandu_day_close_uses_same_local_slot_grid(measured):
+    settings, data = measured
+    settings.timezone = "Asia/Kathmandu"
+    from ha_spark.energy.readiness_measurements import day_bounds
+
+    start, end = day_bounds(START.date(), settings.timezone)
+    for rows in data.values():
+        for i, row in enumerate(rows):
+            row["start"] = (start + timedelta(minutes=5 * i)).timestamp() * 1000
+    from tests.test_readiness import fixture
+
+    day, _, _ = fixture()
+    ledger = ReadinessLedger(settings.db_path)
+    for i in range(49):
+        instant = start + timedelta(minutes=30 * i)
+        await ledger.record(day.slots[0].intent.model_copy(update={
+            "slot_start": instant, "start_energy_kwh": 5,
+        }))
+    await record_closed_days(settings, end + timedelta(hours=1))
+    (saved,) = await ReadinessDays(settings.db_path).days()
+    assert saved.qualifying, saved.reasons
+    assert len(saved.slots) == 48
+    assert saved.slots[0].slot_start == start
+    assert saved.slots[0].components["grid_import"].kwh == pytest.approx(0.6)
+
+
 async def test_day_close_retries_failure_then_preserves_snapshot(measured, monkeypatch, caplog):
     settings, _ = measured
     await seed(settings)

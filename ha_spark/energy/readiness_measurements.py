@@ -15,20 +15,20 @@ import math
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Literal
-from zoneinfo import ZoneInfo
 
 import aiosqlite
 from pydantic import BaseModel, ConfigDict
 
 from ha_spark.config import Settings
 from ha_spark.energy.derived_base_load import ComponentSeries, derive_base_load
+from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.onboarding import (
     _ENERGY_FACTORS,
     _POWER_FACTORS,
     SUPPORTED_UNITS,
     statistic_unit,
 )
-from ha_spark.energy.readiness_ledger import ReadinessLedger, SlotRecord
+from ha_spark.energy.readiness_ledger import ReadinessLedger, SlotRecord, slot_start
 from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.logging import get_logger
 
@@ -137,14 +137,14 @@ class ReadinessDays:
 
 def day_bounds(day: date, timezone: str) -> tuple[datetime, datetime]:
     """UTC boundaries preserve 46/50-slot household-clock DST days."""
-    tz = ZoneInfo(timezone)
+    tz = load_timezone(timezone)
     return (datetime.combine(day, time.min, tz).astimezone(UTC),
             datetime.combine(day + timedelta(days=1), time.min, tz).astimezone(UTC))
 
 
 def measurement_series(
     five_minute: list[dict[str, object]], hourly: list[dict[str, object]],
-    unit: str, invert: bool = False,
+    unit: str, invert: bool = False, timezone: str = "UTC",
 ) -> dict[datetime, Measurement]:
     """Convert recorder rows to half-hours, without scaling partial coverage."""
     if unit not in _POWER_FACTORS and unit not in _ENERGY_FACTORS:
@@ -168,16 +168,24 @@ def measurement_series(
 
     fine = converted(five_minute, 1 / 12)
     coarse = converted(hourly, 1)
-    starts = {t.replace(minute=t.minute // 30 * 30, second=0, microsecond=0) for t in fine}
-    starts |= {t + offset for t in coarse for offset in (timedelta(), HALF_HOUR)}
+    # Spread only whole hourly-only hours, then join on the household slot grid.
+    # A :15/:45-offset household slot may span two recorder hours.
+    coarse_ticks = {
+        hour + timedelta(minutes=5 * i): value / 12
+        for hour, value in coarse.items()
+        if not any(hour <= t < hour + timedelta(hours=1) for t in fine)
+        for i in range(12)
+    }
+    tz = load_timezone(timezone)
+    starts = {slot_start(t.astimezone(tz)) for t in fine.keys() | coarse_ticks.keys()}
     result = {}
     for start in sorted(starts):
         ticks = [start + timedelta(minutes=5 * i) for i in range(6)]
-        hour = start.replace(minute=0)
         if all(t in fine for t in ticks):
             result[start] = Measurement(kwh=sum(fine[t] for t in ticks), provenance="measured")
-        elif hour in coarse and not any(hour <= t < hour + timedelta(hours=1) for t in fine):
-            result[start] = Measurement(kwh=coarse[hour] / 2, provenance="hourly_spread")
+        elif all(t in coarse_ticks for t in ticks):
+            result[start] = Measurement(kwh=sum(coarse_ticks[t] for t in ticks),
+                                        provenance="hourly_spread")
     return result
 
 
@@ -225,7 +233,8 @@ async def snapshot_day(
             period="hour", timeout=settings.ha_timeout,
         )
         series[name] = measurement_series(fine, coarse, statistic_unit(meta),
-                                          bool(getattr(settings, f"derive_invert_{name}", False)))
+                                          bool(getattr(settings, f"derive_invert_{name}", False)),
+                                          settings.timezone)
     slots = []
     instant = start
     while instant < end:
@@ -294,7 +303,7 @@ async def record_closed_days(settings: Settings, now: datetime) -> None:
     and only real evidence outcomes are ever stored as excluded.
     """
     try:
-        tz = ZoneInfo(settings.timezone)
+        tz = load_timezone(settings.timezone)
         today = now.astimezone(tz).date()
         ledger = ReadinessLedger(settings.db_path)
         first = await ledger.first_slot_start()

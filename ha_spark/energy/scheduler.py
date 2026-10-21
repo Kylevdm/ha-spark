@@ -1853,6 +1853,18 @@ async def _run_forever(
     last_revision: PlanRevision | None = None
     last_readiness_slot: datetime | None = None
     readiness_evaluated: date | None = None
+    readiness_task: asyncio.Task[None] | None = None
+
+    async def record_readiness(tick_settings: Settings, tick_now: datetime) -> None:
+        nonlocal readiness_evaluated
+        try:
+            await record_closed_days(tick_settings, tick_now)
+            readiness_evaluated = await readiness_tick(
+                tick_settings, tick_now, readiness_evaluated, authority,
+            )
+        except Exception:
+            log.warning("Readiness background recording failed")
+
     # The plan known resident on the device: the baseline `needs_apply`
     # compares against, `None` when unknown after a failed apply or run (#168).
     # `last_plan` is the latest computed plan, applied or skipped.
@@ -2197,11 +2209,6 @@ async def _run_forever(
                     ev_hold_active=ev_hold_state.active,
                 )
             if guard_enabled and in_window(now.time(), window_start, window_end):
-                await record_guard(
-                    settings, now, last_revision,
-                    authority.state.committed_mode
-                    if authority.known and authority.state is not None else "authority_unknown",
-                )
                 try:
                     # While activating, a fresh plan may already be charging: the
                     # guard's reductions run under the activation's charging grant.
@@ -2217,13 +2224,14 @@ async def _run_forever(
                         )
                 except Exception:
                     log.exception("Supply guard tick failed; will retry next tick")
-            # Day-close joins run after the guard tick so a slow recorder read
-            # never delays it, and after record_slot so the closing boundary's
-            # start energy exists. Failures are isolated inside.
-            await record_closed_days(settings, now)
-            readiness_evaluated = await readiness_tick(
-                settings, now, readiness_evaluated, authority,
-            )
+                await record_guard(
+                    settings, now, last_revision,
+                    authority.state.committed_mode
+                    if authority.known and authority.state is not None else "authority_unknown",
+                )
+            # Recorder and notice I/O must never delay the next protection tick.
+            if readiness_task is None or readiness_task.done():
+                readiness_task = asyncio.create_task(record_readiness(settings, now))
             if last_signal_at is None or now - last_signal_at >= SIGNAL_SAMPLE_INTERVAL:
                 try:
                     await sample_signals(settings, now)
@@ -2245,6 +2253,9 @@ async def _run_forever(
                     log.exception("V2L tick failed; will retry next tick")
             await asyncio.sleep(poll_seconds)
     finally:
+        if readiness_task is not None:
+            readiness_task.cancel()
+            await asyncio.gather(readiness_task, return_exceptions=True)
         state.executor = None
         if pending is not None and not pending.future.done():
             pending.future.set_result(Reply(error="daemon stopped during request"))

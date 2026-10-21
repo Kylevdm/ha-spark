@@ -58,6 +58,25 @@ def test_readiness_slots_counts_household_local_dst_day(
     assert f"0/{slots} slots recorded" in capsys.readouterr().out
 
 
+def test_readiness_slots_kathmandu_current_slot_uses_local_grid(tmp_path, monkeypatch, capsys):
+    zone = ZoneInfo("Asia/Kathmandu")
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 20, 0, 17, tzinfo=zone)
+
+    settings = Settings(timezone="Asia/Kathmandu", db_path=str(tmp_path / "missing.db"))
+    monkeypatch.setattr("ha_spark.cli.datetime", Clock)
+    monkeypatch.setattr("ha_spark.cli.load_settings", lambda **kwargs: settings)
+    assert main(["readiness", "slots", "--days", "1"]) == 0
+    text = capsys.readouterr().out
+    assert "2026-10-20: 0/1 slots recorded" in text
+    assert "gap 2026-10-19T18:15:00+00:00" in text
+    assert "18:45:00" not in text
+    assert "19:15:00" not in text
+
+
 def test_readiness_slots_requires_positive_days(tmp_path, monkeypatch):
     settings = Settings(db_path=str(tmp_path / "missing.db"))
     monkeypatch.setattr("ha_spark.cli.load_settings", lambda **kwargs: settings)

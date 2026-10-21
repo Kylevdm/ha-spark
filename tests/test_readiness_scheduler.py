@@ -18,6 +18,95 @@ from tests.test_readiness_ledger import START, revision
 
 
 @respx.mock
+async def test_blocked_readiness_does_not_delay_next_guard_or_reconcile(tmp_path, monkeypatch):
+    settings = Settings(ha_url="http://ha.test", ha_token="t", timezone="Europe/London",
+                        db_path=str(tmp_path / "ledger.db"), grid_power_entity="sensor.grid")
+    seed_authority(settings, "observe")
+    a = revision()
+    monkeypatch.setattr(scheduler, "current_plan", AsyncMock(return_value=a.run))
+    monkeypatch.setattr(scheduler, "soc_monitor_tick", AsyncMock(return_value=a.run.inputs.soc))
+    monkeypatch.setattr(scheduler, "_run_orchestrator", AsyncMock())
+    monkeypatch.setattr(scheduler, "_run_derived_rerive", AsyncMock())
+    started, cancelled = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def blocked(*args):
+        calls.append("recorder")
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async def guard(*args, **kwargs):
+        calls.append("guard")
+        return 1000
+
+    async def recorded(*args, **kwargs):
+        calls.append("record_guard")
+
+    original = scheduler.reconcile_tick
+
+    async def reconcile(*args, **kwargs):
+        calls.append("reconcile")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler, "record_closed_days", blocked)
+    monkeypatch.setattr(scheduler, "readiness_tick", AsyncMock())
+    monkeypatch.setattr(scheduler, "guard_tick", guard)
+    monkeypatch.setattr(scheduler, "record_guard", recorded)
+    monkeypatch.setattr(scheduler, "reconcile_tick", reconcile)
+    respx.get(url__regex=r"http://ha.test/api/states/.*").respond(404)
+    respx.post(url__regex=r"http://ha.test/api/states/.*").respond(200, json={})
+    stop = daemon_ticks(monkeypatch, [START + timedelta(minutes=m) for m in (0, 1, 2)])
+    with pytest.raises(stop):
+        await asyncio.wait_for(scheduler.run_forever(settings, poll_seconds=123), timeout=2)
+    assert started.is_set()
+    assert cancelled.is_set()
+    assert calls.count("recorder") == 1
+    assert calls.count("guard") == 3
+    assert calls.count("reconcile") >= 2
+    assert calls.index("guard") < calls.index("record_guard")
+    assert calls.index("recorder") < len(calls) - 2
+    assert scheduler.readiness_tick.await_count == 0
+
+
+@respx.mock
+async def test_background_readiness_failure_is_logged_and_isolated(tmp_path, monkeypatch, caplog):
+    settings = Settings(ha_url="http://ha.test", ha_token="t", timezone="Europe/London",
+                        db_path=str(tmp_path / "ledger.db"))
+    seed_authority(settings, "observe")
+    a = revision()
+    monkeypatch.setattr(scheduler, "current_plan", AsyncMock(return_value=a.run))
+    monkeypatch.setattr(scheduler, "soc_monitor_tick", AsyncMock(return_value=a.run.inputs.soc))
+    monkeypatch.setattr(scheduler, "_run_orchestrator", AsyncMock())
+    monkeypatch.setattr(scheduler, "_run_derived_rerive", AsyncMock())
+    calls = []
+
+    async def record(*args):
+        calls.append(("record", asyncio.current_task()))
+
+    async def evaluate(*args):
+        calls.append(("evaluate", asyncio.current_task()))
+        raise RuntimeError("secret-from-transport")
+
+    monkeypatch.setattr(scheduler, "record_closed_days", record)
+    monkeypatch.setattr(scheduler, "readiness_tick", evaluate)
+    respx.get(url__regex=r"http://ha.test/api/states/.*").respond(404)
+    respx.post(url__regex=r"http://ha.test/api/states/.*").respond(200, json={})
+    stop = daemon_ticks(monkeypatch, [START + timedelta(minutes=m) for m in (0, 1, 2)])
+    with pytest.raises(stop):
+        await scheduler.run_forever(settings, poll_seconds=123)
+    assert len(calls) >= 4  # a failed evaluation does not stop later background attempts
+    for i in range(0, len(calls), 2):
+        assert calls[i][0] == "record"
+        assert calls[i + 1][0] == "evaluate"
+        assert calls[i][1] is calls[i + 1][1]
+    assert "Readiness background recording failed" in caplog.text
+    assert "secret-from-transport" not in caplog.text
+
+
+@respx.mock
 async def test_daemon_records_in_force_revision_after_mid_slot_request_and_failed_replan(
     tmp_path, monkeypatch,
 ):

@@ -163,3 +163,30 @@ async def test_missing_database_diagnostic_does_not_create_it(tmp_path):
     path = tmp_path / "missing.db"
     assert await ReadinessLedger(str(path)).slots(START, START + timedelta(days=1)) == []
     assert not path.exists()
+
+
+async def test_partial_slot_export_event_is_recorded(tmp_path):
+    path = str(tmp_path / "ledger.db")
+    a = revision()
+    event = FlexibilityEvent(START + timedelta(minutes=15), START + timedelta(minutes=20),
+                             "export", START, 1.25)
+    a = replace(a, run=replace(a.run, inputs=replace(a.run.inputs, flexibility_event=event),
+                               schedule=replace(a.run.schedule, export_prices=(1.25,) * 48)))
+    await record_slot(path, START, a, "observe", a.run.inputs.soc)
+    (row,) = await ReadinessLedger(path).slots(START, START + timedelta(minutes=30))
+    assert row.event_rate == 1.25
+    assert row.export_rate == 0.05
+
+
+async def test_kathmandu_capture_uses_household_half_hour_grid(tmp_path):
+    path = str(tmp_path / "ledger.db")
+    tz = ZoneInfo("Asia/Kathmandu")
+    now = datetime(2026, 10, 20, 0, 2, tzinfo=tz)
+    a = revision()
+    geometry = compute_horizon_geometry(now, a.run.cfg.window_start, a.run.cfg.window_end, tz)
+    inputs = replace(a.run.inputs, now=now, horizon_start=geometry.horizon_start, geometry=geometry)
+    a = replace(a, issued_at=now, run=replace(a.run, inputs=inputs, tz=tz))
+    await record_slot(path, now, a, "observe", inputs.soc)
+    rows = await ReadinessLedger(path).slots(now - timedelta(hours=1), now + timedelta(hours=1))
+    assert len(rows) == 1
+    assert rows[0].slot_start == now.replace(minute=0).astimezone(UTC)

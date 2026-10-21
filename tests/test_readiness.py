@@ -10,14 +10,30 @@ from ha_spark.energy.models import ForecastHistoryRecord
 from ha_spark.energy.readiness import evaluate_readiness, load_readiness
 from ha_spark.energy.readiness_ledger import GuardRecord, ReadinessLedger
 from ha_spark.energy.readiness_measurements import ReadinessDays
-from tests.test_readiness_replay import single
+from tests.test_readiness_replay import single as replay_single
+
+
+def single(**kwargs):
+    """A complete Observe day with one nonempty slot and a consistent ML model."""
+    day = replay_single(**kwargs)
+    empty = replay_single(held=True).slots[0]
+    slots = [day.slots[0]]
+    for i in range(1, 48):
+        start = day.slots[0].slot_start + timedelta(minutes=30 * i)
+        slots.append(empty.model_copy(update={
+            "slot_start": start,
+            "intent": empty.intent.model_copy(update={"slot_start": start}),
+        }))
+    return day.model_copy(update={"slots": tuple(s.model_copy(update={
+        "intent": s.intent.model_copy(update={"forecast_model": "ml"}),
+    }) for s in slots)})
 
 
 def fixture():
     day = single(fraction=1, current=0, held=True)
     forecast = ForecastHistoryRecord(
         made_at=day.slots[0].slot_start - timedelta(days=1), target_date=day.local_date,
-        model="slots", total_kwh=0, slots=None, source="test", drove_plan=True,
+        model="ml", total_kwh=0, slots=None, source="test", drove_plan=True,
         median_total_kwh=1,
     )
     guards = [GuardRecord(observed_at=day.slots[0].slot_start + timedelta(minutes=i),

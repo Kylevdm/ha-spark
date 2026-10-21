@@ -456,8 +456,9 @@ availability. Untrusted hold evidence is recorded as unknown; an untrusted SoC
 leaves the energy estimate missing, never zero.
 
 Records are write-once in the existing SQLite database. Mid-slot replans do not
-replace them. The first daemon tick in a slot can capture it only during its
-first minute; a missed boundary, absent plan or missing horizon slot stays a gap,
+replace them. The first daemon tick in a slot can capture it within the five-minute
+boundary tolerance (`BOUNDARY_TOLERANCE`), allowing for tick drift; a missed boundary,
+absent plan or missing horizon slot stays a gap,
 including after a restart. Guard samples are recorded only inside the charging
 window in Observe, with invalid reads retained for coverage. Recording uses reads
 only, never changes authority, and failures do not interrupt control-loop work.

@@ -1,4 +1,5 @@
 """The daemon closes readiness days after capturing the new boundary slot."""
+import asyncio
 from datetime import timedelta
 from unittest.mock import AsyncMock
 
@@ -8,9 +9,33 @@ import respx
 from ha_spark.energy import scheduler
 from ha_spark.energy.readiness_measurements import ReadinessDays
 from tests.authority_helpers import seed_authority
-from tests.test_authority_gate import daemon_ticks
+from tests.test_authority_gate import daemon_ticks as control_ticks
 from tests.test_readiness_ledger import START, revision
 from tests.test_readiness_measurements import measured, seed  # noqa: F401
+
+
+def daemon_ticks(monkeypatch, ticks):
+    """Allow background day-close evidence to finish before this test shuts down."""
+    done = asyncio.Event()
+    record = scheduler.record_closed_days
+
+    async def complete(*args, **kwargs):
+        try:
+            await record(*args, **kwargs)
+        finally:
+            done.set()
+
+    monkeypatch.setattr(scheduler, "record_closed_days", complete)
+    stop = control_ticks(monkeypatch, ticks)
+    advance = asyncio.sleep
+
+    async def sleep(seconds):
+        if seconds == 123:
+            await asyncio.wait_for(done.wait(), timeout=2)
+        await advance(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    return stop
 
 
 @pytest.fixture(autouse=True)

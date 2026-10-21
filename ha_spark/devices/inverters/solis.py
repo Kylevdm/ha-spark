@@ -1425,17 +1425,27 @@ class SolisDevice:
             log.warning("Recording the refused hold release failed")
 
     def _clear_release_refused(self) -> None:
-        """A switch read back On is no longer a refused release (#449).
+        """This device's switch read back On: its release is no longer refused (#449).
 
-        Only the refusal metadata: the records themselves still clear through
+        Only the refusal metadata, and the notice flag so the next episode
+        notifies again: the records themselves still clear through
         reconciliation, as before. Bookkeeping failures are logged and ignored.
         """
         store = self._execution.authority
         if store is None or store.state is None:
             return
+        identity = HoldDevice(
+            driver=self._config.driver,
+            power_switch=self._config.entities.get("power_switch", ""),
+            hub=self._settings.solis_control_hub, slave=self._settings.solis_modbus_slave,
+        )
         try:
             store.save_holds(tuple(
-                h.model_copy(update={"release_refused_since": None, "release_refused_reason": None})
+                h.model_copy(update={
+                    "release_refused_since": None, "release_refused_reason": None,
+                    "release_refused_notified": False,
+                })
+                if h.device == identity else h
                 for h in store.state.holds
             ))
         except Exception:  # noqa: BLE001 - bookkeeping never changes the outcome

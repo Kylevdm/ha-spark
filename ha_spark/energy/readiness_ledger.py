@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ha_spark.config import Settings
 from ha_spark.devices import inverter_device
-from ha_spark.energy.forecast import forecast_model_tag
+from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.plan_run import PlanRun
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.energy.sources import parse_time
@@ -101,8 +101,7 @@ BOUNDARY_TOLERANCE = timedelta(minutes=5)
 
 def slot_start(now: datetime) -> datetime:
     """Half-hour boundary as an unambiguous UTC instant (also on DST days)."""
-    utc = now.astimezone(UTC)
-    return utc.replace(minute=utc.minute // 30 * 30, second=0, microsecond=0)
+    return now.replace(minute=now.minute // 30 * 30, second=0, microsecond=0).astimezone(UTC)
 
 
 class ReadinessLedger:
@@ -187,6 +186,8 @@ async def record_slot(
     the minute (60 s sleep plus the tick's work), so that first tick is eligible
     within ``BOUNDARY_TOLERANCE``; a restart later in the slot stays a gap.
     """
+    if revision is not None and revision.run.tz is not None:
+        now = now.astimezone(revision.run.tz)
     start = slot_start(now)
     if revision is None or now.astimezone(UTC) - start >= BOUNDARY_TOLERANCE:
         return
@@ -215,7 +216,7 @@ async def record_slot(
         event_rate = (
             event.rate_gbp_kwh
             if event is not None and event.direction == "export"
-            and event.start <= start < event.end
+            and event.start < start + timedelta(minutes=30) and event.end > start
             else None
         )
         tz = run.tz or (inputs.now.tzinfo if inputs.now is not None else UTC)
@@ -268,6 +269,7 @@ async def record_guard(
     load; the replay's target is the plan's requested power, not the resident
     schedule. Invalid reads remain samples, counting against later coverage.
     """
+    now = now.astimezone(load_timezone(settings.timezone))
     if mode != "observe" or not settings.grid_power_entity or not _in_overnight_window(
         now.time(), parse_time(settings.charge_window_start), parse_time(settings.charge_window_end)
     ):

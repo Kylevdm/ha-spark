@@ -9,16 +9,22 @@ import asyncio
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
-from zoneinfo import ZoneInfo
 
 import aiosqlite
 from pydantic import BaseModel, ConfigDict
 
 from ha_spark.authority import AuthorityStore
 from ha_spark.config import Settings
+from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.models import ForecastHistoryRecord
 from ha_spark.energy.readiness_ledger import GuardRecord, ReadinessLedger
-from ha_spark.energy.readiness_measurements import DayRecord, ReadinessDays, day_bounds
+from ha_spark.energy.readiness_measurements import (
+    COMPONENTS,
+    REQUIRED,
+    DayRecord,
+    ReadinessDays,
+    day_bounds,
+)
 from ha_spark.energy.readiness_replay import ReplayResult, replay_day
 from ha_spark.ha.notifier import send_notification
 from ha_spark.ha.rest import HomeAssistantRest
@@ -57,6 +63,27 @@ def evaluate_readiness(
             excluded[day.local_date] = day.reasons
             continue
         try:
+            start, end = day_bounds(day.local_date, day.timezone)
+            expected_slots = {start + timedelta(minutes=30 * i)
+                              for i in range(int((end - start).total_seconds() / 1800))}
+            if (len(day.slots) != len(expected_slots)
+                    or {s.slot_start for s in day.slots} != expected_slots):
+                raise ValueError("incomplete or duplicate day slots")
+            for slot in day.slots:
+                if slot.intent is None:
+                    raise ValueError("slot record missing")
+                if slot.intent.operating_mode != "observe":
+                    raise ValueError("not Observe")
+                for name in COMPONENTS:
+                    component = slot.components.get(name)
+                    allowed = {"measured", "hourly_spread"}
+                    if name not in REQUIRED:
+                        allowed.add("absent")
+                    if component is None or component.provenance not in allowed:
+                        raise ValueError(f"{name}: measurement provenance invalid")
+            day = day.model_copy(update={"slots": tuple(sorted(
+                day.slots, key=lambda s: s.slot_start,
+            ))})
             replay = replay_day(day)
         except ValueError as exc:
             excluded[day.local_date] = (str(exc),)
@@ -90,14 +117,17 @@ def evaluate_readiness(
         failures.append("cost delta above threshold")
     if breaches:
         failures.append("guard breaches")
-    if coverage is None:
+    if coverage is None or valid == 0:
         insufficient.append("guard evidence missing")
     elif coverage < settings.readiness_min_guard_coverage_pct:
         failures.append("guard coverage below threshold")
     models = {f.model for _, _, f in selected}
+    models.update(s.intent.forecast_model for d, _, _ in selected for s in d.slots
+                  if s.intent is not None)
     if len(models) > 1:
         insufficient.append("model change")
-    if "median" in models:
+    median_active = bool(models & {"slots", "median", "baseline"})
+    if median_active:
         insufficient.append("median active")
     paired = all(f.median_total_kwh is not None for _, _, f in selected)
     model_mae = median_mae = improvement = None
@@ -112,7 +142,7 @@ def evaluate_readiness(
                              if f.median_total_kwh is not None) / len(selected)
             if median_mae == 0:
                 insufficient.append("zero baseline MAE")
-            else:
+            elif len(models) == 1 and not median_active:
                 improvement = (1 - model_mae / median_mae) * 100
                 if model_mae > median_mae * (1 - settings.readiness_mae_improvement_pct / 100):
                     failures.append("MAE improvement below threshold")
@@ -140,7 +170,9 @@ async def load_readiness(settings: Settings) -> ReadinessResult:
                 "SELECT name FROM sqlite_master WHERE name = 'forecasts'"
             ) as cursor:
                 exists = await cursor.fetchone()
-            if exists:
+            async with db.execute("PRAGMA table_info(forecasts)") as cursor:
+                columns = {row[1] for row in await cursor.fetchall()}
+            if exists and "issued_at" in columns:
                 async with db.execute(
                     "SELECT issued_at, target_date, model, total_kwh, drove_plan, "
                     "median_total_kwh FROM forecasts ORDER BY julianday(issued_at), id"
@@ -183,10 +215,10 @@ async def readiness_tick(
     settings: Settings, now: datetime, evaluated: date | None, authority: AuthorityStore,
 ) -> date | None:
     """Evaluate once after the latest closed household-local snapshot exists."""
-    closed = now.astimezone(ZoneInfo(settings.timezone)).date() - timedelta(days=1)
-    if evaluated == closed:
-        return evaluated
     try:
+        closed = now.astimezone(load_timezone(settings.timezone)).date() - timedelta(days=1)
+        if evaluated == closed:
+            return evaluated
         if closed not in await ReadinessDays(settings.db_path).dates():
             return evaluated
         result = await load_readiness(settings)
