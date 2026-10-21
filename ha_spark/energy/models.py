@@ -45,6 +45,22 @@ class ForecastRecord:
 
 
 @dataclass(frozen=True)
+class ForecastHistoryRecord(ForecastRecord):
+    """One immutable forecast revision and its paired median baseline."""
+
+    horizon_start: datetime | None = None
+    horizon_end: datetime | None = None
+    drove_plan: bool = False
+    median_total_kwh: float | None = None
+    median_slots: tuple[float, ...] | None = None
+
+    @property
+    def issued_at(self) -> datetime:
+        """Issue time, retaining ``made_at`` for existing consumers."""
+        return self.made_at
+
+
+@dataclass(frozen=True)
 class SlotProfile:
     """Median home load per local half-hour slot, split weekday/weekend."""
 
@@ -67,6 +83,8 @@ class LoadForecast:
     # P90 day total from the quantile ML model (None elsewhere); feeds the
     # dynamic buffer when buffer_mode is "quantile".
     p90_total_kwh: float | None = None
+    median_total_kwh: float | None = None
+    median_slots: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=True)
