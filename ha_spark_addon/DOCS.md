@@ -837,7 +837,9 @@ retain their original `gather_inputs` fetch time.
 ## Data
 
 The SQLite store lives at `/data/ha_spark.db` and survives restarts and
-updates.
+updates. `db_path` is set at install (add-on options or, standalone, the
+environment) and takes effect at startup; a settings save cannot change it —
+set it in the options or environment and restart.
 
 Dispatch power evidence: `ev_power_entity` reads direct car draw (W or kW).
 `dispatch_grid_power_entity` supplies an independent grid-import reading;

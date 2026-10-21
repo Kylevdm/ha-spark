@@ -10,9 +10,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ha_spark.api.server import INGRESS_PROXY_IP, AppState, build_app
+from ha_spark.authority import operating_mode, resolve_data_dir
 from ha_spark.config import Settings
 from ha_spark.energy.models import ChargeIntent, ChargePlan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+from ha_spark.energy.soc_monitor import monitor_path
 
 
 def _soc(value: float) -> SocMeasurement:
@@ -315,3 +317,71 @@ def test_post_config_rejection_of_nested_device_entry_is_secret_safe(tmp_path: P
     assert "TOPSECRET_AGENT" not in resp.text
     assert not (tmp_path / "options.json").exists()
     assert state.settings.agent_api_token == ""
+
+
+def test_post_config_rejects_a_changed_db_path(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#441: a settings save cannot move ``db_path``, so no config write can
+    relocate the authority store or the runtime state beside it. A changed
+    value is rejected before the merged document is validated or persisted,
+    with a reason naming ``db_path`` that never echoes the submitted value.
+    """
+    options = tmp_path / "options.json"
+    seeded = json.dumps({"min_soc": 20.0}).encode()
+    options.write_bytes(seeded)
+    state = _state(
+        tmp_path, ha_url="http://ha.test", ha_token="x", db_path=str(tmp_path / "t.db"),
+        min_soc=20.0,
+    )
+    before_dir = resolve_data_dir(state.settings)
+    before_mode = operating_mode(state.settings)
+    with caplog.at_level("WARNING"):
+        with _client(state) as client:
+            resp = client.post("/api/config", json={"db_path": "TOPSECRET/moved-db.db"})
+    assert resp.status_code == 400
+    assert "db_path" in resp.json()["error"]
+    assert "TOPSECRET/moved-db.db" not in resp.text
+    assert "moved-db.db" not in caplog.text
+    assert options.read_bytes() == seeded
+    # The running value -- and so the authority directory and mode it decides
+    # -- are exactly as they were before the rejected save.
+    assert state.settings.db_path == str(tmp_path / "t.db")
+    assert resolve_data_dir(state.settings) == before_dir == tmp_path
+    assert operating_mode(state.settings) == before_mode == "authority_unknown"
+
+
+def test_post_config_rejects_null_db_path(tmp_path: Path) -> None:
+    """A ``db_path: null`` update would be dropped by the options overlay and
+    so fall back to a default path; a settings save has no way to express
+    "unset", so it is rejected like any other change (#441). Add-on mode too:
+    every runtime-state path derived from ``db_path`` stays where it was.
+    """
+    options = tmp_path / "options.json"
+    seeded = json.dumps({"min_soc": 20.0}).encode()
+    options.write_bytes(seeded)
+    state = _state(tmp_path, min_soc=20.0)
+    before_monitor = monitor_path(state.settings)
+    with _client(state) as client:
+        resp = client.post("/api/config", json={"db_path": None})
+    assert resp.status_code == 400
+    assert "db_path" in resp.json()["error"]
+    assert "None" not in resp.json()["error"]
+    assert options.read_bytes() == seeded
+    assert state.settings.db_path == "data/ha_spark.db"
+    assert monitor_path(state.settings) == before_monitor
+
+
+def test_post_config_accepts_a_save_echoing_the_running_db_path(tmp_path: Path) -> None:
+    """A GET-then-POST round trip posts the running ``db_path`` back unchanged;
+    that save is accepted and applies its other changes (#441)."""
+    db_path = str(tmp_path / "t.db")
+    state = _state(
+        tmp_path, ha_url="http://ha.test", ha_token="x", db_path=db_path, min_soc=20.0
+    )
+    with _client(state) as client:
+        resp = client.post("/api/config", json={"db_path": db_path, "min_soc": 25.0})
+    assert resp.status_code == 200
+    assert state.settings.min_soc == 25.0
+    assert state.settings.db_path == db_path
+    assert resp.json()["db_path"] == db_path
