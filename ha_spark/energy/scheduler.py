@@ -812,6 +812,50 @@ async def _hold_degraded_notice(
             log.warning("Degraded hold notification failed")
 
 
+_RELEASE_REFUSED_REASONS = {
+    "switch_unreadable": "the power switch is unreadable",
+    "schedule_unverified": "the schedule to restore is not verified",
+}
+
+
+async def _release_refused_notice(
+    settings: Settings, rest: HomeAssistantRest, now: datetime
+) -> None:
+    """Notify once per episode when an owned hold's release stays refused (#449).
+
+    The flag is persisted before sending, so a restart doesn't repeat it; a
+    verified release clears the record and with it the flag. Never blocks.
+    """
+    store = execution_context().authority
+    if store is None or store.state is None:
+        return
+    due = [
+        h for h in store.state.holds
+        if h.release_refused_since is not None and not h.release_refused_notified
+        and now - h.release_refused_since >= timedelta(minutes=settings.hold_degraded_minutes)
+    ]
+    if not due:
+        return
+    try:
+        store.save_holds(tuple(
+            h.model_copy(update={"release_refused_notified": True}) if h in due else h
+            for h in store.state.holds
+        ))
+    except (OSError, ValueError):
+        log.warning("Recording the refused-release notice failed; not sending it")
+        return
+    for record in due:
+        reason = _RELEASE_REFUSED_REASONS.get(record.release_refused_reason or "", "refused")
+        try:
+            await send_notification(
+                settings, rest, "ha-spark hold not released",
+                f"The {record.cause} hold has ended but the battery is still held: "
+                f"{reason}. Check the inverter power switch.",
+            )
+        except Exception:  # noqa: BLE001 - notice failure must not block protection
+            log.warning("Refused-release notification failed")
+
+
 def hold_reconcile_intent(
     intent: ChargeIntent, trusted_holds: tuple[tuple[datetime, datetime], ...] | None
 ) -> ChargeIntent | None:
@@ -1044,6 +1088,7 @@ async def reconcile_tick(
             await _hold_degraded_notice(
                 settings, rest, evidence_read.freshness, now, dispatch_trusted=fresh.hold_trusted
             )
+            await _release_refused_notice(settings, rest, now)
             ev_charging = ev_hold_status_from_read(
                 evidence_read.ev_status, evidence_read.ev_status_trusted
             )

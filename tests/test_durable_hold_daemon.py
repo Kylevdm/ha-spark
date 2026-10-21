@@ -327,3 +327,62 @@ async def test_ev_clearance_updates_every_ev_record(tmp_path, monkeypatch):
         )
     assert not state.active
     assert all(h.pending_release for h in store.state.holds)
+
+
+def fresh_evidence(at):
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Paused", at=at))
+    respx.get("http://ha.test/api/states/binary_sensor.dispatch").mock(
+        return_value=_dispatch_state("off", at=at),
+    )
+
+
+def ended_dispatch_hold(tmp_path):
+    settings, store = episode(tmp_path, "protect", cause="dispatch")
+    store.save_holds((store.state.holds[0].model_copy(
+        update={"trusted_end": NOW - timedelta(minutes=1)}
+    ),))
+    return settings, store
+
+
+@respx.mock
+async def test_refused_release_notifies_once_across_restart(tmp_path, monkeypatch):
+    settings, store = ended_dispatch_hold(tmp_path)
+    switch = _mock_power_switch(monkeypatch, initial="Off")
+    fresh_evidence(NOW)
+    notices = []
+
+    async def notify(*args):
+        notices.append(args)
+
+    monkeypatch.setattr(scheduler, "send_notification", notify)
+    plan = _plan(replace(_INTENT, holds=(), hold_trusted=True))
+    await scheduler.reconcile_tick(settings, plan, NOW)
+    (held,) = store.state.holds
+    assert held.release_refused_reason == "schedule_unverified"
+    assert switch["option"] == "Off"
+    await scheduler.reconcile_tick(settings, plan, NOW + timedelta(minutes=3))
+    assert notices == []
+    await scheduler.reconcile_tick(settings, plan, NOW + timedelta(minutes=6))
+    assert len(notices) == 1
+    assert "schedule to restore is not verified" in notices[0][3]
+    restarted = AuthorityStore(settings)
+    execution_context().authority = restarted
+    await scheduler.reconcile_tick(settings, plan, NOW + timedelta(minutes=7))
+    assert len(notices) == 1
+    assert restarted.state.holds[0].release_refused_notified
+
+
+@respx.mock
+async def test_refused_release_notice_failure_never_blocks(tmp_path, monkeypatch):
+    settings, store = ended_dispatch_hold(tmp_path)
+    _mock_power_switch(monkeypatch, initial="Off")
+    fresh_evidence(NOW)
+
+    async def broken(*args):
+        raise RuntimeError("notify down")
+
+    monkeypatch.setattr(scheduler, "send_notification", broken)
+    plan = _plan(replace(_INTENT, holds=(), hold_trusted=True))
+    await scheduler.reconcile_tick(settings, plan, NOW)
+    await scheduler.reconcile_tick(settings, plan, NOW + timedelta(minutes=6))
+    assert store.state.holds[0].release_refused_notified

@@ -1500,6 +1500,15 @@ class SolisDevice:
                 )
             if current != "off":
                 log.warning("Power-switch state unreadable or not on/off; not writing On")
+                self._mark_release_refused(
+                    self._execution.authority,
+                    HoldDevice(
+                        driver=self._config.driver, power_switch=entity,
+                        hub=self._settings.solis_control_hub,
+                        slave=self._settings.solis_modbus_slave,
+                    ),
+                    "switch_unreadable", datetime.now(UTC),
+                )
                 return ActionLine(
                     f"[WARNING] {desc} refused: state unreadable or not on/off",
                     ActionOutcome.REFUSED,

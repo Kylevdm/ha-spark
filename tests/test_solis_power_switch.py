@@ -1017,3 +1017,17 @@ async def test_fallback_deactivates_active_window_before_current_transition(tmp_
 
     assert [address for address, _ in _register_writes(rest)] == [43143, 43141, 43143]
     assert any(line.startswith("[FALLBACK]") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_safe_state_refusal_marks_the_owned_hold(tmp_path) -> None:
+    """#449: a relinquish On refused on an unreadable switch is visible on the record."""
+    rest = FakeRest(switch="unavailable")
+    device = _device(rest, tmp_path)
+    _seed_owned_hold(device)
+    await device.write_safe_state()
+
+    assert _options(rest) == []
+    (held,) = device._execution.authority.state.holds
+    assert held.release_refused_reason == "switch_unreadable"
+    assert held.release_refused_since is not None

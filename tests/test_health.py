@@ -709,3 +709,26 @@ async def test_health_reports_tariff_and_disabled_export_source_separately() -> 
     assert events.name == "Export event provider"
     assert events.status is Status.OK
     assert "disabled" in events.detail
+
+
+def test_hold_release_warns_only_while_a_release_is_refused(tmp_path) -> None:
+    from ha_spark.authority import HoldDevice, HoldRecord
+    from ha_spark.health import check_hold_release
+    from tests.authority_helpers import seed_authority
+
+    settings = Settings(ha_url="http://ha.test", ha_token="t", db_path=str(tmp_path / "e.db"))
+    store = seed_authority(settings, "protect")
+    assert check_hold_release(settings) == []
+    record = HoldRecord(
+        cause="ev", started_at=datetime(2026, 6, 10, 20, 0, tzinfo=UTC), confirmed=True,
+        device=HoldDevice(driver="solis", power_switch="select.secret_switch", hub="h", slave=1),
+        release_refused_since=datetime(2026, 6, 10, 21, 0, tzinfo=UTC),
+        release_refused_reason="switch_unreadable",
+    )
+    store.save_holds((record,))
+    (result,) = check_hold_release(settings)
+    assert result.status is Status.WARN
+    assert "power switch unreadable" in result.detail
+    assert "secret_switch" not in result.detail
+    store.save_holds(())
+    assert check_hold_release(settings) == []
