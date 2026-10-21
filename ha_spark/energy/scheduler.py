@@ -378,7 +378,9 @@ async def run_once(
         revision = None
         try:
             revision = PlanRevision(
-                uuid4().hex, now.astimezone(UTC), run, device.planned_rate_w(plan.charge_intent),
+                uuid4().hex, now.astimezone(UTC), run,
+                device.planned_rate_w(plan.charge_intent)
+                if Capability.CHARGE_RATE in device.capabilities else None,
                 generation,
             )
         except Exception:
@@ -1921,10 +1923,6 @@ async def _run_forever(
                     await _charger_supports_live_rate(settings)
                 )
             now = datetime.now(tz)
-            readiness_mode = (
-                authority.state.committed_mode
-                if authority.known and authority.state is not None else "authority_unknown"
-            )
             if not startup_reconciled:
                 startup_reconciled = True
                 # No planner or fallback write may precede restart reconciliation.
@@ -2189,11 +2187,18 @@ async def _run_forever(
             if slot_start(now) != last_readiness_slot:
                 last_readiness_slot = slot_start(now)
                 await record_slot(
-                    settings.db_path, now, last_revision, readiness_mode, measurement,
+                    settings.db_path, now, last_revision,
+                    authority.state.committed_mode
+                    if authority.known and authority.state is not None else "authority_unknown",
+                    measurement,
                     ev_hold_active=ev_hold_state.active,
                 )
             if guard_enabled and in_window(now.time(), window_start, window_end):
-                await record_guard(settings, now, last_revision, readiness_mode)
+                await record_guard(
+                    settings, now, last_revision,
+                    authority.state.committed_mode
+                    if authority.known and authority.state is not None else "authority_unknown",
+                )
                 try:
                     # While activating, a fresh plan may already be charging: the
                     # guard's reductions run under the activation's charging grant.

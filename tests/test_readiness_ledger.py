@@ -1,7 +1,11 @@
 """Readiness evidence is immutable, time-indexed and read-only to hardware."""
 from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
+import pytest
+
+from ha_spark.energy.horizon import compute_horizon_geometry
 from ha_spark.energy.models import (
     ExportIntent,
     FlexibilityEvent,
@@ -66,10 +70,9 @@ async def test_slot_captures_replay_parameters_export_hold_and_provenance(tmp_pa
     export = ExportIntent(("export", START, end), START, end, 2, 3, (START,), (2,))
     intent = replace(a.run.plan.charge_intent, holds=((START, end),), export=export)
     event = FlexibilityEvent(START, end, "export", START, 1.25)
-    geometry = a.run.inputs.geometry_for(a.run.cfg)
-    inputs = replace(a.run.inputs, car_plugged_in=True, flexibility_event=event,
-                     geometry=replace(geometry, window_fracs=(0.5,) + (1.0,) * 47))
+    inputs = replace(a.run.inputs, car_plugged_in=True, flexibility_event=event)
     a = replace(a, run=replace(a.run, inputs=inputs,
+                               cfg=replace(a.run.cfg, window_end=time(0, 15)),
                                plan=replace(a.run.plan, charge_intent=intent)))
     await record_slot(path, START, a, "observe", a.run.inputs.soc)
     row = (await ReadinessLedger(path).slots(START, end))[0]
@@ -86,6 +89,36 @@ async def test_slot_captures_replay_parameters_export_hold_and_provenance(tmp_pa
     for name in ("capacity_kwh", "min_soc", "target_cap", "voltage_v", "charge_efficiency",
                  "max_current_a", "battery_discharge_ceiling_kw"):
         assert getattr(row, name) == getattr(cfg, name)
+
+
+@pytest.mark.parametrize("window_start", [time(0), time(23, 30)])
+async def test_mid_slot_plan_records_full_half_hour_window_fraction(tmp_path, window_start):
+    path = str(tmp_path / "ledger.db")
+    a = revision()
+    tz = ZoneInfo("Europe/London")
+    now = (START + timedelta(hours=4, minutes=32)).astimezone(tz)  # 05:32 household clock
+    cfg = replace(a.run.cfg, window_start=window_start, window_end=time(5, 40))
+    geometry = compute_horizon_geometry(now, cfg.window_start, cfg.window_end, tz)
+    inputs = replace(a.run.inputs, now=now, horizon_start=geometry.horizon_start, geometry=geometry)
+    a = replace(a, issued_at=now, run=replace(a.run, cfg=cfg, inputs=inputs, tz=tz))
+    await record_slot(path, now, a, "observe", inputs.soc)
+    (row,) = await ReadinessLedger(path).slots(START, START + timedelta(days=1))
+    assert row.charge_window_fraction == pytest.approx(10 / 30)
+
+
+async def test_event_price_is_separate_from_ordinary_export_rate(tmp_path):
+    path = str(tmp_path / "ledger.db")
+    a = revision()
+    event = FlexibilityEvent(START, START + timedelta(minutes=30), "export", START, 1.25)
+    a = replace(a, run=replace(
+        a.run, inputs=replace(a.run.inputs, flexibility_event=event),
+        schedule=replace(a.run.schedule, export_prices=(1.25, 0.08) + (0.05,) * 46),
+    ))
+    for minutes in (0, 30):
+        await record_slot(path, START + timedelta(minutes=minutes), a, "observe", a.run.inputs.soc)
+    rows = await ReadinessLedger(path).slots(START, START + timedelta(hours=1))
+    assert [r.export_rate for r in rows] == [0.05, 0.08]
+    assert [r.event_rate for r in rows] == [1.25, None]
 
 
 async def test_untrusted_hold_is_unknown_and_ev_hold_is_captured(tmp_path):

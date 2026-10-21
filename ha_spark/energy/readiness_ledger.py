@@ -48,7 +48,7 @@ class PlanRevision:
     revision_id: str
     issued_at: datetime
     run: PlanRun
-    target_w: float
+    target_w: float | None
     config_generation: int
 
 
@@ -61,7 +61,7 @@ class SlotRecord(BaseModel):
     revision_id: str
     issued_at: datetime
     charge_window_fraction: float = Field(ge=0, le=1)
-    charge_current_a: float
+    charge_current_a: float | None
     export_kw: float
     hold_state: Literal["held", "not_held", "unknown"]
     v2l_available: bool
@@ -194,10 +194,31 @@ async def record_slot(
         if export is not None and start in export.selected_slots:
             export_kw = export.slot_export_kw[export.selected_slots.index(start)]
         event = inputs.flexibility_event
+        # Only an export event is priced into the schedule (tariff._event_export_prices).
+        event_rate = (
+            event.rate_gbp_kwh
+            if event is not None and event.direction == "export"
+            and event.start <= start < event.end
+            else None
+        )
+        tz = run.tz or (inputs.now.tzinfo if inputs.now is not None else UTC)
+        local_day = start.astimezone(tz).date()
+        overlap = timedelta()
+        for day in (local_day - timedelta(days=1), local_day):
+            end_day = day if cfg.window_start < cfg.window_end else day + timedelta(days=1)
+            window_start = datetime.combine(day, cfg.window_start, tz).astimezone(UTC)
+            window_end = datetime.combine(end_day, cfg.window_end, tz).astimezone(UTC)
+            overlap += max(
+                timedelta(),
+                min(start + timedelta(minutes=30), window_end) - max(start, window_start),
+            )
         await ReadinessLedger(db_path).record(SlotRecord(
             slot_start=start, operating_mode=mode, revision_id=revision.revision_id,
-            issued_at=revision.issued_at, charge_window_fraction=geometry.window_fracs[i],
-            charge_current_a=revision.target_w / cfg.voltage_v,
+            issued_at=revision.issued_at,
+            charge_window_fraction=overlap / timedelta(minutes=30),
+            charge_current_a=(
+                revision.target_w / cfg.voltage_v if revision.target_w is not None else None
+            ),
             export_kw=export_kw,
             hold_state=("held" if held else "not_held") if intent.hold_trusted else "unknown",
             v2l_available=inputs.car_plugged_in,
@@ -210,9 +231,10 @@ async def record_slot(
             battery_discharge_ceiling_kw=cfg.battery_discharge_ceiling_kw,
             import_rate=schedule.prices[i],
             export_rate=(
-                schedule.export_prices[i] if schedule.export_prices else schedule.export_rate
+                schedule.export_rate if event_rate is not None
+                else schedule.export_prices[i] if schedule.export_prices else schedule.export_rate
             ),
-            event_rate=event.rate_gbp_kwh if event and event.start <= start < event.end else None,
+            event_rate=event_rate,
             forecast_model=forecast_model_tag(run.forecast.source),
             config_generation=revision.config_generation,
         ))
@@ -241,6 +263,9 @@ async def record_guard(
             geometry = revision.run.inputs.geometry_for(revision.run.cfg)
             if geometry is not None and slot_start(now) in geometry.slot_starts:
                 target = revision.target_w
+    except Exception:
+        log.exception("Readiness guard target unavailable")
+    try:
         async with HomeAssistantRest(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
         ) as rest:
@@ -249,7 +274,7 @@ async def record_guard(
                 if math.isfinite(value):
                     supply = value
                 value = await inverter_device(settings, rest).read_charge_rate()
-                if math.isfinite(value):
+                if math.isfinite(value) and value >= 0:
                     setpoint = value
             except Exception:
                 pass  # Invalid evidence is recorded, not skipped or replaced by zero.

@@ -5,6 +5,7 @@ import pytest
 import respx
 
 from ha_spark.config import Settings
+from ha_spark.energy.models import PlannerInputs
 from ha_spark.energy.readiness_ledger import ReadinessLedger, record_guard
 from tests.test_readiness_ledger import START, revision
 
@@ -72,6 +73,63 @@ async def test_guard_without_matching_plan_records_invalid_coverage(tmp_path):
     assert len(rows) == 2
     assert all(not r.sample_valid and r.target_w is None and r.breach is None for r in rows)
     assert all(r.measured_import_w == 500 for r in rows)
+
+
+@respx.mock
+async def test_bad_revision_geometry_still_records_invalid_guard_sample(tmp_path, monkeypatch):
+    settings = Settings(ha_url="http://ha.test", ha_token="t",
+                        db_path=str(tmp_path / "ledger.db"), grid_power_entity="sensor.grid",
+                        charge_window_start="00:00", charge_window_end="06:00")
+    a = revision()
+
+    def bad_geometry(*args):
+        raise ValueError("invalid horizon")
+
+    monkeypatch.setattr(PlannerInputs, "geometry_for", bad_geometry)
+    respx.get("http://ha.test/api/states/sensor.grid").respond(
+        200, json={"entity_id": "sensor.grid", "state": "500", "attributes": {}},
+    )
+    respx.get("http://ha.test/api/states/sensor.solis_control_timed_charge_current").respond(
+        200, json={"entity_id": "sensor.solis_control_timed_charge_current",
+                   "state": "20", "attributes": {}},
+    )
+    await record_guard(settings, START, a, "observe")
+    (row,) = await ReadinessLedger(settings.db_path).guards()
+    assert not row.sample_valid
+    assert row.target_w is None
+    assert row.throttle_w is None
+    assert row.breach is None
+    assert row.measured_import_w == 500
+    assert all(c.request.method == "GET" for c in respx.calls)
+
+
+@pytest.mark.parametrize("setpoint,valid", [("-20", False), ("0", True), ("20", True)])
+@respx.mock
+async def test_negative_setpoint_is_invalid_but_negative_grid_import_is_valid(
+    tmp_path, setpoint, valid,
+):
+    settings = Settings(ha_url="http://ha.test", ha_token="t",
+                        db_path=str(tmp_path / "ledger.db"), grid_power_entity="sensor.grid",
+                        charge_window_start="00:00", charge_window_end="06:00")
+    respx.get("http://ha.test/api/states/sensor.grid").respond(
+        200, json={"entity_id": "sensor.grid", "state": "-500", "attributes": {}},
+    )
+    respx.get("http://ha.test/api/states/sensor.solis_control_timed_charge_current").respond(
+        200, json={"entity_id": "sensor.solis_control_timed_charge_current",
+                   "state": setpoint, "attributes": {}},
+    )
+    await record_guard(settings, START, revision(), "observe")
+    (row,) = await ReadinessLedger(settings.db_path).guards()
+    assert row.sample_valid is valid
+    assert row.measured_import_w == -500
+    if not valid:
+        assert row.setpoint_w is None
+        assert row.throttle_w is None
+        assert row.breach is None
+    else:
+        assert row.throttle_w is not None
+        assert row.breach is False
+    assert all(c.request.method == "GET" for c in respx.calls)
 
 
 @pytest.mark.parametrize("mode,hour", [("observe", 12), ("protect", 0), ("optimise", 0),
