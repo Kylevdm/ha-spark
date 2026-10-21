@@ -26,12 +26,16 @@ if TYPE_CHECKING:
     from ha_spark.config import DeviceConfig, Settings
 
 
-def held_identity_remapped(device: HoldDevice, config: DeviceConfig, settings: Settings) -> bool:
-    """An existing hold must never authorise a replacement control on the same driver."""
-    return device.driver == config.driver and device != HoldDevice(
+def held_identity_remapped(device: HoldDevice, settings: Settings) -> bool:
+    """An existing hold must never authorise a replacement control or driver.
+
+    A held identity that matches no configured device (its entity, hub, slave or
+    driver changed, or the device was removed) blocks every device until Observe.
+    """
+    return all(device != HoldDevice(
         driver=config.driver, power_switch=config.entities.get("power_switch", ""),
         hub=settings.solis_control_hub, slave=settings.solis_modbus_slave,
-    )
+    ) for config in settings.devices)
 
 
 class Ownership(StrEnum):
@@ -60,7 +64,7 @@ class WriteGate:
             return "refuse:stale config"
         if state.committed_mode == "observe":
             return "simulate"
-        if any(held_identity_remapped(h.device, config, settings) for h in state.holds):
+        if any(held_identity_remapped(h.device, settings) for h in state.holds):
             return "refuse:held identity remapped"
         if state.committed_mode == "protect" and ownership == Ownership.CHARGING:
             return "simulate"

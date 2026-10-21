@@ -703,9 +703,15 @@ async def _observe_ev_hold(
         store is not None and store.state is not None
     ) else None
     if record is not None:
-        state.active = record.confirmed and not record.pending_release
-        state.clear_count = record.clear_count
-        state.last_clear_report_at = record.last_clear_report_at
+        # A release still pending (it failed or is retrying) needs the clear
+        # evidence to stay fresh: anything but a fresh not-charging report
+        # re-arms the confirmed hold and restarts the clearance run (Q4/Q5).
+        rearm = record.confirmed and record.pending_release and not (
+            evidence is not None and evidence.validity == "fresh" and charging is False
+        )
+        state.active = (record.confirmed and not record.pending_release) or rearm
+        state.clear_count = 0 if rearm else record.clear_count
+        state.last_clear_report_at = None if rearm else record.last_clear_report_at
     next_state = next_ev_hold_state(state, charging, evidence, overnight_exception=exception)
     if record is not None and store is not None and store.state is not None:
         # Every EV record follows the one EV evidence stream, so a record left
@@ -732,10 +738,7 @@ async def notify_remapped_holds(settings: Settings, rest: HomeAssistantRest) -> 
     records = []
     notify = False
     for record in store.state.holds:
-        remapped = any(
-            held_identity_remapped(record.device, config, settings)
-            for config in settings.devices
-        )
+        remapped = held_identity_remapped(record.device, settings)
         notify |= remapped and not record.remap_notified
         records.append(record.model_copy(update={"remap_notified": remapped}))
     if tuple(records) != store.state.holds:
@@ -834,7 +837,8 @@ def _shutdown_hold_reason(
     """Why a clean shutdown must leave the switch Off, or ``None`` to relinquish (#426)."""
     store = execution_context().authority
     records = store.state.holds if store is not None and store.state is not None else ()
-    if any(h.cause == "ev" and not h.pending_release for h in records):
+    # A pending EV release has not verified yet, so its record still holds.
+    if any(h.cause == "ev" for h in records):
         return "an EV hold is recorded"
     ends = [end for _, end in trusted_holds or ()] + [
         h.trusted_end for h in records if h.cause == "dispatch" and h.trusted_end is not None

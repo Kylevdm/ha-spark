@@ -13,6 +13,21 @@ from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.ha.rest import HomeAssistantRest, HomeAssistantRestError
 from ha_spark.transitions import PreconditionReport
 
+NO_FALLBACK_PLATFORM = "no validated fallback charging schedule for this inverter configuration"
+
+
+def fallback_schedule_problem(settings: Settings) -> str | None:
+    """Why ``settings`` has no valid fallback schedule, or ``None`` when it has one.
+
+    Only a single Solis inverter has a fallback schedule; its current, window and
+    limits are then checked by the driver's validator.
+    """
+    inverters = [config for config in settings.devices if config.type == "inverter"]
+    if len(inverters) != 1 or inverters[0].driver != "solis":
+        return NO_FALLBACK_PLATFORM
+    reason = validate_fallback_schedule(settings)
+    return reason if isinstance(reason, str) else None
+
 
 async def check_preconditions(
     settings: Settings, rest: HomeAssistantRest, soc: SocMeasurement | None,
@@ -23,7 +38,11 @@ async def check_preconditions(
     if len(inverters) != 1:
         failures.append("Protect requires exactly one inverter")
     for config in inverters:
-        device = get_device(config, settings, rest)
+        try:
+            device = get_device(config, settings, rest)
+        except ValueError:
+            failures.append("inverter driver is not supported")
+            continue
         validation = await device.hold_validation()
         if not validation.validated:
             failures.append(validation.reason)
@@ -55,12 +74,9 @@ async def check_preconditions(
         if configured and getattr(settings, option) is None:
             failures.append(f"{option} must be configured for protection evidence")
     optimise = list(failures)
-    if len(inverters) != 1 or inverters[0].driver != "solis":
-        optimise.append("no validated fallback charging schedule for this inverter configuration")
-    else:
-        fallback = validate_fallback_schedule(settings)
-        if isinstance(fallback, str):
-            optimise.append(fallback)
+    fallback = fallback_schedule_problem(settings)
+    if fallback is not None:
+        optimise.append(fallback)
     if soc is None or not soc.ok:
         # Do not echo raw untrusted entity states (which could contain secrets).
         optimise.append("this tick's checked SoC measurement must pass")

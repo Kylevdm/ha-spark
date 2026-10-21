@@ -51,6 +51,7 @@ async def test_preconditions_pass_using_model_probe_and_checked_soc(tmp_path):
 
 @pytest.mark.parametrize("case,reason", [
     ("alphaess", "no validated hold surface (#196)"),
+    ("unknown driver", "inverter driver is not supported"),
     ("multiple", "exactly one inverter"),
     ("model", "differs from reference"),
     ("switch", "power_switch"),
@@ -64,6 +65,8 @@ async def test_preconditions_name_each_failure(tmp_path, case, reason):
     updates = {}
     if case == "alphaess":
         updates["devices"] = [config.devices[0].model_copy(update={"driver": "alphaess"})]
+    elif case == "unknown driver":
+        updates["devices"] = [config.devices[0].model_copy(update={"driver": "bogus"})]
     elif case == "multiple":
         updates["devices"] = config.devices * 2
     elif case == "age":

@@ -5029,13 +5029,17 @@ async def test_shutdown_inside_a_known_hold_leaves_the_hold_in_place(
     assert len(notices) == 1 and "dispatch" in str(notices[0][3])
 
 
+@pytest.mark.parametrize("pending_release", [False, True])
 async def test_shutdown_with_an_ev_hold_keeps_the_switch_off_and_restores_the_window(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, pending_release: bool,
 ) -> None:
-    """#426: Optimise + EV hold, no dispatch: window only, and a notice naming why."""
+    """#426: Optimise + EV hold, no dispatch: window only, and a notice naming why.
+
+    A release still pending has not verified, so its record holds too."""
     device = _RelinquishRecordingDevice()
     ev = HoldRecord(
         cause="ev", started_at=datetime(2026, 6, 10, 21, 0, tzinfo=UTC), confirmed=True,
+        pending_release=pending_release,
         device=HoldDevice(driver="solis", power_switch="select.x", hub="h", slave=1),
     )
     notices = await _run_forever_until_cancelled(

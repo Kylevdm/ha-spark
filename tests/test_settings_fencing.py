@@ -12,7 +12,7 @@ from ha_spark.api.server import AppState
 from ha_spark.authority import AuthorityStore, HoldDevice, HoldRecord, Transition
 from ha_spark.config import ConfigError, validate_options_document
 from ha_spark.devices import inverter_device
-from ha_spark.devices.execution import execution_context
+from ha_spark.devices.execution import Ownership, WriteGate, execution_context
 from ha_spark.energy.scheduler import notify_remapped_holds
 from ha_spark.ha.rest import HomeAssistantRest
 from tests.authority_helpers import seed_authority
@@ -193,3 +193,41 @@ async def test_remap_notice_once_across_restart(tmp_path):
     message = json.loads(route.calls[0].request.content)["message"]
     assert "Observe" in message and "retained" in message
     assert restarted.state.holds[0].device.power_switch == "select.old"
+
+
+@pytest.mark.parametrize("mode", ["optimise", "protect"])
+def test_optimise_rejects_a_save_that_drops_the_fallback_inverter(tmp_path, mode):
+    state = app_state(tmp_path)
+    seed_authority(state.settings, mode)
+    original = state.options_path.read_bytes()
+    if mode == "optimise":
+        with pytest.raises(ConfigError, match="inverter configuration"):
+            state.apply_options({"inverter": "alphaess"})
+        assert state.options_path.read_bytes() == original
+    else:
+        state.apply_options({"inverter": "alphaess"})
+        assert state.settings.devices[0].driver == "alphaess"
+
+
+@respx.mock
+async def test_replacing_the_held_driver_counts_as_a_remap(tmp_path):
+    state = app_state(tmp_path)
+    store = seed_authority(state.settings, "protect")
+    store.save_holds((HoldRecord(
+        cause="ev", started_at=datetime.now(UTC), confirmed=True,
+        device=HoldDevice(driver="solis", power_switch="select.old",
+                          hub=state.settings.solis_control_hub,
+                          slave=state.settings.solis_modbus_slave),
+    ),))
+    state.apply_options({"inverter": "alphaess"})
+    gate = WriteGate(execution_context())
+    with execution_context().planning():
+        mode = gate.mode_for(Ownership.PROTECTION, state.settings.devices[0], state.settings)
+    assert mode == "refuse:held identity remapped"
+    route = respx.post("http://ha.test/api/services/persistent_notification/create").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    async with HomeAssistantRest("http://ha.test/api", "test") as rest:
+        await notify_remapped_holds(state.settings, rest)
+    assert route.call_count == 1
+    assert store.state.holds[0].device.driver == "solis"

@@ -93,8 +93,8 @@ other processes or external Home Assistant automations.
 
 On the Solis, ha-spark re-reads the dispatch state and checks
 `inverter_power_switch_entity` every minute, separately from the half-hourly
-plan. It turns the switch `Off` during an active dispatch hold and `On`
-otherwise. When `ev_status_entity` is configured, Charging, Boosting and
+plan. It turns the switch `Off` during an active dispatch hold and back `On`
+only to release a hold it recorded itself. When `ev_status_entity` is configured, Charging, Boosting and
 Delivering also hold the switch `Off` outside the overnight charge window,
 even without a matching dispatch. Five consecutive clear reads release that
 hold; eco+ Diverting does not start one. Unreadable EV status is ignored for

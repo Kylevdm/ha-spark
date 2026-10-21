@@ -43,10 +43,10 @@ from ha_spark.config import (
 )
 from ha_spark.daemon_channel import DaemonChannel
 from ha_spark.devices.execution import execution_context
-from ha_spark.devices.inverters.solis import validate_fallback_schedule
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.logging import get_logger
+from ha_spark.mode_preconditions import NO_FALLBACK_PLATFORM, fallback_schedule_problem
 
 log = get_logger(__name__)
 
@@ -148,15 +148,17 @@ class AppState:
         # a currently valid fallback, so an install without one can still save.
         unknown = authority is None or (store is not None and store.save_failed)
         if (
-            (unknown and not isinstance(validate_fallback_schedule(self.settings), str))
+            (unknown and fallback_schedule_problem(self.settings) is None)
             or (authority is not None and not unknown and (
                 authority.committed_mode == "optimise"
                 or (authority.transition is not None
                     and authority.transition.target == "optimise")
             ))
         ):
-            reason = validate_fallback_schedule(candidate)
-            if isinstance(reason, str):
+            reason = fallback_schedule_problem(candidate)
+            if reason == NO_FALLBACK_PLATFORM:
+                raise ConfigError("Invalid fallback charging schedule: inverter configuration")
+            if reason is not None:
                 # Driver reasons may include raw window values. Name only known
                 # fields/categories here, never echo candidate input at a surface.
                 fields = [name for name in (
