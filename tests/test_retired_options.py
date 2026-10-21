@@ -9,6 +9,7 @@ from ha_spark import config
 from ha_spark.api.server import AppState, build_app
 from ha_spark.authority import AuthorityStore
 from ha_spark.devices.execution import ExecutionContext, Ownership
+from tests.api_helpers import owner_client
 
 
 @pytest.mark.parametrize("keys", ["proactive_mode", "control", "both"])
@@ -83,20 +84,29 @@ async def test_config_post_drops_retired_key_and_sidecar(tmp_path: Path, surface
         path.write_text(json.dumps(legacy))
     state = AppState(settings, path, reload=lambda: settings)
     if surface == "mcp":
+        from mcp.server.fastmcp.exceptions import ToolError
+
         from ha_spark.agent.mcp_server import build_mcp
 
-        await build_mcp(state).call_tool("set_config", {"updates": {"proactive_mode": "on"}})
-    else:
+        # Agents can't change configuration at all (#457).
+        with pytest.raises(ToolError):
+            await build_mcp(state).call_tool("set_config", {"updates": {"proactive_mode": "on"}})
+    elif surface == "/agent/config":
         with TestClient(build_app(state)) as client:
+            response = client.post(surface, json={"proactive_mode": "on"})
+        assert response.status_code == 409
+    else:
+        with owner_client(state) as client:
             response = client.post(surface, json={"proactive_mode": "on"})
         assert response.status_code == 200
         assert "proactive_mode" not in response.json()
     assert store.store_path.read_bytes() == before
-    persisted = json.loads(path.read_text())
     if existing:
-        assert persisted == legacy
+        assert json.loads(path.read_text()) == legacy
+    elif surface == "/api/config":
+        assert "proactive_mode" not in json.loads(path.read_text())
     else:
-        assert "proactive_mode" not in persisted
+        assert not path.exists()
     assert not (tmp_path / "proactive_mode.txt").exists()
 
 

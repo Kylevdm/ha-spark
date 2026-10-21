@@ -12,6 +12,10 @@ with ``ingress_peer=INGRESS_PROXY_IP`` and answers 403 to any request whose
 socket peer is not HA's ingress proxy (which authenticates the user);
 forwarding headers are ignored. In standalone/dev mode the listener binds to
 loopback only. The published agent port is gated by a bearer token instead.
+
+Owner-only routes (the mode page, ``/api/mode`` and ``/api/config``) exist
+only on the ingress app, never on the published port or the standalone
+listener: an agent token must never reach an owner write (#457).
 """
 
 from __future__ import annotations
@@ -73,6 +77,12 @@ STATE_ATTR = "ha_spark_state"
 # in cleartext. A client that posts this value back is treated as "unchanged"
 # (see apply_options), so a GET-then-POST round-trip can't clobber the secret.
 _REDACTED = "***"
+# The fixed answer to every agent config change (``/agent/config`` and the MCP
+# ``set_config`` tool) until owner-approved config proposals exist (#457).
+AGENT_CONFIG_REFUSAL: dict[str, str] = {
+    "error": "unavailable",
+    "detail": "agent config changes need owner approval, which is not available in this version",
+}
 
 
 # Above one 60 s daemon tick, below HA's ingress proxy timeout.
@@ -357,12 +367,10 @@ def _agent_router(state: AppState) -> APIRouter:
         return await tools.run_plan(state.settings, executor=state.executor)
 
     @router.post("/config", dependencies=[Depends(_Gate(state, "set_config"))])
-    async def config(body: dict[str, object]) -> dict[str, Any]:
-        try:
-            state.apply_options(body)
-        except Exception as exc:  # noqa: BLE001 - validation failure -> 400
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return state.current_options()
+    async def config() -> JSONResponse:
+        # Agents may not change configuration until owner-approved config
+        # proposals exist (ADR-0006, #457): refuse without reading the body.
+        return JSONResponse(AGENT_CONFIG_REFUSAL, status_code=409)
 
     return router
 
@@ -474,6 +482,40 @@ def build_app(
                 )
             return JSONResponse(reply.authority or {})
 
+        @app.get("/api/config")
+        async def get_config(request: Request) -> dict[str, Any]:
+            """Current user options."""
+            return _state_of(request).current_options()
+
+        @app.post("/api/config")
+        async def post_config(request: Request) -> JSONResponse:
+            """Merge posted options, persist, and hot-reload the daemon's settings."""
+            user = request.headers.get("X-Remote-User-Id", "")
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user) is None:
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            if request.headers.get("X-HA-Spark-Request") != "config":
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                return JSONResponse({"error": "application/json required"}, status_code=415)
+            try:
+                updates = await request.json()
+            except Exception:  # noqa: BLE001 - malformed body is a client error
+                return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+            if not isinstance(updates, dict):
+                return JSONResponse({"error": "expected a JSON object"}, status_code=400)
+            try:
+                _state_of(request).apply_options(updates)
+            except ConfigError as exc:
+                # ConfigError reasons name fields only, never an input value (#412).
+                log.warning("Rejecting config update: %s", exc)
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            except Exception as exc:  # noqa: BLE001 - save/reload failure -> client error
+                # Any other exception's text could carry input; report its type only.
+                log.warning("Config update failed: %s", type(exc).__name__)
+                return JSONResponse({"error": "config update failed"}, status_code=400)
+            return JSONResponse(_state_of(request).current_options())
+
     @app.get("/api/health")
     async def health(request: Request) -> dict[str, Any]:
         """Liveness + whether a plan has been computed yet (full doctor stays in the CLI)."""
@@ -500,27 +542,6 @@ def build_app(
             for eid, value, attrs in plan_to_payload(st.plan, st.settings)
         ]
         return {"plan": entities, "generated_at": _iso(st.plan_at)}
-
-    @app.get("/api/config")
-    async def get_config(request: Request) -> dict[str, Any]:
-        """Current user options."""
-        return _state_of(request).current_options()
-
-    @app.post("/api/config")
-    async def post_config(request: Request) -> JSONResponse:
-        """Merge posted options, persist, and hot-reload the daemon's settings."""
-        try:
-            updates = await request.json()
-        except Exception:  # noqa: BLE001 - malformed body is a client error
-            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-        if not isinstance(updates, dict):
-            return JSONResponse({"error": "expected a JSON object"}, status_code=400)
-        try:
-            _state_of(request).apply_options(updates)
-        except Exception as exc:  # noqa: BLE001 - validation/reload failure -> client error
-            log.warning("Rejecting config update: %r", exc)
-            return JSONResponse({"error": str(exc)}, status_code=400)
-        return JSONResponse(_state_of(request).current_options())
 
     app.include_router(agent_router)
     # FastAPI router dependencies (the ``_auth`` gate above) do NOT propagate to a

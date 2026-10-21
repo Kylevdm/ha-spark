@@ -280,12 +280,12 @@ async def test_get_forecast_tool_serves_the_served_day_profile(
     assert payload["load_kwh"] == 12.0
 
 
-async def test_set_config_rejects_invalid_document_before_saving(tmp_path: Path) -> None:
-    """#412: the set_config tool validates the whole candidate before persisting.
+async def test_set_config_refuses_an_invalid_document_without_saving(tmp_path: Path) -> None:
+    """#457: the set_config tool refuses every change before reading it.
 
-    A rejected save must leave the options file byte-identical and the running
-    settings untouched, and the tool error must name the failing field without
-    echoing its value or the secret sitting next to it in the document.
+    The options file stays byte-identical and the running settings untouched,
+    and the tool error is the fixed refusal, never echoing the submitted value
+    or the secret sitting next to it in the document.
     """
     options = tmp_path / "options.json"
     seeded = json.dumps({"min_soc": 20.0, "octopus_api_key": "SECRET_OCTO"}).encode()
@@ -309,16 +309,16 @@ async def test_set_config_rejects_invalid_document_before_saving(tmp_path: Path)
     mcp = build_mcp(state)
     with pytest.raises(ToolError) as excinfo:
         await mcp.call_tool("set_config", {"updates": {"min_soc": "not-a-number"}})
-    assert "min_soc" in str(excinfo.value)
+    assert "unavailable: agent config changes need owner approval" in str(excinfo.value)
     assert "not-a-number" not in str(excinfo.value)
     assert "SECRET_OCTO" not in str(excinfo.value)
     assert options.read_bytes() == seeded
     assert state.settings.min_soc == 20.0
 
 
-async def test_set_config_rejects_a_changed_db_path(tmp_path: Path) -> None:
-    """#441: the set_config tool cannot move ``db_path``. The tool error names
-    the field without echoing the submitted value, and the options file stays
+async def test_set_config_refuses_a_changed_db_path(tmp_path: Path) -> None:
+    """#441/#457: the set_config tool cannot move ``db_path``. The tool error is
+    the fixed refusal without the submitted value, and the options file stays
     byte-identical with the running settings untouched.
     """
     options = tmp_path / "options.json"
@@ -328,7 +328,7 @@ async def test_set_config_rejects_a_changed_db_path(tmp_path: Path) -> None:
     mcp = build_mcp(state)
     with pytest.raises(ToolError) as excinfo:
         await mcp.call_tool("set_config", {"updates": {"db_path": "TOPSECRET/moved-db.db"}})
-    assert "db_path" in str(excinfo.value)
+    assert "unavailable: agent config changes need owner approval" in str(excinfo.value)
     assert "TOPSECRET/moved-db.db" not in str(excinfo.value)
     assert options.read_bytes() == seeded
     assert state.settings.db_path == str(tmp_path / "t.db")

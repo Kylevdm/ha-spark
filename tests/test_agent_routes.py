@@ -8,10 +8,11 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
-from ha_spark.api.server import AppState, build_app
+from ha_spark.api.server import AGENT_CONFIG_REFUSAL, AppState, build_app
 from ha_spark.config import Settings
 from ha_spark.energy import sources
 from ha_spark.energy.models import SLOTS_PER_DAY, LoadForecast
+from tests.api_helpers import owner_client
 
 
 def _state(tmp_path: Path, exposure: str = "read_act", **extra: object) -> AppState:
@@ -55,11 +56,15 @@ def test_config_route_absent_below_read_write(tmp_path: Path) -> None:
         assert client.post("/agent/config", json={"min_soc": 30}).status_code == 404
 
 
-def test_config_route_present_in_read_write(tmp_path: Path) -> None:
-    with TestClient(build_app(_state(tmp_path, exposure="read_write"))) as client:
+def test_config_route_refuses_in_read_write(tmp_path: Path) -> None:
+    """#457: agents can't change configuration until owner approval exists."""
+    state = _state(tmp_path, exposure="read_write", min_soc=20.0)
+    with TestClient(build_app(state)) as client:
         resp = client.post("/agent/config", json={"min_soc": 30.0})
-    assert resp.status_code == 200
-    assert resp.json()["min_soc"] == 30.0
+    assert resp.status_code == 409
+    assert resp.json() == AGENT_CONFIG_REFUSAL
+    assert not (tmp_path / "options.json").exists()
+    assert state.settings.min_soc == 20.0
 
 
 @respx.mock
@@ -96,8 +101,8 @@ def test_read_act_post_context_invalid_body_hits_real_handler_not_404_stub(
     assert resp.status_code == 400
 
 
-def test_agent_config_redacts_secrets_in_read_write(tmp_path: Path) -> None:
-    """The read_write /agent/config response must not leak secrets in cleartext."""
+def test_agent_config_refusal_carries_no_config_or_secret(tmp_path: Path) -> None:
+    """The read_write /agent/config refusal returns no options, so no secret."""
     state = _state(
         tmp_path,
         exposure="read_write",
@@ -105,13 +110,11 @@ def test_agent_config_redacts_secrets_in_read_write(tmp_path: Path) -> None:
         agent_api_token="SECRET_AGENT",
     )
     with TestClient(build_app(state)) as client:
-        resp = client.post("/agent/config", json={"min_soc": 30.0})
-    assert resp.status_code == 200
+        resp = client.post("/agent/config", json={"agent_exposure": "read_write"})
+    assert resp.status_code == 409
     assert "SECRET_OCTO" not in resp.text
     assert "SECRET_AGENT" not in resp.text
-    body = resp.json()
-    assert body["octopus_api_key"] == "***"
-    assert body["agent_api_token"] == "***"
+    assert resp.json() == AGENT_CONFIG_REFUSAL
 
 
 @respx.mock
@@ -129,8 +132,8 @@ def test_exposure_downgrade_via_api_config_applies_without_restart(tmp_path: Pat
     client immediately: the gate is evaluated per request against live settings,
     never captured at router-build time (#93)."""
     respx.get("http://ha.test/api/states").mock(return_value=httpx.Response(200, json=[]))
-    with TestClient(build_app(_state(tmp_path, exposure="read_write"))) as client:
-        assert client.post("/agent/config", json={"min_soc": 30.0}).status_code == 200
+    with owner_client(_state(tmp_path, exposure="read_write")) as client:
+        assert client.post("/agent/config", json={"min_soc": 30.0}).status_code == 409
         assert client.post("/api/config", json={"agent_exposure": "read"}).status_code == 200
         # act + write tiers are gone...
         assert client.post("/agent/config", json={}).status_code == 404
@@ -176,12 +179,12 @@ def test_agent_surface_off_denies_agent_routes_and_schema(tmp_path: Path) -> Non
 
 def test_exposure_upgrade_via_api_config_applies_without_restart(tmp_path: Path) -> None:
     """The gate is not latched: raising the tier at runtime opens the new routes too."""
-    with TestClient(build_app(_state(tmp_path, exposure="read"))) as client:
+    with owner_client(_state(tmp_path, exposure="read")) as client:
         assert client.post("/agent/config", json={"min_soc": 30.0}).status_code == 404
         assert client.post("/api/config", json={"agent_exposure": "read_write"}).status_code == 200
         resp = client.post("/agent/config", json={"min_soc": 30.0})
-    assert resp.status_code == 200
-    assert resp.json()["min_soc"] == 30.0
+    # The write tier is open now, and its one operation refuses (#457).
+    assert resp.status_code == 409
 
 
 @respx.mock
@@ -229,12 +232,16 @@ def test_forecast_route_serves_the_served_day_profile(
     assert body["source"] == "slot profile (14d hourly house stats)"
 
 
-def test_agent_config_rejects_invalid_document_before_saving(tmp_path: Path) -> None:
-    """#412: /agent/config validates the whole candidate before persisting.
-
-    A rejected save must leave the options file byte-identical and the running
-    settings untouched, and the 400 reason must name the failing field without
-    echoing its value or the secret sitting next to it in the document.
+@pytest.mark.parametrize(
+    "updates", [{"min_soc": "not-a-number"}, {"db_path": "TOPSECRET/moved-db.db"}]
+)
+def test_agent_config_refusal_leaves_options_and_settings_untouched(
+    tmp_path: Path, updates: dict[str, object]
+) -> None:
+    """#457: every /agent/config change is refused before anything is read or
+    saved, so the options file stays byte-identical and the running settings
+    untouched (the #412/#441 save rules now apply only to owner saves), and the
+    response never echoes the submitted values or a stored secret.
     """
     options = tmp_path / "options.json"
     seeded = json.dumps({"min_soc": 20.0, "octopus_api_key": "SECRET_OCTO"}).encode()
@@ -243,28 +250,11 @@ def test_agent_config_rejects_invalid_document_before_saving(tmp_path: Path) -> 
         tmp_path, exposure="read_write", min_soc=20.0, octopus_api_key="SECRET_OCTO"
     )
     with TestClient(build_app(state)) as client:
-        resp = client.post("/agent/config", json={"min_soc": "not-a-number"})
-    assert resp.status_code == 400
-    assert "min_soc" in resp.json()["detail"]
+        resp = client.post("/agent/config", json=updates)
+    assert resp.status_code == 409
     assert "not-a-number" not in resp.text
+    assert "TOPSECRET" not in resp.text
     assert "SECRET_OCTO" not in resp.text
     assert options.read_bytes() == seeded
     assert state.settings.min_soc == 20.0
-
-
-def test_agent_config_rejects_a_changed_db_path(tmp_path: Path) -> None:
-    """#441: /agent/config cannot move ``db_path`` either. The rejection leaves
-    the options file byte-identical and the running settings untouched, with a
-    reason naming ``db_path`` that never echoes the submitted value.
-    """
-    options = tmp_path / "options.json"
-    seeded = json.dumps({"min_soc": 20.0}).encode()
-    options.write_bytes(seeded)
-    state = _state(tmp_path, exposure="read_write", min_soc=20.0)
-    with TestClient(build_app(state)) as client:
-        resp = client.post("/agent/config", json={"db_path": "TOPSECRET/moved-db.db"})
-    assert resp.status_code == 400
-    assert "db_path" in resp.json()["detail"]
-    assert "TOPSECRET/moved-db.db" not in resp.text
-    assert options.read_bytes() == seeded
     assert state.settings.db_path == str(tmp_path / "t.db")
