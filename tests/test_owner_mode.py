@@ -61,7 +61,8 @@ async def test_mode_ingress_queues_owner_and_epoch(tmp_path: Path) -> None:
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=("proxy", 1)),
                                 base_url="http://local") as client:
         response = await client.post("/api/mode", json={"target": "protect", "expected_epoch": 7},
-                                     headers={"X-Remote-User-Id": "owner_1"})
+                                     headers={"X-Remote-User-Id": "owner_1",
+                                              "X-HA-Spark-Request": "mode"})
     assert response.status_code == 200
     assert response.json()["epoch"] == 8
 
@@ -92,5 +93,6 @@ async def test_mode_ingress_reply_is_bounded(tmp_path: Path, monkeypatch) -> Non
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=("proxy", 1)),
                                 base_url="http://local") as client:
         response = await client.post("/api/mode", json={"target": "protect", "expected_epoch": 7},
-                                     headers={"X-Remote-User-Id": "owner_1"})
+                                     headers={"X-Remote-User-Id": "owner_1",
+                                              "X-HA-Spark-Request": "mode"})
     assert response.status_code == 504

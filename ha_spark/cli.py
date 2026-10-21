@@ -47,7 +47,6 @@ from ha_spark.energy.onboarding import (
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever
-from ha_spark.energy.soc_monitor import observe_soc
 from ha_spark.energy.sources import _to_float
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.energy.v2l import delivered_fraction, load_session, savings
@@ -58,7 +57,7 @@ from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
 from ha_spark.health import Status, check_load_history, exit_code, format_report, run_health
 from ha_spark.logging import setup_logging
-from ha_spark.mode_preconditions import check_preconditions
+from ha_spark.mode_preconditions import entry_preconditions
 from ha_spark.onboarding_discover import FieldProposal, propose
 from ha_spark.presets import get_preset, preset_names
 from ha_spark.router import route_message
@@ -1000,17 +999,7 @@ async def _cmd_mode_show(settings: Settings) -> int:
     loaded = load_authority(settings)
     view = authority_view(loaded.state, known=loaded.status == "known")
     view["load_status"] = loaded.status
-    async with HomeAssistantRest(
-        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
-    ) as rest:
-        # The daemon's own observation path, so both judge SoC freshness alike.
-        soc = await observe_soc(settings, rest)
-        report = await check_preconditions(settings, rest, soc)
-    view["preconditions"] = {
-        "observe": {"passed": True, "reasons": []},
-        "protect": {"passed": not report.protect, "reasons": list(report.protect)},
-        "optimise": {"passed": not report.optimise, "reasons": list(report.optimise)},
-    }
+    view["preconditions"] = await entry_preconditions(settings)
     print(json.dumps(view, indent=2))
     return 0
 

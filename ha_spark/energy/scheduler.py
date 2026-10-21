@@ -1540,7 +1540,8 @@ async def _accept_mode(
         report, now=now,
     )
     if decision.refusal:
-        return Reply(error=decision.refusal, text="; ".join(decision.reasons))
+        return Reply(error=decision.refusal, text="; ".join(decision.reasons),
+                     reasons=list(decision.reasons))
     old_mode = store.state.committed_mode if known and store.state else "authority_unknown"
     if decision.confirm_observe:
         store.confirm_observe(kind)
