@@ -48,13 +48,16 @@ security and prefer the safe default. Hard rules:
   Only the daemon actuates: real writes go through `WriteGate.mode_for` and the
   write-time `WriteGate.recheck` (`devices/execution.py`). Observe, unknown
   authority and a failed authority save write nothing; Protect writes only its
-  holds (and enabled clock sync); Optimise runs the plan. Never write on an
-  invalid SoC; always read back; isolate failures per action. One narrow
-  exception: after `soc_failure_threshold` failed SoC checks, Solis in Optimise
-  may program the configured cheap-rate window at an explicitly set
-  `solis_fallback_current_a`, through the same gates and read-back; no default
-  current, and AlphaESS never gets it. Holds start and end only on fresh
-  evidence, and `On` is written only to a readable switch. Don't weaken these
+  holds (and enabled clock sync); Optimise runs the plan. An invalid SoC
+  blocks every SoC-derived write; always read back; isolate failures per
+  action. Writes that don't depend on SoC keep their own safeguards: holds
+  (discharge prevention) and authorised clock sync, and, after
+  `soc_failure_threshold` failed SoC checks, the Solis fallback in Optimise,
+  which programs the configured cheap-rate window at an explicitly set
+  `solis_fallback_current_a` through the same gates and read-back; no default
+  current, and AlphaESS never gets it. A hold starts only on fresh evidence
+  and ends on fresh clear evidence, a dispatch's last trusted end, or an
+  explicit owner handover; `On` is written only to a readable switch. Don't weaken these
   (`ha_spark/devices/inverters/`, `energy/supply_guard.py`,
   `energy/soc_monitor.py`, `authority.py`, `transitions.py`).
 - **Parameterised SQL only**; no `eval`/`exec`/`shell=True`/shell interpolation

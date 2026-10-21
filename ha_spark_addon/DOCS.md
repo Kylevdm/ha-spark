@@ -130,8 +130,8 @@ charging or idle and the inverter's resident slot-1 charge window reads back
 fresh. The window's overlay sensors report only on change, so an unchanged
 window counts as fresh while the hub's `sensor.<hub>_inverter_clock` reports
 within `battery_power_max_age_seconds` (for up to 12 hours since the window
-last reported). Without that clock sensor, or with a stale window, the hold
-applies. Five advancing fresh not-charging reports release an EV hold, and
+last reported). A window field older than that maximum with no fresh clock
+report, or older than 12 hours, means the hold applies. Five advancing fresh not-charging reports release an EV hold, and
 the overnight window never releases one; eco+ Diverting does not start one.
 Stale or unreadable EV status neither starts nor releases a hold and appears
 as a warning in `ha-spark health`. In Protect or Optimise, the next minute's

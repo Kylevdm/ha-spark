@@ -76,7 +76,7 @@ only the daemon actuates, through the site operating mode and write-time gate.
 Integration-owned control and temporary manual handover arrive in later phases;
 no bypass is granted here.
 
-- [ ] Observe (the install and upgrade default) computes a plan, logs `[SIMULATE]`
+- [ ] Observe (the new-install and legacy-upgrade default) computes a plan, logs `[SIMULATE]`
       action lines, and makes **zero** hardware-actuating calls, including on shutdown.
 - [ ] Protect writes only the hold and its release, read-back verified, plus
       clock sync when authorised. It never writes the owner's charging schedule.

@@ -191,7 +191,7 @@ UI ([#247](https://github.com/Kylevdm/ha-spark/issues/247)). It adds:
   to the keys needed to start the add-on;
 - one site-wide operating mode (Observe, Protect or Optimise), shipped in
   phase 2 with a durable authority store in the add-on's data directory.
-  Every install and upgrade starts in Observe
+  New installs, and upgrades from the retired settings, start in Observe
   ([ADR 0008](docs/adr/0008-operating-mode-and-authority-lifecycle.md)).
 
 The earlier v1 definition
