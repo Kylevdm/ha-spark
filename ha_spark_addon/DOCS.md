@@ -656,7 +656,12 @@ Endpoints:
   publishes to Home Assistant
 - `GET /api/config`: the current options, with secrets masked
 - `POST /api/config`: merge the posted options, save them to
-  `/data/options.json`, and reload the daemon's settings without a restart
+  `/data/options.json`, and reload the daemon's settings without a restart.
+  It is an owner save, so it needs the `X-Remote-User-Id` header the ingress
+  proxy adds, `X-HA-Spark-Request: config` and a JSON body.
+
+The config endpoints exist only on ingress. They aren't served on the
+published agent port, whatever the token, or on the standalone/dev listener.
 
 ### Agent surface
 
@@ -668,7 +673,9 @@ ha-spark's data and, optionally, trigger a few gated actions.
 - `agent_exposure` (`read` | `read_act` | `read_write`, default `read_act`):
   how much is exposed. `read` is data only (states, plan, forecast,
   predictions, health). `read_act` adds `add_context` and `run_plan`.
-  `read_write` adds `set_config`.
+  `read_write` adds `set_config`, which in this version refuses every change
+  with `unavailable`: agents can't change configuration until owner-approved
+  config proposals exist.
 - `agent_api_token`: bearer token for the published port. If you leave it
   blank, the add-on generates one on first start and saves it to
   `/data/agent_token` in the add-on container (read it from the add-on shell

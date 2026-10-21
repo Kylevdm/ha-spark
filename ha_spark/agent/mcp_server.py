@@ -4,8 +4,9 @@ Mounts at ``/mcp`` from :func:`ha_spark.api.server.build_app`. The tools are the
 same protocol-agnostic core the ``/agent/*`` routes use (:mod:`ha_spark.agent.tools`);
 this module only adapts them to MCP and applies the same exposure gating, so an
 LLM client sees exactly the tools the configured tier permits. The act/write
-tools route through the same operating-mode-gated / ``_OPTION_KEYS``-whitelisted
-paths as the routes -- the model never reaches ``call_service`` directly.
+tools route through the same operating-mode-gated paths as the routes -- the
+model never reaches ``call_service`` directly -- and ``set_config`` refuses every
+change until owner-approved config proposals exist (#457).
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from mcp.types import Tool as MCPTool
 
 from ha_spark.agent import tools
 from ha_spark.agent.exposure import OPERATION_TIERS, Tier, allowed
-from ha_spark.api.server import AppState
+from ha_spark.api.server import AGENT_CONFIG_REFUSAL, AppState
 
 
 class _Gated(FastMCP):
@@ -58,8 +59,8 @@ def build_mcp(state: AppState) -> FastMCP:
     """Build the FastMCP server: every tool registered once, gated at call time.
 
     The gate is :func:`~ha_spark.agent.exposure.allowed` evaluated per request
-    against the live ``state.settings``, so ``POST /api/config`` changes apply
-    without a restart; the ``agent_surface`` master switch denies the surface.
+    against the live ``state.settings``, so an owner's ``POST /api/config`` on
+    ingress applies without a restart; the ``agent_surface`` master switch denies the surface.
     """
     mcp = _Gated(
         state,
@@ -126,9 +127,10 @@ def build_mcp(state: AppState) -> FastMCP:
         return (await tools.run_plan(state.settings, executor=state.executor)).model_dump()
 
     @mcp.tool()
-    async def set_config(updates: dict[str, object]) -> dict[str, object]:
-        """Update whitelisted ha-spark options (hot-reloaded)."""
-        state.apply_options(updates)
-        return state.current_options()
+    async def set_config(updates: Any = None) -> dict[str, object]:
+        """Unavailable: agent config changes need owner approval (not in this version)."""
+        # Untyped so FastMCP's argument validation can't fail first and echo
+        # the submitted value in its error; the argument is never read (#457).
+        raise ToolError(f"{AGENT_CONFIG_REFUSAL['error']}: {AGENT_CONFIG_REFUSAL['detail']}")
 
     return mcp

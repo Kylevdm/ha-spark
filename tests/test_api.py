@@ -15,6 +15,7 @@ from ha_spark.config import Settings
 from ha_spark.energy.models import ChargeIntent, ChargePlan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import monitor_path
+from tests.api_helpers import OWNER_CONFIG_HEADERS, owner_client
 
 
 def _soc(value: float) -> SocMeasurement:
@@ -97,7 +98,7 @@ def test_get_plan_returns_sensor_entities(tmp_path: Path) -> None:
 
 
 def test_get_config_returns_options(tmp_path: Path) -> None:
-    with _client(_state(tmp_path)) as client:
+    with owner_client(_state(tmp_path)) as client:
         resp = client.get("/api/config")
     assert resp.status_code == 200
     assert "min_soc" in resp.json()
@@ -125,7 +126,7 @@ def test_retired_sidecar_directory_is_ignored(tmp_path, caplog):
 
 def test_config_roundtrip_persists_and_reloads(tmp_path: Path) -> None:
     state = _state(tmp_path, min_soc=20.0)
-    with _client(state) as client:
+    with owner_client(state) as client:
         before = client.get("/api/config").json()
         assert before["min_soc"] == 20.0
         resp = client.post("/api/config", json={"min_soc": 25.0, "not_a_key": "x"})
@@ -139,7 +140,7 @@ def test_config_roundtrip_persists_and_reloads(tmp_path: Path) -> None:
 
 
 def test_post_config_rejects_non_object(tmp_path: Path) -> None:
-    with _client(_state(tmp_path)) as client:
+    with owner_client(_state(tmp_path)) as client:
         resp = client.post("/api/config", json=[1, 2, 3])
     assert resp.status_code == 400
 
@@ -152,7 +153,7 @@ def test_get_config_redacts_secrets(tmp_path: Path) -> None:
         axle_api_key="SECRET_AXLE",
         agent_api_token="SECRET_AGENT",
     )
-    with _client(state) as client:
+    with owner_client(state) as client:
         resp = client.get("/api/config")
     assert resp.status_code == 200
     # Raw response text carries neither secret.
@@ -168,7 +169,7 @@ def test_get_config_redacts_secrets(tmp_path: Path) -> None:
 
 def test_unset_secret_not_rendered_as_redacted(tmp_path: Path) -> None:
     """An empty secret stays empty so clients can tell it's not configured."""
-    with _client(_state(tmp_path)) as client:
+    with owner_client(_state(tmp_path)) as client:
         body = client.get("/api/config").json()
     assert body["octopus_api_key"] == ""
     assert body["agent_api_token"] == ""
@@ -183,7 +184,7 @@ def test_post_redacted_secret_does_not_clobber_stored_value(tmp_path: Path) -> N
         encoding="utf-8",
     )
     state = _state(tmp_path, octopus_api_key="REAL_OCTO", agent_api_token="REAL_AGENT")
-    with _client(state) as client:
+    with owner_client(state) as client:
         # Posting the sentinel back (as a client echoing GET /api/config would) is a no-op.
         resp = client.post(
             "/api/config",
@@ -204,7 +205,7 @@ def test_post_redacted_secret_does_not_clobber_stored_value(tmp_path: Path) -> N
 def test_post_genuine_secret_value_is_stored(tmp_path: Path) -> None:
     """A real (non-sentinel) secret value still updates normally."""
     state = _state(tmp_path)
-    with _client(state) as client:
+    with owner_client(state) as client:
         client.post("/api/config", json={"octopus_api_key": "NEW_OCTO"})
     assert state.settings.octopus_api_key == "NEW_OCTO"
     persisted = json.loads((tmp_path / "options.json").read_text(encoding="utf-8"))
@@ -236,7 +237,8 @@ def test_ingress_app_serves_the_proxy(tmp_path: Path) -> None:
     state = _state(tmp_path, min_soc=20.0)
     with _ingress_client(state, INGRESS_PROXY_IP) as client:
         assert client.get("/api/health").status_code == 200
-        assert client.post("/api/config", json={"min_soc": 30.0}).status_code == 200
+        saved = client.post("/api/config", json={"min_soc": 30.0}, headers=OWNER_CONFIG_HEADERS)
+        assert saved.status_code == 200
     assert state.settings.min_soc == 30.0
 
 
@@ -262,7 +264,7 @@ def test_post_config_rejects_invalid_document_before_saving(
     options.write_bytes(seeded)
     state = _state(tmp_path, min_soc=20.0, octopus_api_key="SECRET_OCTO")
     with caplog.at_level("WARNING"):
-        with _client(state) as client:
+        with owner_client(state) as client:
             resp = client.post("/api/config", json={"min_soc": "not-a-number"})
     assert resp.status_code == 400
     assert "min_soc" in resp.json()["error"]
@@ -286,7 +288,7 @@ def test_post_config_rejection_never_echoes_a_secret_value(
     options.write_bytes(seeded)
     state = _state(tmp_path, agent_api_token="REAL_AGENT")
     with caplog.at_level("WARNING"):
-        with _client(state) as client:
+        with owner_client(state) as client:
             resp = client.post("/api/config", json={"agent_api_token": ["TOPSECRET_AGENT"]})
     assert resp.status_code == 400
     assert "agent_api_token" in resp.json()["error"]
@@ -299,7 +301,7 @@ def test_post_config_rejection_never_echoes_a_secret_value(
 def test_post_config_rejection_of_nested_device_entry_is_secret_safe(tmp_path: Path) -> None:
     """A bad nested ``devices`` entry must not echo the offending value."""
     state = _state(tmp_path)
-    with _client(state) as client:
+    with owner_client(state) as client:
         resp = client.post(
             "/api/config",
             json={
@@ -337,7 +339,7 @@ def test_post_config_rejects_a_changed_db_path(
     before_dir = resolve_data_dir(state.settings)
     before_mode = operating_mode(state.settings)
     with caplog.at_level("WARNING"):
-        with _client(state) as client:
+        with owner_client(state) as client:
             resp = client.post("/api/config", json={"db_path": "TOPSECRET/moved-db.db"})
     assert resp.status_code == 400
     assert "db_path" in resp.json()["error"]
@@ -362,7 +364,7 @@ def test_post_config_rejects_null_db_path(tmp_path: Path) -> None:
     options.write_bytes(seeded)
     state = _state(tmp_path, min_soc=20.0)
     before_monitor = monitor_path(state.settings)
-    with _client(state) as client:
+    with owner_client(state) as client:
         resp = client.post("/api/config", json={"db_path": None})
     assert resp.status_code == 400
     assert "db_path" in resp.json()["error"]
@@ -379,9 +381,111 @@ def test_post_config_accepts_a_save_echoing_the_running_db_path(tmp_path: Path) 
     state = _state(
         tmp_path, ha_url="http://ha.test", ha_token="x", db_path=db_path, min_soc=20.0
     )
-    with _client(state) as client:
+    with owner_client(state) as client:
         resp = client.post("/api/config", json={"db_path": db_path, "min_soc": 25.0})
     assert resp.status_code == 200
     assert state.settings.min_soc == 25.0
     assert state.settings.db_path == db_path
     assert resp.json()["db_path"] == db_path
+
+
+# --- #457: config routes are owner-only ingress routes -----------------------
+
+
+def test_published_port_has_no_config_routes_even_with_forged_ingress_headers(
+    tmp_path: Path,
+) -> None:
+    """An agent token plus forged ingress headers never reaches an owner config route."""
+    state = _state(tmp_path, min_soc=20.0, agent_exposure="read")
+    app = build_app(state, require_token=True, token="sekret")
+    forged = {"Authorization": "Bearer sekret", **OWNER_CONFIG_HEADERS}
+    with TestClient(app, client=("192.0.2.10", 50000)) as client:
+        assert client.get("/api/config", headers=forged).status_code == 404
+        resp = client.post(
+            "/api/config", json={"agent_exposure": "read_write", "min_soc": 30.0}, headers=forged
+        )
+        assert resp.status_code == 404
+    assert not (tmp_path / "options.json").exists()
+    assert state.settings.agent_exposure == "read"
+    assert state.settings.min_soc == 20.0
+
+
+def test_standalone_listener_has_no_config_routes(tmp_path: Path) -> None:
+    state = _state(tmp_path, min_soc=20.0)
+    with TestClient(build_app(state)) as client:
+        assert client.get("/api/config").status_code == 404
+        resp = client.post("/api/config", json={"min_soc": 30.0}, headers=OWNER_CONFIG_HEADERS)
+        assert resp.status_code == 404
+    assert not (tmp_path / "options.json").exists()
+    assert state.settings.min_soc == 20.0
+
+
+@pytest.mark.parametrize(
+    ("headers", "status"),
+    [
+        ({"X-HA-Spark-Request": "config"}, 403),
+        ({"X-Remote-User-Id": "bad id!", "X-HA-Spark-Request": "config"}, 403),
+        ({"X-Remote-User-Id": "owner"}, 403),
+        ({"X-Remote-User-Id": "owner", "X-HA-Spark-Request": "mode"}, 403),
+    ],
+)
+def test_ingress_config_save_needs_owner_request_headers(
+    tmp_path: Path, headers: dict[str, str], status: int
+) -> None:
+    state = _state(tmp_path, min_soc=20.0)
+    with TestClient(build_app(state, ingress_peer="testclient")) as client:
+        resp = client.post("/api/config", json={"min_soc": 30.0}, headers=headers)
+    assert resp.status_code == status
+    assert not (tmp_path / "options.json").exists()
+    assert state.settings.min_soc == 20.0
+
+
+def test_ingress_config_save_needs_a_json_content_type(tmp_path: Path) -> None:
+    state = _state(tmp_path, min_soc=20.0)
+    with owner_client(state) as client:
+        resp = client.post(
+            "/api/config",
+            content='{"min_soc": 30.0}',
+            headers={"Content-Type": "text/plain"},
+        )
+    assert resp.status_code == 415
+    assert not (tmp_path / "options.json").exists()
+    assert state.settings.min_soc == 20.0
+
+
+def test_config_save_failure_other_than_validation_never_echoes_its_text(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A reload failure's message may carry input; only its type is reported."""
+    state = _state(tmp_path, min_soc=20.0)
+
+    def _boom() -> Settings:
+        raise ValueError("TOPSECRET_FROM_RELOAD")
+
+    state.reload = _boom
+    with owner_client(state) as client:
+        resp = client.post("/api/config", json={"min_soc": 30.0})
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "config update failed"}
+    assert "TOPSECRET" not in resp.text
+    assert "TOPSECRET" not in caplog.text
+    assert state.settings.min_soc == 20.0
+
+
+def test_post_config_rejection_never_echoes_a_submitted_mapping_key(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A secret pasted as a mapping key is not a field name, so the reason
+    reads ``<key>`` in its place (#457 review)."""
+    state = _state(tmp_path)
+    with owner_client(state) as client:
+        resp = client.post(
+            "/api/config",
+            json={"devices": [{"id": "main", "driver": "solis",
+                               "entities": {"TOPSECRET_ENTITY": []}}]},
+        )
+    assert resp.status_code == 400
+    assert "devices.0.entities.<key>" in resp.json()["error"]
+    assert "TOPSECRET" not in resp.text
+    assert "TOPSECRET" not in caplog.text
+    assert not (tmp_path / "options.json").exists()

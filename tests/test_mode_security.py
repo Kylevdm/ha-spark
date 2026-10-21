@@ -11,6 +11,7 @@ from ha_spark.agent.exposure import OPERATION_TIERS
 from ha_spark.agent.mcp_server import build_mcp
 from ha_spark.api.server import AppState, build_app
 from ha_spark.daemon_channel import Reply, Request
+from tests.api_helpers import owner_client
 from tests.authority_helpers import seed_authority
 from tests.test_owner_mode import settings_at
 
@@ -61,9 +62,13 @@ def test_config_cannot_grant_mode(tmp_path: Path, path: str):
     store = seed_authority(settings, "observe")
     before = store.store_path.read_bytes()
     state = AppState(settings, tmp_path / "options.json", reload=lambda: settings)
-    with TestClient(build_app(state)) as client:
-        client.post(path, json={"operating_mode": "protect", "committed_mode": "protect",
-                                "mode": "protect", "proactive_mode": "on"})
+    # The owner's ingress save really runs (and drops the unknown keys); the
+    # agent route refuses (#457). Neither touches authority.
+    with owner_client(state) as client:
+        response = client.post(path, json={"operating_mode": "protect",
+                                           "committed_mode": "protect",
+                                           "mode": "protect", "proactive_mode": "on"})
+    assert response.status_code == (200 if path == "/api/config" else 409)
     assert store.store_path.read_bytes() == before
 
 

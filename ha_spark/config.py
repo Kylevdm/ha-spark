@@ -203,12 +203,28 @@ def _validation_error_reason(exc: ValidationError) -> str:
     be a secret option (``_SECRET_OPTION_KEYS``) or a nested ``devices``
     entry. Rejection reasons reach API clients, the agent surface and logs,
     so they are built from the error locations and messages only (#412).
+    A location can also hold a submitted mapping key (``devices.0.entities.
+    <key>``), so only known field names and list indexes are kept; any other
+    part reads ``<key>`` (#457).
     """
+    known = _known_field_names()
     reasons: list[str] = []
     for error in exc.errors():
-        location = ".".join(str(part) for part in error["loc"])
+        location = ".".join(
+            str(part) if isinstance(part, int) or part in known else "<key>"
+            for part in error["loc"]
+        )
         reasons.append(f"{location}: {error['msg']}" if location else error["msg"])
     return "; ".join(reasons)
+
+
+def _known_field_names() -> frozenset[str]:
+    """Every field name of the config models, the only location parts a reason names."""
+    models: tuple[type[BaseModel], ...] = (
+        Settings, DeviceConfig, FixedTariffConfig, DynamicTariffConfig,
+        OctopusIntelligentTariffConfig, AxleTariffConfig,
+    )
+    return frozenset(name for model in models for name in model.model_fields)
 
 
 class FixedTariffConfig(BaseModel):
