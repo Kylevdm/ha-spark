@@ -330,3 +330,75 @@ async def test_observe_never_commits_while_a_hold_of_ours_remains(tmp_path, monk
             assert "[FAILED] hold records remain unreleased" in current.transition.failing_actions
     finally:
         execution_context().authority = prior
+
+
+@pytest.mark.parametrize("surface", ["ingress", "cli"])
+@respx.mock
+async def test_owner_happy_path_reaches_the_daemon_store(tmp_path, monkeypatch, caplog, surface):
+    from unittest.mock import AsyncMock
+
+    import httpx
+
+    from ha_spark.api.server import build_app
+
+    settings = settings_at(tmp_path)
+    store = AuthorityStore(settings)
+    store.save(store.state.model_copy(update={"committed_mode": "observe"}))
+    respx.get(url__regex=r"http://ha.test/api/.*").respond(200, json=[])
+    respx.post(url__regex=r"http://ha.test/api/.*").respond(200, json=[])
+    monkeypatch.setattr("ha_spark.energy.scheduler.check_preconditions",
+                        AsyncMock(return_value=PreconditionReport()))
+    monkeypatch.setattr(cli, "load_settings", lambda **kwargs: settings)
+    prior = execution_context().authority
+    caplog.set_level("INFO")
+    try:
+        async with running_daemon(settings, tmp_path, monkeypatch) as (state, _, _, _):
+            before = state.executor.authority.state.epoch
+            if surface == "ingress":
+                app = build_app(state, ingress_peer="proxy")
+                transport = httpx.ASGITransport(app=app, client=("proxy", 1))
+                async with httpx.AsyncClient(transport=transport, base_url="http://l") as client:
+                    response = await client.post(
+                        "/api/mode", json={"target": "protect", "expected_epoch": before},
+                        headers={"X-Remote-User-Id": "owner_1", "X-HA-Spark-Request": "mode"},
+                    )
+                assert response.status_code == 200
+                assert response.json()["mode"] == "protect"
+            else:
+                assert await asyncio.to_thread(cli.main, ["mode", "set", "protect"]) == 0
+            stored = state.executor.authority.state
+            assert stored.committed_mode == "protect"
+            assert stored.epoch == before + 1
+            requester = "owner_1" if surface == "ingress" else "cli"
+            assert (f"requester={requester} old=observe target=protect epoch={before + 1}"
+                    in caplog.text)
+    finally:
+        execution_context().authority = prior
+
+
+@respx.mock
+async def test_restart_resumes_a_stored_protect_evaluation(tmp_path, monkeypatch):
+    settings = settings_at(tmp_path)
+    store = AuthorityStore(settings)
+    store.save(store.state.model_copy(update={
+        "committed_mode": "protect",
+        "transition": Transition(target="protect", started_at=datetime.now(UTC),
+                                 steps=("evaluate_protection",)),
+    }))
+    epoch = store.state.epoch
+    respx.get(url__regex=r"http://ha.test/api/.*").respond(200, json=[])
+    respx.post(url__regex=r"http://ha.test/api/.*").respond(200, json=[])
+    prior = execution_context().authority
+    try:
+        async with running_daemon(settings, tmp_path, monkeypatch) as (state, _, device, _):
+            for _ in range(100):
+                if state.executor.authority.state.transition is None:
+                    break
+                await asyncio.sleep(0.001)
+            result = state.executor.authority.state
+            assert result.transition is None
+            assert result.committed_mode == "protect"
+            assert result.epoch == epoch + 1  # the new process's bump
+            device.reconcile_holds.assert_awaited()
+    finally:
+        execution_context().authority = prior

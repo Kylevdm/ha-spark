@@ -1551,9 +1551,6 @@ async def _accept_mode(
         assert decision.state is not None
         store.save(decision.state)
     assert store.state is not None
-    if request.target == "optimise":
-        log.warning("Entering Optimise: disable any pre-existing automations or manual schedules "
-                    "that write the same devices before proceeding")
     log.info("Operating mode requester=%s old=%s target=%s epoch=%d",
              pending.ingress_user or "cli", old_mode, request.target, store.state.epoch)
     return Reply(authority=channel.authority_status())
@@ -1612,10 +1609,8 @@ async def _mode_lifecycle(
                     return
                 with context.after_authority_save(), context.handover(step):
                     if step == "evaluate_protection":
-                        async with HomeAssistantRest(
-                            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
-                        ) as rest:
-                            await inverter_device(settings, rest).resident_diagnostic()
+                        # The reconcile reads the switch, and the resident window
+                        # for the overnight exception, with fresh evidence.
                         if plan is None:
                             unknown = SocMeasurement(SocStatus.UNAVAILABLE, now)
                             plan = ChargePlan(
@@ -1675,6 +1670,8 @@ async def _mode_lifecycle(
                 ))
             except Exception:
                 failures = ("[FAILED] handover step failed",)
+            if step != "evaluate_protection":  # reconcile_tick logs its own lines
+                _log_action_lines([*lines, *(f for f in failures if f not in lines)])
             if store.state is None:
                 return
             current = store.state
@@ -2013,6 +2010,11 @@ async def _run_forever(
                                     "failing_actions": failures,
                                 }) if failures else None,
                             }))
+                            if not failures:
+                                log.warning(
+                                    "Optimise active: disable any pre-existing automations or "
+                                    "manual schedules that write the same devices"
+                                )
                     plan, last_applied_plan = result.plan, result.applied_plan
                     if recovering:
                         backed_off = await finish_recovery(
