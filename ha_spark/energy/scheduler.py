@@ -1590,8 +1590,24 @@ async def _mode_lifecycle(
                         ):
                             lines.append("[FAILED] hold request not confirmed by read-back")
                     elif step == "release_holds":
-                        store.save_holds(tuple(h for h in state.holds
-                                               if not held_identity_remapped(h.device, settings)))
+                        remapped = [h for h in state.holds
+                                    if held_identity_remapped(h.device, settings)]
+                        if remapped:
+                            # Owner's explicit → Observe: no configured device can
+                            # release these, so say a switch may still be Off.
+                            store.save_holds(tuple(h for h in state.holds if h not in remapped))
+                            log.warning("Dropped %d hold(s) on a device no longer configured; "
+                                        "its power switch may still be Off", len(remapped))
+                            async with HomeAssistantRest(
+                                settings.ha_rest_url, settings.auth_token,
+                                timeout=settings.ha_timeout,
+                            ) as rest:
+                                await send_notification(
+                                    settings, rest, "ha-spark hold dropped",
+                                    "Switching to Observe dropped a hold on an inverter that is "
+                                    "no longer configured. Its power switch may still be Off; "
+                                    "check it and turn it On yourself if it should run.",
+                                )
                         if store.state is not None and store.state.holds:
                             async with HomeAssistantRest(
                                 settings.ha_rest_url, settings.auth_token,
@@ -1855,7 +1871,7 @@ async def _run_forever(
             # which is what every tick in that failure window steers by anyway,
             # so it costs a duplicate read rather than new stale exposure.
             replanned = False
-            pending = channel.queue.get_nowait() if not channel.queue.empty() else None
+            pending = channel.next_request()
             mode_request = pending if pending is not None and pending.request.op == "mode" else None
             if mode_request is not None or (
                 authority.state is not None and authority.state.transition is not None

@@ -71,6 +71,10 @@ STATE_ATTR = "ha_spark_state"
 _REDACTED = "***"
 
 
+# Above one 60 s daemon tick, below HA's ingress proxy timeout.
+_MODE_REPLY_TIMEOUT_S = 90
+
+
 class ModeBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     target: OperatingMode
@@ -395,9 +399,16 @@ def build_app(
             executor = _state_of(request).executor
             if executor is None:
                 return JSONResponse({"error": "no daemon executor"}, status_code=503)
-            reply = await executor.submit_mode(
-                body.target, body.expected_epoch, ingress_user=user,
-            )
+            try:
+                # Accepted within one daemon tick; a later verdict still lands in the store.
+                reply = await asyncio.wait_for(executor.submit_mode(
+                    body.target, body.expected_epoch, ingress_user=user,
+                ), timeout=_MODE_REPLY_TIMEOUT_S)
+            except TimeoutError:
+                return JSONResponse(
+                    {"error": "pending", "detail": "request queued; reload the mode status"},
+                    status_code=504,
+                )
             if reply.error:
                 status = 409 if reply.error in ("stale_epoch", "transition_in_progress") else 400
                 return JSONResponse(

@@ -1,4 +1,5 @@
 """Owner-only operating-mode requests and durable handovers."""
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -76,3 +77,20 @@ def test_ingress_panel_stays_admin_only() -> None:
 
     config = yaml.safe_load(Path("ha_spark_addon/config.yaml").read_text())
     assert config.get("panel_admin", True) is True
+
+
+async def test_mode_ingress_reply_is_bounded(tmp_path: Path, monkeypatch) -> None:
+    from ha_spark.api import server
+
+    class Executor:
+        async def submit_mode(self, target, expected_epoch, *, ingress_user=None):
+            await asyncio.sleep(10)
+
+    monkeypatch.setattr(server, "_MODE_REPLY_TIMEOUT_S", 0.01)
+    state = AppState(settings_at(tmp_path), tmp_path / "options.json", executor=Executor())
+    app = build_app(state, ingress_peer="proxy")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=("proxy", 1)),
+                                base_url="http://local") as client:
+        response = await client.post("/api/mode", json={"target": "protect", "expected_epoch": 7},
+                                     headers={"X-Remote-User-Id": "owner_1"})
+    assert response.status_code == 504

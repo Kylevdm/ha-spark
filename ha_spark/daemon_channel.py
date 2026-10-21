@@ -85,6 +85,8 @@ class DaemonChannel:
         self.path = resolve_data_dir(settings) / "ha_spark.sock"
         self.authority: AuthorityStore | None = None
         self.queue: asyncio.Queue[Pending] = asyncio.Queue(maxsize=64)
+        # Owner mode requests skip queued work so a reply reaches the owner in one tick.
+        self.mode_queue: asyncio.Queue[Pending] = asyncio.Queue(maxsize=8)
         self._fd: int | None = None
         self._server: asyncio.AbstractServer | None = None
         self._handlers: set[asyncio.Task[None]] = set()
@@ -121,10 +123,11 @@ class DaemonChannel:
             task.cancel()
         if self._handlers:
             await asyncio.gather(*self._handlers, return_exceptions=True)
-        while not self.queue.empty():
-            pending = self.queue.get_nowait()
-            if not pending.future.done():
-                pending.future.set_result(Reply(error="daemon stopped"))
+        for queue in (self.mode_queue, self.queue):
+            while not queue.empty():
+                pending = queue.get_nowait()
+                if not pending.future.done():
+                    pending.future.set_result(Reply(error="daemon stopped"))
         if self._fd is not None:
             self.path.unlink(missing_ok=True)
             os.close(self._fd)
@@ -144,6 +147,13 @@ class DaemonChannel:
             Request(op="mode", target=target, expected_epoch=expected_epoch), ingress_user,
         )
 
+    def next_request(self) -> Pending | None:
+        """The next request for this tick: an owner mode request before any work."""
+        for queue in (self.mode_queue, self.queue):
+            if not queue.empty():
+                return queue.get_nowait()
+        return None
+
     async def submit(self, op: Op) -> Reply:
         return await self._submit(Request(op=op))
 
@@ -154,7 +164,8 @@ class DaemonChannel:
             return Reply(error="daemon stopped")
         future = asyncio.get_running_loop().create_future()
         try:
-            self.queue.put_nowait(Pending(request, future, ingress_user))
+            queue = self.mode_queue if request.op == "mode" else self.queue
+            queue.put_nowait(Pending(request, future, ingress_user))
         except asyncio.QueueFull:
             return Reply(error="daemon request queue full")
         # Disconnecting a caller must not cancel an in-flight device sequence.
