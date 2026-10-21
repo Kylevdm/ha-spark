@@ -14,24 +14,17 @@ environment variables, a local ``.env`` file, and built-in defaults.
 
 from __future__ import annotations
 
-import json
 from datetime import time
-from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-from ha_spark.logging import get_logger
-
-log = get_logger(__name__)
 
 # Add-on mode: HA Core is reached through the Supervisor proxy.
 SUPERVISOR_REST_URL = "http://supervisor/core/api"
 SUPERVISOR_WS_URL = "ws://supervisor/core/websocket"
 
 # User-exposed add-on options we honour from /data/options.json.
-_OPTIONS_PATH = Path("/data/options.json")
 _OPTION_KEYS = frozenset(
     {
         "ollama_url",
@@ -714,30 +707,6 @@ class Settings(BaseSettings):
         return f"{ws}/api/websocket"
 
 
-def _read_options_overlay(path: Path = _OPTIONS_PATH) -> dict[str, Any]:
-    """Read user-exposed add-on options from ``/data/options.json``, if present."""
-    if not path.is_file():
-        return {}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        log.warning("Could not read add-on options at %s; ignoring", path)
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    retired = []
-    if "proactive_mode" in raw:
-        retired.append("proactive_mode")
-    devices = raw.get("devices")
-    if isinstance(devices, list) and any(
-        isinstance(device, dict) and "control" in device for device in devices
-    ):
-        retired.append("devices.control")
-    if retired:
-        log.warning("Ignoring deprecated options: %s", ", ".join(retired))
-    return {k: v for k, v in raw.items() if k in _OPTION_KEYS and v is not None}
-
-
 def _validated_settings(settings: Settings) -> Settings:
     """Run the cross-field tariff validations; raise ``ConfigError`` naming the field."""
     validate_fixed_tariff(settings)
@@ -791,14 +760,6 @@ def load_settings(*, validate: bool = True) -> Settings:
     overlay) for diagnostic paths like ``ha-spark health`` that must run and
     report rather than fail fast.
     """
-    overlay = _read_options_overlay()
-    settings = Settings(**overlay)
-    if validate and not settings.is_standalone and not settings.supervisor_token:
-        raise ConfigError(
-            "No Home Assistant credentials. Running as an HA add-on provides "
-            "SUPERVISOR_TOKEN automatically; for standalone/dev set HA_URL and "
-            "HA_TOKEN (see .env.example)."
-        )
-    if validate:
-        _validated_settings(settings)
-    return settings
+    from ha_spark.settings_service import SettingsService
+
+    return SettingsService().load(validate=validate)
