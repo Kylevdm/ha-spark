@@ -206,3 +206,19 @@ async def test_evaluate_protection_step_may_apply_a_hold(tmp_path) -> None:
 
     assert _options(rest) == ["Off"]
     assert any(line.outcome is ActionOutcome.VERIFIED for line in lines)
+
+
+async def test_one_steps_grant_never_carries_to_the_next_action(tmp_path) -> None:
+    rest = FakeRest(switch="Off")
+    device = _protect_device(rest, tmp_path)
+    _in_transition(device, ("release_holds", "commit_observe"), holds=(_hold(device),))
+    coordinator = device._execution.coordinator_for(device._config, device._settings)
+
+    async with coordinator.transition():
+        with device._execution.handover("commit_observe"):
+            first = await device.release_holds()
+        with device._execution.handover("release_holds"):
+            second = await device.release_holds()
+
+    assert [line.outcome for line in first] == [ActionOutcome.REFUSED]
+    assert [line.outcome for line in second] == [ActionOutcome.VERIFIED]
