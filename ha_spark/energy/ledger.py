@@ -1,7 +1,8 @@
 """SQLite store for forecast accuracy and household signals (aiosqlite).
 
-``forecasts`` records one row per (target_date, model) every time the daemon
-computes tonight's plan, so ``forecast-eval`` can later join against actual
+``forecasts`` appends every forecast revision, including paired baselines.
+The compatibility reader selects the latest issue per (target_date, model),
+so ``forecast-eval`` can later join against actual
 consumption and report MAE/MAPE per model — the referee later ML phases
 (6B+) must beat before they drive plans.
 
@@ -20,17 +21,22 @@ from types import TracebackType
 
 import aiosqlite
 
-from ha_spark.energy.models import ForecastRecord
+from ha_spark.energy.models import ForecastHistoryRecord, ForecastRecord
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS forecasts (
-    made_at     TEXT NOT NULL,
+    id          INTEGER PRIMARY KEY,
+    issued_at   TEXT NOT NULL,
     target_date TEXT NOT NULL,
     model       TEXT NOT NULL,
     total_kwh   REAL NOT NULL,
     slots_json  TEXT,
     source      TEXT NOT NULL,
-    PRIMARY KEY (target_date, model)
+    horizon_start TEXT,
+    horizon_end TEXT,
+    drove_plan INTEGER NOT NULL DEFAULT 0,
+    median_total_kwh REAL,
+    median_slots_json TEXT
 );
 CREATE TABLE IF NOT EXISTS signals (
     ts    TEXT NOT NULL,
@@ -40,14 +46,33 @@ CREATE TABLE IF NOT EXISTS signals (
 );
 """
 
-_UPSERT_FORECAST = """
-INSERT INTO forecasts (made_at, target_date, model, total_kwh, slots_json, source)
-VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT(target_date, model) DO UPDATE SET
-    made_at = excluded.made_at,
-    total_kwh = excluded.total_kwh,
-    slots_json = excluded.slots_json,
-    source = excluded.source
+_INSERT_FORECAST = """
+INSERT INTO forecasts (issued_at, target_date, model, total_kwh, slots_json, source,
+                      horizon_start, horizon_end, drove_plan, median_total_kwh, median_slots_json)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+_MIGRATE_FORECASTS = """
+BEGIN IMMEDIATE;
+CREATE TABLE forecasts_history (
+    id INTEGER PRIMARY KEY,
+    issued_at TEXT NOT NULL,
+    target_date TEXT NOT NULL,
+    model TEXT NOT NULL,
+    total_kwh REAL NOT NULL,
+    slots_json TEXT,
+    source TEXT NOT NULL,
+    horizon_start TEXT,
+    horizon_end TEXT,
+    drove_plan INTEGER NOT NULL DEFAULT 0,
+    median_total_kwh REAL,
+    median_slots_json TEXT
+);
+INSERT INTO forecasts_history (issued_at, target_date, model, total_kwh, slots_json, source)
+SELECT made_at, target_date, model, total_kwh, slots_json, source FROM forecasts;
+DROP TABLE forecasts;
+ALTER TABLE forecasts_history RENAME TO forecasts;
+COMMIT;
 """
 
 _UPSERT_SIGNAL = """
@@ -71,8 +96,17 @@ class ForecastLedger:
     async def __aenter__(self) -> ForecastLedger:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self._db_path)
-        await self._db.executescript(_SCHEMA)
-        await self._db.commit()
+        try:
+            await self._db.executescript(_SCHEMA)
+            cursor = await self._db.execute("PRAGMA table_info(forecasts)")
+            if any(row[1] == "made_at" for row in await cursor.fetchall()):
+                await self._db.executescript(_MIGRATE_FORECASTS)
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            await self._db.close()
+            self._db = None
+            raise
         return self
 
     async def __aexit__(
@@ -99,12 +133,22 @@ class ForecastLedger:
         total_kwh: float,
         slots: Iterable[float] | None,
         source: str,
+        *,
+        horizon_start: datetime | None = None,
+        horizon_end: datetime | None = None,
+        drove_plan: bool = False,
+        median_total_kwh: float | None = None,
+        median_slots: Iterable[float] | None = None,
     ) -> None:
-        """Upsert the forecast for ``(target_date, model)``."""
+        """Append a forecast revision; absent evidence remains NULL."""
         slots_json = json.dumps(list(slots)) if slots is not None else None
         await self._conn.execute(
-            _UPSERT_FORECAST,
-            (_iso(made_at), target_date.isoformat(), model, total_kwh, slots_json, source),
+            _INSERT_FORECAST,
+            (_iso(made_at), target_date.isoformat(), model, total_kwh, slots_json, source,
+             _iso(horizon_start) if horizon_start is not None else None,
+             _iso(horizon_end) if horizon_end is not None else None,
+             drove_plan, median_total_kwh,
+             json.dumps(list(median_slots)) if median_slots is not None else None),
         )
         await self._conn.commit()
 
@@ -121,10 +165,13 @@ class ForecastLedger:
         await self._conn.commit()
 
     async def forecasts_since(self, since: date) -> list[ForecastRecord]:
-        """Recorded forecasts with ``target_date >= since``, oldest first."""
+        """Latest issued forecast per day/model, with insertion order breaking ties."""
         cursor = await self._conn.execute(
-            "SELECT made_at, target_date, model, total_kwh, slots_json, source "
-            "FROM forecasts WHERE target_date >= ? ORDER BY target_date, model",
+            "SELECT issued_at, target_date, model, total_kwh, slots_json, source FROM ("
+            "SELECT *, ROW_NUMBER() OVER (PARTITION BY target_date, model "
+            "ORDER BY julianday(issued_at) DESC, id DESC) AS revision "
+            "FROM forecasts WHERE target_date >= ?) WHERE revision = 1 "
+            "ORDER BY target_date, model",
             (since.isoformat(),),
         )
         rows = await cursor.fetchall()
@@ -138,6 +185,28 @@ class ForecastLedger:
                 source=source,
             )
             for made_at, target_date, model, total_kwh, slots_json, source in rows
+        ]
+
+    async def forecast_history(self, since: date) -> list[ForecastHistoryRecord]:
+        """Every revision for target days since ``since``, in issue order."""
+        cursor = await self._conn.execute(
+            "SELECT issued_at, target_date, model, total_kwh, slots_json, source, "
+            "horizon_start, horizon_end, drove_plan, median_total_kwh, median_slots_json "
+            "FROM forecasts WHERE target_date >= ? ORDER BY julianday(issued_at), id",
+            (since.isoformat(),),
+        )
+        return [
+            ForecastHistoryRecord(
+                made_at=datetime.fromisoformat(issued), target_date=date.fromisoformat(target),
+                model=model, total_kwh=total, slots=tuple(json.loads(slots)) if slots else None,
+                source=source,
+                horizon_start=datetime.fromisoformat(start) if start else None,
+                horizon_end=datetime.fromisoformat(end) if end else None,
+                drove_plan=bool(drove), median_total_kwh=median_total,
+                median_slots=tuple(json.loads(median_slots)) if median_slots else None,
+            )
+            for issued, target, model, total, slots, source, start, end, drove,
+            median_total, median_slots in await cursor.fetchall()
         ]
 
     async def signal_history(self, name: str, since: datetime) -> list[tuple[datetime, float]]:

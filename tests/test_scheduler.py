@@ -636,6 +636,42 @@ async def test_run_once_records_the_served_day_forecast_in_day_order(
     assert row.slots == tuple(float(i) for i in range(SLOTS_PER_DAY))
 
 
+@respx.mock
+async def test_run_once_records_paired_forecast_horizon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ha_spark.energy import forecast, orchestrator
+
+    async def stats(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        return [
+            {"start": (midnight - timedelta(hours=h)).timestamp() * 1000, "change": 1.0}
+            for h in range(1, 24 * 15 + 1)
+        ]
+
+    monkeypatch.setattr(forecast, "statistics_during_period", stats)
+    monkeypatch.setattr(orchestrator, "statistics_during_period", stats)
+    respx.route(method="POST", path__startswith="/api/states/").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", authority_mode="observe",
+        db_path=str(tmp_path / "paired.db"), load_model="median",
+    )
+    await run_once(settings)
+    async with ForecastLedger(settings.db_path) as ledger:
+        rows = await ledger.forecast_history(date(2000, 1, 1))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.drove_plan
+    assert row.horizon_start is not None
+    assert row.horizon_end is not None
+    assert row.horizon_end > row.horizon_start
+    assert row.median_total_kwh == row.total_kwh == 24.0
+    assert row.median_slots == row.slots
+
+
 async def test_run_once_skips_unchanged_command_after_fresh_soc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

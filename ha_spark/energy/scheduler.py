@@ -120,6 +120,7 @@ from ha_spark.energy.dispatch_evidence import partition_dispatches
 from ha_spark.energy.dst_clock_sync import DstClockSync
 from ha_spark.energy.evidence_freshness import EvidenceFreshness, check_report_time
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
+from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
 from ha_spark.energy.orchestrator import orchestrate
@@ -291,7 +292,8 @@ def _real_write_mode(settings: Settings, execution: ExecutionContext | None = No
 
 
 async def _record_forecast(
-    settings: Settings, plan: ChargePlan, forecast: LoadForecast
+    settings: Settings, plan: ChargePlan, forecast: LoadForecast,
+    geometry: HorizonGeometry | None = None,
 ) -> None:
     """Log the plan's load forecast for its served day so `forecast-eval` can
     score it later.
@@ -311,6 +313,11 @@ async def _record_forecast(
                 plan.load_kwh,
                 forecast.slots,
                 forecast.source,
+                horizon_start=geometry.horizon_start if geometry is not None else None,
+                horizon_end=geometry.horizon_end if geometry is not None else None,
+                drove_plan=True,
+                median_total_kwh=forecast.median_total_kwh,
+                median_slots=forecast.median_slots,
             )
     except Exception:
         log.exception("Recording forecast failed")
@@ -414,7 +421,7 @@ async def run_once(
                 await run_v2l_topup(settings, rest, plan, inputs.flexibility_event, now)
             except Exception:  # noqa: BLE001 - a request never breaks a plan run
                 log.warning("V2L top-up request failed", exc_info=True)
-    await _record_forecast(settings, plan, run.forecast)
+    await _record_forecast(settings, plan, run.forecast, getattr(run.inputs, "geometry", None))
     await _run_orchestrator(settings)
     await _run_derived_rerive(settings)
     return RunResult(

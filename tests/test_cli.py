@@ -234,6 +234,43 @@ async def test_forecast_eval_reports_accuracy(
     assert "MAE" in out
 
 
+def test_forecast_eval_legacy_database_output_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sqlite3
+    from datetime import UTC, datetime, timedelta
+
+    from ha_spark.energy.eval import evaluate, format_eval
+    from ha_spark.energy.models import ForecastRecord
+
+    issued = datetime.now(UTC) - timedelta(days=3)
+    target = (issued + timedelta(days=1)).date()
+    midnight = datetime.combine(target, datetime.min.time(), tzinfo=UTC)
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", timezone="UTC",
+        db_path=str(tmp_path / "legacy.db"),
+    )
+    with sqlite3.connect(settings.db_path) as conn:
+        conn.execute(
+            "CREATE TABLE forecasts (made_at TEXT NOT NULL, target_date TEXT NOT NULL, "
+            "model TEXT NOT NULL, total_kwh REAL NOT NULL, slots_json TEXT, "
+            "source TEXT NOT NULL, PRIMARY KEY (target_date, model))"
+        )
+        conn.execute("INSERT INTO forecasts VALUES (?, ?, ?, ?, ?, ?)",
+                     (issued.isoformat(), target.isoformat(), "median", 20.0, None, "old"))
+    legacy = [ForecastRecord(issued, target, "median", 20.0, None, "old")]
+    expected = format_eval(evaluate(legacy, {target: 22.0}), 14) + "\n"
+
+    async def stats(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        return [{"start": midnight.timestamp() * 1000, "change": 22.0}]
+
+    monkeypatch.setattr(cli, "statistics_during_period", stats)
+    monkeypatch.setattr(cli, "load_settings", lambda: settings)
+    for _ in range(2):
+        assert cli.main(["forecast-eval", "--days", "14"]) == 0
+        assert capsys.readouterr().out == expected
+
+
 def _ctx_args(**kw: object) -> argparse.Namespace:
     return argparse.Namespace(**kw)
 
