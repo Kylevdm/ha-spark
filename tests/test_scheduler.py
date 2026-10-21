@@ -782,10 +782,23 @@ async def test_dynamic_plan_parity_between_scheduler_and_agent_plan(
 
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
 
+    # Pin the clock so both plan computations share the exact same ``now``.
+    # A few minutes before a half-hour boundary makes a straddle regression
+    # obvious: the two paths would then build horizons of different lengths.
+    now = datetime(2026, 6, 10, 12, 25, tzinfo=UTC)
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            return cls.fromtimestamp(now.timestamp(), tz)
+
+    monkeypatch.setattr(sources, "datetime", _FixedDatetime)
+    monkeypatch.setattr(scheduler, "datetime", _FixedDatetime)
+    monkeypatch.setattr("ha_spark.energy.soc_monitor.datetime", _FixedDatetime)
+
     # One wide live-rate point spanning the whole horizon at a distinctive price,
     # so every slot is priced 0.99 regardless of today's date — nothing like the
     # fixed 0.069/0.30, so a fixed-fallback bug would show up in the cost.
-    now = datetime.now(UTC)
     rates = [{
         "start": (now - timedelta(days=1)).isoformat(),
         "end": (now + timedelta(days=3)).isoformat(),
