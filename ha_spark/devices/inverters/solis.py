@@ -1194,10 +1194,7 @@ class SolisDevice:
         the charging decision, so Protect could not write here even by mistake.
         """
         if state.committed_mode == "protect":
-            current = await self._diagnostic_number("timed_charge_current")
-            if await self.resident_charge_window() is None or current is None or current < 0:
-                return [], "resident schedule unreadable"
-            return [], None
+            return [], await self._resident_schedule_problem()
         if state.fallback.active:
             validated = validate_fallback_schedule(self._settings)
             if isinstance(validated, str):
@@ -1217,6 +1214,95 @@ class SolisDevice:
             (line for line in result.lines if not is_verified(line)), "read-back incomplete"
         )
         return result.lines, f"schedule not confirmed: {detail}"
+
+    async def _resident_schedule_problem(self) -> str | None:
+        """Why the resident slot-1 window and charge current don't read back, else ``None``."""
+        current = await self._diagnostic_number("timed_charge_current")
+        if await self.resident_charge_window() is None or current is None or current < 0:
+            return "resident schedule unreadable"
+        return None
+
+    @device_action(Ownership.PROTECTION)
+    async def release_holds(self) -> list[ActionLine]:
+        """Handover step: release ha-spark's own holds on this inverter for → Observe.
+
+        The owner's explicit handover (ADR-0007), so no fresh clearing evidence
+        is needed, but the rest of the release order stands: the resident
+        schedule must read back, the switch must be readable (Q2), and the
+        records clear only after the On reads back. An Off switch whose request
+        was never confirmed may be the owner's own Off: its record is dropped
+        and the switch left alone. Any failure keeps the records and reports.
+        """
+        store = self._execution.authority
+        identity = HoldDevice(
+            driver=self._config.driver,
+            power_switch=self._config.entities.get("power_switch", ""),
+            hub=self._settings.solis_control_hub, slave=self._settings.solis_modbus_slave,
+        )
+        records = tuple(h for h in store.state.holds if h.device == identity) if (
+            store is not None and store.state is not None
+        ) else ()
+        if not records:
+            return []
+        desc = "release ha-spark's hold: set inverter power switch to On"
+        mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return [_refused(mode)]
+        if mode == "simulate":
+            return [ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)]
+        if mode in ("off", "observe"):
+            return [ActionLine(f"[{mode.upper()}] computed: {desc}", ActionOutcome.SIMULATED)]
+        assert store is not None and store.state is not None
+        entity = identity.power_switch
+        try:
+            try:
+                current = (await self._rest.get_state(entity)).state.strip().lower()
+            except Exception:  # noqa: BLE001 - Q2: never release blind
+                log.warning("Power-switch unreadable; not releasing a hold")
+                return [ActionLine(
+                    f"[WARNING] {desc} refused: state unreadable; "
+                    "a hold is never released blind",
+                    ActionOutcome.REFUSED,
+                )]
+            if current == "on":
+                store.save_holds(tuple(h for h in store.state.holds if h.device != identity))
+                return [ActionLine(
+                    f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED
+                )]
+            if current != "off":
+                log.warning("Power-switch state is not on/off; not releasing a hold")
+                return [ActionLine(
+                    f"[WARNING] {desc} refused: state is not on/off; "
+                    "a hold is never released blind",
+                    ActionOutcome.REFUSED,
+                )]
+            if not any(h.owned and h.confirmed for h in records):
+                store.save_holds(tuple(h for h in store.state.holds if h.device != identity))
+                log.warning("Unconfirmed hold dropped; power switch left Off")
+                return [ActionLine(
+                    "[SKIP] power switch left Off: ha-spark's hold request was never "
+                    "confirmed, so the Off may be the owner's; record dropped",
+                    ActionOutcome.UNCHANGED_VERIFIED,
+                )]
+            problem = await self._resident_schedule_problem()
+            if problem is not None:
+                log.warning("[REFUSED] %s: %s; hold kept", desc, problem)
+                return [ActionLine(
+                    f"[REFUSED] {desc} refused: {problem}; hold kept", ActionOutcome.REFUSED,
+                )]
+            store.save_holds(tuple(
+                h.model_copy(update={"pending_release": True}) if h.device == identity else h
+                for h in store.state.holds
+            ))
+            mismatch = await self._select_option(entity, "On")
+            if not mismatch:
+                store.save_holds(tuple(h for h in store.state.holds if h.device != identity))
+        except Exception:  # noqa: BLE001 - isolate this action's failure
+            log.error("[FAILED] %s", desc)
+            return [ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)]
+        if mismatch:
+            return [ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED)]
+        return [ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)]
 
     def _save_hold_request(
         self, store: AuthorityStore, identity: HoldDevice, intent: ChargeIntent,

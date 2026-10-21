@@ -3,6 +3,7 @@
 The daemon binds the sole authority store. Unbound callers fail closed. Planned
 epochs and config generations are checked under the bus lock and again at each
 actuating call. Remapped held identities never grant authority to a replacement.
+During a transition only the running handover step actuates, for its own class.
 Factories and direct driver construction use the same default context. Coordinators
 keep loop-local locks (CLI/tests may run successive event loops); the daemon uses
 one event loop, and no lock is held across loops or shared with another process.
@@ -44,6 +45,14 @@ class Ownership(StrEnum):
     CLOCK = "clock"
 
 
+# During a transition only the running handover step may actuate, and only its
+# own ownership class. Steps not listed here (``commit_observe``) never write.
+HANDOVER_STEP_OWNERSHIP: dict[str, frozenset[Ownership]] = {
+    "evaluate_protection": frozenset({Ownership.PROTECTION}),
+    "release_holds": frozenset({Ownership.PROTECTION}),
+}
+
+
 class WriteGate:
     """The only permission implementation; legacy keys grant nothing."""
 
@@ -57,7 +66,11 @@ class WriteGate:
         state = store.state
         assert state is not None
         if state.transition is not None:
-            return "refuse:not owned"
+            step = self.context.handover_step.get()
+            if step not in state.transition.steps or ownership not in (
+                HANDOVER_STEP_OWNERSHIP.get(step, frozenset())
+            ):
+                return "refuse:not owned"
         if self.context.planned_epoch.get() != state.epoch:
             return "refuse:stale authority"
         if self.context.planned_generation.get() != self.context.config_generation:
@@ -159,6 +172,7 @@ class ExecutionContext:
         self.planned_generation: ContextVar[int | None] = ContextVar(
             "planned_generation", default=None
         )
+        self.handover_step: ContextVar[str | None] = ContextVar("handover_step", default=None)
         self.gate = WriteGate(self)
         self._buses: dict[tuple[str, str, str], BusCoordinator] = {}
 
@@ -173,6 +187,15 @@ class ExecutionContext:
         finally:
             self.planned_epoch.reset(token)
             self.planned_generation.reset(generation_token)
+
+    @contextmanager
+    def handover(self, step: str) -> Iterator[None]:
+        """Run one step of the stored transition; the gate still checks every fence."""
+        token = self.handover_step.set(step)
+        try:
+            yield
+        finally:
+            self.handover_step.reset(token)
 
     def coordinator_for(self, config: DeviceConfig, settings: Settings) -> BusCoordinator:
         # All sensors/selects and slaves on a Solis Modbus hub share a bus.
