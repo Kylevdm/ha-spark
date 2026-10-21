@@ -139,6 +139,7 @@ from ha_spark.energy.publish import (
     republish_last,
 )
 from ha_spark.energy.readiness_ledger import PlanRevision, record_guard, record_slot, slot_start
+from ha_spark.energy.readiness_measurements import record_closed_days
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor, SocMonitorSnapshot, observe_soc
@@ -2214,6 +2215,10 @@ async def _run_forever(
                         )
                 except Exception:
                     log.exception("Supply guard tick failed; will retry next tick")
+            # Day-close joins run after the guard tick so a slow recorder read
+            # never delays it, and after record_slot so the closing boundary's
+            # start energy exists. Failures are isolated inside.
+            await record_closed_days(settings, now)
             if last_signal_at is None or now - last_signal_at >= SIGNAL_SAMPLE_INTERVAL:
                 try:
                     await sample_signals(settings, now)

@@ -145,6 +145,23 @@ class ReadinessLedger:
             ) as cursor:
                 return [SlotRecord.model_validate_json(row[0]) for row in await cursor.fetchall()]
 
+    async def first_slot_start(self) -> datetime | None:
+        """Earliest captured slot, one row, without creating or migrating a DB."""
+        if not await asyncio.to_thread(Path(self.db_path).exists):
+            return None
+        path = await asyncio.to_thread(Path(self.db_path).resolve)
+        async with aiosqlite.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+            async with db.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'readiness_slots'"
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return None
+            async with db.execute(
+                "SELECT slot_start FROM readiness_slots ORDER BY slot_start LIMIT 1"
+            ) as cursor:
+                row = await cursor.fetchone()
+                return datetime.fromisoformat(row[0]) if row else None
+
     async def guards(self) -> list[GuardRecord]:
         """Read guard samples in chronological order."""
         if not await asyncio.to_thread(Path(self.db_path).exists):
