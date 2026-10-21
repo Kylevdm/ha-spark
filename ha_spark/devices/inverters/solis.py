@@ -730,7 +730,7 @@ class SolisDevice:
         state = await self._rest.get_state(self._sensor("timed_charge_current"))
         return float(state.state) * self._settings.battery_voltage_v
 
-    # --- internal writes (PROACTIVE_MODE-gated, failure-isolated, read-back verified) ---
+    # --- internal writes (mode-gated, failure-isolated, read-back verified) ---
 
     @device_action(Ownership.CHARGING)
     async def _write_charge_window(
@@ -1985,7 +1985,7 @@ class SolisDevice:
         safe_state = (
             "no export window remains programmed"
             if is_verified(window_line)
-            else "the Solis export state was not verified; remain in simulate and inspect it"
+            else "the Solis export state was not verified; switch to Observe and inspect it"
         )
         await send_once(
             store,

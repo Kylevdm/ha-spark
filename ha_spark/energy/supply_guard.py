@@ -6,7 +6,7 @@ guard reads the whole-house draw (``grid_power_entity``, W) and the battery's
 charge-rate setpoint (W), then resizes the setpoint to fit the remaining
 headroom — shedding when over ``supply_max_current_a``, restoring toward the
 plan's target as headroom returns. Writes go through the active ``Charger``, so
-PROACTIVE_MODE gating, failure isolation, and read-back verification apply.
+the operating-mode write gate, failure isolation, and read-back verification apply.
 
 Reasoning is in watts throughout: power balances directly across the AC<->DC
 inverter, so we never mix the battery's DC charge amps with the AC supply limit.
