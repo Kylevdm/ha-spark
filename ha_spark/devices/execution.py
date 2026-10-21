@@ -50,6 +50,11 @@ class Ownership(StrEnum):
 HANDOVER_STEP_OWNERSHIP: dict[str, frozenset[Ownership]] = {
     "evaluate_protection": frozenset({Ownership.PROTECTION}),
     "release_holds": frozenset({Ownership.PROTECTION}),
+    "cancel_export": frozenset({Ownership.CHARGING}),
+    "write_fallback": frozenset({Ownership.CHARGING}),
+    # → Optimise stays activating until its first fresh plan verifies; that plan
+    # and the hold reconcile keep running meanwhile, so protection never lapses.
+    "verify_fresh_plan": frozenset({Ownership.CHARGING, Ownership.PROTECTION}),
 }
 
 
