@@ -45,7 +45,7 @@ class Ownership(StrEnum):
     CLOCK = "clock"
 
 
-# During a transition only the running handover step may actuate, and only its
+# During a transition only the running (first stored) step may actuate, and only its
 # own ownership class. Steps not listed here (``commit_observe``) never write.
 HANDOVER_STEP_OWNERSHIP: dict[str, frozenset[Ownership]] = {
     "evaluate_protection": frozenset({Ownership.PROTECTION}),
@@ -72,7 +72,8 @@ class WriteGate:
         assert state is not None
         if state.transition is not None:
             step = self.context.handover_step.get()
-            if step not in state.transition.steps or ownership not in (
+            steps = state.transition.steps
+            if not steps or step != steps[0] or ownership not in (
                 HANDOVER_STEP_OWNERSHIP.get(step, frozenset())
             ):
                 return "refuse:not owned"
@@ -208,6 +209,20 @@ class ExecutionContext:
         finally:
             self.planned_epoch.reset(token)
             self.planned_generation.reset(generation_token)
+
+    @contextmanager
+    def after_authority_save(self) -> Iterator[None]:
+        """Re-capture only the epoch after this daemon's own save.
+
+        The config generation stays the one captured with the caller's settings
+        snapshot, so a save that lands mid-tick still refuses work planned on it.
+        """
+        state = self.authority.state if self.authority is not None else None
+        token = self.planned_epoch.set(state.epoch if state is not None else None)
+        try:
+            yield
+        finally:
+            self.planned_epoch.reset(token)
 
     @contextmanager
     def handover(self, step: str) -> Iterator[None]:

@@ -261,3 +261,20 @@ async def test_alphaess_uses_the_charging_gate():
     device = AlphaESSDevice(config, settings, FakeRest(), execution=context)
     await device.apply(_intent())
     context.gate.mode_for.assert_called_once_with(Ownership.CHARGING, config, settings)
+
+
+def test_epoch_refresh_after_a_save_keeps_the_snapshots_config_generation(tmp_path) -> None:
+    from ha_spark.devices.execution import ExecutionContext, Ownership
+    from tests.authority_helpers import seed_authority
+
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", db_path=str(tmp_path / "e.db"),
+        inverter_power_switch_entity="select.solisac_power_switch",
+    )
+    context = ExecutionContext()
+    seed_authority(settings, "optimise", context=context)
+    config = settings.devices[0]
+    assert context.gate.mode_for(Ownership.CHARGING, config, settings) == "on"
+    context.config_generation += 1  # a config save lands mid-tick
+    with context.after_authority_save():
+        assert context.gate.mode_for(Ownership.CHARGING, config, settings) == "refuse:stale config"

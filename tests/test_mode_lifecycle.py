@@ -66,7 +66,11 @@ async def test_daemon_protect_and_observe_handover(tmp_path: Path, monkeypatch, 
                     break
                 await asyncio.sleep(0.001)
             assert state.executor.authority.state.transition is None
-            device.release_holds.return_value = [ActionLine("verified", ActionOutcome.VERIFIED)]
+            async def released():
+                state.executor.authority.save_holds(())
+                return [ActionLine("verified", ActionOutcome.VERIFIED)]
+
+            device.release_holds.side_effect = released
             state.executor.authority.save_holds((_hold(settings),))
             current = state.executor.authority.state
             reply = await state.executor.submit_mode("observe", current.epoch, ingress_user="owner")
@@ -112,7 +116,7 @@ async def test_failed_release_stays_switching_and_repeated_observe_joins(
                     break
                 await asyncio.sleep(0.001)
             assert current.committed_mode == "protect"
-            assert current.transition.failing_actions == ("release not verified",)
+            assert current.transition.failing_actions[0] == "release not verified"
             blocked = await state.executor.submit_mode("protect", epoch)
             assert blocked.error == "transition_in_progress"
             joined = await state.executor.submit_mode("observe", epoch)
@@ -253,7 +257,7 @@ async def test_restart_resumes_stored_observe_handover(tmp_path, monkeypatch):
             assert result.committed_mode == "observe"
             assert result.transition is None
             assert result.epoch >= epoch + 2
-            device.release_holds.assert_awaited_once()
+            device.release_holds.assert_awaited()
     finally:
         execution_context().authority = prior
 
@@ -296,5 +300,33 @@ async def test_protect_completes_once_evaluated_and_any_hold_verified(
                     break
                 await asyncio.sleep(0.001)
             assert (current.transition is None) is confirmed
+    finally:
+        execution_context().authority = prior
+
+
+@respx.mock
+async def test_observe_never_commits_while_a_hold_of_ours_remains(tmp_path, monkeypatch):
+    settings = settings_at(tmp_path)
+    store = AuthorityStore(settings)
+    store.save(store.state.model_copy(update={
+        "committed_mode": "protect", "holds": (_hold(settings),),
+    }))
+    respx.get(url__regex=r"http://ha.test/api/.*").respond(200, json=[])
+    respx.post(url__regex=r"http://ha.test/api/.*").respond(200, json=[])
+    prior = execution_context().authority
+    try:
+        async with running_daemon(settings, tmp_path, monkeypatch) as (state, _, device, _):
+            # The driven inverter holds nothing of ours (another one does): empty result.
+            device.release_holds.return_value = []
+            current = state.executor.authority.state
+            reply = await state.executor.submit_mode("observe", current.epoch)
+            assert reply.error is None
+            for _ in range(100):
+                current = state.executor.authority.state
+                if current.transition and current.transition.failing_actions:
+                    break
+                await asyncio.sleep(0.001)
+            assert current.committed_mode == "protect"
+            assert "[FAILED] hold records remain unreleased" in current.transition.failing_actions
     finally:
         execution_context().authority = prior

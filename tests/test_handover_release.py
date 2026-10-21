@@ -311,7 +311,7 @@ async def test_cancel_export_outside_its_step_writes_nothing(tmp_path) -> None:
 async def test_write_fallback_programs_the_fallback_with_no_export(tmp_path) -> None:
     rest = FakeRest(switch="On")
     device = _optimise_device(rest, tmp_path)
-    _in_transition(device, ("cancel_export", "write_fallback"), target="protect")
+    _in_transition(device, ("write_fallback",), target="protect")
 
     with device._execution.handover("write_fallback"):
         lines = await device.write_fallback()
@@ -359,15 +359,37 @@ async def test_optimise_to_observe_handover_in_order(tmp_path) -> None:
         holds=(_hold(device),),
     )
 
+    authority = device._execution.authority
+    assert authority is not None
     for step, run in (
         ("cancel_export", device.cancel_export), ("write_fallback", device.write_fallback),
         ("release_holds", device.release_holds),
     ):
         with device._execution.handover(step):
             assert all(is_verified(line) for line in await run()), step
+        # The runner persists each verified step's removal before the next may write.
+        assert authority.state is not None and authority.state.transition is not None
+        authority.save(authority.state.model_copy(update={"transition": (
+            authority.state.transition.model_copy(
+                update={"steps": authority.state.transition.steps[1:]}
+            )
+        )}))
 
     assert not store.exists
     assert _options(rest) == ["On"]
-    authority = device._execution.authority
-    assert authority is not None and authority.state is not None
+    assert authority.state is not None
     assert authority.state.holds == ()
+
+
+async def test_a_later_step_never_writes_before_the_running_one(tmp_path) -> None:
+    rest = FakeRest(switch="On")
+    _resident_export(rest)
+    device = _optimise_device(rest, tmp_path)
+    await _record_export(device)
+    _in_transition(device, ("cancel_export", "write_fallback", "release_holds", "commit_observe"))
+
+    with device._execution.handover("write_fallback"):
+        lines = await device.write_fallback()
+
+    assert [line.outcome for line in lines] == [ActionOutcome.REFUSED]
+    assert rest.calls == []

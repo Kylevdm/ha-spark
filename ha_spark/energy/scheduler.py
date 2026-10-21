@@ -1610,7 +1610,7 @@ async def _mode_lifecycle(
                     # The normal tick runs the fresh plan and protection every
                     # minute inside this handover, even after partial failure.
                     return
-                with context.planning(), context.handover(step):
+                with context.after_authority_save(), context.handover(step):
                     if step == "evaluate_protection":
                         async with HomeAssistantRest(
                             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
@@ -1646,8 +1646,10 @@ async def _mode_lifecycle(
                                 device = inverter_device(settings, rest)
                                 if isinstance(device, SolisDevice):
                                     lines = list(await device.release_holds())
-                                elif store.state is not None and store.state.holds:
-                                    lines = ["[FAILED] no validated hold release"]
+                                if store.state is not None and store.state.holds:
+                                    # Observe commits only once no hold of ours remains,
+                                    # e.g. one on an inverter the driven device isn't.
+                                    lines.append("[FAILED] hold records remain unreleased")
                     elif step in ("cancel_export", "write_fallback"):
                         async with HomeAssistantRest(
                             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
@@ -1971,7 +1973,7 @@ async def _run_forever(
                             await activation.enter_async_context(
                                 context.coordinator_for(config, settings).transition()
                             )
-                            activation.enter_context(context.planning())
+                            activation.enter_context(context.after_authority_save())
                             activation.enter_context(context.handover("verify_fresh_plan"))
                         result = await run_once(
                             settings,
