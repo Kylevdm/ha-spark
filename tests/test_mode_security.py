@@ -24,7 +24,8 @@ from tests.test_owner_mode import settings_at
 def test_ingress_rejects_bad_mode_body(tmp_path, body):
     state = AppState(settings_at(tmp_path), tmp_path / "options.json")
     with TestClient(build_app(state, ingress_peer="testclient")) as client:
-        response = client.post("/api/mode", json=body, headers={"X-Remote-User-Id": "owner"})
+        response = client.post("/api/mode", json=body,
+                               headers={"X-Remote-User-Id": "owner", "X-HA-Spark-Request": "mode"})
     assert response.status_code == 400
 
 
@@ -47,7 +48,8 @@ async def test_ingress_mode_refusal_status(tmp_path, error, status):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=("proxy", 1)),
                                 base_url="http://local") as client:
         response = await client.post("/api/mode", json={"target": "protect", "expected_epoch": 1},
-                                     headers={"X-Remote-User-Id": "owner"})
+                                     headers={"X-Remote-User-Id": "owner",
+                                              "X-HA-Spark-Request": "mode"})
     assert response.status_code == status
 
 

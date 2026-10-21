@@ -6,10 +6,13 @@ observation but must not treat a prior tick's measurement as a new grant.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from ha_spark.config import Settings
 from ha_spark.devices import get_device
 from ha_spark.devices.inverters.solis import validate_fallback_schedule
 from ha_spark.energy.soc_integrity import SocMeasurement
+from ha_spark.energy.soc_monitor import observe_soc
 from ha_spark.ha.rest import HomeAssistantRest, HomeAssistantRestError
 from ha_spark.transitions import PreconditionReport
 
@@ -27,6 +30,20 @@ def fallback_schedule_problem(settings: Settings) -> str | None:
         return NO_FALLBACK_PLATFORM
     reason = validate_fallback_schedule(settings)
     return reason if isinstance(reason, str) else None
+
+
+async def entry_preconditions(settings: Settings) -> dict[str, Any]:
+    """Read live diagnostic entry conditions without initialising or saving authority."""
+    async with HomeAssistantRest(
+        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
+    ) as rest:
+        soc = await observe_soc(settings, rest)
+        report = await check_preconditions(settings, rest, soc)
+    return {
+        "observe": {"passed": True, "reasons": []},
+        "protect": {"passed": not report.protect, "reasons": list(report.protect)},
+        "optimise": {"passed": not report.optimise, "reasons": list(report.optimise)},
+    }
 
 
 async def check_preconditions(

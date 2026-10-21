@@ -61,6 +61,7 @@ class Reply(BaseModel):
     synced: bool = False
     authority: dict[str, Any] | None = None
     error: str | None = None
+    reasons: list[str] = Field(default_factory=list)
 
 
 def _peer_uid(writer: asyncio.StreamWriter) -> int | None:

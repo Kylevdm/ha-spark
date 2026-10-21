@@ -16,6 +16,32 @@ Settings, presets and agent requests cannot change the operating mode.
 3. Open the **Configuration** tab, set your options (see below), then start the
    add-on.
 
+## Operating-mode page
+
+Open **ha-spark → Open Web UI** in Home Assistant. This ingress-only page is
+available only to Home Assistant administrators; it is not served on the agent
+port or the standalone/dev listener. Standalone mode changes are CLI-only.
+
+The page shows the site mode (including **authority unknown**), epoch,
+transition and failing actions, holds and their causes, fallback and its causes,
+last change and requester kind, and every unmet entry precondition for each
+mode. Refresh to see current progress; an accepted request is not proof that
+hardware has verified it.
+
+Protect and Optimise require confirmation. Before enabling Optimise, disable
+any pre-existing automations or manual schedules that write the same devices.
+Axle export remains supervised: ha-spark will arm configured export windows,
+but a person must be present for preparation and verified cleanup (see the
+[supervised-export runbook](../docs/runbooks/supervised-axle-export.md)).
+A change uses the epoch displayed on the page. A conflict reloads status and
+requires a new click; it never retries the change automatically. With authority
+unknown, only **Confirm Observe** is offered; that confirmation writes no
+hardware. A queued request may still finish, so refresh before trying again.
+
+CLI equivalents are `ha-spark mode show`, `ha-spark mode set protect`,
+`ha-spark mode set optimise`, `ha-spark mode set observe`, and
+`ha-spark mode confirm-observe`. Only the running daemon changes authority.
+
 ## Configuration
 
 ### Entity IDs (required for your installation)

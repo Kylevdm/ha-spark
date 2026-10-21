@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ha-spark operating mode</title>
+<style>
+body { font: 1rem system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
+button { margin: .4rem; padding: .6rem; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+dialog { max-width: 36rem; }
+</style>
+<script src="mode.js" defer></script>
+</head>
+<body>
+<h1>Site operating mode</h1>
+<p>Home Assistant administrators only. Settings and agents cannot change authority.</p>
+<div id="message" role="status" aria-live="polite">Loading…</div>
+<button id="refresh" type="button">Refresh status</button>
+<main id="status"></main>
+<section aria-label="Change operating mode" id="actions"></section>
+<dialog id="confirmation" aria-labelledby="confirm-title">
+<h2 id="confirm-title">Confirm operating mode</h2>
+<p id="confirm-text"></p>
+<button id="confirm" type="button">Confirm change</button>
+<button id="cancel" type="button">Cancel</button>
+</dialog>
+</body>
+</html>
