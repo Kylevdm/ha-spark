@@ -83,13 +83,17 @@ from ha_spark.api.server import (
     stop_server,
 )
 from ha_spark.authority import FALLBACK_CAUSE_SOC_INTEGRITY, AuthorityStore
-from ha_spark.config import Settings
+from ha_spark.config import Settings, actuation_settings_changed
 from ha_spark.daemon_channel import DaemonChannel, Reply, action_lines
 from ha_spark.devices import Capability, Device, inverter_device
-from ha_spark.devices.execution import ExecutionContext, Ownership, execution_context
+from ha_spark.devices.execution import (
+    ExecutionContext,
+    Ownership,
+    execution_context,
+    held_identity_remapped,
+)
 from ha_spark.devices.inverters.solis import (
     SolisDevice,
-    validate_fallback_schedule,
     validated_fallback_current_a,
 )
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome, is_verified, legacy_action_line
@@ -699,9 +703,15 @@ async def _observe_ev_hold(
         store is not None and store.state is not None
     ) else None
     if record is not None:
-        state.active = record.confirmed and not record.pending_release
-        state.clear_count = record.clear_count
-        state.last_clear_report_at = record.last_clear_report_at
+        # A release still pending (it failed or is retrying) needs the clear
+        # evidence to stay fresh: anything but a fresh not-charging report
+        # re-arms the confirmed hold and restarts the clearance run (Q4/Q5).
+        rearm = record.confirmed and record.pending_release and not (
+            evidence is not None and evidence.validity == "fresh" and charging is False
+        )
+        state.active = (record.confirmed and not record.pending_release) or rearm
+        state.clear_count = 0 if rearm else record.clear_count
+        state.last_clear_report_at = None if rearm else record.last_clear_report_at
     next_state = next_ev_hold_state(state, charging, evidence, overnight_exception=exception)
     if record is not None and store is not None and store.state is not None:
         # Every EV record follows the one EV evidence stream, so a record left
@@ -718,6 +728,30 @@ async def _observe_ev_hold(
     state.clear_count = next_state.clear_count
     state.last_clear_report_at = next_state.last_clear_report_at
     return state.active
+
+
+async def notify_remapped_holds(settings: Settings, rest: HomeAssistantRest) -> None:
+    """Keep old identities and persist one degraded notice per mapping mismatch episode."""
+    store = execution_context().authority
+    if store is None or not store.known or store.save_failed or store.state is None:
+        return
+    records = []
+    notify = False
+    for record in store.state.holds:
+        remapped = held_identity_remapped(record.device, settings)
+        notify |= remapped and not record.remap_notified
+        records.append(record.model_copy(update={"remap_notified": remapped}))
+    if tuple(records) != store.state.holds:
+        store.save_holds(tuple(records))
+    if notify:
+        try:
+            await send_notification(
+                settings, rest, "ha-spark degraded hold",
+                "Held control mapping changed; the original hold is retained. "
+                "Move to Observe before using the replacement mapping.",
+            )
+        except Exception:  # noqa: BLE001 - notification failure must not block protection
+            log.warning("Remapped hold notification failed")
 
 
 async def _hold_degraded_notice(
@@ -773,7 +807,9 @@ def hold_reconcile_intent(
     "no dispatch", is evaluated against the last trusted hold set instead, so a
     hold still ends on its own known end time: no expiry timer, no stuck ``Off``.
     With no trusted set yet, durable records provide the dispatch end or an
-    already-cleared owned release. No picture and no record never writes On.
+    already-cleared owned release. An unconfirmed dispatch request counts here
+    (#443): its window can only retry the Off, because a release still needs a
+    confirmed owned record. No picture and no record never writes On.
     """
     if intent.hold_trusted:
         return intent
@@ -782,7 +818,7 @@ def hold_reconcile_intent(
         records = store.state.holds if store is not None and store.state is not None else ()
         recorded_dispatch = tuple(
             (h.started_at, h.trusted_end) for h in records
-            if h.cause == "dispatch" and h.confirmed and h.trusted_end is not None
+            if h.cause == "dispatch" and h.trusted_end is not None
         )
         if recorded_dispatch:
             return replace(intent, holds=recorded_dispatch)
@@ -793,6 +829,23 @@ def hold_reconcile_intent(
         # dispatch picture is absent, but keeps dispatch trust false for export.
         return replace(intent, holds=())
     return replace(intent, holds=trusted_holds)
+
+
+def _shutdown_hold_reason(
+    trusted_holds: tuple[tuple[datetime, datetime], ...] | None, now: datetime
+) -> str | None:
+    """Why a clean shutdown must leave the switch Off, or ``None`` to relinquish (#426)."""
+    store = execution_context().authority
+    records = store.state.holds if store is not None and store.state is not None else ()
+    # A pending EV release has not verified yet, so its record still holds.
+    if any(h.cause == "ev" for h in records):
+        return "an EV hold is recorded"
+    ends = [end for _, end in trusted_holds or ()] + [
+        h.trusted_end for h in records if h.cause == "dispatch" and h.trusted_end is not None
+    ]
+    if any(now < end for end in ends):
+        return "a known dispatch hold is still ahead"
+    return None
 
 
 class ReconcileResult(NamedTuple):
@@ -1527,6 +1580,8 @@ async def _run_forever(
     try:
         while True:
             settings = state.settings  # hot-reloaded by POST /api/config
+            # Capture with the settings snapshot, before any I/O can accept a save.
+            context.planned_generation.set(context.config_generation)
             current_faults = set()
             if not authority.known:
                 current_faults.add("authority unknown")
@@ -1543,21 +1598,14 @@ async def _run_forever(
                     for fault in current_faults - faults:
                         log.warning("%s; hardware writes refused", fault)
                         await send_notification(settings, rest, "ha-spark authority fault", fault)
+                    await notify_remapped_holds(settings, rest)
                     await publish_operating_mode(rest, authority)
             except Exception:
                 log.warning("Authority publication failed")
             faults = current_faults
             context.planned_epoch.set(authority.state.epoch if authority.state else None)
             if settings is not last_settings:
-                if (
-                    settings.charge_window_start != last_settings.charge_window_start
-                    or settings.charge_window_end != last_settings.charge_window_end
-                    or validate_fallback_schedule(settings)
-                    != validate_fallback_schedule(last_settings)
-                    or settings.devices != last_settings.devices
-                    or settings.solis_control_hub != last_settings.solis_control_hub
-                    or settings.solis_modbus_slave != last_settings.solis_modbus_slave
-                ):
+                if actuation_settings_changed(last_settings, settings):
                     monitor.invalidate_fallback_confirmation()
                 # Never reuse a previous plan's command across a hot reload.
                 last_plan = None
@@ -1811,29 +1859,43 @@ async def _run_forever(
             await stop_server(server, serve_task)
         if port_server is not None and port_task is not None:
             await stop_server(port_server, port_task)
-        # One best-effort relinquish on a clean shutdown (#143 §5). No plan means
-        # ha-spark never steered, so there is nothing to hand back. Same rule as
-        # the per-minute relinquish: never while a known hold end is still ahead,
-        # or every restart mid-dispatch would release the hold and drain the
-        # battery into the car until the next process holds it again (#143 §1).
+        # One best-effort relinquish on a clean shutdown (#143 §5), in Optimise
+        # only: the charging gate is "on" in no other mode, so Protect, Observe
+        # and unknown authority write nothing (#426). No plan means ha-spark never
+        # steered, so there is nothing to hand back. A held switch stays Off while
+        # an EV hold is recorded or a known dispatch end is still ahead, or every
+        # restart mid-hold would drain the battery into the car until the next
+        # process holds it again (#143 §1); only the charge window is restored,
+        # and the next start reconciles the hold first.
         # SIGKILL/OOM never reach here; that is the runbook's (#131/#134).
         if last_plan is not None and _real_write_mode(settings):
             try:
                 shutdown_at = datetime.now(load_timezone(settings.timezone))
-                if last_trusted_holds and shutdown_at < max(
-                    end for _, end in last_trusted_holds
-                ):
-                    log.warning(
-                        "Not relinquishing control on shutdown: a known dispatch hold "
-                        "is still ahead"
-                    )
-                else:
-                    async with HomeAssistantRest(
-                        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
-                    ) as rest:
+                kept = _shutdown_hold_reason(last_trusted_holds, shutdown_at)
+                async with HomeAssistantRest(
+                    settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+                ) as rest:
+                    device = inverter_device(settings, rest)
+                    if kept is not None:
+                        log.warning(
+                            "[WARNING] keeping the hold on shutdown: %s; restoring the "
+                            "charge window only", kept,
+                        )
+                        lines = await device.write_safe_window()
+                    else:
                         log.warning("[WARNING] relinquishing control on shutdown")
-                        for line in await inverter_device(settings, rest).write_safe_state():
-                            log.info(line)
+                        lines = await device.write_safe_state()
+                    for line in lines:
+                        log.info(line)
+                    if kept is not None:
+                        try:
+                            await send_notification(
+                                settings, rest, "ha-spark hold kept on shutdown",
+                                f"ha-spark stopped with the inverter held Off: {kept}. "
+                                "It is reconciled on the next start.",
+                            )
+                        except Exception:  # noqa: BLE001 - a notice never blocks shutdown
+                            log.warning("Shutdown hold notification failed")
             except Exception:
                 log.exception("Writing the safe state on shutdown failed")
         context.authority = None

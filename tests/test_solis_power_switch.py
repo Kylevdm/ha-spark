@@ -322,17 +322,32 @@ async def test_export_is_programmed_on_the_tick_the_reconcile_turns_the_switch_o
 
 
 @pytest.mark.asyncio
-async def test_untrusted_soc_still_reconciles_but_blocks_charge_programming(tmp_path) -> None:
+async def test_untrusted_soc_still_holds_but_blocks_charge_programming(tmp_path) -> None:
+    rest = FakeRest(switch="On")
+    device = _device(rest, tmp_path)
+    bad_soc = replace(_soc(), status=SocStatus.UNAVAILABLE, value=None, raw_state="unavailable")
+    intent = _intent(soc=bad_soc, holds=(_window(-10),))
+    lines = await _reconcile(device, intent) + await device.apply(intent)
+
+    assert _options(rest) == ["Off"]
+    assert not any(call[0] == "modbus" for call in rest.calls)
+    assert any(line.startswith("[BLOCKED]") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_untrusted_soc_keeps_an_optimise_hold_until_the_plan_verifies(tmp_path) -> None:
+    """#424: an Optimise release restores a verified plan; a dead SoC can't give one."""
     rest = FakeRest(switch="Off")
     device = _device(rest, tmp_path)
     _seed_owned_hold(device)
+    records = device._execution.authority.state.holds
     bad_soc = replace(_soc(), status=SocStatus.UNAVAILABLE, value=None, raw_state="unavailable")
-    intent = _intent(soc=bad_soc)
-    lines = await _reconcile(device, intent) + await device.apply(intent)
+    lines = await _reconcile(device, _intent(soc=bad_soc))
 
-    assert _options(rest) == ["On"]
+    assert _options(rest) == []
     assert not any(call[0] == "modbus" for call in rest.calls)
-    assert any(line.startswith("[BLOCKED]") for line in lines)
+    assert device._execution.authority.state.holds == records
+    assert any(line.startswith("[REFUSED]") and "SoC" in line for line in lines)
 
 
 @pytest.mark.parametrize(
@@ -632,12 +647,28 @@ async def test_safe_state_already_in_place_writes_nothing(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_safe_state_releases_the_switch_even_when_it_is_unreadable(tmp_path) -> None:
-    """The bound on the reconcile's refused blind release: relinquishing writes ``On``."""
-    rest = _UnreadableSwitchRest(switch="Off")
-    await _device(rest, tmp_path).write_safe_state()
+@pytest.mark.parametrize("rest_type", ["unreadable", "unavailable"])
+async def test_safe_state_refuses_on_for_an_unreadable_switch(tmp_path, rest_type) -> None:
+    """Q2 (#426): every On needs a readable switch; the window is still restored."""
+    rest = (
+        _UnreadableSwitchRest(switch="Off") if rest_type == "unreadable"
+        else FakeRest(switch="unavailable")
+    )
+    lines = await _device(rest, tmp_path).write_safe_state()
 
-    assert _options(rest) == ["On"]
+    assert _options(rest) == []
+    assert lines[0].startswith("[WARNING]") and "refused" in lines[0]
+    assert lines[1].startswith("[APPLIED]")
+
+
+@pytest.mark.asyncio
+async def test_safe_window_writes_only_the_charge_window(tmp_path) -> None:
+    rest = FakeRest(switch="Off")
+    lines = await _device(rest, tmp_path).write_safe_window()
+
+    assert _options(rest) == []
+    assert _register_writes(rest) == [(43143, _SAFE_BLOCK)]
+    assert len(lines) == 1 and lines[0].startswith("[APPLIED]")
 
 
 @pytest.mark.asyncio

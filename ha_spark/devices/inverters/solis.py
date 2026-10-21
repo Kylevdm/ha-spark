@@ -52,7 +52,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from ha_spark.authority import AuthorityStore, HoldDevice, HoldRecord
+from ha_spark.authority import AuthorityState, AuthorityStore, HoldDevice, HoldRecord
 from ha_spark.devices.base import Capability, HoldContract, HoldValidation, fmt_hhmm
 from ha_spark.devices.execution import (
     ExecutionContext,
@@ -450,7 +450,9 @@ class SolisDevice:
         return (await self._apply(intent, None)).lines
 
     @device_action(Ownership.CHARGING)
-    async def _apply(self, intent: ChargeIntent, fallback_current_a: float | None) -> _ApplyResult:
+    async def _apply(
+        self, intent: ChargeIntent, fallback_current_a: float | None, *, releasing: bool = False
+    ) -> _ApplyResult:
         mode = self._coordinator.mode
         if mode.startswith("refuse:"):
             return _ApplyResult([_refused(mode)], False, False, False)
@@ -562,7 +564,9 @@ class SolisDevice:
             # as the retryable clock hold. A read, so `simulate` takes it too.
             if export_error is None and mode in ("on", "simulate"):
                 export_error = await self._clock_refusal(raw_export, export, now, tz)
-            if mode in ("on", "simulate") and export_error is None:
+            # A release programs the plan before its own On write (#424), which
+            # follows only once this pass reads back; the switch is Off until then.
+            if mode in ("on", "simulate") and export_error is None and not releasing:
                 export_error = await self._require_power_switch_on()
             if export_error is not None:
                 export_ready = False
@@ -1033,18 +1037,21 @@ class SolisDevice:
         nothing here forces an inverter poll. The register is written only at a
         genuine hold edge, to correct an external change, or to retry a failure.
 
-        It is exempt from the SoC guard in ``apply``: it commands no SoC-derived
-        magnitude, and freezing the inverter ``Off`` on an unrelated dead sensor
-        is exactly the failure it exists to remove.
+        Holding is exempt from the SoC guard in ``apply``: it commands no
+        SoC-derived magnitude. Releasing is not (#424): in Optimise the On waits
+        for this plan to apply and read back, or for the verified fallback
+        schedule (Q3), so a dead SoC sensor keeps a held switch ``Off``, visibly.
 
         It must never read export state. If the switch is ``On`` during a paid
         export that is because no hold is active, not because export asked —
         ``_require_power_switch_on`` stays a read-only refusal.
         """
-        return [await self._reconcile_power_switch(intent, now)]
+        return await self._reconcile_power_switch(intent, now)
 
     @device_action(Ownership.PROTECTION)
-    async def _reconcile_power_switch(self, intent: ChargeIntent, now: datetime) -> ActionLine:
+    async def _reconcile_power_switch(
+        self, intent: ChargeIntent, now: datetime
+    ) -> list[ActionLine]:
         store = self._execution.authority
         identity = HoldDevice(
             driver=self._config.driver,
@@ -1064,17 +1071,17 @@ class SolisDevice:
         desc = f"set inverter power switch to {wanted}"
         mode = self._coordinator.mode
         if mode.startswith("refuse:"):
-            return _refused(mode)
+            return [_refused(mode)]
         if mode == "simulate":
-            return ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)
+            return [ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)]
         if mode in ("off", "observe"):
-            return ActionLine(f"[{mode.upper()}] computed: {desc}", ActionOutcome.SIMULATED)
+            return [ActionLine(f"[{mode.upper()}] computed: {desc}", ActionOutcome.SIMULATED)]
         entity = self._config.entities.get("power_switch", "")
         if not entity:
-            return ActionLine(
+            return [ActionLine(
                 "[SKIP] no power_switch entity configured; discharge left as-is",
                 ActionOutcome.UNVERIFIED,
-            )
+            )]
         try:
             # The pre-read suppresses a redundant write, and on a failure it
             # decides asymmetrically (#143): unreadable evidence may *close* a
@@ -1105,32 +1112,50 @@ class SolisDevice:
                         store.save_holds(
                             tuple(h for h in store.state.holds if h.device != identity)
                         )
-                    return ActionLine(
+                    return [ActionLine(
                         f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED
-                    )
+                    )]
+                if wanted == "On" and current != "off":
+                    # Q2: every On needs a readable switch; `unavailable` is not Off.
+                    log.warning("Power-switch state is not on/off; not releasing a hold")
+                    return [ActionLine(
+                        f"[WARNING] {desc} refused: state is not on/off; "
+                        "a hold is never released blind",
+                        ActionOutcome.REFUSED,
+                    )]
             except Exception:  # noqa: BLE001 - direction decides
                 if wanted == "On":
                     # Not a benign skip: while the reads stay broken the inverter
                     # is left disabled, the house entirely on grid import. This
-                    # direction is still the safe one, but it is unbounded here
-                    # on purpose — the bound is the relinquish path (#143 §5),
-                    # which writes the safe state once ha-spark is past every
-                    # known hold end and still has no picture.
+                    # direction is still the safe one, and it is unbounded on
+                    # purpose: Q2 (#426) refuses every blind On, the relinquish
+                    # path's included, so the refusal stays visible instead.
                     log.warning("Power-switch unreadable; not releasing a hold")
-                    return ActionLine(
+                    return [ActionLine(
                         f"[WARNING] {desc} refused: state unreadable; "
                         "a hold is never released blind",
                         ActionOutcome.REFUSED,
-                    )
+                    )]
                 log.warning("Power-switch pre-read failed; writing %s anyway", wanted)
             if wanted == "On" and not any(h.owned and h.confirmed for h in records):
                 # An unconfirmed request is not proof ha-spark turned it Off: its
                 # write may never have landed and the owner switched Off since.
-                return ActionLine(
+                return [ActionLine(
                     "[SKIP] owner-Off switch has no confirmed owned hold; left as-is",
                     ActionOutcome.UNVERIFIED,
-                )
+                )]
             assert store is not None and store.state is not None
+            schedule_lines: list[ActionLine] = []
+            if wanted == "On":
+                schedule_lines, refusal = await self._confirm_restore_schedule(
+                    intent, store.state
+                )
+                if refusal is not None:
+                    log.warning("[REFUSED] %s: %s; hold kept", desc, refusal)
+                    return [*schedule_lines, ActionLine(
+                        f"[REFUSED] {desc} refused: {refusal}; hold kept",
+                        ActionOutcome.REFUSED,
+                    )]
             if wanted == "Off":
                 self._save_hold_request(store, identity, intent, now, records, confirmed=False)
             else:
@@ -1148,12 +1173,50 @@ class SolisDevice:
                     store.save_holds(tuple(h for h in store.state.holds if h.device != identity))
         except Exception:  # noqa: BLE001 - isolate this action's failure
             log.error("[FAILED] %s", desc)
-            return ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)
-        return (
+            return [ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)]
+        return [*schedule_lines, (
             ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED)
             if mismatch
             else ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)
+        )]
+
+    async def _confirm_restore_schedule(
+        self, intent: ChargeIntent, state: AuthorityState
+    ) -> tuple[list[ActionLine], str | None]:
+        """Confirm the schedule a release hands the battery back to (#424).
+
+        Returns the lines it produced and a refusal reason, ``None`` once confirmed.
+        Protect never programs the charge schedule, so the resident slot-1 window
+        and charge current must read back. Optimise re-applies what it restores and needs current,
+        slot 1 and the guarded slots all read back: the validated fallback
+        schedule while fallback is active (Q3), else this plan, under ``_apply``'s
+        own SoC guard. Nested in the reconcile's action, ``_apply`` still takes
+        the charging decision, so Protect could not write here even by mistake.
+        """
+        if state.committed_mode == "protect":
+            current = await self._diagnostic_number("timed_charge_current")
+            if await self.resident_charge_window() is None or current is None or current < 0:
+                return [], "resident schedule unreadable"
+            return [], None
+        if state.fallback.active:
+            validated = validate_fallback_schedule(self._settings)
+            if isinstance(validated, str):
+                return [], f"fallback schedule invalid: {validated}"
+            result = await self._apply(
+                ChargeIntent(
+                    target_soc_pct=0.0, soc=intent.soc,
+                    window_start=validated.window_start, window_end=validated.window_end,
+                ),
+                validated.current_a,
+            )
+        else:
+            result = await self._apply(intent, None, releasing=True)
+        if result.current_ok and result.window_verified and result.cleanup_ok:
+            return result.lines, None
+        detail = next(
+            (line for line in result.lines if not is_verified(line)), "read-back incomplete"
         )
+        return result.lines, f"schedule not confirmed: {detail}"
 
     def _save_hold_request(
         self, store: AuthorityStore, identity: HoldDevice, intent: ChargeIntent,
@@ -1186,14 +1249,22 @@ class SolisDevice:
         a discharge window that is zeroed unless it is a verified export still
         running. The scheduler decides *when* (past every known hold end with no
         trusted picture, or a clean shutdown) and fires it once; this only writes.
-        It is the designated bound on the reconcile's refused blind release, so an
-        unreadable switch is written ``On`` here rather than refused. Retries are
-        not this method's: they belong to the read-first reconcile and ``apply``,
-        which never write blind, so broken reads cannot cost the inverter a
-        register write a minute. Each action is gated and isolated like every
-        other write; it never touches the charge or discharge current.
+        An unreadable switch is refused, not written ``On`` (Q2): every On needs a
+        readable switch, and the refusal stays visible. Retries are not this
+        method's: they belong to the read-first reconcile and ``apply``, which
+        never write blind, so broken reads cannot cost the inverter a register
+        write a minute. Each action is gated and isolated like every other write;
+        it never touches the charge or discharge current.
         """
         return [await self._write_safe_power_switch(), await self._write_safe_slot_block()]
+
+    async def write_safe_window(self) -> list[ActionLine]:
+        """The safe state's charge window alone, for a shutdown that keeps a hold (#426).
+
+        A charging-class slot write; the power switch is never touched, so it
+        cannot create an unowned protection write.
+        """
+        return [await self._write_safe_slot_block()]
 
     @device_action(Ownership.PROTECTION)
     async def _write_safe_power_switch(self) -> ActionLine:
@@ -1213,12 +1284,19 @@ class SolisDevice:
             )
         try:
             try:
-                if (await self._rest.get_state(entity)).state.strip().lower() == "on":
-                    return ActionLine(
-                        f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED
-                    )
-            except Exception:  # noqa: BLE001 - unreadable is written, not refused
-                log.warning("Power-switch pre-read failed; writing On anyway")
+                current = (await self._rest.get_state(entity)).state.strip().lower()
+            except Exception:  # noqa: BLE001 - Q2: unreadable is refused, not written
+                current = None
+            if current == "on":
+                return ActionLine(
+                    f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED
+                )
+            if current != "off":
+                log.warning("Power-switch state unreadable or not on/off; not writing On")
+                return ActionLine(
+                    f"[WARNING] {desc} refused: state unreadable or not on/off",
+                    ActionOutcome.REFUSED,
+                )
             mismatch = await self._select_option(entity, "On")
         except Exception:  # noqa: BLE001 - isolate this action's failure
             log.error("[FAILED] %s", desc)

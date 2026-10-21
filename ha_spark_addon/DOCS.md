@@ -93,8 +93,8 @@ other processes or external Home Assistant automations.
 
 On the Solis, ha-spark re-reads the dispatch state and checks
 `inverter_power_switch_entity` every minute, separately from the half-hourly
-plan. It turns the switch `Off` during an active dispatch hold and `On`
-otherwise. When `ev_status_entity` is configured, Charging, Boosting and
+plan. It turns the switch `Off` during an active dispatch hold and back `On`
+only to release a hold it recorded itself. When `ev_status_entity` is configured, Charging, Boosting and
 Delivering also hold the switch `Off` outside the overnight charge window,
 even without a matching dispatch. Five consecutive clear reads release that
 hold; eco+ Diverting does not start one. Unreadable EV status is ignored for
@@ -103,8 +103,13 @@ enabled, the next minute's check corrects a restart, a failed write, or a
 switch change made outside ha-spark. When ha-spark gives up control, including
 during a clean shutdown, it writes a safe state: switch `On`, the configured
 cheap charge window (default `23:30`-`05:30`), and an empty discharge window
-(`00:00`-`00:00`) unless a verified export is still running. If ha-spark can't
-trust the dispatch state, it won't open a new export window.
+(`00:00`-`00:00`) unless a verified export is still running. The switch is
+written `On` only when it reads back `On` or `Off`; otherwise that step is
+refused and logged. A clean shutdown writes only in Optimise. While an EV hold
+is recorded or a known dispatch end is still ahead, it restores the charge
+window, leaves the switch `Off`, and sends a notice; the next start reconciles
+the hold first. If ha-spark can't trust the dispatch state, it won't open a new
+export window.
 
 Before enabling Optimise, disable any Home Assistant automation or
 manual schedule that writes the same inverter or power switch, and keep them
@@ -636,8 +641,17 @@ retained owned hold without fresh evidence raises a degraded notification. It
 notifies once per stale episode, including across restarts; fresh evidence
 re-arms it. EV hold clearance progress and the last trusted dispatch end are
 persisted, and settings reloads do not reset them. A saved request is not a
-read-back confirmation. Owner-Off switches without an owned hold are never
-released by hold reconciliation.
+read-back confirmation. In Optimise, a settings save is refused before persistence
+if it would invalidate the fallback charging schedule (including its current,
+window or limits). Remapping a held switch retains the original hold and raises
+a degraded notice; move to Observe before the replacement mapping can act. A
+release is never redirected to the replacement entity.
+
+Owner-Off switches without an owned hold are never
+released by hold reconciliation. A release writes the switch On only once the
+schedule it hands back to reads back: the resident slot-1 schedule in Protect;
+in Optimise this plan applied and verified, or the verified fallback schedule
+while fallback is active. Until then the hold stays and a refused line is logged.
 
 | Option | Source | Default |
 | --- | --- | --- |
