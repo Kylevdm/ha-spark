@@ -21,10 +21,8 @@ listener: an agent token must never reach an owner write (#457).
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -38,25 +36,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from ha_spark.agent import auth, tools
 from ha_spark.agent.exposure import OPERATION_TIERS, allowed, surface_on
 from ha_spark.authority import OperatingMode, authority_view, load_authority
-from ha_spark.config import (
-    _OPTION_KEYS,
-    _SECRET_OPTION_KEYS,
-    ConfigError,
-    Settings,
-    actuation_settings_changed,
-    load_settings,
-    validate_options_document,
-)
+from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import DaemonChannel
-from ha_spark.devices.execution import execution_context
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.logging import get_logger
-from ha_spark.mode_preconditions import (
-    NO_FALLBACK_PLATFORM,
-    entry_preconditions,
-    fallback_schedule_problem,
-)
+from ha_spark.mode_preconditions import entry_preconditions
+from ha_spark.settings_service import OPTIONS_PATH as OPTIONS_PATH
+from ha_spark.settings_service import SettingsService
 
 log = get_logger(__name__)
 
@@ -70,13 +57,7 @@ INGRESS_PROXY_IP = "172.30.32.2"
 # Optional published port (Task 9): bound only when the user opts in via
 # `agent_surface == "on"` and `agent_expose_port`. Mapped to the host in config.yaml.
 AGENT_PORT = 8098
-# Where the add-on persists user options (HA add-on convention).
-OPTIONS_PATH = Path("/data/options.json")
 STATE_ATTR = "ha_spark_state"
-# Placeholder returned in place of a set secret so it never leaves the process
-# in cleartext. A client that posts this value back is treated as "unchanged"
-# (see apply_options), so a GET-then-POST round-trip can't clobber the secret.
-_REDACTED = "***"
 # The fixed answer to every agent config change (``/agent/config`` and the MCP
 # ``set_config`` tool) until owner-approved config proposals exist (#457).
 AGENT_CONFIG_REFUSAL: dict[str, str] = {
@@ -105,20 +86,43 @@ class ModeBody(BaseModel):
     expected_epoch: int | None = Field(ge=1, strict=True)
 
 
-@dataclass
 class AppState:
-    """State shared between the daemon and the API handlers.
+    """Daemon/API state; all settings operations delegate to the settings service."""
 
-    ``reload`` is injectable so tests can rebuild ``Settings`` without the full
-    add-on/dev credential machinery; in production it is :func:`load_settings`.
-    """
+    def __init__(
+        self,
+        settings: Settings,
+        options_path: Path,
+        reload: Callable[[], Settings] | None = None,
+        plan: ChargePlan | None = None,
+        plan_at: datetime | None = None,
+        executor: DaemonChannel | None = None,
+    ) -> None:
+        self.settings_service = SettingsService(options_path, settings=settings, reload=reload)
+        self.plan = plan
+        self.plan_at = plan_at
+        self.executor = executor
 
-    settings: Settings
-    options_path: Path
-    reload: Callable[[], Settings] = load_settings
-    plan: ChargePlan | None = None
-    plan_at: datetime | None = None
-    executor: DaemonChannel | None = None
+    @property
+    def settings(self) -> Settings:
+        return self.settings_service.settings
+
+    @settings.setter
+    def settings(self, settings: Settings) -> None:
+        # Compatibility for tests; production publishes only through save.
+        self.settings_service.settings = settings
+
+    @property
+    def options_path(self) -> Path:
+        return self.settings_service.options_path
+
+    @property
+    def reload(self) -> Callable[[], Settings]:
+        return self.settings_service.reload
+
+    @reload.setter
+    def reload(self, reload: Callable[[], Settings]) -> None:
+        self.settings_service.reload = reload
 
     def set_plan(self, plan: ChargePlan) -> None:
         """Record the latest computed plan (called by the daemon each run)."""
@@ -126,106 +130,10 @@ class AppState:
         self.plan_at = datetime.now(UTC)
 
     def current_options(self) -> dict[str, Any]:
-        """The user-facing options subset of the current settings.
-
-        Secret keys (``_SECRET_OPTION_KEYS``) are masked with ``_REDACTED`` when
-        set so they never leave the process in cleartext (this is the single
-        chokepoint for ``/api/config``, ``/agent/config`` and the ``set_config``
-        MCP tool). An unset secret keeps its empty value so clients can still
-        tell it isn't configured.
-        """
-        out: dict[str, Any] = {}
-        for key in _OPTION_KEYS:
-            value = getattr(self.settings, key)
-            if key in _SECRET_OPTION_KEYS and value:
-                out[key] = _REDACTED
-            elif key == "devices":
-                # `devices` holds pydantic DeviceConfig models (synthesized from
-                # the flat keys when unset); dump to JSON-safe primitives so the
-                # config response/persistence stays serializable.
-                out[key] = [d.model_dump(mode="json") for d in value]
-            else:
-                out[key] = value
-        return out
+        return self.settings_service.read_view()
 
     def apply_options(self, updates: dict[str, Any]) -> Settings:
-        """Merge ``updates`` into the persisted options, validate, then save.
-
-        Only keys in ``_OPTION_KEYS`` are accepted; unknown keys are ignored. An
-        incoming secret value equal to ``_REDACTED`` is dropped (treated as
-        "unchanged"), so a GET-then-POST round-trip of the masked options can't
-        clobber the real secret with the mask.
-
-        The complete merged candidate is validated into :class:`Settings`
-        (the same overlay/validation semantics as :func:`load_settings`) *before*
-        anything touches disk or the running settings (#412): an invalid
-        document is rejected with a secret-safe reason naming the failing
-        field(s) -- never an input value -- and leaves the options file
-        byte-identical and the running settings exactly as they were.
-
-        ``db_path`` decides where the authority store and the runtime state
-        beside it live, so a save cannot change it (#441): any update whose
-        value differs from the running one (including ``None``, which the
-        options overlay would drop to a default) is rejected before the
-        merged document is validated or persisted, with the same
-        byte-identical/no-echo guarantees. ``db_path`` is still read at startup
-        from the environment and the options file, which need a restart.
-        """
-        if "db_path" in updates and updates["db_path"] != self.settings.db_path:
-            raise ConfigError(
-                "db_path cannot be changed by a settings save; "
-                "set it in the environment or options file and restart"
-            )
-        current: dict[str, Any] = {}
-        if self.options_path.exists():
-            current = json.loads(self.options_path.read_text(encoding="utf-8"))
-        current.update(
-            {
-                k: v
-                for k, v in updates.items()
-                if k in _OPTION_KEYS
-                and not (k in _SECRET_OPTION_KEYS and v == _REDACTED)
-            }
-        )
-        # Validate the whole candidate before persisting anything; a rejected
-        # save must leave the file byte-identical.
-        candidate = validate_options_document(current)
-        context = execution_context()
-        store = context.authority
-        authority = store.state if store is not None and store.known else None
-        # Unknown authority fails closed only for a save that would invalidate
-        # a currently valid fallback, so an install without one can still save.
-        unknown = authority is None or (store is not None and store.save_failed)
-        if (
-            (unknown and fallback_schedule_problem(self.settings) is None)
-            or (authority is not None and not unknown and (
-                authority.committed_mode == "optimise"
-                or (authority.transition is not None
-                    and authority.transition.target == "optimise")
-            ))
-        ):
-            reason = fallback_schedule_problem(candidate)
-            if reason == NO_FALLBACK_PLATFORM:
-                raise ConfigError("Invalid fallback charging schedule: inverter configuration")
-            if reason is not None:
-                # Driver reasons may include raw window values. Name only known
-                # fields/categories here, never echo candidate input at a surface.
-                fields = [name for name in (
-                    "solis_fallback_current_a", "max_charge_current_a", "battery_voltage_v",
-                    "supply_max_current_a", "supply_voltage_v", "charge_window_start",
-                    "charge_window_end",
-                ) if name in reason]
-                detail = ", ".join(fields) or "charge window or site supply limit"
-                raise ConfigError(f"Invalid fallback charging schedule: {detail}")
-        self.options_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.options_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(current), encoding="utf-8")
-        temporary.replace(self.options_path)
-        settings = self.reload()
-        if actuation_settings_changed(self.settings, settings):
-            context.config_generation += 1
-        self.settings = settings
-        return self.settings
+        return self.settings_service.save(updates)
 
 
 def _iso(dt: datetime | None) -> str | None:

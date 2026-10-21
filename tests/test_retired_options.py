@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from ha_spark import config
+from ha_spark import config, settings_service
 from ha_spark.api.server import AppState, build_app
 from ha_spark.authority import AuthorityStore
 from ha_spark.devices.execution import ExecutionContext, Ownership
@@ -27,8 +27,8 @@ async def test_retired_options_load_once_without_grant(tmp_path, monkeypatch, ca
     monkeypatch.setenv("HA_URL", "http://ha.test")
     monkeypatch.setenv("HA_TOKEN", "test")
     monkeypatch.setenv("DB_PATH", str(tmp_path / "events.db"))
-    read_overlay = config._read_options_overlay
-    monkeypatch.setattr(config, "_read_options_overlay", lambda: read_overlay(path))
+    read_overlay = settings_service._read_options_overlay
+    monkeypatch.setattr(settings_service, "_read_options_overlay", lambda _: read_overlay(path))
     settings = config.load_settings()
     warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1

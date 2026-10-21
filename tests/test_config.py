@@ -11,9 +11,9 @@ from ha_spark.config import (
     ConfigError,
     DeviceConfig,
     Settings,
-    _read_options_overlay,
     load_settings,
 )
+from ha_spark.settings_service import _read_options_overlay
 
 ADDON_CONFIG = Path(__file__).parent.parent / "ha_spark_addon" / "config.yaml"
 
@@ -71,7 +71,7 @@ def test_load_settings_fails_fast_without_credentials(
     for var in ("HA_URL", "HA_TOKEN", "SUPERVISOR_TOKEN"):
         monkeypatch.delenv(var, raising=False)
     # No /data/options.json overlay in the test environment.
-    monkeypatch.setattr("ha_spark.config._read_options_overlay", lambda: {})
+    monkeypatch.setattr("ha_spark.settings_service._read_options_overlay", lambda path: {})
     with pytest.raises(ConfigError):
         load_settings()
 
@@ -80,7 +80,7 @@ def test_load_settings_ok_in_addon_mode(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.delenv("HA_URL", raising=False)
     monkeypatch.delenv("HA_TOKEN", raising=False)
     monkeypatch.setenv("SUPERVISOR_TOKEN", "sup-token")
-    monkeypatch.setattr("ha_spark.config._read_options_overlay", lambda: {})
+    monkeypatch.setattr("ha_spark.settings_service._read_options_overlay", lambda path: {})
     settings = load_settings()
     assert settings.is_standalone is False
     assert settings.auth_token == "sup-token"
@@ -92,8 +92,8 @@ def test_load_settings_validate_false_skips_credential_check(
     # Diagnostic paths (`ha-spark health`) must build settings without creds
     # while still honouring the options overlay.
     monkeypatch.setattr(
-        "ha_spark.config._read_options_overlay",
-        lambda: {"ollama_url": "http://100.1.2.3:11434"},
+        "ha_spark.settings_service._read_options_overlay",
+        lambda path: {"ollama_url": "http://100.1.2.3:11434"},
     )
     settings = load_settings(validate=False)
     assert settings.ollama_url == "http://100.1.2.3:11434"
