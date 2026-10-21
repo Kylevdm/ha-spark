@@ -467,6 +467,25 @@ day (default: seven days including today, through the current slot). The diagnos
 is read-only and does not require a running daemon or HA connection. Readiness
 recording is evidence collection, not permission to change the operating mode.
 
+After each household-local day closes, the daemon joins that day's actual metered
+evidence once and stores an immutable day snapshot in the same database: the
+measured grid import and export, solar generation, battery charge and discharge
+per half-hour (EV charging and V2L only when configured), the gross house load,
+the day's start and end battery energy, and the next cheap slot's import rate.
+Required components must be configured; an unconfigured EV or V2L counts as a true
+zero, while a configured component with no measurement for a slot is recorded as
+a substituted zero and excludes the day — never a real zero. An hour measured
+only hourly is spread evenly across its two half-hours and flagged. Days with
+slot gaps, non-Observe slots or missing boundary evidence are stored excluded
+with the reason. Joins are retried while HA's five-minute statistics still exist
+(about ten days); a day that could not be joined in time is stored excluded with
+that reason. Recording failures are isolated and never interrupt control-loop
+work or write hardware.
+
+`ha-spark readiness coverage [--days N]` prints each stored day's provenance
+counts (measured, hourly-spread, substituted, absent) and every exclusion
+reason, read-only from the database; it never joins a day or creates one.
+
 ### Tariff
 
 `rate_offpeak_gbp_kwh`, `rate_peak_gbp_kwh`, `rate_export_gbp_kwh`: the rates

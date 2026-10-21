@@ -46,6 +46,7 @@ from ha_spark.energy.onboarding import (
 )
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.readiness_ledger import ReadinessLedger, slot_start
+from ha_spark.energy.readiness_measurements import COMPONENTS, ReadinessDays
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever
 from ha_spark.energy.sources import _to_float
@@ -97,6 +98,37 @@ async def _cmd_readiness_slots(settings: Settings, *, days: int) -> int:
                 print(f"  gap {instant.isoformat()}")
             else:
                 print(f"  {instant.isoformat()} {row.operating_mode} {row.revision_id}")
+    return 0
+
+
+async def _cmd_readiness_coverage(settings: Settings, *, days: int) -> int:
+    """Report saved closed-day provenance and every exclusion, without rejoining."""
+    if days <= 0:
+        print("--days must be positive", file=sys.stderr)
+        return 2
+    today = datetime.now(load_timezone(settings.timezone)).date()
+    try:
+        rows = {row.local_date: row for row in await ReadinessDays(settings.db_path).days()}
+    except Exception:
+        print("Could not read readiness day snapshots", file=sys.stderr)
+        return 1
+    for offset in range(days, 0, -1):
+        day = today - timedelta(days=offset)
+        row = rows.get(day)
+        if row is None:
+            print(f"{day}: excluded — day snapshot missing (gap)")
+            continue
+        print(f"{day}: {'qualifying' if row.qualifying else 'excluded'} ({len(row.slots)} slots)")
+        for name in COMPONENTS:
+            counts = {
+                provenance: sum(
+                    slot.components[name].provenance == provenance for slot in row.slots
+                )
+                for provenance in ("measured", "hourly_spread", "substituted", "absent")
+            }
+            print(f"  {name}: " + " ".join(f"{key}={value}" for key, value in counts.items()))
+        for reason in row.reasons:
+            print(f"  {reason}")
     return 0
 
 
@@ -738,6 +770,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     readiness = sub.add_parser("readiness", help="inspect readiness evidence (read-only)")
     readiness_sub = readiness.add_subparsers(dest="readiness_command", required=True)
+    coverage = readiness_sub.add_parser("coverage", help="show closed-day measurements and gaps")
+    coverage.add_argument("--days", type=int, default=21)
     slots = readiness_sub.add_parser("slots", help="list recorded slots and gaps")
     slots.add_argument("--days", type=int, default=7, help="household-local days (default: 7)")
 
@@ -1076,6 +1110,8 @@ def main(argv: list[str] | None = None) -> int:
     # failure detail is carried in each check result.
     if args.command == "readiness":
         settings = load_settings(validate=False)
+        if args.readiness_command == "coverage":
+            return asyncio.run(_cmd_readiness_coverage(settings, days=args.days))
         return asyncio.run(_cmd_readiness_slots(settings, days=args.days))
 
     if args.command == "mode":
