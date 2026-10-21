@@ -841,7 +841,7 @@ async def _release_refused_notice(
             h.model_copy(update={"release_refused_notified": True}) if h in due else h
             for h in store.state.holds
         ))
-    except (OSError, ValueError):
+    except Exception:  # noqa: BLE001 - bookkeeping never blocks the tick
         log.warning("Recording the refused-release notice failed; not sending it")
         return
     for record in due:
@@ -1088,7 +1088,6 @@ async def reconcile_tick(
             await _hold_degraded_notice(
                 settings, rest, evidence_read.freshness, now, dispatch_trusted=fresh.hold_trusted
             )
-            await _release_refused_notice(settings, rest, now)
             ev_charging = ev_hold_status_from_read(
                 evidence_read.ev_status, evidence_read.ev_status_trusted
             )
@@ -1134,6 +1133,9 @@ async def reconcile_tick(
                 lines = read_lines + list(await device.write_safe_state())
             else:
                 lines = read_lines + list(await device.reconcile_holds(intent, now))
+            # After this pass, so a hold that is legitimately back (which
+            # ends the refused episode) never reads as "ended but still held".
+            await _release_refused_notice(settings, rest, now)
     except Exception:
         log.exception("Hold reconcile tick failed; will retry next minute")
         return ReconcileResult(

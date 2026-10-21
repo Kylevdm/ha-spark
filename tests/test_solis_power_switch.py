@@ -1031,3 +1031,35 @@ async def test_safe_state_refusal_marks_the_owned_hold(tmp_path) -> None:
     (held,) = device._execution.authority.state.holds
     assert held.release_refused_reason == "switch_unreadable"
     assert held.release_refused_since is not None
+
+
+@pytest.mark.asyncio
+async def test_verified_safe_state_on_clears_the_refusal(tmp_path) -> None:
+    """#449: once the switch reads back On the release is no longer refused."""
+    rest = FakeRest(switch="unavailable")
+    device = _device(rest, tmp_path)
+    _seed_owned_hold(device)
+    await device.write_safe_state()
+    assert device._execution.authority.state.holds[0].release_refused_since is not None
+    rest.states[_SWITCH] = "Off"
+    await device.write_safe_state()
+
+    assert _options(rest) == ["On"]
+    (held,) = device._execution.authority.state.holds
+    assert held.release_refused_since is None
+    assert held.release_refused_reason is None
+
+
+@pytest.mark.asyncio
+async def test_observe_handover_refusal_marks_the_owned_hold(tmp_path) -> None:
+    """#449: the → Observe release_holds step records its refusal too."""
+    rest = FakeRest(switch="unavailable")
+    device = _device(rest, tmp_path, authority_mode="protect")
+    _seed_owned_hold(device)
+    lines = await device.release_holds()
+
+    assert _options(rest) == []
+    assert any("refused" in line for line in lines)
+    assert device._execution.authority.state.holds[0].release_refused_reason == (
+        "switch_unreadable"
+    )

@@ -360,13 +360,16 @@ async def test_refused_release_notifies_once_across_restart(tmp_path, monkeypatc
     (held,) = store.state.holds
     assert held.release_refused_reason == "schedule_unverified"
     assert switch["option"] == "Off"
+    fresh_evidence(NOW + timedelta(minutes=3))
     await scheduler.reconcile_tick(settings, plan, NOW + timedelta(minutes=3))
     assert notices == []
+    fresh_evidence(NOW + timedelta(minutes=6))
     await scheduler.reconcile_tick(settings, plan, NOW + timedelta(minutes=6))
     assert len(notices) == 1
     assert "schedule to restore is not verified" in notices[0][3]
     restarted = AuthorityStore(settings)
     execution_context().authority = restarted
+    fresh_evidence(NOW + timedelta(minutes=7))
     await scheduler.reconcile_tick(settings, plan, NOW + timedelta(minutes=7))
     assert len(notices) == 1
     assert restarted.state.holds[0].release_refused_notified
@@ -384,5 +387,6 @@ async def test_refused_release_notice_failure_never_blocks(tmp_path, monkeypatch
     monkeypatch.setattr(scheduler, "send_notification", broken)
     plan = _plan(replace(_INTENT, holds=(), hold_trusted=True))
     await scheduler.reconcile_tick(settings, plan, NOW)
+    fresh_evidence(NOW + timedelta(minutes=6))
     await scheduler.reconcile_tick(settings, plan, NOW + timedelta(minutes=6))
     assert store.state.holds[0].release_refused_notified

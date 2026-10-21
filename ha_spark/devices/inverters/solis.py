@@ -1262,6 +1262,7 @@ class SolisDevice:
                 current = (await self._rest.get_state(entity)).state.strip().lower()
             except Exception:  # noqa: BLE001 - Q2: never release blind
                 log.warning("Power-switch unreadable; not releasing a hold")
+                self._mark_release_refused(store, identity, "switch_unreadable", datetime.now(UTC))
                 return [ActionLine(
                     f"[WARNING] {desc} refused: state unreadable; "
                     "a hold is never released blind",
@@ -1274,6 +1275,7 @@ class SolisDevice:
                 )]
             if current != "off":
                 log.warning("Power-switch state is not on/off; not releasing a hold")
+                self._mark_release_refused(store, identity, "switch_unreadable", datetime.now(UTC))
                 return [ActionLine(
                     f"[WARNING] {desc} refused: state is not on/off; "
                     "a hold is never released blind",
@@ -1290,6 +1292,9 @@ class SolisDevice:
             problem = await self._resident_schedule_problem()
             if problem is not None:
                 log.warning("[REFUSED] %s: %s; hold kept", desc, problem)
+                self._mark_release_refused(
+                    store, identity, "schedule_unverified", datetime.now(UTC)
+                )
                 return [ActionLine(
                     f"[REFUSED] {desc} refused: {problem}; hold kept", ActionOutcome.REFUSED,
                 )]
@@ -1416,8 +1421,25 @@ class SolisDevice:
                 if h.device == identity and h.owned and h.confirmed else h
                 for h in store.state.holds
             ))
-        except (OSError, ValueError):
+        except Exception:  # noqa: BLE001 - bookkeeping never changes the refusal
             log.warning("Recording the refused hold release failed")
+
+    def _clear_release_refused(self) -> None:
+        """A switch read back On is no longer a refused release (#449).
+
+        Only the refusal metadata: the records themselves still clear through
+        reconciliation, as before. Bookkeeping failures are logged and ignored.
+        """
+        store = self._execution.authority
+        if store is None or store.state is None:
+            return
+        try:
+            store.save_holds(tuple(
+                h.model_copy(update={"release_refused_since": None, "release_refused_reason": None})
+                for h in store.state.holds
+            ))
+        except Exception:  # noqa: BLE001 - bookkeeping never changes the outcome
+            log.warning("Clearing the refused hold release failed")
 
     def _save_hold_request(
         self, store: AuthorityStore, identity: HoldDevice, intent: ChargeIntent,
@@ -1495,6 +1517,7 @@ class SolisDevice:
             except Exception:  # noqa: BLE001 - Q2: unreadable is refused, not written
                 current = None
             if current == "on":
+                self._clear_release_refused()
                 return ActionLine(
                     f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED
                 )
@@ -1517,11 +1540,10 @@ class SolisDevice:
         except Exception:  # noqa: BLE001 - isolate this action's failure
             log.error("[FAILED] %s", desc)
             return ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)
-        return (
-            ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED)
-            if mismatch
-            else ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)
-        )
+        if mismatch:
+            return ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED)
+        self._clear_release_refused()
+        return ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)
 
     @device_action(Ownership.CHARGING)
     async def _write_safe_slot_block(self) -> ActionLine:
