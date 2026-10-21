@@ -24,10 +24,10 @@ def _hold(settings) -> HoldRecord:
     ))
 
 
-@pytest.mark.parametrize("target,error", [("optimise", "preconditions_unmet"),
+@pytest.mark.parametrize("target,error", [("optimise", "stale_epoch"),
                                          ("protect", "stale_epoch")])
 @respx.mock
-async def test_daemon_refuses_unavailable_or_stale_mode(tmp_path, monkeypatch, target, error):
+async def test_daemon_refuses_stale_mode(tmp_path, monkeypatch, target, error):
     settings = settings_at(tmp_path)
     respx.get(url__regex=r"http://ha.test/api/.*").respond(200, json=[])
     respx.post(url__regex=r"http://ha.test/api/.*").respond(200, json=[])
