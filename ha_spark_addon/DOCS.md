@@ -486,6 +486,39 @@ work or write hardware.
 counts (measured, hourly-spread, substituted, absent) and every exclusion
 reason, read-only from the database; it never joins a day or creates one.
 
+### Readiness evaluation
+
+`ha-spark readiness show` prints the current verdict, measurements, qualifying
+household-local days and excluded days with reasons. It reads existing evidence
+only: no HA connection, database creation, notice or authority change.
+
+The daemon evaluates once after the most recent closed day's snapshot is saved.
+It uses the **latest qualifying days**, not a fixed calendar span. A day must
+have a qualifying measured snapshot, a replayable intent history and a driving
+forecast issued before the local day started. Cost replay carries its own battery
+energy from the day's actual start and values the ending-energy difference at
+the next cheap import rate. Any zero-filled derived-load slot excludes the day.
+Forecast MAE compares the driving model with its paired median on identical days,
+against measured base load (gross house load less V2L). A model change, any
+median-driven day, missing paired median or zero baseline MAE is insufficient
+evidence. Missing days are never treated as zero cost or zero breaches.
+
+| Option | Default | Validation / meaning |
+| --- | --- | --- |
+| `readiness_window_days` | `21` | Positive integer; latest qualifying household-local days required |
+| `readiness_mae_improvement_pct` | `10` | 0–100%; minimum MAE improvement over the median |
+| `readiness_max_cost_delta` | `0.0` | Finite GBP; maximum total replay minus incumbent cost |
+| `readiness_min_guard_coverage_pct` | `90` | 0–100%; valid guard samples / expected in-window minute ticks |
+
+Passing requires cost delta at or below the threshold, zero would-have-breached
+guard events, sufficient guard coverage and the forecast improvement margin.
+Measured failures take precedence over insufficient evidence. The first pass
+persists a notice flag before sending a notice with the numbers to the configured
+notify target (or an HA persistent notification). Further passes do not resend;
+only a failing evaluation re-arms it, not insufficient evidence. Delivery or
+recording failures are isolated. Readiness is a recommendation: it never changes
+the operating mode, authority epoch, holds or hardware behaviour.
+
 ### Tariff
 
 `rate_offpeak_gbp_kwh`, `rate_peak_gbp_kwh`, `rate_export_gbp_kwh`: the rates

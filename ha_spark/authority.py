@@ -292,6 +292,16 @@ class AuthorityStore:
         )
         self._persist_initial(state)
 
+    def save_readiness_notice(self, notified: bool) -> None:
+        """Persist only the readiness notice flag, without changing authority."""
+        if self._state is None or self.save_failed or not self.known:
+            raise ValueError("Cannot save readiness notice without known, durable authority")
+        if self._state.readiness_notice.notified == notified:
+            return
+        self.save(self._state.model_copy(update={
+            "readiness_notice": ReadinessNoticeState(notified=notified),
+        }))
+
     def save_holds(self, holds: tuple[HoldRecord, ...]) -> None:
         """Persist before acting; failed saves leave the gate closed.
 
