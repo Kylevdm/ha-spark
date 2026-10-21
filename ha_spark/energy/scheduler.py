@@ -694,20 +694,21 @@ def next_ev_hold_state(
     return EvHoldState(active=True, clear_count=count, last_clear_report_at=reported_at)
 
 
-async def _resident_charge_window(device: Device) -> tuple[time, time] | None:
+async def _resident_charge_window(device: Device, now: datetime) -> tuple[time, time] | None:
     """The resident slot-1 charge window read back from the inverter (#420).
 
-    Reuses #418's overlay reads (GETs only, no refresh, no write). ``None``
-    means unknown or unsupported: unknown is not verified, so the overnight
-    exception never applies on a ``None`` read.
+    Reuses #418's overlay reads (GETs only, no refresh, no write), counted
+    only when every field reports fresh (#444). ``None`` means unknown or
+    unsupported: unknown is not verified, so the overnight exception never
+    applies on a ``None`` read.
     """
-    reader: Callable[[], Awaitable[tuple[time, time] | None]] | None = getattr(
-        device, "resident_charge_window", None
+    reader: Callable[[datetime], Awaitable[tuple[time, time] | None]] | None = getattr(
+        device, "verified_resident_charge_window", None
     )
     if reader is None:
         return None
     try:
-        return await reader()
+        return await reader(now)
     except Exception:  # noqa: BLE001 - an unreadable window is not verified
         log.debug("Resident charge-window read failed; the overnight exception is off")
         return None
@@ -736,7 +737,7 @@ async def _observe_ev_hold(
         and evidence is not None
         and evidence.validity == "fresh"
     ):
-        resident = await _resident_charge_window(device)
+        resident = await _resident_charge_window(device, now)
         exception = ev_hold_overnight_exception(
             now,
             resident,
