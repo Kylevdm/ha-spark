@@ -11,7 +11,8 @@ Pure functions over data the earlier phases already accumulate:
   the configured ``away_load_factor`` once enough away history exists.
 - ``predict_actions`` — the seed of the planned ``predict_actions(context)``
   habit API: advisory ``(action, confidence, reason)`` tuples the orchestrator
-  logs or (later) executes, gated by ``PROACTIVE_MODE``. It never acts itself.
+  logs or (later) executes, gated by the site operating mode through the daemon's
+  write gate. It never acts itself.
 
 No ML dependency — deterministic medians keep it explainable and lets it run
 without the ``[habits]`` extra.
@@ -125,7 +126,8 @@ def predict_actions(ctx: HabitContext) -> list[PredictedAction]:
     """Advisory predictions for ``ctx`` — the seed of the habit API.
 
     The orchestrator requests these every run and logs/executes them per
-    ``PROACTIVE_MODE``; this function only reasons, it never acts.
+    the site operating mode through the daemon's write gate; this function only
+    reasons, it never acts.
     """
     actions: list[PredictedAction] = []
     occ = ctx.predicted_occupancy

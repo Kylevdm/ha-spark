@@ -18,7 +18,7 @@
 #   2. Set host/port to your RS485->Ethernet gateway (Waveshare in Modbus
 #      gateway mode, multi-host enabled, "Storage-type Modbus" OFF — #88).
 #   3. Restart HA. Confirm the `sensor.solis_control_*` entities read plausible
-#      values before setting ha-spark `proactive_mode: on`.
+#      values before enabling Protect or Optimise.
 #
 # ha-spark writes via the `modbus.write_register` service (hub: solis_control,
 # slave: 1) and reads back through the `sensor.solis_control_*` entities named

@@ -71,27 +71,22 @@ every item below must be confirmed on real hardware or live suppliers.
 
 ### Safety (automatic control; must never regress)
 
-These gates cover add-on automatic control and its UI/CLI actions. The
-integration warns but remains manually usable without the add-on. #248 and
-#255 must settle the standalone/manual service and override contracts; no
-bypass is granted here.
+These gates cover add-on automatic control and its UI/CLI actions. In phase 2
+only the daemon actuates, through the site operating mode and write-time gate.
+Integration-owned control and temporary manual handover arrive in later phases;
+no bypass is granted here.
 
-v1 retires `proactive_mode` and per-device `control` for the site operating
-mode ([#266](https://github.com/Kylevdm/ha-spark/issues/266),
-[ADR 0008](adr/0008-operating-mode-and-authority-lifecycle.md)). Each gate
-below carries over in those terms (`supplier` is dropped): `simulate` becomes
-Observe (zero writes), and a real write needs Optimise, or Protect for its own
-protection controls.
-
-- [ ] `proactive_mode: simulate` (default) computes a plan, logs `[SIMULATE]`
-      action lines, and performs **zero** real writes.
-- [ ] A `control: observe` or `supplier` device never actuates, even with
-      `proactive_mode: on`.
-- [ ] A real write happens **only** with `control: ha_spark` **and**
-      `proactive_mode: on`, is verified by read-back, and a failed action is
-      isolated.
-- [ ] Invalid SoC blocks normal SoC-based programming. The narrow configured
-      Solis fallback exception must remain guarded and read-back verified
+- [ ] Observe (the install and upgrade default) computes a plan, logs `[SIMULATE]`
+      action lines, and makes **zero** hardware-actuating calls, including on shutdown.
+- [ ] Protect writes only the hold and its release, read-back verified, plus
+      clock sync when authorised. It never writes the owner's charging schedule.
+- [ ] A real plan write happens **only** in Optimise, is verified by read-back,
+      and a failed action is isolated.
+- [ ] AlphaESS and multi-inverter sites cannot leave Observe in phase 2.
+- [ ] Authority unknown or a failed authority save permits no hardware writes,
+      releases included. Settings and agent requests never change the operating mode.
+- [ ] Invalid SoC blocks SoC-derived writes. The fixed, configured Solis fallback
+      charging schedule remains guarded, read-back verified and Optimise-only
       under #112/#119; AlphaESS never receives that fallback.
 - [ ] No secret (`SUPERVISOR_TOKEN`, `HA_TOKEN`, supplier API keys, Axle API
       key) appears in logs, plan output, or the agent surface.
@@ -109,7 +104,7 @@ protection controls.
 - [ ] Native Solis verifies firmware, gateway caching and register semantics
       (#249/#259).
       The integration is the sole Modbus client; #248 owns its service contract.
-- [ ] Agent surface: `get_state` reports each device's `control` authority;
+- [ ] Agent surface: `get_state` reports the site's operating mode;
       `/agent/*` writes still pass the gate; the LLM cannot reach
       `call_service`; an external non-ingress client is rejected without the
       bearer token. UI mutations use ingress and the same functions/gates as
@@ -131,8 +126,8 @@ protection controls.
 - [ ] V2L refill is planned only when it is cheaper than grid and a
       reservation needs it; an unplugged car means no V2L; the plug-in
       notification fires. Actuation is 1.0.x (below).
-- [ ] The readiness signal evaluates simulate history against the measured bar
-      and never changes `proactive_mode` itself.
+- [ ] The readiness signal evaluates Observe history against the measured bar
+      and never changes the operating mode or hardware behaviour.
 
 - [ ] The phone digest delivers the compatible MVP summary; #247 owns its
       sequencing alongside the ingress app.

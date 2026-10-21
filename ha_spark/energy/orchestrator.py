@@ -2,9 +2,9 @@
 acting on its predictions.
 
 The standing design decision is one decision path that always computes
-``predict_actions(context)``, logs the predictions, and — gated by the single
-``PROACTIVE_MODE`` flag — either executes them as real HA service calls or logs
-them as "simulated", with the same code either way.
+``predict_actions(context)`` and logs the predictions. The site operating mode
+sets its advisory decision mode; any future hardware action must go through the
+daemon's write gate, not actuate here.
 
 This is the decision/audit *skeleton*. The current predicted actions
 (``suggest_away_context``, ``reduce_overnight_charge``) are advisory strings
