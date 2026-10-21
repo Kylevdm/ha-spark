@@ -76,7 +76,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import NamedTuple
 from uuid import uuid4
 
@@ -138,6 +138,7 @@ from ha_spark.energy.publish import (
     publish_soc_integrity,
     republish_last,
 )
+from ha_spark.energy.readiness import readiness_tick
 from ha_spark.energy.readiness_ledger import PlanRevision, record_guard, record_slot, slot_start
 from ha_spark.energy.readiness_measurements import record_closed_days
 from ha_spark.energy.report import format_plan
@@ -1851,6 +1852,7 @@ async def _run_forever(
     last_plan: ChargePlan | None = None
     last_revision: PlanRevision | None = None
     last_readiness_slot: datetime | None = None
+    readiness_evaluated: date | None = None
     # The plan known resident on the device: the baseline `needs_apply`
     # compares against, `None` when unknown after a failed apply or run (#168).
     # `last_plan` is the latest computed plan, applied or skipped.
@@ -2219,6 +2221,9 @@ async def _run_forever(
             # never delays it, and after record_slot so the closing boundary's
             # start energy exists. Failures are isolated inside.
             await record_closed_days(settings, now)
+            readiness_evaluated = await readiness_tick(
+                settings, now, readiness_evaluated, authority,
+            )
             if last_signal_at is None or now - last_signal_at >= SIGNAL_SAMPLE_INTERVAL:
                 try:
                     await sample_signals(settings, now)

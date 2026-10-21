@@ -45,6 +45,7 @@ from ha_spark.energy.onboarding import (
     statistic_unit,
 )
 from ha_spark.energy.plan_run import current_plan
+from ha_spark.energy.readiness import load_readiness
 from ha_spark.energy.readiness_ledger import ReadinessLedger, slot_start
 from ha_spark.energy.readiness_measurements import COMPONENTS, ReadinessDays
 from ha_spark.energy.report import format_plan
@@ -63,6 +64,16 @@ from ha_spark.mode_preconditions import entry_preconditions
 from ha_spark.onboarding_discover import FieldProposal, propose
 from ha_spark.presets import get_preset, preset_names
 from ha_spark.router import route_message
+
+
+async def _cmd_readiness_show(settings: Settings) -> int:
+    try:
+        result = await load_readiness(settings)
+    except Exception:
+        print("Could not evaluate readiness evidence", file=sys.stderr)
+        return 1
+    print(result.model_dump_json(indent=2))
+    return 0
 
 
 async def _cmd_readiness_slots(settings: Settings, *, days: int) -> int:
@@ -770,6 +781,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     readiness = sub.add_parser("readiness", help="inspect readiness evidence (read-only)")
     readiness_sub = readiness.add_subparsers(dest="readiness_command", required=True)
+    readiness_sub.add_parser("show", help="show current readiness evaluation and evidence")
     coverage = readiness_sub.add_parser("coverage", help="show closed-day measurements and gaps")
     coverage.add_argument("--days", type=int, default=21)
     slots = readiness_sub.add_parser("slots", help="list recorded slots and gaps")
@@ -1110,6 +1122,8 @@ def main(argv: list[str] | None = None) -> int:
     # failure detail is carried in each check result.
     if args.command == "readiness":
         settings = load_settings(validate=False)
+        if args.readiness_command == "show":
+            return asyncio.run(_cmd_readiness_show(settings))
         if args.readiness_command == "coverage":
             return asyncio.run(_cmd_readiness_coverage(settings, days=args.days))
         return asyncio.run(_cmd_readiness_slots(settings, days=args.days))
