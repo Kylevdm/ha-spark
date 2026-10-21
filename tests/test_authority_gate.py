@@ -33,7 +33,7 @@ from ha_spark.energy.models import LoadForecast
 from ha_spark.energy.publish import publish_operating_mode
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.health import Status, check_operating_mode, exit_code
-from tests.authority_helpers import seed_authority
+from tests.authority_helpers import run_daemon, seed_authority
 from tests.test_scheduler import _patch_loop
 from tests.test_solis_power_switch import FakeRest, _intent, _now, _window
 
@@ -352,7 +352,7 @@ async def test_fresh_and_upgrade_daemon_observe_all_paths(
     monkeypatch.setattr(SolisDevice, "write_safe_state", safe_state)
     monkeypatch.setattr(scheduler.DstClockSync, "due", lambda *_: datetime.now(UTC))
     with caplog.at_level("INFO"), pytest.raises(stop):
-        await scheduler.run_forever(settings, poll_seconds=123)
+        await run_daemon(settings, poll_seconds=123)
     result = load_authority(settings)
     assert result.status == "known"
     assert result.state.committed_mode == "observe"
@@ -389,7 +389,7 @@ async def test_deleted_store_daemon_notifies_once_and_never_writes(settings, ha,
     ))
     monkeypatch.setattr(scheduler, "sample_signals", AsyncMock())
     with pytest.raises(stop):
-        await scheduler.run_forever(settings, poll_seconds=123)
+        await run_daemon(settings, poll_seconds=123)
     assert not hardware_calls(ha)
     assert not store.store_path.exists()
     notices = [call for call in ha.calls if call[:2] == ("persistent_notification", "create")]
@@ -407,7 +407,7 @@ async def test_new_daemon_bumps_epoch_without_legacy_grant(settings, ha, monkeyp
     ))
     monkeypatch.setattr(scheduler, "sample_signals", AsyncMock())
     with pytest.raises(stop):
-        await scheduler.run_forever(settings, poll_seconds=123)
+        await run_daemon(settings, poll_seconds=123)
     restarted = AuthorityStore(settings)
     assert restarted.state.epoch == store.state.epoch + 1
     assert restarted.state.committed_mode == "observe"
@@ -442,7 +442,7 @@ async def test_daemon_retries_failed_epoch_save_and_notifies_once(settings, ha, 
 
     monkeypatch.setattr(scheduler, "sample_signals", sample)
     with pytest.raises(stop):
-        await scheduler.run_forever(settings, poll_seconds=123)
+        await run_daemon(settings, poll_seconds=123)
     assert first_tick == [(True, [])]
     assert attempts == 3
     assert load_authority(settings).state.epoch == 5
@@ -515,7 +515,7 @@ async def test_unknown_daemon_reply_is_not_success(settings, ha, monkeypatch):
 
     monkeypatch.setattr(scheduler, "sample_signals", submit)
     with pytest.raises(stop):
-        await scheduler.run_forever(settings, poll_seconds=123)
+        await run_daemon(settings, poll_seconds=123)
     reply = await requests[0]
     assert reply.error == "device action refused"
     assert any(line.outcome is ActionOutcome.REFUSED for line in reply.lines)

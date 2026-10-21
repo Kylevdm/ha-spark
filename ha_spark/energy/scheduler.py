@@ -158,6 +158,7 @@ from ha_spark.ha.notifier import send_notification
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 from ha_spark.mode_preconditions import check_preconditions
+from ha_spark.settings_service import SettingsService
 from ha_spark.transitions import PreconditionReport, TransitionRequest, propose_transition
 
 log = get_logger(__name__)
@@ -1788,11 +1789,15 @@ async def _run_forever(
     """Loop: recompute and apply the plan once per local half-hour slot.
 
     Serves the add-on HTTP API (behind ingress) sharing an :class:`AppState`
-    with this loop: ``POST /api/config`` rewrites the options and the loop picks
-    up the reloaded settings on its next tick (hot reload, no restart).
+    with this loop: ``POST /api/config`` commits a settings pair and the loop
+    picks up the active snapshot on its next tick (hot reload, no restart).
     """
+    await channel.__aenter__()
+    service = SettingsService(OPTIONS_PATH, settings=settings)
+    settings = service.load(writable=True)
     warn_deprecated_notify_target(settings)
-    state = AppState(settings=settings, options_path=OPTIONS_PATH, executor=channel)
+    state = AppState(settings=settings, options_path=OPTIONS_PATH, executor=channel,
+                     settings_service=service)
     # Add-on mode: listen on all interfaces (the ingress proxy connects over the
     # hassio network) but answer only the proxy's address. Standalone/dev has no
     # ingress proxy, so bind to loopback and let the OS keep the network out.
@@ -1804,9 +1809,6 @@ async def _run_forever(
             "0.0.0.0",  # noqa: S104 - peer-restricted to the ingress proxy
             INGRESS_PORT,
         )
-    # Constructing the HTTP server above does not bind it. Claim the executor
-    # before starting listeners or touching hardware, including startup probes.
-    await channel.__aenter__()
     authority = AuthorityStore(settings)
     try:
         authority.start_process()

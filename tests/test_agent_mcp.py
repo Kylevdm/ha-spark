@@ -8,7 +8,6 @@ alone would pass even with a broken mount.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import httpx
@@ -20,6 +19,7 @@ from ha_spark.agent import mcp_server as mcp_server_module
 from ha_spark.agent.mcp_server import build_mcp
 from ha_spark.api.server import INGRESS_PROXY_IP, AppState, build_app
 from ha_spark.config import Settings
+from tests.authority_helpers import seed_settings, settings_bytes
 
 _INIT = {
     "jsonrpc": "2.0",
@@ -43,16 +43,8 @@ def _state(tmp_path: Path, exposure: str, surface: str = "on") -> AppState:
         "agent_surface": surface,
         "agent_exposure": exposure,
     }
-    return AppState(  # type: ignore[call-arg]
-        settings=Settings(**settings_kw),  # type: ignore[arg-type]
-        options_path=options_path,
-        # reload rebuilds Settings from the persisted options file merged over the
-        # original settings_kw (tests/test_agent_routes.py's pattern), so
-        # apply_options can model a runtime exposure change without load_settings().
-        reload=lambda: Settings(
-            **{**settings_kw, **json.loads(options_path.read_text(encoding="utf-8"))}
-        ),
-    )
+    service = seed_settings(tmp_path, settings=Settings(**settings_kw))  # type: ignore[arg-type]
+    return AppState(service.settings, options_path, settings_service=service)
 
 
 async def test_read_mode_excludes_act_tools(tmp_path: Path) -> None:
@@ -240,7 +232,7 @@ async def test_mcp_tools_follow_runtime_exposure_change(tmp_path: Path) -> None:
     mcp = build_mcp(state)
     assert "set_config" in {t.name for t in await mcp.list_tools()}
 
-    state.apply_options({"agent_exposure": "read"})
+    state.apply_options({"agent_exposure": "read"}, state.settings_service.revision, "seed")
     names = {t.name for t in await mcp.list_tools()}
     assert "set_config" not in names and "run_plan" not in names
     assert "get_plan" in names
@@ -288,8 +280,6 @@ async def test_set_config_refuses_an_invalid_document_without_saving(tmp_path: P
     or the secret sitting next to it in the document.
     """
     options = tmp_path / "options.json"
-    seeded = json.dumps({"min_soc": 20.0, "octopus_api_key": "SECRET_OCTO"}).encode()
-    options.write_bytes(seeded)
     settings_kw: dict[str, object] = {
         "ha_url": "http://ha.test",
         "ha_token": "x",
@@ -299,20 +289,16 @@ async def test_set_config_refuses_an_invalid_document_without_saving(tmp_path: P
         "min_soc": 20.0,
         "octopus_api_key": "SECRET_OCTO",
     }
-    state = AppState(  # type: ignore[call-arg]
-        settings=Settings(**settings_kw),  # type: ignore[arg-type]
-        options_path=options,
-        reload=lambda: Settings(
-            **{**settings_kw, **json.loads(options.read_text(encoding="utf-8"))}  # type: ignore[arg-type]
-        ),
-    )
+    service = seed_settings(tmp_path, settings=Settings(**settings_kw))  # type: ignore[arg-type]
+    state = AppState(service.settings, options, settings_service=service)
+    seeded = settings_bytes(tmp_path)
     mcp = build_mcp(state)
     with pytest.raises(ToolError) as excinfo:
         await mcp.call_tool("set_config", {"updates": {"min_soc": "not-a-number"}})
     assert "unavailable: agent config changes need owner approval" in str(excinfo.value)
     assert "not-a-number" not in str(excinfo.value)
     assert "SECRET_OCTO" not in str(excinfo.value)
-    assert options.read_bytes() == seeded
+    assert settings_bytes(tmp_path) == seeded
     assert state.settings.min_soc == 20.0
 
 
@@ -321,16 +307,14 @@ async def test_set_config_refuses_a_changed_db_path(tmp_path: Path) -> None:
     the fixed refusal without the submitted value, and the options file stays
     byte-identical with the running settings untouched.
     """
-    options = tmp_path / "options.json"
-    seeded = json.dumps({"min_soc": 20.0}).encode()
-    options.write_bytes(seeded)
     state = _state(tmp_path, "read_write")
+    seeded = settings_bytes(tmp_path)
     mcp = build_mcp(state)
     with pytest.raises(ToolError) as excinfo:
         await mcp.call_tool("set_config", {"updates": {"db_path": "TOPSECRET/moved-db.db"}})
     assert "unavailable: agent config changes need owner approval" in str(excinfo.value)
     assert "TOPSECRET/moved-db.db" not in str(excinfo.value)
-    assert options.read_bytes() == seeded
+    assert settings_bytes(tmp_path) == seeded
     assert state.settings.db_path == str(tmp_path / "t.db")
 
 

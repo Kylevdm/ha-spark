@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -43,7 +42,7 @@ from ha_spark.energy.publish import plan_to_payload
 from ha_spark.logging import get_logger
 from ha_spark.mode_preconditions import entry_preconditions
 from ha_spark.settings_service import OPTIONS_PATH as OPTIONS_PATH
-from ha_spark.settings_service import SettingsService
+from ha_spark.settings_service import RevisionConflict, SettingsService
 
 log = get_logger(__name__)
 
@@ -86,6 +85,12 @@ class ModeBody(BaseModel):
     expected_epoch: int | None = Field(ge=1, strict=True)
 
 
+class ConfigBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(strict=True, ge=1)
+    changes: dict[str, Any]
+
+
 class AppState:
     """Daemon/API state; all settings operations delegate to the settings service."""
 
@@ -93,12 +98,12 @@ class AppState:
         self,
         settings: Settings,
         options_path: Path,
-        reload: Callable[[], Settings] | None = None,
+        settings_service: SettingsService | None = None,
         plan: ChargePlan | None = None,
         plan_at: datetime | None = None,
         executor: DaemonChannel | None = None,
     ) -> None:
-        self.settings_service = SettingsService(options_path, settings=settings, reload=reload)
+        self.settings_service = settings_service or SettingsService(options_path, settings=settings)
         self.plan = plan
         self.plan_at = plan_at
         self.executor = executor
@@ -114,15 +119,7 @@ class AppState:
 
     @property
     def options_path(self) -> Path:
-        return self.settings_service.options_path
-
-    @property
-    def reload(self) -> Callable[[], Settings]:
-        return self.settings_service.reload
-
-    @reload.setter
-    def reload(self, reload: Callable[[], Settings]) -> None:
-        self.settings_service.reload = reload
+        return self.settings_service.data_dir / "ha_spark_config.json"
 
     def set_plan(self, plan: ChargePlan) -> None:
         """Record the latest computed plan (called by the daemon each run)."""
@@ -132,8 +129,10 @@ class AppState:
     def current_options(self) -> dict[str, Any]:
         return self.settings_service.read_view()
 
-    def apply_options(self, updates: dict[str, Any]) -> Settings:
-        return self.settings_service.save(updates)
+    def apply_options(
+        self, updates: dict[str, Any], expected_revision: int, actor: str,
+    ) -> dict[str, Any]:
+        return self.settings_service.save(updates, expected_revision, actor)
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -397,7 +396,7 @@ def build_app(
 
         @app.post("/api/config")
         async def post_config(request: Request) -> JSONResponse:
-            """Merge posted options, persist, and hot-reload the daemon's settings."""
+            """Commit a revisioned partial update and publish the daemon's new snapshot."""
             user = request.headers.get("X-Remote-User-Id", "")
             if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user) is None:
                 return JSONResponse({"error": "forbidden"}, status_code=403)
@@ -410,10 +409,18 @@ def build_app(
                 updates = await request.json()
             except Exception:  # noqa: BLE001 - malformed body is a client error
                 return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-            if not isinstance(updates, dict):
-                return JSONResponse({"error": "expected a JSON object"}, status_code=400)
             try:
-                _state_of(request).apply_options(updates)
+                body = ConfigBody.model_validate(updates)
+            except ValidationError:
+                return JSONResponse({"error": "invalid config envelope"}, status_code=400)
+            try:
+                result = _state_of(request).apply_options(
+                    body.changes, body.expected_revision, f"ingress:{user}",
+                )
+            except RevisionConflict as exc:
+                return JSONResponse(
+                    {"error": "conflict", "revision": exc.revision}, status_code=409,
+                )
             except ConfigError as exc:
                 # ConfigError reasons name fields only, never an input value (#412).
                 log.warning("Rejecting config update: %s", exc)
@@ -422,7 +429,7 @@ def build_app(
                 # Any other exception's text could carry input; report its type only.
                 log.warning("Config update failed: %s", type(exc).__name__)
                 return JSONResponse({"error": "config update failed"}, status_code=400)
-            return JSONResponse(_state_of(request).current_options())
+            return JSONResponse(result)
 
     @app.get("/api/health")
     async def health(request: Request) -> dict[str, Any]:

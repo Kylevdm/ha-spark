@@ -22,7 +22,7 @@ from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 from ha_spark.energy import scheduler
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
-from tests.authority_helpers import seed_authority
+from tests.authority_helpers import seed_authority, seed_settings
 
 
 def settings_at(path: Path, **kwargs: object) -> Settings:
@@ -30,6 +30,7 @@ def settings_at(path: Path, **kwargs: object) -> Settings:
         ha_url="http://ha.test", ha_token="SECRET", db_path=str(path / "t.db"),
         agent_surface="on", agent_exposure="read_act", **kwargs,
     )
+    seed_settings(path, settings=settings)
     seed_authority(settings, "optimise")
     return settings
 
@@ -91,6 +92,7 @@ async def test_without_daemon_computes_but_never_actuates(
 
 @asynccontextmanager
 async def running_daemon(settings: Settings, path: Path, monkeypatch: pytest.MonkeyPatch):
+    seed_settings(path, settings=settings)
     captured = {}
     ready = asyncio.Event()
     planned = asyncio.Event()

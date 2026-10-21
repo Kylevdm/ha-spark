@@ -1,4 +1,3 @@
-import json
 from datetime import UTC, date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -13,6 +12,7 @@ from ha_spark.config import Settings
 from ha_spark.energy import sources
 from ha_spark.energy.models import SLOTS_PER_DAY, LoadForecast
 from tests.api_helpers import owner_client
+from tests.authority_helpers import seed_settings, settings_bytes
 
 
 def _state(tmp_path: Path, exposure: str = "read_act", **extra: object) -> AppState:
@@ -27,16 +27,8 @@ def _state(tmp_path: Path, exposure: str = "read_act", **extra: object) -> AppSt
         "agent_exposure": exposure,
         **extra,
     }
-    return AppState(  # type: ignore[call-arg]
-        settings=Settings(**settings_kw),  # type: ignore[arg-type]
-        options_path=options_path,
-        # reload rebuilds Settings from the persisted options file merged over the
-        # original settings_kw, mirroring tests/test_api.py's pattern -- avoids
-        # load_settings() falling back to real env/`/data/options.json` creds.
-        reload=lambda: Settings(
-            **{**settings_kw, **json.loads(options_path.read_text(encoding="utf-8"))}
-        ),
-    )
+    service = seed_settings(tmp_path, settings=Settings(**settings_kw))  # type: ignore[arg-type]
+    return AppState(service.settings, options_path, settings_service=service)
 
 
 @respx.mock
@@ -132,9 +124,19 @@ def test_exposure_downgrade_via_api_config_applies_without_restart(tmp_path: Pat
     client immediately: the gate is evaluated per request against live settings,
     never captured at router-build time (#93)."""
     respx.get("http://ha.test/api/states").mock(return_value=httpx.Response(200, json=[]))
-    with owner_client(_state(tmp_path, exposure="read_write")) as client:
+    state = _state(tmp_path, exposure="read_write")
+    with owner_client(state) as client:
         assert client.post("/agent/config", json={"min_soc": 30.0}).status_code == 409
-        assert client.post("/api/config", json={"agent_exposure": "read"}).status_code == 200
+        assert (
+            client.post(
+                "/api/config",
+                json={
+                    "expected_revision": state.settings_service.revision,
+                    "changes": {"agent_exposure": "read"},
+                },
+            ).status_code
+            == 200
+        )
         # act + write tiers are gone...
         assert client.post("/agent/config", json={}).status_code == 404
         assert client.post("/agent/run").status_code == 404
@@ -179,9 +181,19 @@ def test_agent_surface_off_denies_agent_routes_and_schema(tmp_path: Path) -> Non
 
 def test_exposure_upgrade_via_api_config_applies_without_restart(tmp_path: Path) -> None:
     """The gate is not latched: raising the tier at runtime opens the new routes too."""
-    with owner_client(_state(tmp_path, exposure="read")) as client:
+    state = _state(tmp_path, exposure="read")
+    with owner_client(state) as client:
         assert client.post("/agent/config", json={"min_soc": 30.0}).status_code == 404
-        assert client.post("/api/config", json={"agent_exposure": "read_write"}).status_code == 200
+        assert (
+            client.post(
+                "/api/config",
+                json={
+                    "expected_revision": state.settings_service.revision,
+                    "changes": {"agent_exposure": "read_write"},
+                },
+            ).status_code
+            == 200
+        )
         resp = client.post("/agent/config", json={"min_soc": 30.0})
     # The write tier is open now, and its one operation refuses (#457).
     assert resp.status_code == 409
@@ -243,18 +255,16 @@ def test_agent_config_refusal_leaves_options_and_settings_untouched(
     untouched (the #412/#441 save rules now apply only to owner saves), and the
     response never echoes the submitted values or a stored secret.
     """
-    options = tmp_path / "options.json"
-    seeded = json.dumps({"min_soc": 20.0, "octopus_api_key": "SECRET_OCTO"}).encode()
-    options.write_bytes(seeded)
     state = _state(
         tmp_path, exposure="read_write", min_soc=20.0, octopus_api_key="SECRET_OCTO"
     )
+    seeded = settings_bytes(tmp_path)
     with TestClient(build_app(state)) as client:
         resp = client.post("/agent/config", json=updates)
     assert resp.status_code == 409
     assert "not-a-number" not in resp.text
     assert "TOPSECRET" not in resp.text
     assert "SECRET_OCTO" not in resp.text
-    assert options.read_bytes() == seeded
+    assert settings_bytes(tmp_path) == seeded
     assert state.settings.min_soc == 20.0
     assert state.settings.db_path == str(tmp_path / "t.db")
