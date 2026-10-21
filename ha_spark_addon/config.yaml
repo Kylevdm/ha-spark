@@ -102,6 +102,10 @@ options:
   dispatch_grid_power_entity: ""
   dispatch_grid_power_invert: false
   hold_degraded_minutes: 60
+  readiness_window_days: 21
+  readiness_mae_improvement_pct: 10
+  readiness_max_cost_delta: 0.0
+  readiness_min_guard_coverage_pct: 90
   ev_status_max_age_seconds: 300
   ev_plug_max_age_seconds: 300
   ev_power_max_age_seconds: 300
@@ -224,6 +228,10 @@ schema:
   dispatch_grid_power_entity: str?
   dispatch_grid_power_invert: bool
   hold_degraded_minutes: int(5,1440)?
+  readiness_window_days: int(1,)?
+  readiness_mae_improvement_pct: float(0,100)?
+  readiness_max_cost_delta: float?
+  readiness_min_guard_coverage_pct: float(0,100)?
   ev_status_max_age_seconds: float(0.001,86400)?
   ev_plug_max_age_seconds: float(0.001,86400)?
   ev_power_max_age_seconds: float(0.001,86400)?

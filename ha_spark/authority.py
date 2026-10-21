@@ -56,6 +56,11 @@ class HoldRecord(_Record):
     evidence_stale_since: AwareDatetime | None = None
     degraded_notified: bool = False
     remap_notified: bool = False
+    # #449: an owned release refused (Q2) since when, why, and whether the
+    # once-per-episode notice went out. Cleared with the record on a verified On.
+    release_refused_since: AwareDatetime | None = None
+    release_refused_reason: Literal["switch_unreadable", "schedule_unverified"] | None = None
+    release_refused_notified: bool = False
 
     @model_validator(mode="after")
     def validate_cause_fields(self) -> Self:
@@ -286,6 +291,16 @@ class AuthorityStore:
             last_changed_at=datetime.now(UTC), requester_kind=requester_kind,
         )
         self._persist_initial(state)
+
+    def save_readiness_notice(self, notified: bool) -> None:
+        """Persist only the readiness notice flag, without changing authority."""
+        if self._state is None or self.save_failed or not self.known:
+            raise ValueError("Cannot save readiness notice without known, durable authority")
+        if self._state.readiness_notice.notified == notified:
+            return
+        self.save(self._state.model_copy(update={
+            "readiness_notice": ReadinessNoticeState(notified=notified),
+        }))
 
     def save_holds(self, holds: tuple[HoldRecord, ...]) -> None:
         """Persist before acting; failed saves leave the gate closed.

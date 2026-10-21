@@ -446,6 +446,80 @@ signals: `occupancy_home_frac` (from `person_entities`), `heatpump_kwh` (from
 Each is optional; leave its entity unset to skip it. If an entity can't be
 read, ha-spark logs a warning and skips that signal only.
 
+### Readiness recording
+
+The daemon captures half-hour slot intent and the import, export and event rates
+from the plan revision in force on the boundary tick. The ledger includes the
+operating mode, forecast model and config generation, battery parameters, checked
+start energy, charge-window fraction and current, export, hold intent and V2L
+availability. Untrusted hold evidence is recorded as unknown; an untrusted SoC
+leaves the energy estimate missing, never zero.
+
+Records are write-once in the existing SQLite database. Mid-slot replans do not
+replace them. The first daemon tick in a slot can capture it within the five-minute
+boundary tolerance (`BOUNDARY_TOLERANCE`), allowing for tick drift; a missed boundary,
+absent plan or missing horizon slot stays a gap,
+including after a restart. Guard samples are recorded only inside the charging
+window in Observe, with invalid reads retained for coverage. Recording uses reads
+only, never changes authority, and failures do not interrupt control-loop work.
+
+`ha-spark readiness slots [--days N]` lists recorded starts and gaps by household-local
+day (default: seven days including today, through the current slot). The diagnostic
+is read-only and does not require a running daemon or HA connection. Readiness
+recording is evidence collection, not permission to change the operating mode.
+
+After each household-local day closes, the daemon joins that day's actual metered
+evidence once and stores an immutable day snapshot in the same database: the
+measured grid import and export, solar generation, battery charge and discharge
+per half-hour (EV charging and V2L only when configured), the gross house load,
+the day's start and end battery energy, and the next cheap slot's import rate.
+Required components must be configured; an unconfigured EV or V2L counts as a true
+zero, while a configured component with no measurement for a slot is recorded as
+a substituted zero and excludes the day — never a real zero. An hour measured
+only hourly is spread evenly across its two half-hours and flagged. Days with
+slot gaps, non-Observe slots or missing boundary evidence are stored excluded
+with the reason. Joins are retried while HA's five-minute statistics still exist
+(about ten days); a day that could not be joined in time is stored excluded with
+that reason. Recording failures are isolated and never interrupt control-loop
+work or write hardware.
+
+`ha-spark readiness coverage [--days N]` prints each stored day's provenance
+counts (measured, hourly-spread, substituted, absent) and every exclusion
+reason, read-only from the database; it never joins a day or creates one.
+
+### Readiness evaluation
+
+`ha-spark readiness show` prints the current verdict, measurements, qualifying
+household-local days and excluded days with reasons. It reads existing evidence
+only: no HA connection, database creation, notice or authority change.
+
+The daemon evaluates once after the most recent closed day's snapshot is saved.
+It uses the **latest qualifying days**, not a fixed calendar span. A day must
+have a qualifying measured snapshot, a replayable intent history and a driving
+forecast issued before the local day started. Cost replay carries its own battery
+energy from the day's actual start and values the ending-energy difference at
+the next cheap import rate. Any zero-filled derived-load slot excludes the day.
+Forecast MAE compares the driving model with its paired median on identical days,
+against measured base load (gross house load less V2L). A model change, any
+median-driven day, missing paired median or zero baseline MAE is insufficient
+evidence. Missing days are never treated as zero cost or zero breaches.
+
+| Option | Default | Validation / meaning |
+| --- | --- | --- |
+| `readiness_window_days` | `21` | Positive integer; latest qualifying household-local days required |
+| `readiness_mae_improvement_pct` | `10` | 0–100%; minimum MAE improvement over the median |
+| `readiness_max_cost_delta` | `0.0` | Finite GBP; maximum total replay minus incumbent cost |
+| `readiness_min_guard_coverage_pct` | `90` | 0–100%; valid guard samples / expected in-window minute ticks |
+
+Passing requires cost delta at or below the threshold, zero would-have-breached
+guard events, sufficient guard coverage and the forecast improvement margin.
+Measured failures take precedence over insufficient evidence. The first pass
+persists a notice flag before sending a notice with the numbers to the configured
+notify target (or an HA persistent notification). Further passes do not resend;
+only a failing evaluation re-arms it, not insufficient evidence. Delivery or
+recording failures are isolated. Readiness is a recommendation: it never changes
+the operating mode, authority epoch, holds or hardware behaviour.
+
 ### Tariff
 
 `rate_offpeak_gbp_kwh`, `rate_peak_gbp_kwh`, `rate_export_gbp_kwh`: the rates
@@ -678,6 +752,9 @@ released by hold reconciliation. A release writes the switch On only once the
 schedule it hands back to reads back: the resident slot-1 schedule in Protect;
 in Optimise this plan applied and verified, or the verified fallback schedule
 while fallback is active. Until then the hold stays and a refused line is logged.
+`ha-spark health` warns while a release is refused, naming why (switch unreadable
+or schedule not verified). After `hold_degraded_minutes` one notification is sent
+per episode, including across restarts; a verified release re-arms it.
 
 | Option | Source | Default |
 | --- | --- | --- |

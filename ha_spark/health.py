@@ -420,6 +420,29 @@ async def check_operating_mode(settings: Settings) -> CheckResult:
     return CheckResult("Operating mode", Status.OK, result.state.committed_mode)
 
 
+def check_hold_release(settings: Settings) -> list[CheckResult]:
+    """A WARN per owned hold whose release has been refused (#449); nothing otherwise.
+
+    Reads the stored records only; names the reason category, never a state value.
+    """
+    result = load_authority(settings)
+    if result.status != "known" or result.state is None:
+        return []
+    reasons = {
+        "switch_unreadable": "power switch unreadable",
+        "schedule_unverified": "schedule to restore not verified",
+    }
+    return [
+        CheckResult(
+            "Hold release", Status.WARN,
+            f"{h.cause} hold release refused since "
+            f"{h.release_refused_since.astimezone(UTC):%Y-%m-%d %H:%M} UTC: "
+            f"{reasons.get(h.release_refused_reason or '', 'refused')}; battery still held",
+        )
+        for h in result.state.holds if h.release_refused_since is not None
+    ]
+
+
 async def check_evidence_freshness(settings: Settings) -> list[CheckResult]:
     """Read-only source validity; no hardware or authority-store writes.
 
@@ -487,7 +510,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         evidence = [CheckResult(
             "Evidence freshness", Status.WARN, f"could not read ({type(exc).__name__})"
         )]
-    return [*results, check_entity_config(settings), *evidence]
+    return [*results, check_entity_config(settings), *check_hold_release(settings), *evidence]
 
 
 def format_report(results: list[CheckResult]) -> str:

@@ -346,7 +346,12 @@ async def test_untrusted_soc_keeps_an_optimise_hold_until_the_plan_verifies(tmp_
 
     assert _options(rest) == []
     assert not any(call[0] == "modbus" for call in rest.calls)
-    assert device._execution.authority.state.holds == records
+    # #449: kept, and marked as waiting on a refused release.
+    (held,) = device._execution.authority.state.holds
+    assert held.release_refused_reason == "schedule_unverified"
+    assert held.model_copy(
+        update={"release_refused_since": None, "release_refused_reason": None}
+    ) == records[0]
     assert any(line.startswith("[REFUSED]") and "SoC" in line for line in lines)
 
 
@@ -1012,3 +1017,49 @@ async def test_fallback_deactivates_active_window_before_current_transition(tmp_
 
     assert [address for address, _ in _register_writes(rest)] == [43143, 43141, 43143]
     assert any(line.startswith("[FALLBACK]") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_safe_state_refusal_marks_the_owned_hold(tmp_path) -> None:
+    """#449: a relinquish On refused on an unreadable switch is visible on the record."""
+    rest = FakeRest(switch="unavailable")
+    device = _device(rest, tmp_path)
+    _seed_owned_hold(device)
+    await device.write_safe_state()
+
+    assert _options(rest) == []
+    (held,) = device._execution.authority.state.holds
+    assert held.release_refused_reason == "switch_unreadable"
+    assert held.release_refused_since is not None
+
+
+@pytest.mark.asyncio
+async def test_verified_safe_state_on_clears_the_refusal(tmp_path) -> None:
+    """#449: once the switch reads back On the release is no longer refused."""
+    rest = FakeRest(switch="unavailable")
+    device = _device(rest, tmp_path)
+    _seed_owned_hold(device)
+    await device.write_safe_state()
+    assert device._execution.authority.state.holds[0].release_refused_since is not None
+    rest.states[_SWITCH] = "Off"
+    await device.write_safe_state()
+
+    assert _options(rest) == ["On"]
+    (held,) = device._execution.authority.state.holds
+    assert held.release_refused_since is None
+    assert held.release_refused_reason is None
+
+
+@pytest.mark.asyncio
+async def test_observe_handover_refusal_marks_the_owned_hold(tmp_path) -> None:
+    """#449: the → Observe release_holds step records its refusal too."""
+    rest = FakeRest(switch="unavailable")
+    device = _device(rest, tmp_path, authority_mode="protect")
+    _seed_owned_hold(device)
+    lines = await device.release_holds()
+
+    assert _options(rest) == []
+    assert any("refused" in line for line in lines)
+    assert device._execution.authority.state.holds[0].release_refused_reason == (
+        "switch_unreadable"
+    )

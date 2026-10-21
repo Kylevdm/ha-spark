@@ -24,6 +24,7 @@ The store is kept for cost backtesting instead.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from statistics import median
 from typing import Any
@@ -140,6 +141,11 @@ async def predict_home_load(
     # factor is learned from past away periods (6E) when enough history exists.
     ctx_scale, ctx_lines = await _context_scale(settings, tz, intervals, target)
     median_forecast = _apply_context(median_forecast, ctx_scale, ctx_lines)
+    median_forecast = replace(
+        median_forecast,
+        median_total_kwh=median_forecast.total_kwh,
+        median_slots=median_forecast.slots,
+    )
     if settings.load_model == "median":
         return median_forecast
     try:
@@ -150,6 +156,11 @@ async def predict_home_load(
     if ml_forecast is None:
         return median_forecast
     ml_forecast = _apply_context(ml_forecast, ctx_scale, ctx_lines)
+    ml_forecast = replace(
+        ml_forecast,
+        median_total_kwh=median_forecast.total_kwh,
+        median_slots=median_forecast.slots,
+    )
     await _record_shadow_forecasts(settings, target, median_forecast, ml_forecast)
     if settings.load_model == "ml":
         return ml_forecast
@@ -302,6 +313,7 @@ async def _record_shadow_forecasts(
                 await ledger.record_forecast(
                     datetime.now(UTC), target, forecast_model_tag(f.source),
                     f.total_kwh, f.slots, f.source,
+                    median_total_kwh=f.median_total_kwh, median_slots=f.median_slots,
                 )
     except Exception:  # noqa: BLE001 - recording must never block the plan
         log.exception("Shadow forecast recording failed")

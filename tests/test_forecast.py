@@ -192,6 +192,31 @@ async def test_load_model_ml_prefers_ml_and_records_shadows(
     assert {r.model for r in rows} == {"ml", "slots"}
 
 
+async def test_ml_forecast_carries_same_day_median_pair(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ha_spark.energy.ledger import ForecastLedger
+
+    async def stats(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        return _hourly_rows(days=14, kwh_per_hour=1.0)
+
+    monkeypatch.setattr(forecast, "statistics_during_period", stats)
+    _patch_ml(monkeypatch, _stub_prediction())
+    settings = _ml_settings(tmp_path, load_model="ml")
+    target = date(2026, 6, 13)
+    result = await predict_home_load(settings, lat=51.5, lon=-0.1, target=target)
+    assert result.target_date == target
+    assert result.median_total_kwh == 24.0
+    assert result.median_slots == (0.5,) * SLOTS_PER_DAY
+    assert result.total_kwh != result.median_total_kwh
+    async with ForecastLedger(settings.db_path) as ledger:
+        history = await ledger.forecast_history(target)
+    assert len(history) == 2
+    assert all(row.target_date == target and not row.drove_plan for row in history)
+    assert all(row.median_total_kwh == 24.0 for row in history)
+    assert all(row.median_slots == result.median_slots for row in history)
+
+
 async def test_load_model_median_never_runs_ml(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

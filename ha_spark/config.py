@@ -121,6 +121,10 @@ _OPTION_KEYS = frozenset(
         "dispatch_grid_power_entity",
         "dispatch_grid_power_invert",
         "hold_degraded_minutes",
+        "readiness_window_days",
+        "readiness_mae_improvement_pct",
+        "readiness_max_cost_delta",
+        "readiness_min_guard_coverage_pct",
         "ev_status_max_age_seconds",
         "ev_plug_max_age_seconds",
         "ev_power_max_age_seconds",
@@ -509,6 +513,10 @@ class Settings(BaseSettings):
 
     # Freshness metadata only; hold consumers are deliberately unchanged (#419).
     hold_degraded_minutes: int = Field(default=60, ge=5, le=1440)
+    readiness_window_days: int = Field(default=21, gt=0)
+    readiness_mae_improvement_pct: float = Field(default=10, ge=0, le=100)
+    readiness_max_cost_delta: float = Field(default=0.0, allow_inf_nan=False)
+    readiness_min_guard_coverage_pct: float = Field(default=90, ge=0, le=100)
     ev_status_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
     ev_plug_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
     ev_power_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)

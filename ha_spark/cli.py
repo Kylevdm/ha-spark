@@ -13,7 +13,7 @@ import json
 import signal
 import sys
 from dataclasses import asdict
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
 import yaml
@@ -45,6 +45,9 @@ from ha_spark.energy.onboarding import (
     statistic_unit,
 )
 from ha_spark.energy.plan_run import current_plan
+from ha_spark.energy.readiness import load_readiness
+from ha_spark.energy.readiness_ledger import ReadinessLedger, slot_start
+from ha_spark.energy.readiness_measurements import COMPONENTS, ReadinessDays
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever
 from ha_spark.energy.sources import _to_float
@@ -61,6 +64,83 @@ from ha_spark.mode_preconditions import entry_preconditions
 from ha_spark.onboarding_discover import FieldProposal, propose
 from ha_spark.presets import get_preset, preset_names
 from ha_spark.router import route_message
+
+
+async def _cmd_readiness_show(settings: Settings) -> int:
+    try:
+        result = await load_readiness(settings)
+    except Exception:
+        print("Could not evaluate readiness evidence", file=sys.stderr)
+        return 1
+    print(result.model_dump_json(indent=2))
+    return 0
+
+
+async def _cmd_readiness_slots(settings: Settings, *, days: int) -> int:
+    """List recorded starts and gaps on household-local calendar days."""
+    if days <= 0:
+        print("--days must be positive", file=sys.stderr)
+        return 2
+    tz = load_timezone(settings.timezone)
+    now = datetime.now(tz)
+    first = now.date() - timedelta(days=days - 1)
+    start = datetime.combine(first, time.min, tzinfo=tz).astimezone(UTC)
+    end = slot_start(now) + timedelta(minutes=30)
+    try:
+        rows = {r.slot_start: r for r in await ReadinessLedger(settings.db_path).slots(start, end)}
+    except Exception:
+        print("Could not read readiness ledger", file=sys.stderr)
+        return 1
+    for offset in range(days):
+        day = first + timedelta(days=offset)
+        cursor = datetime.combine(day, time.min, tzinfo=tz).astimezone(UTC)
+        stop = min(
+            end, datetime.combine(day + timedelta(days=1), time.min, tzinfo=tz).astimezone(UTC)
+        )
+        starts = []
+        while cursor < stop:
+            starts.append(cursor)
+            cursor += timedelta(minutes=30)
+        count = sum(t in rows for t in starts)
+        print(f"{day}: {count}/{len(starts)} slots recorded")
+        for instant in starts:
+            row = rows.get(instant)
+            if row is None:
+                print(f"  gap {instant.isoformat()}")
+            else:
+                print(f"  {instant.isoformat()} {row.operating_mode} {row.revision_id}")
+    return 0
+
+
+async def _cmd_readiness_coverage(settings: Settings, *, days: int) -> int:
+    """Report saved closed-day provenance and every exclusion, without rejoining."""
+    if days <= 0:
+        print("--days must be positive", file=sys.stderr)
+        return 2
+    today = datetime.now(load_timezone(settings.timezone)).date()
+    try:
+        rows = {row.local_date: row for row in await ReadinessDays(settings.db_path).days()}
+    except Exception:
+        print("Could not read readiness day snapshots", file=sys.stderr)
+        return 1
+    for offset in range(days, 0, -1):
+        day = today - timedelta(days=offset)
+        row = rows.get(day)
+        if row is None:
+            print(f"{day}: excluded — day snapshot missing (gap)")
+            continue
+        print(f"{day}: {'qualifying' if row.qualifying else 'excluded'} ({len(row.slots)} slots)")
+        for name in COMPONENTS:
+            counts = {
+                provenance: sum(
+                    slot.components[name].provenance == provenance for slot in row.slots
+                )
+                for provenance in ("measured", "hourly_spread", "substituted", "absent")
+            }
+            print(f"  {name}: " + " ".join(f"{key}={value}" for key, value in counts.items()))
+        for reason in row.reasons:
+            print(f"  {reason}")
+    return 0
 
 
 async def _cmd_v2l(settings: Settings) -> int:
@@ -699,6 +779,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
+    readiness = sub.add_parser("readiness", help="inspect readiness evidence (read-only)")
+    readiness_sub = readiness.add_subparsers(dest="readiness_command", required=True)
+    readiness_sub.add_parser("show", help="show current readiness evaluation and evidence")
+    coverage = readiness_sub.add_parser("coverage", help="show closed-day measurements and gaps")
+    coverage.add_argument("--days", type=int, default=21)
+    slots = readiness_sub.add_parser("slots", help="list recorded slots and gaps")
+    slots.add_argument("--days", type=int, default=7, help="household-local days (default: 7)")
+
     p_inverter = sub.add_parser("inverter", help="Read model identity and resident schedule")
     p_inverter.add_subparsers(dest="inverter_command", required=True).add_parser("show")
 
@@ -1032,6 +1120,14 @@ def main(argv: list[str] | None = None) -> int:
     # add-on options overlay so the configured endpoints are probed) and let the
     # checks themselves report what's wrong. Quiet logs keep the report clean —
     # failure detail is carried in each check result.
+    if args.command == "readiness":
+        settings = load_settings(validate=False)
+        if args.readiness_command == "show":
+            return asyncio.run(_cmd_readiness_show(settings))
+        if args.readiness_command == "coverage":
+            return asyncio.run(_cmd_readiness_coverage(settings, days=args.days))
+        return asyncio.run(_cmd_readiness_slots(settings, days=args.days))
+
     if args.command == "mode":
         settings = load_settings(validate=False)
         if args.mode_command == "show":

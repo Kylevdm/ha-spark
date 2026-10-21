@@ -64,6 +64,10 @@ releases owned holds only for Observe before committing the target mode.
 
 With `inverter_clock_dst_sync` on, the first tick after the household zone's
 UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
+
+Readiness captures the revision and rates in force on each boundary tick, in
+all modes, and separate read-only guard evidence in Observe. Missed boundaries
+stay gaps; mid-slot requests never rewrite a slot. Recording failures are isolated.
 """
 
 from __future__ import annotations
@@ -72,8 +76,9 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import NamedTuple
+from uuid import uuid4
 
 import httpx
 import uvicorn
@@ -120,6 +125,7 @@ from ha_spark.energy.dispatch_evidence import partition_dispatches
 from ha_spark.energy.dst_clock_sync import DstClockSync
 from ha_spark.energy.evidence_freshness import EvidenceFreshness, check_report_time
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
+from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
 from ha_spark.energy.orchestrator import orchestrate
@@ -132,6 +138,9 @@ from ha_spark.energy.publish import (
     publish_soc_integrity,
     republish_last,
 )
+from ha_spark.energy.readiness import readiness_tick
+from ha_spark.energy.readiness_ledger import PlanRevision, record_guard, record_slot, slot_start
+from ha_spark.energy.readiness_measurements import record_closed_days
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor, SocMonitorSnapshot, observe_soc
@@ -258,6 +267,7 @@ class RunResult(NamedTuple):
     apply_lines: tuple[str, ...] = ()
     text: str = ""
     action_lines: tuple[str, ...] = ()
+    revision: PlanRevision | None = None
 
 
 def _apply_failed(lines: list[str]) -> bool:
@@ -291,7 +301,8 @@ def _real_write_mode(settings: Settings, execution: ExecutionContext | None = No
 
 
 async def _record_forecast(
-    settings: Settings, plan: ChargePlan, forecast: LoadForecast
+    settings: Settings, plan: ChargePlan, forecast: LoadForecast,
+    geometry: HorizonGeometry | None = None,
 ) -> None:
     """Log the plan's load forecast for its served day so `forecast-eval` can
     score it later.
@@ -311,6 +322,11 @@ async def _record_forecast(
                 plan.load_kwh,
                 forecast.slots,
                 forecast.source,
+                horizon_start=geometry.horizon_start if geometry is not None else None,
+                horizon_end=geometry.horizon_end if geometry is not None else None,
+                drove_plan=True,
+                median_total_kwh=forecast.median_total_kwh,
+                median_slots=forecast.median_slots,
             )
     except Exception:
         log.exception("Recording forecast failed")
@@ -341,6 +357,10 @@ async def run_once(
     guard, reconcile, fallback, DST and shutdown entry points. Per-call REST
     clients and driver instances therefore never create independent bus locks.
     """
+    context = execution or execution_context()
+    generation = context.planned_generation.get()
+    if generation is None:
+        generation = context.config_generation
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
@@ -356,8 +376,18 @@ async def run_once(
             inverter_device(settings, rest) if execution is None
             else inverter_device(settings, rest, execution=execution)
         )
-        ev_hold_state = ev_hold_state or EvHoldState()
         now = datetime.now(load_timezone(settings.timezone))
+        revision = None
+        try:
+            revision = PlanRevision(
+                uuid4().hex, now.astimezone(UTC), run,
+                device.planned_rate_w(plan.charge_intent)
+                if Capability.CHARGE_RATE in device.capabilities else None,
+                generation,
+            )
+        except Exception:
+            log.exception("Readiness plan provenance unavailable")
+        ev_hold_state = ev_hold_state or EvHoldState()
         evidence_freshness = getattr(inputs, "evidence_freshness", None) or {}
         ev_hold_active = await _observe_ev_hold(
             ev_hold_state,
@@ -414,13 +444,14 @@ async def run_once(
                 await run_v2l_topup(settings, rest, plan, inputs.flexibility_event, now)
             except Exception:  # noqa: BLE001 - a request never breaks a plan run
                 log.warning("V2L top-up request failed", exc_info=True)
-    await _record_forecast(settings, plan, run.forecast)
+    await _record_forecast(settings, plan, run.forecast, getattr(run.inputs, "geometry", None))
     await _run_orchestrator(settings)
     await _run_derived_rerive(settings)
     return RunResult(
         plan, applied_plan, tuple(apply_lines),
         format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz),
         tuple(lines),
+        revision,
     )
 
 
@@ -812,6 +843,50 @@ async def _hold_degraded_notice(
             log.warning("Degraded hold notification failed")
 
 
+_RELEASE_REFUSED_REASONS = {
+    "switch_unreadable": "the power switch is unreadable",
+    "schedule_unverified": "the schedule to restore is not verified",
+}
+
+
+async def _release_refused_notice(
+    settings: Settings, rest: HomeAssistantRest, now: datetime
+) -> None:
+    """Notify once per episode when an owned hold's release stays refused (#449).
+
+    The flag is persisted before sending, so a restart doesn't repeat it; a
+    verified release clears the record and with it the flag. Never blocks.
+    """
+    store = execution_context().authority
+    if store is None or store.state is None:
+        return
+    due = [
+        h for h in store.state.holds
+        if h.release_refused_since is not None and not h.release_refused_notified
+        and now - h.release_refused_since >= timedelta(minutes=settings.hold_degraded_minutes)
+    ]
+    if not due:
+        return
+    try:
+        store.save_holds(tuple(
+            h.model_copy(update={"release_refused_notified": True}) if h in due else h
+            for h in store.state.holds
+        ))
+    except Exception:  # noqa: BLE001 - bookkeeping never blocks the tick
+        log.warning("Recording the refused-release notice failed; not sending it")
+        return
+    for record in due:
+        reason = _RELEASE_REFUSED_REASONS.get(record.release_refused_reason or "", "refused")
+        try:
+            await send_notification(
+                settings, rest, "ha-spark hold not released",
+                f"The {record.cause} hold has ended but the battery is still held: "
+                f"{reason}. Check the inverter power switch.",
+            )
+        except Exception:  # noqa: BLE001 - notice failure must not block protection
+            log.warning("Refused-release notification failed")
+
+
 def hold_reconcile_intent(
     intent: ChargeIntent, trusted_holds: tuple[tuple[datetime, datetime], ...] | None
 ) -> ChargeIntent | None:
@@ -1089,6 +1164,9 @@ async def reconcile_tick(
                 lines = read_lines + list(await device.write_safe_state())
             else:
                 lines = read_lines + list(await device.reconcile_holds(intent, now))
+            # After this pass, so a hold that is legitimately back (which
+            # ends the refused episode) never reads as "ended but still held".
+            await _release_refused_notice(settings, rest, now)
     except Exception:
         log.exception("Hold reconcile tick failed; will retry next minute")
         return ReconcileResult(
@@ -1772,6 +1850,21 @@ async def _run_forever(
         log.exception("Republishing last known states failed")
     last_run_slot: datetime | None = None
     last_plan: ChargePlan | None = None
+    last_revision: PlanRevision | None = None
+    last_readiness_slot: datetime | None = None
+    readiness_evaluated: date | None = None
+    readiness_task: asyncio.Task[None] | None = None
+
+    async def record_readiness(tick_settings: Settings, tick_now: datetime) -> None:
+        nonlocal readiness_evaluated
+        try:
+            await record_closed_days(tick_settings, tick_now)
+            readiness_evaluated = await readiness_tick(
+                tick_settings, tick_now, readiness_evaluated, authority,
+            )
+        except Exception:
+            log.warning("Readiness background recording failed")
+
     # The plan known resident on the device: the baseline `needs_apply`
     # compares against, `None` when unknown after a failed apply or run (#168).
     # `last_plan` is the latest computed plan, applied or skipped.
@@ -1831,6 +1924,7 @@ async def _run_forever(
                     monitor.invalidate_fallback_confirmation()
                 # Never reuse a previous plan's command across a hot reload.
                 last_plan = None
+                last_revision = None
                 last_applied_plan = None
                 last_trusted_holds = None
                 target_w = None
@@ -2028,6 +2122,7 @@ async def _run_forever(
                     state.set_plan(plan)
                     last_run_slot = _slot_start(now)
                     last_plan = plan
+                    last_revision = result.revision
                     reapply = False
                     if plan.charge_intent is not None and plan.charge_intent.hold_trusted:
                         last_trusted_holds = plan.charge_intent.holds
@@ -2104,6 +2199,15 @@ async def _run_forever(
                     )
                 last_reconcile_lines, last_trusted_holds = reconciled[:2]
                 reapply = reapply or reconciled.relinquished
+            if slot_start(now) != last_readiness_slot:
+                last_readiness_slot = slot_start(now)
+                await record_slot(
+                    settings.db_path, now, last_revision,
+                    authority.state.committed_mode
+                    if authority.known and authority.state is not None else "authority_unknown",
+                    measurement,
+                    ev_hold_active=ev_hold_state.active,
+                )
             if guard_enabled and in_window(now.time(), window_start, window_end):
                 try:
                     # While activating, a fresh plan may already be charging: the
@@ -2120,6 +2224,14 @@ async def _run_forever(
                         )
                 except Exception:
                     log.exception("Supply guard tick failed; will retry next tick")
+                await record_guard(
+                    settings, now, last_revision,
+                    authority.state.committed_mode
+                    if authority.known and authority.state is not None else "authority_unknown",
+                )
+            # Recorder and notice I/O must never delay the next protection tick.
+            if readiness_task is None or readiness_task.done():
+                readiness_task = asyncio.create_task(record_readiness(settings, now))
             if last_signal_at is None or now - last_signal_at >= SIGNAL_SAMPLE_INTERVAL:
                 try:
                     await sample_signals(settings, now)
@@ -2141,6 +2253,9 @@ async def _run_forever(
                     log.exception("V2L tick failed; will retry next tick")
             await asyncio.sleep(poll_seconds)
     finally:
+        if readiness_task is not None:
+            readiness_task.cancel()
+            await asyncio.gather(readiness_task, return_exceptions=True)
         state.executor = None
         if pending is not None and not pending.future.done():
             pending.future.set_result(Reply(error="daemon stopped during request"))
