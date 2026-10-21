@@ -132,7 +132,13 @@ async def test_release_never_writes_on_to_an_unreadable_switch(tmp_path, state) 
     assert [line.outcome for line in lines] == [ActionOutcome.REFUSED]
     assert _options(rest) == []
     store = device._execution.authority
-    assert store is not None and store.state is not None and store.state.holds == (hold,)
+    assert store is not None and store.state is not None
+    # #449: the record is kept, marked as waiting on a refused release.
+    (kept,) = store.state.holds
+    assert kept.release_refused_reason == "switch_unreadable"
+    assert kept.model_copy(
+        update={"release_refused_since": None, "release_refused_reason": None}
+    ) == hold
 
 
 async def test_release_keeps_the_hold_when_the_resident_schedule_is_unreadable(tmp_path) -> None:
@@ -148,7 +154,13 @@ async def test_release_keeps_the_hold_when_the_resident_schedule_is_unreadable(t
     assert [line.outcome for line in lines] == [ActionOutcome.REFUSED]
     assert _options(rest) == []
     store = device._execution.authority
-    assert store is not None and store.state is not None and store.state.holds == (hold,)
+    assert store is not None and store.state is not None
+    # #449: the record is kept, marked as waiting on a refused release.
+    (kept,) = store.state.holds
+    assert kept.release_refused_reason == "schedule_unverified"
+    assert kept.model_copy(
+        update={"release_refused_since": None, "release_refused_reason": None}
+    ) == hold
 
 
 async def test_release_leaves_an_unconfirmed_off_alone_and_drops_the_request(tmp_path) -> None:

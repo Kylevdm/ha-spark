@@ -699,6 +699,9 @@ released by hold reconciliation. A release writes the switch On only once the
 schedule it hands back to reads back: the resident slot-1 schedule in Protect;
 in Optimise this plan applied and verified, or the verified fallback schedule
 while fallback is active. Until then the hold stays and a refused line is logged.
+`ha-spark health` warns while a release is refused, naming why (switch unreadable
+or schedule not verified). After `hold_degraded_minutes` one notification is sent
+per episode, including across restarts; a verified release re-arms it.
 
 | Option | Source | Default |
 | --- | --- | --- |

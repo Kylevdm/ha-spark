@@ -56,6 +56,11 @@ class HoldRecord(_Record):
     evidence_stale_since: AwareDatetime | None = None
     degraded_notified: bool = False
     remap_notified: bool = False
+    # #449: an owned release refused (Q2) since when, why, and whether the
+    # once-per-episode notice went out. Cleared with the record on a verified On.
+    release_refused_since: AwareDatetime | None = None
+    release_refused_reason: Literal["switch_unreadable", "schedule_unverified"] | None = None
+    release_refused_notified: bool = False
 
     @model_validator(mode="after")
     def validate_cause_fields(self) -> Self:

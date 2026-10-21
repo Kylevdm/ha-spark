@@ -125,6 +125,7 @@ from ha_spark.energy.dispatch_evidence import partition_dispatches
 from ha_spark.energy.dst_clock_sync import DstClockSync
 from ha_spark.energy.evidence_freshness import EvidenceFreshness, check_report_time
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
+from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
 from ha_spark.energy.orchestrator import orchestrate
@@ -298,7 +299,8 @@ def _real_write_mode(settings: Settings, execution: ExecutionContext | None = No
 
 
 async def _record_forecast(
-    settings: Settings, plan: ChargePlan, forecast: LoadForecast
+    settings: Settings, plan: ChargePlan, forecast: LoadForecast,
+    geometry: HorizonGeometry | None = None,
 ) -> None:
     """Log the plan's load forecast for its served day so `forecast-eval` can
     score it later.
@@ -318,6 +320,11 @@ async def _record_forecast(
                 plan.load_kwh,
                 forecast.slots,
                 forecast.source,
+                horizon_start=geometry.horizon_start if geometry is not None else None,
+                horizon_end=geometry.horizon_end if geometry is not None else None,
+                drove_plan=True,
+                median_total_kwh=forecast.median_total_kwh,
+                median_slots=forecast.median_slots,
             )
     except Exception:
         log.exception("Recording forecast failed")
@@ -433,7 +440,7 @@ async def run_once(
                 await run_v2l_topup(settings, rest, plan, inputs.flexibility_event, now)
             except Exception:  # noqa: BLE001 - a request never breaks a plan run
                 log.warning("V2L top-up request failed", exc_info=True)
-    await _record_forecast(settings, plan, run.forecast)
+    await _record_forecast(settings, plan, run.forecast, getattr(run.inputs, "geometry", None))
     await _run_orchestrator(settings)
     await _run_derived_rerive(settings)
     return RunResult(
@@ -832,6 +839,50 @@ async def _hold_degraded_notice(
             log.warning("Degraded hold notification failed")
 
 
+_RELEASE_REFUSED_REASONS = {
+    "switch_unreadable": "the power switch is unreadable",
+    "schedule_unverified": "the schedule to restore is not verified",
+}
+
+
+async def _release_refused_notice(
+    settings: Settings, rest: HomeAssistantRest, now: datetime
+) -> None:
+    """Notify once per episode when an owned hold's release stays refused (#449).
+
+    The flag is persisted before sending, so a restart doesn't repeat it; a
+    verified release clears the record and with it the flag. Never blocks.
+    """
+    store = execution_context().authority
+    if store is None or store.state is None:
+        return
+    due = [
+        h for h in store.state.holds
+        if h.release_refused_since is not None and not h.release_refused_notified
+        and now - h.release_refused_since >= timedelta(minutes=settings.hold_degraded_minutes)
+    ]
+    if not due:
+        return
+    try:
+        store.save_holds(tuple(
+            h.model_copy(update={"release_refused_notified": True}) if h in due else h
+            for h in store.state.holds
+        ))
+    except Exception:  # noqa: BLE001 - bookkeeping never blocks the tick
+        log.warning("Recording the refused-release notice failed; not sending it")
+        return
+    for record in due:
+        reason = _RELEASE_REFUSED_REASONS.get(record.release_refused_reason or "", "refused")
+        try:
+            await send_notification(
+                settings, rest, "ha-spark hold not released",
+                f"The {record.cause} hold has ended but the battery is still held: "
+                f"{reason}. Check the inverter power switch.",
+            )
+        except Exception:  # noqa: BLE001 - notice failure must not block protection
+            log.warning("Refused-release notification failed")
+
+
 def hold_reconcile_intent(
     intent: ChargeIntent, trusted_holds: tuple[tuple[datetime, datetime], ...] | None
 ) -> ChargeIntent | None:
@@ -1109,6 +1160,9 @@ async def reconcile_tick(
                 lines = read_lines + list(await device.write_safe_state())
             else:
                 lines = read_lines + list(await device.reconcile_holds(intent, now))
+            # After this pass, so a hold that is legitimately back (which
+            # ends the refused episode) never reads as "ended but still held".
+            await _release_refused_notice(settings, rest, now)
     except Exception:
         log.exception("Hold reconcile tick failed; will retry next minute")
         return ReconcileResult(
