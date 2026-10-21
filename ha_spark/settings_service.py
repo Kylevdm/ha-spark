@@ -43,6 +43,14 @@ class RevisionConflict(ConfigError):
         self.revision = revision
 
 
+def _checked(settings: Settings) -> Settings:
+    """Cross-field tariff checks; drop the cause, whose pydantic error holds the input."""
+    try:
+        return _validated_settings(settings)
+    except ConfigError as exc:
+        raise ConfigError(str(exc)) from None
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -170,7 +178,7 @@ class SettingsService:
                     "SUPERVISOR_TOKEN automatically; for standalone/dev set HA_URL and "
                     "HA_TOKEN (see .env.example)."
                 )
-            _validated_settings(settings)
+            _checked(settings)
         return settings
 
     def _pair(self, suffix: str = "") -> tuple[int, dict[str, Any], dict[str, Any]]:
@@ -265,7 +273,7 @@ class SettingsService:
                 revision = 1 if writable else 0
             candidate = self._candidate(inputs, secrets, validate)
             if writable and not validate:
-                _validated_settings(candidate)
+                _checked(candidate)
             if writable and recover:
                 try:
                     self._commit(inputs, secrets, revision, backup=False)
@@ -436,7 +444,7 @@ class SettingsService:
                     inputs.pop(key, None)
                 else:
                     inputs[key] = value
-            candidate = _validated_settings(self._candidate(inputs, secrets, False))
+            candidate = _checked(self._candidate(inputs, secrets, False))
             if type(expected_revision) is not int or expected_revision != self.revision:
                 raise RevisionConflict(self.revision)
             self._guard(candidate)

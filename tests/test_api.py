@@ -111,7 +111,7 @@ def test_retired_sidecar_is_not_read_or_changed(tmp_path, caplog, saved):
         state.apply_options({"proactive_mode": "on"}, state.settings_service.revision, "seed")
     assert path.read_bytes() == original
     assert not caplog.records
-    assert "proactive_mode" not in state.current_options()
+    assert "proactive_mode" not in state.current_options()["settings"]
 
 
 def test_retired_sidecar_directory_is_ignored(tmp_path, caplog):
@@ -120,7 +120,7 @@ def test_retired_sidecar_directory_is_ignored(tmp_path, caplog):
     with pytest.raises(ConfigError, match="retired: use the operating mode"):
         state.apply_options({"proactive_mode": "on"}, state.settings_service.revision, "seed")
     assert not caplog.records
-    assert "proactive_mode" not in state.current_options()
+    assert "proactive_mode" not in state.current_options()["settings"]
 
 
 def test_config_roundtrip_persists_and_reloads(tmp_path: Path) -> None:

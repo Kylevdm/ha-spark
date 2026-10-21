@@ -15,7 +15,7 @@ from ha_spark.devices import inverter_device
 from ha_spark.devices.execution import Ownership, WriteGate, execution_context
 from ha_spark.energy.scheduler import notify_remapped_holds
 from ha_spark.ha.rest import HomeAssistantRest
-from tests.authority_helpers import seed_authority, seed_settings
+from tests.authority_helpers import seed_authority, seed_settings, settings_bytes
 from tests.test_solis_power_switch import FakeRest, _intent, _now, _window
 
 
@@ -64,16 +64,16 @@ def test_fallback_invalid_save_is_rejected_only_when_required(tmp_path, updates,
     store = seed_authority(state.settings, "optimise" if mode == "unknown" else mode)
     if mode == "unknown":
         store.store_path.unlink()
-    original = state.options_path.read_bytes()
+    original = settings_bytes(tmp_path)
     settings = state.settings
     if mode in {"optimise", "unknown"}:
         with pytest.raises(ConfigError):
             state.apply_options(updates, state.settings_service.revision, "seed")
-        assert state.options_path.read_bytes() == original
+        assert settings_bytes(tmp_path) == original
         assert state.settings is settings
     else:
         state.apply_options(updates, state.settings_service.revision, "seed")
-        assert state.options_path.read_bytes() != original
+        assert settings_bytes(tmp_path) != original
 
 
 def test_unknown_authority_still_saves_an_install_without_a_fallback(tmp_path):
@@ -150,12 +150,12 @@ def test_activating_optimise_also_validates_fallback(tmp_path):
     store.save(store.state.model_copy(update={"transition": Transition(
         target="optimise", started_at=datetime.now(UTC),
     )}))
-    original = state.options_path.read_bytes()
+    original = settings_bytes(tmp_path)
     with pytest.raises(ConfigError, match="solis_fallback_current_a"):
         state.apply_options(
             {"solis_fallback_current_a": None}, state.settings_service.revision, "seed",
         )
-    assert state.options_path.read_bytes() == original
+    assert settings_bytes(tmp_path) == original
 
 
 @respx.mock
@@ -194,11 +194,11 @@ async def test_remap_notice_once_across_restart(tmp_path):
 def test_optimise_rejects_a_save_that_drops_the_fallback_inverter(tmp_path, mode):
     state = app_state(tmp_path)
     seed_authority(state.settings, mode)
-    original = state.options_path.read_bytes()
+    original = settings_bytes(tmp_path)
     if mode == "optimise":
         with pytest.raises(ConfigError, match="inverter configuration"):
             state.apply_options({"inverter": "alphaess"}, state.settings_service.revision, "seed")
-        assert state.options_path.read_bytes() == original
+        assert settings_bytes(tmp_path) == original
     else:
         state.apply_options({"inverter": "alphaess"}, state.settings_service.revision, "seed")
         assert state.settings.devices[0].driver == "alphaess"

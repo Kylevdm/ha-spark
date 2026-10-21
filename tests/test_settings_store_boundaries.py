@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import traceback
 from pathlib import Path
 
 import pytest
@@ -49,6 +50,16 @@ def test_legacy_fixture_seeds_equivalent_effective_settings(tmp_path, edited):
         {"min_soc": 25, "inverter_power_switch_entity": "select.owner"} if edited else {}
     )
     assert CANARY not in json.dumps(document)
+
+
+def test_tariff_refusal_carries_no_input_in_its_exception_chain(tmp_path):
+    service = store(tmp_path)
+    service.load(writable=True)
+    with pytest.raises(ConfigError) as excinfo:
+        service.save({"charge_window_start": CANARY}, 1, "seed")
+    chain = "".join(traceback.format_exception(excinfo.value))
+    assert "charge_window_start" in chain
+    assert CANARY not in chain
 
 
 @pytest.mark.parametrize("field", sorted(_SECRET_OPTION_KEYS))
