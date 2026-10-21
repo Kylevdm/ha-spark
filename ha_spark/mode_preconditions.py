@@ -1,8 +1,9 @@
 """Read-only entry checks for Protect and Optimise, never authority grants.
 
 Uses the driver's model-qualified hold contract and existing fallback validator.
-The daemon supplies this tick's checked SoC; diagnostic callers may check a fresh
-observation but must not treat a prior tick's measurement as a new grant.
+The daemon supplies this tick's checked SoC and live programming hold; diagnostic
+callers check a fresh observation and read the persisted monitor state, but must
+not treat a prior tick's measurement as a new grant.
 """
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ from ha_spark.config import Settings
 from ha_spark.devices import get_device
 from ha_spark.devices.inverters.solis import validate_fallback_schedule
 from ha_spark.energy.soc_integrity import SocMeasurement
-from ha_spark.energy.soc_monitor import observe_soc
+from ha_spark.energy.soc_monitor import SocMonitor, observe_soc
 from ha_spark.ha.rest import HomeAssistantRest, HomeAssistantRestError
 from ha_spark.transitions import PreconditionReport
 
@@ -38,7 +39,11 @@ async def entry_preconditions(settings: Settings) -> dict[str, Any]:
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
     ) as rest:
         soc = await observe_soc(settings, rest)
-        report = await check_preconditions(settings, rest, soc)
+        monitor = SocMonitor.load(settings)
+        report = await check_preconditions(
+            settings, rest, soc,
+            soc_programming_held=monitor.fallback_active or monitor.recovery_blocked,
+        )
     return {
         "observe": {"passed": True, "reasons": []},
         "protect": {"passed": not report.protect, "reasons": list(report.protect)},
@@ -48,6 +53,7 @@ async def entry_preconditions(settings: Settings) -> dict[str, Any]:
 
 async def check_preconditions(
     settings: Settings, rest: HomeAssistantRest, soc: SocMeasurement | None,
+    *, soc_programming_held: bool,
 ) -> PreconditionReport:
     """Report every failed entry condition with GETs only; no refresh services."""
     failures: list[str] = []
@@ -97,4 +103,6 @@ async def check_preconditions(
     if soc is None or not soc.ok:
         # Do not echo raw untrusted entity states (which could contain secrets).
         optimise.append("this tick's checked SoC measurement must pass")
+    if soc_programming_held:
+        optimise.append("SoC fallback or recovery is in progress; wait for SoC recovery")
     return PreconditionReport(protect=tuple(failures), optimise=tuple(optimise))
