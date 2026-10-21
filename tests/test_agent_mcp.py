@@ -332,3 +332,17 @@ async def test_set_config_refuses_a_changed_db_path(tmp_path: Path) -> None:
     assert "TOPSECRET/moved-db.db" not in str(excinfo.value)
     assert options.read_bytes() == seeded
     assert state.settings.db_path == str(tmp_path / "t.db")
+
+
+@pytest.mark.parametrize("updates", ["TOPSECRET_ARGUMENT", ["TOPSECRET_ARGUMENT"], 7])
+async def test_set_config_refusal_runs_before_argument_validation(
+    tmp_path: Path, updates: object
+) -> None:
+    """#457 review: an argument of the wrong type gets the fixed refusal, not a
+    validation error echoing the submitted value."""
+    mcp = build_mcp(_state(tmp_path, "read_write"))
+    with pytest.raises(ToolError) as excinfo:
+        await mcp.call_tool("set_config", {"updates": updates})
+    assert "unavailable: agent config changes need owner approval" in str(excinfo.value)
+    assert "TOPSECRET" not in str(excinfo.value)
+    assert "input_value" not in str(excinfo.value)

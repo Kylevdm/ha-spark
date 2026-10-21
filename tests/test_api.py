@@ -470,3 +470,22 @@ def test_config_save_failure_other_than_validation_never_echoes_its_text(
     assert "TOPSECRET" not in resp.text
     assert "TOPSECRET" not in caplog.text
     assert state.settings.min_soc == 20.0
+
+
+def test_post_config_rejection_never_echoes_a_submitted_mapping_key(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A secret pasted as a mapping key is not a field name, so the reason
+    reads ``<key>`` in its place (#457 review)."""
+    state = _state(tmp_path)
+    with owner_client(state) as client:
+        resp = client.post(
+            "/api/config",
+            json={"devices": [{"id": "main", "driver": "solis",
+                               "entities": {"TOPSECRET_ENTITY": []}}]},
+        )
+    assert resp.status_code == 400
+    assert "devices.0.entities.<key>" in resp.json()["error"]
+    assert "TOPSECRET" not in resp.text
+    assert "TOPSECRET" not in caplog.text
+    assert not (tmp_path / "options.json").exists()

@@ -127,9 +127,10 @@ def build_mcp(state: AppState) -> FastMCP:
         return (await tools.run_plan(state.settings, executor=state.executor)).model_dump()
 
     @mcp.tool()
-    async def set_config(updates: dict[str, object]) -> dict[str, object]:
+    async def set_config(updates: Any = None) -> dict[str, object]:
         """Unavailable: agent config changes need owner approval (not in this version)."""
-        # The parameter stays so the tool's schema is unchanged; it is never read.
+        # Untyped so FastMCP's argument validation can't fail first and echo
+        # the submitted value in its error; the argument is never read (#457).
         raise ToolError(f"{AGENT_CONFIG_REFUSAL['error']}: {AGENT_CONFIG_REFUSAL['detail']}")
 
     return mcp
