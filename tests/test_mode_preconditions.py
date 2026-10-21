@@ -9,12 +9,14 @@ import respx
 from ha_spark import cli
 from ha_spark.config import DeviceConfig, Settings
 from ha_spark.energy.soc_integrity import check_soc
+from ha_spark.energy.soc_monitor import SocMonitor, SocOperatingState, monitor_path
 from ha_spark.ha.models import EntityState
 from ha_spark.ha.rest import HomeAssistantRest
-from ha_spark.mode_preconditions import check_preconditions
+from ha_spark.mode_preconditions import check_preconditions, entry_preconditions
 from tests.authority_helpers import seed_authority
 
 NOW = datetime(2026, 10, 20, tzinfo=UTC)
+HELD_REASON = "SoC fallback or recovery is in progress; wait for SoC recovery"
 
 
 def settings(tmp_path, **kwargs):
@@ -43,10 +45,59 @@ def measurement():
 async def test_preconditions_pass_using_model_probe_and_checked_soc(tmp_path):
     route = respx.get(url__regex=r"http://ha.test/api/states/.*").mock(side_effect=ha_response)
     async with HomeAssistantRest("http://ha.test/api", "secret") as rest:
-        report = await check_preconditions(settings(tmp_path), rest, measurement())
+        report = await check_preconditions(
+            settings(tmp_path), rest, measurement(), soc_programming_held=False,
+        )
     assert report.protect == () and report.optimise == ()
     assert route.called
     assert all(call.request.method == "GET" for call in respx.calls)
+
+
+@pytest.mark.parametrize("state", list(SocOperatingState))
+@respx.mock
+async def test_optimise_preconditions_refuse_soc_programming_hold(tmp_path, state):
+    monitor = SocMonitor(fallback_status=state)
+    respx.get(url__regex=r"http://ha.test/api/states/.*").mock(side_effect=ha_response)
+    async with HomeAssistantRest("http://ha.test/api", "secret") as rest:
+        report = await check_preconditions(
+            settings(tmp_path), rest, measurement(),
+            soc_programming_held=monitor.fallback_active or monitor.recovery_blocked,
+        )
+    held = state not in (SocOperatingState.NORMAL, SocOperatingState.PENDING_FAILURE)
+    assert report.optimise == ((HELD_REASON,) if held else ())
+    assert report.protect == ()
+    assert all(call.request.method == "GET" for call in respx.calls)
+
+
+@pytest.mark.parametrize("state", list(SocOperatingState) + ["missing", "unreadable"])
+@respx.mock
+async def test_entry_preconditions_reports_persisted_soc_programming_hold(tmp_path, state):
+    config = settings(tmp_path)
+    path = monitor_path(config)
+    if state == "unreadable":
+        path.write_text("invalid JSON")
+    elif state != "missing":
+        path.write_text(json.dumps({"consecutive_failures": 3, "fallback_status": state}))
+    before = {file.name: file.read_bytes() for file in tmp_path.iterdir()}
+
+    def fresh_response(request):
+        response = ha_response(request)
+        payload = response.json()
+        payload["last_reported"] = datetime.now(UTC).isoformat()
+        return httpx.Response(200, json=payload)
+
+    respx.get(url__regex=r"http://ha.test/api/states/.*").mock(side_effect=fresh_response)
+    result = await entry_preconditions(config)
+    held = state in (
+        SocOperatingState.FALLBACK_THRESHOLD, SocOperatingState.FALLBACK_REQUESTED,
+        SocOperatingState.FALLBACK_VERIFIED, SocOperatingState.FALLBACK_FAILED,
+    )
+    assert result["optimise"] == {
+        "passed": not held, "reasons": [HELD_REASON] if held else [],
+    }
+    assert result["protect"] == {"passed": True, "reasons": []}
+    assert all(call.request.method == "GET" for call in respx.calls)
+    assert {file.name: file.read_bytes() for file in tmp_path.iterdir()} == before
 
 
 @pytest.mark.parametrize("case,reason", [
@@ -83,7 +134,9 @@ async def test_preconditions_name_each_failure(tmp_path, case, reason):
     # respx takes the first matching route: the specific overrides go first.
     respx.get(url__regex=r"http://ha.test/api/states/.*").mock(side_effect=ha_response)
     async with HomeAssistantRest("http://ha.test/api", "secret") as rest:
-        report = await check_preconditions(config, rest, None if case == "soc" else measurement())
+        report = await check_preconditions(
+            config, rest, None if case == "soc" else measurement(), soc_programming_held=False,
+        )
     assert any(reason in failure for failure in report.optimise)
     assert all(call.request.method == "GET" for call in respx.calls)
 
@@ -97,7 +150,7 @@ async def test_preconditions_report_all_missing_evidence_and_fallback(tmp_path):
     })
     respx.get(url__regex=r"http://ha.test/api/states/.*").mock(side_effect=ha_response)
     async with HomeAssistantRest("http://ha.test/api", "secret") as rest:
-        report = await check_preconditions(config, rest, None)
+        report = await check_preconditions(config, rest, None, soc_programming_held=False)
     for reason in ("ev_status_entity", "battery_power_entity", "live_dispatch_max_age_seconds",
                    "solis_fallback_current_a", "SoC"):
         assert any(reason in failure for failure in report.optimise)

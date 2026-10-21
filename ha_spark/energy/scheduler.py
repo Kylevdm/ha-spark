@@ -1588,7 +1588,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
 
 async def _accept_mode(
     settings: Settings, channel: DaemonChannel, pending: Pending,
-    measurement: SocMeasurement | None, now: datetime,
+    measurement: SocMeasurement | None, now: datetime, *, soc_programming_held: bool,
 ) -> Reply:
     store = channel.authority
     assert store is not None
@@ -1609,7 +1609,9 @@ async def _accept_mode(
         async with HomeAssistantRest(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
         ) as rest:
-            report = await check_preconditions(settings, rest, measurement)
+            report = await check_preconditions(
+                settings, rest, measurement, soc_programming_held=soc_programming_held,
+            )
     kind: RequesterKind = "ingress" if pending.ingress_user is not None else "cli"
     decision = propose_transition(
         store.state if known else None,
@@ -1637,7 +1639,7 @@ async def _accept_mode(
 async def _mode_lifecycle(
     settings: Settings, channel: DaemonChannel, pending: Pending | None,
     measurement: SocMeasurement | None, now: datetime, plan: ChargePlan | None,
-    ev_hold_state: EvHoldState,
+    ev_hold_state: EvHoldState, *, soc_programming_held: bool,
 ) -> None:
     store = channel.authority
     assert store is not None
@@ -1648,7 +1650,10 @@ async def _mode_lifecycle(
             await stack.enter_async_context(context.coordinator_for(config, settings).transition())
         if pending is not None:
             try:
-                reply = await _accept_mode(settings, channel, pending, measurement, now)
+                reply = await _accept_mode(
+                    settings, channel, pending, measurement, now,
+                    soc_programming_held=soc_programming_held,
+                )
             except (OSError, ValueError):
                 reply = Reply(error="authority persistence failed")
             except Exception:
@@ -2024,6 +2029,7 @@ async def _run_forever(
                 try:
                     await _mode_lifecycle(
                         settings, channel, mode_request, measurement, now, last_plan, ev_hold_state,
+                        soc_programming_held=monitor.fallback_active or monitor.recovery_blocked,
                     )
                 except (OSError, ValueError):
                     log.warning("Authority handover save failed; hardware writes refused")

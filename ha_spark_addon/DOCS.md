@@ -30,6 +30,8 @@ hardware has verified it.
 
 Protect and Optimise require confirmation. Before enabling Optimise, disable
 any pre-existing automations or manual schedules that write the same devices.
+Entering Optimise also requires no SoC fallback or recovery in progress; wait
+for SoC recovery before requesting the change.
 Axle export remains supervised: ha-spark will arm configured export windows,
 but a person must be present for preparation and verified cleanup (see the
 [supervised-export runbook](../docs/runbooks/supervised-axle-export.md)).

@@ -24,6 +24,50 @@ def _hold(settings) -> HoldRecord:
     ))
 
 
+@pytest.mark.parametrize("held", ["fallback_active", "recovery_blocked"])
+@respx.mock
+async def test_daemon_refuses_optimise_while_live_soc_programming_held(
+    tmp_path, monkeypatch, held,
+):
+    from unittest.mock import Mock
+
+    from ha_spark.energy import scheduler
+    from tests.authority_helpers import seed_authority
+    from tests.test_mode_preconditions import HELD_REASON, ha_response, settings
+
+    config = settings(tmp_path, agent_surface="on")
+    seed_authority(config, "observe")
+    respx.get(url__regex=r"http://ha.test/api/states/.*").mock(side_effect=ha_response)
+    respx.post(url__regex=r"http://ha.test/api/.*").respond(200, json=[])
+    prior = execution_context().authority
+    try:
+        async with running_daemon(config, tmp_path, monkeypatch) as (state, _, device, _):
+            monitor = scheduler.SocMonitor.load(config)
+            monitor.fallback_active = held == "fallback_active"
+            monitor.recovery_blocked = held == "recovery_blocked"
+            # The on-disk monitor is absent; only the daemon's live state holds programming.
+            monkeypatch.setattr(scheduler.SocMonitor, "load", Mock(
+                side_effect=AssertionError("mode requests must not reload the monitor"),
+            ))
+            before = state.executor.authority.state
+            reply = await submit_socket(
+                config, "mode", target="optimise", expected_epoch=before.epoch,
+            )
+            assert reply.error == "preconditions_unmet"
+            assert reply.reasons == [HELD_REASON]
+            assert state.executor.authority.state == before
+            device.apply.assert_not_called()
+            device.apply_fallback.assert_not_called()
+            device.release_holds.assert_not_called()
+            device.cancel_export.assert_not_called()
+            hardware = [call for call in respx.calls if "/api/services/" in str(call.request.url)
+                        and "/api/services/notify/" not in str(call.request.url)
+                        and "/api/services/persistent_notification/" not in str(call.request.url)]
+            assert hardware == []
+    finally:
+        execution_context().authority = prior
+
+
 @pytest.mark.parametrize("target,error", [("optimise", "stale_epoch"),
                                          ("protect", "stale_epoch")])
 @respx.mock
