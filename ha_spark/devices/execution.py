@@ -3,6 +3,7 @@
 The daemon binds the sole authority store. Unbound callers fail closed. Planned
 epochs and config generations are checked under the bus lock and again at each
 actuating call. Remapped held identities never grant authority to a replacement.
+During a transition only the running handover step actuates, for its own class.
 Factories and direct driver construction use the same default context. Coordinators
 keep loop-local locks (CLI/tests may run successive event loops); the daemon uses
 one event loop, and no lock is held across loops or shared with another process.
@@ -44,6 +45,19 @@ class Ownership(StrEnum):
     CLOCK = "clock"
 
 
+# During a transition only the running (first stored) step may actuate, and only its
+# own ownership class. Steps not listed here (``commit_observe``) never write.
+HANDOVER_STEP_OWNERSHIP: dict[str, frozenset[Ownership]] = {
+    "evaluate_protection": frozenset({Ownership.PROTECTION}),
+    "release_holds": frozenset({Ownership.PROTECTION}),
+    "cancel_export": frozenset({Ownership.CHARGING}),
+    "write_fallback": frozenset({Ownership.CHARGING}),
+    # → Optimise stays activating until its first fresh plan verifies; that plan
+    # and the hold reconcile keep running meanwhile, so protection never lapses.
+    "verify_fresh_plan": frozenset({Ownership.CHARGING, Ownership.PROTECTION}),
+}
+
+
 class WriteGate:
     """The only permission implementation; legacy keys grant nothing."""
 
@@ -57,7 +71,12 @@ class WriteGate:
         state = store.state
         assert state is not None
         if state.transition is not None:
-            return "refuse:not owned"
+            step = self.context.handover_step.get()
+            steps = state.transition.steps
+            if not steps or step != steps[0] or ownership not in (
+                HANDOVER_STEP_OWNERSHIP.get(step, frozenset())
+            ):
+                return "refuse:not owned"
         if self.context.planned_epoch.get() != state.epoch:
             return "refuse:stale authority"
         if self.context.planned_generation.get() != self.context.config_generation:
@@ -122,6 +141,18 @@ class BusCoordinator:
             raise AuthorityRevoked(mode.removeprefix("refuse:"))
 
     @asynccontextmanager
+    async def transition(self) -> AsyncIterator[None]:
+        """Wait for a complete action, then own the bus across handover steps."""
+        state = self._state()
+        async with state.lock:
+            state.owner = asyncio.current_task()
+            try:
+                yield
+            finally:
+                state.decisions.clear()
+                state.owner = None
+
+    @asynccontextmanager
     async def action(
         self, gate: WriteGate, ownership: Ownership, config: DeviceConfig, settings: Settings
     ) -> AsyncIterator[None]:
@@ -131,6 +162,9 @@ class BusCoordinator:
         if outer:
             await state.lock.acquire()
             state.owner = task
+        # A transition owns the bus across steps; each top-level action still
+        # takes a fresh decision, so one step's grant never carries to the next.
+        top = not state.modes
         try:
             key = (ownership, id(config), id(settings))
             if key not in state.decisions:
@@ -143,8 +177,9 @@ class BusCoordinator:
                 state.checks.pop()
                 state.modes.pop()
         finally:
-            if outer:
+            if top:
                 state.decisions.clear()
+            if outer:
                 state.owner = None
                 state.lock.release()
 
@@ -159,6 +194,7 @@ class ExecutionContext:
         self.planned_generation: ContextVar[int | None] = ContextVar(
             "planned_generation", default=None
         )
+        self.handover_step: ContextVar[str | None] = ContextVar("handover_step", default=None)
         self.gate = WriteGate(self)
         self._buses: dict[tuple[str, str, str], BusCoordinator] = {}
 
@@ -173,6 +209,29 @@ class ExecutionContext:
         finally:
             self.planned_epoch.reset(token)
             self.planned_generation.reset(generation_token)
+
+    @contextmanager
+    def after_authority_save(self) -> Iterator[None]:
+        """Re-capture only the epoch after this daemon's own save.
+
+        The config generation stays the one captured with the caller's settings
+        snapshot, so a save that lands mid-tick still refuses work planned on it.
+        """
+        state = self.authority.state if self.authority is not None else None
+        token = self.planned_epoch.set(state.epoch if state is not None else None)
+        try:
+            yield
+        finally:
+            self.planned_epoch.reset(token)
+
+    @contextmanager
+    def handover(self, step: str) -> Iterator[None]:
+        """Run one step of the stored transition; the gate still checks every fence."""
+        token = self.handover_step.set(step)
+        try:
+            yield
+        finally:
+            self.handover_step.reset(token)
 
     def coordinator_for(self, config: DeviceConfig, settings: Settings) -> BusCoordinator:
         # All sensors/selects and slaves on a Solis Modbus hub share a bus.

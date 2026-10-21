@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from ha_spark.authority import authority_view, load_authority
+from ha_spark.authority import OperatingMode, authority_view, load_authority
 from ha_spark.config import ConfigError, Settings, load_settings
 from ha_spark.daemon_channel import REFUSED, DaemonAlreadyRunning, Reply, submit_socket
 from ha_spark.dashboard import build_dashboard
@@ -47,7 +47,6 @@ from ha_spark.energy.onboarding import (
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever
-from ha_spark.energy.soc_monitor import observe_soc
 from ha_spark.energy.sources import _to_float
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.energy.v2l import delivered_fraction, load_session, savings
@@ -58,7 +57,7 @@ from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
 from ha_spark.health import Status, check_load_history, exit_code, format_report, run_health
 from ha_spark.logging import setup_logging
-from ha_spark.mode_preconditions import check_preconditions
+from ha_spark.mode_preconditions import entry_preconditions
 from ha_spark.onboarding_discover import FieldProposal, propose
 from ha_spark.presets import get_preset, preset_names
 from ha_spark.router import route_message
@@ -703,8 +702,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_inverter = sub.add_parser("inverter", help="Read model identity and resident schedule")
     p_inverter.add_subparsers(dest="inverter_command", required=True).add_parser("show")
 
-    p_mode = sub.add_parser("mode", help="Read operating-mode authority")
-    p_mode.add_subparsers(dest="mode_command", required=True).add_parser("show")
+    p_mode = sub.add_parser("mode", help="Show or change operating-mode authority")
+    mode_sub = p_mode.add_subparsers(dest="mode_command", required=True)
+    mode_sub.add_parser("show")
+    mode_sub.add_parser("set").add_argument("target", choices=("observe", "protect", "optimise"))
+    mode_sub.add_parser("confirm-observe")
 
     p_states = sub.add_parser(
         "states",
@@ -973,22 +975,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+async def _cmd_mode_set(
+    settings: Settings, target: OperatingMode, *, confirm: bool = False,
+) -> int:
+    """Submit one owner request with the epoch seen; never retry a conflict."""
+    epoch = None
+    if not confirm:
+        status = await submit_socket(settings, "authority_status")
+        if status is None or status.error or status.authority is None:
+            print(REFUSED if status is None else f"[REFUSED] {status.error}")
+            return 1
+        epoch = status.authority.get("epoch")
+    reply = await submit_socket(settings, "mode", target=target, expected_epoch=epoch)
+    if reply is None or reply.error:
+        print(REFUSED if reply is None else f"[REFUSED] {reply.error}: {reply.text}")
+        return 1
+    print(json.dumps(reply.authority, indent=2))
+    return 0
+
+
 async def _cmd_mode_show(settings: Settings) -> int:
     """Read authority and live entry conditions without creating or saving state."""
     loaded = load_authority(settings)
     view = authority_view(loaded.state, known=loaded.status == "known")
     view["load_status"] = loaded.status
-    async with HomeAssistantRest(
-        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
-    ) as rest:
-        # The daemon's own observation path, so both judge SoC freshness alike.
-        soc = await observe_soc(settings, rest)
-        report = await check_preconditions(settings, rest, soc)
-    view["preconditions"] = {
-        "observe": {"passed": True, "reasons": []},
-        "protect": {"passed": not report.protect, "reasons": list(report.protect)},
-        "optimise": {"passed": not report.optimise, "reasons": list(report.optimise)},
-    }
+    view["preconditions"] = await entry_preconditions(settings)
     print(json.dumps(view, indent=2))
     return 0
 
@@ -1023,7 +1034,12 @@ def main(argv: list[str] | None = None) -> int:
     # failure detail is carried in each check result.
     if args.command == "mode":
         settings = load_settings(validate=False)
-        return asyncio.run(_cmd_mode_show(settings))
+        if args.mode_command == "show":
+            return asyncio.run(_cmd_mode_show(settings))
+        return asyncio.run(_cmd_mode_set(
+            settings, args.target if args.mode_command == "set" else "observe",
+            confirm=args.mode_command == "confirm-observe",
+        ))
 
     if args.command == "health":
         settings = load_settings(validate=False)

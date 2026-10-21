@@ -55,6 +55,13 @@ after the recovered plan applied and read back. Observe and Protect still
 count, persist and publish pending failure and threshold crossings but never
 request a fallback write.
 
+Owner mode requests are accepted only here, persisted under the inverter bus
+lock before handover work. Stored steps resume after restart; partial failures
+remain visible and retry on the next tick. Optimise activation always applies a
+fresh plan without a preview baseline, and completes only on typed verification.
+Leaving Optimise cancels export, verifies the fallback starting schedule, then
+releases owned holds only for Observe before committing the target mode.
+
 With `inverter_clock_dst_sync` on, the first tick after the household zone's
 UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
 """
@@ -63,6 +70,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
 from typing import NamedTuple
@@ -82,9 +90,14 @@ from ha_spark.api.server import (
     serve_in_background,
     stop_server,
 )
-from ha_spark.authority import FALLBACK_CAUSE_SOC_INTEGRITY, AuthorityStore
+from ha_spark.authority import (
+    FALLBACK_CAUSE_SOC_INTEGRITY,
+    AuthorityStore,
+    FallbackState,
+    RequesterKind,
+)
 from ha_spark.config import Settings, actuation_settings_changed
-from ha_spark.daemon_channel import DaemonChannel, Reply, action_lines
+from ha_spark.daemon_channel import DaemonChannel, Pending, Reply, action_lines
 from ha_spark.devices import Capability, Device, inverter_device
 from ha_spark.devices.execution import (
     ExecutionContext,
@@ -135,6 +148,8 @@ from ha_spark.energy.v2l import run_v2l_tick, run_v2l_topup, warn_deprecated_not
 from ha_spark.ha.notifier import send_notification
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
+from ha_spark.mode_preconditions import check_preconditions
+from ha_spark.transitions import PreconditionReport, TransitionRequest, propose_transition
 
 log = get_logger(__name__)
 
@@ -1076,7 +1091,10 @@ async def reconcile_tick(
                 lines = read_lines + list(await device.reconcile_holds(intent, now))
     except Exception:
         log.exception("Hold reconcile tick failed; will retry next minute")
-        return ReconcileResult([], trusted_holds, relinquished)
+        return ReconcileResult(
+            [ActionLine("[FAILED] hold reconciliation failed", ActionOutcome.FAILED)],
+            trusted_holds, relinquished,
+        )
     for line in lines:
         if previous is not None and line in previous:
             log.debug(line)
@@ -1119,8 +1137,16 @@ async def _notify_fallback_entered(settings: Settings, rest: HomeAssistantRest) 
 
 
 async def _notify_fallback_left(settings: Settings, rest: HomeAssistantRest) -> None:
+    store = execution_context().authority
+    state = store.state if store is not None else None
+    leaving_optimise = state is not None and (
+        state.committed_mode != "optimise"
+        or (state.transition is not None and state.transition.target != "optimise")
+    )
     await send_notification(
         settings, rest, "ha-spark fallback left",
+        "Fallback charging ownership ended: the owner is leaving Optimise"
+        if leaving_optimise else
         "SoC integrity recovered: fallback charging left; normal programming resumed",
     )
 
@@ -1139,7 +1165,13 @@ async def _mirror_fallback_authority(
     fallback the monitor has already left and the next entry still bumps the
     epoch and notifies once. One notice each way, only on the change.
     """
-    active = monitor.fallback_active and solis
+    store = execution_context().authority
+    state = store.state if store is not None else None
+    active = bool(
+        monitor.fallback_active and solis and state is not None
+        and state.committed_mode == "optimise"
+        and (state.transition is None or state.transition.target == "optimise")
+    )
     try:
         changed = _save_fallback_authority(active)
     except (OSError, ValueError):
@@ -1476,6 +1508,196 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
         await channel.__aexit__(None, None, None)
 
 
+async def _accept_mode(
+    settings: Settings, channel: DaemonChannel, pending: Pending,
+    measurement: SocMeasurement | None, now: datetime,
+) -> Reply:
+    store = channel.authority
+    assert store is not None
+    request = pending.request
+    if request.target is None:
+        return Reply(error="invalid mode request")
+    known = store.known and not store.save_failed
+    if known and request.expected_epoch is None:
+        return Reply(error="stale_epoch", text="authority known; use mode set observe")
+    report = PreconditionReport()
+    if (
+        known and store.state is not None
+        and request.expected_epoch == store.state.epoch and store.state.transition is None
+        and (request.target == "optimise" or (
+            request.target == "protect" and store.state.committed_mode == "observe"
+        ))
+    ):
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
+        ) as rest:
+            report = await check_preconditions(settings, rest, measurement)
+    kind: RequesterKind = "ingress" if pending.ingress_user is not None else "cli"
+    decision = propose_transition(
+        store.state if known else None,
+        TransitionRequest(target=request.target, expected_epoch=request.expected_epoch,
+                          requester_kind=kind, requester_id=pending.ingress_user or "cli"),
+        report, now=now,
+    )
+    if decision.refusal:
+        return Reply(error=decision.refusal, text="; ".join(decision.reasons),
+                     reasons=list(decision.reasons))
+    old_mode = store.state.committed_mode if known and store.state else "authority_unknown"
+    if decision.confirm_observe:
+        store.confirm_observe(kind)
+    elif decision.state is store.state:
+        return Reply(authority=channel.authority_status())
+    else:
+        assert decision.state is not None
+        store.save(decision.state)
+    assert store.state is not None
+    log.info("Operating mode requester=%s old=%s target=%s epoch=%d",
+             pending.ingress_user or "cli", old_mode, request.target, store.state.epoch)
+    return Reply(authority=channel.authority_status())
+
+
+async def _mode_lifecycle(
+    settings: Settings, channel: DaemonChannel, pending: Pending | None,
+    measurement: SocMeasurement | None, now: datetime, plan: ChargePlan | None,
+    ev_hold_state: EvHoldState,
+) -> None:
+    store = channel.authority
+    assert store is not None
+    context = execution_context()
+    async with AsyncExitStack() as stack:
+        config = next((d for d in settings.devices if d.type == "inverter"), None)
+        if config is not None:
+            await stack.enter_async_context(context.coordinator_for(config, settings).transition())
+        if pending is not None:
+            try:
+                reply = await _accept_mode(settings, channel, pending, measurement, now)
+            except (OSError, ValueError):
+                reply = Reply(error="authority persistence failed")
+            except Exception:
+                reply = Reply(error="mode request failed")
+            pending.future.set_result(reply)
+        if not store.known or store.save_failed:
+            return
+        while store.state is not None and store.state.transition is not None:
+            state = store.state
+            transition = state.transition
+            assert transition is not None
+            step = transition.steps[0] if transition.steps else ""
+            lines: list[str] = []
+            try:
+                if transition.target == "observe":
+                    remapped = [h for h in state.holds
+                                if held_identity_remapped(h.device, settings)]
+                    if remapped:
+                        # Drop obsolete ownership before any charging handover:
+                        # it cannot authorise the replacement mapping.
+                        store.save_holds(tuple(h for h in state.holds if h not in remapped))
+                        log.warning("Dropped %d hold(s) on a device no longer configured; "
+                                    "its power switch may still be Off", len(remapped))
+                        async with HomeAssistantRest(
+                            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
+                        ) as rest:
+                            await send_notification(
+                                settings, rest, "ha-spark hold dropped",
+                                "Switching to Observe dropped a hold on an inverter that is "
+                                "no longer configured. Its power switch may still be Off; "
+                                "check it and turn it On yourself if it should run.",
+                            )
+                if step == "verify_fresh_plan":
+                    # The normal tick runs the fresh plan and protection every
+                    # minute inside this handover, even after partial failure.
+                    return
+                with context.after_authority_save(), context.handover(step):
+                    if step == "evaluate_protection":
+                        # The reconcile reads the switch, and the resident window
+                        # for the overnight exception, with fresh evidence.
+                        if plan is None:
+                            unknown = SocMeasurement(SocStatus.UNAVAILABLE, now)
+                            plan = ChargePlan(
+                                soc=unknown, capacity_kwh=0, solar_kwh=0, effective_solar_kwh=0,
+                                load_kwh=0, cheap_covered_kwh=0, usable_now_kwh=0, deficit_kwh=0,
+                                buffer_pct=0, required_kwh=0, target_soc=0, window_hours=0,
+                                ev_charging=False, ha_template_needed=None,
+                                charge_intent=ChargeIntent(
+                                    0, unknown, parse_time(settings.charge_window_start),
+                                    parse_time(settings.charge_window_end), hold_trusted=False,
+                                ),
+                            )
+                        result = await reconcile_tick(settings, plan, now,
+                                                      ev_hold_state=ev_hold_state)
+                        lines = result.lines
+                        # Evaluated, and any hold it needs is verified: an
+                        # unconfirmed request (a write not read back) is not.
+                        if store.state is not None and any(
+                            not h.confirmed for h in store.state.holds
+                        ):
+                            lines.append("[FAILED] hold request not confirmed by read-back")
+                    elif step == "release_holds":
+                        if store.state is not None and store.state.holds:
+                            async with HomeAssistantRest(
+                                settings.ha_rest_url, settings.auth_token,
+                                timeout=settings.ha_timeout,
+                            ) as rest:
+                                device = inverter_device(settings, rest)
+                                if isinstance(device, SolisDevice):
+                                    lines = list(await device.release_holds())
+                                if store.state is not None and store.state.holds:
+                                    # Observe commits only once no hold of ours remains,
+                                    # e.g. one on an inverter the driven device isn't.
+                                    lines.append("[FAILED] hold records remain unreleased")
+                    elif step in ("cancel_export", "write_fallback"):
+                        async with HomeAssistantRest(
+                            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
+                        ) as rest:
+                            device = inverter_device(settings, rest)
+                            if not isinstance(device, SolisDevice):
+                                lines = ["[FAILED] no validated charging handover"]
+                            elif step == "cancel_export":
+                                lines = list(await device.cancel_export())
+                            else:
+                                lines = list(await device.write_fallback())
+                    elif step != "commit_observe":
+                        lines = ["[FAILED] unsupported handover step"]
+                if step in ("cancel_export", "write_fallback") and not lines:
+                    lines = ["[FAILED] charging handover not verified"]
+                failures = tuple(str(line) for line in lines if (
+                    not is_verified(line) if step in (
+                        "release_holds", "cancel_export", "write_fallback",
+                    )
+                    else legacy_action_line(line).outcome in (
+                        ActionOutcome.REFUSED, ActionOutcome.FAILED, ActionOutcome.BLOCKED,
+                    )
+                ))
+            except Exception:
+                failures = ("[FAILED] handover step failed",)
+            if step != "evaluate_protection":  # reconcile_tick logs its own lines
+                _log_action_lines([*lines, *(f for f in failures if f not in lines)])
+            if store.state is None:
+                return
+            current = store.state
+            if failures:
+                store.save(current.model_copy(update={
+                    "transition": transition.model_copy(update={"failing_actions": failures}),
+                }))
+                return
+            remaining = transition.steps[1:]
+            updates: dict[str, object] = {
+                "transition": transition.model_copy(update={"steps": remaining,
+                                                            "failing_actions": ()})
+                if remaining else None,
+            }
+            if not remaining and current.committed_mode != transition.target:
+                updates.update(committed_mode=transition.target, epoch=current.epoch + 1)
+                if transition.target != "optimise":
+                    updates["fallback"] = FallbackState()
+            store.save(current.model_copy(update=updates))
+            if current.fallback.active and "fallback" in updates:
+                async with HomeAssistantRest(
+                    settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
+                ) as rest:
+                    await _notify_fallback_left(settings, rest)
+
+
 async def _run_forever(
     settings: Settings, channel: DaemonChannel, *, poll_seconds: int
 ) -> None:
@@ -1700,7 +1922,20 @@ async def _run_forever(
             # which is what every tick in that failure window steers by anyway,
             # so it costs a duplicate read rather than new stale exposure.
             replanned = False
-            pending = channel.queue.get_nowait() if not channel.queue.empty() else None
+            pending = channel.next_request()
+            mode_request = pending if pending is not None and pending.request.op == "mode" else None
+            if mode_request is not None or (
+                authority.state is not None and authority.state.transition is not None
+            ):
+                try:
+                    await _mode_lifecycle(
+                        settings, channel, mode_request, measurement, now, last_plan, ev_hold_state,
+                    )
+                except (OSError, ValueError):
+                    log.warning("Authority handover save failed; hardware writes refused")
+                context.planned_epoch.set(authority.state.epoch if authority.state else None)
+                if mode_request is not None:
+                    pending = None
             if pending is not None and pending.request.op == "sync_clock":
                 try:
                     async with HomeAssistantRest(
@@ -1719,26 +1954,67 @@ async def _run_forever(
                     last_applied_plan = None
                     pending.future.set_result(Reply(error="daemon clock request failed"))
                 pending = None
-            if pending is not None or recovering or should_run(now, last_run_slot):
+            transition = authority.state.transition if authority.state is not None else None
+            activating = transition is not None and transition.steps == ("verify_fresh_plan",)
+            if activating:
+                # A preview-accepted Observe/Protect plan is not resident hardware.
+                last_applied_plan = None
+            if pending is not None or recovering or activating or should_run(now, last_run_slot):
                 try:
                     # Recovery never compares against a baseline: the resident
                     # program is the fallback, not any earlier plan.
                     previous_plan = None if reapply or recovering else last_applied_plan
-                    result = await run_once(
-                        settings,
-                        soc=measurement,
-                        previous_plan=previous_plan,
-                        trusted_holds=last_trusted_holds,
-                        ev_hold_state=ev_hold_state,
-                        # A failed first tick after restart cannot delegate the
-                        # observation to run_once and lift a restored block.
-                        fallback_active=(
-                            solis_fallback_active
-                            or alphaess_recovery_blocked
-                            or monitor.awaiting_fresh_observation
+                    async with AsyncExitStack() as activation:
+                        if activating:
+                            config = next(d for d in settings.devices if d.type == "inverter")
+                            await activation.enter_async_context(
+                                context.coordinator_for(config, settings).transition()
+                            )
+                            activation.enter_context(context.after_authority_save())
+                            activation.enter_context(context.handover("verify_fresh_plan"))
+                        result = await run_once(
+                            settings,
+                            soc=measurement,
+                            previous_plan=previous_plan,
+                            trusted_holds=last_trusted_holds,
+                            ev_hold_state=ev_hold_state,
+                            # A failed first tick after restart cannot delegate the
+                            # observation to run_once and lift a restored block.
+                            fallback_active=(
+                                solis_fallback_active
+                                or alphaess_recovery_blocked
+                                or monitor.awaiting_fresh_observation
+                            )
+                            and not recovering,
                         )
-                        and not recovering,
-                    )
+                        if activating and authority.state is not None and transition is not None:
+                            # The plan's own actions must all verify, as recovery
+                            # demands; around them, only a typed failure or a hold
+                            # request that never read back holds activation open
+                            # (an owner-Off switch or untrusted-holds note does not).
+                            failures = tuple(dict.fromkeys(
+                                [str(line) for line in result.apply_lines
+                                 if not is_verified(line)]
+                                + [str(line) for line in result.action_lines
+                                   if legacy_action_line(line).outcome in (
+                                       ActionOutcome.REFUSED, ActionOutcome.FAILED,
+                                   )]
+                                + (["[FAILED] hold request not confirmed by read-back"]
+                                   if any(not h.confirmed for h in authority.state.holds)
+                                   else [])
+                            ))
+                            if not recovery_verified(result.apply_lines) and not failures:
+                                failures = ("[FAILED] fresh plan apply not verified",)
+                            authority.save(authority.state.model_copy(update={
+                                "transition": transition.model_copy(update={
+                                    "failing_actions": failures,
+                                }) if failures else None,
+                            }))
+                            if not failures:
+                                log.warning(
+                                    "Optimise active: disable any pre-existing automations or "
+                                    "manual schedules that write the same devices"
+                                )
                     plan, last_applied_plan = result.plan, result.applied_plan
                     if recovering:
                         backed_off = await finish_recovery(
@@ -1784,6 +2060,15 @@ async def _run_forever(
                     # It may have raised mid-apply: the device state is unknown,
                     # so the retry must not skip an unchanged plan (#168).
                     last_applied_plan = None
+                    if activating and authority.state is not None and transition is not None:
+                        try:
+                            authority.save(authority.state.model_copy(update={
+                                "transition": transition.model_copy(update={
+                                    "failing_actions": ("[FAILED] fresh plan run failed",),
+                                }),
+                            }))
+                        except (OSError, ValueError):
+                            log.warning("Authority activation save failed; hardware writes refused")
                     if pending is not None:
                         log.error("Daemon plan request failed; will retry next tick")
                     else:
@@ -1808,27 +2093,31 @@ async def _run_forever(
             # `Off` — the house on grid import — though `last_plan` still holds
             # its known end time (#147).
             if not replanned:
-                reconciled = await reconcile_tick(
-                    settings,
-                    last_plan,
-                    now,
-                    previous=last_reconcile_lines,
-                    trusted_holds=last_trusted_holds,
-                    ev_hold_state=ev_hold_state,
-                )
+                with context.handover("verify_fresh_plan" if activating else ""):
+                    reconciled = await reconcile_tick(
+                        settings,
+                        last_plan,
+                        now,
+                        previous=last_reconcile_lines,
+                        trusted_holds=last_trusted_holds,
+                        ev_hold_state=ev_hold_state,
+                    )
                 last_reconcile_lines, last_trusted_holds = reconciled[:2]
                 reapply = reapply or reconciled.relinquished
             if guard_enabled and in_window(now.time(), window_start, window_end):
                 try:
-                    target_w = await guard_tick(
-                        settings,
-                        target_w,
-                        soc=measurement,
-                        fallback_active=(
-                            solis_fallback_active or monitor.awaiting_fresh_observation
-                        ),
-                        fallback_confirmed=fallback_confirmed,
-                    )
+                    # While activating, a fresh plan may already be charging: the
+                    # guard's reductions run under the activation's charging grant.
+                    with context.handover("verify_fresh_plan" if activating else ""):
+                        target_w = await guard_tick(
+                            settings,
+                            target_w,
+                            soc=measurement,
+                            fallback_active=(
+                                solis_fallback_active or monitor.awaiting_fresh_observation
+                            ),
+                            fallback_confirmed=fallback_confirmed,
+                        )
                 except Exception:
                     log.exception("Supply guard tick failed; will retry next tick")
             if last_signal_at is None or now - last_signal_at >= SIGNAL_SAMPLE_INTERVAL:

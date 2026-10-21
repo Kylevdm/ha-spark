@@ -206,7 +206,7 @@ class AuthorityStore:
     """Single-writer store. Save a new immutable state, then swap on success.
 
     Construction is read-only. Initialise explicitly, and refuse to save into an
-    unknown/uninitialised store. Recovery/owner confirmation is a later ticket.
+    unknown/uninitialised store. Only explicit owner confirmation repairs unknown authority.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -275,6 +275,17 @@ class AuthorityStore:
         )
         self._persist_initial(state)
         return AuthorityLoadResult(status="known", state=state)
+
+    def confirm_observe(self, requester_kind: RequesterKind) -> None:
+        """Explicit unknown-authority recovery: a new identity, never hardware writes."""
+        if self.known:
+            raise ValueError("authority known; use mode set observe")
+        state = AuthorityState(
+            schema_version=1, store_id=uuid4(), committed_mode="observe", transition=None,
+            epoch=1, holds=(), fallback=FallbackState(), readiness_notice=ReadinessNoticeState(),
+            last_changed_at=datetime.now(UTC), requester_kind=requester_kind,
+        )
+        self._persist_initial(state)
 
     def save_holds(self, holds: tuple[HoldRecord, ...]) -> None:
         """Persist before acting; failed saves leave the gate closed.

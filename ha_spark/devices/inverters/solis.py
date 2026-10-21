@@ -79,7 +79,7 @@ from ha_spark.energy.export_notifications import (
 )
 from ha_spark.energy.export_store import ExportEventStore
 from ha_spark.energy.models import ChargeIntent, ExportIntent, window_hours
-from ha_spark.energy.soc_integrity import SocMeasurement
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.logging import get_logger
 
 if TYPE_CHECKING:  # avoid an import cycle: config imports devices.base at runtime
@@ -1194,10 +1194,7 @@ class SolisDevice:
         the charging decision, so Protect could not write here even by mistake.
         """
         if state.committed_mode == "protect":
-            current = await self._diagnostic_number("timed_charge_current")
-            if await self.resident_charge_window() is None or current is None or current < 0:
-                return [], "resident schedule unreadable"
-            return [], None
+            return [], await self._resident_schedule_problem()
         if state.fallback.active:
             validated = validate_fallback_schedule(self._settings)
             if isinstance(validated, str):
@@ -1217,6 +1214,183 @@ class SolisDevice:
             (line for line in result.lines if not is_verified(line)), "read-back incomplete"
         )
         return result.lines, f"schedule not confirmed: {detail}"
+
+    async def _resident_schedule_problem(self) -> str | None:
+        """Why the resident slot-1 window and charge current don't read back, else ``None``."""
+        current = await self._diagnostic_number("timed_charge_current")
+        if await self.resident_charge_window() is None or current is None or current < 0:
+            return "resident schedule unreadable"
+        return None
+
+    @device_action(Ownership.PROTECTION)
+    async def release_holds(self) -> list[ActionLine]:
+        """Handover step: release ha-spark's own holds on this inverter for → Observe.
+
+        The owner's explicit handover (ADR-0007), so no fresh clearing evidence
+        is needed, but the rest of the release order stands: the resident
+        schedule must read back, the switch must be readable (Q2), and the
+        records clear only after the On reads back. An Off switch whose request
+        was never confirmed may be the owner's own Off: its record is dropped
+        and the switch left alone. Any failure keeps the records and reports.
+        """
+        store = self._execution.authority
+        identity = HoldDevice(
+            driver=self._config.driver,
+            power_switch=self._config.entities.get("power_switch", ""),
+            hub=self._settings.solis_control_hub, slave=self._settings.solis_modbus_slave,
+        )
+        records = tuple(h for h in store.state.holds if h.device == identity) if (
+            store is not None and store.state is not None
+        ) else ()
+        if not records:
+            return []
+        desc = "release ha-spark's hold: set inverter power switch to On"
+        mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return [_refused(mode)]
+        if mode == "simulate":
+            return [ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)]
+        if mode in ("off", "observe"):
+            return [ActionLine(f"[{mode.upper()}] computed: {desc}", ActionOutcome.SIMULATED)]
+        assert store is not None and store.state is not None
+        entity = identity.power_switch
+        try:
+            try:
+                current = (await self._rest.get_state(entity)).state.strip().lower()
+            except Exception:  # noqa: BLE001 - Q2: never release blind
+                log.warning("Power-switch unreadable; not releasing a hold")
+                return [ActionLine(
+                    f"[WARNING] {desc} refused: state unreadable; "
+                    "a hold is never released blind",
+                    ActionOutcome.REFUSED,
+                )]
+            if current == "on":
+                store.save_holds(tuple(h for h in store.state.holds if h.device != identity))
+                return [ActionLine(
+                    f"[SKIP] {desc} (already set)", ActionOutcome.UNCHANGED_VERIFIED
+                )]
+            if current != "off":
+                log.warning("Power-switch state is not on/off; not releasing a hold")
+                return [ActionLine(
+                    f"[WARNING] {desc} refused: state is not on/off; "
+                    "a hold is never released blind",
+                    ActionOutcome.REFUSED,
+                )]
+            if not any(h.owned and h.confirmed for h in records):
+                store.save_holds(tuple(h for h in store.state.holds if h.device != identity))
+                log.warning("Unconfirmed hold dropped; power switch left Off")
+                return [ActionLine(
+                    "[SKIP] power switch left Off: ha-spark's hold request was never "
+                    "confirmed, so the Off may be the owner's; record dropped",
+                    ActionOutcome.UNCHANGED_VERIFIED,
+                )]
+            problem = await self._resident_schedule_problem()
+            if problem is not None:
+                log.warning("[REFUSED] %s: %s; hold kept", desc, problem)
+                return [ActionLine(
+                    f"[REFUSED] {desc} refused: {problem}; hold kept", ActionOutcome.REFUSED,
+                )]
+            store.save_holds(tuple(
+                h.model_copy(update={"pending_release": True}) if h.device == identity else h
+                for h in store.state.holds
+            ))
+            mismatch = await self._select_option(entity, "On")
+            if not mismatch:
+                store.save_holds(tuple(h for h in store.state.holds if h.device != identity))
+        except Exception:  # noqa: BLE001 - isolate this action's failure
+            log.error("[FAILED] %s", desc)
+            return [ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)]
+        if mismatch:
+            return [ActionLine(f"[WARNING] {desc}, but {mismatch}", ActionOutcome.UNVERIFIED)]
+        return [ActionLine(f"[APPLIED] {desc}", ActionOutcome.VERIFIED)]
+
+    @device_action(Ownership.CHARGING)
+    async def cancel_export(self) -> list[ActionLine]:
+        """Handover step: cancel automatic export before leaving Optimise.
+
+        Clears slot 1's discharge half and zeroes slots 2 and 3, each read back,
+        then clears the export record and sends the supervised cleanup notice.
+        Unlike the safe state, a live verified export is cancelled, not kept. A
+        failed clear keeps the record, so the export stays visible as live.
+        """
+        desc = "cancel automatic export"
+        mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return [_refused(mode)]
+        if mode == "simulate":
+            return [ActionLine(f"[SIMULATE] would {desc}", ActionOutcome.SIMULATED)]
+        if mode in ("off", "observe"):
+            return [ActionLine(f"[{mode.upper()}] computed: {desc}", ActionOutcome.SIMULATED)]
+        export_store = ExportEventStore(self._settings.db_path)
+        previous_record = None
+        if export_store.exists:
+            async with export_store:
+                previous_record = await export_store.load()
+        window_line = await self._clear_discharge_window(desc)
+        lines = [window_line]
+        for slot in (2, 3):
+            _ok, line = await self._zero_guard_slot(slot)
+            lines.append(line)
+        if not all(is_verified(line) for line in lines) or not export_store.exists:
+            return lines
+        try:
+            async with export_store:
+                await export_store.clear()
+        except Exception:  # noqa: BLE001 - the record stays as evidence of export
+            log.error("[FAILED] clear the export record")
+            return [*lines, ActionLine("[FAILED] clear the export record", ActionOutcome.FAILED)]
+        try:
+            await self._notify_export_lifecycle(
+                None, None, False, None, window_line, datetime.now(UTC), previous_record, mode,
+            )
+        except Exception:  # noqa: BLE001 - notification is never a gate
+            log.warning("Export cleanup notice failed")
+        return lines
+
+    @device_action(Ownership.CHARGING)
+    async def write_fallback(self) -> list[ActionLine]:
+        """Handover step: write the fallback window and current as the owner's schedule.
+
+        Runs after ``cancel_export`` verified. A remaining export record refuses
+        the step instead of preserving the export the way ``apply_fallback`` does.
+        The schedule is re-validated now, and every ``_apply`` guard still runs.
+        """
+        validated = validate_fallback_schedule(self._settings)
+        if isinstance(validated, str):
+            return [ActionLine(
+                f"[BLOCKED] Solis fallback invalid: {validated}", ActionOutcome.BLOCKED
+            )]
+        mode = self._coordinator.mode
+        if mode.startswith("refuse:"):
+            return [_refused(mode)]
+        desc = (
+            f"Solis fallback at {validated.current_a} A in "
+            f"{fmt_hhmm(validated.window_start)}-{fmt_hhmm(validated.window_end)} "
+            "as the owner's schedule"
+        )
+        if mode == "simulate":
+            return [ActionLine(f"[SIMULATE] would write {desc}", ActionOutcome.SIMULATED)]
+        if mode != "on":
+            return [ActionLine(f"[SKIP] {desc} not written (mode {mode})", ActionOutcome.SIMULATED)]
+        if ExportEventStore(self._settings.db_path).exists:
+            return [ActionLine(
+                f"[REFUSED] {desc}: automatic export is not cancelled", ActionOutcome.REFUSED
+            )]
+        intent = ChargeIntent(
+            target_soc_pct=0.0, soc=SocMeasurement(SocStatus.UNAVAILABLE, datetime.now(UTC)),
+            window_start=validated.window_start, window_end=validated.window_end,
+        )
+        result = await self._apply(intent, validated.current_a)
+        if result.current_ok and result.window_verified and result.cleanup_ok:
+            return [*result.lines, ActionLine(
+                f"[APPLIED] {desc} read-back verified", ActionOutcome.VERIFIED
+            )]
+        detail = next(
+            (line for line in result.lines if not is_verified(line)), "read-back incomplete"
+        )
+        return [*result.lines, ActionLine(
+            f"[FAILED] {desc} unconfirmed: {detail}", ActionOutcome.FAILED
+        )]
 
     def _save_hold_request(
         self, store: AuthorityStore, identity: HoldDevice, intent: ChargeIntent,

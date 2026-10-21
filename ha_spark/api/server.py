@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -26,12 +27,13 @@ from typing import Any
 
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ha_spark.agent import auth, tools
 from ha_spark.agent.exposure import OPERATION_TIERS, allowed, surface_on
-from ha_spark.authority import authority_view, load_authority
+from ha_spark.authority import OperatingMode, authority_view, load_authority
 from ha_spark.config import (
     _OPTION_KEYS,
     _SECRET_OPTION_KEYS,
@@ -46,7 +48,11 @@ from ha_spark.devices.execution import execution_context
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.logging import get_logger
-from ha_spark.mode_preconditions import NO_FALLBACK_PLATFORM, fallback_schedule_problem
+from ha_spark.mode_preconditions import (
+    NO_FALLBACK_PLATFORM,
+    entry_preconditions,
+    fallback_schedule_problem,
+)
 
 log = get_logger(__name__)
 
@@ -67,6 +73,26 @@ STATE_ATTR = "ha_spark_state"
 # in cleartext. A client that posts this value back is treated as "unchanged"
 # (see apply_options), so a GET-then-POST round-trip can't clobber the secret.
 _REDACTED = "***"
+
+
+# Above one 60 s daemon tick, below HA's ingress proxy timeout.
+_MODE_REPLY_TIMEOUT_S = 90
+_PAGE_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'; img-src 'self'; frame-ancestors 'self'; "
+        "base-uri 'none'; form-action 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+}
+
+
+class ModeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target: OperatingMode
+    expected_epoch: int | None = Field(ge=1, strict=True)
 
 
 @dataclass
@@ -372,6 +398,68 @@ def build_app(
                 raise HTTPException(status_code=401, detail="invalid or missing token")
 
         app.router.dependencies.append(Depends(_auth))
+
+    if ingress_peer is not None and not require_token:
+
+        @app.get("/")
+        async def mode_page() -> Response:
+            return Response(
+                Path(__file__).with_name("mode.html").read_text(),
+                media_type="text/html", headers=_PAGE_HEADERS,
+            )
+
+        @app.get("/mode.js")
+        async def mode_script() -> Response:
+            return Response(
+                Path(__file__).with_name("mode.js").read_text(),
+                media_type="text/javascript", headers=_PAGE_HEADERS,
+            )
+
+        @app.get("/api/mode")
+        async def get_mode(request: Request) -> JSONResponse:
+            st = _state_of(request)
+            if st.executor is None:
+                return JSONResponse({"error": "no daemon executor"}, status_code=503)
+            preconditions = await entry_preconditions(st.settings)
+            # Snapshot after the diagnostic reads; preconditions never grant authority.
+            view = dict(st.executor.authority_status())
+            view["preconditions"] = preconditions
+            return JSONResponse(view, headers={"Cache-Control": "no-store"})
+
+        @app.post("/api/mode")
+        async def post_mode(request: Request) -> JSONResponse:
+            user = request.headers.get("X-Remote-User-Id", "")
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user) is None:
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            if request.headers.get("X-HA-Spark-Request") != "mode":
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                return JSONResponse({"error": "application/json required"}, status_code=415)
+            try:
+                body = ModeBody.model_validate(await request.json())
+            except (ValueError, ValidationError):
+                return JSONResponse({"error": "invalid mode request"}, status_code=400)
+            executor = _state_of(request).executor
+            if executor is None:
+                return JSONResponse({"error": "no daemon executor"}, status_code=503)
+            try:
+                # Accepted within one daemon tick; a later verdict still lands in the store.
+                reply = await asyncio.wait_for(executor.submit_mode(
+                    body.target, body.expected_epoch, ingress_user=user,
+                ), timeout=_MODE_REPLY_TIMEOUT_S)
+            except TimeoutError:
+                return JSONResponse(
+                    {"error": "pending", "detail": "request queued; reload the mode status"},
+                    status_code=504,
+                )
+            if reply.error:
+                status = 409 if reply.error in ("stale_epoch", "transition_in_progress") else 400
+                return JSONResponse(
+                    {"error": reply.error, "detail": reply.text, "reasons": reply.reasons},
+                    status_code=status,
+                )
+            return JSONResponse(reply.authority or {})
 
     @app.get("/api/health")
     async def health(request: Request) -> dict[str, Any]:
