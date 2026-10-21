@@ -42,17 +42,24 @@ security and prefer the safe default. Hard rules:
 - **The LLM never controls hardware.** It explains, or proposes facts that are
   validated before storage; it must not reach `call_service`. The deterministic
   planner is the sole decider.
-- **Actuation invariants:** real writes only when `PROACTIVE_MODE == on` (and
-  `control == ha_spark` under the driver layer), never on an invalid SoC, always
-  read-back verified, failures isolated per action. One narrow exception: after
-  `soc_failure_threshold` failed SoC checks, Solis may program the configured
-  cheap-rate window at an explicitly set `solis_fallback_current_a`, through the
-  same gates and read-back; no default current, and AlphaESS never gets it.
-  Don't weaken these (`ha_spark/devices/inverters/`, `energy/supply_guard.py`,
-  `energy/soc_monitor.py`). In v1 the site **operating mode** (Observe/Protect/
-  Optimise, decision #266) replaces `PROACTIVE_MODE`/`control` as the write gate;
-  until that lands, the current gates stand, and the replacement must be at
-  least as strict.
+- **Actuation invariants:** the site **operating mode** (Observe/Protect/
+  Optimise, ADR-0008) is the only write gate. It lives in the daemon's durable
+  authority store, never in Settings, and only an owner transition changes it.
+  Only the daemon actuates: real writes go through `WriteGate.mode_for` and the
+  write-time `WriteGate.recheck` (`devices/execution.py`). Observe, unknown
+  authority and a failed authority save write nothing; Protect writes only its
+  holds (and enabled clock sync); Optimise runs the plan. An invalid SoC
+  blocks every SoC-derived write; always read back; isolate failures per
+  action. Writes that don't depend on SoC keep their own safeguards: holds
+  (discharge prevention) and authorised clock sync, and, after
+  `soc_failure_threshold` failed SoC checks, the Solis fallback in Optimise,
+  which programs the configured cheap-rate window at an explicitly set
+  `solis_fallback_current_a` through the same gates and read-back; no default
+  current, and AlphaESS never gets it. A hold starts only on fresh evidence
+  and ends on fresh clear evidence, a dispatch's last trusted end, or an
+  explicit owner handover; `On` is written only to a readable switch. Don't weaken these
+  (`ha_spark/devices/inverters/`, `energy/supply_guard.py`,
+  `energy/soc_monitor.py`, `authority.py`, `transitions.py`).
 - **Parameterised SQL only**; no `eval`/`exec`/`shell=True`/shell interpolation
   of external data.
 - **Network:** outbound only to configured endpoints; any inbound network
@@ -88,9 +95,8 @@ proxy with `SUPERVISOR_TOKEN`; **standalone/dev** needs both `HA_URL` +
 
 Standing decisions: single remote `OLLAMA_URL` tier
 with deterministic offline fallback; raw `entity_id` addressing, no fuzzy name
-matching; `proactive_mode = off|simulate|on` (default `simulate`) gates every
-write, through the same decision path with side effects suppressed (retired in
-v1 for the operating mode; every v1 install starts in Observe).
+matching; every install starts in Observe, which runs the same decision path
+as Optimise with side effects suppressed (`[SIMULATE]`).
 
 ## Conventions
 

@@ -782,10 +782,23 @@ async def test_dynamic_plan_parity_between_scheduler_and_agent_plan(
 
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
 
+    # Pin the clock so both plan computations share the exact same ``now``.
+    # A few minutes before a half-hour boundary makes a straddle regression
+    # obvious: the two paths would then build horizons of different lengths.
+    now = datetime(2026, 6, 10, 12, 25, tzinfo=UTC)
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            return cls.fromtimestamp(now.timestamp(), tz)
+
+    monkeypatch.setattr(sources, "datetime", _FixedDatetime)
+    monkeypatch.setattr(scheduler, "datetime", _FixedDatetime)
+    monkeypatch.setattr("ha_spark.energy.soc_monitor.datetime", _FixedDatetime)
+
     # One wide live-rate point spanning the whole horizon at a distinctive price,
     # so every slot is priced 0.99 regardless of today's date — nothing like the
     # fixed 0.069/0.30, so a fixed-fallback bug would show up in the cost.
-    now = datetime.now(UTC)
     rates = [{
         "start": (now - timedelta(days=1)).isoformat(),
         "end": (now + timedelta(days=3)).isoformat(),
@@ -4020,6 +4033,7 @@ def test_ev_hold_overnight_exception_requires_a_resident_window_and_no_discharge
 
 _SWITCH_URL = "http://ha.test/api/states/select.solisac_power_switch"
 _SWITCH_WRITE_URL = "http://ha.test/api/services/select/select_option"
+_CLOCK_URL = "http://ha.test/api/states/sensor.solis_control_inverter_clock"
 _RESIDENT_FIELDS = (
     "timed_charge_start_hours",
     "timed_charge_start_minutes",
@@ -4062,19 +4076,35 @@ def _switch_writes() -> list[httpx.Response]:
     return [call for call in respx.calls if call.request.method == "POST"]
 
 
-def _mock_resident_window(start: time, end: time) -> None:
-    """The resident slot-1 charge window as #418 reads it back (GETs only)."""
+def _mock_resident_window(
+    start: time, end: time, *, at: datetime | None = None, clock_at: datetime | None = None,
+) -> None:
+    """The resident slot-1 charge window as #418 reads it back (GETs only).
+
+    ``at`` is every field's ``last_reported``; ``clock_at`` mocks the hub's
+    inverter-clock sibling (#444).
+    """
     values = dict(zip(
         _RESIDENT_FIELDS, (start.hour, start.minute, end.hour, end.minute), strict=True
     ))
     for field, value in values.items():
+        body: dict[str, object] = {
+            "entity_id": f"sensor.solis_control_{field}",
+            "state": str(value),
+            "attributes": {},
+        }
+        if at is not None:
+            body["last_reported"] = at.isoformat()
         respx.get(f"http://ha.test/api/states/sensor.solis_control_{field}").mock(
-            return_value=httpx.Response(200, json={
-                "entity_id": f"sensor.solis_control_{field}",
-                "state": str(value),
-                "attributes": {},
-            })
+            return_value=httpx.Response(200, json=body)
         )
+    if clock_at is not None:
+        respx.get(_CLOCK_URL).mock(return_value=httpx.Response(200, json={
+            "entity_id": "sensor.solis_control_inverter_clock",
+            "state": "2026-06-11 01:15:00",
+            "attributes": {},
+            "last_reported": clock_at.isoformat(),
+        }))
 
 
 def _mock_battery_power(state: str, at: datetime) -> None:
@@ -4329,7 +4359,7 @@ async def test_overnight_exception_blocks_a_new_hold_inside_a_resident_window(
     now = datetime(2026, 6, 11, 1, 15, tzinfo=UTC)
     switch = _mock_power_switch(monkeypatch, initial="Off")
     respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Charging", at=now))
-    _mock_resident_window(time(23, 30), time(5, 30))
+    _mock_resident_window(time(23, 30), time(5, 30), at=now, clock_at=now)
     _mock_battery_power("-2851", now)
     ev_state = scheduler.EvHoldState()
 
@@ -4421,6 +4451,121 @@ async def test_overnight_exception_holds_when_direction_or_window_is_not_verifie
         assert any(
             "[APPLIED] set inverter power switch to Off" in line for line in result.lines
         )
+
+
+_WINDOW_NOW = datetime(2026, 6, 11, 1, 15, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("window_at", "clock_at", "excepted"),
+    [
+        (_WINDOW_NOW - timedelta(minutes=4), None, True),  # own reports fresh
+        (_WINDOW_NOW - timedelta(hours=5), _WINDOW_NOW - timedelta(seconds=11), True),
+        (_WINDOW_NOW - timedelta(hours=5), _WINDOW_NOW - timedelta(minutes=10), False),
+        (_WINDOW_NOW - timedelta(hours=5), None, False),  # no clock sibling
+        (_WINDOW_NOW - timedelta(hours=13), _WINDOW_NOW - timedelta(seconds=11), False),
+        (_WINDOW_NOW + timedelta(minutes=5), _WINDOW_NOW, False),  # future-dated
+        (None, _WINDOW_NOW, False),  # no last_reported at all
+    ],
+)
+@respx.mock
+async def test_overnight_exception_needs_fresh_resident_window_reports(
+    monkeypatch: pytest.MonkeyPatch,
+    window_at: datetime | None, clock_at: datetime | None, excepted: bool,
+) -> None:
+    """#444: a cached window is not read back; the clock sibling may vouch up to 12 h."""
+    now = _WINDOW_NOW
+    _mock_power_switch(monkeypatch)
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Charging", at=now))
+    _mock_resident_window(time(23, 30), time(5, 30), at=window_at, clock_at=clock_at)
+    if clock_at is None:
+        respx.get(_CLOCK_URL).mock(return_value=httpx.Response(404))
+    _mock_battery_power("-2851", now)
+    ev_state = scheduler.EvHoldState()
+
+    await scheduler.reconcile_tick(
+        _ev_hold_settings(
+            authority_mode="observe",
+            battery_power_entity="sensor.battery_power",
+            battery_power_discharge_sign="positive",
+        ),
+        _plan(replace(_INTENT, holds=())),
+        now,
+        ev_hold_state=ev_state,
+    )
+
+    assert ev_state.active is not excepted
+
+
+@respx.mock
+async def test_overnight_exception_caps_own_window_reports_at_12_hours(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#444: a max-age above 12 h never makes a 13 h old window field fresh."""
+    now = _WINDOW_NOW
+    _mock_power_switch(monkeypatch)
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Charging", at=now))
+    _mock_resident_window(time(23, 30), time(5, 30), at=now - timedelta(hours=13), clock_at=now)
+    _mock_battery_power("-2851", now)
+    ev_state = scheduler.EvHoldState()
+
+    await scheduler.reconcile_tick(
+        _ev_hold_settings(
+            authority_mode="observe",
+            battery_power_entity="sensor.battery_power",
+            battery_power_discharge_sign="positive",
+            battery_power_max_age_seconds=86400,
+        ),
+        _plan(replace(_INTENT, holds=())),
+        now,
+        ev_hold_state=ev_state,
+    )
+
+    assert ev_state.active is True
+
+
+@pytest.mark.parametrize("bad", ["unavailable", "future", "clock-unavailable"])
+@respx.mock
+async def test_overnight_exception_off_when_one_window_report_is_unusable(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    """#444: one unavailable or future-dated field, or a dead clock, means no exception."""
+    now = _WINDOW_NOW
+    stale = now - timedelta(hours=2)
+    _mock_power_switch(monkeypatch)
+    respx.get(_EV_STATUS_URL).mock(return_value=_ev_status_state("Charging", at=now))
+    _mock_resident_window(time(23, 30), time(5, 30), at=stale, clock_at=now)
+    field = f"http://ha.test/api/states/sensor.solis_control_{_RESIDENT_FIELDS[2]}"
+    if bad == "unavailable":
+        respx.get(field).mock(return_value=httpx.Response(200, json={
+            "entity_id": "x", "state": "unavailable", "attributes": {},
+            "last_reported": now.isoformat(),
+        }))
+    elif bad == "future":
+        respx.get(field).mock(return_value=httpx.Response(200, json={
+            "entity_id": "x", "state": "5", "attributes": {},
+            "last_reported": (now + timedelta(minutes=2)).isoformat(),
+        }))
+    else:
+        respx.get(_CLOCK_URL).mock(return_value=httpx.Response(200, json={
+            "entity_id": "x", "state": "unavailable", "attributes": {},
+            "last_reported": now.isoformat(),
+        }))
+    _mock_battery_power("-2851", now)
+    ev_state = scheduler.EvHoldState()
+
+    await scheduler.reconcile_tick(
+        _ev_hold_settings(
+            authority_mode="observe",
+            battery_power_entity="sensor.battery_power",
+            battery_power_discharge_sign="positive",
+        ),
+        _plan(replace(_INTENT, holds=())),
+        now,
+        ev_hold_state=ev_state,
+    )
+
+    assert ev_state.active is True
 
 
 @pytest.mark.parametrize("mode", ["protect", "optimise", "observe"])

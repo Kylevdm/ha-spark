@@ -5,7 +5,8 @@ with a person present, that a forced grid charge can be commanded on the Solis S
 inverter, before any ha-spark driver code depends on the sequence.
 
 **HITL.** Every write here is made by a human in the Home Assistant UI. ha-spark writes nothing;
-`proactive_mode` is irrelevant to this run.
+the operating mode is irrelevant to these manual writes. Keep ha-spark in Observe
+so its automatic control does not interfere with the run.
 
 **No tier-A source exists for any Solis storage register.** Everything below is community-grade
 evidence about a model that is not on the integration's confirmed list. That is why this run

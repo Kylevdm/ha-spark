@@ -250,3 +250,21 @@ def test_agent_config_rejects_invalid_document_before_saving(tmp_path: Path) -> 
     assert "SECRET_OCTO" not in resp.text
     assert options.read_bytes() == seeded
     assert state.settings.min_soc == 20.0
+
+
+def test_agent_config_rejects_a_changed_db_path(tmp_path: Path) -> None:
+    """#441: /agent/config cannot move ``db_path`` either. The rejection leaves
+    the options file byte-identical and the running settings untouched, with a
+    reason naming ``db_path`` that never echoes the submitted value.
+    """
+    options = tmp_path / "options.json"
+    seeded = json.dumps({"min_soc": 20.0}).encode()
+    options.write_bytes(seeded)
+    state = _state(tmp_path, exposure="read_write", min_soc=20.0)
+    with TestClient(build_app(state)) as client:
+        resp = client.post("/agent/config", json={"db_path": "TOPSECRET/moved-db.db"})
+    assert resp.status_code == 400
+    assert "db_path" in resp.json()["detail"]
+    assert "TOPSECRET/moved-db.db" not in resp.text
+    assert options.read_bytes() == seeded
+    assert state.settings.db_path == str(tmp_path / "t.db")

@@ -694,20 +694,21 @@ def next_ev_hold_state(
     return EvHoldState(active=True, clear_count=count, last_clear_report_at=reported_at)
 
 
-async def _resident_charge_window(device: Device) -> tuple[time, time] | None:
+async def _resident_charge_window(device: Device, now: datetime) -> tuple[time, time] | None:
     """The resident slot-1 charge window read back from the inverter (#420).
 
-    Reuses #418's overlay reads (GETs only, no refresh, no write). ``None``
-    means unknown or unsupported: unknown is not verified, so the overnight
-    exception never applies on a ``None`` read.
+    Reuses #418's overlay reads (GETs only, no refresh, no write), counted
+    only when every field reports fresh (#444). ``None`` means unknown or
+    unsupported: unknown is not verified, so the overnight exception never
+    applies on a ``None`` read.
     """
-    reader: Callable[[], Awaitable[tuple[time, time] | None]] | None = getattr(
-        device, "resident_charge_window", None
+    reader: Callable[[datetime], Awaitable[tuple[time, time] | None]] | None = getattr(
+        device, "verified_resident_charge_window", None
     )
     if reader is None:
         return None
     try:
-        return await reader()
+        return await reader(now)
     except Exception:  # noqa: BLE001 - an unreadable window is not verified
         log.debug("Resident charge-window read failed; the overnight exception is off")
         return None
@@ -736,7 +737,7 @@ async def _observe_ev_hold(
         and evidence is not None
         and evidence.validity == "fresh"
     ):
-        resident = await _resident_charge_window(device)
+        resident = await _resident_charge_window(device, now)
         exception = ev_hold_overnight_exception(
             now,
             resident,
@@ -980,7 +981,7 @@ async def reconcile_tick(
     ``previous``: only lines that changed since the last pass are logged. A
     per-minute pass that logged unconditionally would put 1440 identical lines a
     day into the add-on log — most of them ``[SKIP] ... (already set)``, or in
-    the default ``simulate`` mode a write that never happens — and bury the plan
+    Observe a write that never happens — and bury the plan
     and guard activity an operator actually reads it for.
 
     ``trusted_holds`` is the caller's last trusted dispatch hold set, substituted
@@ -1588,7 +1589,7 @@ async def run_forever(settings: Settings, *, poll_seconds: int = 60) -> None:
 
 async def _accept_mode(
     settings: Settings, channel: DaemonChannel, pending: Pending,
-    measurement: SocMeasurement | None, now: datetime,
+    measurement: SocMeasurement | None, now: datetime, *, soc_programming_held: bool,
 ) -> Reply:
     store = channel.authority
     assert store is not None
@@ -1609,7 +1610,9 @@ async def _accept_mode(
         async with HomeAssistantRest(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
         ) as rest:
-            report = await check_preconditions(settings, rest, measurement)
+            report = await check_preconditions(
+                settings, rest, measurement, soc_programming_held=soc_programming_held,
+            )
     kind: RequesterKind = "ingress" if pending.ingress_user is not None else "cli"
     decision = propose_transition(
         store.state if known else None,
@@ -1637,7 +1640,7 @@ async def _accept_mode(
 async def _mode_lifecycle(
     settings: Settings, channel: DaemonChannel, pending: Pending | None,
     measurement: SocMeasurement | None, now: datetime, plan: ChargePlan | None,
-    ev_hold_state: EvHoldState,
+    ev_hold_state: EvHoldState, *, soc_programming_held: bool,
 ) -> None:
     store = channel.authority
     assert store is not None
@@ -1648,7 +1651,10 @@ async def _mode_lifecycle(
             await stack.enter_async_context(context.coordinator_for(config, settings).transition())
         if pending is not None:
             try:
-                reply = await _accept_mode(settings, channel, pending, measurement, now)
+                reply = await _accept_mode(
+                    settings, channel, pending, measurement, now,
+                    soc_programming_held=soc_programming_held,
+                )
             except (OSError, ValueError):
                 reply = Reply(error="authority persistence failed")
             except Exception:
@@ -2024,6 +2030,7 @@ async def _run_forever(
                 try:
                     await _mode_lifecycle(
                         settings, channel, mode_request, measurement, now, last_plan, ev_hold_state,
+                        soc_programming_held=monitor.fallback_active or monitor.recovery_blocked,
                     )
                 except (OSError, ValueError):
                     log.warning("Authority handover save failed; hardware writes refused")

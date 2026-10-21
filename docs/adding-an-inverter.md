@@ -96,23 +96,36 @@ command as an ordinary charge-only intent. `export_trusted` is `False` when the
 Axle read failed, so an empty `export` then means "unknown", not "cancelled"
 (#148).
 
-## Control authority and the actuation gate
+## Operating mode and the actuation gate
 
-Every device carries a `control` authority (`ControlAuthority`):
-`observe` (read and plan around, never write), `ha_spark` (may write), or
-`supplier` (reserved for a device a third party controls). Drivers call
-`effective_mode(config.control, settings.proactive_mode)` at the top of
-`apply` (and any other write path) and branch on the result: `on` makes real
-`call_service` writes, `simulate` and `observe` log the intended writes only,
-and `off` only computes. A real write requires **both** `control == ha_spark`
-**and** `proactive_mode == on`. Anything else suppresses side effects through
-the same decision path. Don't weaken this gate.
+The daemon owns one site operating mode and the shared execution context in
+`ha_spark/devices/execution.py`. Each complete device action (prerequisite
+reads, writes and read-backs) runs under its bus coordinator's action lock.
+`WriteGate.mode_for(ownership, config, settings)` supplies the coordinator
+mode: `"on"` permits writes, `"simulate"` logs `[SIMULATE]` without writing,
+and `"refuse:..."` reports why the action cannot run. Drivers use the
+coordinator mode rather than deciding permission from settings.
 
-In v1 the add-on drivers retire at cutover into device modules in the
-companion integration
-([ADR 0005](adr/0005-integration-authority-and-operating-modes.md#core-and-device-modules-amended-by-336-2026-10-17)),
-and the site operating mode replaces `control`/`proactive_mode` as this gate
-([ADR 0008](adr/0008-operating-mode-and-authority-lifecycle.md)).
+Ownership is `Ownership.PROTECTION`, `CHARGING` or `CLOCK`. Observe simulates
+all three; Protect permits protection and clock actions but simulates charging;
+Optimise permits all three, subject to every existing device safeguard.
+Unknown authority, failed persistence and stale planned epochs or config
+generations refuse writes. During handover only the running stored step's
+ownership classes can actuate.
+
+Immediately before **every** actuating service call, use the coordinator's
+`confirm_write()`: it calls `WriteGate.recheck` under the held lock and raises
+if permission no longer holds. A cached action mode is not a write-time grant.
+Keep read-back verification, write-if-changed and per-action failure isolation.
+Only the daemon actuates; CLI and agent callers submit work to it.
+
+A new driver stays Observe-only until its model has a validated hold, release,
+read-back and evidence-freshness contract declared by `hold_validation()`.
+`mode_preconditions.check_preconditions` checks that contract, required evidence
+and the single-inverter restriction. Optimise also requires a validated fallback
+charging schedule and trusted SoC. AlphaESS has no validated hold surface (#196).
+The later companion integration takes over device I/O; phase 2 still uses
+add-on drivers ([ADR 0008](adr/0008-operating-mode-and-authority-lifecycle.md)).
 
 ## Registering a new driver
 
@@ -136,7 +149,8 @@ and the site operating mode replaces `control`/`proactive_mode` as this gate
    `HomeAssistantRest` (mock the service calls and state reads), as the Solis
    driver's tests do. Cover the applied happy path, a read-back mismatch
    warning, a write failure, the SoC-unreadable guard, and the
-   `observe`/`simulate` authority branches.
+   Observe simulation, Protect ownership restrictions, unknown authority and
+   stale-epoch refusals through the public device methods.
 
 ## The preset pattern
 

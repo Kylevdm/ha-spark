@@ -4,21 +4,23 @@ Human-present procedure for the first production-path Axle export event. This
 runbook covers the prototype in [#128](https://github.com/Kylevdm/ha-spark/issues/128)
 and the implementation in [#133](https://github.com/Kylevdm/ha-spark/issues/133).
 
-This is supervised hardware control. The operator enables real control shortly
+This is supervised hardware control. The operator requests Optimise shortly
 before the event, watches the inverter and household telemetry throughout, and
-returns ha-spark to `simulate` after verified cleanup. Do not use a parallel HA
+returns ha-spark to Observe after verified cleanup. Do not use a parallel HA
 automation or enter an event window by hand.
 
 ## Before the event
 
 - [ ] A person is present and can stop the run immediately.
-- [ ] `proactive_mode` is `simulate` while the installation is prepared.
-- [ ] The configured inverter device has `control: ha_spark` and the Solis
-      overlay is healthy.
+- [ ] The committed operating mode is Observe while the installation is prepared.
+- [ ] The Solis overlay is healthy, the daemon is running, and `ha-spark mode show`
+      reports all Optimise entry preconditions pass, including a validated model,
+      configured protection evidence, trusted SoC and a configured fallback
+      current.
 - [ ] The incumbent automations that write the Solis power switch or timed
       discharge window are disabled for this run.
-- [ ] Clock check steps 1 to 3 pass in `simulate`. The sync (steps 4 and 5)
-      runs right after real control is enabled, before the window arms (see
+- [ ] Clock check steps 1 to 3 pass in Observe. The sync (steps 4 and 5)
+      runs right after Optimise is requested, before the window arms (see
       [Clock check](#clock-check)). The configured `timezone` is the
       **household clock**, and everything else is checked against it. Slot 1
       stores a local wall-clock window with no date, which the inverter fires
@@ -37,9 +39,10 @@ automation or enter an event window by hand.
 
 ### Clock check
 
-Steps 1 to 3 run while still in `simulate`. Steps 4 and 5 run shortly before the
-event, right after real control is enabled (the sync writes only when
-`proactive_mode` is `on`) and before the export window arms.
+Steps 1 to 3 run while still in Observe. Steps 4 and 5 run shortly before the
+event, after the owner requests Optimise and before the export window arms.
+Clock sync goes through the running daemon and its write gate; it writes only
+when the current operating mode and transition authorise it.
 
 1. **First native read only:** in Home Assistant, briefly enable the disabled
    `sensor.solisac_rtc` entity. Confirm `sensor.solis_control_inverter_clock`
@@ -74,7 +77,8 @@ Record the clock check before proceeding. Use UTC for the record timestamp.
 | Operator / outcome | |
 
 Keep the record with the event evidence for #134. A failed or incomplete clock
-check is an abort condition. Return `proactive_mode` to `simulate`.
+check is an abort condition. Request Observe with `ha-spark mode set observe`
+or the ingress mode page and verify the handover completes.
 
 The accepted-event notice is the preparation prompt. It includes the event
 window, planned export, DNO limit, and the requirement to keep a person present.
@@ -84,10 +88,12 @@ event. Repeated polls of the same event do not repeat it.
 ## Enable and observe
 
 1. Confirm the accepted notice and the planner output identify the same event.
-2. Set `proactive_mode` to `on` on the add-on's **Configuration** tab.
+2. Request Optimise on the ingress mode page or with `ha-spark mode set optimise`.
+   The daemon must be running; a refused request grants nothing. The mode stays
+   activating until its first fresh plan is fully read-back verified.
 3. Run [Clock check](#clock-check) steps 4 and 5 (sync, then `health`) and fill
-   in the record. If the sync is not confirmed, return to `simulate`.
-4. Confirm the control authority is still `ha_spark`, the power switch is `On`,
+   in the record. If the sync is not confirmed, request Observe and verify handover.
+4. Confirm the committed mode is Optimise, the power switch is `On`,
    and the fresh SoC guard passes.
 5. Watch the log for the verified Solis timed-discharge current and Slot 1
    window. The start notice is sent only after those writes have read back.
@@ -111,7 +117,7 @@ Stop the run and leave the installation in the safe state if any of these occur:
 
 - event identity, direction, or window changes unexpectedly;
 - event data is stale, malformed, or no longer explicit;
-- SoC, power switch, control authority, work mode, or overlay health fails;
+- SoC, power switch, operating-mode authority, work mode, or overlay health fails;
 - a current or Slot 1 write is rejected or does not read back;
 - battery, solar, house-load, or grid telemetry cannot confirm the expected
   direction or the export limit is approached;
@@ -135,11 +141,14 @@ notice is not evidence that cleanup succeeded; verify the Slot 1 read-back.
    window reads back as `00:00-00:00`.
 3. Record the cleanup timestamp, final Slot 1 values, final SoC, grid power,
    and any remaining plan or guard warnings.
-4. If cleanup is not verified, keep the person present, leave real control
-   disabled, and inspect the overlay before any retry. Do not assume a notice
-   was proof of cleanup.
-5. Set `proactive_mode` back to `simulate` and confirm the log reports computed
-   actions without Home Assistant write services.
+4. If cleanup is not verified, keep the person present, request Observe, and
+   inspect the overlay before any retry. A failed handover stays visible as
+   switching to Observe; do not assume a notice was proof of cleanup.
+5. Request Observe on the ingress mode page or with `ha-spark mode set observe`.
+   Verify the handover completes and the committed mode is Observe. Only then
+   confirm `[SIMULATE]` actions with no hardware-actuating service calls.
+   Leaving Optimise cancels export, writes and verifies the fallback charging schedule,
+   then releases owned holds before committing Observe.
 
 ## Restart recovery
 
@@ -150,8 +159,8 @@ notice is not evidence that cleanup succeeded; verify the Slot 1 read-back.
   the next trusted plan either continues it or performs verified cleanup.
 - If the process is intentionally stopped after the event, keep writes
   authorised long enough to verify the safe state. A forced process kill may
-  skip cleanup, so a person must check the overlay before real control is
-  enabled again.
+  skip cleanup, so a person must check the overlay before requesting Optimise
+  again.
 
 ## Evidence record
 

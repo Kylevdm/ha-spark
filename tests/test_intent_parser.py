@@ -123,6 +123,13 @@ async def test_unmatched_message_returns_help() -> None:
     assert "strategy" in result.text
 
 
+async def test_help_advertises_operating_mode_not_retired_gate() -> None:
+    result = await parse_offline("help", Settings(), REST)  # type: ignore[arg-type]
+    assert not result.matched
+    assert "mode                                  the site operating mode" in result.text
+    assert "proactive" not in result.text
+
+
 async def test_plan_failure_is_reported_not_raised(monkeypatch: pytest.MonkeyPatch) -> None:
     async def boom(settings: Settings, rest: Any) -> PlanRun:
         raise RuntimeError("HA is down")

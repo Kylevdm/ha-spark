@@ -13,8 +13,8 @@ from an offset remembered between passes. So a restart across the change still
 syncs, a ``timezone`` hot-reload is never mistaken for a change, and a stale
 memory can never fire weeks later. The only state is which change has already
 been handled. The six-hour lookback bounds the whole episode: a failing sync
-retries every pass until then (one notification after 30 minutes), and a switch
-from ``simulate`` to ``on`` inside it still syncs.
+retries every pass until then (one notification after 30 minutes), and an authorised
+operating-mode change inside it still syncs.
 
 Daylight saving only, never drift: nothing here reads the clock error to decide
 whether to sync, and it syncs whatever the error beforehand. Every write

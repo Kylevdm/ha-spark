@@ -7,7 +7,7 @@ implementation detail.
 
 **The plan**:
 The *current* plan, recomputed every half-hourly tariff slot, not "tonight's
-plan" computed once a day. Simulate-mode logs, the savings backtest, and
+plan" computed once a day. Observe logs, the savings backtest, and
 copilot explanations all refer to the latest revision. Drivers write only when
 a recomputation changes a setpoint.
 (Decision: Q7, 2026-07-12.)
@@ -16,7 +16,7 @@ a recomputation changes a setpoint.
 The point at which ha-spark runs Kyle's own household better than a configured
 Predbat could: a zero-export site with heavy load, solar, V2L charging, and
 flexibility payments. It is not the shipped v0.9.0 "MVP" roadmap milestone
-(planner, Solis actuation, and simulate mode).
+(planner, Solis actuation, and plan previews).
 
 **Zero-export site**:
 A household where export is *permitted* (G98) but *unpaid* (no MCS, so no
@@ -69,10 +69,10 @@ validated context facts but never set a setpoint. HA holds the Telegram
 credentials; ha-spark holds none.
 
 **Readiness signal**:
-A recommendation, never a gate. When simulate-mode history clears a measured
+A recommendation, never a gate. When Observe history clears a measured
 bar (a clean multi-week backtest beating the incumbent setup, no simulated
 guard breaches, improved forecast error), ha-spark *tells* the owner it makes
-sense to enable real control. Switching it on is always the owner's own
+sense to enter Optimise. Changing the operating mode is always the owner's own
 decision. (Decision: Q11, 2026-07-12.)
 
 **Reservation**:
@@ -237,14 +237,16 @@ unpaid.
 _Avoid_: orphaned force (that is the in-memory RC keep-alive's failure, not a
 resident window's)
 
-**Hold** — a period, outside the overnight charging window, during which
+**Hold** — a period during which
 ha-spark stops the house battery discharging so it never feeds the car. A
 hold is caused by an Octopus dispatch, or by the car actively charging
 (charging, boosting or delivering; *not* eco+ solar diversion) whether or not
 a dispatch explains it. Unknown evidence cannot start a hold; a confirmed EV
-hold needs fresh clear evidence or explicit handover to end, while a dispatch
-hold ends at its last trusted end time. A hold outranks fallback charging and
-a flexibility-event export.
+hold needs five distinct, advancing fresh not-charging reports or explicit
+handover to end, while a dispatch hold ends at its last trusted end time.
+A verified charge window with fresh battery-direction evidence showing no
+discharge can prevent a new hold, but cannot clear a confirmed EV hold. A hold
+outranks fallback charging and a flexibility-event export.
 (Decisions: #170, 2026-10-04; #267, 2026-10-12.)
 _Avoid_: dispatch hold (when meaning either cause), pause, block
 
@@ -268,12 +270,20 @@ plans without writing to hardware.
 **Protect**:
 An operating mode that prevents the house battery feeding the car while
 ordinary charging schedules remain under manual control. It owns the controls
-needed to apply and release that protection. It does not depend on the
-add-on, so it never uses the fallback charging schedule.
+needed to apply and release that protection, with optional clock-change sync.
+It never uses the fallback charging schedule. In phase 2 the add-on daemon
+provides protection; protection independent of the add-on awaits the integration.
 
 **Optimise**:
 An operating mode that authorises the full automatic energy plan, subject to
 safety checks. Settings and device definitions cannot grant this authority.
+
+**Authority store**:
+The durable record of the site's operating mode, authority epoch, transition,
+holds and fallback state. In phase 2 it belongs to the add-on, not Settings;
+only the running daemon changes authority on an owner's request. A missing or
+invalid previously initialised store means authority unknown, with no hardware
+writes, until the owner confirms Observe. Every install starts in Observe.
 
 **Temporary manual control**:
 An explicit handover of the site's controls to the owner. It expires by

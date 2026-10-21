@@ -71,6 +71,7 @@ from ha_spark.devices.inverters.solis_clock import (
 )
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome, is_verified
 from ha_spark.devices.registry import register
+from ha_spark.energy.evidence_freshness import check_report_time
 from ha_spark.energy.export_notifications import (
     ExportNotificationStore,
     make_notice,
@@ -79,7 +80,7 @@ from ha_spark.energy.export_notifications import (
 )
 from ha_spark.energy.export_store import ExportEventStore
 from ha_spark.energy.models import ChargeIntent, ExportIntent, window_hours
-from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+from ha_spark.energy.soc_integrity import MAX_UNCHANGED, SocMeasurement, SocStatus
 from ha_spark.logging import get_logger
 
 if TYPE_CHECKING:  # avoid an import cycle: config imports devices.base at runtime
@@ -110,6 +111,14 @@ _WINDOW_FIELDS = (
     "timed_discharge_end_minutes",
 )
 _SLOT_SUFFIX = {1: "", 2: "_2", 3: "_3"}
+
+
+def _window_part(index: int, value: float | None) -> int | None:
+    """A whole hour (even index) or minute (odd index) window field, else ``None``."""
+    maximum = 23 if index % 2 == 0 else 59
+    if value is None or not math.isfinite(value) or not value.is_integer():
+        return None
+    return int(value) if 0 <= value <= maximum else None
 # Current register scale: the overlay sensor decodes raw/10 to amps; encode x10.
 _CURRENT_SCALE = 10.0
 _MAX_CHARGE_CURRENT_A = 62.5
@@ -352,11 +361,51 @@ class SolisDevice:
         """
         parts: list[int] = []
         for index, field in enumerate(_WINDOW_FIELDS[:4]):
-            value = await self._diagnostic_number(field)
-            maximum = 23 if index % 2 == 0 else 59
-            if value is None or not value.is_integer() or not 0 <= value <= maximum:
+            part = _window_part(index, await self._diagnostic_number(field))
+            if part is None:
                 return None
-            parts.append(int(value))
+            parts.append(part)
+        return (time(parts[0], parts[1]), time(parts[2], parts[3]))
+
+    async def verified_resident_charge_window(self, now: datetime) -> tuple[time, time] | None:
+        """The resident slot-1 charge window only when every field reports fresh (#444).
+
+        A cached HA state is not a live picture. The overlay advances
+        ``last_reported`` only on change, so an unchanged field may be vouched
+        for by the hub's inverter clock, which changes every poll (#419's
+        sibling rule, capped at ``MAX_UNCHANGED``), against the inverter-side
+        ``battery_power_max_age_seconds``. GETs only; any stale, future,
+        unknown or unreadable field means unknown (``None``).
+        """
+        max_age = self._settings.battery_power_max_age_seconds
+        if max_age is None:
+            return None
+        # A field older than MAX_UNCHANGED is stale even under a longer max-age.
+        max_age = min(max_age, MAX_UNCHANGED.total_seconds())
+        sibling: datetime | None = None
+        try:
+            clock = await self._rest.get_state(clock_entity(self._hub))
+            if clock.state not in ("unavailable", "unknown", ""):
+                sibling = clock.last_reported
+        except httpx.HTTPError:
+            pass
+        parts: list[int] = []
+        for index, field in enumerate(_WINDOW_FIELDS[:4]):
+            try:
+                state = await self._rest.get_state(self._sensor(field))
+                value: float | None = float(state.state)
+            except httpx.HTTPError:
+                return None
+            except (ValueError, TypeError):
+                value = None
+            part = _window_part(index, value)
+            freshness = check_report_time(
+                state.last_reported, now=now, max_age_s=max_age,
+                option="battery_power_max_age_seconds", sibling_reported_at=sibling,
+            )
+            if part is None or freshness.validity != "fresh":
+                return None
+            parts.append(part)
         return (time(parts[0], parts[1]), time(parts[2], parts[3]))
 
     async def resident_diagnostic(self) -> dict[str, object]:
@@ -372,10 +421,14 @@ class SolisDevice:
                     switch = state
             except httpx.HTTPError:
                 pass
+        fresh = window is not None and (
+            await self.verified_resident_charge_window(datetime.now(UTC)) == window
+        )
         return {
             "charge_window": (
                 f"{fmt_hhmm(window[0])}–{fmt_hhmm(window[1])}" if window else "unknown"
             ),
+            "charge_window_fresh": ("yes" if fresh else "no") if window else "unknown",
             "charge_current_a": current if current is not None and current >= 0 else "unknown",
             "power_switch": switch,
         }
@@ -679,7 +732,7 @@ class SolisDevice:
         state = await self._rest.get_state(self._sensor("timed_charge_current"))
         return float(state.state) * self._settings.battery_voltage_v
 
-    # --- internal writes (PROACTIVE_MODE-gated, failure-isolated, read-back verified) ---
+    # --- internal writes (mode-gated, failure-isolated, read-back verified) ---
 
     @device_action(Ownership.CHARGING)
     async def _write_charge_window(
@@ -1934,7 +1987,7 @@ class SolisDevice:
         safe_state = (
             "no export window remains programmed"
             if is_verified(window_line)
-            else "the Solis export state was not verified; remain in simulate and inspect it"
+            else "the Solis export state was not verified; switch to Observe and inspect it"
         )
         await send_once(
             store,

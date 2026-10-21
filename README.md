@@ -23,10 +23,10 @@ for the ML load model), and the Octopus and Axle APIs if you configure them.
   test can replay any decision and the copilot can explain it
   ([why not an LP solver](docs/adr/0002-auditable-over-optimal-planning.md)).
 - **Gated actuation.** All hardware writes go through one decision path.
-  ha-spark writes only when the owner has switched on real control and the
-  SoC reading is valid, and it reads back every write to confirm it. A failed
-  action doesn't stop the others. Simulate mode runs the same path and skips
-  the writes.
+  The daemon writes only as the owner's site operating mode permits, and
+  reads back every write to confirm it. Invalid SoC blocks SoC-derived writes,
+  not the fixed fallback charging schedule or discharge-only holds. A failed
+  action doesn't stop the others. Observe previews the plan without writes.
 - **Untrusted inputs.** ha-spark treats Home Assistant states, tariff and Axle
   payloads, and LLM replies as untrusted. It coerces or validates each one
   before use. If a payload is bad, ha-spark plans without it. A bad payload
@@ -43,11 +43,11 @@ for the ML load model), and the Octopus and Axle APIs if you configure them.
 - **Written decisions.** Each architecture decision has an
   [ADR](docs/adr/), and [`CONTEXT.md`](CONTEXT.md) defines the domain terms.
 
-> Status: add-on v0.22.0 includes:
+> Status: the add-on includes:
 >
 > - a deterministic planner that replans every half hour, holds battery energy
 >   back with reservations, and can derive base load from component statistics
-> - per-device control authority
+> - one site operating mode: Observe, Protect or Optimise
 > - fixed, dynamic, and Octopus Intelligent tariffs, plus Axle export events
 >   as a separate provider that works with any of them
 > - native Solis timed-slot control. A per-minute reconcile turns the power
@@ -61,7 +61,7 @@ for the ML load model), and the Octopus and Axle APIs if you configure them.
 >   less than grid import (scheduling it waits on plugged-in sensing), and
 >   ha-spark asks you to start V2L when an Axle export slot would otherwise go
 >   unfunded. ha-spark never switches V2L itself.
-> - simulate mode and savings backtests
+> - Observe plan previews, readiness evidence and savings backtests
 > - onboarding, the NL copilot, and an optional API that external agents can
 >   use to read data and trigger gated actions (`agent_surface`)
 >
@@ -91,7 +91,7 @@ event provider, so it works with any supported tariff.
    and caps export at the configured DNO export limit. It uses reservations to
    charge and hold back enough energy to fund those slots, and keeps the
    household's own post-event reservation.
-3. **Actuation.** The inverter driver checks the power switch, control
+3. **Actuation.** The inverter driver checks the power switch, Optimise
    authority, and SoC freshness, then writes the discharge window and reads it
    back. ha-spark checks the inverter clock first, because the inverter fires
    the window on its own clock.
@@ -189,9 +189,10 @@ UI ([#247](https://github.com/Kylevdm/ha-spark/issues/247)). It adds:
   ([ADR 0005](docs/adr/0005-integration-authority-and-operating-modes.md));
 - configuration that you edit in the UI, with the Supervisor options cut down
   to the keys needed to start the add-on;
-- one site-wide operating mode (Observe, Protect or Optimise) in place of
-  `proactive_mode` and per-device `control`. Every v1 install starts in
-  Observe ([ADR 0008](docs/adr/0008-operating-mode-and-authority-lifecycle.md)).
+- one site-wide operating mode (Observe, Protect or Optimise), shipped in
+  phase 2 with a durable authority store in the add-on's data directory.
+  New installs, and upgrades from the retired settings, start in Observe
+  ([ADR 0008](docs/adr/0008-operating-mode-and-authority-lifecycle.md)).
 
 The earlier v1 definition
 ([#94](https://github.com/Kylevdm/ha-spark/issues/94)) still applies where it
@@ -199,10 +200,9 @@ doesn't conflict. Of its features, derived base load, half-hourly replanning,
 reservations, and supervised Axle export have shipped. V2L refill planning
 has shipped in the planner but can't schedule a refill until plugged-in
 sensing lands.
-The morning plan digest and the readiness signal
-([#53](https://github.com/Kylevdm/ha-spark/issues/53)) are still open. The
-readiness signal will tell you when your simulate history supports switching
-on real control. `1.0.0`
+The morning plan digest is still open. The readiness signal
+([#53](https://github.com/Kylevdm/ha-spark/issues/53)) evaluates Observe history
+and tells you when the evidence supports Optimise; it never changes the mode. `1.0.0`
 ships once every item in the
 [release gate](docs/releasing.md#v100-release-gate) is confirmed on real
 hardware.
@@ -218,12 +218,16 @@ hardware.
    80%?", and "what did you save this week?". It runs against your own Ollama
    instance (on your LAN or over Tailscale) and falls back to a deterministic
    parser, so it needs no cloud service and cannot issue a hardware command.
-2. **You switch on real control when you're ready.** ha-spark starts in
-   `simulate` mode, which makes the same decisions and logs each write it
-   would make without touching hardware. `ha-spark backtest` prices your
-   recorded grid import under your tariff, and the plan report can show your
-   existing charge-needed template sensor next to ha-spark's figure. Set
-   `proactive_mode: on` when the logs convince you.
+2. **You choose the operating mode when you're ready.** ha-spark starts in
+   Observe, which plans and logs `[SIMULATE]` writes without touching hardware.
+   `ha-spark backtest` prices your recorded grid import under your tariff, and
+   the plan report can show your existing charge-needed template sensor next
+   to ha-spark's figure. Protect owns only battery-to-car holds and optional
+   clock-change sync; Optimise runs the full plan, including the supply guard,
+   fallback charging schedule and supervised Axle export. Only an owner can
+   change modes, from the ingress mode page or with `ha-spark mode set protect`
+   or `ha-spark mode set optimise`, with the daemon running. Settings and
+   agents cannot change it; standalone/dev mode changes are CLI-only.
 
 ## How it compares
 
@@ -239,7 +243,7 @@ made each decision, without configuring an optimization framework.
 | Actuates hardware itself | ❌ user wires automations | ✅ | ✅ with guard rails (SoC validity, read-back, failure isolation) |
 | Setup effort | YAML + sensor templates + REST commands | YAML; docs assume HA/file-editing fluency | add-on options UI + onboarding wizard |
 | Explains decisions in plain language | ❌ | ❌ | ✅ local LLM over the deterministic plan |
-| Try-before-trust mode | ❌ | partial (read-only mode) | ✅ simulate mode + savings backtest |
+| Try-before-trust mode | ❌ | partial (read-only mode) | ✅ Observe mode + savings backtest |
 | Cloud dependence | none | none (paid cloud version exists) | none, by design |
 
 ## Non-goals
@@ -259,21 +263,26 @@ made each decision, without configuring an optimization framework.
 3. Set your entity IDs and tariff on the **Configuration** tab, then start the
    add-on.
 
-The aim is a first simulated plan within 15 minutes of installing.
+The aim is a first Observe plan within 15 minutes of installing.
 `ha-spark onboard` proposes entity mappings from your HA registry,
-`ha-spark health` checks each connection, and simulate mode shows the first
+`ha-spark health` checks each connection, and Observe shows the first
 overnight plan the same evening.
 
 [`ha_spark_addon/DOCS.md`](ha_spark_addon/DOCS.md) has the full option
 reference and the onboarding steps: health check, load-history backfill, first
-plan, then real control.
+plan, then an owner-requested mode change.
 
 A per-inverter driver controls battery charging. Set the `inverter` option to
 `solis` (the default) or `alphaess`. On Solis, ha-spark also checks the
 configured power switch every minute. It turns the switch off during an
-Octopus dispatch or EV charging hold and back on afterwards, and leaves the
-inverter in a safe state when it gives up control. Disable any existing automations that write to the same
-inverter before you set `proactive_mode: on`.
+Octopus dispatch or EV charging hold and back on only to release its own
+verified hold. A car charging without fresh battery-direction evidence can
+start a hold even inside the charge window. Clean shutdown in Optimise restores
+the charge window but retains active holds; Protect and Observe write nothing
+on shutdown. AlphaESS and multi-inverter sites stay in Observe, and a Solis
+without a configured fallback current can enter Protect but not Optimise.
+Disable any existing automations that write the same controls before entering
+Protect or Optimise.
 [`docs/adding-an-inverter.md`](docs/adding-an-inverter.md) describes the driver
 contract and how to add another inverter, and
 [`docs/adr/0003-ha-spark-owns-the-solis-inverter.md`](docs/adr/0003-ha-spark-owns-the-solis-inverter.md)

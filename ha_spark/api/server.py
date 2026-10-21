@@ -152,7 +152,20 @@ class AppState:
         document is rejected with a secret-safe reason naming the failing
         field(s) -- never an input value -- and leaves the options file
         byte-identical and the running settings exactly as they were.
+
+        ``db_path`` decides where the authority store and the runtime state
+        beside it live, so a save cannot change it (#441): any update whose
+        value differs from the running one (including ``None``, which the
+        options overlay would drop to a default) is rejected before the
+        merged document is validated or persisted, with the same
+        byte-identical/no-echo guarantees. ``db_path`` is still read at startup
+        from the environment and the options file, which need a restart.
         """
+        if "db_path" in updates and updates["db_path"] != self.settings.db_path:
+            raise ConfigError(
+                "db_path cannot be changed by a settings save; "
+                "set it in the environment or options file and restart"
+            )
         current: dict[str, Any] = {}
         if self.options_path.exists():
             current = json.loads(self.options_path.read_text(encoding="utf-8"))
