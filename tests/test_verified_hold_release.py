@@ -18,6 +18,13 @@ from tests.test_solis_power_switch import (
 )
 
 
+def _without_refusal(holds):
+    return tuple(
+        h.model_copy(update={"release_refused_since": None, "release_refused_reason": None})
+        for h in holds
+    )
+
+
 @pytest.fixture(autouse=True)
 def _skip_read_back_delays(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
@@ -34,7 +41,11 @@ async def test_release_refuses_an_unreadable_schedule(tmp_path, mode):
     records = device._execution.authority.state.holds
     lines = await _reconcile(device, _intent())
     assert _options(rest) == []
-    assert device._execution.authority.state.holds == records
+    # #449: the records are kept, marked as waiting on a refused release.
+    assert _without_refusal(device._execution.authority.state.holds) == records
+    assert device._execution.authority.state.holds[0].release_refused_reason == (
+        "schedule_unverified"
+    )
     assert any("[REFUSED]" in line and "schedule" in line for line in lines)
 
 
@@ -115,7 +126,7 @@ async def test_release_refuses_a_switch_that_is_not_on_or_off(tmp_path):
     records = device._execution.authority.state.holds
     lines = await _reconcile(device, _intent())
     assert rest.calls == []
-    assert device._execution.authority.state.holds == records
+    assert _without_refusal(device._execution.authority.state.holds) == records
     assert any("refused" in line and "not on/off" in line for line in lines)
 
 
@@ -157,3 +168,71 @@ async def test_failed_on_read_back_keeps_the_record(tmp_path):
     assert _options(rest) == ["On"]
     assert device._execution.authority.state.holds
     assert not any(line.startswith("[APPLIED]") for line in lines)
+
+
+async def test_refused_release_records_since_and_keeps_it_across_refusals(tmp_path):
+    rest = FakeRest(switch="unavailable")
+    device = _device(rest, tmp_path)
+    _seed_owned_hold(device)
+    store = device._execution.authority
+    await _reconcile(device, _intent())
+    (first,) = store.state.holds
+    assert first.release_refused_reason == "switch_unreadable"
+    assert first.release_refused_since is not None
+    assert not first.release_refused_notified
+    rest.states[_SWITCH] = "Off"
+    rest.states["sensor.solis_control_timed_charge_start_hours"] = "unavailable"
+    await _reconcile(device, _intent())
+    (second,) = store.state.holds
+    assert second.release_refused_since == first.release_refused_since
+    assert second.release_refused_reason == "schedule_unverified"
+    assert _options(rest) == []
+
+
+async def test_unreadable_switch_read_marks_the_refusal(tmp_path):
+    rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path)
+    _seed_owned_hold(device)
+    original = rest.get_state
+
+    async def broken(entity_id):
+        if entity_id == _SWITCH:
+            raise RuntimeError("HA down")
+        return await original(entity_id)
+
+    rest.get_state = broken
+    await _reconcile(device, _intent())
+    assert _options(rest) == []
+    assert device._execution.authority.state.holds[0].release_refused_reason == (
+        "switch_unreadable"
+    )
+
+
+async def test_verified_release_clears_the_refusal_with_the_record(tmp_path):
+    rest = FakeRest(switch="unavailable")
+    device = _device(rest, tmp_path)
+    _seed_owned_hold(device)
+    await _reconcile(device, _intent())
+    assert device._execution.authority.state.holds[0].release_refused_since is not None
+    rest.states[_SWITCH] = "Off"
+    await _reconcile(device, _intent())
+    assert _options(rest) == ["On"]
+    assert not device._execution.authority.state.holds
+
+
+async def test_holding_again_ends_the_refusal_episode_but_keeps_the_notice_flag(tmp_path):
+    rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path, authority_mode="protect")
+    store = device._execution.authority
+    record = _record(device, "dispatch").model_copy(update={
+        "release_refused_since": _now() - timedelta(hours=1),
+        "release_refused_reason": "switch_unreadable",
+        "release_refused_notified": True,
+    })
+    store.save_holds((record,))
+    held = replace(_intent(), holds=((_now() - timedelta(minutes=5), _now() + timedelta(hours=1)),))
+    await _reconcile(device, held)
+    (kept,) = store.state.holds
+    assert kept.release_refused_since is None
+    assert kept.release_refused_reason is None
+    assert kept.release_refused_notified

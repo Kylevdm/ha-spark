@@ -346,7 +346,12 @@ async def test_untrusted_soc_keeps_an_optimise_hold_until_the_plan_verifies(tmp_
 
     assert _options(rest) == []
     assert not any(call[0] == "modbus" for call in rest.calls)
-    assert device._execution.authority.state.holds == records
+    # #449: kept, and marked as waiting on a refused release.
+    (held,) = device._execution.authority.state.holds
+    assert held.release_refused_reason == "schedule_unverified"
+    assert held.model_copy(
+        update={"release_refused_since": None, "release_refused_reason": None}
+    ) == records[0]
     assert any(line.startswith("[REFUSED]") and "SoC" in line for line in lines)
 
 

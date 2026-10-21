@@ -1118,6 +1118,7 @@ class SolisDevice:
                 if wanted == "On" and current != "off":
                     # Q2: every On needs a readable switch; `unavailable` is not Off.
                     log.warning("Power-switch state is not on/off; not releasing a hold")
+                    self._mark_release_refused(store, identity, "switch_unreadable", now)
                     return [ActionLine(
                         f"[WARNING] {desc} refused: state is not on/off; "
                         "a hold is never released blind",
@@ -1131,6 +1132,7 @@ class SolisDevice:
                     # purpose: Q2 (#426) refuses every blind On, the relinquish
                     # path's included, so the refusal stays visible instead.
                     log.warning("Power-switch unreadable; not releasing a hold")
+                    self._mark_release_refused(store, identity, "switch_unreadable", now)
                     return [ActionLine(
                         f"[WARNING] {desc} refused: state unreadable; "
                         "a hold is never released blind",
@@ -1152,6 +1154,7 @@ class SolisDevice:
                 )
                 if refusal is not None:
                     log.warning("[REFUSED] %s: %s; hold kept", desc, refusal)
+                    self._mark_release_refused(store, identity, "schedule_unverified", now)
                     return [*schedule_lines, ActionLine(
                         f"[REFUSED] {desc} refused: {refusal}; hold kept",
                         ActionOutcome.REFUSED,
@@ -1392,6 +1395,30 @@ class SolisDevice:
             f"[FAILED] {desc} unconfirmed: {detail}", ActionOutcome.FAILED
         )]
 
+    @staticmethod
+    def _mark_release_refused(
+        store: AuthorityStore | None, identity: HoldDevice,
+        reason: Literal["switch_unreadable", "schedule_unverified"], now: datetime,
+    ) -> None:
+        """Record that this device's owned, confirmed holds wait on a refused release (#449).
+
+        Bookkeeping only: a failed save is logged and never turns the refusal
+        into anything else. The start time is kept across repeated refusals.
+        """
+        if store is None or store.state is None:
+            return
+        try:
+            store.save_holds(tuple(
+                h.model_copy(update={
+                    "release_refused_since": h.release_refused_since or now,
+                    "release_refused_reason": reason,
+                })
+                if h.device == identity and h.owned and h.confirmed else h
+                for h in store.state.holds
+            ))
+        except (OSError, ValueError):
+            log.warning("Recording the refused hold release failed")
+
     def _save_hold_request(
         self, store: AuthorityStore, identity: HoldDevice, intent: ChargeIntent,
         now: datetime, records: tuple[HoldRecord, ...], *, confirmed: bool,
@@ -1413,7 +1440,13 @@ class SolisDevice:
             )
         store.save_holds(
             tuple(h for h in store.state.holds if h.device != identity)
-            + tuple(h.model_copy(update={"confirmed": confirmed}) for h in existing.values())
+            # Holding again ends a refused-release episode short of release; the
+            # notice flag stays until a verified On clears the record (#449).
+            + tuple(h.model_copy(update={
+                "confirmed": confirmed,
+                "release_refused_since": None,
+                "release_refused_reason": None,
+            }) for h in existing.values())
         )
 
     async def write_safe_state(self) -> list[ActionLine]:
