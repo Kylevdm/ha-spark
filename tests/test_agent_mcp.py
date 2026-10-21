@@ -314,3 +314,21 @@ async def test_set_config_rejects_invalid_document_before_saving(tmp_path: Path)
     assert "SECRET_OCTO" not in str(excinfo.value)
     assert options.read_bytes() == seeded
     assert state.settings.min_soc == 20.0
+
+
+async def test_set_config_rejects_a_changed_db_path(tmp_path: Path) -> None:
+    """#441: the set_config tool cannot move ``db_path``. The tool error names
+    the field without echoing the submitted value, and the options file stays
+    byte-identical with the running settings untouched.
+    """
+    options = tmp_path / "options.json"
+    seeded = json.dumps({"min_soc": 20.0}).encode()
+    options.write_bytes(seeded)
+    state = _state(tmp_path, "read_write")
+    mcp = build_mcp(state)
+    with pytest.raises(ToolError) as excinfo:
+        await mcp.call_tool("set_config", {"updates": {"db_path": "TOPSECRET/moved-db.db"}})
+    assert "db_path" in str(excinfo.value)
+    assert "TOPSECRET/moved-db.db" not in str(excinfo.value)
+    assert options.read_bytes() == seeded
+    assert state.settings.db_path == str(tmp_path / "t.db")
