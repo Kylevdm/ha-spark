@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from ha_spark.authority import authority_view, load_authority
+from ha_spark.authority import OperatingMode, authority_view, load_authority
 from ha_spark.config import ConfigError, Settings, load_settings
 from ha_spark.daemon_channel import REFUSED, DaemonAlreadyRunning, Reply, submit_socket
 from ha_spark.dashboard import build_dashboard
@@ -703,8 +703,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_inverter = sub.add_parser("inverter", help="Read model identity and resident schedule")
     p_inverter.add_subparsers(dest="inverter_command", required=True).add_parser("show")
 
-    p_mode = sub.add_parser("mode", help="Read operating-mode authority")
-    p_mode.add_subparsers(dest="mode_command", required=True).add_parser("show")
+    p_mode = sub.add_parser("mode", help="Show or change operating-mode authority")
+    mode_sub = p_mode.add_subparsers(dest="mode_command", required=True)
+    mode_sub.add_parser("show")
+    mode_sub.add_parser("set").add_argument("target", choices=("observe", "protect", "optimise"))
+    mode_sub.add_parser("confirm-observe")
 
     p_states = sub.add_parser(
         "states",
@@ -973,6 +976,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+async def _cmd_mode_set(
+    settings: Settings, target: OperatingMode, *, confirm: bool = False,
+) -> int:
+    """Submit one owner request with the epoch seen; never retry a conflict."""
+    epoch = None
+    if not confirm:
+        status = await submit_socket(settings, "authority_status")
+        if status is None or status.error or status.authority is None:
+            print(REFUSED if status is None else f"[REFUSED] {status.error}")
+            return 1
+        epoch = status.authority.get("epoch")
+    reply = await submit_socket(settings, "mode", target=target, expected_epoch=epoch)
+    if reply is None or reply.error:
+        print(REFUSED if reply is None else f"[REFUSED] {reply.error}: {reply.text}")
+        return 1
+    print(json.dumps(reply.authority, indent=2))
+    return 0
+
+
 async def _cmd_mode_show(settings: Settings) -> int:
     """Read authority and live entry conditions without creating or saving state."""
     loaded = load_authority(settings)
@@ -1023,7 +1045,12 @@ def main(argv: list[str] | None = None) -> int:
     # failure detail is carried in each check result.
     if args.command == "mode":
         settings = load_settings(validate=False)
-        return asyncio.run(_cmd_mode_show(settings))
+        if args.mode_command == "show":
+            return asyncio.run(_cmd_mode_show(settings))
+        return asyncio.run(_cmd_mode_set(
+            settings, args.target if args.mode_command == "set" else "observe",
+            confirm=args.mode_command == "confirm-observe",
+        ))
 
     if args.command == "health":
         settings = load_settings(validate=False)

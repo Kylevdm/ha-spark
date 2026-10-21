@@ -1,8 +1,8 @@
 """Private fixed-operation transport; only the scheduler consumes the work queue.
 
-The socket is not an authority boundary: requests add no write permission and
-carry no caller identity. Device work never runs in a connection handler. Besides
-the 0600 mode, the kernel-reported peer uid must match the daemon's own uid.
+The owner-only socket authenticates CLI mode requests by kernel peer uid and
+0600 permissions. Socket callers cannot claim an ingress identity. Only the daemon
+loop persists grants or runs device work; ordinary work requests add no permission.
 """
 from __future__ import annotations
 
@@ -15,13 +15,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from ha_spark.authority import AuthorityStore, authority_view, resolve_data_dir
+from ha_spark.authority import AuthorityStore, OperatingMode, authority_view, resolve_data_dir
 from ha_spark.config import Settings
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 
-Op = Literal["replan", "apply", "sync_clock", "authority_status"]
+Op = Literal["replan", "apply", "sync_clock", "authority_status", "mode"]
 REFUSED = "[REFUSED] no ha-spark daemon running; hardware writes happen only inside the daemon"
 
 
@@ -32,6 +32,16 @@ class DaemonAlreadyRunning(RuntimeError):
 class Request(BaseModel):
     model_config = ConfigDict(extra="forbid")
     op: Op
+    target: OperatingMode | None = None
+    expected_epoch: int | None = Field(default=None, ge=1, strict=True)
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> Request:
+        if self.op == "mode" and self.target is None:
+            raise ValueError("mode requires target")
+        if self.op != "mode" and (self.target is not None or self.expected_epoch is not None):
+            raise ValueError("mode fields require mode operation")
+        return self
 
 
 class Line(BaseModel):
@@ -67,6 +77,7 @@ def _peer_uid(writer: asyncio.StreamWriter) -> int | None:
 class Pending:
     request: Request
     future: asyncio.Future[Reply]
+    ingress_user: str | None = None
 
 
 class DaemonChannel:
@@ -74,6 +85,8 @@ class DaemonChannel:
         self.path = resolve_data_dir(settings) / "ha_spark.sock"
         self.authority: AuthorityStore | None = None
         self.queue: asyncio.Queue[Pending] = asyncio.Queue(maxsize=64)
+        # Owner mode requests skip queued work so a reply reaches the owner in one tick.
+        self.mode_queue: asyncio.Queue[Pending] = asyncio.Queue(maxsize=8)
         self._fd: int | None = None
         self._server: asyncio.AbstractServer | None = None
         self._handlers: set[asyncio.Task[None]] = set()
@@ -110,10 +123,11 @@ class DaemonChannel:
             task.cancel()
         if self._handlers:
             await asyncio.gather(*self._handlers, return_exceptions=True)
-        while not self.queue.empty():
-            pending = self.queue.get_nowait()
-            if not pending.future.done():
-                pending.future.set_result(Reply(error="daemon stopped"))
+        for queue in (self.mode_queue, self.queue):
+            while not queue.empty():
+                pending = queue.get_nowait()
+                if not pending.future.done():
+                    pending.future.set_result(Reply(error="daemon stopped"))
         if self._fd is not None:
             self.path.unlink(missing_ok=True)
             os.close(self._fd)
@@ -126,14 +140,32 @@ class DaemonChannel:
             save_failed=store.save_failed if store else False,
         )
 
+    async def submit_mode(
+        self, target: OperatingMode, expected_epoch: int | None, *, ingress_user: str | None = None,
+    ) -> Reply:
+        return await self._submit(
+            Request(op="mode", target=target, expected_epoch=expected_epoch), ingress_user,
+        )
+
+    def next_request(self) -> Pending | None:
+        """The next request for this tick: an owner mode request before any work."""
+        for queue in (self.mode_queue, self.queue):
+            if not queue.empty():
+                return queue.get_nowait()
+        return None
+
     async def submit(self, op: Op) -> Reply:
-        if op == "authority_status":
+        return await self._submit(Request(op=op))
+
+    async def _submit(self, request: Request, ingress_user: str | None = None) -> Reply:
+        if request.op == "authority_status":
             return Reply(authority=self.authority_status())
         if self._server is None or not self._server.is_serving():
             return Reply(error="daemon stopped")
         future = asyncio.get_running_loop().create_future()
         try:
-            self.queue.put_nowait(Pending(Request(op=op), future))
+            queue = self.mode_queue if request.op == "mode" else self.queue
+            queue.put_nowait(Pending(request, future, ingress_user))
         except asyncio.QueueFull:
             return Reply(error="daemon request queue full")
         # Disconnecting a caller must not cancel an in-flight device sequence.
@@ -157,7 +189,7 @@ class DaemonChannel:
             except (ValueError, ValidationError, TimeoutError):
                 reply = Reply(error="invalid daemon request")
             else:
-                reply = await self.submit(request.op)
+                reply = await self._submit(request)
             writer.write(reply.model_dump_json().encode() + b"\n")
             await writer.drain()
         except (ConnectionError, OSError):
@@ -171,7 +203,10 @@ class DaemonChannel:
             self._handlers.discard(task)
 
 
-async def submit_socket(settings: Settings, op: Op) -> Reply | None:
+async def submit_socket(
+    settings: Settings, op: Op, *, target: OperatingMode | None = None,
+    expected_epoch: int | None = None,
+) -> Reply | None:
     """None means unreachable. Never retry an accepted request after a lost reply."""
     path = resolve_data_dir(settings) / "ha_spark.sock"
     try:
@@ -181,7 +216,8 @@ async def submit_socket(settings: Settings, op: Op) -> Reply | None:
     except (OSError, TimeoutError):
         return None
     try:
-        writer.write(Request(op=op).model_dump_json().encode() + b"\n")
+        writer.write(Request(op=op, target=target, expected_epoch=expected_epoch)
+                     .model_dump_json().encode() + b"\n")
         await writer.drain()
         return Reply.model_validate_json(await reader.readline())
     except (OSError, ValueError):

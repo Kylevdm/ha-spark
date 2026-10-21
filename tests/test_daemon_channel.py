@@ -88,3 +88,15 @@ async def test_foreign_or_unknown_peer_refused_before_reading(
         reply = await submit_socket(settings, "apply")
         assert reply is not None and reply.error == "daemon request refused"
         assert channel.queue.empty()
+
+
+async def test_owner_mode_request_is_served_before_queued_work(tmp_path: Path) -> None:
+    async with DaemonChannel(settings_at(tmp_path)) as channel:
+        work = [asyncio.create_task(channel.submit("apply")) for _ in range(3)]
+        mode = asyncio.create_task(channel.submit_mode("observe", 4))
+        await asyncio.sleep(0)
+        first = channel.next_request()
+        assert first is not None and first.request.op == "mode"
+        assert channel.next_request().request.op == "apply"  # type: ignore[union-attr]
+        for task in (*work, mode):
+            task.cancel()

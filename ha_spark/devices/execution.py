@@ -135,6 +135,18 @@ class BusCoordinator:
             raise AuthorityRevoked(mode.removeprefix("refuse:"))
 
     @asynccontextmanager
+    async def transition(self) -> AsyncIterator[None]:
+        """Wait for a complete action, then own the bus across handover steps."""
+        state = self._state()
+        async with state.lock:
+            state.owner = asyncio.current_task()
+            try:
+                yield
+            finally:
+                state.decisions.clear()
+                state.owner = None
+
+    @asynccontextmanager
     async def action(
         self, gate: WriteGate, ownership: Ownership, config: DeviceConfig, settings: Settings
     ) -> AsyncIterator[None]:
@@ -144,6 +156,9 @@ class BusCoordinator:
         if outer:
             await state.lock.acquire()
             state.owner = task
+        # A transition owns the bus across steps; each top-level action still
+        # takes a fresh decision, so one step's grant never carries to the next.
+        top = not state.modes
         try:
             key = (ownership, id(config), id(settings))
             if key not in state.decisions:
@@ -156,8 +171,9 @@ class BusCoordinator:
                 state.checks.pop()
                 state.modes.pop()
         finally:
-            if outer:
+            if top:
                 state.decisions.clear()
+            if outer:
                 state.owner = None
                 state.lock.release()
 
