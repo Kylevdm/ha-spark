@@ -458,6 +458,63 @@ async def test_onboard_write_fragment_uses_preset_for_gaps(
 
 
 @respx.mock
+@pytest.mark.parametrize("empty", [False, True])
+async def test_onboard_write_fragment_imports_without_secrets(
+    tmp_path, monkeypatch, capsys, empty,
+):
+    from ha_spark.daemon_channel import DaemonChannel
+    from ha_spark.devices.execution import execution_context
+    from tests.authority_helpers import seed_settings
+
+    context = execution_context()
+    monkeypatch.setattr(context, "authority", None)
+    monkeypatch.setattr(context, "config_generation", context.config_generation)
+    service = seed_settings(tmp_path, {"octopus_api_key": "ONBOARD-SECRET-CANARY"},
+                            settings=Settings(ha_url="http://ha.test", ha_token="test",
+                                              db_path=str(tmp_path / "ha_spark.db")))
+
+    async def ok(_settings):
+        return CheckResult("Load history", Status.OK, "ready")
+
+    monkeypatch.setattr(cli, "check_load_history", ok)
+    monkeypatch.setattr(cli, "Settings", lambda: service.settings)
+    respx.get("http://ha.test/api/states").mock(
+        return_value=httpx.Response(200, json=[] if empty else _states_json())
+    )
+    assert await _cmd_onboard(service.settings, as_json=False, write=True,
+                              preset_name=None if empty else "solis") == 0
+    output = capsys.readouterr().out
+    assert "ONBOARD-SECRET-CANARY" not in output
+    assert "ha-spark config import onboard.yaml" in output
+    fragment = output.split("```yaml\n", 1)[1].split("```", 1)[0]
+    assert "octopus_api_key" not in fragment
+    assert "axle_api_key" not in fragment
+    assert "agent_api_token" not in fragment
+    path = tmp_path / "onboard.yaml"
+    path.write_text(fragment)
+    async with DaemonChannel(service.settings) as channel:
+        channel.settings_service = service
+        assert await asyncio.to_thread(cli.main, ["config", "import", str(path)]) == 0
+    if empty:
+        assert service.export() == {}
+    else:
+        assert service.export()["soc_entity"] == "sensor.solisac_battery_soc"
+        assert service.export()["inverter_power_switch_entity"] == "select.solisac_power_switch"
+    assert service.settings.octopus_api_key == "ONBOARD-SECRET-CANARY"
+
+
+@pytest.mark.parametrize("command", ["onboard", "backfill-load"])
+def test_config_guidance_points_to_store(command, capsys):
+    with pytest.raises(SystemExit) as caught:
+        build_parser().parse_args([command, "--help"])
+    assert caught.value.code == 0
+    output = capsys.readouterr().out
+    assert "ha-spark config set" in output
+    assert "BACKFILL_SOURCE_ENTITY" not in output
+    assert "CONSUMPTION_ENERGY_ENTITY" not in output
+
+
+@respx.mock
 async def test_onboard_unknown_preset_errors(capsys: pytest.CaptureFixture[str]) -> None:
     settings = Settings(ha_url="http://ha.test", ha_token="t")
     rc = await _cmd_onboard(settings, as_json=False, write=False, preset_name="nope")

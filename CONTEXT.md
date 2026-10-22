@@ -285,6 +285,27 @@ only the running daemon changes authority on an owner's request. A missing or
 invalid previously initialised store means authority unknown, with no hardware
 writes, until the owner confirms Observe. Every install starts in Observe.
 
+**Settings document**:
+The versioned record of the owner's non-secret configuration inputs. It belongs
+to ha-spark, not the Supervisor, and each accepted change creates a new revision
+shared with the secrets file. Defaults and derived values are not owner inputs.
+A settings change never grants authority or changes the operating mode.
+(Decision: #456, 2026-10-21.)
+
+**Secrets file**:
+The separate, access-restricted record of configuration credentials, committed
+with the settings document as one revision. Readers learn only whether each
+secret is set, never its value; leaving a secret out of a change preserves it.
+(Decision: #456, 2026-10-21.)
+
+**Configuration repair**:
+The bootstrap-only state in which ha-spark cannot trust its saved configuration
+and accepts only a valid configuration import to resume normal startup.
+Protection and optimisation are suspended: no plan, hardware write, hold,
+fallback charging schedule or operating-mode transition runs. Stored authority
+is reported without changing it; it is not evidence of active protection.
+(Decision: #456, 2026-10-21.)
+
 **Temporary manual control**:
 An explicit handover of the site's controls to the owner. It expires by
 default and returns to the previous operating mode after current conditions

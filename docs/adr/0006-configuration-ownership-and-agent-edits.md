@@ -4,6 +4,42 @@ Status: accepted (2026-10-10), confirmed by the owner in [Config store: what lea
 
 The companion integration must execute protection and fallback while the add-on is unavailable. It therefore owns its device connections, validated device, bank, and site limits, fixed fallback charging schedule, and durable manual-control state. The add-on owns planning, tariff, UI, and agent settings. The ingress UI is the primary editor for both, but each field has one authoritative owner. This differs from a [Zigbee2MQTT-style add-on-owned device bridge](https://www.zigbee2mqtt.io/guide/usage/integrations/home_assistant.html) because the agreed fallback requirement survives an add-on outage.
 
+## Phase 3 amendment (#456, 2026-10-22)
+
+The UI-owned config store ships before the companion integration. This amendment
+supersedes the conflicting cutover, secret-editor and agent-edit statements below
+for phase 3; the eventual ownership table remains the v1 destination.
+
+- **Cutover amends “no importer”.** On first start only, seed the settings document
+  and secrets file from legacy `options.json`, or from the Supervisor's stored
+  options when the file no longer has legacy settings. A persistent initialisation
+  marker prevents later reseeding. Owners can also use `ha-spark config import FILE`
+  with saved legacy JSON/YAML or a secret-free export. Invalid or lost configuration
+  enters bootstrap-only configuration repair, where only a valid import with the
+  current repair token ends repair. Repair performs no hardware writes, holds,
+  fallback or transitions and never changes authority.
+- **CLI secret entry is an owner channel.** Alongside ingress secret controls,
+  `ha-spark config set-secret KEY` accepts a no-echo prompt or stdin, never a value
+  on argv; `--clear` explicitly unsets it. Ordinary CLI `config set` refuses secret
+  fields. All CLI writes use the daemon socket and the single settings service.
+- **Activation.** Device/driver addressing changes require restart, including
+  `inverter`, explicit `devices`, `solis_control_hub`, `solis_modbus_slave` and
+  `alphaess_serial`; fenced entity-ID remaps remain live. Listener, agent-token
+  and other startup-bound client changes also require restart. A candidate with
+  any restart-field difference is committed as `pending_restart` as a whole;
+  no live subset runs ahead of it. Later saves remain pending while those
+  differences remain. Saves never change the operating mode or authority.
+- **Interim ownership.** Integration-owned fields stay in the add-on store with
+  `integration` metadata until later phases move them. Only `log_level` remains
+  in the Supervisor form; old options and runtime environment variables are not
+  ongoing settings sources.
+- **Agents wait for phase 14.** `set_config` and `POST /agent/config` refuse every
+  call with `unavailable`; proposals and owner approval are not implemented in
+  this release. Config routes exist only on ingress, never the published agent
+  port or standalone listener. The existing `read_write`, `agent_api_token` and
+  generated token fallback remain until phase 14; per-client credentials and
+  the proposal ladder below are still future work.
+
 ## Stores and editors
 
 | Data | Authority | Editors |

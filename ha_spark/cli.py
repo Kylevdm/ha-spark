@@ -453,12 +453,17 @@ async def _cmd_onboard(
             print("      no candidate found")
 
     if write:
-        print("\n# Proposed options (paste into the add-on Configuration / .env):")
+        print("\nSave the following settings fragment as onboard.yaml, then review it.")
+        print("Import replaces non-secret inputs; merge with `ha-spark config export` first")
+        print("if you want to keep other settings. Omitted secrets are unchanged.")
+        print("```yaml")
+        has_mapping = False
         for p in proposals:
             resolved = _resolve_field(p, preset)
             if resolved is None:
                 continue
             entity_id, origin = resolved
+            has_mapping = True
             print(f"{p.config_field}: {entity_id}    # {origin}")
             if (
                 p.config_field == "dispatch_grid_power_entity"
@@ -466,6 +471,10 @@ async def _cmd_onboard(
             ):
                 invert = preset.get("dispatch_grid_power_invert", "false")
                 print(f"dispatch_grid_power_invert: {invert}")
+        if not has_mapping:
+            print("{}")
+        print("```")
+        print("ha-spark config import onboard.yaml")
 
     print()
     result = await check_load_history(settings)
@@ -495,7 +504,7 @@ async def _cmd_backfill_load(
     forecast chain (``consumption_energy_entity``) consumes the result
     unchanged — no need to repoint between paths:
 
-    - The source-entity path (``--from`` / ``BACKFILL_SOURCE_ENTITY``)
+    - The source-entity path (``--from`` / ``backfill_source_entity`` in the store)
       copies a single power/energy sensor's hourly rows into the target.
     - The derived path (``--derive``, enabled by setting any
       ``derive_*_entity`` option) computes base load by energy balance
@@ -554,14 +563,15 @@ async def _cmd_backfill_load(
                 print(f"  {note}")
         print(
             f"{BACKFILL_STATISTIC_ID} now holds the derived base-load series; "
-            "point CONSUMPTION_ENERGY_ENTITY at it (or run `ha-spark onboard` "
-            "to confirm readiness)."
+            "run `ha-spark config set consumption_energy_entity=ha_spark:house_load` "
+            "and `ha-spark onboard` to confirm readiness."
         )
         return 0
     entity = source or settings.backfill_source_entity
     if not entity:
         print(
-            "No source entity: pass --from <entity_id> or set BACKFILL_SOURCE_ENTITY "
+            "No source entity: pass --from <entity_id> or run "
+            "`ha-spark config set backfill_source_entity=<entity_id>` "
             "(use --list to see candidates).",
             file=sys.stderr,
         )
@@ -573,7 +583,8 @@ async def _cmd_backfill_load(
         return 2
     print(f"Imported {count} hourly stats ({span}) from {entity} into {BACKFILL_STATISTIC_ID}.")
     print(
-        f"Set CONSUMPTION_ENERGY_ENTITY={BACKFILL_STATISTIC_ID} to use it for the load "
+        f"Run `ha-spark config set consumption_energy_entity={BACKFILL_STATISTIC_ID}` "
+        "to use it for the load "
         "forecast, then run `ha-spark onboard` to confirm readiness."
     )
     return 0
@@ -888,9 +899,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Scan Home Assistant's entities and propose which one maps to each "
         "ha-spark config field (battery SoC, solar forecast, dispatch sensor, charge "
         "current control, ...), ranked by device class / unit / name. Then report "
-        "whether CONSUMPTION_ENERGY_ENTITY has enough hourly history for the slot-profile "
+        "whether consumption_energy_entity has enough hourly history for the slot-profile "
         "forecast. Exit 0 when ready, 2 otherwise — fix gaps with `backfill-load`. "
-        "Proposals are advisory: review and set the options yourself.",
+        "Proposals are advisory: review and save with `ha-spark config set KEY=VALUE` "
+        "or import the --write fragment.",
     )
     p_onboard.add_argument(
         "--json", dest="as_json", action="store_true",
@@ -898,7 +910,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_onboard.add_argument(
         "--write", action="store_true",
-        help="Also print a ready-to-paste options fragment for the proposed mapping",
+        help="Print an import-ready settings fragment and the config import command",
     )
     p_onboard.add_argument(
         "--preset", dest="preset", metavar="NAME", choices=preset_names(),
@@ -970,20 +982,21 @@ def build_parser() -> argparse.ArgumentParser:
         description="Rebuild ha_spark:house_load history for the load forecast. Two "
         "paths write the same external id (the forecast chain consumes it "
         "unchanged, no need to repoint ``consumption_energy_entity``): the "
-        "source-entity path (``--from`` / ``BACKFILL_SOURCE_ENTITY``) copies a "
+        "source-entity path (``--from`` / stored ``backfill_source_entity``) copies a "
         "single power/energy sensor's hourly rows into ``ha_spark:house_load``, "
         "and the derived path (``--derive``) computes base load by energy "
         "balance over per-component statistic IDs (``derive_grid_import_entity`` "
         "etc., with explicit invert flags) and writes the result to the same id. "
         "Both paths are idempotent (recorder upserts by statistic_id+start); "
         "they are mutually exclusive at dispatch. ``--list`` shows "
-        "backfill-capable source candidates regardless of path.",
+        "backfill-capable source candidates regardless of path. Save a default with "
+        "`ha-spark config set backfill_source_entity=<entity_id>`.",
     )
     p_bf.add_argument(
         "--from",
         dest="source",
         metavar="ENTITY_ID",
-        help="Source statistic to build history from (default: BACKFILL_SOURCE_ENTITY). "
+        help="Source statistic to build history from (default: stored backfill_source_entity). "
         "Mutually exclusive with --derive.",
     )
     p_bf.add_argument(
@@ -1424,7 +1437,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "backfill-load":
         if args.derive and (args.source or settings.backfill_source_entity):
             print(
-                "--derive and --from / BACKFILL_SOURCE_ENTITY are mutually exclusive; "
+                "--derive and --from / stored backfill_source_entity are mutually exclusive; "
                 "pick one path.",
                 file=sys.stderr,
             )
