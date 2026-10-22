@@ -25,6 +25,7 @@ from ha_spark.config import (
     _validated_settings,
     _validation_error_reason,
     actuation_settings_changed,
+    field_metadata,
 )
 from ha_spark.devices.execution import execution_context
 from ha_spark.logging import get_logger
@@ -32,7 +33,7 @@ from ha_spark.mode_preconditions import NO_FALLBACK_PLATFORM, fallback_schedule_
 
 log = get_logger(__name__)
 OPTIONS_PATH = Path("/data/options.json")
-_KEYS = _OPTION_KEYS - {"db_path", "log_level"}
+_KEYS = frozenset(field_metadata())
 
 
 class RevisionConflict(ConfigError):

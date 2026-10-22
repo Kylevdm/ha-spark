@@ -6,11 +6,13 @@ from pydantic import ValidationError
 
 from ha_spark.config import (
     _OPTION_KEYS,
+    _SECRET_OPTION_KEYS,
     SUPERVISOR_REST_URL,
     SUPERVISOR_WS_URL,
     ConfigError,
     DeviceConfig,
     Settings,
+    field_metadata,
     load_settings,
 )
 from ha_spark.settings_service import _read_options_overlay
@@ -127,25 +129,71 @@ def test_solar_percentile_coerces_addon_string() -> None:
     assert Settings(solar_percentile=90).solar_percentile == 90
 
 
-def test_addon_schema_covers_all_option_keys() -> None:
-    """Every honoured option key appears in the add-on schema, and vice versa.
+def test_addon_bootstrap_schema_and_runtime_field_classification() -> None:
+    import yaml
 
-    Only top-level (exactly 2-space-indented) schema keys count; nested keys
-    under ``devices:`` (deeper indentation) are skipped.
-    """
-    in_schema = False
-    schema_keys: set[str] = set()
-    for line in ADDON_CONFIG.read_text(encoding="utf-8").splitlines():
-        if line == "schema:":
-            in_schema = True
-            continue
-        if in_schema:
-            if not line.startswith("  "):
-                break
-            if line.startswith("   "):  # 3+ spaces => nested; skip
-                continue
-            schema_keys.add(line.split(":", 1)[0].strip())
-    assert schema_keys == set(_OPTION_KEYS)
+    addon = yaml.safe_load(ADDON_CONFIG.read_text(encoding="utf-8"))
+    assert set(addon["schema"]) == set(addon["options"]) == {"log_level"}
+    metadata = field_metadata()
+    bootstrap = {"ha_url", "ha_token", "supervisor_token", "db_path", "log_level"}
+    assert set(metadata) == Settings.model_fields.keys() - bootstrap
+    for name, meta in metadata.items():
+        assert meta["owner"] in {"addon", "integration"}, name
+        assert type(meta["secret"]) is bool, name
+        assert meta["reload"] in {"live", "restart"}, name
+    assert {name for name, meta in metadata.items() if meta["secret"]} == _SECRET_OPTION_KEYS
+    for name in bootstrap:
+        assert Settings.model_fields[name].json_schema_extra is None
+    legacy = yaml.safe_load((Path(__file__).parent / "fixtures/addon-config-0.24.yaml").read_text())
+    assert set(legacy["options"]) <= _OPTION_KEYS
+    assert set(legacy["schema"]) <= _OPTION_KEYS
+
+
+def test_restart_fields_match_startup_bindings() -> None:
+    metadata = field_metadata()
+    assert {name for name, meta in metadata.items() if meta["reload"] == "restart"} == {
+        "inverter",
+        "devices",
+        "solis_control_hub",
+        "solis_modbus_slave",
+        "alphaess_serial",
+        "agent_surface",
+        "agent_expose_port",
+        "agent_api_token",
+    }
+    for name in ("timezone", "ha_timeout", "ollama_url", "inverter_power_switch_entity"):
+        assert metadata[name]["reload"] == "live"
+
+
+@pytest.mark.parametrize("standalone", [False, True])
+@pytest.mark.parametrize("source", ["env", "dotenv"])
+def test_runtime_environment_is_ignored(monkeypatch, tmp_path, standalone, source):
+    values = {
+        "MIN_SOC": "30",
+        "OCTOPUS_API_KEY": "env-key",
+        "TARIFF_PROVIDER": "invalid",
+        "DEVICES": "not-json",
+        "DB_PATH": "custom/ha_spark.db",
+        "SUPERVISOR_TOKEN": "sup-token",
+        "LOG_LEVEL": "DEBUG",
+    }
+    if standalone:
+        values.update(HA_URL="http://ha.test", HA_TOKEN="test")
+    if source == "env":
+        for key, value in values.items():
+            monkeypatch.setenv(key, value)
+    else:
+        (tmp_path / ".env").write_text("\n".join(f"{k}={v}" for k, v in values.items()))
+        monkeypatch.setitem(Settings.model_config, "env_file", ".env")
+    settings = Settings()
+    assert settings.is_standalone is standalone
+    assert settings.min_soc == 20
+    assert settings.octopus_api_key == ""
+    assert settings.tariff_provider == "fixed"
+    assert settings.log_level == "DEBUG"
+    assert settings.db_path == ("custom/ha_spark.db" if standalone else "data/ha_spark.db")
+    assert settings.supervisor_token == ("" if standalone else "sup-token")
+    assert Settings(min_soc=25).min_soc == 25
 
 
 def test_agent_defaults() -> None:
@@ -213,15 +261,8 @@ def test_dno_export_limit_defaults_to_g98_minimum_on_every_surface() -> None:
         window_start=time(23, 30),
         window_end=time(5, 30),
     )
-    addon_default = next(
-        line.split(":", 1)[1].strip()
-        for line in ADDON_CONFIG.read_text(encoding="utf-8").splitlines()
-        if line.startswith("  dno_export_limit_kw:")
-    )
-
     assert Settings().dno_export_limit_kw == 3.68
     assert planner.dno_export_limit_kw == 3.68
-    assert addon_default == "3.68"
 
 
 def test_inverter_clock_tolerance_defaults_to_five_minutes() -> None:
