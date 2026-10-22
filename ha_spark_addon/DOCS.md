@@ -13,8 +13,9 @@ Settings, presets and agent requests cannot change the operating mode.
    Repositories** and add `https://github.com/Kylevdm/ha-spark`.
 2. Install the **ha-spark** add-on. Home Assistant builds the image on your
    machine, so the first install takes a few minutes.
-3. Open the **Configuration** tab, set your options (see below), then start the
-   add-on.
+3. Start the add-on in Observe, then configure ha-spark's own store through
+   `ha-spark config` (see below). The add-on **Configuration** tab holds only
+   `log_level`; it is not an editor for runtime settings.
 
 ## Operating-mode page
 
@@ -44,21 +45,163 @@ CLI equivalents are `ha-spark mode show`, `ha-spark mode set protect`,
 `ha-spark mode set optimise`, `ha-spark mode set observe`, and
 `ha-spark mode confirm-observe`. Only the running daemon changes authority.
 
+## Updating to 0.25.0 (cutover)
+
+1. **Switch the operating mode to Observe before updating**, using the mode
+   page or `ha-spark mode set observe`. Wait for the handover to complete.
+2. **Copy your options YAML and keep it:** open the add-on **Configuration**
+   tab, choose **Edit in YAML**, and save the contents somewhere safe before
+   the update. This legacy copy may contain secrets; do not share it.
+3. **Update.** On the first start, ha-spark seeds its store once from
+   `options.json`, or from the Supervisor's stored copy of your options. On
+   current Supervisors the expected source after an update is `supervisor`,
+   because the Supervisor strips retired keys from `options.json` but keeps
+   them in its stored copy. The log line
+   `Configuration committed ... actor=seed source=options|supervisor|defaults`
+   tells you which source was used. Options never saved in the form are absent
+   from the Supervisor's copy; ha-spark's code defaults match the 0.24.1 defaults.
+
+   If no saved options are found while the operating mode is Protect or
+   Optimise, ha-spark enters configuration repair with:
+   “No saved options found to seed from while the operating mode is not Observe; import a saved configuration”.
+   Run `ha-spark config import <file>` on the saved copy. Invalid seed values
+   also require repair, not an unchecked start. In Observe the same case seeds
+   defaults instead (`source=defaults`), so import the saved copy then.
+4. **Check `ha-spark config show`**, confirm the mappings and limits, then
+   return to your previous mode through the mode page or `ha-spark mode set`.
+   Importing settings never changes the operating mode.
+
+After updating, the Supervisor logs `Option '<key>' does not exist in the schema`
+for each retired key every 15 minutes. This is expected and harmless: those
+stored legacy options are no longer runtime settings. Keep your saved YAML
+until you have checked the new store.
+
 ## Configuration
+
+### ha-spark's own store
+
+All runtime fields described below are **settings in ha-spark's own store**,
+not Supervisor add-on options. Only `log_level` remains in the Supervisor form.
+The one settings service validates ingress, CLI, seed and import changes.
+Environment variables and `.env` are not runtime sources: they supply only
+bootstrap HA credentials, the standalone data path and log level.
+
+The data directory (`/data` in the add-on, beside the database in standalone/dev)
+contains:
+
+- `ha_spark_config.json`: the versioned **settings document**, with
+  `schema_version`, a positive `revision`, and `settings` holding explicit owner
+  inputs only. Defaults and derived device definitions are not copied into it.
+- `ha_spark_secrets.json`: the separate **secrets file**, mode `0600`, containing
+  the Octopus key, Axle key and agent token inputs at the same revision.
+
+Every commit increments the revision and commits the pair together; matching
+`*.prev` files allow recovery from an interrupted pair replacement. The
+initialisation marker prevents a lost store from being silently seeded again.
+A rejected save leaves the files and running snapshot unchanged. Unknown keys
+are refused, and concurrent writers must supply the revision they last read;
+conflicts require a fresh read, not a blind retry. A save never changes authority,
+the operating mode or hardware. The data directory cannot be moved by a save.
+
+Safe planning, tariff and fenced entity-ID changes apply live and request a
+replan under the normal operating-mode gates. Device/driver addressing (including
+`inverter`, explicit `devices`, `solis_control_hub`, `solis_modbus_slave` and
+`alphaess_serial`), listeners, the agent token and startup-bound clients require
+an add-on restart. The read view includes each field's `owner`, `secret` and
+`reload` metadata. Integration-owned fields remain here for now, tagged
+`integration`; they have not yet moved to a companion integration.
+
+A change requiring restart is reported as `pending_restart`, including the
+fields concerned. The whole candidate waits: no live part of the same save
+runs ahead, and later saves remain pending while restart-field differences
+remain. Restart loads and checks the committed candidate as a whole.
+
+### Owner CLI
+
+Run these inside the add-on container, or in your standalone environment:
+
+```sh
+ha-spark config show
+ha-spark config export > settings.json
+ha-spark config set target_soc_cap=85 notify_service=mobile_app_phone
+ha-spark config set-secret octopus_api_key
+ha-spark config set-secret axle_api_key --clear
+ha-spark config import settings.json
+```
+
+- `show` returns effective values, revision, input keys, field metadata and
+  live/pending-restart status. Each secret is only `{"secret": true, "set": true|false}`.
+- `export` returns only non-secret inputs, not defaults or secret values.
+- `set KEY=VALUE…` merges non-secret changes. Values are parsed as JSON when
+  possible, otherwise as strings. It reads the revision before saving; a race
+  reports a conflict. Use `set-secret`, not `set`, for secret fields.
+- `set-secret KEY` reads a no-echo prompt on a terminal, or one line from stdin.
+  **Never put a secret value on argv** (including shell arguments); use the
+  prompt or secure stdin. `--clear` explicitly unsets the named secret.
+- `import FILE` accepts size-limited JSON or safe YAML: either an export or a
+  saved legacy Supervisor options file. It **replaces non-secret inputs**, not
+  merges them; omitted fields return to defaults. Omitted secrets and legacy
+  `***` masks preserve existing secrets; clearing is explicit. A legacy file
+  can carry old secrets into the separate secrets file, but new CLI secret
+  entry uses `set-secret`, never command-line values. Legacy `log_level` is
+  ignored, retired `proactive_mode` and device `control` are dropped with a
+  warning, and `db_path` is accepted only if it matches the fixed database path.
+  Move a non-default database to that fixed path first; import cannot move it.
+
+All CLI writes go through the owner-only daemon socket, not direct file edits,
+and refuse when no daemon is running. Without a daemon, `show` and `export`
+can read the files without changing them. In repair only `show` and `import`
+are available; import reads and supplies the current repair token automatically.
+Exports are secret-free backups, not backups of credentials.
+
+### Configuration repair
+
+Missing or unreadable files after initialisation, a mismatched pair with no
+matching previous pair, invalid values, an unsupported schema version, a failed
+seed or a failed pending-restart validation trigger **configuration repair**.
+A document from a newer schema is not overwritten by import.
+
+This bootstrap-only state serves diagnostics and repair through ingress and
+the daemon socket. It builds no device drivers, runs no scheduler tick, computes
+no plan, performs no mode transition, and makes **no hardware writes at all**,
+including shutdown safe-state writes, hold maintenance, clock sync or fallback.
+The published agent surface is unavailable. The authority store is read-only:
+recorded holds and transitions remain recorded, not enforced or advanced.
+
+**Protection and optimisation are suspended.** A switch already Off stays Off;
+ha-spark does not release it. The EV is not protected from drawing the house
+battery, any resident export window is unsupervised, and no fallback charging
+schedule is applied. Take manual control of the equipment as needed until
+configuration is repaired; repair itself supplies no safety net.
+
+`ha-spark health` exits non-zero with a failing Configuration check;
+`/api/health` reports failure. `ha-spark mode show` and the mode page show stored
+authority, holds and transitions marked `suspended: configuration_repair`, not
+active protection. Settings-dependent CLI commands refuse rather than using an
+untrusted mapping. Socket work and mode changes, including Confirm Observe,
+are refused during repair.
+
+Repair ends only when a valid import commits with the current repair token:
+use `ha-spark config import <file>`, or the ingress import endpoint below.
+Ordinary saves are refused. Import validates the complete candidate and normal
+save guards still apply; it cannot bypass fallback validation in Optimise.
+Normal startup then begins in the same process, including startup hold
+reconciliation and monitor restoration before the first plan. An existing
+transition resumes only on that normal startup path.
 
 ### Entity IDs (required for your installation)
 
 The defaults match the author's hardware (Solis inverter, Solcast, Octopus
 Intelligent, myenergi zappi). Point these at your own entities:
 
-| Option | What it must be |
+| Setting | What it must be |
 |---|---|
 | `soc_entity` | Battery state of charge (%) |
 | `soc_max_report_age_minutes` | How old Home Assistant's `last_reported` for `soc_entity` may be before ha-spark treats the SoC as stale and blocks real charge writes (default `10.0`). Some integrations never re-report an unchanged SoC, so an older SoC still counts as fresh if `battery_voltage_entity` reported within this age, which shows the integration is live. That exception lasts up to 12 hours. ha-spark does not check whether the battery is idle |
 | `soc_failure_threshold` | How many consecutive failed SoC observations trigger the configured Solis fallback (default `3`). Before fallback entry, one good observation resets the count. Once fallback is requested, verified, or unconfirmed, a passing observation leaves it in place until recovery (`soc_recovery_minutes`) |
 | `soc_recovery_minutes` | How many minutes of continuously passing SoC observations an active Solis fallback needs before ha-spark recovers (default `10`). Any failed observation restarts the count. The SoC may move, but its `last_reported` must never go backwards and must advance at least once; the battery-voltage liveness exception does not count. ha-spark then computes a fresh plan from the current SoC and the remaining cheap-rate window. The fallback stays in place until that plan is written and read back; a failed or mismatched read-back keeps the fallback and retries every minute. In Observe nothing is written, so recovery completes once the fresh plan is computed |
 | `solis_fallback_current_a` | Optional fallback-current ceiling in amps. When set, a sustained SoC failure programs only the configured `charge_window_start`–`charge_window_end` and this current, capped by `max_charge_current_a` and the Solis 62.5 A register limit. It is disabled when blank; there is no implicit current default. Only a successful Solis read-back is reported as verified |
-| `battery_power_entity` | Optional battery power in W, sampled each minute to check SoC against energy flow. The Solis preset uses `sensor.solisac_battery_power`. Both power signs count. Jumps unexplained by energy flow by more than 2 percentage points fail; unchanged SoC fails after more than 2 points of energy flows. Two consecutive reads of a rejected changed value accept a possible BMS recalibration with a warning. Missing power skips that interval; without this option these checks are off. The baseline resets on restart |
+| `battery_power_entity` | Optional battery power in W, sampled each minute to check SoC against energy flow. The Solis preset uses `sensor.solisac_battery_power`. Both power signs count. Jumps unexplained by energy flow by more than 2 percentage points fail; unchanged SoC fails after more than 2 points of energy flows. Two consecutive reads of a rejected changed value accept a possible BMS recalibration with a warning. Missing power skips that interval; without this setting these checks are off. The baseline resets on restart |
 | `battery_voltage_entity` | Battery voltage (V). ha-spark also uses it to tell whether the SoC's source is live, so pick the voltage sensor from the same integration as `soc_entity` |
 | `solar_tomorrow_entity` | Solcast "forecast tomorrow" sensor (with `detailedForecast` attribute) |
 | `solar_today_entity` | Optional Solcast "forecast today" sensor; recommended for accurate charge sizing. Honours `solar_percentile` and `detailedForecast`, like the tomorrow sensor. If missing or invalid, today's solar counts as zero: this oversizes the charge, never undersizes it. |
@@ -165,7 +308,7 @@ repoint anything when you switch paths.
 
 Per hour: `base = grid_import - grid_export + solar_generation + battery_discharge - battery_charge - ev_charge`.
 
-| Option | What it must be |
+| Setting | What it must be |
 |---|---|
 | `derive_grid_import_entity` | **Required** if you set any of these. Long-term statistic id for grid import (kWh or compatible). Without it, the derived path refuses to run. |
 | `derive_grid_export_entity` | Optional grid-export statistic id. If unset, ha-spark treats export as zero and adds a note to the run report. |
@@ -192,8 +335,8 @@ run report gives the reason.
 ### Multiple inverters (optional)
 
 Single-inverter installs need no change here. ha-spark still reads the flat
-`inverter` and entity-ID options above, converting them in memory without
-rewriting `options.json`. `devices` is the structured alternative for installs
+`inverter` and entity-ID settings above, deriving devices in memory without
+persisting that derived list in the settings document. `devices` is the structured alternative for installs
 that need explicit device definitions. The site operating mode covers them all:
 
 ```yaml
@@ -261,7 +404,7 @@ safety checks, as the plan's do. Leave `grid_power_entity` empty to turn the gua
 
 ### SoC integrity and fallback
 
-ha-spark checks `soc_entity` once a minute (see the `soc_*` options above). It
+ha-spark checks `soc_entity` once a minute (see the `soc_*` settings above). It
 publishes the result as `sensor.ha_spark_soc_integrity`, whose state is the
 operating state and whose attributes give the failure count, the integrity
 reason and evidence, the fallback window and current ceiling, and recovery
@@ -393,7 +536,7 @@ discharge power (W), adds it to the kWh delivered this session, values that
 energy at the configured rates less conversion losses, publishes
 `sensor.ha_spark_v2l_*`, and sends HA notifications.
 
-| Option | What it must be |
+| Setting | What it must be |
 |---|---|
 | `v2l_power_entity` | V2L discharge-power sensor (W). Empty (the default) disables the feature. |
 | `v2l_round_trip_efficiency` | Charge and discharge conversion losses combined into one efficiency (default `0.85`). ha-spark divides delivered kWh by this to get the energy needed to refill the car. |
@@ -514,7 +657,7 @@ against measured base load (gross house load less V2L). A model change, any
 median-driven day, missing paired median or zero baseline MAE is insufficient
 evidence. Missing days are never treated as zero cost or zero breaches.
 
-| Option | Default | Validation / meaning |
+| Setting | Default | Validation / meaning |
 | --- | --- | --- |
 | `readiness_window_days` | `21` | Positive integer; latest qualifying household-local days required |
 | `readiness_mae_improvement_pct` | `10` | 0–100%; minimum MAE improvement over the median |
@@ -554,7 +697,7 @@ the current import tariff and product codes from the account API on each rate
 fetch, so a tariff switch is picked up without a restart. Existing
 `octopus_product_code`/`octopus_tariff_code` settings are optional manual
 overrides; set both to skip discovery. If the account has multiple import meter
-points, set the existing `octopus_mpan` option to choose one. If that setting
+points, set `octopus_mpan` in the store to choose one. If that setting
 does not match, or discovery fails, rates fall back to the fixed rate/window
 and `ha-spark health` reports a warning. `octopus_meter_serial` is only needed
 for consumption reads. ha-spark never logs or echoes the API key, account
@@ -572,16 +715,14 @@ name the Home Assistant mirror entity, which ha-spark reads if the direct
 request fails. Set `axle_event_rate_gbp_kwh` to the paid export rate, because
 Axle's Home Assistant event response doesn't include one. The provider accepts
 only explicit, fresh export windows. Import events and malformed or stale
-responses produce no export slots. The API key is a `password` option, and
+responses produce no export slots. Enter the API key with
+`ha-spark config set-secret axle_api_key`; it lives in the secrets file and
 ha-spark never writes it to logs or reports.
 
-**Upgrading from `tariff_provider: axle`:** before updating the add-on, switch
-`tariff_provider` to `fixed` (or `octopus_intelligent`, with its required
-credentials). Then update and set `export_event_provider: axle`. The old
-`axle` tariff value has been removed; leaving it in place makes the Supervisor
-refuse the configuration after the update. Existing `axle_api_key`,
-`axle_api_url`, `axle_event_entity`, and `axle_event_rate_gbp_kwh` options are
-unchanged.
+**Importing an older `tariff_provider: axle` configuration:** the old `axle`
+tariff value has been removed. Change it to `fixed` (or `octopus_intelligent`,
+with its required credentials) and add `export_event_provider: axle` in the
+saved file before importing it. Other Axle field names are unchanged.
 
 Set `notify_service` to the bare Home Assistant notify service name, such as
 `mobile_app_<device>` (without `notify.`), for all notifications, including V2L and
@@ -654,11 +795,21 @@ Endpoints:
 - `GET /api/health`: liveness, and when the latest plan was computed
 - `GET /api/plan`: the latest plan, as the same sensor payload the daemon
   publishes to Home Assistant
-- `GET /api/config`: the current options, with secrets masked
-- `POST /api/config`: merge the posted options, save them to
-  `/data/options.json`, and reload the daemon's settings without a restart.
-  It is an owner save, so it needs the `X-Remote-User-Id` header the ingress
-  proxy adds, `X-HA-Spark-Request: config` and a JSON body.
+- `GET /api/config`: the settings service's read view, with revision, field
+  metadata, input keys and pending-restart status; secrets are set/unset only.
+  In repair it returns reasons and a repair token instead.
+- `POST /api/config`: merge `{"expected_revision": 1, "changes": {...}}` through
+  the settings service. Returns the new revision, changed field names and
+  `live` or `pending_restart`; 400 for sanitised validation reasons, 409 for
+  a revision conflict, or 503 in repair.
+- `POST /api/config/import`: replace inputs with
+  `{"expected": 1, "document": {...}}`, or use the current repair token as
+  `expected` in repair. This is the only configuration write accepted in repair.
+
+Both POST endpoints require the ingress proxy's valid `X-Remote-User-Id`,
+`X-HA-Spark-Request: config` and `Content-Type: application/json`. Failed request
+checks return 403 or 415. All writes use the same validation and save guards;
+no settings page is added in this phase.
 
 The config endpoints exist only on ingress. They aren't served on the
 published agent port, whatever the token, or on the standalone/dev listener.
@@ -675,12 +826,13 @@ ha-spark's data and, optionally, trigger a few gated actions.
   predictions, health). `read_act` adds `add_context` and `run_plan`.
   `read_write` adds `set_config`, which in this version refuses every change
   with `unavailable`: agents can't change configuration until owner-approved
-  config proposals exist.
+  config proposals exist in phase 14.
 - `agent_api_token`: bearer token for the published port. If you leave it
   blank, the add-on generates one on first start and saves it to
   `/data/agent_token` in the add-on container (read it from the add-on shell
   with `cat /data/agent_token`). The token never appears in the add-on log.
-  It's a `password` field, so the UI never shows it again.
+  Set your own token with `ha-spark config set-secret agent_api_token`;
+  config reads show only set/unset status, never the token.
 - `agent_expose_port` (`bool`, default `false`): publish the agent surface on
   the host network for clients that can't reach add-on ingress.
 
@@ -720,17 +872,20 @@ every hardware decision.
    with the current setting:
    - `ha-spark onboard --preset solis` fills anything it can't match from the
      reference Solis/Solcast/Octopus/zappi setup.
-   - `ha-spark onboard --write` also prints an options fragment ready to paste.
+   - `ha-spark onboard --write` also prints an import-ready YAML settings
+     fragment and `ha-spark config import onboard.yaml`. Save only the fenced
+     YAML as that file. Import replaces non-secret inputs: merge with an export
+     first if you need to retain other settings. The fragment contains no secrets.
    - `ha-spark onboard --json` prints the proposals as JSON for other tools.
 
-   The proposals are advisory. Review them and set the options in the
-   **Configuration** tab yourself; the wizard never rewrites your config.
+   The proposals are advisory. Review them and save with `ha-spark config set`
+   or the printed import command; discovery itself never rewrites your config.
 3. The load forecast needs hourly household-load history:
    - `ha-spark backfill-load --list` lists statistics you can import. Then
      `ha-spark backfill-load --from <entity_id>` imports one as
      `ha_spark:house_load` history. `ha-spark onboard` tells you when there is
      enough history.
-   - Or set the `derive_*_entity` options (grid import is required) and run
+   - Or set the `derive_*_entity` settings (grid import is required) and run
      `ha-spark backfill-load --derive` once. See "Derived base load" above;
      each plan run then keeps the last 48 hours up to date.
 4. If `notify_service` is configured, run `ha-spark notify-test` from the add-on
@@ -773,7 +928,7 @@ while fallback is active. Until then the hold stays and a refused line is logged
 or schedule not verified). After `hold_degraded_minutes` one notification is sent
 per episode, including across restarts; a verified release re-arms it.
 
-| Option | Source | Default |
+| Setting | Source | Default |
 | --- | --- | --- |
 | `ev_status_max_age_seconds` | `ev_status_entity` charging status | 300 |
 | `ev_plug_max_age_seconds` | `ev_plug_entity` plug status | 300 |
@@ -784,8 +939,8 @@ per episode, including across restarts; a verified release re-arms it.
 | `battery_power_max_age_seconds` | `battery_power_entity` direction evidence | 300 |
 | `octopus_dispatch_max_age_seconds` | Octopus API dispatch windows | 2700 |
 
-Settings require `0 < max_age_seconds <= 86400` (the add-on form accepts
-0.001–86400). An explicitly unset/`None` limit is **unknown**, with
+Settings require `0 < max_age_seconds <= 86400`.
+An explicitly unset/`None` limit is **unknown**, with
 `no validated max-age; set <option>`; no unmeasured source should acquire a
 guessed default.
 
@@ -843,15 +998,16 @@ retain their original `gather_inputs` fetch time.
 
 ## Data
 
-The SQLite store lives at `/data/ha_spark.db` and survives restarts and
-updates. `db_path` is set at install (add-on options or, standalone, the
-environment) and takes effect at startup; a settings save cannot change it —
-set it in the options or environment and restart.
+The SQLite store lives at the fixed `/data/ha_spark.db` in the add-on and
+survives restarts and updates. It holds history, not settings. Standalone/dev
+uses bootstrap `DB_PATH` to fix the database and data directory at startup.
+`db_path` is not a runtime setting: neither a save nor an import can move the
+data directory or database. Settings and secrets live beside it.
 
 Dispatch power evidence: `ev_power_entity` reads direct car draw (W or kW).
 `dispatch_grid_power_entity` supplies an independent grid-import reading;
 set `dispatch_grid_power_invert: true` for the Solis import-negative meter.
-These options do not enable the supply guard. During an active dispatch,
+These settings do not enable the supply guard. During an active dispatch,
 car draw ≥1.4 kW or grid import ≥3 kW above forecast house load confirms it.
 After ten minutes, an otherwise uncorroborated dispatch is released only when
 both readable power signals are below those thresholds. Missing or invalid

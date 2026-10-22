@@ -158,6 +158,7 @@ from ha_spark.ha.notifier import send_notification
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 from ha_spark.mode_preconditions import check_preconditions
+from ha_spark.settings_service import ConfigurationRepair, SettingsService
 from ha_spark.transitions import PreconditionReport, TransitionRequest, propose_transition
 
 log = get_logger(__name__)
@@ -1782,31 +1783,77 @@ async def _mode_lifecycle(
                     await _notify_fallback_left(settings, rest)
 
 
+def _ingress_server(state: AppState) -> uvicorn.Server:
+    """The ingress listener for ``state``.
+
+    Add-on mode: listen on all interfaces (the ingress proxy connects over the
+    hassio network) but answer only the proxy's address. Standalone/dev has no
+    ingress proxy, so bind to loopback and let the OS keep the network out.
+    """
+    if state.settings_service.bootstrap.is_standalone:
+        return make_server(build_app(state), "127.0.0.1", INGRESS_PORT)
+    return make_server(
+        build_app(state, ingress_peer=INGRESS_PROXY_IP),
+        "0.0.0.0",  # noqa: S104 - peer-restricted to the ingress proxy
+        INGRESS_PORT,
+    )
+
+
+async def _serve_repair(service: SettingsService, channel: DaemonChannel) -> None:
+    """Configuration repair: serve only the fix until an import commits.
+
+    Only the socket (config show/import, authority status) and the ingress
+    app's config, health and mode-status routes answer. No scheduler, driver,
+    SoC monitor, readiness recording, published port, transition, hold,
+    shutdown safe-state or clock sync runs, and authority is only ever read.
+    """
+    log.warning(
+        "Configuration repair: protection and optimisation suspended until a valid "
+        "configuration is imported"
+    )
+    state = AppState(settings=service.bootstrap, options_path=OPTIONS_PATH, executor=channel,
+                     settings_service=service)
+    server = _ingress_server(state)
+    repaired = asyncio.Event()
+    service.on_repaired = repaired.set
+    serve_task: asyncio.Task[None] | None = None
+    try:
+        serve_task = await serve_in_background(server)
+    except Exception:
+        log.exception("HTTP API failed to start; continuing without it")
+    try:
+        if service.repair is not None:
+            await repaired.wait()
+    finally:
+        service.on_repaired = None
+        state.executor = None
+        if serve_task is not None:
+            await stop_server(server, serve_task)
+
+
 async def _run_forever(
     settings: Settings, channel: DaemonChannel, *, poll_seconds: int
 ) -> None:
     """Loop: recompute and apply the plan once per local half-hour slot.
 
     Serves the add-on HTTP API (behind ingress) sharing an :class:`AppState`
-    with this loop: ``POST /api/config`` rewrites the options and the loop picks
-    up the reloaded settings on its next tick (hot reload, no restart).
+    with this loop: ``POST /api/config`` commits a settings pair and the loop
+    picks up the active snapshot on its next tick (hot reload, no restart).
     """
-    warn_deprecated_notify_target(settings)
-    state = AppState(settings=settings, options_path=OPTIONS_PATH, executor=channel)
-    # Add-on mode: listen on all interfaces (the ingress proxy connects over the
-    # hassio network) but answer only the proxy's address. Standalone/dev has no
-    # ingress proxy, so bind to loopback and let the OS keep the network out.
-    if settings.is_standalone:
-        server = make_server(build_app(state), "127.0.0.1", INGRESS_PORT)
-    else:
-        server = make_server(
-            build_app(state, ingress_peer=INGRESS_PROXY_IP),
-            "0.0.0.0",  # noqa: S104 - peer-restricted to the ingress proxy
-            INGRESS_PORT,
-        )
-    # Constructing the HTTP server above does not bind it. Claim the executor
-    # before starting listeners or touching hardware, including startup probes.
     await channel.__aenter__()
+    service = SettingsService(OPTIONS_PATH, settings=settings)
+    channel.settings_service = service
+    while True:
+        try:
+            settings = service.load(writable=True)
+            break
+        except ConfigurationRepair:
+            await _serve_repair(service, channel)
+    service.request_replan = channel.request_replan
+    warn_deprecated_notify_target(settings)
+    state = AppState(settings=settings, options_path=OPTIONS_PATH, executor=channel,
+                     settings_service=service)
+    server = _ingress_server(state)
     authority = AuthorityStore(settings)
     try:
         authority.start_process()

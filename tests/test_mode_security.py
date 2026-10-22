@@ -61,14 +61,17 @@ def test_config_cannot_grant_mode(tmp_path: Path, path: str):
     })
     store = seed_authority(settings, "observe")
     before = store.store_path.read_bytes()
-    state = AppState(settings, tmp_path / "options.json", reload=lambda: settings)
-    # The owner's ingress save really runs (and drops the unknown keys); the
-    # agent route refuses (#457). Neither touches authority.
+    from tests.authority_helpers import seed_settings
+
+    service = seed_settings(tmp_path, settings=settings)
+    state = AppState(settings, tmp_path / "options.json", settings_service=service)
+    # The owner's save rejects unknown/retired keys; the agent refuses every
+    # edit (#457). Neither touches authority.
     with owner_client(state) as client:
-        response = client.post(path, json={"operating_mode": "protect",
-                                           "committed_mode": "protect",
-                                           "mode": "protect", "proactive_mode": "on"})
-    assert response.status_code == (200 if path == "/api/config" else 409)
+        response = client.post(path, json={"expected_revision": service.revision, "changes": {
+            "operating_mode": "protect", "committed_mode": "protect",
+            "mode": "protect", "proactive_mode": "on"}})
+    assert response.status_code == (400 if path == "/api/config" else 409)
     assert store.store_path.read_bytes() == before
 
 

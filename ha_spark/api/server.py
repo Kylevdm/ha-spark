@@ -16,15 +16,15 @@ loopback only. The published agent port is gated by a bearer token instead.
 Owner-only routes (the mode page, ``/api/mode`` and ``/api/config``) exist
 only on the ingress app, never on the published port or the standalone
 listener: an agent token must never reach an owner write (#457).
+
+In configuration repair only the mode page and status, the config read,
+``POST /api/config/import`` and health answer; everything else is 503.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import re
-from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -33,30 +33,19 @@ import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError
 
 from ha_spark.agent import auth, tools
 from ha_spark.agent.exposure import OPERATION_TIERS, allowed, surface_on
 from ha_spark.authority import OperatingMode, authority_view, load_authority
-from ha_spark.config import (
-    _OPTION_KEYS,
-    _SECRET_OPTION_KEYS,
-    ConfigError,
-    Settings,
-    actuation_settings_changed,
-    load_settings,
-    validate_options_document,
-)
+from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import DaemonChannel
-from ha_spark.devices.execution import execution_context
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.logging import get_logger
-from ha_spark.mode_preconditions import (
-    NO_FALLBACK_PLATFORM,
-    entry_preconditions,
-    fallback_schedule_problem,
-)
+from ha_spark.mode_preconditions import entry_preconditions
+from ha_spark.settings_service import OPTIONS_PATH as OPTIONS_PATH
+from ha_spark.settings_service import RepairTokenConflict, RevisionConflict, SettingsService
 
 log = get_logger(__name__)
 
@@ -70,13 +59,7 @@ INGRESS_PROXY_IP = "172.30.32.2"
 # Optional published port (Task 9): bound only when the user opts in via
 # `agent_surface == "on"` and `agent_expose_port`. Mapped to the host in config.yaml.
 AGENT_PORT = 8098
-# Where the add-on persists user options (HA add-on convention).
-OPTIONS_PATH = Path("/data/options.json")
 STATE_ATTR = "ha_spark_state"
-# Placeholder returned in place of a set secret so it never leaves the process
-# in cleartext. A client that posts this value back is treated as "unchanged"
-# (see apply_options), so a GET-then-POST round-trip can't clobber the secret.
-_REDACTED = "***"
 # The fixed answer to every agent config change (``/agent/config`` and the MCP
 # ``set_config`` tool) until owner-approved config proposals exist (#457).
 AGENT_CONFIG_REFUSAL: dict[str, str] = {
@@ -105,20 +88,51 @@ class ModeBody(BaseModel):
     expected_epoch: int | None = Field(ge=1, strict=True)
 
 
-@dataclass
+class ConfigBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(strict=True, ge=1)
+    changes: dict[str, Any]
+
+
+class ImportBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # The revision, or in configuration repair the repair token.
+    expected: StrictInt | StrictStr = Field(union_mode="left_to_right")
+    document: dict[str, Any]
+
+
+# The routes configuration repair serves (method, path); everything else is 503.
+_REPAIR_ROUTES = frozenset({
+    ("GET", "/"), ("GET", "/mode.js"), ("GET", "/api/mode"), ("GET", "/api/config"),
+    ("POST", "/api/config/import"), ("GET", "/api/health"),
+})
+
+
 class AppState:
-    """State shared between the daemon and the API handlers.
+    """Daemon/API state; all settings operations delegate to the settings service."""
 
-    ``reload`` is injectable so tests can rebuild ``Settings`` without the full
-    add-on/dev credential machinery; in production it is :func:`load_settings`.
-    """
+    def __init__(
+        self,
+        settings: Settings,
+        options_path: Path,
+        settings_service: SettingsService | None = None,
+        plan: ChargePlan | None = None,
+        plan_at: datetime | None = None,
+        executor: DaemonChannel | None = None,
+    ) -> None:
+        self.settings_service = settings_service or SettingsService(options_path, settings=settings)
+        self.plan = plan
+        self.plan_at = plan_at
+        self.executor = executor
 
-    settings: Settings
-    options_path: Path
-    reload: Callable[[], Settings] = load_settings
-    plan: ChargePlan | None = None
-    plan_at: datetime | None = None
-    executor: DaemonChannel | None = None
+    @property
+    def settings(self) -> Settings:
+        return self.settings_service.settings
+
+    @settings.setter
+    def settings(self, settings: Settings) -> None:
+        # Compatibility for tests; production publishes only through save.
+        self.settings_service.settings = settings
 
     def set_plan(self, plan: ChargePlan) -> None:
         """Record the latest computed plan (called by the daemon each run)."""
@@ -126,106 +140,12 @@ class AppState:
         self.plan_at = datetime.now(UTC)
 
     def current_options(self) -> dict[str, Any]:
-        """The user-facing options subset of the current settings.
+        return self.settings_service.read_view()
 
-        Secret keys (``_SECRET_OPTION_KEYS``) are masked with ``_REDACTED`` when
-        set so they never leave the process in cleartext (this is the single
-        chokepoint for ``/api/config``, ``/agent/config`` and the ``set_config``
-        MCP tool). An unset secret keeps its empty value so clients can still
-        tell it isn't configured.
-        """
-        out: dict[str, Any] = {}
-        for key in _OPTION_KEYS:
-            value = getattr(self.settings, key)
-            if key in _SECRET_OPTION_KEYS and value:
-                out[key] = _REDACTED
-            elif key == "devices":
-                # `devices` holds pydantic DeviceConfig models (synthesized from
-                # the flat keys when unset); dump to JSON-safe primitives so the
-                # config response/persistence stays serializable.
-                out[key] = [d.model_dump(mode="json") for d in value]
-            else:
-                out[key] = value
-        return out
-
-    def apply_options(self, updates: dict[str, Any]) -> Settings:
-        """Merge ``updates`` into the persisted options, validate, then save.
-
-        Only keys in ``_OPTION_KEYS`` are accepted; unknown keys are ignored. An
-        incoming secret value equal to ``_REDACTED`` is dropped (treated as
-        "unchanged"), so a GET-then-POST round-trip of the masked options can't
-        clobber the real secret with the mask.
-
-        The complete merged candidate is validated into :class:`Settings`
-        (the same overlay/validation semantics as :func:`load_settings`) *before*
-        anything touches disk or the running settings (#412): an invalid
-        document is rejected with a secret-safe reason naming the failing
-        field(s) -- never an input value -- and leaves the options file
-        byte-identical and the running settings exactly as they were.
-
-        ``db_path`` decides where the authority store and the runtime state
-        beside it live, so a save cannot change it (#441): any update whose
-        value differs from the running one (including ``None``, which the
-        options overlay would drop to a default) is rejected before the
-        merged document is validated or persisted, with the same
-        byte-identical/no-echo guarantees. ``db_path`` is still read at startup
-        from the environment and the options file, which need a restart.
-        """
-        if "db_path" in updates and updates["db_path"] != self.settings.db_path:
-            raise ConfigError(
-                "db_path cannot be changed by a settings save; "
-                "set it in the environment or options file and restart"
-            )
-        current: dict[str, Any] = {}
-        if self.options_path.exists():
-            current = json.loads(self.options_path.read_text(encoding="utf-8"))
-        current.update(
-            {
-                k: v
-                for k, v in updates.items()
-                if k in _OPTION_KEYS
-                and not (k in _SECRET_OPTION_KEYS and v == _REDACTED)
-            }
-        )
-        # Validate the whole candidate before persisting anything; a rejected
-        # save must leave the file byte-identical.
-        candidate = validate_options_document(current)
-        context = execution_context()
-        store = context.authority
-        authority = store.state if store is not None and store.known else None
-        # Unknown authority fails closed only for a save that would invalidate
-        # a currently valid fallback, so an install without one can still save.
-        unknown = authority is None or (store is not None and store.save_failed)
-        if (
-            (unknown and fallback_schedule_problem(self.settings) is None)
-            or (authority is not None and not unknown and (
-                authority.committed_mode == "optimise"
-                or (authority.transition is not None
-                    and authority.transition.target == "optimise")
-            ))
-        ):
-            reason = fallback_schedule_problem(candidate)
-            if reason == NO_FALLBACK_PLATFORM:
-                raise ConfigError("Invalid fallback charging schedule: inverter configuration")
-            if reason is not None:
-                # Driver reasons may include raw window values. Name only known
-                # fields/categories here, never echo candidate input at a surface.
-                fields = [name for name in (
-                    "solis_fallback_current_a", "max_charge_current_a", "battery_voltage_v",
-                    "supply_max_current_a", "supply_voltage_v", "charge_window_start",
-                    "charge_window_end",
-                ) if name in reason]
-                detail = ", ".join(fields) or "charge window or site supply limit"
-                raise ConfigError(f"Invalid fallback charging schedule: {detail}")
-        self.options_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.options_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(current), encoding="utf-8")
-        temporary.replace(self.options_path)
-        settings = self.reload()
-        if actuation_settings_changed(self.settings, settings):
-            context.config_generation += 1
-        self.settings = settings
-        return self.settings
+    def apply_options(
+        self, updates: dict[str, Any], expected_revision: int, actor: str,
+    ) -> dict[str, Any]:
+        return self.settings_service.save(updates, expected_revision, actor)
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -409,6 +329,8 @@ def build_app(
         gate_bindings=_gate_bindings(agent_router),
     )
     setattr(app.state, STATE_ATTR, state)
+    # Added first so the ingress peer check runs before it.
+    app.add_middleware(_RepairGate, state=state)
     if ingress_peer is not None:
         app.add_middleware(_PeerGate, peer=ingress_peer)
 
@@ -441,6 +363,11 @@ def build_app(
             st = _state_of(request)
             if st.executor is None:
                 return JSONResponse({"error": "no daemon executor"}, status_code=503)
+            if st.settings_service.repair is not None:
+                # The stored authority, read only; no settings to check entry against.
+                return JSONResponse(
+                    st.executor.authority_status(), headers={"Cache-Control": "no-store"},
+                )
             preconditions = await entry_preconditions(st.settings)
             # Snapshot after the diagnostic reads; preconditions never grant authority.
             view = dict(st.executor.authority_status())
@@ -489,7 +416,7 @@ def build_app(
 
         @app.post("/api/config")
         async def post_config(request: Request) -> JSONResponse:
-            """Merge posted options, persist, and hot-reload the daemon's settings."""
+            """Commit a revisioned partial update and publish the daemon's new snapshot."""
             user = request.headers.get("X-Remote-User-Id", "")
             if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user) is None:
                 return JSONResponse({"error": "forbidden"}, status_code=403)
@@ -502,10 +429,18 @@ def build_app(
                 updates = await request.json()
             except Exception:  # noqa: BLE001 - malformed body is a client error
                 return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-            if not isinstance(updates, dict):
-                return JSONResponse({"error": "expected a JSON object"}, status_code=400)
             try:
-                _state_of(request).apply_options(updates)
+                body = ConfigBody.model_validate(updates)
+            except ValidationError:
+                return JSONResponse({"error": "invalid config envelope"}, status_code=400)
+            try:
+                result = _state_of(request).apply_options(
+                    body.changes, body.expected_revision, f"ingress:{user}",
+                )
+            except RevisionConflict as exc:
+                return JSONResponse(
+                    {"error": "conflict", "revision": exc.revision}, status_code=409,
+                )
             except ConfigError as exc:
                 # ConfigError reasons name fields only, never an input value (#412).
                 log.warning("Rejecting config update: %s", exc)
@@ -514,22 +449,65 @@ def build_app(
                 # Any other exception's text could carry input; report its type only.
                 log.warning("Config update failed: %s", type(exc).__name__)
                 return JSONResponse({"error": "config update failed"}, status_code=400)
-            return JSONResponse(_state_of(request).current_options())
+            return JSONResponse(result)
+
+        @app.post("/api/config/import")
+        async def post_config_import(request: Request) -> JSONResponse:
+            """Replace the configuration; in repair the only write, with the repair token."""
+            user = request.headers.get("X-Remote-User-Id", "")
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user) is None:
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            if request.headers.get("X-HA-Spark-Request") != "config":
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                return JSONResponse({"error": "application/json required"}, status_code=415)
+            try:
+                body = ImportBody.model_validate(await request.json())
+            except Exception:  # noqa: BLE001 - malformed body is a client error
+                return JSONResponse({"error": "invalid config import"}, status_code=400)
+            try:
+                result = _state_of(request).settings_service.import_document(
+                    body.document, body.expected, f"ingress:{user}",
+                )
+            except RevisionConflict as exc:
+                return JSONResponse(
+                    {"error": "conflict", "revision": exc.revision}, status_code=409,
+                )
+            except RepairTokenConflict as exc:
+                return JSONResponse(
+                    {"error": "conflict", "repair_token": exc.token}, status_code=409,
+                )
+            except ConfigError as exc:
+                # ConfigError reasons name fields only, never an input value (#412).
+                log.warning("Rejecting config import: %s", exc)
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            except Exception as exc:  # noqa: BLE001 - save failure -> client error
+                log.warning("Config import failed: %s", type(exc).__name__)
+                return JSONResponse({"error": "config import failed"}, status_code=400)
+            return JSONResponse(result)
 
     @app.get("/api/health")
     async def health(request: Request) -> dict[str, Any]:
         """Liveness + whether a plan has been computed yet (full doctor stays in the CLI)."""
         st = _state_of(request)
+        repair = st.settings_service.repair
         if st.executor is not None:
             authority = st.executor.authority_status()
         else:
-            loaded = load_authority(st.settings)
+            loaded = load_authority(
+                st.settings if repair is None else st.settings_service.bootstrap
+            )
             authority = authority_view(loaded.state, known=loaded.status == "known")
         failed = authority["mode"] == "authority_unknown" or authority["save_failed"]
-        return {
-            "status": "fail" if failed else "ok", "plan_at": _iso(st.plan_at),
+        result: dict[str, Any] = {
+            "status": "fail" if failed or repair is not None else "ok",
+            "plan_at": _iso(st.plan_at),
             "operating_mode": authority["mode"], "authority": authority,
         }
+        if repair is not None:
+            result["configuration"] = {"status": "configuration_repair", "reasons": repair}
+        return result
 
     @app.get("/api/plan")
     async def get_plan(request: Request) -> dict[str, Any]:
@@ -592,6 +570,29 @@ def _origin_gated(asgi_app: Any) -> Any:
 
 def _has_origin(scope: Any) -> bool:
     return any(name.lower() == b"origin" for name, _ in scope.get("headers", []))
+
+
+class _RepairGate:
+    """ASGI middleware: in configuration repair, 503 everything but :data:`_REPAIR_ROUTES`."""
+
+    def __init__(self, app: Any, state: AppState) -> None:
+        self.app = app
+        self.state = state
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if (
+            scope["type"] in ("http", "websocket")
+            and self.state.settings_service.repair is not None
+            and (scope.get("method"), scope["path"]) not in _REPAIR_ROUTES
+        ):
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1013})
+            else:
+                await JSONResponse({"error": "configuration_repair"}, status_code=503)(
+                    scope, receive, send
+                )
+            return
+        await self.app(scope, receive, send)
 
 
 class _PeerGate:

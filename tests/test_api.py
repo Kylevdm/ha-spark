@@ -11,11 +11,12 @@ from fastapi.testclient import TestClient
 
 from ha_spark.api.server import INGRESS_PROXY_IP, AppState, build_app
 from ha_spark.authority import operating_mode, resolve_data_dir
-from ha_spark.config import Settings
+from ha_spark.config import ConfigError, Settings
 from ha_spark.energy.models import ChargeIntent, ChargePlan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import monitor_path
 from tests.api_helpers import OWNER_CONFIG_HEADERS, owner_client
+from tests.authority_helpers import seed_settings, settings_bytes
 
 
 def _soc(value: float) -> SocMeasurement:
@@ -57,12 +58,8 @@ def _plan(**overrides: object) -> ChargePlan:
 
 def _state(tmp_path: Path, **settings_kw: object) -> AppState:
     options_path = tmp_path / "options.json"
-    # reload rebuilds Settings from the persisted file (stands in for load_settings).
-    return AppState(
-        settings=Settings(**settings_kw),  # type: ignore[arg-type]
-        options_path=options_path,
-        reload=lambda: Settings(**json.loads(options_path.read_text(encoding="utf-8"))),
-    )
+    service = seed_settings(tmp_path, settings=Settings(**settings_kw))  # type: ignore[arg-type]
+    return AppState(service.settings, options_path, settings_service=service)
 
 
 def _client(state: AppState) -> TestClient:
@@ -101,7 +98,7 @@ def test_get_config_returns_options(tmp_path: Path) -> None:
     with owner_client(_state(tmp_path)) as client:
         resp = client.get("/api/config")
     assert resp.status_code == 200
-    assert "min_soc" in resp.json()
+    assert "min_soc" in resp.json()["settings"]
 
 
 @pytest.mark.parametrize("saved", ["off", "simulate", "on", "invalid", "\udcff"])
@@ -110,32 +107,36 @@ def test_retired_sidecar_is_not_read_or_changed(tmp_path, caplog, saved):
     original = saved.encode("utf-8", errors="surrogateescape")
     path.write_bytes(original)
     state = _state(tmp_path)
-    state.apply_options({"proactive_mode": "on"})
+    with pytest.raises(ConfigError, match="retired: use the operating mode"):
+        state.apply_options({"proactive_mode": "on"}, state.settings_service.revision, "seed")
     assert path.read_bytes() == original
     assert not caplog.records
-    assert "proactive_mode" not in state.current_options()
+    assert "proactive_mode" not in state.current_options()["settings"]
 
 
 def test_retired_sidecar_directory_is_ignored(tmp_path, caplog):
     (tmp_path / "proactive_mode.txt").mkdir()
     state = _state(tmp_path)
-    state.apply_options({"proactive_mode": "on"})
+    with pytest.raises(ConfigError, match="retired: use the operating mode"):
+        state.apply_options({"proactive_mode": "on"}, state.settings_service.revision, "seed")
     assert not caplog.records
-    assert "proactive_mode" not in state.current_options()
+    assert "proactive_mode" not in state.current_options()["settings"]
 
 
 def test_config_roundtrip_persists_and_reloads(tmp_path: Path) -> None:
     state = _state(tmp_path, min_soc=20.0)
     with owner_client(state) as client:
         before = client.get("/api/config").json()
-        assert before["min_soc"] == 20.0
-        resp = client.post("/api/config", json={"min_soc": 25.0, "not_a_key": "x"})
-        after = resp.json()
+        assert before["settings"]["min_soc"] == 20.0
+        resp = client.post(
+            "/api/config",
+            json={"expected_revision": before["revision"], "changes": {"min_soc": 25.0}},
+        )
+        after = client.get("/api/config").json()["settings"]
     assert resp.status_code == 200
     assert after["min_soc"] == 25.0
-    # persisted to the options file, and the unknown key was dropped
-    persisted = json.loads((tmp_path / "options.json").read_text(encoding="utf-8"))
-    assert persisted == {"min_soc": 25.0}
+    persisted = json.loads((tmp_path / "ha_spark_config.json").read_text())
+    assert persisted["settings"] == {"min_soc": 25.0}
     assert state.settings.min_soc == 25.0
 
 
@@ -160,55 +161,58 @@ def test_get_config_redacts_secrets(tmp_path: Path) -> None:
     assert "SECRET_OCTO" not in resp.text
     assert "SECRET_AXLE" not in resp.text
     assert "SECRET_AGENT" not in resp.text
-    body = resp.json()
-    # Keys are still present (response shape preserved) but redacted.
-    assert body["octopus_api_key"] == "***"
-    assert body["axle_api_key"] == "***"
-    assert body["agent_api_token"] == "***"
+    body = resp.json()["settings"]
+    assert body["octopus_api_key"] == {"secret": True, "set": True}
+    assert body["axle_api_key"] == {"secret": True, "set": True}
+    assert body["agent_api_token"] == {"secret": True, "set": True}
 
 
 def test_unset_secret_not_rendered_as_redacted(tmp_path: Path) -> None:
     """An empty secret stays empty so clients can tell it's not configured."""
     with owner_client(_state(tmp_path)) as client:
-        body = client.get("/api/config").json()
-    assert body["octopus_api_key"] == ""
-    assert body["agent_api_token"] == ""
+        body = client.get("/api/config").json()["settings"]
+    assert body["octopus_api_key"] == {"secret": True, "set": False}
+    assert body["agent_api_token"] == {"secret": True, "set": False}
 
 
 def test_post_redacted_secret_does_not_clobber_stored_value(tmp_path: Path) -> None:
     """GET-then-POST round-trip of the masked options must not overwrite the secret."""
-    # The secrets live in the persisted options file (as in add-on mode), so the
-    # reload after apply_options reconstructs them rather than losing them.
-    (tmp_path / "options.json").write_text(
-        json.dumps({"octopus_api_key": "REAL_OCTO", "agent_api_token": "REAL_AGENT"}),
-        encoding="utf-8",
-    )
     state = _state(tmp_path, octopus_api_key="REAL_OCTO", agent_api_token="REAL_AGENT")
     with owner_client(state) as client:
         # Posting the sentinel back (as a client echoing GET /api/config would) is a no-op.
         resp = client.post(
             "/api/config",
-            json={"octopus_api_key": "***", "agent_api_token": "***", "min_soc": 25.0},
+            json={
+                "expected_revision": state.settings_service.revision,
+                "changes": {"octopus_api_key": "***", "agent_api_token": "***", "min_soc": 25.0},
+            },
         )
     assert resp.status_code == 200
     # Stored secrets are unchanged; the non-secret update still applied.
     assert state.settings.octopus_api_key == "REAL_OCTO"
     assert state.settings.agent_api_token == "REAL_AGENT"
     assert state.settings.min_soc == 25.0
-    persisted = json.loads((tmp_path / "options.json").read_text(encoding="utf-8"))
-    # The sentinel was dropped, so the persisted secrets keep their real values.
+    persisted = json.loads((tmp_path / "ha_spark_secrets.json").read_text())["secrets"]
     assert persisted["octopus_api_key"] == "REAL_OCTO"
     assert persisted["agent_api_token"] == "REAL_AGENT"
-    assert persisted["min_soc"] == 25.0
+    assert (
+        json.loads((tmp_path / "ha_spark_config.json").read_text())["settings"]["min_soc"] == 25.0
+    )
 
 
 def test_post_genuine_secret_value_is_stored(tmp_path: Path) -> None:
     """A real (non-sentinel) secret value still updates normally."""
     state = _state(tmp_path)
     with owner_client(state) as client:
-        client.post("/api/config", json={"octopus_api_key": "NEW_OCTO"})
+        client.post(
+            "/api/config",
+            json={
+                "expected_revision": state.settings_service.revision,
+                "changes": {"octopus_api_key": "NEW_OCTO"},
+            },
+        )
     assert state.settings.octopus_api_key == "NEW_OCTO"
-    persisted = json.loads((tmp_path / "options.json").read_text(encoding="utf-8"))
+    persisted = json.loads((tmp_path / "ha_spark_secrets.json").read_text())["secrets"]
     assert persisted["octopus_api_key"] == "NEW_OCTO"
 
 
@@ -237,7 +241,14 @@ def test_ingress_app_serves_the_proxy(tmp_path: Path) -> None:
     state = _state(tmp_path, min_soc=20.0)
     with _ingress_client(state, INGRESS_PROXY_IP) as client:
         assert client.get("/api/health").status_code == 200
-        saved = client.post("/api/config", json={"min_soc": 30.0}, headers=OWNER_CONFIG_HEADERS)
+        saved = client.post(
+            "/api/config",
+            json={
+                "expected_revision": state.settings_service.revision,
+                "changes": {"min_soc": 30.0},
+            },
+            headers=OWNER_CONFIG_HEADERS,
+        )
         assert saved.status_code == 200
     assert state.settings.min_soc == 30.0
 
@@ -259,19 +270,23 @@ def test_post_config_rejects_invalid_document_before_saving(
     settings untouched, and the 400 reason must name the failing field without
     echoing its value or the secret sitting next to it in the document.
     """
-    options = tmp_path / "options.json"
-    seeded = json.dumps({"min_soc": 20.0, "octopus_api_key": "SECRET_OCTO"}).encode()
-    options.write_bytes(seeded)
     state = _state(tmp_path, min_soc=20.0, octopus_api_key="SECRET_OCTO")
+    seeded = settings_bytes(tmp_path)
     with caplog.at_level("WARNING"):
         with owner_client(state) as client:
-            resp = client.post("/api/config", json={"min_soc": "not-a-number"})
+            resp = client.post(
+                "/api/config",
+                json={
+                    "expected_revision": state.settings_service.revision,
+                    "changes": {"min_soc": "not-a-number"},
+                },
+            )
     assert resp.status_code == 400
     assert "min_soc" in resp.json()["error"]
     assert "not-a-number" not in resp.text
     assert "SECRET_OCTO" not in resp.text
     assert "SECRET_OCTO" not in caplog.text
-    assert options.read_bytes() == seeded
+    assert settings_bytes(tmp_path) == seeded
     assert state.settings.min_soc == 20.0
 
 
@@ -283,18 +298,22 @@ def test_post_config_rejection_never_echoes_a_secret_value(
     pydantic's ValidationError embeds ``input_value``, so a rejected secret
     value would otherwise leave the process in cleartext (CLAUDE.md top rule).
     """
-    options = tmp_path / "options.json"
-    seeded = json.dumps({"agent_api_token": "REAL_AGENT"}).encode()
-    options.write_bytes(seeded)
     state = _state(tmp_path, agent_api_token="REAL_AGENT")
+    seeded = settings_bytes(tmp_path)
     with caplog.at_level("WARNING"):
         with owner_client(state) as client:
-            resp = client.post("/api/config", json={"agent_api_token": ["TOPSECRET_AGENT"]})
+            resp = client.post(
+                "/api/config",
+                json={
+                    "expected_revision": state.settings_service.revision,
+                    "changes": {"agent_api_token": ["TOPSECRET_AGENT"]},
+                },
+            )
     assert resp.status_code == 400
     assert "agent_api_token" in resp.json()["error"]
     assert "TOPSECRET_AGENT" not in resp.text
     assert "TOPSECRET_AGENT" not in caplog.text
-    assert options.read_bytes() == seeded
+    assert settings_bytes(tmp_path) == seeded
     assert state.settings.agent_api_token == "REAL_AGENT"
 
 
@@ -305,13 +324,16 @@ def test_post_config_rejection_of_nested_device_entry_is_secret_safe(tmp_path: P
         resp = client.post(
             "/api/config",
             json={
-                "devices": [
-                    {
-                        "id": "main_inverter",
-                        "driver": "solis",
-                        "entities": {"power_switch": ["TOPSECRET_AGENT"]},
-                    }
-                ]
+                "expected_revision": state.settings_service.revision,
+                "changes": {
+                    "devices": [
+                        {
+                            "id": "main_inverter",
+                            "driver": "solis",
+                            "entities": {"power_switch": ["TOPSECRET_AGENT"]},
+                        }
+                    ]
+                },
             },
         )
     assert resp.status_code == 400
@@ -329,23 +351,30 @@ def test_post_config_rejects_a_changed_db_path(
     value is rejected before the merged document is validated or persisted,
     with a reason naming ``db_path`` that never echoes the submitted value.
     """
-    options = tmp_path / "options.json"
-    seeded = json.dumps({"min_soc": 20.0}).encode()
-    options.write_bytes(seeded)
     state = _state(
-        tmp_path, ha_url="http://ha.test", ha_token="x", db_path=str(tmp_path / "t.db"),
+        tmp_path,
+        ha_url="http://ha.test",
+        ha_token="x",
+        db_path=str(tmp_path / "t.db"),
         min_soc=20.0,
     )
+    seeded = settings_bytes(tmp_path)
     before_dir = resolve_data_dir(state.settings)
     before_mode = operating_mode(state.settings)
     with caplog.at_level("WARNING"):
         with owner_client(state) as client:
-            resp = client.post("/api/config", json={"db_path": "TOPSECRET/moved-db.db"})
+            resp = client.post(
+                "/api/config",
+                json={
+                    "expected_revision": state.settings_service.revision,
+                    "changes": {"db_path": "TOPSECRET/moved-db.db"},
+                },
+            )
     assert resp.status_code == 400
     assert "db_path" in resp.json()["error"]
     assert "TOPSECRET/moved-db.db" not in resp.text
     assert "moved-db.db" not in caplog.text
-    assert options.read_bytes() == seeded
+    assert settings_bytes(tmp_path) == seeded
     # The running value -- and so the authority directory and mode it decides
     # -- are exactly as they were before the rejected save.
     assert state.settings.db_path == str(tmp_path / "t.db")
@@ -359,34 +388,41 @@ def test_post_config_rejects_null_db_path(tmp_path: Path) -> None:
     "unset", so it is rejected like any other change (#441). Add-on mode too:
     every runtime-state path derived from ``db_path`` stays where it was.
     """
-    options = tmp_path / "options.json"
-    seeded = json.dumps({"min_soc": 20.0}).encode()
-    options.write_bytes(seeded)
     state = _state(tmp_path, min_soc=20.0)
+    seeded = settings_bytes(tmp_path)
     before_monitor = monitor_path(state.settings)
     with owner_client(state) as client:
-        resp = client.post("/api/config", json={"db_path": None})
+        resp = client.post(
+            "/api/config",
+            json={
+                "expected_revision": state.settings_service.revision,
+                "changes": {"db_path": None},
+            },
+        )
     assert resp.status_code == 400
     assert "db_path" in resp.json()["error"]
     assert "None" not in resp.json()["error"]
-    assert options.read_bytes() == seeded
-    assert state.settings.db_path == "data/ha_spark.db"
+    assert settings_bytes(tmp_path) == seeded
+    assert state.settings.db_path == str(tmp_path / "ha_spark.db")
     assert monitor_path(state.settings) == before_monitor
 
 
-def test_post_config_accepts_a_save_echoing_the_running_db_path(tmp_path: Path) -> None:
-    """A GET-then-POST round trip posts the running ``db_path`` back unchanged;
-    that save is accepted and applies its other changes (#441)."""
+def test_post_config_rejects_even_the_running_bootstrap_db_path(tmp_path: Path) -> None:
+    """db_path is bootstrap-only, even when the submitted value is unchanged."""
     db_path = str(tmp_path / "t.db")
-    state = _state(
-        tmp_path, ha_url="http://ha.test", ha_token="x", db_path=db_path, min_soc=20.0
-    )
+    state = _state(tmp_path, ha_url="http://ha.test", ha_token="x", db_path=db_path, min_soc=20.0)
     with owner_client(state) as client:
-        resp = client.post("/api/config", json={"db_path": db_path, "min_soc": 25.0})
-    assert resp.status_code == 200
-    assert state.settings.min_soc == 25.0
+        resp = client.post(
+            "/api/config",
+            json={
+                "expected_revision": state.settings_service.revision,
+                "changes": {"db_path": db_path, "min_soc": 25.0},
+            },
+        )
+    assert resp.status_code == 400
+    assert state.settings.min_soc == 20.0
     assert state.settings.db_path == db_path
-    assert resp.json()["db_path"] == db_path
+    assert "db_path" in resp.json()["error"]
 
 
 # --- #457: config routes are owner-only ingress routes -----------------------
@@ -454,19 +490,25 @@ def test_ingress_config_save_needs_a_json_content_type(tmp_path: Path) -> None:
 
 
 def test_config_save_failure_other_than_validation_never_echoes_its_text(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A reload failure's message may carry input; only its type is reported."""
     state = _state(tmp_path, min_soc=20.0)
 
-    def _boom() -> Settings:
-        raise ValueError("TOPSECRET_FROM_RELOAD")
+    def _boom(*args, **kwargs):
+        raise OSError("TOPSECRET_FROM_RELOAD")
 
-    state.reload = _boom
+    monkeypatch.setattr("ha_spark.settings_service.os.replace", _boom)
     with owner_client(state) as client:
-        resp = client.post("/api/config", json={"min_soc": 30.0})
+        resp = client.post(
+            "/api/config",
+            json={
+                "expected_revision": state.settings_service.revision,
+                "changes": {"min_soc": 30.0},
+            },
+        )
     assert resp.status_code == 400
-    assert resp.json() == {"error": "config update failed"}
+    assert resp.json() == {"error": "Configuration save failed; restart required"}
     assert "TOPSECRET" not in resp.text
     assert "TOPSECRET" not in caplog.text
     assert state.settings.min_soc == 20.0
@@ -481,8 +523,9 @@ def test_post_config_rejection_never_echoes_a_submitted_mapping_key(
     with owner_client(state) as client:
         resp = client.post(
             "/api/config",
-            json={"devices": [{"id": "main", "driver": "solis",
-                               "entities": {"TOPSECRET_ENTITY": []}}]},
+            json={"expected_revision": state.settings_service.revision, "changes": {
+                "devices": [{"id": "main", "driver": "solis",
+                             "entities": {"TOPSECRET_ENTITY": []}}]}},
         )
     assert resp.status_code == 400
     assert "devices.0.entities.<key>" in resp.json()["error"]

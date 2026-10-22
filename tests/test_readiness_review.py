@@ -11,7 +11,7 @@ from ha_spark.config import Settings
 from ha_spark.daemon_channel import DaemonChannel, Pending, Request
 from ha_spark.energy import scheduler
 from ha_spark.energy.readiness_ledger import ReadinessLedger
-from tests.authority_helpers import seed_authority
+from tests.authority_helpers import run_daemon, seed_authority
 from tests.test_authority_gate import daemon_ticks
 from tests.test_readiness_ledger import START, revision
 
@@ -41,7 +41,7 @@ async def test_capture_uses_post_handover_mode_and_driver_rate_capability(
     respx.post(url__regex=r"http://ha.test/api/states/.*").respond(200, json={})
     stop = daemon_ticks(monkeypatch, [START.astimezone(ZoneInfo(settings.timezone))])
     with pytest.raises(stop):
-        await scheduler.run_forever(settings, poll_seconds=123)
+        await run_daemon(settings, poll_seconds=123)
     (row,) = await ReadinessLedger(settings.db_path).slots(START, START + timedelta(hours=1))
     assert row.operating_mode == "observe"
     if inverter == "alphaess":

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from ha_spark import config
+from ha_spark import config, settings_service
 from ha_spark.api.server import AppState, build_app
 from ha_spark.authority import AuthorityStore
 from ha_spark.devices.execution import ExecutionContext, Ownership
@@ -27,8 +27,8 @@ async def test_retired_options_load_once_without_grant(tmp_path, monkeypatch, ca
     monkeypatch.setenv("HA_URL", "http://ha.test")
     monkeypatch.setenv("HA_TOKEN", "test")
     monkeypatch.setenv("DB_PATH", str(tmp_path / "events.db"))
-    read_overlay = config._read_options_overlay
-    monkeypatch.setattr(config, "_read_options_overlay", lambda: read_overlay(path))
+    read_overlay = settings_service._read_options_overlay
+    monkeypatch.setattr(settings_service, "_read_options_overlay", lambda _: read_overlay(path))
     settings = config.load_settings()
     warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
@@ -82,7 +82,10 @@ async def test_config_post_drops_retired_key_and_sidecar(tmp_path: Path, surface
     }
     if existing:
         path.write_text(json.dumps(legacy))
-    state = AppState(settings, path, reload=lambda: settings)
+    from tests.authority_helpers import seed_settings
+
+    service = seed_settings(tmp_path, settings=settings)
+    state = AppState(service.settings, path, settings_service=service)
     if surface == "mcp":
         from mcp.server.fastmcp.exceptions import ToolError
 
@@ -97,14 +100,13 @@ async def test_config_post_drops_retired_key_and_sidecar(tmp_path: Path, surface
         assert response.status_code == 409
     else:
         with owner_client(state) as client:
-            response = client.post(surface, json={"proactive_mode": "on"})
-        assert response.status_code == 200
-        assert "proactive_mode" not in response.json()
+            response = client.post(surface, json={"expected_revision": service.revision,
+                                                  "changes": {"proactive_mode": "on"}})
+        assert response.status_code == 400
+        assert "retired: use the operating mode" in response.json()["error"]
     assert store.store_path.read_bytes() == before
     if existing:
         assert json.loads(path.read_text()) == legacy
-    elif surface == "/api/config":
-        assert "proactive_mode" not in json.loads(path.read_text())
     else:
         assert not path.exists()
     assert not (tmp_path / "proactive_mode.txt").exists()

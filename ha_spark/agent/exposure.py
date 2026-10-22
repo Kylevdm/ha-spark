@@ -50,7 +50,7 @@ def allowed(state: AppState, tier: Tier) -> bool:
     """Whether an operation at ``tier`` may be served right now.
 
     Reads ``state.settings`` on every call; never cache the answer --
-    ``AppState.apply_options`` replaces the settings object at runtime.
+    ``SettingsService.save`` replaces the settings object at runtime.
     """
     if not surface_on(state):
         return False

@@ -1,19 +1,23 @@
 import json
 from pathlib import Path
 
+import httpx
 import pytest
+import respx
 from pydantic import ValidationError
 
 from ha_spark.config import (
     _OPTION_KEYS,
+    _SECRET_OPTION_KEYS,
     SUPERVISOR_REST_URL,
     SUPERVISOR_WS_URL,
     ConfigError,
     DeviceConfig,
     Settings,
-    _read_options_overlay,
+    field_metadata,
     load_settings,
 )
+from ha_spark.settings_service import SUPERVISOR_INFO_URL, _read_options_overlay
 
 ADDON_CONFIG = Path(__file__).parent.parent / "ha_spark_addon" / "config.yaml"
 
@@ -71,16 +75,21 @@ def test_load_settings_fails_fast_without_credentials(
     for var in ("HA_URL", "HA_TOKEN", "SUPERVISOR_TOKEN"):
         monkeypatch.delenv(var, raising=False)
     # No /data/options.json overlay in the test environment.
-    monkeypatch.setattr("ha_spark.config._read_options_overlay", lambda: {})
+    monkeypatch.setattr("ha_spark.settings_service._read_options_overlay", lambda path: {})
     with pytest.raises(ConfigError):
         load_settings()
 
 
+@respx.mock
 def test_load_settings_ok_in_addon_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HA_URL", raising=False)
     monkeypatch.delenv("HA_TOKEN", raising=False)
     monkeypatch.setenv("SUPERVISOR_TOKEN", "sup-token")
-    monkeypatch.setattr("ha_spark.config._read_options_overlay", lambda: {})
+    monkeypatch.setattr("ha_spark.settings_service._read_options_overlay", lambda path: {})
+    # An empty overlay in add-on mode asks the Supervisor for stored options.
+    respx.get(SUPERVISOR_INFO_URL).mock(
+        return_value=httpx.Response(200, json={"result": "ok", "data": {"options": {}}})
+    )
     settings = load_settings()
     assert settings.is_standalone is False
     assert settings.auth_token == "sup-token"
@@ -92,8 +101,8 @@ def test_load_settings_validate_false_skips_credential_check(
     # Diagnostic paths (`ha-spark health`) must build settings without creds
     # while still honouring the options overlay.
     monkeypatch.setattr(
-        "ha_spark.config._read_options_overlay",
-        lambda: {"ollama_url": "http://100.1.2.3:11434"},
+        "ha_spark.settings_service._read_options_overlay",
+        lambda path: {"ollama_url": "http://100.1.2.3:11434"},
     )
     settings = load_settings(validate=False)
     assert settings.ollama_url == "http://100.1.2.3:11434"
@@ -127,25 +136,79 @@ def test_solar_percentile_coerces_addon_string() -> None:
     assert Settings(solar_percentile=90).solar_percentile == 90
 
 
-def test_addon_schema_covers_all_option_keys() -> None:
-    """Every honoured option key appears in the add-on schema, and vice versa.
+def test_addon_bootstrap_schema_and_runtime_field_classification() -> None:
+    import yaml
 
-    Only top-level (exactly 2-space-indented) schema keys count; nested keys
-    under ``devices:`` (deeper indentation) are skipped.
-    """
-    in_schema = False
-    schema_keys: set[str] = set()
-    for line in ADDON_CONFIG.read_text(encoding="utf-8").splitlines():
-        if line == "schema:":
-            in_schema = True
-            continue
-        if in_schema:
-            if not line.startswith("  "):
-                break
-            if line.startswith("   "):  # 3+ spaces => nested; skip
-                continue
-            schema_keys.add(line.split(":", 1)[0].strip())
-    assert schema_keys == set(_OPTION_KEYS)
+    addon = yaml.safe_load(ADDON_CONFIG.read_text(encoding="utf-8"))
+    assert set(addon["schema"]) == set(addon["options"]) == {"log_level"}
+    metadata = field_metadata()
+    bootstrap = {"ha_url", "ha_token", "supervisor_token", "db_path", "log_level"}
+    assert set(metadata) == Settings.model_fields.keys() - bootstrap
+    for name, meta in metadata.items():
+        assert meta["owner"] in {"addon", "integration"}, name
+        assert type(meta["secret"]) is bool, name
+        assert meta["reload"] in {"live", "restart"}, name
+    assert {name for name, meta in metadata.items() if meta["secret"]} == _SECRET_OPTION_KEYS
+    for name in bootstrap:
+        assert Settings.model_fields[name].json_schema_extra is None
+    legacy = yaml.safe_load((Path(__file__).parent / "fixtures/addon-config-0.24.yaml").read_text())
+    assert set(legacy["options"]) <= _OPTION_KEYS
+    assert set(legacy["schema"]) <= _OPTION_KEYS
+
+
+def test_addon_supervisor_seed_uses_default_role_api_access() -> None:
+    import yaml
+
+    addon = yaml.safe_load(ADDON_CONFIG.read_text(encoding="utf-8"))
+    assert addon["hassio_api"] is True
+    assert addon.get("hassio_role", "default") == "default"
+
+
+def test_restart_fields_match_startup_bindings() -> None:
+    metadata = field_metadata()
+    assert {name for name, meta in metadata.items() if meta["reload"] == "restart"} == {
+        "inverter",
+        "devices",
+        "solis_control_hub",
+        "solis_modbus_slave",
+        "alphaess_serial",
+        "agent_surface",
+        "agent_expose_port",
+        "agent_api_token",
+    }
+    for name in ("timezone", "ha_timeout", "ollama_url", "inverter_power_switch_entity"):
+        assert metadata[name]["reload"] == "live"
+
+
+@pytest.mark.parametrize("standalone", [False, True])
+@pytest.mark.parametrize("source", ["env", "dotenv"])
+def test_runtime_environment_is_ignored(monkeypatch, tmp_path, standalone, source):
+    values = {
+        "MIN_SOC": "30",
+        "OCTOPUS_API_KEY": "env-key",
+        "TARIFF_PROVIDER": "invalid",
+        "DEVICES": "not-json",
+        "DB_PATH": "custom/ha_spark.db",
+        "SUPERVISOR_TOKEN": "sup-token",
+        "LOG_LEVEL": "DEBUG",
+    }
+    if standalone:
+        values.update(HA_URL="http://ha.test", HA_TOKEN="test")
+    if source == "env":
+        for key, value in values.items():
+            monkeypatch.setenv(key, value)
+    else:
+        (tmp_path / ".env").write_text("\n".join(f"{k}={v}" for k, v in values.items()))
+        monkeypatch.setitem(Settings.model_config, "env_file", ".env")
+    settings = Settings()
+    assert settings.is_standalone is standalone
+    assert settings.min_soc == 20
+    assert settings.octopus_api_key == ""
+    assert settings.tariff_provider == "fixed"
+    assert settings.log_level == "DEBUG"
+    assert settings.db_path == ("custom/ha_spark.db" if standalone else "data/ha_spark.db")
+    assert settings.supervisor_token == ("" if standalone else "sup-token")
+    assert Settings(min_soc=25).min_soc == 25
 
 
 def test_agent_defaults() -> None:
@@ -213,15 +276,8 @@ def test_dno_export_limit_defaults_to_g98_minimum_on_every_surface() -> None:
         window_start=time(23, 30),
         window_end=time(5, 30),
     )
-    addon_default = next(
-        line.split(":", 1)[1].strip()
-        for line in ADDON_CONFIG.read_text(encoding="utf-8").splitlines()
-        if line.startswith("  dno_export_limit_kw:")
-    )
-
     assert Settings().dno_export_limit_kw == 3.68
     assert planner.dno_export_limit_kw == 3.68
-    assert addon_default == "3.68"
 
 
 def test_inverter_clock_tolerance_defaults_to_five_minutes() -> None:
@@ -380,37 +436,27 @@ def test_export_event_provider_is_independent_of_tariff() -> None:
         Settings(tariff_provider="axle")
 
 
-def test_validate_options_document_names_field_without_its_value() -> None:
-    """#412: a rejected options document names the failing field(s), never an
-    input value (which can be a secret option or a nested devices entry)."""
-    from ha_spark.config import validate_options_document
+def test_settings_save_names_field_without_its_value(tmp_path) -> None:
+    """#412: a rejected save names fields, never input values or secrets."""
+    from tests.test_settings_store import store
 
+    service = store(tmp_path)
+    service.load(writable=True)
     with pytest.raises(ConfigError) as exc:
-        validate_options_document(
-            {"min_soc": "not-a-number", "octopus_api_key": "SECRET_OCTO"}
+        service.save(
+            {"min_soc": "not-a-number", "octopus_api_key": "SECRET_OCTO"}, 1, "seed"
         )
     assert "min_soc" in str(exc.value)
     assert "not-a-number" not in str(exc.value)
     assert "SECRET_OCTO" not in str(exc.value)
 
 
-def test_validate_options_document_honours_only_option_keys() -> None:
-    """The document validator uses load_settings' overlay semantics: only
-    ``_OPTION_KEYS`` are honoured and ``None`` values are dropped."""
-    from ha_spark.config import validate_options_document
+def test_settings_save_rejects_a_bad_tariff_naming_the_field(tmp_path) -> None:
+    from tests.test_settings_store import store
 
-    settings = validate_options_document(
-        {"min_soc": 30.0, "ha_token": "SNEAKY", "not_a_key": 1, "db_path": None}
-    )
-    assert settings.min_soc == 30.0
-    assert settings.ha_token != "SNEAKY"
-    assert settings.db_path == "data/ha_spark.db"
-
-
-def test_validate_options_document_rejects_a_bad_tariff_naming_the_field() -> None:
-    from ha_spark.config import validate_options_document
-
+    service = store(tmp_path)
+    service.load(writable=True)
     with pytest.raises(ConfigError) as exc:
-        validate_options_document({"charge_window_start": "25:99"})
+        service.save({"charge_window_start": "25:99"}, 1, "seed")
     assert "window_start" in str(exc.value)
     assert "25:99" not in str(exc.value)

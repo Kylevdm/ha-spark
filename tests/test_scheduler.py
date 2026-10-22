@@ -35,7 +35,6 @@ from ha_spark.energy.scheduler import (
     SIGNAL_SAMPLE_INTERVAL,
     charge_current_changed,
     guard_tick,
-    run_forever,
     run_once,
     sample_signals,
     setpoint_changed,
@@ -45,6 +44,7 @@ from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor
 from ha_spark.ha.rest import HomeAssistantRest
 from tests.authority_helpers import legacy_settings as Settings
+from tests.authority_helpers import run_daemon as run_forever
 from tests.authority_helpers import seed_authority
 
 
@@ -6107,12 +6107,14 @@ async def test_loop_failure_during_recovery_restarts_the_stability_wait(
     ],
 )
 async def test_run_forever_restricts_the_ingress_listener(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     settings_kw: dict[str, str],
     host: str,
     peer: str | None,
 ) -> None:
     """Add-on mode answers only the ingress proxy; standalone binds loopback only."""
+    for module in ("ha_spark.authority", "ha_spark.daemon_channel", "ha_spark.settings_service"):
+        monkeypatch.setattr(f"{module}.resolve_data_dir", lambda _: tmp_path)
     captured: dict[str, object] = {}
 
     class _Bound(Exception):

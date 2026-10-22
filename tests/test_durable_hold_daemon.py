@@ -12,7 +12,7 @@ from ha_spark.config import Settings
 from ha_spark.devices.execution import execution_context
 from ha_spark.energy import scheduler
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
-from tests.authority_helpers import seed_authority
+from tests.authority_helpers import run_daemon, seed_authority
 from tests.test_authority_gate import daemon_ticks
 from tests.test_scheduler import (
     _EV_STATUS_URL,
@@ -100,7 +100,7 @@ async def test_restart_reconciles_before_soc_fallback_or_plan(
     monkeypatch.setattr(scheduler, "run_once", plan)
     stop = daemon_ticks(monkeypatch, [NOW.astimezone(ZoneInfo("Europe/London"))])
     with pytest.raises(stop):
-        await scheduler.run_forever(settings, poll_seconds=123)
+        await run_daemon(settings, poll_seconds=123)
     assert events[:3] == ["reconcile", "soc/fallback", "plan"]
     assert AuthorityStore(settings).state.store_id == original.state.store_id
 
@@ -280,7 +280,7 @@ async def test_daemon_reload_keeps_durable_ev_clearance(tmp_path, monkeypatch, m
         (NOW + timedelta(minutes=30)).astimezone(ZoneInfo("Europe/London")),
     ])
     with pytest.raises(stop):
-        await scheduler.run_forever(settings, poll_seconds=123)
+        await run_daemon(settings, poll_seconds=123)
     assert len(seen) == 2
     assert seen[0] is seen[1]
     assert AuthorityStore(settings).state.holds[0].clear_count == 3

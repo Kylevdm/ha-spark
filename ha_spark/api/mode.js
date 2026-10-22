@@ -39,6 +39,11 @@ function render(view) {
     detail("Last change", view.last_changed_at);
     detail("Requester kind", view.requester_kind);
     if (view.save_failed) detail("Authority fault", "Authority store save failed; writes are blocked.");
+    if (view.suspended === "configuration_repair") {
+        detail("Suspended", "Configuration needs repair: protection and optimisation are "
+            + "suspended until a valid configuration is imported.");
+        return;
+    }
     element("h2", "Entry preconditions (checked again when requested)", statusNode);
     for (const target of ["observe", "protect", "optimise"]) {
         const report = view.preconditions[target];

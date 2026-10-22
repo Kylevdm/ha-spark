@@ -1,11 +1,9 @@
 """Source freshness: report-time metadata, and only fresh evidence rates a dispatch."""
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import pytest
 import respx
-import yaml
 from pydantic import ValidationError
 
 from ha_spark.config import _OPTION_KEYS, Settings
@@ -89,10 +87,7 @@ def test_unvalidated_max_age() -> None:
 
 @pytest.mark.parametrize("source", SOURCES)
 def test_options_defaults_and_bounds(source: str) -> None:
-    addon = yaml.safe_load((Path(__file__).parents[1] / "ha_spark_addon/config.yaml").read_text())
     key = f"{source}_max_age_seconds"
-    assert addon["options"][key] == (2700 if source == "octopus_dispatch" else 300)
-    assert addon["schema"][key] == "float(0.001,86400)?"
     assert key in _OPTION_KEYS
     assert getattr(Settings(), key) == (2700 if source == "octopus_dispatch" else 300)
     for invalid in (0, -1, 86401, float("inf"), float("nan")):

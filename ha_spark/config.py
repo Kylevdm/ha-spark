@@ -3,35 +3,34 @@
 ha-spark targets the Home Assistant add-on runtime. In add-on mode the HA REST
 and WebSocket endpoints are reached through the Supervisor proxy
 (``http://supervisor/core/api`` / ``ws://supervisor/core/websocket``) and
-authenticated with ``SUPERVISOR_TOKEN``; user-exposed options come from
-``/data/options.json``. For local development a standalone escape hatch is kept:
+authenticated with ``SUPERVISOR_TOKEN``; owner inputs come from the committed
+settings document and secrets file. For local development a standalone escape hatch is kept:
 set ``HA_URL`` + ``HA_TOKEN`` and the same code paths talk to an HA instance
 directly.
 
-Settings load (in precedence order) from add-on options (``/data/options.json``),
-environment variables, a local ``.env`` file, and built-in defaults.
+The settings service loads the committed pair, or previews legacy options on
+first start. Environment variables and a local ``.env`` supply only mode-specific
+bootstrap values, never runtime settings.
 """
 
 from __future__ import annotations
 
-import json
 from datetime import time
-from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, TypedDict, cast
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
-
-from ha_spark.logging import get_logger
-
-log = get_logger(__name__)
+from pydantic_settings import (
+    BaseSettings,
+    EnvSettingsSource,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 # Add-on mode: HA Core is reached through the Supervisor proxy.
 SUPERVISOR_REST_URL = "http://supervisor/core/api"
 SUPERVISOR_WS_URL = "ws://supervisor/core/websocket"
 
-# User-exposed add-on options we honour from /data/options.json.
-_OPTIONS_PATH = Path("/data/options.json")
+# Frozen 0.24 legacy seed/import vocabulary, not the runtime or Supervisor schema.
 _OPTION_KEYS = frozenset(
     {
         "ollama_url",
@@ -58,8 +57,6 @@ _OPTION_KEYS = frozenset(
         "charge_window_start",
         "charge_window_end",
         # Energy planner v2: tariff, slot profile, Octopus consumption pull.
-        # The API key is exposed here too — options.json is the only user config
-        # surface in add-on mode (the add-on schema will mark it `password`).
         "rate_offpeak_gbp_kwh",
         "rate_peak_gbp_kwh",
         "rate_export_gbp_kwh",
@@ -356,6 +353,23 @@ class DeviceConfig(BaseModel):
     entities: dict[str, str] = Field(default_factory=dict)
 
 
+class FieldMeta(TypedDict):
+    """Eventual owner, secrecy and activation policy for one runtime field."""
+
+    owner: Literal["addon", "integration"]
+    secret: bool
+    reload: Literal["live", "restart"]
+
+
+def _metadata(
+    owner: Literal["addon", "integration"],
+    reload: Literal["live", "restart"] = "live",
+    *,
+    secret: bool = False,
+) -> Any:
+    return Field(json_schema_extra={"owner": owner, "secret": secret, "reload": reload})
+
+
 class Settings(BaseSettings):
     """Top-level configuration for ha-spark."""
 
@@ -365,21 +379,45 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # Filter before decoding: even malformed runtime JSON in the environment
+        # must have no effect. File secrets are not a configuration source.
+        env = cast(EnvSettingsSource, env_settings)
+        dotenv = cast(EnvSettingsSource, dotenv_settings)
+        effective = {**dotenv.env_vars, **env.env_vars, **init_settings()}
+        if effective.get("ha_url") and effective.get("ha_token"):
+            allowed = {"ha_url", "ha_token", "db_path", "log_level"}
+        else:
+            allowed = {"supervisor_token", "log_level"}
+        for source in (env, dotenv):
+            source.env_vars = {
+                key: value for key, value in source.env_vars.items() if key in allowed
+            }
+        return init_settings, env_settings, dotenv_settings
+
     # --- Home Assistant ---
     # Add-on mode is the default (URLs/token derived from the Supervisor).
     # Setting both ha_url and ha_token switches to standalone/dev mode.
     ha_url: str = Field(default="")
     ha_token: str = Field(default="")
     supervisor_token: str = Field(default="")
-    ha_timeout: float = Field(default=10.0)
+    ha_timeout: Annotated[float, _metadata("addon")] = Field(default=10.0)
 
     # --- Ollama (single remote tier, typically reached over Tailscale) ---
-    ollama_url: str = Field(default="http://127.0.0.1:11434")
-    ollama_model: str = Field(default="qwen3:14b")
+    ollama_url: Annotated[str, _metadata("addon")] = Field(default="http://127.0.0.1:11434")
+    ollama_model: Annotated[str, _metadata("addon")] = Field(default="qwen3:14b")
     # Context window; Ollama's default of 2048 truncates agent prompts.
-    ollama_num_ctx: int = Field(default=32768)
-    ollama_timeout: float = Field(default=120.0)
-    ollama_health_timeout: float = Field(default=2.0)
+    ollama_num_ctx: Annotated[int, _metadata("addon")] = Field(default=32768)
+    ollama_timeout: Annotated[float, _metadata("addon")] = Field(default=120.0)
+    ollama_health_timeout: Annotated[float, _metadata("addon")] = Field(default=2.0)
 
     # --- Storage ---
     db_path: str = Field(default="data/ha_spark.db")
@@ -389,71 +427,79 @@ class Settings(BaseSettings):
 
     # --- Energy planner ---
     # Battery / inverter model.
-    battery_capacity_kwh: float = Field(default=26.88)
-    battery_voltage_v: float = Field(default=51.0)  # fallback if the sensor is unavailable
-    min_soc: float = Field(default=20.0)
-    target_soc_cap: float = Field(default=90.0)
-    max_charge_current_a: float = Field(default=62.5)
+    battery_capacity_kwh: Annotated[float, _metadata("integration")] = Field(default=26.88)
+    # Fallback if the sensor is unavailable.
+    battery_voltage_v: Annotated[float, _metadata("integration")] = Field(default=51.0)
+    min_soc: Annotated[float, _metadata("addon")] = Field(default=20.0)
+    target_soc_cap: Annotated[float, _metadata("addon")] = Field(default=90.0)
+    max_charge_current_a: Annotated[float, _metadata("integration")] = Field(default=62.5)
     # Optional Solis-only current ceiling used after sustained SoC failures.
     # None disables fallback programming; the driver also caps it at the
     # normal configured current and the 62.5 A register limit.
-    solis_fallback_current_a: float | None = Field(default=None, ge=1, le=62.5)
+    solis_fallback_current_a: Annotated[float | None, _metadata("integration")] = Field(
+        default=None, ge=1, le=62.5
+    )
     # Conservative planning ceiling for battery discharge.  It is distinct
     # from Solis's fixed hardware command and keeps the planner inverter-agnostic.
-    battery_discharge_ceiling_kw: float = Field(default=3.2, ge=0)
+    battery_discharge_ceiling_kw: Annotated[float, _metadata("integration")] = Field(
+        default=3.2, ge=0
+    )
     # Installation-specific grid-export cap. Defaults to the G98 fit-and-inform
     # limit (16 A single-phase); raise it only to a G99-approved figure.
-    dno_export_limit_kw: float = Field(default=3.68, ge=0)
+    dno_export_limit_kw: Annotated[float, _metadata("integration")] = Field(default=3.68, ge=0)
     # Safety margin applied to the forecast deficit before sizing the charge.
-    charge_buffer_pct: float = Field(default=20.0)
+    charge_buffer_pct: Annotated[float, _metadata("addon")] = Field(default=20.0)
     # Round-trip AC->DC->AC efficiency: the planner buys required/efficiency.
-    charge_efficiency: float = Field(default=0.90)
+    charge_efficiency: Annotated[float, _metadata("addon")] = Field(default=0.90)
     # Overnight sizing: "deficit" buys only the forecast shortfall;
     # "fill" charges to target_soc_cap every night (wins once export > off-peak).
-    charge_strategy: Literal["deficit", "fill"] = Field(default="deficit")
+    charge_strategy: Annotated[Literal["deficit", "fill"], _metadata("addon")] = Field(
+        default="deficit"
+    )
 
     # Forecast / model coefficients.
-    solar_haircut_k: float = Field(default=1.0)
+    solar_haircut_k: Annotated[float, _metadata("addon")] = Field(default=1.0)
     # Solcast percentile to plan on: 50 (median), 10 (conservative), 90 (optimistic).
-    solar_percentile: Literal[10, 50, 90] = Field(default=50)
-    forecast_days: int = Field(default=14)
-    expected_load_kwh: float = Field(default=24.0)  # fallback when statistics unavailable
+    solar_percentile: Annotated[Literal[10, 50, 90], _metadata("addon")] = Field(default=50)
+    forecast_days: Annotated[int, _metadata("addon")] = Field(default=14)
+    # Fallback when statistics are unavailable.
+    expected_load_kwh: Annotated[float, _metadata("addon")] = Field(default=24.0)
 
     # Fixed cheap charge window (local HH:MM).
-    charge_window_start: str = Field(default="23:30")
-    charge_window_end: str = Field(default="05:30")
+    charge_window_start: Annotated[str, _metadata("integration")] = Field(default="23:30")
+    charge_window_end: Annotated[str, _metadata("integration")] = Field(default="05:30")
 
     # Two-rate tariff (GBP/kWh): off-peak inside the window/dispatch slots, else peak.
-    rate_offpeak_gbp_kwh: float = Field(default=0.069)
-    rate_peak_gbp_kwh: float = Field(default=0.30)
+    rate_offpeak_gbp_kwh: Annotated[float, _metadata("addon")] = Field(default=0.069)
+    rate_peak_gbp_kwh: Annotated[float, _metadata("addon")] = Field(default=0.30)
     # Export/feed-in rate (GBP/kWh); 0 disables export revenue in cost projections.
-    rate_export_gbp_kwh: float = Field(default=0.0)
+    rate_export_gbp_kwh: Annotated[float, _metadata("addon")] = Field(default=0.0)
 
     # Tariff provider: "fixed" costs against rate_offpeak/rate_peak + the charge
     # window above; "dynamic" costs each slot at its live price from an HA
     # half-hourly price sensor (falls back to fixed on a missing/bad read).
-    tariff_provider: Literal["fixed", "dynamic", "octopus_intelligent"] = Field(
-        default="fixed"
-    )
-    export_event_provider: Literal["none", "axle"] = "none"
-    dynamic_rates_entity: str = Field(default="")
+    tariff_provider: Annotated[
+        Literal["fixed", "dynamic", "octopus_intelligent"], _metadata("addon")
+    ] = Field(default="fixed")
+    export_event_provider: Annotated[Literal["none", "axle"], _metadata("addon")] = "none"
+    dynamic_rates_entity: Annotated[str, _metadata("addon")] = Field(default="")
     # Optional: a second entity for tomorrow's rates (many integrations publish
     # today/tomorrow as separate entities). Blank is fine — slots past today's
     # coverage just fall back to the fixed rate.
-    dynamic_rates_entity_tomorrow: str = Field(default="")
+    dynamic_rates_entity_tomorrow: Annotated[str, _metadata("addon")] = Field(default="")
 
     # v2 slot-profile load model (from imported Octopus half-hourly consumption).
-    profile_min_days: int = Field(default=7)
-    profile_history_days: int = Field(default=60)
-    timezone: str = Field(default="Europe/London")
+    profile_min_days: Annotated[int, _metadata("addon")] = Field(default=7)
+    profile_history_days: Annotated[int, _metadata("addon")] = Field(default=60)
+    timezone: Annotated[str, _metadata("integration")] = Field(default="Europe/London")
 
     # Retained for configuration compatibility; the daemon now replans every
     # local half-hour slot.
-    plan_run_time: str = Field(default="22:00")
+    plan_run_time: Annotated[str, _metadata("addon")] = Field(default="22:00")
 
     # Statistic whose history seeds `ha-spark backfill-load` (a true-load power
     # or energy sensor); the CLI's --from flag overrides it.
-    backfill_source_entity: str = Field(default="")
+    backfill_source_entity: Annotated[str, _metadata("addon")] = Field(default="")
 
     # Derived base load (ADR-0001): per-component HA statistic IDs.
     # `derive_grid_import_entity` is required when any are set; the others
@@ -461,185 +507,235 @@ class Settings(BaseSettings):
     # are explicit (never inferred): true flips the canonical sign after the
     # usual unit conversion, so a mis-signed sensor never silently corrupts
     # the balance.
-    derive_grid_import_entity: str = Field(default="")
-    derive_grid_export_entity: str = Field(default="")
-    derive_solar_generation_entity: str = Field(default="")
-    derive_battery_charge_entity: str = Field(default="")
-    derive_battery_discharge_entity: str = Field(default="")
-    derive_ev_charge_entity: str = Field(default="")
-    derive_invert_grid_import: bool = Field(default=False)
-    derive_invert_grid_export: bool = Field(default=False)
-    derive_invert_solar_generation: bool = Field(default=False)
-    derive_invert_battery_charge: bool = Field(default=False)
-    derive_invert_battery_discharge: bool = Field(default=False)
-    derive_invert_ev_charge: bool = Field(default=False)
+    derive_grid_import_entity: Annotated[str, _metadata("addon")] = Field(default="")
+    derive_grid_export_entity: Annotated[str, _metadata("addon")] = Field(default="")
+    derive_solar_generation_entity: Annotated[str, _metadata("addon")] = Field(default="")
+    derive_battery_charge_entity: Annotated[str, _metadata("addon")] = Field(default="")
+    derive_battery_discharge_entity: Annotated[str, _metadata("addon")] = Field(default="")
+    derive_ev_charge_entity: Annotated[str, _metadata("addon")] = Field(default="")
+    derive_invert_grid_import: Annotated[bool, _metadata("addon")] = Field(default=False)
+    derive_invert_grid_export: Annotated[bool, _metadata("addon")] = Field(default=False)
+    derive_invert_solar_generation: Annotated[bool, _metadata("addon")] = Field(default=False)
+    derive_invert_battery_charge: Annotated[bool, _metadata("addon")] = Field(default=False)
+    derive_invert_battery_discharge: Annotated[bool, _metadata("addon")] = Field(default=False)
+    derive_invert_ev_charge: Annotated[bool, _metadata("addon")] = Field(default=False)
 
     # Octopus REST API (for `pull-consumption`; CSV import needs none of these).
     # `octopus_api_key` also drives the `octopus_intelligent` tariff provider
     # below (Kraken GraphQL auth + REST standard-unit-rates).
-    octopus_api_key: str = Field(default="")
-    octopus_mpan: str = Field(default="")
-    octopus_meter_serial: str = Field(default="")
-    octopus_api_url: str = Field(default="https://api.octopus.energy/v1")
+    octopus_api_key: Annotated[str, _metadata("addon", secret=True)] = Field(default="")
+    octopus_mpan: Annotated[str, _metadata("addon")] = Field(default="")
+    octopus_meter_serial: Annotated[str, _metadata("addon")] = Field(default="")
+    octopus_api_url: Annotated[str, _metadata("addon")] = Field(
+        default="https://api.octopus.energy/v1"
+    )
     # Octopus Intelligent tariff provider: account number for the GraphQL
     # plannedDispatches query, product/tariff code for the standard-unit-rates
     # REST endpoint (e.g. "INTELLI-VAR-22-10-14" / "E-1R-INTELLI-VAR-22-10-14-A").
-    octopus_account_number: str = Field(default="")
-    octopus_product_code: str = Field(default="")
-    octopus_tariff_code: str = Field(default="")
+    octopus_account_number: Annotated[str, _metadata("addon")] = Field(default="")
+    octopus_product_code: Annotated[str, _metadata("addon")] = Field(default="")
+    octopus_tariff_code: Annotated[str, _metadata("addon")] = Field(default="")
 
     # Axle supervised export-event source. The API key is the static token from
     # Axle's Home Assistant account page; the entity is the optional HA mirror.
-    axle_api_key: str = Field(default="")
-    axle_api_url: str = Field(default="https://api.axle.energy")
-    axle_event_entity: str = Field(default="")
-    axle_event_rate_gbp_kwh: float = Field(default=1.0, ge=0)
+    axle_api_key: Annotated[str, _metadata("addon", secret=True)] = Field(default="")
+    axle_api_url: Annotated[str, _metadata("addon")] = Field(default="https://api.axle.energy")
+    axle_event_entity: Annotated[str, _metadata("addon")] = Field(default="")
+    axle_event_rate_gbp_kwh: Annotated[float, _metadata("addon")] = Field(default=1.0, ge=0)
     # Shared HA notify.<service> target for all notices; V2L retains a deprecated fallback.
-    notify_service: str = Field(default="")
+    notify_service: Annotated[str, _metadata("addon")] = Field(default="")
 
     # HA entity IDs (all overridable). Blank by default; set via `ha-spark
     # onboard` (entity auto-discovery) or the `solis` preset (ha_spark/presets.py),
     # which holds the values for the original Solis/Solcast/Octopus/zappi setup.
-    soc_entity: str = Field(default="")
+    soc_entity: Annotated[str, _metadata("integration")] = Field(default="")
     # How old Home Assistant's top-level `last_reported` for the SoC sensor may
     # be before the measurement is judged stale (ha_spark/energy/soc_integrity.py).
     # Untrusted SoC blocks real charge writes, so this is a safety threshold.
-    soc_max_report_age_minutes: float = Field(default=10.0, gt=0)
+    soc_max_report_age_minutes: Annotated[float, _metadata("addon")] = Field(default=10.0, gt=0)
     # Consecutive failed SoC observations before fallback entry (#115). The first
     # failure already blocks SoC-based programming and charge-rate increases.
-    soc_failure_threshold: int = Field(default=3, ge=1)
+    soc_failure_threshold: Annotated[int, _metadata("addon")] = Field(default=3, ge=1)
     # Continuous passing minutes before an active Solis fallback recovers (#117).
     # Observed at the one-minute cadence; any failure restarts the count.
-    soc_recovery_minutes: int = Field(default=10, ge=1)
-    battery_voltage_entity: str = Field(default="")
-    battery_power_entity: str = Field(default="")
-    solar_tomorrow_entity: str = Field(default="")
+    soc_recovery_minutes: Annotated[int, _metadata("addon")] = Field(default=10, ge=1)
+    battery_voltage_entity: Annotated[str, _metadata("integration")] = Field(default="")
+    battery_power_entity: Annotated[str, _metadata("integration")] = Field(default="")
+    solar_tomorrow_entity: Annotated[str, _metadata("addon")] = Field(default="")
     # Optional Solcast "forecast today" sensor (#398): today's solar for
     # charge sizing while the charge window's day is today. Without it (or on
     # an invalid payload) today's solar counts as zero, which oversizes the
     # charge and never undersizes it.
-    solar_today_entity: str = Field(default="")
-    octopus_rate_entity: str = Field(default="")
-    dispatch_entity: str = Field(default="")
-    ev_plug_entity: str = Field(default="")
-    ev_status_entity: str = Field(default="")
-    ev_power_entity: str = Field(default="")  # direct car draw, W or kW
-    dispatch_grid_power_entity: str = Field(default="")  # independent import evidence
-    dispatch_grid_power_invert: bool = Field(default=False)
+    solar_today_entity: Annotated[str, _metadata("addon")] = Field(default="")
+    octopus_rate_entity: Annotated[str, _metadata("integration")] = Field(default="")
+    dispatch_entity: Annotated[str, _metadata("integration")] = Field(default="")
+    ev_plug_entity: Annotated[str, _metadata("integration")] = Field(default="")
+    ev_status_entity: Annotated[str, _metadata("integration")] = Field(default="")
+    # Direct car draw, W or kW.
+    ev_power_entity: Annotated[str, _metadata("integration")] = Field(default="")
+    # Independent import evidence.
+    dispatch_grid_power_entity: Annotated[str, _metadata("integration")] = Field(default="")
+    dispatch_grid_power_invert: Annotated[bool, _metadata("integration")] = Field(default=False)
 
     # Freshness metadata only; hold consumers are deliberately unchanged (#419).
-    hold_degraded_minutes: int = Field(default=60, ge=5, le=1440)
-    readiness_window_days: int = Field(default=21, gt=0)
-    readiness_mae_improvement_pct: float = Field(default=10, ge=0, le=100)
-    readiness_max_cost_delta: float = Field(default=0.0, allow_inf_nan=False)
-    readiness_min_guard_coverage_pct: float = Field(default=90, ge=0, le=100)
-    ev_status_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
-    ev_plug_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
-    ev_power_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
-    live_dispatch_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
-    adjusted_rate_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
-    dispatch_grid_power_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
-    battery_power_max_age_seconds: float | None = Field(default=300, gt=0, le=86400)
-    octopus_dispatch_max_age_seconds: float | None = Field(default=2700, gt=0, le=86400)
-    ev_liveness_entity: str = ""
-    dispatch_liveness_entity: str = ""
-    battery_power_discharge_sign: Literal["positive", "negative"] | None = None
+    hold_degraded_minutes: Annotated[int, _metadata("addon")] = Field(default=60, ge=5, le=1440)
+    readiness_window_days: Annotated[int, _metadata("addon")] = Field(default=21, gt=0)
+    readiness_mae_improvement_pct: Annotated[float, _metadata("addon")] = Field(
+        default=10, ge=0, le=100
+    )
+    readiness_max_cost_delta: Annotated[float, _metadata("addon")] = Field(
+        default=0.0, allow_inf_nan=False
+    )
+    readiness_min_guard_coverage_pct: Annotated[float, _metadata("addon")] = Field(
+        default=90, ge=0, le=100
+    )
+    ev_status_max_age_seconds: Annotated[float | None, _metadata("addon")] = Field(
+        default=300, gt=0, le=86400
+    )
+    ev_plug_max_age_seconds: Annotated[float | None, _metadata("addon")] = Field(
+        default=300, gt=0, le=86400
+    )
+    ev_power_max_age_seconds: Annotated[float | None, _metadata("addon")] = Field(
+        default=300, gt=0, le=86400
+    )
+    live_dispatch_max_age_seconds: Annotated[float | None, _metadata("addon")] = Field(
+        default=300, gt=0, le=86400
+    )
+    adjusted_rate_max_age_seconds: Annotated[float | None, _metadata("addon")] = Field(
+        default=300, gt=0, le=86400
+    )
+    dispatch_grid_power_max_age_seconds: Annotated[float | None, _metadata("addon")] = Field(
+        default=300, gt=0, le=86400
+    )
+    battery_power_max_age_seconds: Annotated[float | None, _metadata("addon")] = Field(
+        default=300, gt=0, le=86400
+    )
+    octopus_dispatch_max_age_seconds: Annotated[float | None, _metadata("addon")] = Field(
+        default=2700, gt=0, le=86400
+    )
+    ev_liveness_entity: Annotated[str, _metadata("integration")] = ""
+    dispatch_liveness_entity: Annotated[str, _metadata("integration")] = ""
+    battery_power_discharge_sign: Annotated[
+        Literal["positive", "negative"] | None, _metadata("integration")
+    ] = None
     # True house load excluding battery/EV.
-    consumption_energy_entity: str = Field(default="")
+    consumption_energy_entity: Annotated[str, _metadata("addon")] = Field(default="")
     # Live supply guard: throttle battery charging while whole-house AC draw
     # exceeds supply_max_current_a. Disabled while grid_power_entity is empty.
-    grid_power_entity: str = Field(default="")  # W; whole-house grid/supply draw
-    supply_max_current_a: float = Field(default=75.0)
-    supply_voltage_v: float = Field(default=240.0)  # AC volts, converts W -> A
-    charge_current_entity: str = Field(default="")
-    inverter_power_switch_entity: str = Field(default="")
-    ha_template_charge_needed_entity: str = Field(default="")
+    # W; whole-house grid/supply draw.
+    grid_power_entity: Annotated[str, _metadata("integration")] = Field(default="")
+    supply_max_current_a: Annotated[float, _metadata("integration")] = Field(default=75.0)
+    # AC volts, converts W -> A.
+    supply_voltage_v: Annotated[float, _metadata("integration")] = Field(default=240.0)
+    charge_current_entity: Annotated[str, _metadata("integration")] = Field(default="")
+    inverter_power_switch_entity: Annotated[str, _metadata("integration")] = Field(default="")
+    ha_template_charge_needed_entity: Annotated[str, _metadata("addon")] = Field(default="")
 
     # Inverter selector: picks the Charger adapter (ha_spark/energy/chargers.py).
-    inverter: Literal["solis", "alphaess"] = Field(default="solis")
+    inverter: Annotated[Literal["solis", "alphaess"], _metadata("integration", "restart")] = Field(
+        default="solis"
+    )
     # Solis native control: the thin HA `modbus:` overlay hub (#90) ha-spark
     # writes the timed-slot registers through (`modbus.write_register`) and reads
     # back via its `sensor.<hub>_*` entities. The window/current/work-mode
     # registers are fixed in the driver (docs/solis-control-modbus-overlay.yaml).
-    solis_model_confirmed: bool = False
-    solis_control_hub: str = Field(default="solis_control")
-    solis_modbus_slave: int = Field(default=1)
+    solis_model_confirmed: Annotated[bool, _metadata("integration")] = False
+    solis_control_hub: Annotated[str, _metadata("integration", "restart")] = Field(
+        default="solis_control"
+    )
+    solis_modbus_slave: Annotated[int, _metadata("integration", "restart")] = Field(default=1)
     # How far the inverter clock may disagree with the household clock before
     # an export window is refused and `health` warns (#155/#161).
     # Below health's 30-minute failure threshold, so a failure is always refused.
-    inverter_clock_tolerance_minutes: float = Field(default=5.0, ge=0.1, lt=30)
+    inverter_clock_tolerance_minutes: Annotated[float, _metadata("integration")] = Field(
+        default=5.0, ge=0.1, lt=30
+    )
     # Opt-in: sync the inverter clock at each daylight-saving change (#161).
-    inverter_clock_dst_sync: bool = Field(default=False)
+    inverter_clock_dst_sync: Annotated[bool, _metadata("integration")] = Field(default=False)
     # AlphaESS system serial for the alphaess.setbatterycharge service call.
-    alphaess_serial: str = Field(default="")
+    alphaess_serial: Annotated[str, _metadata("integration", "restart")] = Field(default="")
 
     # Structured device config (Phase 7): a list of controllable devices. Left
     # empty in flat-config installs; the after-validator synthesizes one inverter
     # device from the flat entity keys below so existing setups need no change.
-    devices: list[DeviceConfig] = Field(default_factory=list)
+    devices: Annotated[list[DeviceConfig], _metadata("integration", "restart")] = Field(
+        default_factory=list
+    )
 
     # Forecast ledger signal sampling (Phase 6A): recorded so training data
     # accumulates ahead of the models (6B+) that will consume it.
     # Comma-separated person/device_tracker entity ids; empty disables occupancy sampling.
-    person_entities: str = Field(default="")
+    person_entities: Annotated[str, _metadata("addon")] = Field(default="")
     # Dedicated heat-pump energy sensor (kWh); empty disables heatpump_kwh sampling.
-    heatpump_energy_entity: str = Field(default="")
+    heatpump_energy_entity: Annotated[str, _metadata("addon")] = Field(default="")
     # Weather entity with a `temperature` attribute (e.g. HA's built-in Met.no `weather.home`).
-    outdoor_weather_entity: str = Field(default="weather.home")
+    outdoor_weather_entity: Annotated[str, _metadata("addon")] = Field(default="weather.home")
 
     # Weather-aware ML load model (Phase 6B; needs the [habits] extra).
     # "median" = slot-profile only; "ml" = always prefer the ML model when it can
     # run; "auto" = use ML only once forecast-eval shows it beating the median
     # over the trailing 14 days (safe default: degrades to median until then).
-    load_model: Literal["median", "ml", "auto"] = Field(default="auto")
+    load_model: Annotated[Literal["median", "ml", "auto"], _metadata("addon")] = Field(
+        default="auto"
+    )
     # "quantile" replaces the fixed charge_buffer_pct with (P90-P50)/P50 from the
     # ML model whenever an ML forecast drives the plan.
-    buffer_mode: Literal["fixed", "quantile"] = Field(default="fixed")
+    buffer_mode: Annotated[Literal["fixed", "quantile"], _metadata("addon")] = Field(
+        default="fixed"
+    )
     # Site coordinates for Open-Meteo; unset -> read from HA /api/config.
-    latitude: float | None = Field(default=None)
-    longitude: float | None = Field(default=None)
+    latitude: Annotated[float | None, _metadata("addon")] = Field(default=None)
+    longitude: Annotated[float | None, _metadata("addon")] = Field(default=None)
 
     # Context store (Phase 6C): load multipliers for an active dated fact.
     # away (holiday) lightens the forecast; guests heightens it. high_usage/
     # low_usage facts carry their own factor instead.
-    away_load_factor: float = Field(default=0.4)
-    guests_load_factor: float = Field(default=1.3)
+    away_load_factor: Annotated[float, _metadata("addon")] = Field(default=0.4)
+    guests_load_factor: Annotated[float, _metadata("addon")] = Field(default=1.3)
 
     # Agent surface (MCP + OpenAPI): "off" disables the surface entirely.
-    agent_surface: Literal["off", "on"] = Field(default="off")
+    agent_surface: Annotated[Literal["off", "on"], _metadata("addon", "restart")] = Field(
+        default="off"
+    )
     # Exposure level gates which tools are registered: read-only, read + act
     # (reviewable proposals), or read + write (direct actuation).
-    agent_exposure: Literal["read", "read_act", "read_write"] = Field(default="read_act")
+    agent_exposure: Annotated[Literal["read", "read_act", "read_write"], _metadata("addon")] = (
+        Field(default="read_act")
+    )
     # Bearer token for the agent surface; blank means auto-generate at runtime.
-    agent_api_token: str = Field(default="")
+    agent_api_token: Annotated[str, _metadata("addon", "restart", secret=True)] = Field(default="")
     # Expose the agent surface port directly (bypassing ingress); off by default.
-    agent_expose_port: bool = Field(default=False)
+    agent_expose_port: Annotated[bool, _metadata("addon", "restart")] = Field(default=False)
 
     # --- V2L (Vehicle-to-Load) observe + tally + notify ---
     # The car's V2L discharge-power sensor (W). Empty disables the feature.
-    v2l_power_entity: str = Field(default="")
+    v2l_power_entity: Annotated[str, _metadata("integration")] = Field(default="")
     # Round-trip AC->DC->AC->DC efficiency, used to discount the cost of
     # refilling the car later. One calibration knob folding both DC<->AC stages.
-    v2l_round_trip_efficiency: float = Field(default=0.85)
+    v2l_round_trip_efficiency: Annotated[float, _metadata("addon")] = Field(default=0.85)
     # GBP/kWh import rate being offset now (peak) vs the cheap rate to refill.
-    v2l_peak_rate_gbp: float = Field(default=0.30)
-    v2l_offpeak_rate_gbp: float = Field(default=0.07)
+    v2l_peak_rate_gbp: Annotated[float, _metadata("addon")] = Field(default=0.30)
+    v2l_offpeak_rate_gbp: Annotated[float, _metadata("addon")] = Field(default=0.07)
     # Local time (HH:MM) the cheap window starts; the unplug nudge fires here.
-    v2l_cutoff_time: str = Field(default="01:00")
+    v2l_cutoff_time: Annotated[str, _metadata("addon")] = Field(default="01:00")
     # HA notify.<service> target (e.g. mobile_app_x). Empty disables notifications.
-    v2l_notify_service: str = Field(default="")
+    v2l_notify_service: Annotated[str, _metadata("addon")] = Field(default="")
     # Optional V2L budget (kWh) standing in for car SoC; 0 disables the
     # predictive plug-in warning.
-    v2l_budget_kwh: float = Field(default=0.0)
-    v2l_max_rate_kw: float = Field(default=3.0, gt=0, allow_inf_nan=False)
-    v2l_preferred_rate_kw: float = Field(default=1.5, gt=0, allow_inf_nan=False)
+    v2l_budget_kwh: Annotated[float, _metadata("addon")] = Field(default=0.0)
+    v2l_max_rate_kw: Annotated[float, _metadata("integration")] = Field(
+        default=3.0, gt=0, allow_inf_nan=False
+    )
+    v2l_preferred_rate_kw: Annotated[float, _metadata("addon")] = Field(
+        default=1.5, gt=0, allow_inf_nan=False
+    )
     # Rectifier AC->DC efficiency from the car into the house battery, and the
     # DC rate it charges at (measured: 10 A AC input limit) (#208).
-    v2l_rectifier_efficiency: float = Field(default=0.94, gt=0, le=1)
-    v2l_charge_kw: float = Field(default=2.15, gt=0)
+    v2l_rectifier_efficiency: Annotated[float, _metadata("addon")] = Field(default=0.94, gt=0, le=1)
+    v2l_charge_kw: Annotated[float, _metadata("integration")] = Field(default=2.15, gt=0)
     # Points below the overnight plan's expected SoC on an Axle event day that
     # count as a miscalculation worth a V2L top-up request (#208).
-    v2l_soc_tolerance_pct: float = Field(default=5.0, ge=0)
+    v2l_soc_tolerance_pct: Annotated[float, _metadata("addon")] = Field(default=5.0, ge=0)
 
     @field_validator("notify_service", "v2l_notify_service")
     @classmethod
@@ -714,28 +810,13 @@ class Settings(BaseSettings):
         return f"{ws}/api/websocket"
 
 
-def _read_options_overlay(path: Path = _OPTIONS_PATH) -> dict[str, Any]:
-    """Read user-exposed add-on options from ``/data/options.json``, if present."""
-    if not path.is_file():
-        return {}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        log.warning("Could not read add-on options at %s; ignoring", path)
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    retired = []
-    if "proactive_mode" in raw:
-        retired.append("proactive_mode")
-    devices = raw.get("devices")
-    if isinstance(devices, list) and any(
-        isinstance(device, dict) and "control" in device for device in devices
-    ):
-        retired.append("devices.control")
-    if retired:
-        log.warning("Ignoring deprecated options: %s", ", ".join(retired))
-    return {k: v for k, v in raw.items() if k in _OPTION_KEYS and v is not None}
+def field_metadata() -> dict[str, FieldMeta]:
+    """Runtime-field vocabulary and classification; bootstrap fields are excluded."""
+    return {
+        name: cast(FieldMeta, dict(field.json_schema_extra))
+        for name, field in Settings.model_fields.items()
+        if isinstance(field.json_schema_extra, dict) and "owner" in field.json_schema_extra
+    }
 
 
 def _validated_settings(settings: Settings) -> Settings:
@@ -754,51 +835,18 @@ def actuation_settings_changed(previous: Settings, current: Settings) -> bool:
         "solis_control_hub", "solis_modbus_slave", "solis_fallback_current_a",
         "max_charge_current_a", "battery_voltage_v", "battery_discharge_ceiling_kw",
         "dno_export_limit_kw", "supply_max_current_a", "supply_voltage_v",
-        "min_soc", "target_soc_cap", "alphaess_serial", "ha_url", "db_path",
+        "min_soc", "target_soc_cap", "alphaess_serial", "ha_url",
     }
     fields.update(name for name in Settings.model_fields if name.endswith("_entity"))
     return any(getattr(previous, name) != getattr(current, name) for name in fields)
 
 
-def validate_options_document(options: dict[str, Any]) -> Settings:
-    """Build complete :class:`Settings` from a candidate options document and validate it.
-
-    The same overlay semantics as :func:`load_settings` (only ``_OPTION_KEYS``
-    honoured, ``None`` values dropped) and the same validation, minus the
-    environment credential check -- credentials come from the environment,
-    not the options document. Used to validate the complete merged candidate
-    *before* it is persisted by an options save (API, agent, MCP), so an
-    invalid document is rejected without touching disk or the running
-    settings. Raises ``ConfigError`` naming the failing field(s); the reason
-    never carries an input value (see ``_validation_error_reason``).
-    """
-    overlay = {k: v for k, v in options.items() if k in _OPTION_KEYS and v is not None}
-    try:
-        settings = Settings(**overlay)
-    except ValidationError as exc:
-        raise ConfigError(_validation_error_reason(exc)) from exc
-    return _validated_settings(settings)
-
-
 def load_settings(*, validate: bool = True) -> Settings:
-    """Build :class:`Settings`, overlaying add-on options, and validate.
+    """Read configuration without writing; only the daemon initialises the store.
 
-    Add-on options (``/data/options.json``) take precedence over environment
-    variables. In add-on mode a ``SUPERVISOR_TOKEN`` is required; standalone/dev
-    mode (``HA_URL`` + ``HA_TOKEN`` set) bypasses that requirement.
-
-    ``validate=False`` skips the credential check (but keeps the options
-    overlay) for diagnostic paths like ``ha-spark health`` that must run and
-    report rather than fail fast.
+    ``validate=False`` skips credential and cross-field tariff checks for
+    diagnostics. Invalid persisted field values always raise a safe ConfigError.
     """
-    overlay = _read_options_overlay()
-    settings = Settings(**overlay)
-    if validate and not settings.is_standalone and not settings.supervisor_token:
-        raise ConfigError(
-            "No Home Assistant credentials. Running as an HA add-on provides "
-            "SUPERVISOR_TOKEN automatically; for standalone/dev set HA_URL and "
-            "HA_TOKEN (see .env.example)."
-        )
-    if validate:
-        _validated_settings(settings)
-    return settings
+    from ha_spark.settings_service import SettingsService
+
+    return SettingsService().load(validate=validate)
