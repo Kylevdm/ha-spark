@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from copy import deepcopy
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -84,6 +85,16 @@ def _read_options_overlay(path: Path = OPTIONS_PATH) -> dict[str, Any]:
     if not path.exists():
         return {}
     raw = _read_json(path)
+    return normalise_legacy(raw)
+
+
+def normalise_legacy(
+    document: dict[str, Any], fixed_path: str | None = None, *, strict: bool = False,
+) -> dict[str, Any]:
+    """Shared pure seed/import normalisation; reasons never include input text."""
+    raw = document.copy()
+    if fixed_path is not None and "db_path" in raw and raw["db_path"] != fixed_path:
+        raise ConfigError("db_path differs from the fixed path; move the database first")
     retired = []
     if "proactive_mode" in raw:
         retired.append("proactive_mode")
@@ -101,8 +112,15 @@ def _read_options_overlay(path: Path = OPTIONS_PATH) -> dict[str, Any]:
         log.warning("Ignoring deprecated options: %s", ", ".join(retired))
     unknown = len(raw.keys() - _OPTION_KEYS - {"proactive_mode"})
     if unknown:
+        if strict:
+            raise ConfigError(f"Unknown configuration fields: {unknown}")
         log.warning("Ignoring %d unknown legacy options", unknown)
-    return {k: v for k, v in raw.items() if k in _OPTION_KEYS and (v is not None or k == "db_path")}
+    return {
+        k: v for k, v in raw.items()
+        if k in _OPTION_KEYS and (v is not None or k == "db_path")
+        and not (k in _SECRET_OPTION_KEYS and v == "")
+        and not (k == "devices" and v == [])
+    }
 
 
 class SettingsService:
@@ -261,22 +279,10 @@ class SettingsService:
             else:
                 raw = _read_options_overlay(self.options_path)
                 self._apply_log_level(raw)
-                if "db_path" in raw and raw["db_path"] != self._bootstrap.db_path:
-                    raise ConfigError(
-                        "db_path differs from the fixed path; move the database first"
-                    )
-                inputs, secrets = {}, {}
-                for key, value in raw.items():
-                    if key not in _KEYS:
-                        continue
-                    if key in _SECRET_OPTION_KEYS:
-                        if value != "":
-                            secrets[key] = value
-                    elif key == "devices":
-                        if value != []:
-                            inputs[key] = value
-                    else:
-                        inputs[key] = value
+                raw = normalise_legacy(raw, self._bootstrap.db_path)
+                inputs = {key: value for key, value in raw.items()
+                          if key in _KEYS - _SECRET_OPTION_KEYS}
+                secrets = {key: value for key, value in raw.items() if key in _SECRET_OPTION_KEYS}
                 revision = 1 if writable else 0
             candidate = self._candidate(inputs, secrets, validate)
             inputs = _validated_devices(inputs, candidate)
@@ -421,6 +427,21 @@ class SettingsService:
                 "inputs": sorted(self._inputs.keys() | self._secrets.keys()),
             }
 
+    def export(self) -> dict[str, Any]:
+        """Return owner inputs only, never secrets or derived defaults."""
+        with self._lock:
+            return deepcopy(self._inputs)
+
+    def import_document(
+        self, document: dict[str, Any], expected: int, actor: str,
+    ) -> dict[str, Any]:
+        """Replace inputs through the same validation, revision and save guards."""
+        with self._lock:
+            raw = normalise_legacy(document, self.settings.db_path, strict=True)
+            changes = {key: None for key in self._inputs}
+            changes.update({key: value for key, value in raw.items() if key in _KEYS})
+            return self.save(changes, expected, actor)
+
     def save(self, changes: dict[str, Any], expected_revision: int, actor: str) -> dict[str, Any]:
         """Validate a complete candidate, check the revision/guards, commit, fence, swap."""
         with self._lock:
@@ -486,7 +507,7 @@ class SettingsService:
             self._inputs, self._secrets, self.revision = inputs, secrets, revision
             self._settings = candidate
             # Actors are channel identities, never arbitrary request body text.
-            safe_actor = actor if actor == "seed" else "ingress"
+            safe_actor = actor if actor in {"seed", "cli", "import"} else "ingress"
             if actor.startswith("ingress:"):
                 user = actor.removeprefix("ingress:")
                 if 1 <= len(user) <= 64 and all(

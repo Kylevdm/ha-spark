@@ -1795,6 +1795,7 @@ async def _run_forever(
     await channel.__aenter__()
     service = SettingsService(OPTIONS_PATH, settings=settings)
     settings = service.load(writable=True)
+    channel.settings_service = service
     warn_deprecated_notify_target(settings)
     state = AppState(settings=settings, options_path=OPTIONS_PATH, executor=channel,
                      settings_service=service)
