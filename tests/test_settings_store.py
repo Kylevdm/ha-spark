@@ -50,6 +50,49 @@ def test_preview_writes_nothing_and_daemon_initialises_pair(tmp_path):
     assert (tmp_path / "ha_spark_config.initialised").is_file()
 
 
+@pytest.mark.parametrize("standalone", [False, True])
+@pytest.mark.parametrize("source", ["env", "dotenv"])
+def test_runtime_environment_cannot_override_seed_or_committed_pair(
+    tmp_path, monkeypatch, standalone, source
+):
+    monkeypatch.chdir(tmp_path)
+    for key in ("HA_URL", "HA_TOKEN", "SUPERVISOR_TOKEN", "DB_PATH", "LOG_LEVEL"):
+        monkeypatch.delenv(key, raising=False)
+    values = {
+        "MIN_SOC": "30",
+        "OCTOPUS_API_KEY": "env-key",
+        "TARIFF_PROVIDER": "invalid",
+        "DEVICES": "not-json",
+        "LOG_LEVEL": "DEBUG",
+    }
+    if standalone:
+        values.update(
+            HA_URL="http://ha.test", HA_TOKEN="test", DB_PATH=str(tmp_path / "ha_spark.db")
+        )
+    else:
+        values["SUPERVISOR_TOKEN"] = "test"
+    if source == "env":
+        for key, value in values.items():
+            monkeypatch.setenv(key, value)
+    else:
+        (tmp_path / ".env").write_text("\n".join(f"{k}={v}" for k, v in values.items()))
+        monkeypatch.setitem(Settings.model_config, "env_file", ".env")
+    options = tmp_path / "options.json"
+    options.write_text('{"min_soc": 20, "tariff_provider": "fixed", "log_level": "WARNING"}')
+    for writable in (True, False):
+        service = SettingsService(options, data_dir=tmp_path)
+        settings = service.load(writable=writable)
+        assert settings.is_standalone is standalone
+        assert settings.min_soc == 20
+        assert settings.octopus_api_key == ""
+        assert settings.tariff_provider == "fixed"
+        assert settings.log_level == "WARNING"
+        assert service.revision == 1
+    document = json.loads((tmp_path / "ha_spark_config.json").read_text())
+    assert document["settings"] == {}
+    assert json.loads((tmp_path / "ha_spark_secrets.json").read_text())["secrets"] == {}
+
+
 def test_seed_drops_coerced_defaults(tmp_path):
     (tmp_path / "options.json").write_text('{"solar_percentile": "50"}')
     service = store(tmp_path)
