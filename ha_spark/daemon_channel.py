@@ -3,6 +3,8 @@
 The owner-only socket authenticates CLI mode requests by kernel peer uid and
 0600 permissions. Socket callers cannot claim an ingress identity. Only the daemon
 loop persists grants or runs device work; ordinary work requests add no permission.
+Config requests call the shared settings service inline and never enter the work queue.
+Request lines are capped at 256 KiB, including the JSON envelope and newline.
 """
 from __future__ import annotations
 
@@ -18,10 +20,15 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from ha_spark.authority import AuthorityStore, OperatingMode, authority_view, resolve_data_dir
-from ha_spark.config import Settings
+from ha_spark.config import _SECRET_OPTION_KEYS, ConfigError, Settings
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome
+from ha_spark.settings_service import RevisionConflict, SettingsService
 
-Op = Literal["replan", "apply", "sync_clock", "authority_status", "mode"]
+MAX_CONFIG_BYTES = 256 * 1024
+Op = Literal[
+    "replan", "apply", "sync_clock", "authority_status", "mode",
+    "config_show", "config_export", "config_save", "config_import", "config_set_secret",
+]
 REFUSED = "[REFUSED] no ha-spark daemon running; hardware writes happen only inside the daemon"
 
 
@@ -35,12 +42,32 @@ class Request(BaseModel):
     target: OperatingMode | None = None
     expected_epoch: int | None = Field(default=None, ge=1, strict=True)
 
+    expected_revision: int | None = Field(default=None, ge=0, strict=True)
+    changes: dict[str, Any] | None = None
+    document: dict[str, Any] | None = None
+    field: str | None = None
+    value: str | dict[str, bool] | None = None
+
     @model_validator(mode="after")
     def validate_mode(self) -> Request:
         if self.op == "mode" and self.target is None:
             raise ValueError("mode requires target")
         if self.op != "mode" and (self.target is not None or self.expected_epoch is not None):
             raise ValueError("mode fields require mode operation")
+        allowed = {
+            "config_save": {"expected_revision", "changes"},
+            "config_import": {"expected_revision", "document"},
+            "config_set_secret": {"expected_revision", "field", "value"},
+        }.get(self.op, set())
+        fields = {"expected_revision", "changes", "document", "field", "value"}
+        present = {key for key in fields if getattr(self, key) is not None}
+        if present != allowed:
+            raise ValueError("invalid config operation fields")
+        if self.op == "config_set_secret" and self.field not in _SECRET_OPTION_KEYS:
+            raise ValueError("invalid secret field")
+        if self.op == "config_save" and self.changes is not None:
+            if self.changes.keys() & _SECRET_OPTION_KEYS:
+                raise ValueError("use config_set_secret for secrets")
         return self
 
 
@@ -60,6 +87,7 @@ class Reply(BaseModel):
     plan: list[dict[str, object]] = Field(default_factory=list)
     synced: bool = False
     authority: dict[str, Any] | None = None
+    config: dict[str, Any] | None = None
     error: str | None = None
     reasons: list[str] = Field(default_factory=list)
 
@@ -85,6 +113,7 @@ class DaemonChannel:
     def __init__(self, settings: Settings) -> None:
         self.path = resolve_data_dir(settings) / "ha_spark.sock"
         self.authority: AuthorityStore | None = None
+        self.settings_service: SettingsService | None = None
         self.queue: asyncio.Queue[Pending] = asyncio.Queue(maxsize=64)
         # Owner mode requests skip queued work so a reply reaches the owner in one tick.
         self.mode_queue: asyncio.Queue[Pending] = asyncio.Queue(maxsize=8)
@@ -106,7 +135,7 @@ class DaemonChannel:
             mask = os.umask(0o177)
             try:
                 self._server = await asyncio.start_unix_server(
-                    self._handle, path=self.path, limit=4096
+                    self._handle, path=self.path, limit=MAX_CONFIG_BYTES
                 )
             finally:
                 os.umask(mask)
@@ -173,6 +202,33 @@ class DaemonChannel:
             return Reply(authority=self.authority_status())
         if self._server is None or not self._server.is_serving():
             return Reply(error="daemon stopped")
+        if request.op.startswith("config_"):
+            service = self.settings_service
+            if service is None:
+                return Reply(error="configuration unavailable")
+            try:
+                if request.op == "config_show":
+                    result = service.read_view()
+                elif request.op == "config_export":
+                    result = service.export()
+                elif request.op == "config_import":
+                    assert request.document is not None and request.expected_revision is not None
+                    result = service.import_document(
+                        request.document, request.expected_revision, "import",
+                    )
+                else:
+                    assert request.expected_revision is not None
+                    changes = request.changes
+                    if request.op == "config_set_secret":
+                        assert request.field is not None
+                        changes = {request.field: request.value}
+                    assert changes is not None
+                    result = service.save(changes, request.expected_revision, "cli")
+                return Reply(config=result)
+            except RevisionConflict as exc:
+                return Reply(error="conflict", config={"revision": exc.revision})
+            except ConfigError as exc:
+                return Reply(error="invalid configuration", reasons=[str(exc)])
         future = asyncio.get_running_loop().create_future()
         try:
             queue = self.mode_queue if request.op == "mode" else self.queue
@@ -194,7 +250,7 @@ class DaemonChannel:
                 return
             try:
                 raw = await asyncio.wait_for(reader.readline(), timeout=5)
-                if len(raw) > 4096 or not raw.endswith(b"\n"):
+                if len(raw) > MAX_CONFIG_BYTES or not raw.endswith(b"\n"):
                     raise ValueError
                 request = Request.model_validate_json(raw)
             except (ValueError, ValidationError, TimeoutError):
@@ -217,6 +273,9 @@ class DaemonChannel:
 async def submit_socket(
     settings: Settings, op: Op, *, target: OperatingMode | None = None,
     expected_epoch: int | None = None,
+    expected_revision: int | None = None, changes: dict[str, Any] | None = None,
+    document: dict[str, Any] | None = None, field: str | None = None,
+    value: str | dict[str, bool] | None = None,
 ) -> Reply | None:
     """None means unreachable. Never retry an accepted request after a lost reply."""
     path = resolve_data_dir(settings) / "ha_spark.sock"
@@ -227,8 +286,14 @@ async def submit_socket(
     except (OSError, TimeoutError):
         return None
     try:
-        writer.write(Request(op=op, target=target, expected_epoch=expected_epoch)
-                     .model_dump_json().encode() + b"\n")
+        payload = Request(
+            op=op, target=target, expected_epoch=expected_epoch,
+            expected_revision=expected_revision, changes=changes, document=document,
+            field=field, value=value,
+        ).model_dump_json(exclude_none=True).encode() + b"\n"
+        if len(payload) > MAX_CONFIG_BYTES:
+            return Reply(error="daemon request too large")
+        writer.write(payload)
         await writer.drain()
         return Reply.model_validate_json(await reader.readline())
     except (OSError, ValueError):

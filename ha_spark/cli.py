@@ -15,13 +15,21 @@ import signal
 import sys
 from dataclasses import asdict
 from datetime import UTC, date, datetime, time, timedelta
+from getpass import getpass
 from pathlib import Path
+from typing import Any
 
 import yaml
 
 from ha_spark.authority import OperatingMode, authority_view, load_authority
-from ha_spark.config import ConfigError, Settings, load_settings
-from ha_spark.daemon_channel import REFUSED, DaemonAlreadyRunning, Reply, submit_socket
+from ha_spark.config import _SECRET_OPTION_KEYS, ConfigError, Settings, load_settings
+from ha_spark.daemon_channel import (
+    MAX_CONFIG_BYTES,
+    REFUSED,
+    DaemonAlreadyRunning,
+    Reply,
+    submit_socket,
+)
 from ha_spark.dashboard import build_dashboard
 from ha_spark.devices import get_device
 from ha_spark.devices.inverters.solis_clock import clock_entity, clock_error, describe_error
@@ -65,6 +73,7 @@ from ha_spark.mode_preconditions import entry_preconditions
 from ha_spark.onboarding_discover import FieldProposal, propose
 from ha_spark.presets import get_preset, preset_names
 from ha_spark.router import route_message
+from ha_spark.settings_service import SettingsService
 
 
 async def _cmd_readiness_show(settings: Settings) -> int:
@@ -795,6 +804,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_inverter = sub.add_parser("inverter", help="Read model identity and resident schedule")
     p_inverter.add_subparsers(dest="inverter_command", required=True).add_parser("show")
 
+    config = sub.add_parser("config", help="Read or change owner configuration")
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+    config_sub.add_parser("show")
+    config_sub.add_parser("export")
+    config_sub.add_parser("set").add_argument("assignments", nargs="+")
+    secret = config_sub.add_parser("set-secret")
+    secret.add_argument("key")
+    secret.add_argument("--clear", action="store_true")
+    config_sub.add_parser("import").add_argument("file", type=Path)
+
     p_mode = sub.add_parser("mode", help="Show or change operating-mode authority")
     mode_sub = p_mode.add_subparsers(dest="mode_command", required=True)
     mode_sub.add_parser("show")
@@ -1068,6 +1087,96 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _import_file(path: Path) -> dict[str, Any]:
+    """Size-limited safe parsing; parser exceptions never cross the CLI boundary."""
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(MAX_CONFIG_BYTES + 1)
+        if len(raw) > MAX_CONFIG_BYTES:
+            raise ConfigError("Configuration import too large")
+        text = raw.decode("utf-8")
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            value = yaml.safe_load(text)
+        if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+            raise ConfigError("Invalid configuration document")
+        # Also reject YAML-only objects and cyclic aliases before sending JSON.
+        json.dumps(value)
+        return value
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        location = f": line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        raise ConfigError(f"Invalid configuration YAML{location}") from None
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+        raise ConfigError("Invalid or unreadable configuration import") from None
+
+
+async def _cmd_config(settings: Settings, args: argparse.Namespace) -> int:
+    command = args.config_command
+    if command in {"show", "export"}:
+        reply = await submit_socket(
+            settings, "config_show" if command == "show" else "config_export",
+        )
+        if reply is None:
+            service = SettingsService(settings=settings)
+            service.load(validate=False)
+            reply = Reply(config=service.read_view() if command == "show" else service.export())
+    else:
+        changes: dict[str, Any] = {}
+        document = None
+        if command == "set":
+            for assignment in args.assignments:
+                key, separator, value = assignment.partition("=")
+                if not separator:
+                    print("[REFUSED] expected KEY=VALUE")
+                    return 2
+                if key in _SECRET_OPTION_KEYS:
+                    print("[REFUSED] use config set-secret for secret fields")
+                    return 2
+                try:
+                    changes[key] = json.loads(value)
+                except json.JSONDecodeError:
+                    changes[key] = value
+        elif command == "import":
+            try:
+                document = _import_file(args.file)
+            except ConfigError as exc:
+                print(f"[REFUSED] {exc}")
+                return 2
+        shown = await submit_socket(settings, "config_show")
+        if shown is None or shown.error or shown.config is None:
+            print(REFUSED if shown is None else "[REFUSED] configuration unavailable")
+            return 1
+        revision = shown.config["revision"]
+        if command == "set":
+            reply = await submit_socket(settings, "config_save",
+                                        expected_revision=revision, changes=changes)
+        elif command == "import":
+            reply = await submit_socket(settings, "config_import",
+                                        expected_revision=revision, document=document)
+        else:
+            secret: str | dict[str, bool]
+            if args.clear:
+                secret = {"clear": True}
+            else:
+                secret = getpass("Secret: ") if sys.stdin.isatty() else sys.stdin.readline().rstrip(
+                    "\r\n"
+                )
+            reply = await submit_socket(settings, "config_set_secret",
+                                        expected_revision=revision, field=args.key, value=secret)
+    if reply is None or reply.error:
+        print(REFUSED if reply is None else f"[REFUSED] {reply.error}")
+        if reply is not None:
+            for reason in reply.reasons:
+                print(reason)
+            if reply.config is not None:
+                print(json.dumps(reply.config))
+        return 1
+    print(json.dumps(reply.config, indent=2))
+    return 0
+
+
 async def _cmd_mode_set(
     settings: Settings, target: OperatingMode, *, confirm: bool = False,
 ) -> int:
@@ -1117,8 +1226,22 @@ async def _cmd_inverter_show(settings: Settings) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # argparse echoes unexpected arguments; secret entry must never echo argv.
+    if argv[:2] == ["config", "set-secret"]:
+        tail = [item for item in argv[2:] if item != "--clear"]
+        if len(tail) != 1 or tail[0] not in _SECRET_OPTION_KEYS:
+            print("[REFUSED] set-secret requires a secret field; value comes from stdin")
+            return 2
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "config":
+        try:
+            return asyncio.run(_cmd_config(Settings(), args))
+        except (ConfigError, ValueError, OSError, EOFError):
+            print("[REFUSED] configuration command failed")
+            return 2
 
     # Diagnostic paths use the settings service's read-only load (a seed preview
     # before the initialisation marker), which never writes. Skip credential and

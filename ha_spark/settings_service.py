@@ -1,8 +1,10 @@
 """Versioned owner-input settings and secrets, committed as one durable revision.
 
-Read-only loads preview first-start legacy options without writing. The daemon
-opts into initialisation and saves only after claiming its executor lock. A save
-never changes authority: stale work is fenced before publishing the new snapshot.
+Read-only loads preview first-start legacy options without writing; the seed
+reads them from ``options.json`` or, when that file holds no legacy key, from
+the Supervisor's stored options. The daemon opts into initialisation and
+saves only after claiming its executor lock. A save never changes authority:
+stale work is fenced before publishing the new snapshot.
 """
 
 from __future__ import annotations
@@ -11,10 +13,12 @@ import json
 import os
 import tempfile
 from collections.abc import Callable
+from copy import deepcopy
 from pathlib import Path
 from threading import RLock
 from typing import Any
 
+import httpx
 from pydantic import ValidationError
 
 from ha_spark.authority import AuthorityStore, resolve_data_dir
@@ -34,6 +38,7 @@ from ha_spark.mode_preconditions import NO_FALLBACK_PLATFORM, fallback_schedule_
 
 log = get_logger(__name__)
 OPTIONS_PATH = Path("/data/options.json")
+SUPERVISOR_INFO_URL = "http://supervisor/addons/self/info"
 _KEYS = frozenset(field_metadata())
 
 
@@ -80,11 +85,13 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _read_options_overlay(path: Path = OPTIONS_PATH) -> dict[str, Any]:
-    """Read the legacy seed vocabulary; never report arbitrary input keys."""
-    if not path.exists():
-        return {}
-    raw = _read_json(path)
+def normalise_legacy(
+    document: dict[str, Any], fixed_path: str | None = None, *, strict: bool = False,
+) -> dict[str, Any]:
+    """Shared pure seed/import normalisation; reasons never include input text."""
+    raw = document.copy()
+    if fixed_path is not None and "db_path" in raw and raw["db_path"] != fixed_path:
+        raise ConfigError("db_path differs from the fixed path; move the database first")
     retired = []
     if "proactive_mode" in raw:
         retired.append("proactive_mode")
@@ -102,8 +109,50 @@ def _read_options_overlay(path: Path = OPTIONS_PATH) -> dict[str, Any]:
         log.warning("Ignoring deprecated options: %s", ", ".join(retired))
     unknown = len(raw.keys() - _OPTION_KEYS - {"proactive_mode"})
     if unknown:
+        if strict:
+            raise ConfigError(f"Unknown configuration fields: {unknown}")
         log.warning("Ignoring %d unknown legacy options", unknown)
-    return {k: v for k, v in raw.items() if k in _OPTION_KEYS and (v is not None or k == "db_path")}
+    return {
+        k: v for k, v in raw.items()
+        if k in _OPTION_KEYS and (v is not None or k == "db_path")
+        and not (k in _SECRET_OPTION_KEYS and v == "")
+        and not (k == "devices" and v == [])
+    }
+
+
+def _read_options_overlay(path: Path = OPTIONS_PATH) -> dict[str, Any]:
+    """Read the legacy seed vocabulary from the Supervisor options file."""
+    if not path.exists():
+        return {}
+    return normalise_legacy(_read_json(path))
+
+
+def _supervisor_options(token: str) -> dict[str, Any] | None:
+    """The add-on's stored options from the Supervisor, or ``None`` if unavailable.
+
+    The response is untrusted, like any other seed source: only a 200 ``ok``
+    envelope holding a dict ``data.options`` counts. Nothing about a failure
+    is logged: status text, body or error messages can echo the payload or
+    the bearer token.
+    """
+    try:
+        response = httpx.get(
+            SUPERVISOR_INFO_URL,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5.0,
+        )
+        if response.status_code != 200:
+            return None
+        body = response.json()
+    except (httpx.HTTPError, ValueError, RecursionError):
+        return None
+    if not isinstance(body, dict) or body.get("result") != "ok":
+        return None
+    data = body.get("data")
+    if not isinstance(data, dict):
+        return None
+    options = data.get("options")
+    return options if isinstance(options, dict) else None
 
 
 class SettingsService:
@@ -264,23 +313,24 @@ class SettingsService:
                     recover = True
             else:
                 raw = _read_options_overlay(self.options_path)
-                self._apply_log_level(raw)
-                if "db_path" in raw and raw["db_path"] != self._bootstrap.db_path:
-                    raise ConfigError(
-                        "db_path differs from the fixed path; move the database first"
-                    )
-                inputs, secrets = {}, {}
-                for key, value in raw.items():
-                    if key not in _KEYS:
-                        continue
-                    if key in _SECRET_OPTION_KEYS:
-                        if value != "":
-                            secrets[key] = value
-                    elif key == "devices":
-                        if value != []:
-                            inputs[key] = value
+                if (
+                    not raw.keys() - {"log_level"}
+                    and not self._bootstrap.is_standalone
+                    and self._bootstrap.supervisor_token
+                ):
+                    # The Supervisor may already have stripped the legacy keys
+                    # from options.json; its stored options are then the seed
+                    # source, coerced exactly like the file.
+                    stored = _supervisor_options(self._bootstrap.supervisor_token)
+                    if stored is None:
+                        log.warning("Supervisor options unavailable; seeding defaults")
                     else:
-                        inputs[key] = value
+                        raw = {**raw, **normalise_legacy(stored)}
+                self._apply_log_level(raw)
+                raw = normalise_legacy(raw, self._bootstrap.db_path)
+                inputs = {key: value for key, value in raw.items()
+                          if key in _KEYS - _SECRET_OPTION_KEYS}
+                secrets = {key: value for key, value in raw.items() if key in _SECRET_OPTION_KEYS}
                 revision = 1 if writable else 0
             candidate = self._candidate(inputs, secrets, validate)
             pending_marker = self._path("ha_spark_config.pending")
@@ -438,6 +488,21 @@ class SettingsService:
                 "inputs": sorted(self._inputs.keys() | self._secrets.keys()),
             }
 
+    def export(self) -> dict[str, Any]:
+        """Return owner inputs only, never secrets or derived defaults."""
+        with self._lock:
+            return deepcopy(self._inputs)
+
+    def import_document(
+        self, document: dict[str, Any], expected: int, actor: str,
+    ) -> dict[str, Any]:
+        """Replace inputs through the same validation, revision and save guards."""
+        with self._lock:
+            raw = normalise_legacy(document, self.settings.db_path, strict=True)
+            changes = {key: None for key in self._inputs}
+            changes.update({key: value for key, value in raw.items() if key in _KEYS})
+            return self.save(changes, expected, actor)
+
     def save(self, changes: dict[str, Any], expected_revision: int, actor: str) -> dict[str, Any]:
         """Validate a complete candidate, check the revision/guards, commit, fence, swap."""
         with self._lock:
@@ -524,7 +589,7 @@ class SettingsService:
                     except Exception:
                         log.warning("Configuration replan request unavailable")
             # Actors are channel identities, never arbitrary request body text.
-            safe_actor = actor if actor == "seed" else "ingress"
+            safe_actor = actor if actor in {"seed", "cli", "import"} else "ingress"
             if actor.startswith("ingress:"):
                 user = actor.removeprefix("ingress:")
                 if 1 <= len(user) <= 64 and all(
