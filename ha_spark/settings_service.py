@@ -251,6 +251,8 @@ class SettingsService:
         self._secrets: dict[str, Any] = {}
         self.pending_restart = False
         self._pending_restart_fields: set[str] = set()
+        # Input keys behind the running snapshot, for the pending-restart comparison.
+        self._live_inputs: frozenset[str] = frozenset()
         self.request_replan: Callable[[], None] | None = None
         # Called once an import ends configuration repair.
         self.on_repaired: Callable[[], None] | None = None
@@ -497,6 +499,7 @@ class SettingsService:
                 raise _RestartRequired("Configuration load failed; restart required") from None
         self._inputs, self._secrets, self.revision = inputs, secrets, revision
         self._settings = candidate
+        self._live_inputs = frozenset(inputs)
         self.pending_restart = False
         self._pending_restart_fields.clear()
         self.repair = None
@@ -596,6 +599,7 @@ class SettingsService:
                 "pending_restart_fields": sorted(self._pending_restart_fields),
                 "settings": out,
                 "inputs": sorted(self._inputs.keys() | self._secrets.keys()),
+                "metadata": field_metadata(),
             }
 
     def repair_token(self) -> str:
@@ -687,6 +691,7 @@ class SettingsService:
         execution_context().config_generation += 1
         self._inputs, self._secrets, self.revision = inputs, secrets, revision
         self._settings = candidate
+        self._live_inputs = frozenset(inputs)
         self.repair = None
         changed = sorted(inputs.keys() | secrets.keys())
         log.info(
@@ -740,16 +745,17 @@ class SettingsService:
                 | self._secrets.keys()
                 if (inputs | secrets).get(key) != (self._inputs | self._secrets).get(key)
             )
+            # Pending = the committed pair differs from the running snapshot in a
+            # restart field. A synthesized device list follows live entity edits,
+            # so `devices` counts only when the running or committed pair sets it.
             restart_fields = {
                 key
                 for key, meta in field_metadata().items()
                 if meta["reload"] == "restart"
-                and key in (
-                    inputs.keys() | secrets.keys() | self._inputs.keys() | self._secrets.keys()
-                )
+                and (key != "devices" or "devices" in inputs.keys() | self._live_inputs)
                 and getattr(self.settings, key) != getattr(candidate, key)
             }
-            pending_restart = self.pending_restart or bool(restart_fields)
+            pending_restart = bool(restart_fields)
             revision = self.revision + 1
             try:
                 # Durable before the pair: a crash may cause an extra check, never a missed one.
@@ -760,13 +766,14 @@ class SettingsService:
                 self.save_failed = True
                 raise ConfigError("Configuration save failed; restart required") from None
             self.pending_restart = pending_restart
-            self._pending_restart_fields |= restart_fields
+            self._pending_restart_fields = restart_fields
             self._inputs, self._secrets, self.revision = inputs, secrets, revision
             if not self.pending_restart:
                 context = execution_context()
                 if actuation_settings_changed(self.settings, candidate):
                     context.config_generation += 1
                 self._settings = candidate
+                self._live_inputs = frozenset(inputs)
                 if self.request_replan is not None:
                     try:
                         self.request_replan()

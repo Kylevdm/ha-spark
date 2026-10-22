@@ -311,3 +311,31 @@ def test_save_fences_actuation_but_not_notification_changes(service):
     save(service, {"inverter_power_switch_entity": "select.new"})
     assert context.config_generation == generation + 1
     assert service.settings.inverter_power_switch_entity == "select.new"
+
+
+def test_reverting_the_pending_restart_change_goes_live_again(service):
+    running = service.settings.solis_modbus_slave
+    assert save(service, {"solis_modbus_slave": running + 1})["status"] == "pending_restart"
+    result = save(service, {"solis_modbus_slave": running, "min_soc": 25})
+    assert result["status"] == "live"
+    assert service.settings.min_soc == 25
+    assert service.read_view()["pending_restart_fields"] == []
+
+
+def test_removing_a_running_restart_input_stays_pending(service):
+    assert save(service, {"solis_modbus_slave": 2})["status"] == "pending_restart"
+    restarted = SettingsService(service.options_path, data_dir=service.data_dir)
+    restarted.load(writable=True)
+    snapshot = restarted.settings
+    # Dropping the input reverts to the default: a restart change even though
+    # neither the old nor the new committed inputs hold the key afterwards.
+    assert save(restarted, {"solis_modbus_slave": None})["status"] == "pending_restart"
+    assert save(restarted, {"min_soc": 25})["status"] == "pending_restart"
+    assert restarted.settings is snapshot
+
+
+def test_read_view_carries_field_metadata(service):
+    metadata = service.read_view()["metadata"]
+    assert metadata["solis_modbus_slave"] == {"owner": "integration", "secret": False,
+                                              "reload": "restart"}
+    assert metadata["octopus_api_key"]["secret"] is True
