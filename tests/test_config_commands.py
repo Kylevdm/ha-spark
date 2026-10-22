@@ -117,6 +117,56 @@ def test_cli_set_reads_revision_and_reports_conflict(service, monkeypatch, capsy
     assert "conflict" in capsys.readouterr().out
 
 
+async def test_cli_import_nondefault_db_path_refused_without_writes(
+    service, tmp_path, monkeypatch, capsys,
+):
+    import asyncio
+
+    document = tmp_path / "legacy.json"
+    document.write_text(json.dumps({"db_path": str(tmp_path / "elsewhere" / "ha_spark.db")}))
+    monkeypatch.setattr(cli, "Settings", lambda: service.settings)
+    snapshot = service.settings
+    async with DaemonChannel(service.settings) as channel:
+        channel.settings_service = service
+        before = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
+        assert await asyncio.to_thread(cli.main, ["config", "import", str(document)]) != 0
+        captured = capsys.readouterr()
+        assert "move the database" in captured.out + captured.err
+        assert {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()} == before
+        assert service.settings is snapshot
+
+
+@pytest.mark.parametrize("command", ["import", "set-secret"])
+def test_cli_import_and_secret_refuse_without_daemon_before_reading_stdin(
+    service, tmp_path, monkeypatch, capsys, command,
+):
+    import sys
+
+    class UnreadableStdin:
+        def isatty(self):
+            raise AssertionError("secret input must not be inspected without a daemon")
+
+        def readline(self, *args):
+            raise AssertionError("secret input must not be read without a daemon")
+
+        def read(self, *args):
+            raise AssertionError("secret input must not be read without a daemon")
+
+    async def submit(*args, **kwargs):
+        return None
+
+    document = tmp_path / "import.json"
+    document.write_text("{}")
+    monkeypatch.setattr(cli, "submit_socket", submit)
+    monkeypatch.setattr(cli, "Settings", lambda: service.settings)
+    monkeypatch.setattr(sys, "stdin", UnreadableStdin())
+    argument = str(document) if command == "import" else "octopus_api_key"
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
+    assert cli.main(["config", command, argument]) != 0
+    assert cli.REFUSED in capsys.readouterr().out
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()} == before
+
+
 def test_cli_no_daemon_writes_refused(service, monkeypatch, capsys):
     async def submit(*args, **kwargs):
         return None

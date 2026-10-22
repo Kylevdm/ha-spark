@@ -188,6 +188,68 @@ def test_commit_fault_loads_one_complete_generation(tmp_path, monkeypatch, opera
     assert (settings.min_soc, settings.octopus_api_key) in {(21, "old"), (22, "new")}
 
 
+@pytest.mark.parametrize(
+    "operation,step",
+    [(operation, step)
+     for operation, steps in (("replace", 3), ("fsync", 6), ("link", 2))
+     for step in range(1, steps + 1)],
+)
+def test_pending_commit_fault_recovers_pair_and_rechecks_marker_once(
+    tmp_path, monkeypatch, operation, step,
+):
+    from ha_spark.settings_service import ConfigurationRepair
+    from tests.authority_helpers import seed_authority
+
+    context = execution_context()
+    monkeypatch.setattr(context, "authority", None)
+    service = store(tmp_path)
+    service.load(writable=True)
+    service.save({"solis_modbus_slave": 1, "octopus_api_key": "old"}, 1, "seed")
+    original = getattr(os, operation)
+    calls = 0
+
+    def fault(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == step:
+            raise OSError(CANARY)
+        return original(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, operation, fault)
+        with pytest.raises(ConfigError) as error:
+            service.save({"solis_modbus_slave": 2, "octopus_api_key": "new"}, 2, "seed")
+        assert CANARY not in str(error.value)
+    fresh = store(tmp_path)
+    settings = fresh.load()
+    assert (fresh.revision, settings.solis_modbus_slave, settings.octopus_api_key) in {
+        (2, 1, "old"), (3, 2, "new"),
+    }
+    marker = tmp_path / "ha_spark_config.pending"
+    had_marker = marker.exists()
+    assert had_marker == (operation == "link" or step > 1)
+    # Neither generation has a valid fallback. Optimise makes the startup
+    # re-check observable without spying on the service's private guard.
+    seed_authority(settings, "optimise")
+    if had_marker:
+        with pytest.raises(ConfigurationRepair, match="solis_fallback_current_a"):
+            store(tmp_path).load(writable=True)
+        assert marker.exists()
+    seed_authority(settings, "observe")
+    loaded = store(tmp_path)
+    active = loaded.load(writable=True)
+    assert (loaded.revision, active.solis_modbus_slave, active.octopus_api_key) == (
+        fresh.revision, settings.solis_modbus_slave, settings.octopus_api_key,
+    )
+    document = json.loads((tmp_path / "ha_spark_config.json").read_text())
+    secrets = json.loads((tmp_path / "ha_spark_secrets.json").read_text())
+    assert document["revision"] == secrets["revision"] == loaded.revision
+    assert not marker.exists()
+    # After consuming the marker the same load must not check a second time.
+    seed_authority(settings, "optimise")
+    assert store(tmp_path).load(writable=True).solis_modbus_slave == settings.solis_modbus_slave
+
+
 def test_marked_missing_pair_never_reseeds(tmp_path):
     service = store(tmp_path)
     service.load(writable=True)
@@ -363,6 +425,26 @@ def test_supervisor_options_follow_the_fixed_db_path_rule(tmp_path, addon_env):
     with pytest.raises(ConfigError, match="move the database first"):
         addon_store(tmp_path).load(writable=True)
     assert list(tmp_path.iterdir()) == []
+
+
+@respx.mock
+def test_invalid_supervisor_seed_enters_repair_without_writes_or_payload_echo(
+    tmp_path, addon_env, caplog,
+):
+    from ha_spark.settings_service import ConfigurationRepair
+
+    options = tmp_path / "options.json"
+    options.write_text("{}")
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    route = supervisor_route({"tariff_provider": "invalid", "octopus_api_key": CANARY})
+    service = addon_store(tmp_path)
+    with pytest.raises(ConfigurationRepair, match="tariff_provider") as error:
+        service.load(writable=True)
+    assert route.call_count == 1
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
+    view = service.read_view()
+    assert view["status"] == "configuration_repair"
+    assert CANARY not in str(error.value) + json.dumps(view) + caplog.text
 
 
 @respx.mock

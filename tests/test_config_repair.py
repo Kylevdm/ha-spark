@@ -362,6 +362,101 @@ async def test_import_ends_repair_and_reconciles_holds_before_the_first_plan(
     assert CANARY not in capsys.readouterr().out
 
 
+@respx.mock
+async def test_repair_builds_and_serves_only_the_ingress_listener(
+    store: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corrupt(store, tariff_provider=CANARY, agent_surface="on", agent_expose_port=True)
+    apps, servers, served = [], [], []
+    ingress_server = scheduler._ingress_server
+
+    def capture_ingress(state):
+        # The daemon fixture installs its server fakes before entering repair.
+        build, make = scheduler.build_app, scheduler.make_server
+        serve = scheduler.serve_in_background
+
+        def capture_build(*args, **kwargs):
+            apps.append(kwargs)
+            return build(*args, **kwargs)
+
+        def capture_server(app, host, port):
+            server = make(app, host, port)
+            servers.append((server, host, port))
+            return server
+
+        async def capture_serve(server):
+            served.append(server)
+            return await serve(server)
+
+        monkeypatch.setattr(scheduler, "build_app", capture_build)
+        monkeypatch.setattr(scheduler, "make_server", capture_server)
+        monkeypatch.setattr(scheduler, "serve_in_background", capture_serve)
+        return ingress_server(state)
+
+    monkeypatch.setattr(scheduler, "_ingress_server", capture_ingress)
+    async with repairing_daemon(store, monkeypatch):
+        assert apps == [{}]
+        assert len(servers) == 1
+        server, host, port = servers[0]
+        assert (host, port) == ("127.0.0.1", scheduler.INGRESS_PORT)
+        assert port != scheduler.AGENT_PORT
+        assert served == [server]
+    assert len(apps) == len(servers) == len(served) == 1
+    assert not respx.calls
+
+
+@respx.mock
+async def test_running_repair_ingress_import_resumes_normal_startup(
+    store: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corrupt(store, tariff_provider=CANARY)
+    seed_optimise_with_hold_and_transition(store)
+    async with repairing_daemon(store, monkeypatch) as (_, events, states, planned):
+        def import_from_ingress():
+            with owner_client(states[0]) as client:
+                view = client.get("/api/config").json()
+                return client.post("/api/config/import", json={
+                    "expected": view["repair_token"],
+                    "document": {"solis_fallback_current_a": 20,
+                                 "inverter_power_switch_entity": "select.old"},
+                })
+
+        response = await asyncio.to_thread(import_from_ingress)
+        assert response.status_code == 200, response.text
+        assert CANARY not in response.text
+        await asyncio.wait_for(planned.wait(), 5)
+        assert states[0].settings_service.repair is None
+        assert len(states) == 2
+        assert events.index("monitor") < events.index("reconcile") < events.index("run_once")
+        assert events.index("reconcile") < events.index("lifecycle")
+    assert not respx.calls
+
+
+def test_repair_health_reports_configuration_field_reasons_without_secrets(store: Path) -> None:
+    corrupt(store, tariff_provider=CANARY)
+    with owner_client(repair_state(store)) as client:
+        response = client.get("/api/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "fail"
+    assert any("tariff_provider" in reason
+               for reason in response.json()["configuration"]["reasons"])
+    assert CANARY not in response.text
+
+
+@pytest.mark.parametrize("command", ["coverage", "slots"])
+def test_readiness_reports_repair_for_coverage_and_slots(
+    store: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], command: str,
+) -> None:
+    corrupt(store, tariff_provider=CANARY)
+    monkeypatch.setenv("HA_URL", "http://ha.test")
+    monkeypatch.setenv("HA_TOKEN", "test")
+    monkeypatch.setenv("DB_PATH", str(store / "ha_spark.db"))
+    assert cli.main(["readiness", command]) == 2
+    captured = capsys.readouterr()
+    assert "configuration repair" in captured.err.lower()
+    assert CANARY not in captured.out + captured.err
+
+
 # --- ingress -----------------------------------------------------------------------------------
 
 

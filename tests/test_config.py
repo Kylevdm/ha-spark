@@ -156,6 +156,14 @@ def test_addon_bootstrap_schema_and_runtime_field_classification() -> None:
     assert set(legacy["schema"]) <= _OPTION_KEYS
 
 
+def test_addon_supervisor_seed_uses_default_role_api_access() -> None:
+    import yaml
+
+    addon = yaml.safe_load(ADDON_CONFIG.read_text(encoding="utf-8"))
+    assert addon["hassio_api"] is True
+    assert addon.get("hassio_role", "default") == "default"
+
+
 def test_restart_fields_match_startup_bindings() -> None:
     metadata = field_metadata()
     assert {name for name, meta in metadata.items() if meta["reload"] == "restart"} == {
