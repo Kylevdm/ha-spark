@@ -589,3 +589,60 @@ def test_config_parse_errors_never_echo_arguments(argv, capsys):
     assert cli.main(argv) == 2
     out = capsys.readouterr()
     assert CANARY not in out.out + out.err
+
+
+@pytest.fixture
+def restore_context() -> Iterator[None]:
+    context = execution_context()
+    authority, generation = context.authority, context.config_generation
+    try:
+        yield
+    finally:
+        context.authority, context.config_generation = authority, generation
+
+
+@pytest.mark.parametrize("authority", ["protect", "optimise", "to-protect", "to-optimise"])
+def test_defaults_seed_past_observe_enters_repair_until_an_import(
+    tmp_path: Path, restore_context: None, authority: str,
+) -> None:
+    store = seed_authority(
+        bootstrap(tmp_path), "observe" if authority.startswith("to-") else authority,
+    )
+    if authority.startswith("to-"):
+        store.save(store.state.model_copy(update={
+            "transition": Transition(target=authority[3:], started_at=datetime.now(UTC)),
+        }))
+    (tmp_path / "options.json").write_text(json.dumps({"log_level": "INFO"}))
+    authority_before = authority_bytes(tmp_path)
+    service = daemon_service(tmp_path)
+    with pytest.raises(ConfigurationRepair, match="not Observe"):
+        service.load(writable=True)
+    assert not list(tmp_path.glob("ha_spark_config*"))
+    assert not list(tmp_path.glob("ha_spark_secrets*"))
+    assert authority_bytes(tmp_path) == authority_before
+    document = {"solis_fallback_current_a": 20} if authority.endswith("optimise") else {}
+    service.import_document(document, service.repair_token(), "import")
+    assert service.repair is None
+    assert (tmp_path / "ha_spark_config.initialised").is_file()
+    assert authority_bytes(tmp_path) == authority_before
+
+
+@pytest.mark.parametrize("authority", ["none", "observe", "unknown"])
+def test_defaults_seed_proceeds_while_authority_writes_nothing(
+    tmp_path: Path, restore_context: None, authority: str,
+) -> None:
+    if authority != "none":
+        store = seed_authority(bootstrap(tmp_path), "observe")
+        if authority == "unknown":
+            store.store_path.unlink()
+    (tmp_path / "options.json").write_text(json.dumps({"log_level": "INFO"}))
+    service = daemon_service(tmp_path)
+    service.load(writable=True)
+    assert service.repair is None
+    assert (tmp_path / "ha_spark_config.initialised").is_file()
+
+
+def test_legacy_seed_under_optimise_is_unchanged(tmp_path: Path, restore_context: None) -> None:
+    seed_authority(bootstrap(tmp_path), "optimise")
+    (tmp_path / "options.json").write_text(json.dumps({"min_soc": 25}))
+    assert daemon_service(tmp_path).load(writable=True).min_soc == 25

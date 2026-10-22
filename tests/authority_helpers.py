@@ -93,6 +93,9 @@ def seed_settings(
     # An already-initialised install never seeds; keep the Supervisor out of it.
     supervisor_options = settings_service._supervisor_options
     settings_service._supervisor_options = lambda token: {}
+    # Nor does the defaults-seed authority check apply to that setup.
+    observe_or_new = settings_service._observe_or_new
+    settings_service._observe_or_new = lambda settings: True
     try:
         context.authority = None
         service.load(validate=False, writable=True)
@@ -104,6 +107,7 @@ def seed_settings(
             service.load(validate=False, writable=True)
     finally:
         settings_service._supervisor_options = supervisor_options
+        settings_service._observe_or_new = observe_or_new
         context.authority = authority
         context.config_generation = generation
     return service

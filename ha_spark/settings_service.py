@@ -30,7 +30,7 @@ from typing import Any
 import httpx
 from pydantic import ValidationError
 
-from ha_spark.authority import AuthorityStore, resolve_data_dir
+from ha_spark.authority import AuthorityStore, load_authority, resolve_data_dir
 from ha_spark.config import (
     _OPTION_KEYS,
     _SECRET_OPTION_KEYS,
@@ -226,6 +226,21 @@ def _supervisor_options(token: str) -> dict[str, Any] | None:
         return None
     options = data.get("options")
     return options if isinstance(options, dict) else None
+
+
+def _observe_or_new(settings: Settings) -> bool:
+    """False only when durable authority is, or is moving to, Protect or Optimise.
+
+    Fresh and unknown authority write nothing, and leaving them needs an owner
+    transition whose entry checks the configured inverter.
+    """
+    result = load_authority(settings)
+    state = result.state
+    if result.status != "known" or state is None:
+        return True
+    return state.committed_mode == "observe" and (
+        state.transition is None or state.transition.target == "observe"
+    )
 
 
 class SettingsService:
@@ -437,6 +452,13 @@ class SettingsService:
                     if legacy.keys() - {"log_level"}:
                         seed_source = "supervisor"
                     raw = {**raw, **legacy}
+            if seed_source == "defaults" and not _observe_or_new(self._bootstrap):
+                # Defaults address the documented Solis hub; an install already
+                # past Observe must get its own configuration back by import.
+                raise ConfigError(
+                    "No saved options found to seed from while the operating mode is "
+                    "not Observe; import a saved configuration"
+                )
             self._apply_log_level(raw)
             raw = normalise_legacy(raw, self._bootstrap.db_path)
             inputs = {key: value for key, value in raw.items()
