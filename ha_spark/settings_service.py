@@ -1,8 +1,10 @@
 """Versioned owner-input settings and secrets, committed as one durable revision.
 
-Read-only loads preview first-start legacy options without writing. The daemon
-opts into initialisation and saves only after claiming its executor lock. A save
-never changes authority: stale work is fenced before publishing the new snapshot.
+Read-only loads preview first-start legacy options without writing; the seed
+reads them from ``options.json`` or, when that file holds no legacy key, from
+the Supervisor's stored options. The daemon opts into initialisation and
+saves only after claiming its executor lock. A save never changes authority:
+stale work is fenced before publishing the new snapshot.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+import httpx
 from pydantic import ValidationError
 
 from ha_spark.authority import resolve_data_dir
@@ -33,6 +36,7 @@ from ha_spark.mode_preconditions import NO_FALLBACK_PLATFORM, fallback_schedule_
 
 log = get_logger(__name__)
 OPTIONS_PATH = Path("/data/options.json")
+SUPERVISOR_INFO_URL = "http://supervisor/addons/self/info"
 _KEYS = frozenset(field_metadata())
 
 
@@ -79,11 +83,8 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _read_options_overlay(path: Path = OPTIONS_PATH) -> dict[str, Any]:
-    """Read the legacy seed vocabulary; never report arbitrary input keys."""
-    if not path.exists():
-        return {}
-    raw = _read_json(path)
+def _normalise_legacy_options(raw: dict[str, Any]) -> dict[str, Any]:
+    """Coerce untrusted legacy options to the seed vocabulary; never report input keys."""
     retired = []
     if "proactive_mode" in raw:
         retired.append("proactive_mode")
@@ -103,6 +104,41 @@ def _read_options_overlay(path: Path = OPTIONS_PATH) -> dict[str, Any]:
     if unknown:
         log.warning("Ignoring %d unknown legacy options", unknown)
     return {k: v for k, v in raw.items() if k in _OPTION_KEYS and (v is not None or k == "db_path")}
+
+
+def _read_options_overlay(path: Path = OPTIONS_PATH) -> dict[str, Any]:
+    """Read the legacy seed vocabulary from the Supervisor options file."""
+    if not path.exists():
+        return {}
+    return _normalise_legacy_options(_read_json(path))
+
+
+def _supervisor_options(token: str) -> dict[str, Any] | None:
+    """The add-on's stored options from the Supervisor, or ``None`` if unavailable.
+
+    The response is untrusted, like any other seed source: only a 200 ``ok``
+    envelope holding a dict ``data.options`` counts. Nothing about a failure
+    is logged: status text, body or error messages can echo the payload or
+    the bearer token.
+    """
+    try:
+        response = httpx.get(
+            SUPERVISOR_INFO_URL,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5.0,
+        )
+        if response.status_code != 200:
+            return None
+        body = response.json()
+    except (httpx.HTTPError, ValueError, RecursionError):
+        return None
+    if not isinstance(body, dict) or body.get("result") != "ok":
+        return None
+    data = body.get("data")
+    if not isinstance(data, dict):
+        return None
+    options = data.get("options")
+    return options if isinstance(options, dict) else None
 
 
 class SettingsService:
@@ -260,6 +296,19 @@ class SettingsService:
                     recover = True
             else:
                 raw = _read_options_overlay(self.options_path)
+                if (
+                    not raw.keys() - {"log_level"}
+                    and not self._bootstrap.is_standalone
+                    and self._bootstrap.supervisor_token
+                ):
+                    # The Supervisor may already have stripped the legacy keys
+                    # from options.json; its stored options are then the seed
+                    # source, coerced exactly like the file.
+                    stored = _supervisor_options(self._bootstrap.supervisor_token)
+                    if stored is None:
+                        log.warning("Supervisor options unavailable; seeding defaults")
+                    else:
+                        raw = {**raw, **_normalise_legacy_options(stored)}
                 self._apply_log_level(raw)
                 if "db_path" in raw and raw["db_path"] != self._bootstrap.db_path:
                     raise ConfigError(
