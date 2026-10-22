@@ -19,6 +19,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import re
 import tempfile
 from collections.abc import Callable
 from copy import deepcopy
@@ -202,14 +203,20 @@ def _supervisor_options(token: str) -> dict[str, Any] | None:
     the bearer token.
     """
     try:
-        response = httpx.get(
-            SUPERVISOR_INFO_URL,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=5.0,
-        )
-        if response.status_code != 200:
-            return None
-        body = response.json()
+        # The transport, unlike httpx.Client, logs no request line, so the
+        # Supervisor's status text never reaches the log.
+        with httpx.HTTPTransport() as transport:
+            response = transport.handle_request(httpx.Request(
+                "GET", SUPERVISOR_INFO_URL,
+                headers={"Authorization": f"Bearer {token}"},
+                extensions={"timeout": httpx.Timeout(5.0).as_dict()},
+            ))
+            try:
+                if response.status_code != 200:
+                    return None
+                body = json.loads(response.read())
+            finally:
+                response.close()
     except (httpx.HTTPError, ValueError, RecursionError):
         return None
     if not isinstance(body, dict) or body.get("result") != "ok":
@@ -650,8 +657,11 @@ class SettingsService:
         )
         candidate = _checked(self._candidate(inputs, secrets, False))
         inputs = _validated_devices(inputs, candidate)
-        if not isinstance(expected, str) or not hmac.compare_digest(
-            expected, self.repair_token()
+        # compare_digest raises on non-ASCII str; compare the fixed token format first.
+        if (
+            not isinstance(expected, str)
+            or re.fullmatch(r"[0-9a-f]{64}|none", expected) is None
+            or not hmac.compare_digest(expected, self.repair_token())
         ):
             raise RepairTokenConflict(self.repair_token())
         self._guard(candidate, startup=True)
@@ -673,6 +683,8 @@ class SettingsService:
         except (OSError, ValueError, TypeError):
             self.save_failed = True
             raise ConfigError("Configuration save failed; restart required") from None
+        # Nothing was planned in repair, but publishing a snapshot is always fenced.
+        execution_context().config_generation += 1
         self._inputs, self._secrets, self.revision = inputs, secrets, revision
         self._settings = candidate
         self.repair = None

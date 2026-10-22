@@ -363,3 +363,13 @@ def test_supervisor_options_follow_the_fixed_db_path_rule(tmp_path, addon_env):
     with pytest.raises(ConfigError, match="move the database first"):
         addon_store(tmp_path).load(writable=True)
     assert list(tmp_path.iterdir()) == []
+
+
+@respx.mock
+def test_supervisor_status_text_never_reaches_the_log(tmp_path, addon_env, caplog):
+    caplog.set_level("DEBUG")
+    respx.get(SUPERVISOR_INFO_URL).mock(
+        return_value=httpx.Response(500, extensions={"reason_phrase": CANARY.encode()})
+    )
+    addon_store(tmp_path).load(writable=True)
+    assert CANARY not in caplog.text

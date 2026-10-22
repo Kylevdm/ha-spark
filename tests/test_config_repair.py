@@ -435,3 +435,62 @@ def test_pending_restart_failing_the_fallback_check_enters_repair(store: Path) -
     with pytest.raises(ConfigurationRepair, match="solis_fallback_current_a"):
         service.load(writable=True)
     assert {p.name: p.read_bytes() for p in store.iterdir() if p.is_file()} == before
+
+
+# --- Batch R safety review findings ------------------------------------------
+
+
+def test_non_ascii_repair_token_is_a_conflict_not_a_crash(store):
+    corrupt(store, tariff_provider="invalid")
+    service = SettingsService(store / "options.json", settings=bootstrap(store), data_dir=store)
+    with pytest.raises(ConfigurationRepair):
+        service.load(writable=True)
+    with pytest.raises(RepairTokenConflict):
+        service.import_document({"min_soc": 20}, "é", "import")
+
+
+def test_repair_import_fences_before_publishing(store):
+    corrupt(store, tariff_provider="invalid")
+    service = SettingsService(store / "options.json", settings=bootstrap(store), data_dir=store)
+    with pytest.raises(ConfigurationRepair):
+        service.load(writable=True)
+    context = execution_context()
+    generation = context.config_generation
+    service.import_document(
+        {"solis_fallback_current_a": 20}, service.repair_token(), "import",
+    )
+    assert context.config_generation == generation + 1
+
+
+@pytest.mark.parametrize("command", ["health", "mode", "readiness"])
+def test_diagnostics_report_a_daemon_in_repair_the_local_load_misses(
+    store, monkeypatch, capsys, command,
+):
+    # The store loads read-only, but the running daemon is in repair.
+    monkeypatch.setenv("HA_URL", "http://ha.test")
+    monkeypatch.setenv("HA_TOKEN", "test")
+    monkeypatch.setenv("DB_PATH", str(store / "ha_spark.db"))
+
+    async def submit(settings, op, **kwargs):
+        if op == "authority_status":
+            return cli.Reply(authority={"mode": "optimise", "suspended": "configuration_repair"})
+        assert op == "config_show"
+        return cli.Reply(config={"status": "configuration_repair",
+                                 "reasons": ["tariff_provider: invalid"]})
+
+    monkeypatch.setattr(cli, "submit_socket", submit)
+    argv = {"health": ["health"], "mode": ["mode", "show"], "readiness": ["readiness", "show"]}
+    code = cli.main(argv[command])
+    out = capsys.readouterr()
+    assert code != 0
+    assert "tariff_provider" in out.out + out.err
+
+
+@pytest.mark.parametrize("argv", [
+    ["config", "set", "min_soc=20", f"--{CANARY}"],
+    ["config", "import", "backup.yaml", CANARY],
+])
+def test_config_parse_errors_never_echo_arguments(argv, capsys):
+    assert cli.main(argv) == 2
+    out = capsys.readouterr()
+    assert CANARY not in out.out + out.err

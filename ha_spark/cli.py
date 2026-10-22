@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import io
 import json
 import signal
 import sys
@@ -1238,6 +1240,28 @@ async def _cmd_mode_show(settings: Settings) -> int:
     return 0
 
 
+def _daemon_repair(settings: Settings) -> ConfigurationRepair | None:
+    """A running daemon's repair state, which a read-only load can miss.
+
+    The daemon validates fully and re-checks a pending restart change; the
+    diagnostic load does neither, so ask the daemon before reporting normally.
+    """
+    async def ask() -> ConfigurationRepair | None:
+        status = await submit_socket(settings, "authority_status")
+        if (
+            status is None or status.authority is None
+            or status.authority.get("suspended") != "configuration_repair"
+        ):
+            return None
+        shown = await submit_socket(settings, "config_show")
+        reasons = shown.config.get("reasons") if shown and shown.config else None
+        if not isinstance(reasons, list) or not all(isinstance(r, str) for r in reasons):
+            reasons = ["configuration_repair"]
+        return ConfigurationRepair(reasons, settings)
+
+    return asyncio.run(ask())
+
+
 def _cmd_mode_show_repair(repair: ConfigurationRepair) -> int:
     """The stored authority, read only, marked suspended; no live preconditions."""
     loaded = load_authority(repair.bootstrap)
@@ -1277,7 +1301,18 @@ def main(argv: list[str] | None = None) -> int:
             print("[REFUSED] set-secret requires a secret field; value comes from stdin")
             return 2
     parser = build_parser()
-    args = parser.parse_args(argv)
+    if argv[:1] == ["config"]:
+        # argparse errors echo the offending arguments; config input may be secret.
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                args = parser.parse_args(argv)
+        except SystemExit as exc:
+            if exc.code == 0:
+                raise
+            print("[REFUSED] invalid config command; see `ha-spark config --help`")
+            return 2
+    else:
+        args = parser.parse_args(argv)
 
     if args.command == "config":
         try:
@@ -1299,6 +1334,9 @@ def main(argv: list[str] | None = None) -> int:
         except ConfigError as exc:
             print(f"Configuration error: {exc}", file=sys.stderr)
             return 2
+        if (suspended := _daemon_repair(settings)) is not None:
+            print(_repair_message(suspended), file=sys.stderr)
+            return 2
         if args.readiness_command == "show":
             return asyncio.run(_cmd_readiness_show(settings))
         if args.readiness_command == "coverage":
@@ -1317,6 +1355,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Configuration error: {exc}", file=sys.stderr)
             return 2
         if args.mode_command == "show":
+            if (suspended := _daemon_repair(settings)) is not None:
+                return _cmd_mode_show_repair(suspended)
             return asyncio.run(_cmd_mode_show(settings))
         return asyncio.run(_cmd_mode_set(
             settings, args.target if args.mode_command == "set" else "observe",
@@ -1333,6 +1373,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Configuration error: {exc}", file=sys.stderr)
             return 2
         setup_logging("WARNING")
+        if (suspended := _daemon_repair(settings)) is not None:
+            return asyncio.run(_cmd_repair_health(suspended))
         return asyncio.run(_cmd_health(settings))
 
     try:
