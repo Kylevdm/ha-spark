@@ -4,6 +4,8 @@ The owner-only socket authenticates CLI mode requests by kernel peer uid and
 0600 permissions. Socket callers cannot claim an ingress identity. Only the daemon
 loop persists grants or runs device work; ordinary work requests add no permission.
 Config requests call the shared settings service inline and never enter the work queue.
+In configuration repair only ``config_show``, ``config_import`` and a read-only
+``authority_status`` answer; everything else is refused with ``configuration_repair``.
 Request lines are capped at 256 KiB, including the JSON envelope and newline.
 """
 from __future__ import annotations
@@ -19,10 +21,16 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from ha_spark.authority import AuthorityStore, OperatingMode, authority_view, resolve_data_dir
+from ha_spark.authority import (
+    AuthorityStore,
+    OperatingMode,
+    authority_view,
+    load_authority,
+    resolve_data_dir,
+)
 from ha_spark.config import _SECRET_OPTION_KEYS, ConfigError, Settings
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome
-from ha_spark.settings_service import RevisionConflict, SettingsService
+from ha_spark.settings_service import RepairTokenConflict, RevisionConflict, SettingsService
 
 MAX_CONFIG_BYTES = 256 * 1024
 Op = Literal[
@@ -30,6 +38,7 @@ Op = Literal[
     "config_show", "config_export", "config_save", "config_import", "config_set_secret",
 ]
 REFUSED = "[REFUSED] no ha-spark daemon running; hardware writes happen only inside the daemon"
+CONFIGURATION_REPAIR = "configuration_repair"
 
 
 class DaemonAlreadyRunning(RuntimeError):
@@ -43,6 +52,7 @@ class Request(BaseModel):
     expected_epoch: int | None = Field(default=None, ge=1, strict=True)
 
     expected_revision: int | None = Field(default=None, ge=0, strict=True)
+    repair_token: str | None = Field(default=None, max_length=128)
     changes: dict[str, Any] | None = None
     document: dict[str, Any] | None = None
     field: str | None = None
@@ -59,9 +69,11 @@ class Request(BaseModel):
             "config_import": {"expected_revision", "document"},
             "config_set_secret": {"expected_revision", "field", "value"},
         }.get(self.op, set())
-        fields = {"expected_revision", "changes", "document", "field", "value"}
+        fields = {"expected_revision", "repair_token", "changes", "document", "field", "value"}
         present = {key for key in fields if getattr(self, key) is not None}
-        if present != allowed:
+        if self.op == "config_import" and present == {"repair_token", "document"}:
+            pass
+        elif present != allowed:
             raise ValueError("invalid config operation fields")
         if self.op == "config_set_secret" and self.field not in _SECRET_OPTION_KEYS:
             raise ValueError("invalid secret field")
@@ -163,7 +175,17 @@ class DaemonChannel:
             os.close(self._fd)
             self._fd = None
 
+    def _repairing(self) -> bool:
+        return self.settings_service is not None and self.settings_service.repair is not None
+
     def authority_status(self) -> dict[str, Any]:
+        if self._repairing():
+            assert self.settings_service is not None
+            # Repair only reads the store: no initialisation, save or fence.
+            loaded = load_authority(self.settings_service.bootstrap)
+            view = authority_view(loaded.state, known=loaded.status == "known")
+            view["suspended"] = CONFIGURATION_REPAIR
+            return view
         store = self.authority
         return authority_view(
             store.state if store else None, known=store.known if store else False,
@@ -202,6 +224,9 @@ class DaemonChannel:
             return Reply(authority=self.authority_status())
         if self._server is None or not self._server.is_serving():
             return Reply(error="daemon stopped")
+        if self._repairing() and request.op not in ("config_show", "config_import"):
+            return Reply(error=CONFIGURATION_REPAIR,
+                         text="configuration needs repair; import a valid configuration")
         if request.op.startswith("config_"):
             service = self.settings_service
             if service is None:
@@ -212,10 +237,10 @@ class DaemonChannel:
                 elif request.op == "config_export":
                     result = service.export()
                 elif request.op == "config_import":
-                    assert request.document is not None and request.expected_revision is not None
-                    result = service.import_document(
-                        request.document, request.expected_revision, "import",
-                    )
+                    expected = (request.repair_token if request.repair_token is not None
+                                else request.expected_revision)
+                    assert request.document is not None and expected is not None
+                    result = service.import_document(request.document, expected, "import")
                 else:
                     assert request.expected_revision is not None
                     changes = request.changes
@@ -227,6 +252,8 @@ class DaemonChannel:
                 return Reply(config=result)
             except RevisionConflict as exc:
                 return Reply(error="conflict", config={"revision": exc.revision})
+            except RepairTokenConflict as exc:
+                return Reply(error="conflict", config={"repair_token": exc.token})
             except ConfigError as exc:
                 return Reply(error="invalid configuration", reasons=[str(exc)])
         future = asyncio.get_running_loop().create_future()
@@ -275,7 +302,7 @@ async def submit_socket(
     expected_epoch: int | None = None,
     expected_revision: int | None = None, changes: dict[str, Any] | None = None,
     document: dict[str, Any] | None = None, field: str | None = None,
-    value: str | dict[str, bool] | None = None,
+    value: str | dict[str, bool] | None = None, repair_token: str | None = None,
 ) -> Reply | None:
     """None means unreachable. Never retry an accepted request after a lost reply."""
     path = resolve_data_dir(settings) / "ha_spark.sock"
@@ -289,7 +316,7 @@ async def submit_socket(
         payload = Request(
             op=op, target=target, expected_epoch=expected_epoch,
             expected_revision=expected_revision, changes=changes, document=document,
-            field=field, value=value,
+            field=field, value=value, repair_token=repair_token,
         ).model_dump_json(exclude_none=True).encode() + b"\n"
         if len(payload) > MAX_CONFIG_BYTES:
             return Reply(error="daemon request too large")

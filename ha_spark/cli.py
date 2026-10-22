@@ -67,13 +67,20 @@ from ha_spark.ha.rest import HomeAssistantRest, HomeAssistantRestError, notify
 from ha_spark.ha.state_cache import StateCache
 from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
-from ha_spark.health import Status, check_load_history, exit_code, format_report, run_health
+from ha_spark.health import (
+    Status,
+    check_load_history,
+    exit_code,
+    format_report,
+    run_health,
+    run_repair_health,
+)
 from ha_spark.logging import setup_logging
 from ha_spark.mode_preconditions import entry_preconditions
 from ha_spark.onboarding_discover import FieldProposal, propose
 from ha_spark.presets import get_preset, preset_names
 from ha_spark.router import route_message
-from ha_spark.settings_service import SettingsService
+from ha_spark.settings_service import ConfigurationRepair, SettingsService
 
 
 async def _cmd_readiness_show(settings: Settings) -> int:
@@ -224,6 +231,20 @@ async def _cmd_health(settings: Settings) -> int:
     results = await run_health(settings)
     print(format_report(results))
     return exit_code(results)
+
+
+async def _cmd_repair_health(repair: ConfigurationRepair) -> int:
+    """Configuration repair: the critical Configuration check fails, so exit non-zero."""
+    results = await run_repair_health(repair.bootstrap, repair.reasons)
+    print(format_report(results))
+    return exit_code(results)
+
+
+def _repair_message(repair: ConfigurationRepair) -> str:
+    return (
+        f"Configuration repair: {repair}. Protection and optimisation are suspended; "
+        "import a valid configuration with `ha-spark config import FILE`."
+    )
 
 
 async def _cmd_notify_test(settings: Settings) -> int:
@@ -1120,7 +1141,11 @@ async def _cmd_config(settings: Settings, args: argparse.Namespace) -> int:
         )
         if reply is None:
             service = SettingsService(settings=settings)
-            service.load(validate=False)
+            try:
+                service.load(validate=False)
+            except ConfigurationRepair:
+                if command == "export":
+                    raise
             reply = Reply(config=service.read_view() if command == "show" else service.export())
     else:
         changes: dict[str, Any] = {}
@@ -1148,8 +1173,15 @@ async def _cmd_config(settings: Settings, args: argparse.Namespace) -> int:
         if shown is None or shown.error or shown.config is None:
             print(REFUSED if shown is None else "[REFUSED] configuration unavailable")
             return 1
-        revision = shown.config["revision"]
-        if command == "set":
+        repairing = shown.config.get("status") == "configuration_repair"
+        if repairing and command != "import":
+            print("[REFUSED] configuration_repair: only `config import` is accepted")
+            return 1
+        revision = None if repairing else shown.config["revision"]
+        if repairing:
+            reply = await submit_socket(settings, "config_import", document=document,
+                                        repair_token=shown.config["repair_token"])
+        elif command == "set":
             reply = await submit_socket(settings, "config_save",
                                         expected_revision=revision, changes=changes)
         elif command == "import":
@@ -1206,6 +1238,17 @@ async def _cmd_mode_show(settings: Settings) -> int:
     return 0
 
 
+def _cmd_mode_show_repair(repair: ConfigurationRepair) -> int:
+    """The stored authority, read only, marked suspended; no live preconditions."""
+    loaded = load_authority(repair.bootstrap)
+    view = authority_view(loaded.state, known=loaded.status == "known")
+    view["load_status"] = loaded.status
+    view["suspended"] = "configuration_repair"
+    print(json.dumps(view, indent=2))
+    print(_repair_message(repair), file=sys.stderr)
+    return 2
+
+
 async def _cmd_inverter_show(settings: Settings) -> int:
     """Only HA GETs: no execution, authority-store access, or entity refresh service."""
     diagnostics = []
@@ -1248,7 +1291,14 @@ def main(argv: list[str] | None = None) -> int:
     # cross-field tariff checks so diagnostics can report what's wrong. Quiet logs
     # keep the report clean; failure detail is carried in each check result.
     if args.command == "readiness":
-        settings = load_settings(validate=False)
+        try:
+            settings = load_settings(validate=False)
+        except ConfigurationRepair as repair:
+            print(_repair_message(repair), file=sys.stderr)
+            return 2
+        except ConfigError as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 2
         if args.readiness_command == "show":
             return asyncio.run(_cmd_readiness_show(settings))
         if args.readiness_command == "coverage":
@@ -1256,7 +1306,16 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_cmd_readiness_slots(settings, days=args.days))
 
     if args.command == "mode":
-        settings = load_settings(validate=False)
+        try:
+            settings = load_settings(validate=False)
+        except ConfigurationRepair as repair:
+            if args.mode_command == "show":
+                return _cmd_mode_show_repair(repair)
+            # Requests still reach the daemon, which refuses them in repair.
+            settings = repair.bootstrap
+        except ConfigError as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 2
         if args.mode_command == "show":
             return asyncio.run(_cmd_mode_show(settings))
         return asyncio.run(_cmd_mode_set(
@@ -1265,12 +1324,25 @@ def main(argv: list[str] | None = None) -> int:
         ))
 
     if args.command == "health":
-        settings = load_settings(validate=False)
+        try:
+            settings = load_settings(validate=False)
+        except ConfigurationRepair as repair:
+            setup_logging("WARNING")
+            return asyncio.run(_cmd_repair_health(repair))
+        except ConfigError as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 2
         setup_logging("WARNING")
         return asyncio.run(_cmd_health(settings))
 
     try:
         settings = load_settings()
+    except ConfigurationRepair as repair:
+        if args.command != "run" or args.once:
+            print(_repair_message(repair), file=sys.stderr)
+            return 2
+        # The daemon starts in repair from the bootstrap settings alone.
+        settings = repair.bootstrap
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2

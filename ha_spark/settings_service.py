@@ -5,10 +5,18 @@ reads them from ``options.json`` or, when that file holds no legacy key, from
 the Supervisor's stored options. The daemon opts into initialisation and
 saves only after claiming its executor lock. A save never changes authority:
 stale work is fenced before publishing the new snapshot.
+
+A store that can't be trusted (missing or unreadable after the marker, a
+mismatched pair with no matching ``*.prev``, invalid values, an unsupported
+``schema_version`` or a failed seed) puts the service in configuration repair:
+nothing is written or reseeded, reasons name fields only, and the one write
+accepted is an import carrying the repair token (a keyed digest of the files
+on disk, or ``none``).
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import tempfile
@@ -40,10 +48,42 @@ log = get_logger(__name__)
 OPTIONS_PATH = Path("/data/options.json")
 SUPERVISOR_INFO_URL = "http://supervisor/addons/self/info"
 _KEYS = frozenset(field_metadata())
+_REPAIR_FILES = (
+    "ha_spark_config.json",
+    "ha_spark_secrets.json",
+    "ha_spark_config.json.prev",
+    "ha_spark_secrets.json.prev",
+    "ha_spark_config.initialised",
+)
 
 
 class _PairRevisionMismatch(ConfigError):
     """Two valid settings envelopes belong to different revisions."""
+
+
+class ConfigurationRepair(ConfigError):
+    """The committed configuration can't be trusted; only repair may run.
+
+    ``bootstrap`` is the environment-only settings (data directory, HA
+    credentials), never a runtime configuration to act on.
+    """
+
+    def __init__(self, reasons: list[str], bootstrap: Settings) -> None:
+        super().__init__("; ".join(reasons))
+        self.reasons = reasons
+        self.bootstrap = bootstrap
+
+
+class RepairTokenConflict(ConfigError):
+    """The files changed since the owner read the repair token."""
+
+    def __init__(self, token: str) -> None:
+        super().__init__("conflict")
+        self.token = token
+
+
+class _RestartRequired(ConfigError):
+    """A persistence failure while loading: a restart, not an import, is the fix."""
 
 
 class RevisionConflict(ConfigError):
@@ -120,6 +160,32 @@ def normalise_legacy(
     }
 
 
+def _merged(
+    changes: dict[str, Any], inputs: dict[str, Any], secrets: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Apply a partial update in the service's wire form to copies of the inputs."""
+    inputs, secrets = inputs.copy(), secrets.copy()
+    for key, value in changes.items():
+        if key in _SECRET_OPTION_KEYS:
+            if value == "***":
+                continue
+            if (
+                value == {"clear": True}
+                and isinstance(value, dict)
+                and value["clear"] is True
+            ):
+                secrets.pop(key, None)
+            elif isinstance(value, str) and value:
+                secrets[key] = value
+            else:
+                raise ConfigError(f"Invalid secret update: {key}")
+        elif value is None or (key == "devices" and value == []):
+            inputs.pop(key, None)
+        else:
+            inputs[key] = value
+    return inputs, secrets
+
+
 def _read_options_overlay(path: Path = OPTIONS_PATH) -> dict[str, Any]:
     """Read the legacy seed vocabulary from the Supervisor options file."""
     if not path.exists():
@@ -179,8 +245,13 @@ class SettingsService:
         self.pending_restart = False
         self._pending_restart_fields: set[str] = set()
         self.request_replan: Callable[[], None] | None = None
+        # Called once an import ends configuration repair.
+        self.on_repaired: Callable[[], None] | None = None
         self.revision = 0
         self.save_failed = False
+        self.repair: list[str] | None = None
+        # Keys the repair token so it never exposes a stable digest of the secrets file.
+        self._token_key = os.urandom(32)
         self._writable = False
         self._lock = RLock()
 
@@ -194,6 +265,13 @@ class SettingsService:
     def settings(self, settings: Settings) -> None:
         # Compatibility for tests replacing AppState.settings directly.
         self._settings = settings
+
+    @property
+    def bootstrap(self) -> Settings:
+        """Environment-only settings; the sole settings available in repair."""
+        if self._bootstrap is None:
+            raise RuntimeError("Settings have not been loaded")
+        return self._bootstrap
 
     @property
     def data_dir(self) -> Path:
@@ -237,12 +315,6 @@ class SettingsService:
         except ValidationError as exc:
             raise ConfigError(_validation_error_reason(exc)) from None
         if validate:
-            if not settings.is_standalone and not settings.supervisor_token:
-                raise ConfigError(
-                    "No Home Assistant credentials. Running as an HA add-on provides "
-                    "SUPERVISOR_TOKEN automatically; for standalone/dev set HA_URL and "
-                    "HA_TOKEN (see .env.example)."
-                )
             _checked(settings)
         return settings
 
@@ -294,109 +366,134 @@ class SettingsService:
                         "db_path": str(self.data_dir / "ha_spark.db"),
                     }
                 )
-            marker = self._path("ha_spark_config.initialised")
-            recover = False
-            if marker.exists():
-                # Supervisor still owns log_level, the sole remaining bootstrap option.
-                try:
-                    options = _read_json(self.options_path) if self.options_path.exists() else {}
-                except ConfigError:
-                    options = {}
-                self._apply_log_level(options)
-                try:
-                    revision, inputs, secrets = self._pair()
-                except _PairRevisionMismatch as current_error:
-                    try:
-                        revision, inputs, secrets = self._pair(".prev")
-                    except ConfigError:
-                        raise current_error from None
-                    recover = True
-            else:
-                raw = _read_options_overlay(self.options_path)
-                if (
-                    not raw.keys() - {"log_level"}
-                    and not self._bootstrap.is_standalone
-                    and self._bootstrap.supervisor_token
-                ):
-                    # The Supervisor may already have stripped the legacy keys
-                    # from options.json; its stored options are then the seed
-                    # source, coerced exactly like the file.
-                    stored = _supervisor_options(self._bootstrap.supervisor_token)
-                    if stored is None:
-                        log.warning("Supervisor options unavailable; seeding defaults")
-                    else:
-                        raw = {**raw, **normalise_legacy(stored)}
-                self._apply_log_level(raw)
-                raw = normalise_legacy(raw, self._bootstrap.db_path)
-                inputs = {key: value for key, value in raw.items()
-                          if key in _KEYS - _SECRET_OPTION_KEYS}
-                secrets = {key: value for key, value in raw.items() if key in _SECRET_OPTION_KEYS}
-                revision = 1 if writable else 0
-            candidate = self._candidate(inputs, secrets, validate)
-            pending_marker = self._path("ha_spark_config.pending")
-            if writable and pending_marker.exists():
-                self._guard(candidate, startup=True)
-            inputs = _validated_devices(inputs, candidate)
-            if writable and not validate:
-                _checked(candidate)
-            if writable and recover:
-                try:
-                    self._commit(inputs, secrets, revision, backup=False)
-                except OSError:
-                    self.save_failed = True
-                    raise ConfigError("Configuration recovery failed; restart required") from None
-            if not marker.exists():
-                # Compare validated values: Supervisor choices can encode numeric
-                # defaults as strings (notably solar_percentile).
-                inputs = {
-                    key: value
-                    for key, value in inputs.items()
-                    if key == "devices"
-                    or getattr(candidate, key)
-                    != Settings.model_fields[key].get_default(call_default_factory=True)
-                }
-            if writable and not marker.exists():
-                # Validate before touching any remnants from an interrupted seed.
-                try:
-                    self.data_dir.mkdir(parents=True, exist_ok=True)
-                    for name in (
-                        "ha_spark_config.json",
-                        "ha_spark_secrets.json",
-                        "ha_spark_config.json.prev",
-                        "ha_spark_secrets.json.prev",
-                    ):
-                        self._path(name).unlink(missing_ok=True)
-                    for pattern in (
-                        ".ha_spark_config.json.*",
-                        ".ha_spark_secrets.json.*",
-                        ".ha_spark_config.initialised.*",
-                    ):
-                        for path in self.data_dir.glob(pattern):
-                            path.unlink()
-                    self._commit(inputs, secrets, revision, backup=False)
-                    self._write_marker()
-                except OSError:
-                    self.save_failed = True
-                    raise ConfigError(
-                        "Configuration initialisation failed; restart required"
-                    ) from None
-                log.info(
-                    "Configuration committed revision=%d fields=%s actor=seed",
-                    revision,
-                    ",".join(sorted(inputs.keys() | secrets.keys())),
+            # Credentials are bootstrap: no configuration import can supply them.
+            if validate and not self._bootstrap.is_standalone and (
+                not self._bootstrap.supervisor_token
+            ):
+                raise ConfigError(
+                    "No Home Assistant credentials. Running as an HA add-on provides "
+                    "SUPERVISOR_TOKEN automatically; for standalone/dev set HA_URL and "
+                    "HA_TOKEN (see .env.example)."
                 )
-            if writable and pending_marker.exists():
-                try:
-                    pending_marker.unlink()
-                    self._sync_directory()
-                except OSError:
-                    raise ConfigError("Configuration load failed; restart required") from None
-            self._inputs, self._secrets, self.revision = inputs, secrets, revision
-            self._settings = candidate
-            self.pending_restart = False
-            self._pending_restart_fields.clear()
             self._writable = writable
-            return candidate
+            try:
+                return self._load(validate=validate, writable=writable)
+            except _RestartRequired as exc:
+                raise ConfigError(str(exc)) from None
+            except ConfigError as exc:
+                # Every reason is a service message naming fields, never input text.
+                self.repair = [str(exc)]
+                self._settings = None
+                self._inputs, self._secrets, self.revision = {}, {}, 0
+                log.error("Configuration repair: %s", exc)
+                raise ConfigurationRepair(self.repair, self.bootstrap) from None
+
+    def _load(self, *, validate: bool, writable: bool) -> Settings:
+        """Read the store; any ``ConfigError`` before a write means repair."""
+        assert self._bootstrap is not None
+        marker = self._path("ha_spark_config.initialised")
+        recover = False
+        if marker.exists():
+            # Supervisor still owns log_level, the sole remaining bootstrap option.
+            try:
+                options = _read_json(self.options_path) if self.options_path.exists() else {}
+            except ConfigError:
+                options = {}
+            self._apply_log_level(options)
+            try:
+                revision, inputs, secrets = self._pair()
+            except _PairRevisionMismatch as current_error:
+                try:
+                    revision, inputs, secrets = self._pair(".prev")
+                except ConfigError:
+                    raise current_error from None
+                recover = True
+        else:
+            raw = _read_options_overlay(self.options_path)
+            if (
+                not raw.keys() - {"log_level"}
+                and not self._bootstrap.is_standalone
+                and self._bootstrap.supervisor_token
+            ):
+                # The Supervisor may already have stripped the legacy keys
+                # from options.json; its stored options are then the seed
+                # source, coerced exactly like the file.
+                stored = _supervisor_options(self._bootstrap.supervisor_token)
+                if stored is None:
+                    log.warning("Supervisor options unavailable; seeding defaults")
+                else:
+                    raw = {**raw, **normalise_legacy(stored)}
+            self._apply_log_level(raw)
+            raw = normalise_legacy(raw, self._bootstrap.db_path)
+            inputs = {key: value for key, value in raw.items()
+                      if key in _KEYS - _SECRET_OPTION_KEYS}
+            secrets = {key: value for key, value in raw.items() if key in _SECRET_OPTION_KEYS}
+            revision = 1 if writable else 0
+        candidate = self._candidate(inputs, secrets, validate)
+        pending_marker = self._path("ha_spark_config.pending")
+        if writable and pending_marker.exists():
+            self._guard(candidate, startup=True)
+        inputs = _validated_devices(inputs, candidate)
+        if writable and not validate:
+            _checked(candidate)
+        if writable and recover:
+            try:
+                self._commit(inputs, secrets, revision, backup=False)
+            except OSError:
+                self.save_failed = True
+                raise _RestartRequired("Configuration recovery failed; restart required") from None
+        if not marker.exists():
+            # Compare validated values: Supervisor choices can encode numeric
+            # defaults as strings (notably solar_percentile).
+            inputs = {
+                key: value
+                for key, value in inputs.items()
+                if key == "devices"
+                or getattr(candidate, key)
+                != Settings.model_fields[key].get_default(call_default_factory=True)
+            }
+        if writable and not marker.exists():
+            # Validate before touching any remnants from an interrupted seed.
+            try:
+                self.data_dir.mkdir(parents=True, exist_ok=True)
+                for name in (
+                    "ha_spark_config.json",
+                    "ha_spark_secrets.json",
+                    "ha_spark_config.json.prev",
+                    "ha_spark_secrets.json.prev",
+                ):
+                    self._path(name).unlink(missing_ok=True)
+                for pattern in (
+                    ".ha_spark_config.json.*",
+                    ".ha_spark_secrets.json.*",
+                    ".ha_spark_config.initialised.*",
+                ):
+                    for path in self.data_dir.glob(pattern):
+                        path.unlink()
+                self._commit(inputs, secrets, revision, backup=False)
+                self._write_marker()
+            except OSError:
+                self.save_failed = True
+                raise _RestartRequired(
+                    "Configuration initialisation failed; restart required"
+                ) from None
+            log.info(
+                "Configuration committed revision=%d fields=%s actor=seed",
+                revision,
+                ",".join(sorted(inputs.keys() | secrets.keys())),
+            )
+        if writable and pending_marker.exists():
+            try:
+                pending_marker.unlink()
+                self._sync_directory()
+            except OSError:
+                raise _RestartRequired("Configuration load failed; restart required") from None
+        self._inputs, self._secrets, self.revision = inputs, secrets, revision
+        self._settings = candidate
+        self.pending_restart = False
+        self._pending_restart_fields.clear()
+        self.repair = None
+        return candidate
 
     def _apply_log_level(self, options: dict[str, Any]) -> None:
         """Take the Supervisor's log_level when present; env applies only when absent."""
@@ -476,6 +573,12 @@ class SettingsService:
     def read_view(self) -> dict[str, Any]:
         """The single masking point for effective runtime values."""
         with self._lock:
+            if self.repair is not None:
+                return {
+                    "status": "configuration_repair",
+                    "reasons": list(self.repair),
+                    "repair_token": self.repair_token(),
+                }
             out = {key: getattr(self.settings, key) for key in _KEYS}
             out["devices"] = [device.model_dump(mode="json") for device in self.settings.devices]
             for key in _SECRET_OPTION_KEYS:
@@ -488,26 +591,113 @@ class SettingsService:
                 "inputs": sorted(self._inputs.keys() | self._secrets.keys()),
             }
 
+    def repair_token(self) -> str:
+        """Keyed digest of the configuration files on disk, or ``none`` when there are none."""
+        mac = hmac.new(self._token_key, digestmod="sha256")
+        present = False
+        for name in _REPAIR_FILES:
+            path = self._path(name)
+            try:
+                data = path.read_bytes()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                data = b"\0unreadable"
+            present = True
+            mac.update(name.encode() + b"\0" + len(data).to_bytes(8, "big") + data)
+        return mac.hexdigest() if present else "none"
+
     def export(self) -> dict[str, Any]:
         """Return owner inputs only, never secrets or derived defaults."""
         with self._lock:
             return deepcopy(self._inputs)
 
     def import_document(
-        self, document: dict[str, Any], expected: int, actor: str,
+        self, document: dict[str, Any], expected: int | str, actor: str,
     ) -> dict[str, Any]:
-        """Replace inputs through the same validation, revision and save guards."""
+        """Replace inputs through the same validation, revision and save guards.
+
+        ``expected`` is the revision, or in repair the repair token.
+        """
         with self._lock:
+            if self.repair is not None:
+                return self._repair_import(document, expected)
             raw = normalise_legacy(document, self.settings.db_path, strict=True)
             changes = {key: None for key in self._inputs}
             changes.update({key: value for key, value in raw.items() if key in _KEYS})
-            return self.save(changes, expected, actor)
+            return self.save(changes, expected if isinstance(expected, int) else -1, actor)
+
+    def _repair_import(self, document: dict[str, Any], expected: int | str) -> dict[str, Any]:
+        """The one write repair accepts: no trusted snapshot, so no current fallback."""
+        if self.save_failed:
+            raise ConfigError("Configuration save failed; restart required")
+        if not self._writable:
+            raise ConfigError("Configuration writes require the running daemon")
+        on_disk = {name: self._readable(name) for name in _REPAIR_FILES[:4]}
+        for name in ("ha_spark_config.json", "ha_spark_config.json.prev"):
+            version = on_disk[name].get("schema_version")
+            if type(version) is int and version > 1:
+                raise ConfigError("Configuration written by a newer schema_version; not replaced")
+        raw = normalise_legacy(document, self.bootstrap.db_path, strict=True)
+        # Omitted secrets are preserved from a secrets file that still reads cleanly.
+        kept = on_disk["ha_spark_secrets.json"].get("secrets")
+        if not isinstance(kept, dict) or not all(
+            key in _SECRET_OPTION_KEYS and isinstance(value, str) for key, value in kept.items()
+        ):
+            kept = {}
+        inputs, secrets = _merged(
+            {key: value for key, value in raw.items() if key in _KEYS}, {}, kept,
+        )
+        candidate = _checked(self._candidate(inputs, secrets, False))
+        inputs = _validated_devices(inputs, candidate)
+        if not isinstance(expected, str) or not hmac.compare_digest(
+            expected, self.repair_token()
+        ):
+            raise RepairTokenConflict(self.repair_token())
+        self._guard(candidate, startup=True)
+        revision = 1 + max(
+            (
+                value["revision"]
+                for value in on_disk.values()
+                if type(value.get("revision")) is int and value["revision"] > 0
+            ),
+            default=0,
+        )
+        try:
+            # The untrusted pair is never kept as a rollback target.
+            for name in ("ha_spark_config.json.prev", "ha_spark_secrets.json.prev"):
+                self._path(name).unlink(missing_ok=True)
+            self._commit(inputs, secrets, revision, backup=False)
+            if not self._path("ha_spark_config.initialised").exists():
+                self._write_marker()
+        except (OSError, ValueError, TypeError):
+            self.save_failed = True
+            raise ConfigError("Configuration save failed; restart required") from None
+        self._inputs, self._secrets, self.revision = inputs, secrets, revision
+        self._settings = candidate
+        self.repair = None
+        changed = sorted(inputs.keys() | secrets.keys())
+        log.info(
+            "Configuration committed revision=%d fields=%s actor=import",
+            revision, ",".join(changed),
+        )
+        if self.on_repaired is not None:
+            self.on_repaired()
+        return {"revision": revision, "changed": changed, "status": "live"}
+
+    def _readable(self, name: str) -> dict[str, Any]:
+        try:
+            return _read_json(self._path(name))
+        except ConfigError:
+            return {}
 
     def save(self, changes: dict[str, Any], expected_revision: int, actor: str) -> dict[str, Any]:
         """Validate a complete candidate, check the revision/guards, commit, fence, swap."""
         with self._lock:
             if self.save_failed:
                 raise ConfigError("Configuration save failed; restart required")
+            if self.repair is not None:
+                raise ConfigError("Configuration repair: only an import is accepted")
             if not self._writable:
                 raise ConfigError("Configuration writes require the running daemon")
             for key in ("db_path", "log_level"):
@@ -524,25 +714,7 @@ class SettingsService:
             unknown = len(changes.keys() - _KEYS)
             if unknown:
                 raise ConfigError(f"Unknown configuration fields: {unknown}")
-            inputs, secrets = self._inputs.copy(), self._secrets.copy()
-            for key, value in changes.items():
-                if key in _SECRET_OPTION_KEYS:
-                    if value == "***":
-                        continue
-                    if (
-                        value == {"clear": True}
-                        and isinstance(value, dict)
-                        and value["clear"] is True
-                    ):
-                        secrets.pop(key, None)
-                    elif isinstance(value, str) and value:
-                        secrets[key] = value
-                    else:
-                        raise ConfigError(f"Invalid secret update: {key}")
-                elif value is None or (key == "devices" and value == []):
-                    inputs.pop(key, None)
-                else:
-                    inputs[key] = value
+            inputs, secrets = _merged(changes, self._inputs, self._secrets)
             candidate = _checked(self._candidate(inputs, secrets, False))
             inputs = _validated_devices(inputs, candidate)
             if type(expected_revision) is not int or expected_revision != self.revision:
