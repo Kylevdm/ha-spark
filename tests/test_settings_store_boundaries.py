@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import traceback
@@ -368,6 +369,7 @@ def test_run_config_failure_exits_two_without_echo_or_hardware(
     commit_failure,
 ):
     service = store(tmp_path)
+    repairs = []
     if commit_failure:
 
         def fail(*args, **kwargs):
@@ -376,13 +378,26 @@ def test_run_config_failure_exits_two_without_echo_or_hardware(
         monkeypatch.setattr(os, "replace", fail)
     else:
         (tmp_path / "options.json").write_text(json.dumps({"tariff_provider": CANARY}))
+
+        async def repair(daemon_service, channel):
+            repairs.append(daemon_service.read_view())
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(scheduler, "_serve_repair", repair)
     monkeypatch.setattr(cli, "load_settings", lambda: service.load())
     monkeypatch.setattr(cli, "setup_logging", lambda level: None)
     monkeypatch.setattr(scheduler, "OPTIONS_PATH", tmp_path / "options.json")
-    assert cli.main(["run"]) == 2
+    code = cli.main(["run"])
     output = capsys.readouterr()
-    assert "Configuration error:" in output.err
-    assert CANARY not in output.err + output.out
+    if commit_failure:
+        assert code == 2
+        assert "Configuration error:" in output.err
+    else:
+        # #463: a seed whose legacy values fail validation starts configuration
+        # repair instead of exiting.
+        assert code == 0
+        assert [view["status"] for view in repairs] == ["configuration_repair"]
+    assert CANARY not in output.err + output.out + json.dumps(repairs)
     assert not (tmp_path / "ha_spark_config.initialised").exists()
 
 
