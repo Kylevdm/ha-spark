@@ -6,11 +6,13 @@ import json
 import os
 from pathlib import Path
 
+import httpx
 import pytest
+import respx
 
 from ha_spark.config import ConfigError, Settings
 from ha_spark.devices.execution import execution_context
-from ha_spark.settings_service import SettingsService
+from ha_spark.settings_service import SUPERVISOR_INFO_URL, SettingsService
 
 
 @pytest.fixture(autouse=True)
@@ -202,3 +204,162 @@ def test_bad_seed_is_secret_safe_and_writes_nothing(tmp_path, caplog):
         store(tmp_path).load(writable=True)
     assert "CANARY-5f3a" not in str(error.value) + caplog.text
     assert list(tmp_path.iterdir()) == [path]
+
+
+# --- Supervisor seed fallback (#464) ------------------------------------------
+
+CANARY = "CANARY-5f3a"
+
+
+@pytest.fixture
+def addon_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bootstrap mode picks the seed sources; keep the environment out of it."""
+    for var in ("HA_URL", "HA_TOKEN", "SUPERVISOR_TOKEN", "LOG_LEVEL", "DB_PATH"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def addon_store(tmp_path: Path, token: str = "sup-token") -> SettingsService:
+    return SettingsService(
+        tmp_path / "options.json",
+        data_dir=tmp_path,
+        settings=Settings(supervisor_token=token, ha_url="", ha_token=""),
+    )
+
+
+def supervisor_route(options: object) -> respx.Route:
+    return respx.get(SUPERVISOR_INFO_URL).mock(
+        return_value=httpx.Response(200, json={"result": "ok", "data": {"options": options}})
+    )
+
+
+@respx.mock
+@pytest.mark.parametrize("options_file", [None, {}, {"log_level": "WARNING"}])
+def test_supervisor_stored_options_seed_when_file_has_no_legacy_key(
+    tmp_path, addon_env, options_file, caplog
+):
+    if options_file is not None:
+        (tmp_path / "options.json").write_text(json.dumps(options_file))
+    supervisor_route({
+        "min_soc": 25,
+        "octopus_api_key": CANARY,
+        "proactive_mode": "on",
+        f"{CANARY}-key": "value",
+    })
+    service = addon_store(tmp_path)
+    settings = service.load(writable=True)
+    assert settings.min_soc == 25
+    assert settings.octopus_api_key == CANARY
+    assert settings.log_level == ("WARNING" if options_file == {"log_level": "WARNING"} else "INFO")
+    assert service.revision == 1
+    assert (tmp_path / "ha_spark_config.initialised").is_file()
+    document = json.loads((tmp_path / "ha_spark_config.json").read_text())
+    assert document["settings"] == {"min_soc": 25}
+    assert json.loads((tmp_path / "ha_spark_secrets.json").read_text()) == {
+        "revision": 1,
+        "secrets": {"octopus_api_key": CANARY},
+    }
+    assert respx.calls[0].request.headers["Authorization"] == "Bearer sup-token"
+    assert CANARY not in caplog.text
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "unauthorised",
+        "server",
+        "timeout",
+        "connect",
+        "invalid-json",
+        "result-error",
+        "data-not-dict",
+        "options-list",
+        "options-missing",
+    ],
+)
+def test_supervisor_failure_falls_back_to_default_seed_without_echo(
+    tmp_path, addon_env, failure, caplog
+):
+    route = respx.get(SUPERVISOR_INFO_URL)
+    if failure == "unauthorised":
+        route.mock(return_value=httpx.Response(401, json={"result": "error", "message": CANARY}))
+    elif failure == "server":
+        route.mock(return_value=httpx.Response(500, text=CANARY))
+    elif failure == "timeout":
+        route.mock(side_effect=httpx.ReadTimeout(CANARY))
+    elif failure == "connect":
+        route.mock(side_effect=httpx.ConnectError(CANARY))
+    elif failure == "invalid-json":
+        route.mock(return_value=httpx.Response(200, text='{"result": "ok", "data": ' + CANARY))
+    elif failure == "result-error":
+        route.mock(return_value=httpx.Response(200, json={"result": "error", "message": CANARY}))
+    elif failure == "data-not-dict":
+        route.mock(return_value=httpx.Response(200, json={"result": "ok", "data": CANARY}))
+    elif failure == "options-list":
+        route.mock(
+            return_value=httpx.Response(200, json={"result": "ok", "data": {"options": [CANARY]}})
+        )
+    else:
+        route.mock(return_value=httpx.Response(200, json={"result": "ok", "data": {}}))
+    service = addon_store(tmp_path, token=f"token-{CANARY}")
+    settings = service.load(writable=True)
+    assert settings.min_soc == Settings().min_soc
+    assert settings.octopus_api_key == ""
+    assert service.revision == 1
+    assert json.loads((tmp_path / "ha_spark_config.json").read_text())["settings"] == {}
+    assert json.loads((tmp_path / "ha_spark_secrets.json").read_text())["secrets"] == {}
+    assert "Supervisor options unavailable; seeding defaults" in caplog.text
+    assert CANARY not in caplog.text
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("options_file", "expected_min_soc"),
+    [({"min_soc": 25}, 25), ({"db_path": "placeholder"}, 20)],
+)
+def test_supervisor_not_consulted_when_options_file_holds_a_legacy_key(
+    tmp_path, addon_env, options_file, expected_min_soc
+):
+    if options_file.get("db_path"):
+        options_file["db_path"] = str(tmp_path / "ha_spark.db")
+    (tmp_path / "options.json").write_text(json.dumps(options_file))
+    route = supervisor_route({"min_soc": 30})
+    service = addon_store(tmp_path)
+    assert service.load(writable=True).min_soc == expected_min_soc
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_supervisor_not_consulted_after_initialisation_marker(tmp_path, addon_env):
+    route = supervisor_route({"min_soc": 25})
+    assert addon_store(tmp_path).load(writable=True).min_soc == 25
+    assert route.call_count == 1
+    (tmp_path / "options.json").write_text("{}")
+    assert addon_store(tmp_path).load(writable=True).min_soc == 25
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_standalone_never_consults_the_supervisor(tmp_path, addon_env):
+    route = respx.get(SUPERVISOR_INFO_URL)
+    service = SettingsService(
+        tmp_path / "options.json",
+        data_dir=tmp_path,
+        settings=Settings(
+            ha_url="http://ha.test",
+            ha_token="test",
+            supervisor_token="sup-token",
+            db_path=str(tmp_path / "ha_spark.db"),
+        ),
+    )
+    service.load(writable=True)
+    assert route.call_count == 0
+    assert (tmp_path / "ha_spark_config.initialised").is_file()
+
+
+@respx.mock
+def test_supervisor_options_follow_the_fixed_db_path_rule(tmp_path, addon_env):
+    supervisor_route({"min_soc": 25, "db_path": "custom/ha_spark.db"})
+    with pytest.raises(ConfigError, match="move the database first"):
+        addon_store(tmp_path).load(writable=True)
+    assert list(tmp_path.iterdir()) == []
