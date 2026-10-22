@@ -1120,11 +1120,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # `health` is the tool you reach for when config is broken, so it must run and
-    # diagnose rather than fail fast: skip credential validation (but keep the
-    # add-on options overlay so the configured endpoints are probed) and let the
-    # checks themselves report what's wrong. Quiet logs keep the report clean —
-    # failure detail is carried in each check result.
+    # Diagnostic paths use the settings service's read-only load (a seed preview
+    # before the initialisation marker), which never writes. Skip credential and
+    # cross-field tariff checks so diagnostics can report what's wrong. Quiet logs
+    # keep the report clean; failure detail is carried in each check result.
     if args.command == "readiness":
         settings = load_settings(validate=False)
         if args.readiness_command == "show":

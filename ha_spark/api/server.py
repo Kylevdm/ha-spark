@@ -117,10 +117,6 @@ class AppState:
         # Compatibility for tests; production publishes only through save.
         self.settings_service.settings = settings
 
-    @property
-    def options_path(self) -> Path:
-        return self.settings_service.data_dir / "ha_spark_config.json"
-
     def set_plan(self, plan: ChargePlan) -> None:
         """Record the latest computed plan (called by the daemon each run)."""
         self.plan = plan

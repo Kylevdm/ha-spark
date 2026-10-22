@@ -841,26 +841,6 @@ def actuation_settings_changed(previous: Settings, current: Settings) -> bool:
     return any(getattr(previous, name) != getattr(current, name) for name in fields)
 
 
-def validate_options_document(options: dict[str, Any]) -> Settings:
-    """Build complete :class:`Settings` from a candidate options document and validate it.
-
-    The same overlay semantics as :func:`load_settings` (only runtime fields
-    honoured, ``None`` values dropped) and the same validation, minus the
-    environment credential check -- credentials come from the environment,
-    not the options document. Used to validate the complete merged candidate
-    *before* it is persisted by an options save (API, agent, MCP), so an
-    invalid document is rejected without touching disk or the running
-    settings. Raises ``ConfigError`` naming the failing field(s); the reason
-    never carries an input value (see ``_validation_error_reason``).
-    """
-    overlay = {k: v for k, v in options.items() if k in field_metadata() and v is not None}
-    try:
-        settings = Settings(**overlay)
-    except ValidationError as exc:
-        raise ConfigError(_validation_error_reason(exc)) from exc
-    return _validated_settings(settings)
-
-
 def load_settings(*, validate: bool = True) -> Settings:
     """Read configuration without writing; only the daemon initialises the store.
 

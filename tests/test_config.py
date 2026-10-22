@@ -421,37 +421,27 @@ def test_export_event_provider_is_independent_of_tariff() -> None:
         Settings(tariff_provider="axle")
 
 
-def test_validate_options_document_names_field_without_its_value() -> None:
-    """#412: a rejected options document names the failing field(s), never an
-    input value (which can be a secret option or a nested devices entry)."""
-    from ha_spark.config import validate_options_document
+def test_settings_save_names_field_without_its_value(tmp_path) -> None:
+    """#412: a rejected save names fields, never input values or secrets."""
+    from tests.test_settings_store import store
 
+    service = store(tmp_path)
+    service.load(writable=True)
     with pytest.raises(ConfigError) as exc:
-        validate_options_document(
-            {"min_soc": "not-a-number", "octopus_api_key": "SECRET_OCTO"}
+        service.save(
+            {"min_soc": "not-a-number", "octopus_api_key": "SECRET_OCTO"}, 1, "seed"
         )
     assert "min_soc" in str(exc.value)
     assert "not-a-number" not in str(exc.value)
     assert "SECRET_OCTO" not in str(exc.value)
 
 
-def test_validate_options_document_honours_only_option_keys() -> None:
-    """The document validator uses load_settings' overlay semantics: only
-    ``_OPTION_KEYS`` are honoured and ``None`` values are dropped."""
-    from ha_spark.config import validate_options_document
+def test_settings_save_rejects_a_bad_tariff_naming_the_field(tmp_path) -> None:
+    from tests.test_settings_store import store
 
-    settings = validate_options_document(
-        {"min_soc": 30.0, "ha_token": "SNEAKY", "not_a_key": 1, "db_path": None}
-    )
-    assert settings.min_soc == 30.0
-    assert settings.ha_token != "SNEAKY"
-    assert settings.db_path == "data/ha_spark.db"
-
-
-def test_validate_options_document_rejects_a_bad_tariff_naming_the_field() -> None:
-    from ha_spark.config import validate_options_document
-
+    service = store(tmp_path)
+    service.load(writable=True)
     with pytest.raises(ConfigError) as exc:
-        validate_options_document({"charge_window_start": "25:99"})
+        service.save({"charge_window_start": "25:99"}, 1, "seed")
     assert "window_start" in str(exc.value)
     assert "25:99" not in str(exc.value)

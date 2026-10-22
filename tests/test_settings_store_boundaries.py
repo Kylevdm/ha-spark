@@ -15,8 +15,9 @@ from fastapi.testclient import TestClient
 from ha_spark import cli
 from ha_spark.api.server import AppState, build_app
 from ha_spark.config import _SECRET_OPTION_KEYS, ConfigError, Settings
+from ha_spark.daemon_channel import DaemonChannel
 from ha_spark.energy import scheduler
-from ha_spark.settings_service import RevisionConflict
+from ha_spark.settings_service import RevisionConflict, SettingsService
 from tests.api_helpers import OWNER_CONFIG_HEADERS
 from tests.test_settings_store import preserve_fence as preserve_fence
 from tests.test_settings_store import store
@@ -413,3 +414,131 @@ def test_present_malformed_supervisor_log_level_is_refused(tmp_path, monkeypatch
     (tmp_path / "options.json").write_text(json.dumps({"log_level": 123}))
     with pytest.raises(ConfigError, match="log_level"):
         store(tmp_path).load(writable=not marked)
+
+
+@pytest.mark.parametrize("corruption", ["unknown", "json", "envelope", "revision", "unreadable"])
+def test_invalid_current_pair_never_restores_previous(tmp_path, corruption, monkeypatch):
+    service = store(tmp_path)
+    service.load(writable=True)
+    service.save({"min_soc": 22}, 1, "seed")
+    path = tmp_path / "ha_spark_config.json"
+    document = json.loads(path.read_text())
+    if corruption == "unknown":
+        document["settings"][CANARY] = "value"
+    elif corruption == "envelope":
+        document[CANARY] = "value"
+    elif corruption == "revision":
+        document["revision"] = 0
+    path.write_text("{" + CANARY if corruption == "json" else json.dumps(document))
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    if corruption == "unreadable":
+        original = Path.read_text
+
+        def unreadable(current, *args, **kwargs):
+            if current == path:
+                raise OSError(CANARY)
+            return original(current, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", unreadable)
+    with pytest.raises(ConfigError) as error:
+        store(tmp_path).load(writable=True)
+    assert CANARY not in str(error.value)
+    assert before == {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+
+
+@pytest.mark.parametrize("matching_path", [False, True])
+def test_addon_seed_uses_fixed_database_path(tmp_path, matching_path):
+    path = tmp_path / "options.json"
+    fixed_path = str(tmp_path / "ha_spark.db")
+    path.write_text(json.dumps({
+        "db_path": fixed_path if matching_path else "data/ha_spark.db",
+        "min_soc": 23,
+        "rate_peak_gbp_kwh": 0.42,
+        "inverter_power_switch_entity": "select.owner",
+    }))
+    service = SettingsService(path, settings=Settings(supervisor_token="t"), data_dir=tmp_path)
+    if not matching_path:
+        with pytest.raises(ConfigError, match="move the database first"):
+            service.load(writable=True)
+        assert list(tmp_path.iterdir()) == [path]
+        return
+    assert service.load(writable=True).db_path == fixed_path
+    assert service.settings.min_soc == 23
+    assert service.settings.rate_peak_gbp_kwh == 0.42
+    assert service.settings.devices[0].entities["power_switch"] == "select.owner"
+    assert service.revision == 1
+    assert (tmp_path / "ha_spark_config.initialised").is_file()
+    assert "devices" not in json.loads((tmp_path / "ha_spark_config.json").read_text())["settings"]
+
+
+def test_seed_and_ingress_save_audit_is_secret_safe(tmp_path, caplog):
+    (tmp_path / "options.json").write_text(json.dumps({"min_soc": 23}))
+    service = store(tmp_path)
+    with caplog.at_level("INFO"):
+        service.load(writable=True)
+        state = AppState(service.settings, service.options_path, settings_service=service)
+        with TestClient(build_app(state, ingress_peer="testclient")) as client:
+            response = client.post(
+                "/api/config",
+                headers=OWNER_CONFIG_HEADERS,
+                json={
+                    "expected_revision": 1,
+                    "changes": {"min_soc": 24, "octopus_api_key": CANARY},
+                },
+            )
+            assert response.status_code == 200
+        service.save({"axle_api_key": CANARY}, 2, "ingress:malformed\nuser")
+    messages = [record.getMessage() for record in caplog.records]
+    assert "Configuration committed revision=1 fields=min_soc actor=seed" in messages
+    assert (
+        "Configuration committed revision=2 fields=min_soc,octopus_api_key actor=ingress:owner"
+    ) in messages
+    assert "Configuration committed revision=3 fields=axle_api_key actor=ingress" in messages
+    assert all(CANARY not in message for message in messages)
+    assert all("malformed" not in message for message in messages)
+
+
+@respx.mock
+async def test_executor_lock_refusal_never_seeds_clean_directory(tmp_path, monkeypatch, capsys):
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="test", db_path=str(tmp_path / "ha_spark.db")
+    )
+    monkeypatch.setattr(scheduler, "OPTIONS_PATH", tmp_path / "options.json")
+    async with DaemonChannel(settings):
+        assert await cli._cmd_run(settings, once=False) == 1
+    assert "already running" in capsys.readouterr().err
+    for name in ("ha_spark_config.json", "ha_spark_secrets.json", "ha_spark_config.initialised"):
+        assert not (tmp_path / name).exists()
+
+
+def test_read_view_inputs_are_sorted_owner_inputs_including_secrets(tmp_path):
+    (tmp_path / "options.json").write_text(json.dumps({
+        "min_soc": 23, "octopus_api_key": CANARY,
+    }))
+    service = store(tmp_path)
+    service.load(writable=True)
+    assert service.read_view()["inputs"] == ["min_soc", "octopus_api_key"]
+    service.save({"rate_peak_gbp_kwh": 0.42, "axle_api_key": CANARY}, 1, "seed")
+    assert service.read_view()["inputs"] == [
+        "axle_api_key", "min_soc", "octopus_api_key", "rate_peak_gbp_kwh",
+    ]
+
+
+@pytest.mark.parametrize("content", ['{"' + CANARY + '": invalid}', '["' + CANARY + '"]'])
+def test_corrupt_legacy_options_never_default_or_write(tmp_path, content, caplog):
+    path = tmp_path / "options.json"
+    path.write_text(content)
+    with pytest.raises(ConfigError) as error:
+        store(tmp_path).load(writable=True)
+    assert CANARY not in str(error.value) + caplog.text
+    assert list(tmp_path.iterdir()) == [path]
+    assert path.read_text() == content
+
+
+def test_seed_trims_default_but_preserves_nondefault_input(tmp_path):
+    (tmp_path / "options.json").write_text(json.dumps({
+        "min_soc": Settings().min_soc, "rate_peak_gbp_kwh": 0.42,
+    }))
+    store(tmp_path).load(writable=True)
+    document = json.loads((tmp_path / "ha_spark_config.json").read_text())
+    assert document["settings"] == {"rate_peak_gbp_kwh": 0.42}

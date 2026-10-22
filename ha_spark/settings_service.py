@@ -36,6 +36,10 @@ OPTIONS_PATH = Path("/data/options.json")
 _KEYS = frozenset(field_metadata())
 
 
+class _PairRevisionMismatch(ConfigError):
+    """Two valid settings envelopes belong to different revisions."""
+
+
 class RevisionConflict(ConfigError):
     """The writer's base revision is no longer current."""
 
@@ -198,8 +202,8 @@ class SettingsService:
         if (
             type(revision) is not int
             or revision < 1
-            or secrets.get("revision") != revision
             or type(secrets.get("revision")) is not int
+            or secrets["revision"] < 1
         ):
             raise ConfigError("Configuration revision mismatch")
         inputs, secret_inputs = document.get("settings"), secrets.get("secrets")
@@ -217,6 +221,8 @@ class SettingsService:
             raise ConfigError(f"Unknown configuration fields: {unknown}")
         if any(not isinstance(value, str) for value in secret_inputs.values()):
             raise ConfigError("Invalid secret fields")
+        if secrets["revision"] != revision:
+            raise _PairRevisionMismatch("Configuration revision mismatch")
         return revision, inputs, secret_inputs
 
     def load(self, *, validate: bool = True, writable: bool = False) -> Settings:
@@ -246,10 +252,7 @@ class SettingsService:
                 self._apply_log_level(options)
                 try:
                     revision, inputs, secrets = self._pair()
-                except ConfigError as current_error:
-                    # Do not downgrade an unsupported schema to a previous version.
-                    if "schema_version" in str(current_error):
-                        raise
+                except _PairRevisionMismatch as current_error:
                     try:
                         revision, inputs, secrets = self._pair(".prev")
                     except ConfigError:
