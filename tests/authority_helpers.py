@@ -9,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+from ha_spark import settings_service
 from ha_spark.authority import AuthorityStore, OperatingMode
 from ha_spark.config import _OPTION_KEYS, _SECRET_OPTION_KEYS, Settings
 from ha_spark.devices.execution import ExecutionContext, execution_context
@@ -89,12 +90,24 @@ def seed_settings(
     service = SettingsService(directory / "options.json", settings=bootstrap, data_dir=directory)
     context = execution_context()
     authority, generation = context.authority, context.config_generation
+    # An already-initialised install never seeds; keep the Supervisor out of it.
+    supervisor_options = settings_service._supervisor_options
+    settings_service._supervisor_options = lambda token: {}
+    # Nor does the defaults-seed authority check apply to that setup.
+    observe_or_new = settings_service._observe_or_new
+    settings_service._observe_or_new = lambda settings: True
     try:
         context.authority = None
         service.load(validate=False, writable=True)
         if inputs:
             service.save(inputs, service.revision, "seed")
+            # Setup represents an install that already started with these
+            # inputs, so no restart-field change is pending re-check.
+            (directory / "ha_spark_config.pending").unlink(missing_ok=True)
+            service.load(validate=False, writable=True)
     finally:
+        settings_service._supervisor_options = supervisor_options
+        settings_service._observe_or_new = observe_or_new
         context.authority = authority
         context.config_generation = generation
     return service

@@ -1,0 +1,11 @@
+log_level: info
+db_path: /data/ha_spark.db
+inverter: solis
+charge_window_start: '23:30'
+charge_window_end: '05:30'
+target_soc_cap: 90
+proactive_mode: simulate
+octopus_api_key: ''
+axle_api_key: ''
+agent_api_token: ''
+devices: []

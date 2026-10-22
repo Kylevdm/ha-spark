@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from ha_spark.authority import Transition
-from ha_spark.config import ConfigError
+from ha_spark.config import ConfigError, Settings, field_metadata
 from ha_spark.devices.execution import execution_context
 from ha_spark.settings_service import SettingsService
 from tests.authority_helpers import seed_authority, seed_settings
@@ -150,6 +150,159 @@ def test_invalid_candidate_is_secret_safe_and_changes_nothing(service):
     assert service.settings is settings
 
 
+def test_restart_save_is_all_or_nothing_and_applies_after_restart(service):
+    snapshot = service.settings
+    generation = execution_context().config_generation
+    result = save(service, {
+        "agent_api_token": "replacement-secret",
+        "solis_modbus_slave": 2,
+        "inverter_power_switch_entity": "select.new",
+    })
+    assert result["status"] == "pending_restart"
+    assert service.settings is snapshot
+    assert execution_context().config_generation == generation
+    view = service.read_view()
+    assert view["status"] == "pending_restart"
+    assert view["pending_restart_fields"] == ["agent_api_token", "solis_modbus_slave"]
+    assert view["settings"]["agent_api_token"] == {"secret": True, "set": False}
+    assert "replacement-secret" not in json.dumps(view)
+
+    assert save(service, {"min_soc": 25})["status"] == "pending_restart"
+    assert service.settings is snapshot
+    assert execution_context().config_generation == generation
+    fresh = SettingsService(service.options_path, data_dir=service.data_dir)
+    fresh.load(writable=True)
+    assert fresh.settings.agent_api_token == "replacement-secret"
+    assert fresh.settings.solis_modbus_slave == 2
+    assert fresh.settings.inverter_power_switch_entity == "select.new"
+    assert fresh.settings.min_soc == 25
+    assert fresh.read_view()["status"] == "live"
+    assert fresh.read_view()["pending_restart_fields"] == []
+
+
+def test_live_save_requests_replan_but_pending_save_does_not(service):
+    snapshots = []
+    service.request_replan = lambda: snapshots.append(service.settings)
+    result = save(service, {"inverter_power_switch_entity": "select.new"})
+    assert result["status"] == "live"
+    assert snapshots == [service.settings]
+    save(service, {"solis_modbus_slave": 2})
+    save(service, {"min_soc": 25})
+    assert len(snapshots) == 1
+
+
+@pytest.mark.parametrize("transition", [False, True])
+def test_startup_rechecks_fallback_against_current_authority(service, transition):
+    service = seed_settings(service.data_dir, settings=Settings(
+        ha_url="http://ha.test", ha_token="test",
+        db_path=str(service.data_dir / "ha_spark.db"),
+    ))
+    seed_authority(service.settings, "observe")
+    save(service, {"solis_modbus_slave": 2, "solis_fallback_current_a": None})
+    store = seed_authority(service.settings, "observe" if transition else "optimise")
+    if transition:
+        store.save(store.state.model_copy(update={"transition": Transition(
+            target="optimise", started_at=datetime.now(UTC),
+        )}))
+    before = {p.name: p.read_bytes() for p in service.data_dir.iterdir() if p.is_file()}
+    execution_context().authority = None
+    fresh = SettingsService(
+        service.options_path, settings=service.settings, data_dir=service.data_dir,
+    )
+    with pytest.raises(ConfigError, match="solis_fallback_current_a"):
+        fresh.load(writable=True)
+    assert {p.name: p.read_bytes() for p in service.data_dir.iterdir() if p.is_file()} == before
+    assert store.store_path.read_bytes() == before[store.store_path.name]
+
+
+@pytest.mark.parametrize("writable", [False, True])
+def test_startup_without_pending_marker_does_not_recheck_fallback(service, writable):
+    service = seed_settings(service.data_dir, settings=Settings(
+        ha_url="http://ha.test", ha_token="test",
+        db_path=str(service.data_dir / "ha_spark.db"),
+    ))
+    seed_authority(service.settings, "observe")
+    save(service, {"solis_fallback_current_a": None})
+    seed_authority(service.settings, "optimise")
+    execution_context().authority = None
+    fresh = SettingsService(
+        service.options_path, settings=service.settings, data_dir=service.data_dir,
+    )
+    assert fresh.load(writable=writable).solis_fallback_current_a is None
+
+
+def test_read_only_load_leaves_pending_marker_and_skips_guard(service):
+    seed_authority(service.settings, "observe")
+    save(service, {"solis_modbus_slave": 2, "solis_fallback_current_a": None})
+    seed_authority(service.settings, "optimise")
+    marker = service.data_dir / "ha_spark_config.pending"
+    assert marker.exists()
+    before = {p.name: p.read_bytes() for p in service.data_dir.iterdir() if p.is_file()}
+    fresh = SettingsService(service.options_path, data_dir=service.data_dir)
+    assert fresh.load().solis_modbus_slave == 2
+    assert {p.name: p.read_bytes() for p in service.data_dir.iterdir() if p.is_file()} == before
+
+
+def test_unknown_startup_authority_accepts_pending_and_removes_marker(service):
+    seed_authority(service.settings, "observe")
+    save(service, {"solis_modbus_slave": 2, "solis_fallback_current_a": None})
+    execution_context().authority = None
+    fresh = SettingsService(service.options_path, data_dir=service.data_dir)
+    assert fresh.load(writable=True).solis_modbus_slave == 2
+    assert not (service.data_dir / "ha_spark_config.pending").exists()
+
+
+def test_pending_marker_write_failure_refuses_save(service, monkeypatch):
+    import os
+
+    original = os.replace
+
+    def fail_marker(source, destination):
+        if Path(destination).name == "ha_spark_config.pending":
+            raise OSError("secret-canary")
+        original(source, destination)
+
+    before = pair(service)
+    snapshot = service.settings
+    monkeypatch.setattr(os, "replace", fail_marker)
+    with pytest.raises(ConfigError, match="Configuration save failed; restart required") as error:
+        save(service, {"solis_modbus_slave": 2})
+    assert "secret-canary" not in str(error.value)
+    assert service.save_failed
+    assert pair(service) == before
+    assert service.settings is snapshot
+    assert not (service.data_dir / "ha_spark_config.pending").exists()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("agent_api_token", "replacement-secret"),
+    ("agent_expose_port", True),
+    ("agent_surface", "on"),
+    ("alphaess_serial", "replacement-serial"),
+    ("devices", [{"id": "new", "driver": "solis"}]),
+    ("inverter", "alphaess"),
+    ("solis_control_hub", "replacement-hub"),
+    ("solis_modbus_slave", 2),
+])
+def test_each_restart_field_defers_complete_snapshot(service, field, value):
+    assert field_metadata()[field]["reload"] == "restart"
+    seed_authority(service.settings, "observe")
+    snapshot = service.settings
+    generation = execution_context().config_generation
+    result = save(service, {field: value, "min_soc": 25})
+    assert result["status"] == "pending_restart"
+    assert service.settings is snapshot
+    assert execution_context().config_generation == generation
+    assert field in service.read_view()["pending_restart_fields"]
+    assert (service.data_dir / "ha_spark_config.pending").exists()
+    fresh = SettingsService(service.options_path, data_dir=service.data_dir)
+    fresh.load(writable=True)
+    assert getattr(fresh.settings, field) != getattr(snapshot, field)
+    assert fresh.settings.min_soc == 25
+    assert fresh.read_view()["status"] == "live"
+    assert not (service.data_dir / "ha_spark_config.pending").exists()
+
+
 def test_save_fences_actuation_but_not_notification_changes(service):
     context = execution_context()
     generation = context.config_generation
@@ -158,3 +311,31 @@ def test_save_fences_actuation_but_not_notification_changes(service):
     save(service, {"inverter_power_switch_entity": "select.new"})
     assert context.config_generation == generation + 1
     assert service.settings.inverter_power_switch_entity == "select.new"
+
+
+def test_reverting_the_pending_restart_change_goes_live_again(service):
+    running = service.settings.solis_modbus_slave
+    assert save(service, {"solis_modbus_slave": running + 1})["status"] == "pending_restart"
+    result = save(service, {"solis_modbus_slave": running, "min_soc": 25})
+    assert result["status"] == "live"
+    assert service.settings.min_soc == 25
+    assert service.read_view()["pending_restart_fields"] == []
+
+
+def test_removing_a_running_restart_input_stays_pending(service):
+    assert save(service, {"solis_modbus_slave": 2})["status"] == "pending_restart"
+    restarted = SettingsService(service.options_path, data_dir=service.data_dir)
+    restarted.load(writable=True)
+    snapshot = restarted.settings
+    # Dropping the input reverts to the default: a restart change even though
+    # neither the old nor the new committed inputs hold the key afterwards.
+    assert save(restarted, {"solis_modbus_slave": None})["status"] == "pending_restart"
+    assert save(restarted, {"min_soc": 25})["status"] == "pending_restart"
+    assert restarted.settings is snapshot
+
+
+def test_read_view_carries_field_metadata(service):
+    metadata = service.read_view()["metadata"]
+    assert metadata["solis_modbus_slave"] == {"owner": "integration", "secret": False,
+                                              "reload": "restart"}
+    assert metadata["octopus_api_key"]["secret"] is True

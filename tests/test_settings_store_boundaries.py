@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import traceback
@@ -72,6 +73,11 @@ def test_secret_wire_forms_and_clear_survive_restart(tmp_path, field, caplog):
     service.save({field: "***", "min_soc": 22}, 2, "seed")
     service.save({"min_soc": None}, 3, "seed")
     assert getattr(store(tmp_path).load(), field) == CANARY
+    if field == "agent_api_token":
+        assert result["status"] == "pending_restart"
+        assert service.read_view()["settings"][field] == {"secret": True, "set": False}
+        service = store(tmp_path)
+        service.load(writable=True)
     assert service.read_view()["settings"][field] == {"secret": True, "set": True}
     service.save({field: {"clear": True}}, 4, "seed")
     fresh = store(tmp_path)
@@ -363,6 +369,7 @@ def test_run_config_failure_exits_two_without_echo_or_hardware(
     commit_failure,
 ):
     service = store(tmp_path)
+    repairs = []
     if commit_failure:
 
         def fail(*args, **kwargs):
@@ -371,13 +378,26 @@ def test_run_config_failure_exits_two_without_echo_or_hardware(
         monkeypatch.setattr(os, "replace", fail)
     else:
         (tmp_path / "options.json").write_text(json.dumps({"tariff_provider": CANARY}))
+
+        async def repair(daemon_service, channel):
+            repairs.append(daemon_service.read_view())
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(scheduler, "_serve_repair", repair)
     monkeypatch.setattr(cli, "load_settings", lambda: service.load())
     monkeypatch.setattr(cli, "setup_logging", lambda level: None)
     monkeypatch.setattr(scheduler, "OPTIONS_PATH", tmp_path / "options.json")
-    assert cli.main(["run"]) == 2
+    code = cli.main(["run"])
     output = capsys.readouterr()
-    assert "Configuration error:" in output.err
-    assert CANARY not in output.err + output.out
+    if commit_failure:
+        assert code == 2
+        assert "Configuration error:" in output.err
+    else:
+        # #463: a seed whose legacy values fail validation starts configuration
+        # repair instead of exiting.
+        assert code == 0
+        assert [view["status"] for view in repairs] == ["configuration_repair"]
+    assert CANARY not in output.err + output.out + json.dumps(repairs)
     assert not (tmp_path / "ha_spark_config.initialised").exists()
 
 
@@ -489,7 +509,7 @@ def test_seed_and_ingress_save_audit_is_secret_safe(tmp_path, caplog):
             assert response.status_code == 200
         service.save({"axle_api_key": CANARY}, 2, "ingress:malformed\nuser")
     messages = [record.getMessage() for record in caplog.records]
-    assert "Configuration committed revision=1 fields=min_soc actor=seed" in messages
+    assert "Configuration committed revision=1 fields=min_soc actor=seed source=options" in messages
     assert (
         "Configuration committed revision=2 fields=min_soc,octopus_api_key actor=ingress:owner"
     ) in messages

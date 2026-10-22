@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
 
+import httpx
 import pytest
+import respx
 from pydantic import ValidationError
 
 from ha_spark.config import (
@@ -15,7 +17,7 @@ from ha_spark.config import (
     field_metadata,
     load_settings,
 )
-from ha_spark.settings_service import _read_options_overlay
+from ha_spark.settings_service import SUPERVISOR_INFO_URL, _read_options_overlay
 
 ADDON_CONFIG = Path(__file__).parent.parent / "ha_spark_addon" / "config.yaml"
 
@@ -78,11 +80,16 @@ def test_load_settings_fails_fast_without_credentials(
         load_settings()
 
 
+@respx.mock
 def test_load_settings_ok_in_addon_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HA_URL", raising=False)
     monkeypatch.delenv("HA_TOKEN", raising=False)
     monkeypatch.setenv("SUPERVISOR_TOKEN", "sup-token")
     monkeypatch.setattr("ha_spark.settings_service._read_options_overlay", lambda path: {})
+    # An empty overlay in add-on mode asks the Supervisor for stored options.
+    respx.get(SUPERVISOR_INFO_URL).mock(
+        return_value=httpx.Response(200, json={"result": "ok", "data": {"options": {}}})
+    )
     settings = load_settings()
     assert settings.is_standalone is False
     assert settings.auth_token == "sup-token"
@@ -147,6 +154,14 @@ def test_addon_bootstrap_schema_and_runtime_field_classification() -> None:
     legacy = yaml.safe_load((Path(__file__).parent / "fixtures/addon-config-0.24.yaml").read_text())
     assert set(legacy["options"]) <= _OPTION_KEYS
     assert set(legacy["schema"]) <= _OPTION_KEYS
+
+
+def test_addon_supervisor_seed_uses_default_role_api_access() -> None:
+    import yaml
+
+    addon = yaml.safe_load(ADDON_CONFIG.read_text(encoding="utf-8"))
+    assert addon["hassio_api"] is True
+    assert addon.get("hassio_role", "default") == "default"
 
 
 def test_restart_fields_match_startup_bindings() -> None:

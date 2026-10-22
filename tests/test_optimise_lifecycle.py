@@ -1,6 +1,6 @@
 """Owner requests activate Optimise and hand charging back in verified order."""
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -224,9 +224,13 @@ async def test_activation_completes_past_unverified_protection_notes_and_guard_m
 ):
     from ha_spark.devices.execution import Ownership
 
+    # The guard runs only inside the charge window, and 00:00-23:59 misses the
+    # minute before midnight, so the window is centred on the clock instead.
+    now = datetime.now(UTC)
     settings = settings_at(
-        tmp_path, grid_power_entity="sensor.grid",
-        charge_window_start="00:00", charge_window_end="23:59",
+        tmp_path, grid_power_entity="sensor.grid", timezone="UTC",
+        charge_window_start=f"{now - timedelta(hours=1):%H:%M}",
+        charge_window_end=f"{now + timedelta(hours=1):%H:%M}",
     )
     store = AuthorityStore(settings)
     store.save(store.state.model_copy(update={"committed_mode": "protect"}))

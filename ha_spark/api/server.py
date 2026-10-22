@@ -16,6 +16,9 @@ loopback only. The published agent port is gated by a bearer token instead.
 Owner-only routes (the mode page, ``/api/mode`` and ``/api/config``) exist
 only on the ingress app, never on the published port or the standalone
 listener: an agent token must never reach an owner write (#457).
+
+In configuration repair only the mode page and status, the config read,
+``POST /api/config/import`` and health answer; everything else is 503.
 """
 
 from __future__ import annotations
@@ -30,7 +33,7 @@ import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError
 
 from ha_spark.agent import auth, tools
 from ha_spark.agent.exposure import OPERATION_TIERS, allowed, surface_on
@@ -42,7 +45,7 @@ from ha_spark.energy.publish import plan_to_payload
 from ha_spark.logging import get_logger
 from ha_spark.mode_preconditions import entry_preconditions
 from ha_spark.settings_service import OPTIONS_PATH as OPTIONS_PATH
-from ha_spark.settings_service import RevisionConflict, SettingsService
+from ha_spark.settings_service import RepairTokenConflict, RevisionConflict, SettingsService
 
 log = get_logger(__name__)
 
@@ -89,6 +92,20 @@ class ConfigBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: int = Field(strict=True, ge=1)
     changes: dict[str, Any]
+
+
+class ImportBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # The revision, or in configuration repair the repair token.
+    expected: StrictInt | StrictStr = Field(union_mode="left_to_right")
+    document: dict[str, Any]
+
+
+# The routes configuration repair serves (method, path); everything else is 503.
+_REPAIR_ROUTES = frozenset({
+    ("GET", "/"), ("GET", "/mode.js"), ("GET", "/api/mode"), ("GET", "/api/config"),
+    ("POST", "/api/config/import"), ("GET", "/api/health"),
+})
 
 
 class AppState:
@@ -312,6 +329,8 @@ def build_app(
         gate_bindings=_gate_bindings(agent_router),
     )
     setattr(app.state, STATE_ATTR, state)
+    # Added first so the ingress peer check runs before it.
+    app.add_middleware(_RepairGate, state=state)
     if ingress_peer is not None:
         app.add_middleware(_PeerGate, peer=ingress_peer)
 
@@ -344,6 +363,11 @@ def build_app(
             st = _state_of(request)
             if st.executor is None:
                 return JSONResponse({"error": "no daemon executor"}, status_code=503)
+            if st.settings_service.repair is not None:
+                # The stored authority, read only; no settings to check entry against.
+                return JSONResponse(
+                    st.executor.authority_status(), headers={"Cache-Control": "no-store"},
+                )
             preconditions = await entry_preconditions(st.settings)
             # Snapshot after the diagnostic reads; preconditions never grant authority.
             view = dict(st.executor.authority_status())
@@ -427,20 +451,63 @@ def build_app(
                 return JSONResponse({"error": "config update failed"}, status_code=400)
             return JSONResponse(result)
 
+        @app.post("/api/config/import")
+        async def post_config_import(request: Request) -> JSONResponse:
+            """Replace the configuration; in repair the only write, with the repair token."""
+            user = request.headers.get("X-Remote-User-Id", "")
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user) is None:
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            if request.headers.get("X-HA-Spark-Request") != "config":
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                return JSONResponse({"error": "application/json required"}, status_code=415)
+            try:
+                body = ImportBody.model_validate(await request.json())
+            except Exception:  # noqa: BLE001 - malformed body is a client error
+                return JSONResponse({"error": "invalid config import"}, status_code=400)
+            try:
+                result = _state_of(request).settings_service.import_document(
+                    body.document, body.expected, f"ingress:{user}",
+                )
+            except RevisionConflict as exc:
+                return JSONResponse(
+                    {"error": "conflict", "revision": exc.revision}, status_code=409,
+                )
+            except RepairTokenConflict as exc:
+                return JSONResponse(
+                    {"error": "conflict", "repair_token": exc.token}, status_code=409,
+                )
+            except ConfigError as exc:
+                # ConfigError reasons name fields only, never an input value (#412).
+                log.warning("Rejecting config import: %s", exc)
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            except Exception as exc:  # noqa: BLE001 - save failure -> client error
+                log.warning("Config import failed: %s", type(exc).__name__)
+                return JSONResponse({"error": "config import failed"}, status_code=400)
+            return JSONResponse(result)
+
     @app.get("/api/health")
     async def health(request: Request) -> dict[str, Any]:
         """Liveness + whether a plan has been computed yet (full doctor stays in the CLI)."""
         st = _state_of(request)
+        repair = st.settings_service.repair
         if st.executor is not None:
             authority = st.executor.authority_status()
         else:
-            loaded = load_authority(st.settings)
+            loaded = load_authority(
+                st.settings if repair is None else st.settings_service.bootstrap
+            )
             authority = authority_view(loaded.state, known=loaded.status == "known")
         failed = authority["mode"] == "authority_unknown" or authority["save_failed"]
-        return {
-            "status": "fail" if failed else "ok", "plan_at": _iso(st.plan_at),
+        result: dict[str, Any] = {
+            "status": "fail" if failed or repair is not None else "ok",
+            "plan_at": _iso(st.plan_at),
             "operating_mode": authority["mode"], "authority": authority,
         }
+        if repair is not None:
+            result["configuration"] = {"status": "configuration_repair", "reasons": repair}
+        return result
 
     @app.get("/api/plan")
     async def get_plan(request: Request) -> dict[str, Any]:
@@ -503,6 +570,29 @@ def _origin_gated(asgi_app: Any) -> Any:
 
 def _has_origin(scope: Any) -> bool:
     return any(name.lower() == b"origin" for name, _ in scope.get("headers", []))
+
+
+class _RepairGate:
+    """ASGI middleware: in configuration repair, 503 everything but :data:`_REPAIR_ROUTES`."""
+
+    def __init__(self, app: Any, state: AppState) -> None:
+        self.app = app
+        self.state = state
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if (
+            scope["type"] in ("http", "websocket")
+            and self.state.settings_service.repair is not None
+            and (scope.get("method"), scope["path"]) not in _REPAIR_ROUTES
+        ):
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1013})
+            else:
+                await JSONResponse({"error": "configuration_repair"}, status_code=503)(
+                    scope, receive, send
+                )
+            return
+        await self.app(scope, receive, send)
 
 
 class _PeerGate:

@@ -10,18 +10,28 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import io
 import json
 import signal
 import sys
 from dataclasses import asdict
 from datetime import UTC, date, datetime, time, timedelta
+from getpass import getpass
 from pathlib import Path
+from typing import Any
 
 import yaml
 
 from ha_spark.authority import OperatingMode, authority_view, load_authority
-from ha_spark.config import ConfigError, Settings, load_settings
-from ha_spark.daemon_channel import REFUSED, DaemonAlreadyRunning, Reply, submit_socket
+from ha_spark.config import _SECRET_OPTION_KEYS, ConfigError, Settings, load_settings
+from ha_spark.daemon_channel import (
+    MAX_CONFIG_BYTES,
+    REFUSED,
+    DaemonAlreadyRunning,
+    Reply,
+    submit_socket,
+)
 from ha_spark.dashboard import build_dashboard
 from ha_spark.devices import get_device
 from ha_spark.devices.inverters.solis_clock import clock_entity, clock_error, describe_error
@@ -59,12 +69,20 @@ from ha_spark.ha.rest import HomeAssistantRest, HomeAssistantRestError, notify
 from ha_spark.ha.state_cache import StateCache
 from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
-from ha_spark.health import Status, check_load_history, exit_code, format_report, run_health
+from ha_spark.health import (
+    Status,
+    check_load_history,
+    exit_code,
+    format_report,
+    run_health,
+    run_repair_health,
+)
 from ha_spark.logging import setup_logging
 from ha_spark.mode_preconditions import entry_preconditions
 from ha_spark.onboarding_discover import FieldProposal, propose
 from ha_spark.presets import get_preset, preset_names
 from ha_spark.router import route_message
+from ha_spark.settings_service import ConfigurationRepair, SettingsService
 
 
 async def _cmd_readiness_show(settings: Settings) -> int:
@@ -215,6 +233,20 @@ async def _cmd_health(settings: Settings) -> int:
     results = await run_health(settings)
     print(format_report(results))
     return exit_code(results)
+
+
+async def _cmd_repair_health(repair: ConfigurationRepair) -> int:
+    """Configuration repair: the critical Configuration check fails, so exit non-zero."""
+    results = await run_repair_health(repair.bootstrap, repair.reasons)
+    print(format_report(results))
+    return exit_code(results)
+
+
+def _repair_message(repair: ConfigurationRepair) -> str:
+    return (
+        f"Configuration repair: {repair}. Protection and optimisation are suspended; "
+        "import a valid configuration with `ha-spark config import FILE`."
+    )
 
 
 async def _cmd_notify_test(settings: Settings) -> int:
@@ -421,12 +453,17 @@ async def _cmd_onboard(
             print("      no candidate found")
 
     if write:
-        print("\n# Proposed options (paste into the add-on Configuration / .env):")
+        print("\nSave the following settings fragment as onboard.yaml, then review it.")
+        print("Import replaces non-secret inputs; merge with `ha-spark config export` first")
+        print("if you want to keep other settings. Omitted secrets are unchanged.")
+        print("```yaml")
+        has_mapping = False
         for p in proposals:
             resolved = _resolve_field(p, preset)
             if resolved is None:
                 continue
             entity_id, origin = resolved
+            has_mapping = True
             print(f"{p.config_field}: {entity_id}    # {origin}")
             if (
                 p.config_field == "dispatch_grid_power_entity"
@@ -434,6 +471,10 @@ async def _cmd_onboard(
             ):
                 invert = preset.get("dispatch_grid_power_invert", "false")
                 print(f"dispatch_grid_power_invert: {invert}")
+        if not has_mapping:
+            print("{}")
+        print("```")
+        print("ha-spark config import onboard.yaml")
 
     print()
     result = await check_load_history(settings)
@@ -463,7 +504,7 @@ async def _cmd_backfill_load(
     forecast chain (``consumption_energy_entity``) consumes the result
     unchanged — no need to repoint between paths:
 
-    - The source-entity path (``--from`` / ``BACKFILL_SOURCE_ENTITY``)
+    - The source-entity path (``--from`` / ``backfill_source_entity`` in the store)
       copies a single power/energy sensor's hourly rows into the target.
     - The derived path (``--derive``, enabled by setting any
       ``derive_*_entity`` option) computes base load by energy balance
@@ -522,14 +563,15 @@ async def _cmd_backfill_load(
                 print(f"  {note}")
         print(
             f"{BACKFILL_STATISTIC_ID} now holds the derived base-load series; "
-            "point CONSUMPTION_ENERGY_ENTITY at it (or run `ha-spark onboard` "
-            "to confirm readiness)."
+            "run `ha-spark config set consumption_energy_entity=ha_spark:house_load` "
+            "and `ha-spark onboard` to confirm readiness."
         )
         return 0
     entity = source or settings.backfill_source_entity
     if not entity:
         print(
-            "No source entity: pass --from <entity_id> or set BACKFILL_SOURCE_ENTITY "
+            "No source entity: pass --from <entity_id> or run "
+            "`ha-spark config set backfill_source_entity=<entity_id>` "
             "(use --list to see candidates).",
             file=sys.stderr,
         )
@@ -541,7 +583,8 @@ async def _cmd_backfill_load(
         return 2
     print(f"Imported {count} hourly stats ({span}) from {entity} into {BACKFILL_STATISTIC_ID}.")
     print(
-        f"Set CONSUMPTION_ENERGY_ENTITY={BACKFILL_STATISTIC_ID} to use it for the load "
+        f"Run `ha-spark config set consumption_energy_entity={BACKFILL_STATISTIC_ID}` "
+        "to use it for the load "
         "forecast, then run `ha-spark onboard` to confirm readiness."
     )
     return 0
@@ -795,6 +838,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_inverter = sub.add_parser("inverter", help="Read model identity and resident schedule")
     p_inverter.add_subparsers(dest="inverter_command", required=True).add_parser("show")
 
+    config = sub.add_parser("config", help="Read or change owner configuration")
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+    config_sub.add_parser("show")
+    config_sub.add_parser("export")
+    config_sub.add_parser("set").add_argument("assignments", nargs="+")
+    secret = config_sub.add_parser("set-secret")
+    secret.add_argument("key")
+    secret.add_argument("--clear", action="store_true")
+    config_sub.add_parser("import").add_argument("file", type=Path)
+
     p_mode = sub.add_parser("mode", help="Show or change operating-mode authority")
     mode_sub = p_mode.add_subparsers(dest="mode_command", required=True)
     mode_sub.add_parser("show")
@@ -846,9 +899,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Scan Home Assistant's entities and propose which one maps to each "
         "ha-spark config field (battery SoC, solar forecast, dispatch sensor, charge "
         "current control, ...), ranked by device class / unit / name. Then report "
-        "whether CONSUMPTION_ENERGY_ENTITY has enough hourly history for the slot-profile "
+        "whether consumption_energy_entity has enough hourly history for the slot-profile "
         "forecast. Exit 0 when ready, 2 otherwise — fix gaps with `backfill-load`. "
-        "Proposals are advisory: review and set the options yourself.",
+        "Proposals are advisory: review and save with `ha-spark config set KEY=VALUE` "
+        "or import the --write fragment.",
     )
     p_onboard.add_argument(
         "--json", dest="as_json", action="store_true",
@@ -856,7 +910,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_onboard.add_argument(
         "--write", action="store_true",
-        help="Also print a ready-to-paste options fragment for the proposed mapping",
+        help="Print an import-ready settings fragment and the config import command",
     )
     p_onboard.add_argument(
         "--preset", dest="preset", metavar="NAME", choices=preset_names(),
@@ -928,20 +982,21 @@ def build_parser() -> argparse.ArgumentParser:
         description="Rebuild ha_spark:house_load history for the load forecast. Two "
         "paths write the same external id (the forecast chain consumes it "
         "unchanged, no need to repoint ``consumption_energy_entity``): the "
-        "source-entity path (``--from`` / ``BACKFILL_SOURCE_ENTITY``) copies a "
+        "source-entity path (``--from`` / stored ``backfill_source_entity``) copies a "
         "single power/energy sensor's hourly rows into ``ha_spark:house_load``, "
         "and the derived path (``--derive``) computes base load by energy "
         "balance over per-component statistic IDs (``derive_grid_import_entity`` "
         "etc., with explicit invert flags) and writes the result to the same id. "
         "Both paths are idempotent (recorder upserts by statistic_id+start); "
         "they are mutually exclusive at dispatch. ``--list`` shows "
-        "backfill-capable source candidates regardless of path.",
+        "backfill-capable source candidates regardless of path. Save a default with "
+        "`ha-spark config set backfill_source_entity=<entity_id>`.",
     )
     p_bf.add_argument(
         "--from",
         dest="source",
         metavar="ENTITY_ID",
-        help="Source statistic to build history from (default: BACKFILL_SOURCE_ENTITY). "
+        help="Source statistic to build history from (default: stored backfill_source_entity). "
         "Mutually exclusive with --derive.",
     )
     p_bf.add_argument(
@@ -1068,6 +1123,107 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _import_file(path: Path) -> dict[str, Any]:
+    """Size-limited safe parsing; parser exceptions never cross the CLI boundary."""
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(MAX_CONFIG_BYTES + 1)
+        if len(raw) > MAX_CONFIG_BYTES:
+            raise ConfigError("Configuration import too large")
+        text = raw.decode("utf-8")
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            value = yaml.safe_load(text)
+        if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+            raise ConfigError("Invalid configuration document")
+        # Also reject YAML-only objects and cyclic aliases before sending JSON.
+        json.dumps(value)
+        return value
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        location = f": line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        raise ConfigError(f"Invalid configuration YAML{location}") from None
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+        raise ConfigError("Invalid or unreadable configuration import") from None
+
+
+async def _cmd_config(settings: Settings, args: argparse.Namespace) -> int:
+    command = args.config_command
+    if command in {"show", "export"}:
+        reply = await submit_socket(
+            settings, "config_show" if command == "show" else "config_export",
+        )
+        if reply is None:
+            service = SettingsService(settings=settings)
+            try:
+                service.load(validate=False)
+            except ConfigurationRepair:
+                if command == "export":
+                    raise
+            reply = Reply(config=service.read_view() if command == "show" else service.export())
+    else:
+        changes: dict[str, Any] = {}
+        document = None
+        if command == "set":
+            for assignment in args.assignments:
+                key, separator, value = assignment.partition("=")
+                if not separator:
+                    print("[REFUSED] expected KEY=VALUE")
+                    return 2
+                if key in _SECRET_OPTION_KEYS:
+                    print("[REFUSED] use config set-secret for secret fields")
+                    return 2
+                try:
+                    changes[key] = json.loads(value)
+                except json.JSONDecodeError:
+                    changes[key] = value
+        elif command == "import":
+            try:
+                document = _import_file(args.file)
+            except ConfigError as exc:
+                print(f"[REFUSED] {exc}")
+                return 2
+        shown = await submit_socket(settings, "config_show")
+        if shown is None or shown.error or shown.config is None:
+            print(REFUSED if shown is None else "[REFUSED] configuration unavailable")
+            return 1
+        repairing = shown.config.get("status") == "configuration_repair"
+        if repairing and command != "import":
+            print("[REFUSED] configuration_repair: only `config import` is accepted")
+            return 1
+        revision = None if repairing else shown.config["revision"]
+        if repairing:
+            reply = await submit_socket(settings, "config_import", document=document,
+                                        repair_token=shown.config["repair_token"])
+        elif command == "set":
+            reply = await submit_socket(settings, "config_save",
+                                        expected_revision=revision, changes=changes)
+        elif command == "import":
+            reply = await submit_socket(settings, "config_import",
+                                        expected_revision=revision, document=document)
+        else:
+            secret: str | dict[str, bool]
+            if args.clear:
+                secret = {"clear": True}
+            else:
+                secret = getpass("Secret: ") if sys.stdin.isatty() else sys.stdin.readline().rstrip(
+                    "\r\n"
+                )
+            reply = await submit_socket(settings, "config_set_secret",
+                                        expected_revision=revision, field=args.key, value=secret)
+    if reply is None or reply.error:
+        print(REFUSED if reply is None else f"[REFUSED] {reply.error}")
+        if reply is not None:
+            for reason in reply.reasons:
+                print(reason)
+            if reply.config is not None:
+                print(json.dumps(reply.config))
+        return 1
+    print(json.dumps(reply.config, indent=2))
+    return 0
+
+
 async def _cmd_mode_set(
     settings: Settings, target: OperatingMode, *, confirm: bool = False,
 ) -> int:
@@ -1097,6 +1253,39 @@ async def _cmd_mode_show(settings: Settings) -> int:
     return 0
 
 
+def _daemon_repair(settings: Settings) -> ConfigurationRepair | None:
+    """A running daemon's repair state, which a read-only load can miss.
+
+    The daemon validates fully and re-checks a pending restart change; the
+    diagnostic load does neither, so ask the daemon before reporting normally.
+    """
+    async def ask() -> ConfigurationRepair | None:
+        status = await submit_socket(settings, "authority_status")
+        if (
+            status is None or status.authority is None
+            or status.authority.get("suspended") != "configuration_repair"
+        ):
+            return None
+        shown = await submit_socket(settings, "config_show")
+        reasons = shown.config.get("reasons") if shown and shown.config else None
+        if not isinstance(reasons, list) or not all(isinstance(r, str) for r in reasons):
+            reasons = ["configuration_repair"]
+        return ConfigurationRepair(reasons, settings)
+
+    return asyncio.run(ask())
+
+
+def _cmd_mode_show_repair(repair: ConfigurationRepair) -> int:
+    """The stored authority, read only, marked suspended; no live preconditions."""
+    loaded = load_authority(repair.bootstrap)
+    view = authority_view(loaded.state, known=loaded.status == "known")
+    view["load_status"] = loaded.status
+    view["suspended"] = "configuration_repair"
+    print(json.dumps(view, indent=2))
+    print(_repair_message(repair), file=sys.stderr)
+    return 2
+
+
 async def _cmd_inverter_show(settings: Settings) -> int:
     """Only HA GETs: no execution, authority-store access, or entity refresh service."""
     diagnostics = []
@@ -1117,15 +1306,50 @@ async def _cmd_inverter_show(settings: Settings) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # argparse echoes unexpected arguments; secret entry must never echo argv.
+    if argv[:2] == ["config", "set-secret"]:
+        tail = [item for item in argv[2:] if item != "--clear"]
+        if len(tail) != 1 or tail[0] not in _SECRET_OPTION_KEYS:
+            print("[REFUSED] set-secret requires a secret field; value comes from stdin")
+            return 2
     parser = build_parser()
-    args = parser.parse_args(argv)
+    if argv[:1] == ["config"]:
+        # argparse errors echo the offending arguments; config input may be secret.
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                args = parser.parse_args(argv)
+        except SystemExit as exc:
+            if exc.code == 0:
+                raise
+            print("[REFUSED] invalid config command; see `ha-spark config --help`")
+            return 2
+    else:
+        args = parser.parse_args(argv)
+
+    if args.command == "config":
+        try:
+            return asyncio.run(_cmd_config(Settings(), args))
+        except (ConfigError, ValueError, OSError, EOFError):
+            print("[REFUSED] configuration command failed")
+            return 2
 
     # Diagnostic paths use the settings service's read-only load (a seed preview
     # before the initialisation marker), which never writes. Skip credential and
     # cross-field tariff checks so diagnostics can report what's wrong. Quiet logs
     # keep the report clean; failure detail is carried in each check result.
     if args.command == "readiness":
-        settings = load_settings(validate=False)
+        try:
+            settings = load_settings(validate=False)
+        except ConfigurationRepair as repair:
+            print(_repair_message(repair), file=sys.stderr)
+            return 2
+        except ConfigError as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 2
+        if (suspended := _daemon_repair(settings)) is not None:
+            print(_repair_message(suspended), file=sys.stderr)
+            return 2
         if args.readiness_command == "show":
             return asyncio.run(_cmd_readiness_show(settings))
         if args.readiness_command == "coverage":
@@ -1133,8 +1357,19 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_cmd_readiness_slots(settings, days=args.days))
 
     if args.command == "mode":
-        settings = load_settings(validate=False)
+        try:
+            settings = load_settings(validate=False)
+        except ConfigurationRepair as repair:
+            if args.mode_command == "show":
+                return _cmd_mode_show_repair(repair)
+            # Requests still reach the daemon, which refuses them in repair.
+            settings = repair.bootstrap
+        except ConfigError as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 2
         if args.mode_command == "show":
+            if (suspended := _daemon_repair(settings)) is not None:
+                return _cmd_mode_show_repair(suspended)
             return asyncio.run(_cmd_mode_show(settings))
         return asyncio.run(_cmd_mode_set(
             settings, args.target if args.mode_command == "set" else "observe",
@@ -1142,12 +1377,27 @@ def main(argv: list[str] | None = None) -> int:
         ))
 
     if args.command == "health":
-        settings = load_settings(validate=False)
+        try:
+            settings = load_settings(validate=False)
+        except ConfigurationRepair as repair:
+            setup_logging("WARNING")
+            return asyncio.run(_cmd_repair_health(repair))
+        except ConfigError as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 2
         setup_logging("WARNING")
+        if (suspended := _daemon_repair(settings)) is not None:
+            return asyncio.run(_cmd_repair_health(suspended))
         return asyncio.run(_cmd_health(settings))
 
     try:
         settings = load_settings()
+    except ConfigurationRepair as repair:
+        if args.command != "run" or args.once:
+            print(_repair_message(repair), file=sys.stderr)
+            return 2
+        # The daemon starts in repair from the bootstrap settings alone.
+        settings = repair.bootstrap
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
@@ -1187,7 +1437,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "backfill-load":
         if args.derive and (args.source or settings.backfill_source_entity):
             print(
-                "--derive and --from / BACKFILL_SOURCE_ENTITY are mutually exclusive; "
+                "--derive and --from / stored backfill_source_entity are mutually exclusive; "
                 "pick one path.",
                 file=sys.stderr,
             )

@@ -66,7 +66,7 @@ class CheckResult:
 
 # Checks ha-spark cannot run without. Ollama is deliberately excluded: when it is
 # unreachable the offline intent parser takes over, so that is degraded, not broken.
-_CRITICAL = frozenset({"HA REST", "HA WS", "SQLite", "Operating mode"})
+_CRITICAL = frozenset({"HA REST", "HA WS", "SQLite", "Operating mode", "Configuration"})
 
 _GLYPH = {Status.OK: "✓", Status.WARN: "⚠", Status.FAIL: "✗"}
 
@@ -412,6 +412,8 @@ async def check_operating_mode(settings: Settings) -> CheckResult:
             return CheckResult("Operating mode", Status.FAIL, "authority save failure")
         if reply.authority.get("mode") == "authority_unknown":
             return CheckResult("Operating mode", Status.FAIL, "authority_unknown")
+        if reply.authority.get("suspended"):
+            return CheckResult("Operating mode", Status.FAIL, "suspended: configuration_repair")
     if result.status == "uninitialised":
         # No daemon of this version has started yet; nothing can write either way.
         return CheckResult("Operating mode", Status.WARN, "uninitialised (daemon not yet started)")
@@ -511,6 +513,30 @@ async def run_health(settings: Settings) -> list[CheckResult]:
             "Evidence freshness", Status.WARN, f"could not read ({type(exc).__name__})"
         )]
     return [*results, check_entity_config(settings), *check_hold_release(settings), *evidence]
+
+
+async def run_repair_health(bootstrap: Settings, reasons: list[str]) -> list[CheckResult]:
+    """Configuration repair: report the suspension and the stored authority, nothing live.
+
+    Reasons name fields only. No HA, supplier or device check runs without a
+    trusted configuration.
+    """
+    loaded = load_authority(bootstrap)
+    stored = "authority unknown"
+    if loaded.status == "known" and loaded.state is not None:
+        transition = loaded.state.transition
+        stored = (
+            f"stored mode {loaded.state.committed_mode}, {len(loaded.state.holds)} hold(s), "
+            f"transition {transition.target if transition else 'none'}"
+        )
+    detail = (
+        "configuration repair: protection and optimisation suspended "
+        f"({stored}); {'; '.join(reasons)}"
+    )
+    return [
+        CheckResult("Configuration", Status.FAIL, detail),
+        await check_operating_mode(bootstrap),
+    ]
 
 
 def format_report(results: list[CheckResult]) -> str:

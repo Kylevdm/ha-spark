@@ -17,6 +17,21 @@ def settings_at(path: Path) -> Settings:
     return Settings(ha_url="http://ha.test", ha_token="secret", db_path=str(path / "t.db"))
 
 
+async def test_settings_replan_is_best_effort_normal_queued_work(tmp_path: Path) -> None:
+    channel = DaemonChannel(settings_at(tmp_path))
+    channel.request_replan()
+    assert channel.next_request() is None
+    async with channel:
+        channel.request_replan()
+        pending = channel.next_request()
+        assert pending is not None
+        assert pending.request == Request(op="replan")
+        pending.future.set_result(Reply())
+        for _ in range(channel.queue.maxsize + 1):
+            channel.request_replan()
+        assert channel.queue.qsize() == channel.queue.maxsize
+
+
 async def test_private_socket_and_exclusive_daemon(tmp_path: Path) -> None:
     settings = settings_at(tmp_path)
     async with DaemonChannel(settings) as channel:

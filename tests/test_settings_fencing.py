@@ -15,6 +15,7 @@ from ha_spark.devices import inverter_device
 from ha_spark.devices.execution import Ownership, WriteGate, execution_context
 from ha_spark.energy.scheduler import notify_remapped_holds
 from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.settings_service import SettingsService
 from tests.authority_helpers import seed_authority, seed_settings, settings_bytes
 from tests.test_solis_power_switch import FakeRest, _intent, _now, _window
 
@@ -32,7 +33,8 @@ async def test_device_save_fences_previously_planned_action(tmp_path):
     seed_authority(state.settings, "optimise")
     rest = FakeRest()
     device = inverter_device(state.settings, rest)
-    state.apply_options({"solis_modbus_slave": 2}, state.settings_service.revision, "seed")
+    state.apply_options({"inverter_power_switch_entity": "select.new"},
+                        state.settings_service.revision, "seed")
     line = await device.set_charge_rate(1000)
     assert line.startswith("[REFUSED] stale config")
     assert not rest.calls
@@ -134,7 +136,8 @@ async def test_save_during_prerequisite_read_fences_write(tmp_path):
     class SavingRest(FakeRest):
         async def get_state(self, entity_id):
             result = await super().get_state(entity_id)
-            state.apply_options({"solis_modbus_slave": 2}, state.settings_service.revision, "seed")
+            state.apply_options({"inverter_power_switch_entity": "select.new"},
+                                state.settings_service.revision, "seed")
             return result
 
     rest = SavingRest()
@@ -200,7 +203,17 @@ def test_optimise_rejects_a_save_that_drops_the_fallback_inverter(tmp_path, mode
             state.apply_options({"inverter": "alphaess"}, state.settings_service.revision, "seed")
         assert settings_bytes(tmp_path) == original
     else:
-        state.apply_options({"inverter": "alphaess"}, state.settings_service.revision, "seed")
+        snapshot = state.settings
+        generation = execution_context().config_generation
+        result = state.apply_options({"inverter": "alphaess"},
+                                     state.settings_service.revision, "seed")
+        assert result["status"] == "pending_restart"
+        assert state.settings is snapshot
+        assert execution_context().config_generation == generation
+        state.settings_service = SettingsService(
+            state.settings_service.options_path, settings=snapshot, data_dir=tmp_path,
+        )
+        state.settings_service.load(writable=True)
         assert state.settings.devices[0].driver == "alphaess"
 
 
@@ -214,7 +227,16 @@ async def test_replacing_the_held_driver_counts_as_a_remap(tmp_path):
                           hub=state.settings.solis_control_hub,
                           slave=state.settings.solis_modbus_slave),
     ),))
-    state.apply_options({"inverter": "alphaess"}, state.settings_service.revision, "seed")
+    snapshot = state.settings
+    generation = execution_context().config_generation
+    result = state.apply_options({"inverter": "alphaess"}, state.settings_service.revision, "seed")
+    assert result["status"] == "pending_restart"
+    assert state.settings is snapshot
+    assert execution_context().config_generation == generation
+    state.settings_service = SettingsService(
+        state.settings_service.options_path, settings=snapshot, data_dir=tmp_path,
+    )
+    state.settings_service.load(writable=True)
     gate = WriteGate(execution_context())
     with execution_context().planning():
         mode = gate.mode_for(Ownership.PROTECTION, state.settings.devices[0], state.settings)
