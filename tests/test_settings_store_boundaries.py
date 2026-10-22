@@ -509,7 +509,7 @@ def test_seed_and_ingress_save_audit_is_secret_safe(tmp_path, caplog):
             assert response.status_code == 200
         service.save({"axle_api_key": CANARY}, 2, "ingress:malformed\nuser")
     messages = [record.getMessage() for record in caplog.records]
-    assert "Configuration committed revision=1 fields=min_soc actor=seed" in messages
+    assert "Configuration committed revision=1 fields=min_soc actor=seed source=options" in messages
     assert (
         "Configuration committed revision=2 fields=min_soc,octopus_api_key actor=ingress:owner"
     ) in messages

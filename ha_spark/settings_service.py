@@ -402,6 +402,7 @@ class SettingsService:
         assert self._bootstrap is not None
         marker = self._path("ha_spark_config.initialised")
         recover = False
+        seed_source = "defaults"
         if marker.exists():
             # Supervisor still owns log_level, the sole remaining bootstrap option.
             try:
@@ -419,9 +420,10 @@ class SettingsService:
                 recover = True
         else:
             raw = _read_options_overlay(self.options_path)
-            if (
-                not raw.keys() - {"log_level"}
-                and not self._bootstrap.is_standalone
+            if raw.keys() - {"log_level"}:
+                seed_source = "options"
+            elif (
+                not self._bootstrap.is_standalone
                 and self._bootstrap.supervisor_token
             ):
                 # The Supervisor may already have stripped the legacy keys
@@ -431,7 +433,10 @@ class SettingsService:
                 if stored is None:
                     log.warning("Supervisor options unavailable; seeding defaults")
                 else:
-                    raw = {**raw, **normalise_legacy(stored)}
+                    legacy = normalise_legacy(stored)
+                    if legacy.keys() - {"log_level"}:
+                        seed_source = "supervisor"
+                    raw = {**raw, **legacy}
             self._apply_log_level(raw)
             raw = normalise_legacy(raw, self._bootstrap.db_path)
             inputs = {key: value for key, value in raw.items()
@@ -487,9 +492,10 @@ class SettingsService:
                     "Configuration initialisation failed; restart required"
                 ) from None
             log.info(
-                "Configuration committed revision=%d fields=%s actor=seed",
+                "Configuration committed revision=%d fields=%s actor=seed source=%s",
                 revision,
                 ",".join(sorted(inputs.keys() | secrets.keys())),
+                seed_source,
             )
         if writable and pending_marker.exists():
             try:

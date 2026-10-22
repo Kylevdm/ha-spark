@@ -392,6 +392,29 @@ def test_supervisor_not_consulted_when_options_file_holds_a_legacy_key(
 
 
 @respx.mock
+@pytest.mark.parametrize(
+    ("options_file", "stored", "source"),
+    [
+        ({"min_soc": 25}, {"min_soc": 30}, "options"),
+        ({"log_level": "INFO"}, {"min_soc": 30}, "supervisor"),
+        ({"log_level": "INFO"}, {"log_level": "INFO"}, "defaults"),
+        ({"log_level": "INFO"}, None, "defaults"),
+    ],
+)
+def test_seed_commit_names_its_source(tmp_path, addon_env, caplog, options_file, stored, source):
+    (tmp_path / "options.json").write_text(json.dumps(options_file))
+    if stored is None:
+        respx.get(SUPERVISOR_INFO_URL).mock(return_value=httpx.Response(500))
+    else:
+        supervisor_route(stored)
+    with caplog.at_level("INFO"):
+        addon_store(tmp_path).load(writable=True)
+    seeds = [r.getMessage() for r in caplog.records if "actor=seed" in r.getMessage()]
+    assert len(seeds) == 1
+    assert seeds[0].endswith(f"actor=seed source={source}")
+
+
+@respx.mock
 def test_supervisor_not_consulted_after_initialisation_marker(tmp_path, addon_env):
     route = supervisor_route({"min_soc": 25})
     assert addon_store(tmp_path).load(writable=True).min_soc == 25
