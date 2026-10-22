@@ -52,6 +52,13 @@ def _checked(settings: Settings) -> Settings:
         raise ConfigError(str(exc)) from None
 
 
+def _validated_devices(inputs: dict[str, Any], candidate: Settings) -> dict[str, Any]:
+    """Persist devices as validated, so an ignored nested key never reaches the document."""
+    if "devices" not in inputs:
+        return inputs
+    return {**inputs, "devices": [d.model_dump(mode="json") for d in candidate.devices]}
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -233,11 +240,10 @@ class SettingsService:
             if marker.exists():
                 # Supervisor still owns log_level, the sole remaining bootstrap option.
                 try:
-                    level = _read_json(self.options_path).get("log_level")
+                    options = _read_json(self.options_path) if self.options_path.exists() else {}
                 except ConfigError:
-                    level = None
-                if isinstance(level, str):
-                    self._bootstrap = self._bootstrap.model_copy(update={"log_level": level})
+                    options = {}
+                self._apply_log_level(options)
                 try:
                     revision, inputs, secrets = self._pair()
                 except ConfigError as current_error:
@@ -251,10 +257,7 @@ class SettingsService:
                     recover = True
             else:
                 raw = _read_options_overlay(self.options_path)
-                if isinstance(raw.get("log_level"), str):
-                    self._bootstrap = self._bootstrap.model_copy(
-                        update={"log_level": raw["log_level"]}
-                    )
+                self._apply_log_level(raw)
                 if "db_path" in raw and raw["db_path"] != self._bootstrap.db_path:
                     raise ConfigError(
                         "db_path differs from the fixed path; move the database first"
@@ -273,6 +276,7 @@ class SettingsService:
                         inputs[key] = value
                 revision = 1 if writable else 0
             candidate = self._candidate(inputs, secrets, validate)
+            inputs = _validated_devices(inputs, candidate)
             if writable and not validate:
                 _checked(candidate)
             if writable and recover:
@@ -325,6 +329,15 @@ class SettingsService:
             self._settings = candidate
             self._writable = writable
             return candidate
+
+    def _apply_log_level(self, options: dict[str, Any]) -> None:
+        """Take the Supervisor's log_level when present; env applies only when absent."""
+        assert self._bootstrap is not None
+        if "log_level" not in options:
+            return
+        if not isinstance(options["log_level"], str):
+            raise ConfigError("Invalid log_level")
+        self._bootstrap = self._bootstrap.model_copy(update={"log_level": options["log_level"]})
 
     def _sync_directory(self) -> None:
         fd = os.open(self.data_dir, os.O_RDONLY | os.O_DIRECTORY)
@@ -446,6 +459,7 @@ class SettingsService:
                 else:
                     inputs[key] = value
             candidate = _checked(self._candidate(inputs, secrets, False))
+            inputs = _validated_devices(inputs, candidate)
             if type(expected_revision) is not int or expected_revision != self.revision:
                 raise RevisionConflict(self.revision)
             self._guard(candidate)

@@ -387,3 +387,29 @@ def test_only_log_level_remains_a_supervisor_bootstrap_option(tmp_path):
     settings = store(tmp_path).load()
     assert settings.min_soc == 20
     assert settings.log_level == "DEBUG"
+
+
+def test_unknown_device_fields_never_reach_the_settings_document(tmp_path):
+    service = store(tmp_path)
+    service.load(writable=True)
+    device = {"id": "main", "type": "inverter", "driver": "solis", "octopus_api_key": CANARY}
+    service.save({"devices": [device]}, 1, "seed")
+    assert CANARY not in (tmp_path / "ha_spark_config.json").read_text()
+    assert store(tmp_path).load().devices[0].id == "main"
+
+
+def test_unknown_seeded_device_fields_never_reach_the_settings_document(tmp_path):
+    device = {"id": "main", "type": "inverter", "driver": "solis", "octopus_api_key": CANARY}
+    (tmp_path / "options.json").write_text(json.dumps({"devices": [device]}))
+    store(tmp_path).load(writable=True)
+    assert CANARY not in (tmp_path / "ha_spark_config.json").read_text()
+
+
+@pytest.mark.parametrize("marked", [False, True])
+def test_present_malformed_supervisor_log_level_is_refused(tmp_path, monkeypatch, marked):
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    if marked:
+        store(tmp_path).load(writable=True)
+    (tmp_path / "options.json").write_text(json.dumps({"log_level": 123}))
+    with pytest.raises(ConfigError, match="log_level"):
+        store(tmp_path).load(writable=not marked)
