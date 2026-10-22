@@ -94,6 +94,10 @@ def seed_settings(
         service.load(validate=False, writable=True)
         if inputs:
             service.save(inputs, service.revision, "seed")
+            # Setup represents an install that already started with these
+            # inputs, so no restart-field change is pending re-check.
+            (directory / "ha_spark_config.pending").unlink(missing_ok=True)
+            service.load(validate=False, writable=True)
     finally:
         context.authority = authority
         context.config_generation = generation

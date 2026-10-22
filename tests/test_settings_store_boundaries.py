@@ -72,6 +72,11 @@ def test_secret_wire_forms_and_clear_survive_restart(tmp_path, field, caplog):
     service.save({field: "***", "min_soc": 22}, 2, "seed")
     service.save({"min_soc": None}, 3, "seed")
     assert getattr(store(tmp_path).load(), field) == CANARY
+    if field == "agent_api_token":
+        assert result["status"] == "pending_restart"
+        assert service.read_view()["settings"][field] == {"secret": True, "set": False}
+        service = store(tmp_path)
+        service.load(writable=True)
     assert service.read_view()["settings"][field] == {"secret": True, "set": True}
     service.save({field: {"clear": True}}, 4, "seed")
     fresh = store(tmp_path)

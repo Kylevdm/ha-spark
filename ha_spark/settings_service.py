@@ -10,13 +10,14 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from threading import RLock
 from typing import Any
 
 from pydantic import ValidationError
 
-from ha_spark.authority import resolve_data_dir
+from ha_spark.authority import AuthorityStore, resolve_data_dir
 from ha_spark.config import (
     _OPTION_KEYS,
     _SECRET_OPTION_KEYS,
@@ -126,6 +127,9 @@ class SettingsService:
         self._directory = data_dir
         self._inputs: dict[str, Any] = {}
         self._secrets: dict[str, Any] = {}
+        self.pending_restart = False
+        self._pending_restart_fields: set[str] = set()
+        self.request_replan: Callable[[], None] | None = None
         self.revision = 0
         self.save_failed = False
         self._writable = False
@@ -279,6 +283,9 @@ class SettingsService:
                         inputs[key] = value
                 revision = 1 if writable else 0
             candidate = self._candidate(inputs, secrets, validate)
+            pending_marker = self._path("ha_spark_config.pending")
+            if writable and pending_marker.exists():
+                self._guard(candidate, startup=True)
             inputs = _validated_devices(inputs, candidate)
             if writable and not validate:
                 _checked(candidate)
@@ -328,8 +335,16 @@ class SettingsService:
                     revision,
                     ",".join(sorted(inputs.keys() | secrets.keys())),
                 )
+            if writable and pending_marker.exists():
+                try:
+                    pending_marker.unlink()
+                    self._sync_directory()
+                except OSError:
+                    raise ConfigError("Configuration load failed; restart required") from None
             self._inputs, self._secrets, self.revision = inputs, secrets, revision
             self._settings = candidate
+            self.pending_restart = False
+            self._pending_restart_fields.clear()
             self._writable = writable
             return candidate
 
@@ -400,10 +415,10 @@ class SettingsService:
             for path in temporary:
                 path.unlink(missing_ok=True)
 
-    def _write_marker(self) -> None:
-        path = self._temporary("ha_spark_config.initialised", {})
+    def _write_marker(self, name: str = "ha_spark_config.initialised") -> None:
+        path = self._temporary(name, {})
         try:
-            os.replace(path, self._path("ha_spark_config.initialised"))
+            os.replace(path, self._path(name))
             self._sync_directory()
         finally:
             path.unlink(missing_ok=True)
@@ -417,6 +432,8 @@ class SettingsService:
                 out[key] = {"secret": True, "set": bool(getattr(self.settings, key))}
             return {
                 "revision": self.revision,
+                "status": "pending_restart" if self.pending_restart else "live",
+                "pending_restart_fields": sorted(self._pending_restart_fields),
                 "settings": out,
                 "inputs": sorted(self._inputs.keys() | self._secrets.keys()),
             }
@@ -474,17 +491,38 @@ class SettingsService:
                 | self._secrets.keys()
                 if (inputs | secrets).get(key) != (self._inputs | self._secrets).get(key)
             )
+            restart_fields = {
+                key
+                for key, meta in field_metadata().items()
+                if meta["reload"] == "restart"
+                and key in (
+                    inputs.keys() | secrets.keys() | self._inputs.keys() | self._secrets.keys()
+                )
+                and getattr(self.settings, key) != getattr(candidate, key)
+            }
+            pending_restart = self.pending_restart or bool(restart_fields)
             revision = self.revision + 1
             try:
+                # Durable before the pair: a crash may cause an extra check, never a missed one.
+                if pending_restart:
+                    self._write_marker("ha_spark_config.pending")
                 self._commit(inputs, secrets, revision)
             except (OSError, ValueError, TypeError):
                 self.save_failed = True
                 raise ConfigError("Configuration save failed; restart required") from None
-            context = execution_context()
-            if actuation_settings_changed(self.settings, candidate):
-                context.config_generation += 1
+            self.pending_restart = pending_restart
+            self._pending_restart_fields |= restart_fields
             self._inputs, self._secrets, self.revision = inputs, secrets, revision
-            self._settings = candidate
+            if not self.pending_restart:
+                context = execution_context()
+                if actuation_settings_changed(self.settings, candidate):
+                    context.config_generation += 1
+                self._settings = candidate
+                if self.request_replan is not None:
+                    try:
+                        self.request_replan()
+                    except Exception:
+                        log.warning("Configuration replan request unavailable")
             # Actors are channel identities, never arbitrary request body text.
             safe_actor = actor if actor == "seed" else "ingress"
             if actor.startswith("ingress:"):
@@ -499,16 +537,20 @@ class SettingsService:
                 ",".join(changed),
                 safe_actor,
             )
-            return {"revision": revision, "changed": changed, "status": "live"}
+            return {
+                "revision": revision, "changed": changed,
+                "status": "pending_restart" if self.pending_restart else "live",
+            }
 
-    def _guard(self, candidate: Settings) -> None:
+    def _guard(self, candidate: Settings, *, startup: bool = False) -> None:
         context = execution_context()
-        store = context.authority
+        # Startup reads durable authority without initialising, saving or fencing it.
+        store = AuthorityStore(candidate) if startup else context.authority
         authority = store.state if store is not None and store.known else None
         # Unknown authority fails closed only for a save that would invalidate
         # a currently valid fallback, so an install without one can still save.
         unknown = authority is None or (store is not None and store.save_failed)
-        if (unknown and fallback_schedule_problem(self.settings) is None) or (
+        if (unknown and not startup and fallback_schedule_problem(self.settings) is None) or (
             authority is not None
             and not unknown
             and (
