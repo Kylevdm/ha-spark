@@ -184,6 +184,16 @@ class DaemonChannel:
                 return queue.get_nowait()
         return None
 
+    def request_replan(self) -> None:
+        """Best-effort settings notification; ordinary queued work grants no authority."""
+        if self._server is None or not self._server.is_serving():
+            return
+        future: asyncio.Future[Reply] = asyncio.get_running_loop().create_future()
+        try:
+            self.queue.put_nowait(Pending(Request(op="replan"), future))
+        except asyncio.QueueFull:
+            pass
+
     async def submit(self, op: Op) -> Reply:
         return await self._submit(Request(op=op))
 
