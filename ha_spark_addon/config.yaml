@@ -12,6 +12,9 @@ init: true
 # shutdown makes two verified Solis writes of up to ~15 s each (#164).
 timeout: 45
 homeassistant_api: true
+# Default-role Supervisor API: the one-time first-start seed reads the add-on's
+# stored options from /addons/self/info when options.json no longer holds them.
+hassio_api: true
 startup: services
 boot: auto
 # HTTP API for the companion integration, reached through HA's authenticated
