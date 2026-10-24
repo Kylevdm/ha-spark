@@ -384,6 +384,25 @@ makes it.
 (Decision: #291, 2026-10-13.)
 _Avoid_: add-on service call, Supervisor call
 
+**Site snapshot**:
+Everything the integration owns or measures that the add-on needs to plan and
+to show the owner, handed over in one piece at one moment: the operating mode,
+any manual control, holds, the supply guard's state, the battery's charge and
+whether it is trusted, the limits, the major loads and the solar forecast. The
+add-on believes only this, never Home Assistant's copy of the same values,
+which anyone with access could overwrite. An old snapshot means the
+integration is out of reach.
+(Decision: #322, 2026-10-24.)
+_Avoid_: integration entities (when meaning what the add-on reads), state sync
+
+**Plan summary**:
+What the add-on hands back for Home Assistant to show: the plan's headline
+numbers, what it is doing now and what it does next, and any override. The
+integration shows it as ha-spark's plan sensors; without the add-on they show
+nothing rather than an old plan.
+(Decision: #322, 2026-10-24.)
+_Avoid_: published plan, plan push
+
 **Device intent**:
 What an add-on command asks one device to do, in device terms rather than
 register values: a charge window, a current limit, a dated export window. The
