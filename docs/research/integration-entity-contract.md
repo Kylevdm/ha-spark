@@ -273,6 +273,8 @@ not settled for the integration (D9).
 
 ## 5. Open decisions
 
+Decisions 4, 11, 12 and 15 are resolved in [Integration plan sensors, safeguard entities, and how state crosses the boundary](https://github.com/Kylevdm/ha-spark/issues/322) (ADR-0008 amendment).
+
 1. **HA device model.** Which HA devices exist (site, inverter, battery bank,
    gateway), and the `via_device` chain (inverter via gateway?). Is the site a
    `service` device? A bank is neither a physical control unit nor a service
