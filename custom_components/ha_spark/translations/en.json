@@ -1,5 +1,6 @@
 {
   "config": {
+    "step": {},
     "abort": {
       "addon_required": "ha-spark is set up through its add-on. Install and start the ha-spark add-on: Home Assistant then discovers it and offers it here."
     }
