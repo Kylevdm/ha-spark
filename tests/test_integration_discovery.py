@@ -114,11 +114,17 @@ async def test_status_line_of_a_real_supervisor_reply_never_reaches_the_log(
         logging.getLogger("httpcore").setLevel(httpcore_level)
         logging.getLogger().setLevel(root_level)
     assert canary not in caplog.text
+    assert "X-Echo" not in caplog.text and "HTTP/1.1" not in caplog.text
     assert FIXTURE["auth_token"] not in caplog.text
+    failures = [r.getMessage() for r in caplog.records if "discovery" in r.getMessage()]
+    assert failures and set(failures) == {"Supervisor discovery failed: ValueError"}
 
 
 @respx.mock
-async def test_cancel_inflight_post_precedes_withdrawal() -> None:
+async def test_cancel_joins_an_inflight_post_and_nothing_posts_after() -> None:
+    """Cancelling joins the post in flight. Its reply never arrived, so there is no
+    message id and nothing to withdraw: a post the Supervisor accepted without
+    replying stays until the next boot replaces it (spec #472, accepted)."""
     entered = asyncio.Event()
     cancelled = asyncio.Event()
 
@@ -273,8 +279,7 @@ async def test_daemon_pairing_shutdown_order_and_standalone(
         with suppress(asyncio.CancelledError):
             await task
     if standalone:
-        assert not post_route.called
-        assert not delete_route.called
+        assert not any(call.request.url.host == "supervisor" for call in respx.calls)
     else:
         assert post_route.call_count == delete_route.call_count == 1
         assert events[-1] == "withdraw"

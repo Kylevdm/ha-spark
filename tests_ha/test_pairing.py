@@ -45,6 +45,17 @@ async def test_foreign_slug_aborts(hass: HomeAssistant, slug: str) -> None:
     assert result["reason"] == "invalid_discovery"
 
 
+@pytest.mark.parametrize("config", [None, [], "config", 8099])
+async def test_discovery_config_that_is_not_an_object_aborts(
+    hass: HomeAssistant, config: Any
+) -> None:
+    info = HassioServiceInfo(config=config, name="ha-spark", slug=ADDON_SLUG, uuid="d")
+    result = await start(hass, info)
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "invalid_discovery"
+    assert not hass.config_entries.async_entries(DOMAIN)
+
+
 @pytest.mark.parametrize("updates", [
     {"host": ""}, {"host": 123}, {"port": True}, {"port": 0}, {"port": 65536},
     {"auth_token": ""}, {"session_id": None},
@@ -96,7 +107,7 @@ async def test_new_discovery_replaces_pending_confirmation(hass: HomeAssistant) 
     assert result["result"].data["auth_token"] == "new-token"
 
 
-async def test_racing_confirmations_create_one_entry(hass: HomeAssistant) -> None:
+async def test_confirmation_racing_a_refresh_creates_one_entry(hass: HomeAssistant) -> None:
     pending = await start(hass, discovery())
     results = await asyncio.gather(
         hass.config_entries.flow.async_configure(pending["flow_id"], {}),

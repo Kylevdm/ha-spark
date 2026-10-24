@@ -24,7 +24,7 @@ class HaSparkConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_hassio(self, discovery_info: HassioServiceInfo) -> ConfigFlowResult:
         """Accept only our Supervisor add-on and validated connection fields."""
         config = discovery_info.config
-        if discovery_info.slug != ADDON_SLUG or not all(
+        if discovery_info.slug != ADDON_SLUG or not isinstance(config, dict) or not all(
             isinstance(config.get(key), str) and bool(config[key].strip())
             for key in ("host", "auth_token", "session_id")
         ) or type(config.get("port")) is not int or not 1 <= config["port"] <= 65535:
