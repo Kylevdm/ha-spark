@@ -6,6 +6,14 @@ The companion integration has exactly one config entry per site (`single_config_
 
 The obvious choice, keying a discovery-created entry on the discovery uuid, is a trap. When an add-on is uninstalled, Home Assistant deletes every `hassio`-source entry whose `unique_id` equals the discovery uuid (Core `hassio/discovery.py:142-160`). That would delete the integration's entry and its authority store, which breaks integration-owned authority ([ADR-0005](0005-integration-authority-and-operating-modes.md)) and the removal handover ([ADR-0008](0008-operating-mode-and-authority-lifecycle.md)). We also rejected one entry per bus, because the site is the unit of authority (one mode, one epoch, one store), and per-bus entries would split that store.
 
+## Amendment (2026-10-24): flow-enforced single entry
+
+One entry per site is enforced by the config flow, not the manifest's
+`single_config_entry` flag. Home Assistant applies that flag before the hassio
+step runs, which would block the per-boot discovery refresh. The linked add-on's
+refresh updates connection data silently; other flows cannot create a second
+site. The generated site identity and the intent above are unchanged.
+
 ## Consequences
 
 - Discovery only links the add-on. For an entry that already links this add-on, the per-boot discovery refreshes host, port and token silently. Switching an entry adopted standalone over to a discovered add-on needs an HA admin's confirmation, because it changes who may command the hardware.

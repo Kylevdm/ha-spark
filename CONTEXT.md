@@ -374,6 +374,12 @@ whenever the assistant chose to make it, wherever it was asked from.
 (Decision: #269, 2026-10-12.)
 _Avoid_: run plan, force replan, apply now
 
+**Add-on session**:
+The per-boot session of the add-on that its integration bearer token belongs to.
+Both rotate when the add-on process restarts; configuration repair ending within
+the same process does not start a new session.
+(Decision: #472, 2026-10-24.)
+
 **Add-on command**:
 A request that ha-spark's add-on makes of the integration with the add-on's
 authority, such as applying the plan or carrying an owner's request from

@@ -73,6 +73,7 @@ stay gaps; mid-slot requests never rewrite a slot. Recording failures are isolat
 from __future__ import annotations
 
 import asyncio
+import socket
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
@@ -156,6 +157,7 @@ from ha_spark.energy.tariff import _in_overnight_window as in_window
 from ha_spark.energy.v2l import run_v2l_tick, run_v2l_topup, warn_deprecated_notify_target
 from ha_spark.ha.notifier import send_notification
 from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.integration_discovery import IntegrationDiscovery
 from ha_spark.logging import get_logger
 from ha_spark.mode_preconditions import check_preconditions
 from ha_spark.settings_service import ConfigurationRepair, SettingsService
@@ -1799,7 +1801,9 @@ def _ingress_server(state: AppState) -> uvicorn.Server:
     )
 
 
-async def _serve_repair(service: SettingsService, channel: DaemonChannel) -> None:
+async def _serve_repair(
+    service: SettingsService, channel: DaemonChannel, discovery: IntegrationDiscovery | None = None,
+) -> None:
     """Configuration repair: serve only the fix until an import commits.
 
     Only the socket (config show/import, authority status) and the ingress
@@ -1819,11 +1823,17 @@ async def _serve_repair(service: SettingsService, channel: DaemonChannel) -> Non
     serve_task: asyncio.Task[None] | None = None
     try:
         serve_task = await serve_in_background(server)
+        if discovery is not None:
+            discovery.start()
     except Exception:
         log.exception("HTTP API failed to start; continuing without it")
     try:
         if service.repair is not None:
             await repaired.wait()
+    except asyncio.CancelledError:
+        if discovery is not None:
+            await discovery.cancel_announcement()
+        raise
     finally:
         service.on_repaired = None
         state.executor = None
@@ -1833,6 +1843,22 @@ async def _serve_repair(service: SettingsService, channel: DaemonChannel) -> Non
 
 async def _run_forever(
     settings: Settings, channel: DaemonChannel, *, poll_seconds: int
+) -> None:
+    """Keep one boot identity through repair, normal operation and shutdown."""
+    discovery = None if settings.is_standalone else IntegrationDiscovery(
+        supervisor_token=settings.supervisor_token, host=socket.gethostname(),
+    )
+    try:
+        await _run_paired(settings, channel, poll_seconds=poll_seconds, discovery=discovery)
+    finally:
+        if discovery is not None:
+            await discovery.cancel_announcement()
+            await discovery.withdraw()
+
+
+async def _run_paired(
+    settings: Settings, channel: DaemonChannel, *, poll_seconds: int,
+    discovery: IntegrationDiscovery | None,
 ) -> None:
     """Loop: recompute and apply the plan once per local half-hour slot.
 
@@ -1848,7 +1874,10 @@ async def _run_forever(
             settings = service.load(writable=True)
             break
         except ConfigurationRepair:
-            await _serve_repair(service, channel)
+            if discovery is None:
+                await _serve_repair(service, channel)
+            else:
+                await _serve_repair(service, channel, discovery)
     service.request_replan = channel.request_replan
     warn_deprecated_notify_target(settings)
     state = AppState(settings=settings, options_path=OPTIONS_PATH, executor=channel,
@@ -1867,6 +1896,8 @@ async def _run_forever(
     serve_task: asyncio.Task[None] | None = None
     try:
         serve_task = await serve_in_background(server)
+        if discovery is not None:
+            discovery.start()
         log.info("HTTP API listening on :%d (ingress)", INGRESS_PORT)
     except Exception:
         log.exception("HTTP API failed to start; continuing without it")
@@ -2307,6 +2338,8 @@ async def _run_forever(
                     log.exception("V2L tick failed; will retry next tick")
             await asyncio.sleep(poll_seconds)
     finally:
+        if discovery is not None:
+            await discovery.cancel_announcement()
         if readiness_task is not None:
             readiness_task.cancel()
             await asyncio.gather(readiness_task, return_exceptions=True)

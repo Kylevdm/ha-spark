@@ -17,9 +17,10 @@ homeassistant_api: true
 hassio_api: true
 startup: services
 boot: auto
-# HTTP API for the companion integration, reached through HA's authenticated
-# ingress proxy (not mapped to the host network; the app answers only the proxy's
-# address, 172.30.32.2). Must match api.server.INGRESS_PORT.
+discovery: [ha_spark]
+# Shared HTTP listener: the UI uses HA's authenticated ingress proxy; the
+# companion integration connects directly using its per-boot bearer channel.
+# Not mapped to the host network. Must match api.server.INGRESS_PORT.
 ingress: true
 ingress_port: 8099
 ports:
