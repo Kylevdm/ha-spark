@@ -1,4 +1,10 @@
 {
+  "issues": {
+    "api_version_skew": {
+      "title": "ha-spark API versions are incompatible",
+      "description": "The ha-spark add-on release {addon_release} speaks API version {addon_api_version} (supported: {addon_supported}). The integration sent API version {integration_api_version} and supports: {supported}. Update the add-on or integration so they support a common API version, then restart the updated half."
+    }
+  },
   "entity": {
     "binary_sensor": {
       "addon_connected": {"name": "Add-on connected"}
