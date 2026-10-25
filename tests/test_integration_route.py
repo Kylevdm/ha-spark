@@ -354,3 +354,55 @@ def test_number_blocks_nulls_and_current_soc(state, discovery, configured, sampl
         assert body["plan"]["planned_cost_gbp"] is None
         assert body["plan"]["baseline_cost_gbp"] is None
         assert "sensor.private" not in json.dumps(body)
+
+
+@pytest.mark.parametrize("field", [
+    "required_kwh", "target_soc", "load_kwh", "effective_solar_kwh", "deficit_kwh",
+    "planned_cost", "baseline_cost",
+])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+async def test_non_finite_plan_number_is_null_and_heartbeat_counts(state, discovery, field, bad):
+    from dataclasses import replace
+
+    from tests.test_api import _plan
+
+    state.plan = replace(_plan(planned_cost=1.0, baseline_cost=2.0), **{field: bad})
+    state.plan_at = datetime(2026, 10, 24, 11, 30, tzinfo=UTC)
+    response = await request(state, discovery,
+                             headers={"Authorization": f"Bearer {discovery.auth_token}"})
+    assert response.status_code == 200
+    plan = response.json()["plan"]
+    wire_key = {
+        "required_kwh": "charge_needed_kwh", "target_soc": "target_soc_pct",
+        "load_kwh": "forecast_load_kwh", "effective_solar_kwh": "solar_forecast_kwh",
+        "deficit_kwh": "deficit_kwh", "planned_cost": "planned_cost_gbp",
+        "baseline_cost": "baseline_cost_gbp",
+    }[field]
+    assert plan[wire_key] is None
+    assert all(value is not None for key, value in plan.items() if key != wire_key)
+
+
+@pytest.mark.parametrize("session", [
+    {"kwh_delivered": "bad"}, {"kwh_delivered": True}, {"kwh_delivered": float("inf")},
+    {"peak_power_w": None}, {"kwh_delivered": 1.7e308}, {"peak_power_w": float("nan")},
+])
+async def test_hostile_session_file_nulls_v2l_and_heartbeat_counts(state, discovery, session):
+    state.settings = state.settings.model_copy(update={"v2l_power_entity": "sensor.v2l"})
+    path = Path(state.settings.db_path).parent / "ha_spark_v2l_session.json"
+    path.write_text(json.dumps({"day": "2026-10-24", "last_sample_ts": "x", **session}))
+    response = await request(state, discovery,
+                             headers={"Authorization": f"Bearer {discovery.auth_token}"})
+    assert response.status_code == 200
+    assert response.json()["v2l"] is None
+
+
+async def test_session_file_unread_without_v2l(state, discovery, caplog):
+    caplog.set_level(logging.DEBUG)
+    path = Path(state.settings.db_path).parent / "ha_spark_v2l_session.json"
+    path.write_text(json.dumps({"day": "x", CANARY: 1}))
+    response = await request(state, discovery,
+                             headers={"Authorization": f"Bearer {discovery.auth_token}"})
+    assert response.status_code == 200
+    assert response.json()["v2l"] is None
+    assert CANARY not in caplog.text
+    assert "V2L session" not in caplog.text

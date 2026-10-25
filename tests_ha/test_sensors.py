@@ -24,14 +24,27 @@ async def test_golden_sensors_and_legacy_ids(
         hass.states.async_set(desc.requested_entity_id, "legacy")
     aioclient_mock.post(URL, json=summary())
     entry = await setup(hass)
-    expected = ["9.6", "90.0", "10.0", "5.0", "8.0", "1.23", "3.46", "2.35", "0.47",
-                "2026-10-24T11:30:00+00:00"]
-    for desc, value in zip(DESCRIPTIONS, expected, strict=True):
+    # (state, unit, device class, state class), fixed independently of DESCRIPTIONS.
+    expected = {
+        "sensor.ha_spark_charge_needed_kwh": ("9.6", "kWh", "energy", None),
+        "sensor.ha_spark_target_soc": ("90.0", "%", "battery", None),
+        "sensor.ha_spark_forecast_load_kwh": ("10.0", "kWh", "energy", None),
+        "sensor.ha_spark_solar_forecast_kwh": ("5.0", "kWh", "energy", None),
+        "sensor.ha_spark_deficit_kwh": ("8.0", "kWh", "energy", None),
+        "sensor.ha_spark_planned_cost": ("1.23", "GBP", "monetary", None),
+        "sensor.ha_spark_baseline_cost": ("3.46", "GBP", "monetary", None),
+        "sensor.ha_spark_v2l_energy_kwh": ("2.35", "kWh", "energy", "total_increasing"),
+        "sensor.ha_spark_v2l_net_saving_gbp": ("0.47", "GBP", "monetary", None),
+        "sensor.ha_spark_last_run": ("2026-10-24T11:30:00+00:00", None, "timestamp", None),
+    }
+    assert {desc.requested_entity_id for desc in DESCRIPTIONS} == set(expected)
+    for desc in DESCRIPTIONS:
+        value, unit, device_class, state_class = expected[desc.requested_entity_id]
         state = hass.states.get(desc.requested_entity_id)
         assert state is not None and state.state == value
-        assert state.attributes.get("device_class") == desc.device_class
-        assert state.attributes.get("unit_of_measurement") == desc.native_unit_of_measurement
-        assert state.attributes.get("state_class") == desc.state_class
+        assert state.attributes.get("device_class") == device_class
+        assert state.attributes.get("unit_of_measurement") == unit
+        assert state.attributes.get("state_class") == state_class
         registered = er.async_get(hass).async_get(desc.requested_entity_id)
         assert registered is not None
         assert registered.unique_id == f"{entry.data['site_id']}_{desc.key}"
@@ -51,6 +64,9 @@ async def test_sensor_value_rules(
     entry = await setup(hass)
     last = state_value(hass, LAST)
     body = summary()
+    later = "2026-10-24T11:45:00+00:00"
+    if body["plan"] is not None:
+        body["plan"]["computed_at"] = later
     if change == "soc":
         body["plan"]["soc_trusted"] = False
     elif change in {"v2l", "plan"}:
@@ -75,7 +91,9 @@ async def test_sensor_value_rules(
     for desc in DESCRIPTIONS:
         value = state_value(hass, desc.requested_entity_id)
         if desc.key == "last_run":
-            assert value == last
+            # Only a counted summary with a plan advances Last run; nothing clears it.
+            advanced = change not in {"401", "plan"}
+            assert value == (later if advanced else last)
         elif change in {"401", "deadline"} or (change == "soc" and desc.soc_derived) or (
             change == "v2l" and desc.v2l
         ):
@@ -109,6 +127,8 @@ async def test_last_run_restores_while_down(
     ("plan", "deficit_kwh", float("nan")), ("v2l", "energy_kwh", False),
     ("v2l", "peak_power_w", float("inf")), ("v2l", "net_saving_gbp", "1"),
     ("plan", "computed_at", "2026-10-24T11:30:00"), ("plan", "soc_trusted", 1),
+    ("plan", "deficit_kwh", type("Float", (float,), {})(1.0)),
+    ("v2l", "energy_kwh", type("Int", (int,), {})(1)),
 ])
 def test_invalid_number_blocks(block: str, key: str, value: Any) -> None:
     body = fixture("plan_summary")

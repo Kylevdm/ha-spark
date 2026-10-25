@@ -1309,7 +1309,10 @@ def _log_action_lines(action_lines: list[ActionLine | str]) -> None:
             log.info(line)
 
 
-async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasurement | None:
+async def soc_monitor_tick(
+    settings: Settings, monitor: SocMonitor,
+    on_observed: Callable[[SocMeasurement], None] | None = None,
+) -> SocMeasurement | None:
     """One per-minute SoC observation: check, count once, publish. Never raises.
 
     The daemon loop's sole SoC observation cadence (#114): the returned
@@ -1325,6 +1328,9 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
         ) as rest:
             measurement = await observe_soc(settings, rest, monitor=monitor)
+            if on_observed is not None:
+                # Display only (#481): publish the verdict before the awaits below.
+                on_observed(measurement)
             snapshot = monitor.record(
                 measurement,
                 failure_threshold=settings.soc_failure_threshold,
@@ -2062,7 +2068,10 @@ async def _run_paired(
                     last_reconcile_lines, last_trusted_holds = startup_result[:2]
             # Sole SoC observation cadence (#114): one checked measurement per
             # minute in every operating state, reused by everything below.
-            measurement = await soc_monitor_tick(settings, monitor)
+            def _observed(observed: SocMeasurement) -> None:
+                state.soc_observation_ok = observed.ok
+
+            measurement = await soc_monitor_tick(settings, monitor, _observed)
             state.soc_observation_ok = measurement is not None and measurement.ok
             solis_fallback_active = monitor.fallback_active and any(
                 device.type == "inverter" and device.driver == "solis"

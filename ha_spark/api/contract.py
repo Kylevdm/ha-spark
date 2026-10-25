@@ -11,6 +11,7 @@ Both suites compare their constant with `tests/fixtures/contract/contract.json`,
 so neither half can move a contract version alone.
 """
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final
@@ -119,6 +120,17 @@ def plan_summary(
     }
 
 
+def _finite(value: object, ndigits: int) -> float | None:
+    """A rounded finite number, else None: one bad value never fails the heartbeat."""
+    if not isinstance(value, (int, float)) or type(value) not in (int, float):
+        return None
+    try:
+        rounded = round(float(value), ndigits)
+    except OverflowError:
+        return None
+    return rounded if math.isfinite(rounded) else None
+
+
 def plan_block(
     plan: ChargePlan | None, computed_at: datetime | None, soc_observation_ok: bool,
 ) -> dict[str, object] | None:
@@ -128,29 +140,35 @@ def plan_block(
     return {
         "computed_at": computed_at.isoformat(),
         "soc_trusted": plan.soc.ok and soc_observation_ok,
-        "charge_needed_kwh": round(plan.required_kwh, 2),
-        "target_soc_pct": round(plan.target_soc, 0),
-        "forecast_load_kwh": round(plan.load_kwh, 2),
-        "solar_forecast_kwh": round(plan.effective_solar_kwh, 2),
-        "deficit_kwh": round(plan.deficit_kwh, 2),
-        "planned_cost_gbp": round(plan.planned_cost, 2) if plan.planned_cost is not None else None,
-        "baseline_cost_gbp": (
-            round(plan.baseline_cost, 2) if plan.baseline_cost is not None else None
-        ),
+        "charge_needed_kwh": _finite(plan.required_kwh, 2),
+        "target_soc_pct": _finite(plan.target_soc, 0),
+        "forecast_load_kwh": _finite(plan.load_kwh, 2),
+        "solar_forecast_kwh": _finite(plan.effective_solar_kwh, 2),
+        "deficit_kwh": _finite(plan.deficit_kwh, 2),
+        "planned_cost_gbp": _finite(plan.planned_cost, 2),
+        "baseline_cost_gbp": _finite(plan.baseline_cost, 2),
     }
 
 
 def v2l_block(session: V2LSession | None, settings: Settings | None) -> dict[str, object] | None:
-    """Session values use the existing savings and reset semantics."""
+    """Session values use the existing savings and reset semantics.
+
+    The session file is the add-on's own but unvalidated: any non-number or
+    non-finite value, input or result, makes the block null rather than invented.
+    """
     if (settings is None or not settings.v2l_power_entity or session is None
             or session.last_sample_ts is None):
         return None
+    kwh, peak = _finite(session.kwh_delivered, 6), _finite(session.peak_power_w, 6)
+    if kwh is None or peak is None:
+        return None
     avoided, refill, net = savings(
-        session.kwh_delivered, settings.v2l_peak_rate_gbp, settings.v2l_offpeak_rate_gbp,
+        kwh, settings.v2l_peak_rate_gbp, settings.v2l_offpeak_rate_gbp,
         settings.v2l_round_trip_efficiency, delivered_fraction(settings),
     )
-    return {
-        "energy_kwh": round(session.kwh_delivered, 2), "net_saving_gbp": round(net, 2),
-        "avoided_gbp": round(avoided, 2), "refill_cost_gbp": round(refill, 2),
-        "peak_power_w": round(session.peak_power_w, 0),
+    block: dict[str, object] = {
+        "energy_kwh": _finite(kwh, 2), "net_saving_gbp": _finite(net, 2),
+        "avoided_gbp": _finite(avoided, 2), "refill_cost_gbp": _finite(refill, 2),
+        "peak_power_w": _finite(peak, 0),
     }
+    return None if None in block.values() else block

@@ -128,7 +128,8 @@ def parse_summary(body: object) -> Summary:
 
 
 def _number(value: object) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
+    # Exact types: bool and other subclasses are refused before conversion.
+    if not isinstance(value, (int, float)) or type(value) not in (int, float):
         raise MalformedSummary()
     try:
         number = float(value)

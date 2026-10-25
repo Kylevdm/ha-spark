@@ -653,7 +653,10 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
             plan_summary(
                 session_id=integration.session_id, built_at=now, loop_tick=state.loop_tick,
                 plan=state.plan, plan_at=state.plan_at, soc_observation_ok=state.soc_observation_ok,
-                session=v2l.load_session(state.settings), settings=state.settings,
+                session=(
+                    v2l.load_session(state.settings) if state.settings.v2l_power_entity else None
+                ),
+                settings=state.settings,
             ),
             headers={"Cache-Control": "no-store"},
         )
