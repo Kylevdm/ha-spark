@@ -9,6 +9,12 @@ The add-on build fails unless two things agree. The add-on Dockerfile installs
 2. A matching annotated `vX.Y.Z` git **tag pushed**. Without it the build fails
    with `pathspec 'vX.Y.Z' did not match`.
 
+The add-on and the companion integration release in lockstep: the bump commit
+sets the same version in `ha_spark_addon/config.yaml`,
+`custom_components/ha_spark/manifest.json`, `pyproject.toml` and
+`ha_spark/__init__.py` (`__version__`). `tests/test_packaging.py` fails if they
+differ.
+
 The order is:
 
 1. Commit the version bump. In the same commit, fold the changelog fragments
@@ -16,6 +22,9 @@ The order is:
 2. Tag it `vX.Y.Z`.
 3. Push the branch and the tag.
 4. Merge to `master`.
+5. Publish the GitHub Release for `vX.Y.Z` (a pre-release for release
+   candidates). HACS reads Releases, not tags, and publishing last keeps HACS
+   from offering an integration before its add-on is in the store.
 
 Keep `config.yaml` `options`/`schema` in sync with `config.py` `_OPTION_KEYS`
 (a test enforces this). For any option or behaviour change, bump the version,
