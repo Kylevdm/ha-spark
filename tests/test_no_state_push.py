@@ -90,3 +90,39 @@ async def test_mode_soc_fallback_and_recovery_ticks_never_push_or_replay_states(
     assert authority.state is not None and not authority.state.fallback.active
     assert cache.read_text() == cached
     assert not pushes.called
+
+
+@respx.mock
+async def test_soc_failures_through_the_threshold_never_push_states(
+    tmp_path: Path,
+) -> None:
+    """Fresh failed observations, pending failure and the threshold crossing (in Optimise,
+    with a fallback current configured) make no state POST; the V2L tick is
+    covered by tests/test_v2l.py::test_run_v2l_tick_integrates_without_state_push_and_notifies."""
+    from datetime import timedelta
+
+    from ha_spark.config import Settings
+    from ha_spark.energy.soc_monitor import SocMonitor
+    from tests.test_scheduler import _soc_get
+
+    stale = datetime.now(UTC) - timedelta(hours=1)
+    _soc_get(["50", "50", "50"], [stale, stale, stale])
+    pushes = respx.post(url__regex=r"http://ha\.test/api/states/.*").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", authority_mode="optimise",
+        db_path=str(tmp_path / "ledger.db"), soc_entity="sensor.soc",
+        soc_failure_threshold=3, solis_fallback_current_a=42.0, v2l_power_entity="",
+    )
+    monitor = SocMonitor(path=tmp_path / "ha_spark_soc_monitor.json")
+    for _ in range(3):
+        await scheduler.soc_monitor_tick(settings, monitor)
+
+    import json
+
+    assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
+        "consecutive_failures": 3, "fallback_status": "fallback_threshold",
+    }
+    assert not pushes.called

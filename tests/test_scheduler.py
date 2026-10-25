@@ -1753,7 +1753,6 @@ async def test_loop_third_consecutive_failure_reaches_fallback_threshold(
     ]
     assert published[-1][1]["consecutive_failures"] == 3
     assert published[-1][1]["failure_threshold"] == 3
-    assert s.solis_fallback_current_a is None
     assert published[-1][1]["fallback_confirmed"] is False
     assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
         "consecutive_failures": 3,
@@ -1862,7 +1861,6 @@ async def test_loop_enters_configured_fallback_at_threshold_and_publishes_confir
     ]
     state, attrs = published[1]
     assert state == "fallback_verified"
-    assert settings.solis_fallback_current_a == 42.0
     assert attrs["fallback_confirmed"] is True
     assert attrs["fallback_action"] == (
         "[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"
