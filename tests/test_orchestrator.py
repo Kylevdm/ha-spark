@@ -2,20 +2,13 @@
 
 from __future__ import annotations
 
-import json
 from datetime import date
 from pathlib import Path
 
-import httpx
-import respx
-
+from ha_spark.agent import tools
 from ha_spark.config import Settings
 from ha_spark.energy.habits import HabitContext
 from ha_spark.energy.orchestrator import Decision, decide_outcome, decisions_for
-from ha_spark.energy.publish import publish_predictions
-from ha_spark.ha.rest import HomeAssistantRest
-
-BASE = "http://ha.test/api"
 
 
 def test_decide_outcome_is_advisory_in_every_mode() -> None:
@@ -53,23 +46,19 @@ def test_decisions_for_low_occupancy_no_away() -> None:
     assert decisions[0].mode == "on"
 
 
-@respx.mock
-async def test_publish_predictions_pushes_sensor(tmp_path: Path) -> None:
-    route = respx.post(f"{BASE}/states/sensor.ha_spark_predictions").mock(
-        return_value=httpx.Response(200, json={})
-    )
+async def test_agent_predictions_preserve_advisory_decisions(tmp_path: Path, monkeypatch) -> None:
     decisions = [
         Decision(
             "reduce_overnight_charge", 0.9, "an away period is active", "simulate", "advisory"
         ),
     ]
     settings = Settings(db_path=str(tmp_path / "ha_spark.db"))
-    async with HomeAssistantRest(BASE, "tok") as rest:
-        await publish_predictions(rest, decisions, settings)
+    async def orchestrate(_settings):
+        return decisions
 
-    assert route.called
-    body = json.loads(respx.calls.last.request.content)
-    assert body["state"] == "1"
-    assert body["attributes"]["operating_mode"] == "authority_unknown"
-    assert body["attributes"]["predictions"][0]["action"] == "reduce_overnight_charge"
-    assert body["attributes"]["predictions"][0]["outcome"] == "advisory"
+    monkeypatch.setattr(tools, "orchestrate", orchestrate)
+    result = await tools.get_predictions(settings)
+    assert result.decisions == [{
+        "action": "reduce_overnight_charge", "confidence": 0.9,
+        "reason": "an away period is active", "mode": "simulate", "outcome": "advisory",
+    }]

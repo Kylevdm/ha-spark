@@ -103,14 +103,6 @@ class HomeAssistantRest:
         except (TypeError, ValueError):
             raise HomeAssistantRestError("Home Assistant REST response was invalid") from None
 
-    async def set_state(
-        self, entity_id: str, state: str, attributes: dict[str, Any] | None = None
-    ) -> None:
-        """Set an entity's state, creating it if it doesn't exist yet."""
-        await self._post(
-            f"/states/{entity_id}", {"state": state, "attributes": attributes or {}}
-        )
-
     async def call_service(
         self, domain: str, service: str, data: dict[str, Any] | None = None
     ) -> list[EntityState]:

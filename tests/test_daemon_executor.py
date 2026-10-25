@@ -140,8 +140,7 @@ async def running_daemon(settings: Settings, path: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(scheduler, "inverter_device", lambda *args: device)
     monkeypatch.setattr(scheduler.SocMonitor, "load", lambda s: monitor)
     monkeypatch.setattr(scheduler, "soc_monitor_tick", AsyncMock(return_value=measurement))
-    for name in ("sample_signals", "republish_last", "_record_forecast", "_run_orchestrator",
-                 "_run_derived_rerive"):
+    for name in ("sample_signals", "_record_forecast", "_run_derived_rerive"):
         monkeypatch.setattr(scheduler, name, AsyncMock())
     monkeypatch.setattr(scheduler, "run_once", record_run)
     task = asyncio.create_task(scheduler.run_forever(settings, poll_seconds=0))

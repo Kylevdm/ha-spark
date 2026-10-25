@@ -57,7 +57,6 @@ async def test_daemon_snapshots_previous_day_and_writes_no_hardware(
     a = revision()
     monkeypatch.setattr(scheduler, "current_plan", AsyncMock(return_value=a.run))
     monkeypatch.setattr(scheduler, "soc_monitor_tick", AsyncMock(return_value=a.run.inputs.soc))
-    monkeypatch.setattr(scheduler, "_run_orchestrator", AsyncMock())
     monkeypatch.setattr(scheduler, "_run_derived_rerive", AsyncMock())
     respx.get(url__regex=r"http://ha.test/api/states/.*").respond(404)
     respx.post(url__regex=r"http://ha.test/api/states/.*").respond(200, json={})
@@ -82,7 +81,6 @@ async def test_daemon_tick_survives_a_raising_day_close_ledger(
     a = revision()
     monkeypatch.setattr(scheduler, "current_plan", AsyncMock(return_value=a.run))
     monkeypatch.setattr(scheduler, "soc_monitor_tick", AsyncMock(return_value=a.run.inputs.soc))
-    monkeypatch.setattr(scheduler, "_run_orchestrator", AsyncMock())
     monkeypatch.setattr(scheduler, "_run_derived_rerive", AsyncMock())
 
     class RaisingLedger:
@@ -120,7 +118,6 @@ async def test_day_close_join_never_delays_the_guard_tick(
     a = revision()
     monkeypatch.setattr(scheduler, "current_plan", AsyncMock(return_value=a.run))
     monkeypatch.setattr(scheduler, "soc_monitor_tick", AsyncMock(return_value=a.run.inputs.soc))
-    monkeypatch.setattr(scheduler, "_run_orchestrator", AsyncMock())
     monkeypatch.setattr(scheduler, "_run_derived_rerive", AsyncMock())
     monkeypatch.setattr(scheduler, "_charger_supports_live_rate", AsyncMock(return_value=True))
     monkeypatch.setattr(scheduler, "guard_tick", AsyncMock(return_value=None))

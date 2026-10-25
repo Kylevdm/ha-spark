@@ -1,24 +1,14 @@
-"""Tests for publishing the computed plan to HA."""
+"""Tests for the legacy plan payload and public SoC monitor results."""
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime, time, timedelta
-from pathlib import Path
-
-import httpx
-import respx
 
 from ha_spark.config import Settings
 from ha_spark.energy.models import ChargeIntent, ChargePlan
-from ha_spark.energy.publish import (
-    plan_to_payload,
-    publish_plan,
-    publish_soc_integrity,
-    republish_last,
-)
+from ha_spark.energy.publish import plan_to_payload
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
-from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.energy.soc_monitor import SocMonitor, SocOperatingState
 
 
 def _soc(value: float) -> SocMeasurement:
@@ -32,8 +22,6 @@ def _soc(value: float) -> SocMeasurement:
         age_s=0.0,
         max_age_s=600.0,
     )
-
-BASE = "http://ha.test/api"
 
 
 def _plan(**overrides: object) -> ChargePlan:
@@ -68,86 +56,15 @@ def test_plan_to_payload_maps_core_sensors() -> None:
     assert "sensor.ha_spark_planned_cost" not in by_id
 
 
-@respx.mock
-async def test_publish_plan_pushes_required_entities(tmp_path: Path) -> None:
-    for route in [
-        "sensor.ha_spark_charge_needed_kwh",
-        "sensor.ha_spark_target_soc",
-        "sensor.ha_spark_soc_now",
-        "sensor.ha_spark_forecast_load_kwh",
-        "sensor.ha_spark_solar_forecast_kwh",
-        "sensor.ha_spark_deficit_kwh",
-        "sensor.ha_spark_plan_status",
-        "sensor.ha_spark_last_run",
-    ]:
-        respx.post(f"{BASE}/states/{route}").mock(return_value=httpx.Response(200, json={}))
-
-    settings = Settings(db_path=str(tmp_path / "ha_spark.db"))
-    async with HomeAssistantRest(BASE, "tok") as rest:
-        await publish_plan(rest, _plan(), settings)
+def test_plan_payload_skips_none_cost_fields() -> None:
+    ids = {eid for eid, _, _ in plan_to_payload(
+        _plan(planned_cost=None, baseline_cost=None), Settings()
+    )}
+    assert "sensor.ha_spark_planned_cost" not in ids
+    assert "sensor.ha_spark_baseline_cost" not in ids
 
 
-@respx.mock
-async def test_publish_plan_skips_none_cost_fields(tmp_path: Path) -> None:
-    for route in [
-        "sensor.ha_spark_charge_needed_kwh",
-        "sensor.ha_spark_target_soc",
-        "sensor.ha_spark_soc_now",
-        "sensor.ha_spark_forecast_load_kwh",
-        "sensor.ha_spark_solar_forecast_kwh",
-        "sensor.ha_spark_deficit_kwh",
-        "sensor.ha_spark_plan_status",
-        "sensor.ha_spark_last_run",
-    ]:
-        respx.post(f"{BASE}/states/{route}").mock(return_value=httpx.Response(200, json={}))
-    planned_route = respx.post(f"{BASE}/states/sensor.ha_spark_planned_cost").mock(
-        return_value=httpx.Response(200, json={})
-    )
-
-    settings = Settings(db_path=str(tmp_path / "ha_spark.db"))
-    async with HomeAssistantRest(BASE, "tok") as rest:
-        await publish_plan(rest, _plan(planned_cost=None, baseline_cost=None), settings)
-
-    assert planned_route.call_count == 0
-
-
-@respx.mock
-async def test_republish_last_replays_cached_payload(tmp_path: Path) -> None:
-    for route in [
-        "sensor.ha_spark_charge_needed_kwh",
-        "sensor.ha_spark_target_soc",
-        "sensor.ha_spark_soc_now",
-        "sensor.ha_spark_forecast_load_kwh",
-        "sensor.ha_spark_solar_forecast_kwh",
-        "sensor.ha_spark_deficit_kwh",
-        "sensor.ha_spark_plan_status",
-        "sensor.ha_spark_last_run",
-    ]:
-        respx.post(f"{BASE}/states/{route}").mock(return_value=httpx.Response(200, json={}))
-
-    settings = Settings(db_path=str(tmp_path / "ha_spark.db"))
-    async with HomeAssistantRest(BASE, "tok") as rest:
-        await publish_plan(rest, _plan(), settings)
-
-    calls_before = len(respx.calls)
-    cached = json.loads((tmp_path / "ha_spark_published.json").read_text(encoding="utf-8"))
-    cached_by_id = {entity_id: state for entity_id, state, _ in cached}
-    async with HomeAssistantRest(BASE, "tok") as rest:
-        await republish_last(rest, settings)
-
-    assert len(respx.calls) - calls_before == 8
-    assert cached_by_id["sensor.ha_spark_soc_now"] == "40"
-    assert cached_by_id["sensor.ha_spark_charge_needed_kwh"] == "9.60"
-    replayed = {
-        call.request.url.path.rsplit("/", 1)[-1]: json.loads(call.request.content)["state"]
-        for call in respx.calls[calls_before:]
-    }
-    assert replayed["sensor.ha_spark_soc_now"] == "40"
-    assert replayed["sensor.ha_spark_charge_needed_kwh"] == "9.60"
-
-
-@respx.mock
-async def test_untrusted_soc_is_published_and_replayed_as_unavailable(tmp_path: Path) -> None:
+def test_untrusted_soc_payload_is_unavailable() -> None:
     bad = SocMeasurement(
         status=SocStatus.STALE,
         observed_at=datetime.now(UTC),
@@ -156,29 +73,8 @@ async def test_untrusted_soc_is_published_and_replayed_as_unavailable(tmp_path: 
         age_s=746.0,
         max_age_s=600.0,
     )
-    plan = _plan(soc=bad, planned_cost=8.25, baseline_cost=10.5)
-    settings = Settings(db_path=str(tmp_path / "ha_spark.db"))
-    payload = plan_to_payload(plan, settings)
-    routes = {
-        entity_id: respx.post(f"{BASE}/states/{entity_id}").mock(
-            return_value=httpx.Response(200, json={})
-        )
-        for entity_id, _, _ in payload
-    }
-
-    async with HomeAssistantRest(BASE, "tok") as rest:
-        await publish_plan(rest, plan, settings)
-
-    cache = json.loads((tmp_path / "ha_spark_published.json").read_text(encoding="utf-8"))
-    cached = {entity_id: state for entity_id, state, _ in cache}
-    calls_before_replay = len(respx.calls)
-    async with HomeAssistantRest(BASE, "tok") as rest:
-        await republish_last(rest, settings)
-
-    replayed = {
-        call.request.url.path.rsplit("/", 1)[-1]: json.loads(call.request.content)["state"]
-        for call in respx.calls[calls_before_replay:]
-    }
+    payload = plan_to_payload(_plan(soc=bad, planned_cost=8.25, baseline_cost=10.5), Settings())
+    by_id = {eid: state for eid, state, _ in payload}
     for entity_id in (
         "sensor.ha_spark_charge_needed_kwh",
         "sensor.ha_spark_target_soc",
@@ -187,69 +83,9 @@ async def test_untrusted_soc_is_published_and_replayed_as_unavailable(tmp_path: 
         "sensor.ha_spark_planned_cost",
         "sensor.ha_spark_baseline_cost",
     ):
-        assert json.loads(routes[entity_id].calls[0].request.content)["state"] == "unavailable"
-        assert cached[entity_id] == "unavailable"
-        assert replayed[entity_id] == "unavailable"
-    assert cached["sensor.ha_spark_forecast_load_kwh"] == "10.00"
-    assert cached["sensor.ha_spark_solar_forecast_kwh"] == "5.00"
-    assert replayed["sensor.ha_spark_forecast_load_kwh"] == "10.00"
-    assert replayed["sensor.ha_spark_solar_forecast_kwh"] == "5.00"
-
-
-@respx.mock
-async def test_republish_last_hides_untrusted_values_in_an_older_cache(tmp_path: Path) -> None:
-    bad = SocMeasurement(
-        status=SocStatus.STALE,
-        observed_at=datetime.now(UTC),
-        value=70.0,
-        raw_state="70",
-        age_s=746.0,
-        max_age_s=600.0,
-    )
-    settings = Settings(db_path=str(tmp_path / "ha_spark.db"))
-    old_payload = plan_to_payload(_plan(soc=bad, planned_cost=8.25, baseline_cost=10.5), settings)
-    soc_dependent_states = {
-        "sensor.ha_spark_charge_needed_kwh": "24.19",
-        "sensor.ha_spark_target_soc": "90",
-        "sensor.ha_spark_soc_now": "0",
-        "sensor.ha_spark_deficit_kwh": "24.19",
-        "sensor.ha_spark_planned_cost": "8.25",
-        "sensor.ha_spark_baseline_cost": "10.50",
-    }
-    old_payload = [
-        (entity_id, soc_dependent_states.get(entity_id, state), attributes)
-        for entity_id, state, attributes in old_payload
-    ]
-    (tmp_path / "ha_spark_published.json").write_text(
-        json.dumps(old_payload), encoding="utf-8"
-    )
-    routes = {
-        entity_id: respx.post(f"{BASE}/states/{entity_id}").mock(
-            return_value=httpx.Response(200, json={})
-        )
-        for entity_id, _, _ in old_payload
-    }
-
-    async with HomeAssistantRest(BASE, "tok") as rest:
-        await republish_last(rest, settings)
-
-    for entity_id in soc_dependent_states:
-        assert json.loads(routes[entity_id].calls[0].request.content)["state"] == "unavailable"
-    assert (
-        json.loads(routes["sensor.ha_spark_forecast_load_kwh"].calls[0].request.content)["state"]
-        == "10.00"
-    )
-    assert (
-        json.loads(routes["sensor.ha_spark_solar_forecast_kwh"].calls[0].request.content)["state"]
-        == "5.00"
-    )
-
-
-@respx.mock
-async def test_republish_last_noop_when_no_cache(tmp_path: Path) -> None:
-    settings = Settings(db_path=str(tmp_path / "missing" / "ha_spark.db"))
-    async with HomeAssistantRest(BASE, "tok") as rest:
-        await republish_last(rest, settings)  # should not raise, nothing mocked to call
+        assert by_id[entity_id] == "unavailable"
+    assert by_id["sensor.ha_spark_forecast_load_kwh"] == "10.00"
+    assert by_id["sensor.ha_spark_solar_forecast_kwh"] == "5.00"
 
 
 def test_plan_status_publishes_soc_status_and_reason() -> None:
@@ -305,16 +141,7 @@ def test_plan_status_publishes_event_soc_needed_only_when_present() -> None:
     assert "export_soc_needed_at" not in without_need
 
 
-@respx.mock
-async def test_publish_soc_integrity_exposes_pending_state_and_evidence() -> None:
-    """The per-minute monitor sensor carries the pending state, the failure
-    count, and the observation's evidence — never a computed plan."""
-    from ha_spark.energy.soc_integrity import SocStatus
-    from ha_spark.energy.soc_monitor import SocMonitor, SocOperatingState
-
-    push = respx.post(f"{BASE}/states/sensor.ha_spark_soc_integrity").mock(
-        return_value=httpx.Response(200, json={})
-    )
+def test_monitor_exposes_pending_state_and_evidence() -> None:
     now = datetime.now(UTC)
     stale = SocMeasurement(
         status=SocStatus.STALE,
@@ -325,41 +152,19 @@ async def test_publish_soc_integrity_exposes_pending_state_and_evidence() -> Non
         age_s=3600.0,
         max_age_s=600.0,
     )
-    monitor = SocMonitor()  # no path: persistence is not under test here
-    snapshot = monitor.record(stale, failure_threshold=3)
+    snapshot = SocMonitor().record(stale, failure_threshold=3)
     assert snapshot.state is SocOperatingState.PENDING_FAILURE
-
-    async with HomeAssistantRest(BASE, "t") as rest:
-        await publish_soc_integrity(rest, snapshot, Settings())
-
-    assert push.called
-    body = json.loads(push.calls[0].request.content)
-    assert body["state"] == "pending_failure"
-    attrs = body["attributes"]
-    assert attrs["consecutive_failures"] == 1
-    assert attrs["failure_threshold"] == 3
-    assert attrs["soc_status"] == "stale"
-    assert "over the 600s maximum" in attrs["soc_reason"]
-    assert attrs["soc_value"] == 30.0
-    assert attrs["soc_age_s"] == 3600.0
-    assert attrs["fallback_window_start"] == "23:30"
-    assert attrs["fallback_window_end"] == "05:30"
-    assert attrs["fallback_current_configured_a"] is None
-    assert attrs["fallback_current_ceiling_a"] is None
-    assert attrs["fallback_confirmed"] is False
-    assert attrs["fallback_actions"] == []
-    # A monitoring verdict, not a plan: no plan attribute ever appears.
-    assert not any(k.startswith("plan") or k == "model" for k in attrs)
+    assert snapshot.consecutive_failures == 1
+    assert snapshot.failure_threshold == 3
+    assert snapshot.measurement.status is SocStatus.STALE
+    assert "over the 600s maximum" in snapshot.measurement.reason
+    assert snapshot.measurement.value == 30.0
+    assert snapshot.measurement.age_s == 3600.0
+    assert snapshot.fallback_confirmed is False
+    assert snapshot.fallback_action is None
 
 
-@respx.mock
-async def test_publish_soc_integrity_reports_fallback_confirmation_not_request() -> None:
-    from ha_spark.energy.soc_integrity import SocStatus
-    from ha_spark.energy.soc_monitor import SocMonitor
-
-    push = respx.post(f"{BASE}/states/sensor.ha_spark_soc_integrity").mock(
-        return_value=httpx.Response(200, json={})
-    )
+def test_monitor_reports_fallback_confirmation_not_request() -> None:
     failed = SocMeasurement(
         status=SocStatus.STALE,
         observed_at=datetime.now(UTC),
@@ -370,29 +175,16 @@ async def test_publish_soc_integrity_reports_fallback_confirmation_not_request()
     )
     monitor = SocMonitor()
     monitor.record(failed, failure_threshold=1)
-    assert monitor.request_fallback() is not None
+    requested = monitor.request_fallback()
+    assert requested is not None
+    assert not requested.fallback_confirmed
     snapshot = monitor.complete_fallback(action_line="[FALLBACK] Solis fallback verified")
-    settings = Settings(solis_fallback_current_a=35.0, max_charge_current_a=35.0)
-
-    async with HomeAssistantRest(BASE, "t") as rest:
-        await publish_soc_integrity(rest, snapshot, settings)
-
-    body = json.loads(push.calls[0].request.content)
-    assert body["state"] == "fallback_verified"
-    assert body["attributes"]["fallback_current_configured_a"] == 35.0
-    assert body["attributes"]["fallback_current_ceiling_a"] == 35
-    assert body["attributes"]["fallback_confirmed"] is True
-    assert body["attributes"]["fallback_action"] == "[FALLBACK] Solis fallback verified"
-    assert body["attributes"]["fallback_actions"] == ["[FALLBACK] Solis fallback verified"]
+    assert snapshot.state is SocOperatingState.FALLBACK_VERIFIED
+    assert snapshot.fallback_confirmed is True
+    assert snapshot.fallback_action == "[FALLBACK] Solis fallback verified"
 
 
-@respx.mock
-async def test_publish_soc_integrity_exposes_alphaess_recovery_action() -> None:
-    from ha_spark.energy.soc_monitor import SocMonitor
-
-    push = respx.post(f"{BASE}/states/sensor.ha_spark_soc_integrity").mock(
-        return_value=httpx.Response(200, json={})
-    )
+def test_monitor_exposes_alphaess_recovery_action() -> None:
     now = datetime.now(UTC)
     failed = SocMeasurement(
         status=SocStatus.STALE, observed_at=now, value=30.0,
@@ -406,11 +198,5 @@ async def test_publish_soc_integrity_exposes_alphaess_recovery_action() -> None:
     )
     monitor.record(passing, failure_threshold=1, recover_without_fallback=True)
     snapshot = monitor.complete_recovery(action_line="[RECOVERED] AlphaESS plan applied")
-
-    async with HomeAssistantRest(BASE, "t") as rest:
-        await publish_soc_integrity(rest, snapshot, Settings(inverter="alphaess"))
-
-    attrs = json.loads(push.calls[0].request.content)["attributes"]
-    assert attrs["recovery_action"] == "[RECOVERED] AlphaESS plan applied"
-    assert attrs["recovery_actions"] == ["[RECOVERED] AlphaESS plan applied"]
-    assert attrs["fallback_confirmed"] is False
+    assert snapshot.recovery_action == "[RECOVERED] AlphaESS plan applied"
+    assert snapshot.fallback_confirmed is False

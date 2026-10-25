@@ -1,30 +1,13 @@
-"""Publish the computed charge plan to HA as sensor.ha_spark_* states.
-
-ha-spark otherwise only logs its calculations and writes its own SQLite DB —
-nothing is visible in Home Assistant. This pushes the key numbers via
-``POST /api/states`` so they show up as ordinary sensors. Pushed states are
-not backed by an integration, so HA forgets them on restart; the last
-payload is cached to disk and replayed by :func:`republish_last` so a
-restarted daemon doesn't leave them ``unknown`` until the next scheduled run.
-"""
+"""Legacy plan payload for GET /api/plan, agent tools and daemon replies."""
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
-from ha_spark.authority import AuthorityStore, authority_view, operating_mode
+from ha_spark.authority import operating_mode
 from ha_spark.config import Settings
-from ha_spark.devices.inverters.solis import validated_fallback_current_a
 from ha_spark.energy.models import ChargePlan
-from ha_spark.energy.orchestrator import Decision
-from ha_spark.energy.soc_monitor import SocMonitorSnapshot
-from ha_spark.ha.rest import HomeAssistantRest
-from ha_spark.logging import get_logger
-
-log = get_logger(__name__)
 
 Entity = tuple[str, str, dict[str, Any]]
 _SOC_DERIVED_SENSORS = frozenset(
@@ -47,15 +30,10 @@ def _hide_untrusted_soc_values(entities: list[Entity]) -> list[Entity]:
     ]
 
 
-def _cache_path(settings: Settings) -> Path:
-    return Path(settings.db_path).parent / "ha_spark_published.json"
-
-
 def plan_to_payload(plan: ChargePlan, settings: Settings) -> list[Entity]:
     """Map a computed plan to the (entity_id, state, attributes) sensors.
 
-    Shared source of truth: the daemon pushes these via REST, and the add-on
-    HTTP API serves the same list so the companion integration mirrors them.
+    GET /api/plan, the agent tools and daemon replies use this legacy payload.
     """
     plan_status_attributes: dict[str, Any] = {
         "friendly_name": "ha-spark plan status",
@@ -162,149 +140,3 @@ def plan_to_payload(plan: ChargePlan, settings: Settings) -> list[Entity]:
             )
         )
     return entities if plan.soc.ok else _hide_untrusted_soc_values(entities)
-
-
-async def _push(rest: HomeAssistantRest, entities: list[Entity]) -> None:
-    for entity_id, state, attributes in entities:
-        try:
-            await rest.set_state(entity_id, state, attributes)
-        except Exception:
-            log.warning("Publishing %s failed", entity_id, exc_info=True)
-
-
-async def publish_plan(rest: HomeAssistantRest, plan: ChargePlan, settings: Settings) -> None:
-    """Push the plan's computed numbers as sensor.ha_spark_* states (best-effort)."""
-    entities = plan_to_payload(plan, settings)
-    await _push(rest, entities)
-    try:
-        path = _cache_path(settings)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(entities), encoding="utf-8")
-    except OSError:
-        log.warning("Caching published states failed", exc_info=True)
-
-
-async def publish_operating_mode(rest: HomeAssistantRest, store: AuthorityStore) -> None:
-    attributes = authority_view(store.state, known=store.known, save_failed=store.save_failed)
-    mode = str(attributes.pop("mode"))
-    await _push(rest, [("sensor.ha_spark_operating_mode", mode, attributes)])
-
-
-async def publish_soc_integrity(
-    rest: HomeAssistantRest, snapshot: SocMonitorSnapshot, settings: Settings
-) -> None:
-    """Push the per-minute SoC monitoring state as sensor.ha_spark_soc_integrity.
-
-    Deliberately a standalone sensor, not plan-status attributes: it is updated
-    every minute and must never imply a computed plan was applied. Best-effort
-    per entity, and never written to the republish cache — a restarted daemon
-    republishes a *fresh* observation, not a stale monitoring verdict.
-    """
-    m = snapshot.measurement
-    fallback_supported = any(
-        device.type == "inverter" and device.driver == "solis" for device in settings.devices
-    )
-    hardware_confirmation = "not_applicable"
-    if fallback_supported and snapshot.state.value.startswith("fallback_"):
-        hardware_confirmation = "confirmed" if snapshot.fallback_confirmed else "unconfirmed"
-    integrity_actions = []
-    if snapshot.restored_state:
-        integrity_actions.append("[RESTORED] software integrity state")
-    if snapshot.fresh_observation:
-        integrity_actions.append("[OBSERVED] fresh checked SoC measurement")
-    if snapshot.fallback_confirmed:
-        integrity_actions.append("[CONFIRMED] Solis fallback hardware read-back")
-    await _push(
-        rest,
-        [
-            (
-                "sensor.ha_spark_soc_integrity",
-                snapshot.state.value,
-                {
-                    "friendly_name": "ha-spark SoC integrity",
-                    "consecutive_failures": snapshot.consecutive_failures,
-                    "failure_threshold": snapshot.failure_threshold,
-                    "restored_state": snapshot.restored_state,
-                    "fresh_observation": snapshot.fresh_observation,
-                    "soc_status": m.status.value,
-                    "soc_reason": m.reason,
-                    "soc_value": m.value,
-                    "soc_observed_at": m.observed_at.isoformat(),
-                    "soc_reported_at": (
-                        m.reported_at.isoformat() if m.reported_at else None
-                    ),
-                    "soc_age_s": m.age_s,
-                    "soc_max_age_s": m.max_age_s,
-                    "operating_mode": operating_mode(settings),
-                    "fallback_window_start": settings.charge_window_start,
-                    "fallback_window_end": settings.charge_window_end,
-                    "fallback_supported": fallback_supported,
-                    "fallback_current_configured_a": settings.solis_fallback_current_a,
-                    "fallback_current_ceiling_a": (
-                        validated_fallback_current_a(settings) if fallback_supported else None
-                    ),
-                    "fallback_confirmed": snapshot.fallback_confirmed,
-                    "hardware_confirmation": hardware_confirmation,
-                    "integrity_actions": integrity_actions,
-                    "fallback_action": snapshot.fallback_action,
-                    "fallback_actions": (
-                        [snapshot.fallback_action] if snapshot.fallback_action else []
-                    ),
-                    "recovery_minutes": settings.soc_recovery_minutes,
-                    "recovery_since": (
-                        snapshot.recovery_since.isoformat() if snapshot.recovery_since else None
-                    ),
-                    "recovery_ready": snapshot.recovery_ready,
-                    "recovery_action": snapshot.recovery_action,
-                    "recovery_actions": (
-                        [snapshot.recovery_action] if snapshot.recovery_action else []
-                    ),
-                },
-            )
-        ],
-    )
-
-
-async def publish_predictions(
-    rest: HomeAssistantRest, decisions: list[Decision], settings: Settings
-) -> None:
-    """Surface the orchestrator's decisions as sensor.ha_spark_predictions (best-effort)."""
-    attrs: dict[str, Any] = {
-        "friendly_name": "ha-spark predictions",
-        "operating_mode": operating_mode(settings),
-        "predictions": [
-            {
-                "action": d.action,
-                "confidence": round(d.confidence, 2),
-                "reason": d.reason,
-                "outcome": d.outcome,
-            }
-            for d in decisions
-        ],
-    }
-    await _push(rest, [("sensor.ha_spark_predictions", str(len(decisions)), attrs)])
-
-
-async def republish_last(rest: HomeAssistantRest, settings: Settings) -> None:
-    """Re-push the last published payload (no-op if none is cached)."""
-    path = _cache_path(settings)
-    if not path.is_file():
-        return
-    try:
-        entities: list[Entity] = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        log.warning("Reading cached published states failed", exc_info=True)
-        return
-    status_attributes = next(
-        (
-            attributes
-            for entity_id, _, attributes in entities
-            if entity_id == "sensor.ha_spark_plan_status"
-        ),
-        {},
-    )
-    if status_attributes.get("soc_status") != "ok":
-        # Older releases cached placeholder-derived numbers; don't restore them
-        # as readings before the next plan publishes fresh, trusted SoC data.
-        entities = _hide_untrusted_soc_values(entities)
-    await _push(rest, [(e[0], e[1], e[2]) for e in entities])

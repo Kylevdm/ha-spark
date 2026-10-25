@@ -113,31 +113,16 @@ async def test_config_post_drops_retired_key_and_sidecar(tmp_path: Path, surface
 
 
 @pytest.mark.parametrize("mode", ["observe", "protect", "optimise"])
-async def test_published_payloads_report_committed_mode(tmp_path, monkeypatch, mode):
+async def test_plan_payload_reports_committed_mode(tmp_path, mode):
     from ha_spark.energy import publish
-    from ha_spark.energy.soc_monitor import SocMonitor
     from tests.authority_helpers import seed_authority
-    from tests.test_publish import _plan, _soc
+    from tests.test_publish import _plan
 
     settings = config.Settings(
         ha_url="http://ha.test", ha_token="test", db_path=str(tmp_path / "events.db")
     )
     seed_authority(settings, mode)
     entities = publish.plan_to_payload(_plan(), settings)
-    captured = []
-
-    async def capture(rest, payload):
-        captured.extend(payload)
-
-    monkeypatch.setattr(publish, "_push", capture)
-    snapshot = SocMonitor().record(_soc(40), failure_threshold=3)
-    await publish.publish_soc_integrity(None, snapshot, settings)
-    await publish.publish_predictions(None, [], settings)
-    by_id = {eid: attrs for eid, _, attrs in entities + captured}
-    for eid in (
-        "sensor.ha_spark_plan_status",
-        "sensor.ha_spark_soc_integrity",
-        "sensor.ha_spark_predictions",
-    ):
-        assert by_id[eid]["operating_mode"] == mode
-        assert "proactive_mode" not in by_id[eid]
+    by_id = {eid: attrs for eid, _, attrs in entities}
+    assert by_id["sensor.ha_spark_plan_status"]["operating_mode"] == mode
+    assert "proactive_mode" not in by_id["sensor.ha_spark_plan_status"]
