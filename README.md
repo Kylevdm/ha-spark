@@ -182,10 +182,10 @@ UI ([#247](https://github.com/Kylevdm/ha-spark/issues/247)). It adds:
 - an ingress web app for onboarding, statistics, a visual plan, chat, a manual
   override, and settings, giving every owner task a home in the UI
   ([CLI parity](https://github.com/Kylevdm/ha-spark/issues/364#issuecomment-6241994831));
-- a companion HACS integration that talks to Solis and AlphaESS inverters
-  directly, replaces the Solcast integration, and owns ha-spark's entities.
-  The add-on keeps the
-  planner and the UI, and the integration makes no planning decisions
+- a companion HACS integration, now shipping read-only plan sensors and
+  mirrors of the add-on's mode, fallback and holds. In later v1 phases it
+  takes over Solis and AlphaESS control and replaces the Solcast integration.
+  The add-on keeps the planner and the UI; the integration makes no planning decisions
   ([ADR 0005](docs/adr/0005-integration-authority-and-operating-modes.md));
 - configuration that you edit in the UI, with the Supervisor options cut down
   to the keys needed to start the add-on;
