@@ -1,0 +1,11 @@
+{
+  "domain": "ha_spark",
+  "name": "ha-spark",
+  "codeowners": ["@Kylevdm"],
+  "config_flow": true,
+  "documentation": "https://github.com/Kylevdm/ha-spark",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/Kylevdm/ha-spark/issues",
+  "requirements": [],
+  "version": "0.26.0"
+}

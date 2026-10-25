@@ -1,0 +1,78 @@
+{
+  "issues": {
+    "api_version_skew": {
+      "title": "ha-spark API versions are incompatible",
+      "description": "The ha-spark add-on release {addon_release} speaks API version {addon_api_version} (supported: {addon_supported}). The integration sent API version {integration_api_version} and supports: {supported}. Update the add-on or integration so they support a common API version, then restart the updated half."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "fallback_active": {"name": "Fallback active"},
+      "ev_hold": {"name": "EV hold"},
+      "dispatch_hold": {"name": "Dispatch hold"},
+      "addon_connected": {
+        "name": "Add-on connected"
+      }
+    },
+    "sensor": {
+      "operating_mode": {
+        "name": "Operating mode",
+        "state": {
+          "observe": "Observe",
+          "protect": "Protect",
+          "optimise": "Optimise",
+          "authority_unknown": "Authority unknown"
+        }
+      },
+      "charge_needed": {
+        "name": "Charge needed"
+      },
+      "target_soc": {
+        "name": "Target SoC"
+      },
+      "forecast_load": {
+        "name": "Forecast load"
+      },
+      "solar_forecast": {
+        "name": "Solar forecast"
+      },
+      "deficit": {
+        "name": "Deficit"
+      },
+      "planned_cost": {
+        "name": "Planned cost"
+      },
+      "baseline_cost": {
+        "name": "Baseline cost"
+      },
+      "v2l_energy": {
+        "name": "V2L energy"
+      },
+      "v2l_net_saving": {
+        "name": "V2L net saving"
+      },
+      "plan_status": {
+        "name": "Plan status"
+      },
+      "next_change": {
+        "name": "Next planned change"
+      },
+      "last_run": {
+        "name": "Last run"
+      }
+    }
+  },
+  "config": {
+    "step": {
+      "confirm": {
+        "title": "ha-spark discovered",
+        "description": "Connect the ha-spark add-on to this Home Assistant site?"
+      }
+    },
+    "abort": {
+      "already_configured": "This ha-spark site is already configured.",
+      "invalid_discovery": "The discovery is not from the ha-spark add-on or contains invalid connection data.",
+      "addon_required": "ha-spark is set up through its add-on. Install and start the ha-spark add-on: Home Assistant then discovers it and offers it here."
+    }
+  }
+}

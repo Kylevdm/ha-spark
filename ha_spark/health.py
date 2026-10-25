@@ -10,6 +10,7 @@ which the deterministic offline parser is a valid fallback).
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -69,6 +70,10 @@ class CheckResult:
 _CRITICAL = frozenset({"HA REST", "HA WS", "SQLite", "Operating mode", "Configuration"})
 
 _GLYPH = {Status.OK: "✓", Status.WARN: "⚠", Status.FAIL: "✗"}
+
+
+# Matches SiteSnapshot.release_version: version characters only, safe to print.
+_RELEASE_VERSION = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
 
 
 async def check_ha_rest(settings: Settings) -> CheckResult:
@@ -422,6 +427,36 @@ async def check_operating_mode(settings: Settings) -> CheckResult:
     return CheckResult("Operating mode", Status.OK, result.state.committed_mode)
 
 
+async def check_integration_link(settings: Settings) -> CheckResult:
+    """Read daemon-only liveness; a missing integration is never a failure.
+
+    Only validated values are printed: the reply is another process's output.
+    """
+    try:
+        reply = await submit_socket(settings, "integration_link")
+    except OSError:
+        return CheckResult("Integration link", Status.WARN, "unknown (daemon connection lost)")
+    if reply is None:
+        # The add-on's startup health runs before the daemon: no link to report is not a fault.
+        return CheckResult("Integration link", Status.OK, "unknown (no daemon running)")
+    view = reply.integration_link
+    state = view.get("state") if view is not None else None
+    if reply.error is not None or view is None or state not in (
+        "connected", "never_connected", "unreachable", "version_skew",
+    ):
+        return CheckResult("Integration link", Status.WARN, "unknown")
+    detail = str(state)
+    version = view.get("integration_release_version")
+    if isinstance(version, str) and _RELEASE_VERSION.fullmatch(version):
+        detail += f"; integration {version}"
+    age = view.get("snapshot_age_s")
+    if state == "connected" and type(age) is int and age >= 0:
+        detail += f"; snapshot age {age}s"
+    return CheckResult(
+        "Integration link", Status.OK if state == "connected" else Status.WARN, detail,
+    )
+
+
 def check_hold_release(settings: Settings) -> list[CheckResult]:
     """A WARN per owned hold whose release has been refused (#449); nothing otherwise.
 
@@ -493,6 +528,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
     results = await asyncio.gather(
         check_operating_mode(settings),
+        check_integration_link(settings),
         check_ha_rest(settings),
         *([check_notify_service(settings)] if settings.notify_service else []),
         check_ha_websocket(settings),
@@ -536,6 +572,7 @@ async def run_repair_health(bootstrap: Settings, reasons: list[str]) -> list[Che
     return [
         CheckResult("Configuration", Status.FAIL, detail),
         await check_operating_mode(bootstrap),
+        await check_integration_link(bootstrap),
     ]
 
 

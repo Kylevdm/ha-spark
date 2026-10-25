@@ -30,7 +30,6 @@ from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 from ha_spark.energy import scheduler, sources
 from ha_spark.energy.models import LoadForecast
-from ha_spark.energy.publish import publish_operating_mode
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.health import Status, check_operating_mode, exit_code
 from tests.authority_helpers import run_daemon, seed_authority
@@ -55,7 +54,6 @@ def ha(respx_mock, monkeypatch):
     rig.states["sensor.grid"] = "25000"
     rig.states["sensor.soc"] = "50"
     rig.states["sensor.solis_control_timed_charge_current"] = "40"
-    monkeypatch.setattr(scheduler, "_run_orchestrator", AsyncMock())
     monkeypatch.setattr(scheduler, "_run_derived_rerive", AsyncMock())
 
     async def respond(request: httpx.Request) -> httpx.Response:
@@ -269,7 +267,7 @@ async def test_recorded_transition_refuses_every_owner(settings, ha):
 
 
 @pytest.mark.parametrize("mode", ["observe", "protect", "optimise", "authority_unknown"])
-async def test_operating_mode_publication_and_http_health(settings, ha, mode, tmp_path):
+async def test_operating_mode_authority_and_http_health(settings, ha, mode, tmp_path):
     store = seed_authority(settings, "optimise" if mode == "authority_unknown" else mode, epoch=7)
     if mode == "authority_unknown":
         store.store_path.unlink()
@@ -280,13 +278,7 @@ async def test_operating_mode_publication_and_http_health(settings, ha, mode, tm
         body = client.get("/api/health").json()
     assert body["operating_mode"] == mode
     assert body["status"] == ("fail" if mode == "authority_unknown" else "ok")
-    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        await publish_operating_mode(rest, store)
-    requests = [call.request for call in respx.calls
-                if call.request.url.path == "/api/states/sensor.ha_spark_operating_mode"]
-    payload = json.loads(requests[-1].content)
-    assert payload["state"] == mode
-    attrs = payload["attributes"]
+    attrs = body["authority"]
     assert attrs["epoch"] == 7
     assert attrs["holds"] == []
     assert attrs["fallback"] == {"active": False, "causes": []}
@@ -366,9 +358,9 @@ async def test_fresh_and_upgrade_daemon_observe_all_paths(
     forecast.assert_awaited()
     sample.assert_awaited()
     paths = [call.request.url.path for call in respx.calls if call.request.method == "POST"]
-    assert paths.count("/api/states/sensor.ha_spark_soc_integrity") == 3
-    assert paths.count("/api/states/sensor.ha_spark_operating_mode") == 3
-    assert "/api/states/sensor.ha_spark_plan_status" in paths
+    assert not any(path.startswith("/api/states/") for path in paths)
+    monitor = json.loads((Path(settings.db_path).parent / "ha_spark_soc_monitor.json").read_text())
+    assert monitor == {"consecutive_failures": 3, "fallback_status": "fallback_threshold"}
 
 
 async def test_deleted_store_daemon_notifies_once_and_never_writes(settings, ha, monkeypatch):
@@ -561,7 +553,7 @@ async def test_refused_is_never_preview_or_recovery_evidence(settings, ha):
     assert not hardware_calls(ha)
 
 
-async def test_mode_sensor_preserves_authority_details_without_secrets(settings, ha):
+async def test_health_preserves_authority_details_without_secrets(settings, ha):
     store = seed_authority(settings, "protect", epoch=9)
     now = datetime.now(UTC)
     store.save(store.state.model_copy(update={
@@ -574,11 +566,13 @@ async def test_mode_sensor_preserves_authority_details_without_secrets(settings,
         "requester_kind": "cli",
     }))
     store.save_failed = True
-    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        await publish_operating_mode(rest, store)
-    payload = json.loads(respx.calls[-1].request.content)
-    attrs = payload["attributes"]
-    assert payload["state"] == "protect"
+    channel = DaemonChannel(settings)
+    channel.authority = store
+    state = AppState(settings, store.store_path.parent / "options.json", executor=channel)
+    with TestClient(build_app(state)) as client:
+        payload = client.get("/api/health").json()
+    attrs = payload["authority"]
+    assert payload["operating_mode"] == "protect"
     assert attrs["transition_target"] == "optimise"
     assert attrs["transition_state"] == "pending"
     assert attrs["failing_actions"] == ["charge window"]

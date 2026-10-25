@@ -5,7 +5,8 @@ The owner-only socket authenticates CLI mode requests by kernel peer uid and
 loop persists grants or runs device work; ordinary work requests add no permission.
 Config requests call the shared settings service inline and never enter the work queue.
 In configuration repair only ``config_show``, ``config_import`` and a read-only
-``authority_status`` answer; everything else is refused with ``configuration_repair``.
+``authority_status`` and ``integration_link`` answer; everything else is refused
+with ``configuration_repair``.
 Request lines are capped at 256 KiB, including the JSON envelope and newline.
 """
 from __future__ import annotations
@@ -15,12 +16,14 @@ import fcntl
 import os
 import socket
 import struct
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from ha_spark.api.contract import AuthorityInputs, IntegrationLink, link_view
 from ha_spark.authority import (
     AuthorityStore,
     OperatingMode,
@@ -34,7 +37,7 @@ from ha_spark.settings_service import RepairTokenConflict, RevisionConflict, Set
 
 MAX_CONFIG_BYTES = 256 * 1024
 Op = Literal[
-    "replan", "apply", "sync_clock", "authority_status", "mode",
+    "replan", "apply", "sync_clock", "authority_status", "integration_link", "mode",
     "config_show", "config_export", "config_save", "config_import", "config_set_secret",
 ]
 REFUSED = "[REFUSED] no ha-spark daemon running; hardware writes happen only inside the daemon"
@@ -99,6 +102,7 @@ class Reply(BaseModel):
     plan: list[dict[str, object]] = Field(default_factory=list)
     synced: bool = False
     authority: dict[str, Any] | None = None
+    integration_link: dict[str, Any] | None = None
     config: dict[str, Any] | None = None
     error: str | None = None
     reasons: list[str] = Field(default_factory=list)
@@ -125,6 +129,7 @@ class DaemonChannel:
     def __init__(self, settings: Settings) -> None:
         self.path = resolve_data_dir(settings) / "ha_spark.sock"
         self.authority: AuthorityStore | None = None
+        self.link_view: Callable[[], dict[str, object]] | None = None
         self.settings_service: SettingsService | None = None
         self.queue: asyncio.Queue[Pending] = asyncio.Queue(maxsize=64)
         # Owner mode requests skip queued work so a reply reaches the owner in one tick.
@@ -158,6 +163,8 @@ class DaemonChannel:
         return self
 
     async def __aexit__(self, *args: object) -> None:
+        # A startup cancelled before its finally ran must not leave a departed AppState bound.
+        self.link_view = None
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -178,19 +185,26 @@ class DaemonChannel:
     def _repairing(self) -> bool:
         return self.settings_service is not None and self.settings_service.repair is not None
 
-    def authority_status(self) -> dict[str, Any]:
+    def authority_inputs(self) -> AuthorityInputs:
+        """The stored authority as read now; never initialises, saves or fences."""
         if self._repairing():
             assert self.settings_service is not None
             # Repair only reads the store: no initialisation, save or fence.
             loaded = load_authority(self.settings_service.bootstrap)
-            view = authority_view(loaded.state, known=loaded.status == "known")
-            view["suspended"] = CONFIGURATION_REPAIR
-            return view
+            return AuthorityInputs(loaded.state, loaded.status == "known", False)
         store = self.authority
-        return authority_view(
-            store.state if store else None, known=store.known if store else False,
-            save_failed=store.save_failed if store else False,
+        return AuthorityInputs(
+            store.state if store else None, store.known if store else False,
+            store.save_failed if store else False,
         )
+
+    def authority_status(self) -> dict[str, Any]:
+        repairing = self._repairing()
+        inputs = self.authority_inputs()
+        view = authority_view(inputs.state, known=inputs.known, save_failed=inputs.save_failed)
+        if repairing:
+            view["suspended"] = CONFIGURATION_REPAIR
+        return view
 
     async def submit_mode(
         self, target: OperatingMode, expected_epoch: int | None, *, ingress_user: str | None = None,
@@ -222,6 +236,9 @@ class DaemonChannel:
     async def _submit(self, request: Request, ingress_user: str | None = None) -> Reply:
         if request.op == "authority_status":
             return Reply(authority=self.authority_status())
+        if request.op == "integration_link":
+            return Reply(integration_link=(self.link_view() if self.link_view else
+                         link_view(IntegrationLink(None, None, False), datetime.now(UTC))))
         if self._server is None or not self._server.is_serving():
             return Reply(error="daemon stopped")
         if self._repairing() and request.op not in ("config_show", "config_import"):

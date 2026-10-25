@@ -1,0 +1,6 @@
+{
+  "host": "37491418-ha-spark-addon",
+  "port": 8099,
+  "auth_token": "fixture-only-integration-token",
+  "session_id": "b79156f6-2fbe-4c30-ae3a-6b7fb4dd18d1"
+}

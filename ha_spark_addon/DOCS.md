@@ -17,6 +17,75 @@ Settings, presets and agent requests cannot change the operating mode.
    `ha-spark config` (see below). The add-on **Configuration** tab holds only
    `log_level`; it is not an editor for runtime settings.
 
+## Companion integration
+
+The read-only companion integration gives ha-spark's entities a place in Home
+Assistant's entity registry, on one **ha-spark** service device.
+
+1. In HACS, open **Custom repositories**, add
+   `https://github.com/Kylevdm/ha-spark`, and choose category **Integration**.
+2. Download **ha-spark**, then restart Home Assistant.
+3. With the add-on running, open **Settings → Devices & services** and accept
+   the discovered **ha-spark** integration.
+
+The add-on announces itself through Supervisor discovery. There is one entry
+per site, and an add-on restart reconnects it without another confirmation.
+Adding the integration manually points you to the add-on; there is no manual
+host, port or token form. Standalone installs do not have an integration yet.
+Installing it does not change the operating mode or any hardware control.
+
+### Entities
+
+These are the initial entity ids; you can rename them in Home Assistant.
+
+| Entity | Entity id | Notes |
+|---|---|---|
+| Charge needed | `sensor.ha_spark_charge_needed_kwh` | kWh; SoC-derived |
+| Target SoC | `sensor.ha_spark_target_soc` | %; SoC-derived |
+| Forecast load | `sensor.ha_spark_forecast_load_kwh` | kWh |
+| Solar forecast | `sensor.ha_spark_solar_forecast_kwh` | kWh; the plan's effective solar |
+| Deficit | `sensor.ha_spark_deficit_kwh` | kWh; SoC-derived |
+| Plan status | `sensor.ha_spark_plan_status` | Current action: `hold`, `export`, `charge` or `idle` |
+| Last run | `sensor.ha_spark_last_run` | Last plan time; retained across disconnection and Home Assistant restarts |
+| Planned cost | `sensor.ha_spark_planned_cost` | GBP; SoC-derived |
+| Baseline cost | `sensor.ha_spark_baseline_cost` | GBP; SoC-derived |
+| V2L energy | `sensor.ha_spark_v2l_energy_kwh` | Session kWh; total increasing |
+| V2L net saving | `sensor.ha_spark_v2l_net_saving_gbp` | Session GBP; avoided cost, refill cost and peak power attributes |
+| Next planned change | `sensor.ha_spark_next_planned_change` | Timestamp; action and reason attributes |
+| Add-on connected | `binary_sensor.ha_spark_add_on_connected` | Connectivity; last counted heartbeat attribute |
+| Operating mode | `sensor.ha_spark_operating_mode` | Read-only mirror; `observe`, `protect`, `optimise` or `authority_unknown` |
+| Fallback active | `binary_sensor.ha_spark_fallback_active` | Read-only mirror; causes attribute |
+| EV hold | `binary_sensor.ha_spark_ev_hold` | Read-only mirror; cause attribute |
+| Dispatch hold | `binary_sensor.ha_spark_dispatch_hold` | Read-only mirror; cause and trusted end attributes |
+
+Plan status describes the plan's intended action, not device read-back. Its
+attributes give the reason, model, strategy, SoC status and reason, and export
+SoC need with its time when present. Operating mode has transition target,
+last changed time and save-failed attributes. Mode, fallback and holds still
+belong to the add-on's authority store; these entities cannot change them.
+
+The integration polls every 30 seconds. A heartbeat counts only with a
+compatible API version, the accepted add-on session and a recent control-loop
+tick. **Add-on connected** goes off after 120 seconds without a counted
+heartbeat. A rejected token, changed session or incompatible API version ends
+the session at once. Losing the connection changes no authority or fallback
+behaviour in the add-on.
+
+All summary-fed entities show `unavailable` without a counted heartbeat,
+except **Last run**, which keeps its last value even when no plan exists after
+an add-on restart. **Add-on connected** itself is always available. SoC-derived
+sensors also show `unavailable` while SoC is not trusted; the V2L sensors do so
+while V2L is unconfigured or has no valid sample. A missing plan value shows
+`unknown`; **Next planned change** is `unknown` when no change is scheduled.
+
+An incompatible `api_version` raises a Home Assistant repair naming the
+versions. Update the mismatched half; the repair clears after a compatible
+heartbeat. The integration's diagnostics download includes the last plan
+summary and connection outcome, with the token and host redacted.
+`ha-spark health` and `GET /api/health` also show the integration link as
+**never connected**, **connected**, **unreachable** or **version skew**. A
+missing integration is a warning, not a planning failure.
+
 ## Operating-mode page
 
 Open **ha-spark → Open Web UI** in Home Assistant. This ingress-only page is
@@ -44,6 +113,40 @@ hardware. A queued request may still finish, so refresh before trying again.
 CLI equivalents are `ha-spark mode show`, `ha-spark mode set protect`,
 `ha-spark mode set optimise`, `ha-spark mode set observe`, and
 `ha-spark mode confirm-observe`. Only the running daemon changes authority.
+
+## Updating to 0.26.0
+
+Update the add-on first, then the integration through HACS, then restart Home
+Assistant and accept the discovery if this is your first install. The add-on
+no longer pushes any Home Assistant states, so install the integration to keep
+your plan sensors. Standalone installs no longer get those states.
+
+Either upgrade order keeps today's entity ids: before registration the
+integration removes old pushed states that have no entity registry entry.
+If an earlier attempt left an id ending in `_2`, open **Settings → Devices &
+services → Entities**, delete or rename the old entity occupying the desired
+id, then edit the new entity's id to remove `_2`. This is a one-time fix;
+check dashboards and automations for references to the old id.
+
+### Sensor and automation cutover
+
+| Removed entity | Replacement |
+|---|---|
+| `sensor.ha_spark_soc_now` | Your inverter's SoC entity |
+| `sensor.ha_spark_soc_integrity` | **Fallback active** for fallback state; SoC status and reason in **Plan status** attributes |
+| `sensor.ha_spark_v2l_power_w` | Your V2L power source entity |
+| `sensor.ha_spark_predictions` | No replacement in this release; the ingress plan view arrives later |
+
+Replace references to these removed ids in dashboards and automations.
+`sensor.ha_spark_plan_status` now shows `hold`, `export`, `charge` or `idle`,
+not the model name. Change state triggers and conditions that match old model
+names to the appropriate action values; use the `model` attribute if the
+model itself matters. The `operating_mode` attribute is removed: use
+`sensor.ha_spark_operating_mode` instead.
+
+**V2L net saving** no longer has a state class: Home Assistant doesn't accept
+`measurement` on a monetary sensor, so it keeps no new long-term statistics.
+Its history and current value are unaffected.
 
 ## Updating to 0.25.0 (cutover)
 
@@ -404,11 +507,10 @@ safety checks, as the plan's do. Leave `grid_power_entity` empty to turn the gua
 
 ### SoC integrity and fallback
 
-ha-spark checks `soc_entity` once a minute (see the `soc_*` settings above). It
-publishes the result as `sensor.ha_spark_soc_integrity`, whose state is the
-operating state and whose attributes give the failure count, the integrity
-reason and evidence, the fallback window and current ceiling, and recovery
-progress. What you see in that sensor, the log and the action lines:
+ha-spark checks `soc_entity` once a minute (see the `soc_*` settings above).
+The companion integration shows fallback state in **Fallback active** and the
+plan's SoC status and reason in **Plan status** attributes. The log and action
+lines give the detailed operating state and recovery progress:
 
 - **Blocked** (`pending_failure`): from the first failed check, real SoC-based
   programming and charge-rate increases are refused with a `[BLOCKED]` line
@@ -513,9 +615,9 @@ ha-spark learns from occupancy and away history as it builds up:
   configured `away_load_factor`.
 
 `ha-spark learn-factors` shows the current learned away factor, tomorrow's
-predicted occupancy, and any advisory habit predictions. The daemon logs those
-predictions each run, labelled with `operating_mode`. They are advisory and
-never write to hardware.
+predicted occupancy, and any advisory habit predictions. The agent's
+`get_predictions` tool also returns advisory predictions. These predictions
+never write to hardware; there is no predictions sensor.
 
 ### V2L (vehicle-to-load, optional)
 
@@ -533,8 +635,9 @@ and rectifier actuation are separate work; these actions are plan data only.
 V2L is a manual physical adapter with no control API, so ha-spark only reads
 it. When `v2l_power_entity` is set, each daemon tick reads the car's V2L
 discharge power (W), adds it to the kWh delivered this session, values that
-energy at the configured rates less conversion losses, publishes
-`sensor.ha_spark_v2l_*`, and sends HA notifications.
+energy at the configured rates less conversion losses, and sends HA
+notifications. The companion integration reads the session values in the plan
+summary.
 
 | Setting | What it must be |
 |---|---|
@@ -551,10 +654,10 @@ energy at the configured rates less conversion losses, publishes
 | `v2l_charge_kw` | DC rate the rectifier charges the house battery at (default `2.15`, the measured rate at its 10 A AC input limit). Sets the "start V2L by" time. |
 | `v2l_soc_tolerance_pct` | How many SoC points below the overnight plan's expected path, on an Axle event day, count as the plan having been wrong (default `5`). |
 
-Published sensors: `sensor.ha_spark_v2l_power_w` (current discharge power),
-`sensor.ha_spark_v2l_energy_kwh` (session total), and
-`sensor.ha_spark_v2l_net_saving_gbp` (avoided peak import minus the cheap-rate
-refill cost, which can be negative). Only part of the car's AC output offsets
+The companion integration provides `sensor.ha_spark_v2l_energy_kwh` (session
+total) and `sensor.ha_spark_v2l_net_saving_gbp` (avoided peak import minus the
+cheap-rate refill cost, which can be negative). For current discharge power,
+use your V2L power source entity. Only part of the car's AC output offsets
 import: it passes the rectifier into the house battery and then the battery's
 discharge leg, taken as the square root of `charge_efficiency`. The session tally survives restarts and
 resets at the start of a new day once the car is idle.
@@ -783,18 +886,24 @@ it recognises.
 
 ### HTTP API (for companion integrations)
 
-The daemon serves an HTTP API for the companion integration through add-on
-ingress, on port 8099. Home Assistant authenticates every request, and the
-port is not mapped to the host network. The add-on answers only connections
-from Home Assistant's ingress proxy (`172.30.32.2`); requests from any other
-address, including other add-ons on the Supervisor network, get `403`.
-Forwarding headers such as `X-Forwarded-For` are ignored. In standalone/dev
-mode (`ha_url` + `ha_token`) it listens on `http://127.0.0.1:8099` only.
-Endpoints:
+The companion integration uses `POST /integration/heartbeat` directly on the
+add-on's port 8099, not ingress or `/api/*`. It sends the site snapshot and
+receives the plan summary, using a per-boot bearer token supplied by Supervisor
+discovery. The add-on keeps that token only in memory. Requests carrying
+ingress headers get `403`, missing or bad tokens get `401`, unsupported API
+versions get a `409` version refusal, and authenticated requests in
+configuration repair get `503`. The route is not served on the agent port or
+in standalone mode. The port is not mapped to the host network.
 
-- `GET /api/health`: liveness, and when the latest plan was computed
-- `GET /api/plan`: the latest plan, as the same sensor payload the daemon
-  publishes to Home Assistant
+The separate `/api/*` ingress endpoints answer only connections from Home
+Assistant's ingress proxy (`172.30.32.2`); requests from any other address get
+`403`. Forwarding headers such as `X-Forwarded-For` are ignored. In
+standalone/dev mode (`ha_url` + `ha_token`) the listener binds only to
+`http://127.0.0.1:8099`. Ingress endpoints:
+
+- `GET /api/health`: liveness, when the latest plan was computed, and the read-only
+  integration link (state, site id, integration release and API versions, snapshot time and age)
+- `GET /api/plan`: the latest plan as sensor-style rows used by the API and agent
 - `GET /api/config`: the settings service's read view, with revision, field
   metadata, input keys and pending-restart status; secrets are set/unset only.
   In repair it returns reasons and a repair token instead.
@@ -864,7 +973,11 @@ every hardware decision.
 1. **Check the Log tab** after the first start. The add-on runs
    `ha-spark health` and prints one line per check: HA REST, HA WebSocket,
    Ollama, SQLite, load history, supply guard, tariff provider, household
-   clock, inverter clock (Solis only), notify service (when configured), and entity config.
+   clock, inverter clock (Solis only), notify service (when configured), entity config,
+   and integration link. The link is connected, never connected, unreachable after
+   90 seconds, or version skew. With no daemon running (as in the startup check, which runs
+   before the daemon) the link is unknown and not flagged. A missing or disconnected integration
+   is a warning, never a failure, including in configuration repair.
 2. **Map your entities.** From a shell in the add-on container (e.g. the SSH
    add-on with `docker exec -it addon_<slug> sh`, or the add-on's own
    terminal), run `ha-spark onboard`. It scans your HA entities and proposes

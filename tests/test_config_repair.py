@@ -258,8 +258,8 @@ async def repairing_daemon(path: Path, monkeypatch: pytest.MonkeyPatch):
                         record("reconcile", ReconcileResult([], None)))
     monkeypatch.setattr(scheduler, "_mode_lifecycle", record("lifecycle"))
     monkeypatch.setattr(scheduler, "run_once", record("run_once"))
-    for name in ("sample_signals", "republish_last", "record_slot", "record_closed_days",
-                 "readiness_tick", "publish_operating_mode", "notify_remapped_holds"):
+    for name in ("sample_signals", "record_slot", "record_closed_days",
+                 "readiness_tick", "notify_remapped_holds"):
         monkeypatch.setattr(scheduler, name, record(name))
     settings = Settings()
     task = asyncio.create_task(scheduler.run_forever(settings, poll_seconds=0))

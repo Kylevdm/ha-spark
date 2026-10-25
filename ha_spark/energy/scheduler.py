@@ -40,7 +40,7 @@ recovery ready (#117); each tick then computes a fresh plan from that tick's
 measurement and applies it, leaving fallback only once the apply reads back
 clean. A recovered apply that is not fully verified re-applies the fallback on
 the same tick and records its verdict (#423), so the unconfirmed or verified
-state is published at once, and the next recovery attempt waits five minutes;
+state is recorded at once, and the next recovery attempt waits five minutes;
 an unconfirmed re-apply is retried every minute of that wait, because the
 per-minute fallback path deliberately stays quiet while recovery is ready.
 AlphaESS has no fallback request: after the threshold it stays blocked until
@@ -52,7 +52,7 @@ authority store owns *fallback active* and its causes (phase 2: the only cause
 is SoC integrity) and is saved, with a bumped epoch, before the fallback write
 is requested; entry and exit each notify once, and exit clears the store only
 after the recovered plan applied and read back. Observe and Protect still
-count, persist and publish pending failure and threshold crossings but never
+count and persist pending failure and threshold crossings but never
 request a fallback write.
 
 Owner mode requests are accepted only here, persisted under the inverter bus
@@ -73,10 +73,12 @@ stay gaps; mid-slot requests never rewrite a slot. Recording failures are isolat
 from __future__ import annotations
 
 import asyncio
+import socket
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
+from datetime import datetime as utc_datetime
 from typing import NamedTuple
 from uuid import uuid4
 
@@ -128,16 +130,8 @@ from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
-from ha_spark.energy.orchestrator import orchestrate
 from ha_spark.energy.plan_run import current_plan
-from ha_spark.energy.publish import (
-    plan_to_payload,
-    publish_operating_mode,
-    publish_plan,
-    publish_predictions,
-    publish_soc_integrity,
-    republish_last,
-)
+from ha_spark.energy.publish import plan_to_payload
 from ha_spark.energy.readiness import readiness_tick
 from ha_spark.energy.readiness_ledger import PlanRevision, record_guard, record_slot, slot_start
 from ha_spark.energy.readiness_measurements import record_closed_days
@@ -156,6 +150,7 @@ from ha_spark.energy.tariff import _in_overnight_window as in_window
 from ha_spark.energy.v2l import run_v2l_tick, run_v2l_topup, warn_deprecated_notify_target
 from ha_spark.ha.notifier import send_notification
 from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.integration_discovery import IntegrationDiscovery
 from ha_spark.logging import get_logger
 from ha_spark.mode_preconditions import check_preconditions
 from ha_spark.settings_service import ConfigurationRepair, SettingsService
@@ -439,14 +434,12 @@ async def run_once(
             lines.append("[SKIP] charge setpoint unchanged")
         for line in lines:
             log.info(line)
-        await publish_plan(rest, plan, settings)
         if settings.v2l_power_entity:
             try:
                 await run_v2l_topup(settings, rest, plan, inputs.flexibility_event, now)
             except Exception:  # noqa: BLE001 - a request never breaks a plan run
                 log.warning("V2L top-up request failed", exc_info=True)
     await _record_forecast(settings, plan, run.forecast, getattr(run.inputs, "geometry", None))
-    await _run_orchestrator(settings)
     await _run_derived_rerive(settings)
     return RunResult(
         plan, applied_plan, tuple(apply_lines),
@@ -454,22 +447,6 @@ async def run_once(
         tuple(lines),
         revision,
     )
-
-
-async def _run_orchestrator(settings: Settings) -> None:
-    """Compute proactive decisions for tomorrow and publish them (best-effort).
-
-    Isolated so a failure here never aborts the daily run. Nothing is executed
-    yet — decisions are advisory; this is the seam later proactivity hangs off.
-    """
-    try:
-        decisions = await orchestrate(settings)
-        async with HomeAssistantRest(
-            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
-        ) as rest:
-            await publish_predictions(rest, decisions, settings)
-    except Exception:
-        log.exception("Proactive orchestrator failed")
 
 
 async def _run_derived_rerive(settings: Settings) -> None:
@@ -1306,8 +1283,11 @@ def _log_action_lines(action_lines: list[ActionLine | str]) -> None:
             log.info(line)
 
 
-async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasurement | None:
-    """One per-minute SoC observation: check, count once, publish. Never raises.
+async def soc_monitor_tick(
+    settings: Settings, monitor: SocMonitor,
+    on_observed: Callable[[SocMeasurement], None] | None = None,
+) -> SocMeasurement | None:
+    """One per-minute SoC observation: check, count once, persist. Never raises.
 
     The daemon loop's sole SoC observation cadence (#114): the returned
     measurement is the one every consumer this tick (planning, device
@@ -1322,7 +1302,10 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
         ) as rest:
             measurement = await observe_soc(settings, rest, monitor=monitor)
-            snapshot = monitor.record(
+            if on_observed is not None:
+                # Display only (#481): publish the verdict before the awaits below.
+                on_observed(measurement)
+            monitor.record(
                 measurement,
                 failure_threshold=settings.soc_failure_threshold,
                 recovery_duration=timedelta(minutes=settings.soc_recovery_minutes),
@@ -1383,7 +1366,7 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
                             )
                         ]
                     action_line = _fallback_verdict_line(action_lines)
-                    snapshot = monitor.complete_fallback(action_line=action_line)
+                    monitor.complete_fallback(action_line=action_line)
                     _log_action_lines(action_lines)
                     if entered:
                         log.info(
@@ -1392,7 +1375,6 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
                             FALLBACK_CAUSE_SOC_INTEGRITY,
                         )
                         await _notify_fallback_entered(settings, rest)
-            await publish_soc_integrity(rest, snapshot, settings)
             return measurement
     except Exception:
         log.exception("SoC monitor tick failed; will retry next minute")
@@ -1402,7 +1384,7 @@ async def soc_monitor_tick(settings: Settings, monitor: SocMonitor) -> SocMeasur
 async def _reapply_fallback(
     settings: Settings, monitor: SocMonitor, measurement: SocMeasurement | None
 ) -> bool:
-    """#423: re-apply the fallback now and publish its verdict. Never raises.
+    """#423: re-apply the fallback now and record its verdict. Never raises.
 
     Only the recovery path calls this: ``request_fallback`` returns ``None``
     while recovery is ready, so the per-minute path cannot re-program a
@@ -1410,8 +1392,8 @@ async def _reapply_fallback(
     device action, gate, schedule validation and read-back as entry; the
     store is already active, so there is no epoch bump and no notice.
     Returns whether an attempt was made (Optimise, Solis, a configured
-    fallback current): the verdict, verified or failed, is recorded and
-    published either way, and a failed attempt is retried by the next call.
+    fallback current): the verdict, verified or failed, is recorded
+    either way, and a failed attempt is retried by the next call.
     """
     inverter = next((device for device in settings.devices if device.type == "inverter"), None)
     if (
@@ -1445,7 +1427,6 @@ async def _reapply_fallback(
                 ]
             snapshot = monitor.complete_fallback(action_line=_fallback_verdict_line(action_lines))
             _log_action_lines(action_lines)
-            await publish_soc_integrity(rest, snapshot, settings)
             return True
     except Exception:
         log.exception("Solis fallback re-apply failed; will retry next minute")
@@ -1462,13 +1443,6 @@ async def _reapply_fallback(
         except Exception:
             log.exception("Recording the failed fallback re-apply failed")
             return True
-    try:
-        async with HomeAssistantRest(
-            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
-        ) as rest:
-            await publish_soc_integrity(rest, snapshot, settings)
-    except Exception:
-        log.exception("Publishing the fallback re-apply verdict failed")
     return True
 
 
@@ -1493,7 +1467,7 @@ async def finish_recovery(
     is this tick's observation, carried by the same-tick fallback re-apply.
     A failed apply may have changed the resident program, so a verified
     fallback loses its confirmation and is re-applied and re-verified on this
-    same tick (#423), with its verdict published; the store's fallback stays
+    same tick (#423), with its verdict recorded; the store's fallback stays
     active (no epoch bump, no notice). Returns whether the recovery backoff
     started: the next recovery attempt then waits five minutes, while an
     unconfirmed re-apply is retried every minute of that wait by the loop.
@@ -1515,7 +1489,7 @@ async def finish_recovery(
         else:
             action = f"[RECOVERED] normal programming resumed: {line}"
         log.info(action)
-        snapshot = monitor.complete_recovery(action_line=action)
+        monitor.complete_recovery(action_line=action)
         left = False
         try:
             # #422: the store's fallback active + cause are cleared and the
@@ -1544,12 +1518,11 @@ async def finish_recovery(
         async with HomeAssistantRest(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
         ) as rest:
-            await publish_soc_integrity(rest, snapshot, settings)
             if left:
                 log.info("SoC integrity: fallback exit persisted in the authority store")
                 await _notify_fallback_left(settings, rest)
     except Exception:
-        log.exception("Publishing the SoC recovery transition failed")
+        log.exception("Notifying the SoC recovery transition failed")
     return False
 
 
@@ -1783,26 +1756,31 @@ async def _mode_lifecycle(
                     await _notify_fallback_left(settings, rest)
 
 
-def _ingress_server(state: AppState) -> uvicorn.Server:
+def _ingress_server(
+    state: AppState, discovery: IntegrationDiscovery | None = None,
+) -> uvicorn.Server:
     """The ingress listener for ``state``.
 
     Add-on mode: listen on all interfaces (the ingress proxy connects over the
-    hassio network) but answer only the proxy's address. Standalone/dev has no
-    ingress proxy, so bind to loopback and let the OS keep the network out.
+    hassio network); ingress answers only the proxy, integration uses its token.
+    Standalone/dev has no ingress proxy, so bind to loopback and let the OS
+    keep the network out.
     """
     if state.settings_service.bootstrap.is_standalone:
         return make_server(build_app(state), "127.0.0.1", INGRESS_PORT)
     return make_server(
-        build_app(state, ingress_peer=INGRESS_PROXY_IP),
-        "0.0.0.0",  # noqa: S104 - peer-restricted to the ingress proxy
+        build_app(state, ingress_peer=INGRESS_PROXY_IP, integration=discovery),
+        "0.0.0.0",  # noqa: S104 - ingress peer check or integration bearer auth
         INGRESS_PORT,
     )
 
 
-async def _serve_repair(service: SettingsService, channel: DaemonChannel) -> None:
+async def _serve_repair(
+    service: SettingsService, channel: DaemonChannel, discovery: IntegrationDiscovery | None = None,
+) -> None:
     """Configuration repair: serve only the fix until an import commits.
 
-    Only the socket (config show/import, authority status) and the ingress
+    Only the socket (config show/import, authority status, integration link) and the ingress
     app's config, health and mode-status routes answer. No scheduler, driver,
     SoC monitor, readiness recording, published port, transition, hold,
     shutdown safe-state or clock sync runs, and authority is only ever read.
@@ -1813,19 +1791,27 @@ async def _serve_repair(service: SettingsService, channel: DaemonChannel) -> Non
     )
     state = AppState(settings=service.bootstrap, options_path=OPTIONS_PATH, executor=channel,
                      settings_service=service)
-    server = _ingress_server(state)
+    channel.link_view = state.integration_link_view
+    server = _ingress_server(state) if discovery is None else _ingress_server(state, discovery)
     repaired = asyncio.Event()
     service.on_repaired = repaired.set
     serve_task: asyncio.Task[None] | None = None
     try:
         serve_task = await serve_in_background(server)
+        if discovery is not None:
+            discovery.start()
     except Exception:
         log.exception("HTTP API failed to start; continuing without it")
     try:
         if service.repair is not None:
             await repaired.wait()
+    except asyncio.CancelledError:
+        if discovery is not None:
+            await discovery.cancel_announcement()
+        raise
     finally:
         service.on_repaired = None
+        channel.link_view = None
         state.executor = None
         if serve_task is not None:
             await stop_server(server, serve_task)
@@ -1833,6 +1819,22 @@ async def _serve_repair(service: SettingsService, channel: DaemonChannel) -> Non
 
 async def _run_forever(
     settings: Settings, channel: DaemonChannel, *, poll_seconds: int
+) -> None:
+    """Keep one boot identity through repair, normal operation and shutdown."""
+    discovery = None if settings.is_standalone else IntegrationDiscovery(
+        supervisor_token=settings.supervisor_token, host=socket.gethostname(),
+    )
+    try:
+        await _run_paired(settings, channel, poll_seconds=poll_seconds, discovery=discovery)
+    finally:
+        if discovery is not None:
+            await discovery.cancel_announcement()
+            await discovery.withdraw()
+
+
+async def _run_paired(
+    settings: Settings, channel: DaemonChannel, *, poll_seconds: int,
+    discovery: IntegrationDiscovery | None,
 ) -> None:
     """Loop: recompute and apply the plan once per local half-hour slot.
 
@@ -1848,12 +1850,16 @@ async def _run_forever(
             settings = service.load(writable=True)
             break
         except ConfigurationRepair:
-            await _serve_repair(service, channel)
+            if discovery is None:
+                await _serve_repair(service, channel)
+            else:
+                await _serve_repair(service, channel, discovery)
     service.request_replan = channel.request_replan
     warn_deprecated_notify_target(settings)
     state = AppState(settings=settings, options_path=OPTIONS_PATH, executor=channel,
                      settings_service=service)
-    server = _ingress_server(state)
+    channel.link_view = state.integration_link_view
+    server = _ingress_server(state) if discovery is None else _ingress_server(state, discovery)
     authority = AuthorityStore(settings)
     try:
         authority.start_process()
@@ -1867,6 +1873,8 @@ async def _run_forever(
     serve_task: asyncio.Task[None] | None = None
     try:
         serve_task = await serve_in_background(server)
+        if discovery is not None:
+            discovery.start()
         log.info("HTTP API listening on :%d (ingress)", INGRESS_PORT)
     except Exception:
         log.exception("HTTP API failed to start; continuing without it")
@@ -1894,13 +1902,6 @@ async def _run_forever(
             settings.grid_power_entity,
             settings.supply_max_current_a,
         )
-    try:
-        async with HomeAssistantRest(
-            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
-        ) as rest:
-            await republish_last(rest, settings)
-    except Exception:
-        log.exception("Republishing last known states failed")
     last_run_slot: datetime | None = None
     last_plan: ChargePlan | None = None
     last_revision: PlanRevision | None = None
@@ -1967,9 +1968,8 @@ async def _run_forever(
                         log.warning("%s; hardware writes refused", fault)
                         await send_notification(settings, rest, "ha-spark authority fault", fault)
                     await notify_remapped_holds(settings, rest)
-                    await publish_operating_mode(rest, authority)
             except Exception:
-                log.warning("Authority publication failed")
+                log.warning("Authority notification failed")
             faults = current_faults
             context.planned_epoch.set(authority.state.epoch if authority.state else None)
             if settings is not last_settings:
@@ -2024,7 +2024,11 @@ async def _run_forever(
                     last_reconcile_lines, last_trusted_holds = startup_result[:2]
             # Sole SoC observation cadence (#114): one checked measurement per
             # minute in every operating state, reused by everything below.
-            measurement = await soc_monitor_tick(settings, monitor)
+            def _observed(observed: SocMeasurement) -> None:
+                state.soc_observation_ok = observed.ok
+
+            measurement = await soc_monitor_tick(settings, monitor, _observed)
+            state.soc_observation_ok = measurement is not None and measurement.ok
             solis_fallback_active = monitor.fallback_active and any(
                 device.type == "inverter" and device.driver == "solis"
                 for device in settings.devices
@@ -2064,7 +2068,7 @@ async def _run_forever(
                     fallback_confirmed = solis_fallback_active and monitor.fallback_confirmed
             # Set once `run_once` has *returned*, because it makes its own
             # reconcile pass with the plan it just computed. A run that raises
-            # after that pass (`apply` or `publish_plan`) therefore falls back
+            # after that pass therefore falls back
             # below as well: one extra read-first pass against `last_plan`,
             # which is what every tick in that failure window steers by anyway,
             # so it costs a duplicate read rather than new stale exposure.
@@ -2305,8 +2309,12 @@ async def _run_forever(
                     await run_v2l_tick(settings, now)
                 except Exception:
                     log.exception("V2L tick failed; will retry next tick")
+            # The real clock: tests replace this module's ``datetime`` to script ``now``.
+            state.loop_tick = utc_datetime.now(UTC)
             await asyncio.sleep(poll_seconds)
     finally:
+        if discovery is not None:
+            await discovery.cancel_announcement()
         if readiness_task is not None:
             readiness_task.cancel()
             await asyncio.gather(readiness_task, return_exceptions=True)
@@ -2359,3 +2367,4 @@ async def _run_forever(
         context.authority = None
         context.planned_epoch.set(None)
         channel.authority = None
+        channel.link_view = None

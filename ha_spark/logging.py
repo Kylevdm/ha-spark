@@ -10,6 +10,9 @@ _CONFIGURED = False
 def setup_logging(level: str = "INFO") -> None:
     """Configure root logging once, idempotently."""
     global _CONFIGURED
+    # httpcore's DEBUG trace logs response status lines and headers, which can
+    # carry a Supervisor's or supplier's reason phrase; it never logs above DEBUG.
+    logging.getLogger("httpcore").setLevel(logging.INFO)
     if _CONFIGURED:
         logging.getLogger().setLevel(level.upper())
         return
