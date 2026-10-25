@@ -1,4 +1,9 @@
 {
+  "entity": {
+    "binary_sensor": {
+      "addon_connected": {"name": "Add-on connected"}
+    }
+  },
   "config": {
     "step": {
       "confirm": {
