@@ -41,10 +41,11 @@ class SiteSnapshot(BaseModel):
 
     @field_validator("sent_at", mode="before")
     @classmethod
-    def string_timestamp(cls, value: object) -> datetime:
+    def string_timestamp(cls, value: object) -> object:
+        # Pydantic parses the string (RFC 3339, strict offsets); refuse its unix-number form.
         if not isinstance(value, str):
             raise ValueError("timestamp must be a string")
-        return datetime.fromisoformat(value)
+        return value
 
     @field_validator("sent_at")
     @classmethod

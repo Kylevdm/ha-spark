@@ -193,7 +193,10 @@ async def test_golden_envelope_and_no_mutation(state, discovery, monkeypatch):
     before = (state.current_options(), state.settings_service.revision,
               state.settings.model_dump(), state.plan, state.plan_at)
     authority_before = load_authority(state.settings)
-    response = await request(state, discovery, content=SNAPSHOT_BODY,
+    # Planning-input-like fields ride along; they must be dropped, never applied.
+    injected = json.loads(SNAPSHOT_BODY) | {"mode": "optimise", "operating_mode": "optimise",
+                                            "fallback": {"active": True}, "holds": [CANARY]}
+    response = await request(state, discovery, content=json.dumps(injected).encode(),
                              headers={"Authorization": f"Bearer {discovery.auth_token}"})
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
@@ -267,7 +270,8 @@ def test_version_skew_keeps_snapshot_and_returns_refusal(state, discovery, versi
     ("release_version", 1), ("site_id", CANARY), ("site_id", None),
     ("site_id", 123), ("sent_at", "2026-10-24T12:00:00"), ("sent_at", 123),
     ("sent_at", None), ("sent_at", "0001-01-01T00:00:00+14:00"),
-    ("sent_at", "9999-12-31T23:59:59-14:00"),
+    ("sent_at", "9999-12-31T23:59:59-14:00"), ("sent_at", "2026-10-24T12:00:00+00:60"),
+    ("sent_at", "2026-10-24T12:00:00+01:99"), ("sent_at", "2026-10-24T12:00:00+00:00:60"),
 ])
 def test_invalid_snapshot_does_not_mutate_or_echo(state, discovery, caplog, field, value):
     caplog.set_level(logging.DEBUG)
