@@ -1,16 +1,16 @@
-"""Add-on HTTP API served behind add-on ingress.
+"""Add-on HTTP API with separate ingress and integration auth on port 8099.
 
-The companion HA integration drives ha-spark through this API instead of the
-daemon pushing states directly: it reads the latest plan (to create entities)
-and reads/writes user options (onboarding + settings). Runs in the daemon's
+The companion integration uses a per-boot bearer credential on the isolated
+``/integration`` surface, which refuses ingress headers. Ingress retains its
+peer and owner-header checks, including for mounted apps. Runs in the daemon's
 event loop (see :mod:`ha_spark.energy.scheduler`).
 
 Auth: the ingress listener is not mapped to the host network, but other
 containers on the Supervisor's internal network can reach it, so the handlers
 do not trust their caller by default. In add-on mode the ingress app is built
-with ``ingress_peer=INGRESS_PROXY_IP`` and answers 403 to any request whose
+with ``ingress_peer=INGRESS_PROXY_IP`` and answers 403 to ingress requests whose
 socket peer is not HA's ingress proxy (which authenticates the user);
-forwarding headers are ignored. In standalone/dev mode the listener binds to
+forwarding headers cannot bypass the peer check. In standalone/dev mode the listener binds to
 loopback only. The published agent port is gated by a bearer token instead.
 
 Owner-only routes (the mode page, ``/api/mode`` and ``/api/config``) exist
@@ -24,6 +24,7 @@ In configuration repair only the mode page and status, the config read,
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -37,11 +38,13 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, Validat
 
 from ha_spark.agent import auth, tools
 from ha_spark.agent.exposure import OPERATION_TIERS, allowed, surface_on
+from ha_spark.api.contract import plan_summary
 from ha_spark.authority import OperatingMode, authority_view, load_authority
 from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import DaemonChannel
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.publish import plan_to_payload
+from ha_spark.integration_discovery import IntegrationDiscovery
 from ha_spark.logging import get_logger
 from ha_spark.mode_preconditions import entry_preconditions
 from ha_spark.settings_service import OPTIONS_PATH as OPTIONS_PATH
@@ -301,14 +304,21 @@ def build_app(
     require_token: bool = False,
     token: str = "",
     ingress_peer: str | None = None,
+    integration: IntegrationDiscovery | None = None,
 ) -> FastAPI:
     """Build the FastAPI app with the API routes bound to ``state``.
 
     ``require_token``/``token`` gate every route (including ``/api/*``) behind
     bearer auth -- used by the published port (Task 9). ``ingress_peer``, set
-    for the add-on ingress listener, answers 403 to every request (``/mcp``
-    included) whose socket peer is not that address.
+    for the add-on ingress listener, answers 403 to ingress requests (``/mcp``
+    included) whose socket peer is not that address. ``integration`` isolates
+    the heartbeat namespace under its per-boot credential before those checks.
     """
+    if integration is not None and (
+        require_token or ingress_peer is None or state.settings_service.bootstrap.is_standalone
+    ):
+        raise ValueError("Integration requires the add-on ingress listener")
+
     # Local import: mcp_server does ``from ha_spark.api.server import AppState``,
     # so a module-top import would cycle.
     from ha_spark.agent.mcp_server import build_mcp
@@ -333,6 +343,8 @@ def build_app(
     app.add_middleware(_RepairGate, state=state)
     if ingress_peer is not None:
         app.add_middleware(_PeerGate, peer=ingress_peer)
+    if integration is not None:
+        app.add_middleware(_IntegrationGate, state=state, integration=integration)
 
     if require_token:
 
@@ -570,6 +582,86 @@ def _origin_gated(asgi_app: Any) -> Any:
 
 def _has_origin(scope: Any) -> bool:
     return any(name.lower() == b"origin" for name, _ in scope.get("headers", []))
+
+
+_HEARTBEAT_MAX_BODY = 16 * 1024
+
+
+def _heartbeat_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _reject_constant(name: str) -> object:
+    """``NaN`` and ``Infinity`` aren't JSON; ``json.loads`` accepts them by default."""
+    raise ValueError(name)
+
+
+def _integration_app(integration: IntegrationDiscovery) -> FastAPI:
+    # No slash redirect: its Location would echo the request's query string.
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
+
+    @app.post("/integration/heartbeat")
+    async def heartbeat(request: Request) -> JSONResponse:
+        invalid = JSONResponse({"error": "invalid heartbeat"}, status_code=400)
+        try:
+            length = request.headers.get("content-length")
+            if length is not None and int(length) > _HEARTBEAT_MAX_BODY:
+                return invalid
+            body = bytearray()
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > _HEARTBEAT_MAX_BODY:
+                    return invalid
+                body.extend(chunk)
+            if not isinstance(json.loads(body, parse_constant=_reject_constant), dict):
+                return invalid
+        except (ValueError, RecursionError):
+            return invalid
+        return JSONResponse(
+            plan_summary(session_id=integration.session_id, built_at=_heartbeat_now()),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return app
+
+
+class _IntegrationGate:
+    """Own the integration namespace before ingress peer and repair checks.
+
+    Classifies on the raw ``scope["path"]``, as the router does only while
+    ``root_path`` is empty; :func:`make_server` never sets one.
+    """
+
+    def __init__(self, app: Any, state: AppState, integration: IntegrationDiscovery) -> None:
+        self.app = app
+        self.state = state
+        self.integration = integration
+        self.heartbeat_app = _integration_app(integration)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] not in ("http", "websocket") or not (
+            scope["path"] == "/integration" or scope["path"].startswith("/integration/")
+        ):
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        headers = [(k.lower(), v) for k, v in scope.get("headers", [])]
+        authorization = next((v.decode("latin-1") for k, v in headers
+                              if k == b"authorization"), None)
+        if any(k in (b"x-ingress-path", b"x-hass-source") or k.startswith(b"x-remote-user-")
+               for k, _ in headers):
+            response = JSONResponse({"error": "forbidden"}, status_code=403)
+        elif (authorization is not None and not authorization.isascii()) or not auth.verify(
+            authorization, self.integration.auth_token,
+        ):
+            response = JSONResponse({"error": "invalid or missing token"}, status_code=401)
+        elif self.state.settings_service.repair is not None:
+            response = JSONResponse({"error": "configuration_repair"}, status_code=503)
+        else:
+            await self.heartbeat_app(scope, receive, send)
+            return
+        await response(scope, receive, send)
 
 
 class _RepairGate:
