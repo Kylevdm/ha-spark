@@ -160,11 +160,11 @@ async def test_liveness_outcomes(
         "503": "server_error", "500": "server_error", "400": "malformed",
         "json": "malformed", "oversized": "malformed", "stale": "stale_tick",
         "future": "future_tick", "null": "null_tick", "401": "unauthorized",
-        "session": "session_mismatch", "409": "version_refused",
+        "session": "session_mismatch", "409": "malformed",
     }.get(outcome, outcome)
     assert coordinator.last_outcome == expected
     assert coordinator.last_outcome_at == dt_util.utcnow()
-    ended = outcome in {"401", "session"}
+    ended = outcome in {"401", "session", "incompatible"}
     assert state_value(hass) == ("off" if ended else "on")
     assert TOKEN not in caplog.text
     assert TOKEN not in str(coordinator.last_outcome)

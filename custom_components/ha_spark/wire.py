@@ -15,6 +15,7 @@ compare their constant with `tests/fixtures/contract/contract.json`, so neither
 half can move a contract version alone.
 """
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final
@@ -42,16 +43,56 @@ class Summary:
     commands_pending: bool
 
 
-def build_snapshot(*, site_id: str, release_version: str, sent_at: datetime) -> dict[str, object]:
+def build_snapshot(
+    *, site_id: str, release_version: str, sent_at: datetime, api_version: int = API_VERSION,
+) -> dict[str, object]:
     """Build the identity-only snapshot for api_version 1."""
     if str(UUID(site_id)) != site_id or sent_at.utcoffset() is None:
         raise ValueError("Invalid snapshot identity or time")
     return {
-        "api_version": API_VERSION,
+        "api_version": api_version,
         "release_version": release_version,
         "site_id": site_id,
         "sent_at": sent_at.astimezone(UTC).isoformat(),
     }
+
+
+@dataclass(frozen=True)
+class VersionEnvelope:
+    """Frozen version metadata, safe to display even for an unsupported body."""
+
+    api_version: int
+    release_version: str
+    supported_api_versions: frozenset[int] | None = None
+
+
+def parse_version_envelope(body: object) -> VersionEnvelope:
+    """Validate the frozen envelope before inspecting version-specific fields."""
+    if not isinstance(body, dict):
+        raise MalformedSummary()
+    version = body.get("api_version")
+    release = body.get("release_version")
+    if (
+        type(version) is not int or version < 1
+        or not isinstance(release, str)
+        or re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}", release) is None
+    ):
+        raise MalformedSummary()
+    return VersionEnvelope(version, release)
+
+
+def parse_refusal(body: object) -> VersionEnvelope:
+    """Validate a refusal without retaining unknown fields or error contents."""
+    envelope = parse_version_envelope(body)
+    assert isinstance(body, dict)
+    supported = body.get("supported_api_versions")
+    if (
+        not isinstance(supported, list) or not 1 <= len(supported) <= 16
+        or any(type(version) is not int or version < 1 for version in supported)
+        or len(set(supported)) != len(supported)
+    ):
+        raise MalformedSummary()
+    return VersionEnvelope(envelope.api_version, envelope.release_version, frozenset(supported))
 
 
 def _timestamp(value: object) -> datetime:

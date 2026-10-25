@@ -12,7 +12,8 @@ from enum import StrEnum
 
 import aiohttp
 
-from .wire import SUPPORTED_API_VERSIONS, Summary, parse_summary
+from . import wire
+from .wire import Summary, VersionEnvelope
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class Outcome(StrEnum):
     UNAUTHORIZED = "unauthorized"
     SESSION_MISMATCH = "session_mismatch"
     VERSION_REFUSED = "version_refused"
+    VERSION_SKEW = "version_skew"
     INCOMPATIBLE = "incompatible"
 
 
@@ -40,6 +42,7 @@ class PollResult:
 
     outcome: Outcome
     summary: Summary | None = None
+    envelope: VersionEnvelope | None = None
 
 
 async def async_poll(
@@ -53,11 +56,9 @@ async def async_poll(
         ) as response:
             if response.status == 401:
                 return PollResult(Outcome.UNAUTHORIZED)
-            if response.status == 409:
-                return PollResult(Outcome.VERSION_REFUSED)
             if 500 <= response.status < 600:
                 return PollResult(Outcome.SERVER_ERROR)
-            if response.status != 200:
+            if response.status not in {200, 409}:
                 return PollResult(Outcome.MALFORMED)
             # read(n) returns what has arrived so far, so collect chunks up to the cap.
             stream = response.content
@@ -67,11 +68,12 @@ async def async_poll(
                 if len(raw) > 65536:
                     return PollResult(Outcome.MALFORMED)
             body = json.loads(raw)
-            # Read the frozen version envelope before the version-specific body.
-            if isinstance(body, dict) and type(body.get("api_version")) is int:
-                if body["api_version"] > 0 and body["api_version"] not in SUPPORTED_API_VERSIONS:
-                    return PollResult(Outcome.INCOMPATIBLE)
-            return PollResult(Outcome.COUNTED, parse_summary(body))
+            if response.status == 409:
+                return PollResult(Outcome.VERSION_REFUSED, envelope=wire.parse_refusal(body))
+            envelope = wire.parse_version_envelope(body)
+            if envelope.api_version not in wire.SUPPORTED_API_VERSIONS:
+                return PollResult(Outcome.INCOMPATIBLE, envelope=envelope)
+            return PollResult(Outcome.COUNTED, wire.parse_summary(body), envelope)
     except TimeoutError:
         return PollResult(Outcome.TIMEOUT)
     except aiohttp.ClientError:

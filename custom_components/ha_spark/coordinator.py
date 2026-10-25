@@ -11,12 +11,15 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
+from . import wire
 from .channel import Outcome, PollResult, async_poll
+from .const import DOMAIN
 from .wire import Summary, build_snapshot
 
 _LOGGER = logging.getLogger(__name__)
@@ -30,6 +33,8 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                          update_interval=timedelta(seconds=30))
         self.entry = entry
         self.release_version = release_version
+        self.api_version = max(wire.SUPPORTED_API_VERSIONS)
+        self.addon_api_version: int | None = None
         self.connected = False
         self.last_counted: datetime | None = None
         # The latest counted summary; entities show it only while connected.
@@ -69,24 +74,41 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         if not self._running or self._ended:
             return self.connected
         data = self.entry.data
+        api_version = self.api_version
+        envelope = None
         try:
             snapshot = build_snapshot(site_id=data["site_id"],
                                       release_version=self.release_version,
-                                      sent_at=dt_util.utcnow())
+                                      sent_at=dt_util.utcnow(), api_version=api_version)
         except (KeyError, ValueError):
             # Raised text would carry the stored value; HA logs an update's exceptions.
             result = PollResult(Outcome.MALFORMED)
         else:
-            result = await async_poll(
-                async_get_clientsession(self.hass),
-                url=f"http://{data['host']}:{data['port']}/integration/heartbeat",
-                token=data["auth_token"],
-                snapshot=snapshot,
-            )
+            session = async_get_clientsession(self.hass)
+            url = f"http://{data['host']}:{data['port']}/integration/heartbeat"
+            result = await async_poll(session, url=url, token=data["auth_token"], snapshot=snapshot)
+            envelope = result.envelope
+            if result.outcome is Outcome.VERSION_REFUSED:
+                assert envelope is not None and envelope.supported_api_versions is not None
+                common = wire.SUPPORTED_API_VERSIONS & envelope.supported_api_versions
+                if common:
+                    if not self._running or self._ended or self.entry.data is not data:
+                        return self.connected
+                    api_version = max(common)
+                    snapshot = {**snapshot, "api_version": api_version}
+                    result = await async_poll(
+                        session, url=url, token=data["auth_token"], snapshot=snapshot,
+                    )
+                    envelope = result.envelope or envelope
+                if result.outcome is Outcome.VERSION_REFUSED:
+                    result = PollResult(Outcome.VERSION_SKEW, envelope=envelope)
         # A new discovery replaces entry.data at once and reloads later: a reply to the old
         # connection data must not count against the new session.
         if not self._running or self._ended or self.entry.data is not data:
             return self.connected
+        self.api_version = api_version
+        if envelope is not None:
+            self.addon_api_version = envelope.api_version
         now = dt_util.utcnow()
         outcome = result.outcome
         summary = result.summary
@@ -102,14 +124,33 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self.last_outcome = outcome
         self.last_outcome_at = now
         if outcome is Outcome.COUNTED:
+            ir.async_delete_issue(self.hass, DOMAIN, "api_version_skew")
             self.connected = True
             self.last_counted = now
             self.summary = summary
             self._clear_deadline()
             self._cancel_deadline = async_call_later(self.hass, 120, self._expire)
-        elif outcome in {Outcome.UNAUTHORIZED, Outcome.SESSION_MISMATCH}:
+        elif outcome in {
+            Outcome.UNAUTHORIZED, Outcome.SESSION_MISMATCH,
+            Outcome.VERSION_SKEW, Outcome.INCOMPATIBLE,
+        }:
             self._ended = True
             self.connected = False
             self._clear_deadline()
-        # TODO #479: version_refused/incompatible end the session and raise the skew repair.
+            if outcome in {Outcome.VERSION_SKEW, Outcome.INCOMPATIBLE}:
+                assert envelope is not None
+                ir.async_create_issue(
+                    self.hass, DOMAIN, "api_version_skew", is_fixable=False,
+                    severity=ir.IssueSeverity.ERROR, translation_key="api_version_skew",
+                    translation_placeholders={
+                        "addon_release": envelope.release_version,
+                        "addon_api_version": str(envelope.api_version),
+                        "integration_api_version": str(self.api_version),
+                        "supported": ", ".join(map(str, sorted(wire.SUPPORTED_API_VERSIONS))),
+                        "addon_supported": (
+                            ", ".join(map(str, sorted(envelope.supported_api_versions)))
+                            if envelope.supported_api_versions is not None else "unknown"
+                        ),
+                    },
+                )
         return self.connected
