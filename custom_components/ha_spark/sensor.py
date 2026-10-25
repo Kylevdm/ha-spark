@@ -30,6 +30,7 @@ class SparkSensorDescription(SensorEntityDescription):
     soc_derived: bool = False
     v2l: bool = False
     value_fn: Callable[[Summary], float | datetime | None]
+    attributes_fn: Callable[[Summary], dict[str, Any] | None] | None = None
 
 
 DESCRIPTIONS = (
@@ -92,6 +93,10 @@ DESCRIPTIONS = (
         requested_entity_id="sensor.ha_spark_v2l_net_saving_gbp",
         device_class=SensorDeviceClass.MONETARY, native_unit_of_measurement="GBP",
         value_fn=lambda s: s.v2l.net_saving_gbp if s.v2l else None,
+        attributes_fn=lambda s: {
+            "avoided_gbp": s.v2l.avoided_gbp, "refill_cost_gbp": s.v2l.refill_cost_gbp,
+            "peak_power_w": s.v2l.peak_power_w,
+        } if s.v2l else None,
     ),
     SparkSensorDescription(
         key="last_run", translation_key="last_run",
@@ -141,11 +146,8 @@ class SparkSensor(SparkEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         summary = self.coordinator.summary
-        if self.entity_description.key != "v2l_net_saving" or not summary or not summary.v2l:
-            return None
-        return {"avoided_gbp": summary.v2l.avoided_gbp,
-                "refill_cost_gbp": summary.v2l.refill_cost_gbp,
-                "peak_power_w": summary.v2l.peak_power_w}
+        attributes_fn = self.entity_description.attributes_fn
+        return attributes_fn(summary) if attributes_fn and summary else None
 
 
 class LastRun(SparkSensor, RestoreSensor):

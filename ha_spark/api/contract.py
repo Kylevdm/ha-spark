@@ -20,6 +20,7 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 from ha_spark import __version__
+from ha_spark.authority import AuthorityState
 from ha_spark.config import Settings
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.v2l import V2LSession, delivered_fraction, savings
@@ -101,11 +102,20 @@ def version_refusal() -> dict[str, object]:
     }
 
 
+@dataclass(frozen=True)
+class AuthorityInputs:
+    """The authority store as the daemon holds it, for allowlisted projections only."""
+
+    state: AuthorityState | None
+    known: bool
+    save_failed: bool
+
+
 def plan_summary(
     *, session_id: str, built_at: datetime, loop_tick: datetime | None,
     plan: ChargePlan | None = None, plan_at: datetime | None = None,
     soc_observation_ok: bool = False, session: V2LSession | None = None,
-    settings: Settings | None = None,
+    settings: Settings | None = None, authority: AuthorityInputs | None = None,
 ) -> dict[str, object]:
     """Project only the envelope and allowlisted plan/session display numbers."""
     return {

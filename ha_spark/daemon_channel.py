@@ -23,7 +23,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from ha_spark.api.contract import IntegrationLink, link_view
+from ha_spark.api.contract import AuthorityInputs, IntegrationLink, link_view
 from ha_spark.authority import (
     AuthorityStore,
     OperatingMode,
@@ -185,19 +185,26 @@ class DaemonChannel:
     def _repairing(self) -> bool:
         return self.settings_service is not None and self.settings_service.repair is not None
 
-    def authority_status(self) -> dict[str, Any]:
+    def authority_inputs(self) -> AuthorityInputs:
+        """The stored authority as read now; never initialises, saves or fences."""
         if self._repairing():
             assert self.settings_service is not None
             # Repair only reads the store: no initialisation, save or fence.
             loaded = load_authority(self.settings_service.bootstrap)
-            view = authority_view(loaded.state, known=loaded.status == "known")
-            view["suspended"] = CONFIGURATION_REPAIR
-            return view
+            return AuthorityInputs(loaded.state, loaded.status == "known", False)
         store = self.authority
-        return authority_view(
-            store.state if store else None, known=store.known if store else False,
-            save_failed=store.save_failed if store else False,
+        return AuthorityInputs(
+            store.state if store else None, store.known if store else False,
+            store.save_failed if store else False,
         )
+
+    def authority_status(self) -> dict[str, Any]:
+        repairing = self._repairing()
+        inputs = self.authority_inputs()
+        view = authority_view(inputs.state, known=inputs.known, save_failed=inputs.save_failed)
+        if repairing:
+            view["suspended"] = CONFIGURATION_REPAIR
+        return view
 
     async def submit_mode(
         self, target: OperatingMode, expected_epoch: int | None, *, ingress_user: str | None = None,

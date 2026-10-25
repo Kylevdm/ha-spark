@@ -40,6 +40,7 @@ from ha_spark.agent import auth, tools
 from ha_spark.agent.exposure import OPERATION_TIERS, allowed, surface_on
 from ha_spark.api.contract import (
     SUPPORTED_API_VERSIONS,
+    AuthorityInputs,
     IntegrationLink,
     SiteSnapshot,
     link_view,
@@ -649,6 +650,11 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
             return invalid
         now = _heartbeat_now()
         state.integration_link = IntegrationLink(snapshot, now, False)
+        if state.executor is not None:
+            authority = state.executor.authority_inputs()
+        else:
+            loaded = load_authority(state.settings)
+            authority = AuthorityInputs(loaded.state, loaded.status == "known", False)
         return JSONResponse(
             plan_summary(
                 session_id=integration.session_id, built_at=now, loop_tick=state.loop_tick,
@@ -656,7 +662,7 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
                 session=(
                     v2l.load_session(state.settings) if state.settings.v2l_power_entity else None
                 ),
-                settings=state.settings,
+                settings=state.settings, authority=authority,
             ),
             headers={"Cache-Control": "no-store"},
         )
