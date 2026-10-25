@@ -314,7 +314,9 @@ def build_app(
     included) whose socket peer is not that address. ``integration`` isolates
     the heartbeat namespace under its per-boot credential before those checks.
     """
-    if integration is not None and (require_token or ingress_peer is None):
+    if integration is not None and (
+        require_token or ingress_peer is None or state.settings_service.bootstrap.is_standalone
+    ):
         raise ValueError("Integration requires the add-on ingress listener")
 
     # Local import: mcp_server does ``from ha_spark.api.server import AppState``,
@@ -589,8 +591,14 @@ def _heartbeat_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _reject_constant(name: str) -> object:
+    """``NaN`` and ``Infinity`` aren't JSON; ``json.loads`` accepts them by default."""
+    raise ValueError(name)
+
+
 def _integration_app(integration: IntegrationDiscovery) -> FastAPI:
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    # No slash redirect: its Location would echo the request's query string.
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
 
     @app.post("/integration/heartbeat")
     async def heartbeat(request: Request) -> JSONResponse:
@@ -604,7 +612,7 @@ def _integration_app(integration: IntegrationDiscovery) -> FastAPI:
                 if len(body) + len(chunk) > _HEARTBEAT_MAX_BODY:
                     return invalid
                 body.extend(chunk)
-            if not isinstance(json.loads(body), dict):
+            if not isinstance(json.loads(body, parse_constant=_reject_constant), dict):
                 return invalid
         except (ValueError, RecursionError):
             return invalid
@@ -617,7 +625,11 @@ def _integration_app(integration: IntegrationDiscovery) -> FastAPI:
 
 
 class _IntegrationGate:
-    """Own the integration namespace before ingress peer and repair checks."""
+    """Own the integration namespace before ingress peer and repair checks.
+
+    Classifies on the raw ``scope["path"]``, as the router does only while
+    ``root_path`` is empty; :func:`make_server` never sets one.
+    """
 
     def __init__(self, app: Any, state: AppState, integration: IntegrationDiscovery) -> None:
         self.app = app

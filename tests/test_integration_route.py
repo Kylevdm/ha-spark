@@ -31,6 +31,12 @@ def discovery() -> IntegrationDiscovery:
 
 @pytest.fixture
 def state(tmp_path: Path) -> AppState:
+    settings = Settings(supervisor_token="test", db_path=str(tmp_path / "ha_spark.db"))
+    return AppState(settings, tmp_path / "options.json")
+
+
+@pytest.fixture
+def standalone(tmp_path: Path) -> AppState:
     settings = Settings(ha_url="http://ha.test", ha_token="test",
                         db_path=str(tmp_path / "ha_spark.db"))
     return AppState(settings, tmp_path / "options.json")
@@ -91,18 +97,20 @@ async def test_token_cannot_open_ingress(state, discovery, method, path):
     assert response.status_code == 403
 
 
-def test_agent_and_standalone_separation(state, discovery):
+def test_agent_and_standalone_separation(state, standalone, discovery):
     with pytest.raises(ValueError):
         build_app(state, ingress_peer="proxy", integration=discovery, require_token=True)
     with pytest.raises(ValueError):
         build_app(state, integration=discovery)
+    with pytest.raises(ValueError):
+        build_app(standalone, ingress_peer="proxy", integration=discovery)
     with TestClient(build_app(state, require_token=True, token="agent")) as client:
         for path in ("/agent/health", "/mcp"):
             assert client.get(path, headers={
                 "Authorization": f"Bearer {discovery.auth_token}"}).status_code == 401
         assert client.post("/integration/heartbeat", headers={
-            "Authorization": "Bearer agent"}, json={}).status_code in (401, 404)
-    listener = _ingress_server(state, discovery)
+            "Authorization": "Bearer agent"}, json={}).status_code == 404
+    listener = _ingress_server(standalone, discovery)
     assert listener.config.host == "127.0.0.1"
     with TestClient(listener.config.app) as client:
         assert client.post("/integration/heartbeat", json={}).status_code == 404
@@ -110,8 +118,9 @@ def test_agent_and_standalone_separation(state, discovery):
 
 @pytest.mark.parametrize("body", [b"not-json-CANARY-HEARTBEAT-SECRET", b"[]",
     b'"CANARY-HEARTBEAT-SECRET"', b"[" * 3000 + b"]" * 3000,
-    CANARY.encode() + b"x" * 16385],
-    ids=["invalid-json", "array", "string", "deep-nesting", "content-length-cap"])
+    CANARY.encode() + b"x" * 16385, b'{"x": NaN}', b'{"x": -Infinity}'],
+    ids=["invalid-json", "array", "string", "deep-nesting", "content-length-cap", "nan",
+         "infinity"])
 async def test_invalid_body(state, discovery, body, caplog):
     caplog.set_level(logging.DEBUG)
     response = await request(state, discovery, content=body,
@@ -141,6 +150,10 @@ async def test_integration_namespace(state, discovery):
     assert (await request(state, discovery, path="/integration/other",
                           headers=headers)).status_code == 404
     assert (await request(state, discovery, path="/integration/other")).status_code == 401
+    trailing = await request(state, discovery, path=f"/integration/heartbeat/?q={CANARY}",
+                             headers=headers)
+    assert trailing.status_code == 404
+    assert CANARY not in str(trailing.headers) + trailing.text
     with TestClient(build_app(state, ingress_peer="proxy", integration=discovery)) as client:
         with pytest.raises(WebSocketDisconnect) as exc:
             with client.websocket_connect("/integration/heartbeat"):
@@ -165,7 +178,7 @@ async def test_repair_auth_order(state, discovery, authorization, ingress_header
 
 async def test_agent_token_cannot_open_integration(tmp_path, discovery, caplog):
     caplog.set_level(logging.DEBUG)
-    settings = Settings(ha_url="http://ha.test", ha_token="test", agent_surface="on",
+    settings = Settings(supervisor_token="test", agent_surface="on",
                         agent_api_token=CANARY, db_path=str(tmp_path / "ha_spark.db"))
     state = AppState(settings, tmp_path / "options.json")
     response = await request(state, discovery, headers={"Authorization": f"Bearer {CANARY}"})
