@@ -17,7 +17,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .channel import Outcome, PollResult, async_poll
-from .wire import build_snapshot
+from .wire import Summary, build_snapshot
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +32,8 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self.release_version = release_version
         self.connected = False
         self.last_counted: datetime | None = None
+        # The latest counted summary; entities show it only while connected.
+        self.summary: Summary | None = None
         self.last_outcome: Outcome | None = None
         self.last_outcome_at: datetime | None = None
         self._running = True
@@ -102,6 +104,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         if outcome is Outcome.COUNTED:
             self.connected = True
             self.last_counted = now
+            self.summary = summary
             self._clear_deadline()
             self._cancel_deadline = async_call_later(self.hass, 120, self._expire)
         elif outcome in {Outcome.UNAUTHORIZED, Outcome.SESSION_MISMATCH}:
