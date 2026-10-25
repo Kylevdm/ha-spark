@@ -38,7 +38,13 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, Validat
 
 from ha_spark.agent import auth, tools
 from ha_spark.agent.exposure import OPERATION_TIERS, allowed, surface_on
-from ha_spark.api.contract import plan_summary
+from ha_spark.api.contract import (
+    SUPPORTED_API_VERSIONS,
+    IntegrationLink,
+    SiteSnapshot,
+    plan_summary,
+    version_refusal,
+)
 from ha_spark.authority import OperatingMode, authority_view, load_authority
 from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import DaemonChannel
@@ -127,6 +133,8 @@ class AppState:
         self.plan = plan
         self.plan_at = plan_at
         self.executor = executor
+        self.integration_link = IntegrationLink(None, None, False)
+        self.loop_tick: datetime | None = None
 
     @property
     def settings(self) -> Settings:
@@ -596,7 +604,7 @@ def _reject_constant(name: str) -> object:
     raise ValueError(name)
 
 
-def _integration_app(integration: IntegrationDiscovery) -> FastAPI:
+def _integration_app(state: AppState, integration: IntegrationDiscovery) -> FastAPI:
     # No slash redirect: its Location would echo the request's query string.
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
 
@@ -612,12 +620,31 @@ def _integration_app(integration: IntegrationDiscovery) -> FastAPI:
                 if len(body) + len(chunk) > _HEARTBEAT_MAX_BODY:
                     return invalid
                 body.extend(chunk)
-            if not isinstance(json.loads(body, parse_constant=_reject_constant), dict):
+            payload = json.loads(body, parse_constant=_reject_constant)
+            if not isinstance(payload, dict):
                 return invalid
         except (ValueError, RecursionError):
             return invalid
+        version = payload.get("api_version")
+        release = payload.get("release_version")
+        if (type(version) is not int or version < 1 or not isinstance(release, str)
+                or not 1 <= len(release) <= 64):
+            return invalid
+        if version not in SUPPORTED_API_VERSIONS:
+            previous = state.integration_link
+            state.integration_link = IntegrationLink(previous.snapshot, previous.received_at, True)
+            return JSONResponse(version_refusal(), status_code=409,
+                                headers={"Cache-Control": "no-store"})
+        try:
+            snapshot = SiteSnapshot.model_validate(payload)
+        except ValidationError:
+            return invalid
+        now = _heartbeat_now()
+        state.integration_link = IntegrationLink(snapshot, now, False)
         return JSONResponse(
-            plan_summary(session_id=integration.session_id, built_at=_heartbeat_now()),
+            plan_summary(
+                session_id=integration.session_id, built_at=now, loop_tick=state.loop_tick,
+            ),
             headers={"Cache-Control": "no-store"},
         )
 
@@ -635,7 +662,7 @@ class _IntegrationGate:
         self.app = app
         self.state = state
         self.integration = integration
-        self.heartbeat_app = _integration_app(integration)
+        self.heartbeat_app = _integration_app(state, integration)
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] not in ("http", "websocket") or not (

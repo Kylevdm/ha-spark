@@ -78,6 +78,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
+from datetime import datetime as utc_datetime
 from typing import NamedTuple
 from uuid import uuid4
 
@@ -2339,6 +2340,8 @@ async def _run_paired(
                     await run_v2l_tick(settings, now)
                 except Exception:
                     log.exception("V2L tick failed; will retry next tick")
+            # The real clock: tests replace this module's ``datetime`` to script ``now``.
+            state.loop_tick = utc_datetime.now(UTC)
             await asyncio.sleep(poll_seconds)
     finally:
         if discovery is not None:
