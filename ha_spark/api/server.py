@@ -42,6 +42,7 @@ from ha_spark.api.contract import (
     SUPPORTED_API_VERSIONS,
     IntegrationLink,
     SiteSnapshot,
+    link_view,
     plan_summary,
     version_refusal,
 )
@@ -135,6 +136,10 @@ class AppState:
         self.executor = executor
         self.integration_link = IntegrationLink(None, None, False)
         self.loop_tick: datetime | None = None
+
+    def integration_link_view(self) -> dict[str, object]:
+        """Read the current link without affecting authority or planning."""
+        return link_view(self.integration_link, datetime.now(UTC))
 
     @property
     def settings(self) -> Settings:
@@ -523,6 +528,7 @@ def build_app(
         result: dict[str, Any] = {
             "status": "fail" if failed or repair is not None else "ok",
             "plan_at": _iso(st.plan_at),
+            "integration_link": st.integration_link_view(),
             "operating_mode": authority["mode"], "authority": authority,
         }
         if repair is not None:

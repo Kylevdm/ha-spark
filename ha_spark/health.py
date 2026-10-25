@@ -422,6 +422,28 @@ async def check_operating_mode(settings: Settings) -> CheckResult:
     return CheckResult("Operating mode", Status.OK, result.state.committed_mode)
 
 
+async def check_integration_link(settings: Settings) -> CheckResult:
+    """Read daemon-only liveness; a missing integration is never a failure."""
+    reply = await submit_socket(settings, "integration_link")
+    if reply is None:
+        return CheckResult("Integration link", Status.WARN, "unknown (no daemon running)")
+    view = reply.integration_link
+    if reply.error is not None or view is None or view.get("state") not in (
+        "connected", "never_connected", "unreachable", "version_skew",
+    ):
+        return CheckResult("Integration link", Status.WARN, "unknown")
+    state = view["state"]
+    detail = str(state)
+    version = view.get("integration_release_version")
+    if isinstance(version, str):
+        detail += f"; integration {version}"
+    if state == "connected":
+        detail += f"; snapshot age {view.get('snapshot_age_s')}s"
+    return CheckResult(
+        "Integration link", Status.OK if state == "connected" else Status.WARN, detail,
+    )
+
+
 def check_hold_release(settings: Settings) -> list[CheckResult]:
     """A WARN per owned hold whose release has been refused (#449); nothing otherwise.
 
@@ -493,6 +515,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
     results = await asyncio.gather(
         check_operating_mode(settings),
+        check_integration_link(settings),
         check_ha_rest(settings),
         *([check_notify_service(settings)] if settings.notify_service else []),
         check_ha_websocket(settings),
@@ -536,6 +559,7 @@ async def run_repair_health(bootstrap: Settings, reasons: list[str]) -> list[Che
     return [
         CheckResult("Configuration", Status.FAIL, detail),
         await check_operating_mode(bootstrap),
+        await check_integration_link(bootstrap),
     ]
 
 
