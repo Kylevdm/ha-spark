@@ -867,8 +867,9 @@ every hardware decision.
    Ollama, SQLite, load history, supply guard, tariff provider, household
    clock, inverter clock (Solis only), notify service (when configured), entity config,
    and integration link. The link is connected, never connected, unreachable after
-   90 seconds, or version skew. With no daemon running the link is unknown. A missing or
-   disconnected integration is a warning, never a failure, including in configuration repair.
+   90 seconds, or version skew. With no daemon running (as in the startup check, which runs
+   before the daemon) the link is unknown and not flagged. A missing or disconnected integration
+   is a warning, never a failure, including in configuration repair.
 2. **Map your entities.** From a shell in the add-on container (e.g. the SSH
    add-on with `docker exec -it addon_<slug> sh`, or the add-on's own
    terminal), run `ha-spark onboard`. It scans your HA entities and proposes

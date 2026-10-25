@@ -437,7 +437,8 @@ async def check_integration_link(settings: Settings) -> CheckResult:
     except OSError:
         return CheckResult("Integration link", Status.WARN, "unknown (daemon connection lost)")
     if reply is None:
-        return CheckResult("Integration link", Status.WARN, "unknown (no daemon running)")
+        # The add-on's startup health runs before the daemon: no link to report is not a fault.
+        return CheckResult("Integration link", Status.OK, "unknown (no daemon running)")
     view = reply.integration_link
     state = view.get("state") if view is not None else None
     if reply.error is not None or view is None or state not in (

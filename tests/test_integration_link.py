@@ -101,9 +101,9 @@ async def test_link_no_daemon(tmp_path: Path) -> None:
     settings = Settings(ha_url="http://ha.test", ha_token=TOKEN,
                         db_path=str(tmp_path / "ha_spark.db"))
     result = await health.check_integration_link(settings)
-    assert result.status is health.Status.WARN
+    assert result.status is health.Status.OK
     assert result.detail == "unknown (no daemon running)"
-    assert health.exit_code([result]) == 2
+    assert health.exit_code([result]) == 0
 
 
 @pytest.mark.parametrize("reply", [Reply(), Reply(error="unavailable")])
