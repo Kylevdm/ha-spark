@@ -10,6 +10,21 @@ Both suites compare their constant with `tests/fixtures/contract/contract.json`,
 so neither half can move a contract version alone.
 """
 
+from datetime import datetime
 from typing import Final
 
+from ha_spark import __version__
+
 API_VERSION: Final = 1
+
+
+def plan_summary(*, session_id: str, built_at: datetime) -> dict[str, object]:
+    """Project the phase-4 envelope without any daemon or household state."""
+    return {
+        "api_version": API_VERSION,
+        "release_version": __version__,
+        "session_id": session_id,
+        "built_at": built_at.isoformat(),
+        "commands_pending": False,
+        "plan": None,
+    }

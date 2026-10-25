@@ -1785,18 +1785,21 @@ async def _mode_lifecycle(
                     await _notify_fallback_left(settings, rest)
 
 
-def _ingress_server(state: AppState) -> uvicorn.Server:
+def _ingress_server(
+    state: AppState, discovery: IntegrationDiscovery | None = None,
+) -> uvicorn.Server:
     """The ingress listener for ``state``.
 
     Add-on mode: listen on all interfaces (the ingress proxy connects over the
-    hassio network) but answer only the proxy's address. Standalone/dev has no
-    ingress proxy, so bind to loopback and let the OS keep the network out.
+    hassio network); ingress answers only the proxy, integration uses its token.
+    Standalone/dev has no ingress proxy, so bind to loopback and let the OS
+    keep the network out.
     """
     if state.settings_service.bootstrap.is_standalone:
         return make_server(build_app(state), "127.0.0.1", INGRESS_PORT)
     return make_server(
-        build_app(state, ingress_peer=INGRESS_PROXY_IP),
-        "0.0.0.0",  # noqa: S104 - peer-restricted to the ingress proxy
+        build_app(state, ingress_peer=INGRESS_PROXY_IP, integration=discovery),
+        "0.0.0.0",  # noqa: S104 - ingress peer check or integration bearer auth
         INGRESS_PORT,
     )
 
@@ -1817,7 +1820,7 @@ async def _serve_repair(
     )
     state = AppState(settings=service.bootstrap, options_path=OPTIONS_PATH, executor=channel,
                      settings_service=service)
-    server = _ingress_server(state)
+    server = _ingress_server(state) if discovery is None else _ingress_server(state, discovery)
     repaired = asyncio.Event()
     service.on_repaired = repaired.set
     serve_task: asyncio.Task[None] | None = None
@@ -1882,7 +1885,7 @@ async def _run_paired(
     warn_deprecated_notify_target(settings)
     state = AppState(settings=settings, options_path=OPTIONS_PATH, executor=channel,
                      settings_service=service)
-    server = _ingress_server(state)
+    server = _ingress_server(state) if discovery is None else _ingress_server(state, discovery)
     authority = AuthorityStore(settings)
     try:
         authority.start_process()

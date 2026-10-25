@@ -2,7 +2,8 @@
 
 One `vX.Y.Z` tag ships the add-on and the companion integration, so the
 `config.yaml` `version`, the integration manifest's `version` and
-`pyproject.toml`'s `version` must stay in lockstep; the Supervisor store must
+`pyproject.toml`'s `version` (and the package's `__version__`, which the plan
+summary reports) must stay in lockstep; the Supervisor store must
 see no add-on config file outside `ha_spark_addon/`; HACS must not offer the
 default branch; and both test suites read one `api_version` from the shared
 contract fixture. The integration is read as files here: this suite never
@@ -30,16 +31,25 @@ IGNORED_DIRS = frozenset({"__pycache__"})
 
 
 def _release_versions(root: Path = REPO_ROOT) -> dict[str, str]:
-    """Read the three places one release version must agree with itself."""
+    """Read the four places one release version must agree with itself."""
     addon = yaml.safe_load((root / ADDON_DIR / "config.yaml").read_text("utf-8"))
     manifest = json.loads(
         (root / "custom_components" / "ha_spark" / "manifest.json").read_text("utf-8")
     )
     pyproject = tomllib.loads((root / "pyproject.toml").read_text("utf-8"))
+    package = ast.parse((root / "ha_spark" / "__init__.py").read_text("utf-8"))
+    version = next(
+        node.value.value
+        for node in package.body
+        if isinstance(node, ast.Assign)
+        and [getattr(t, "id", None) for t in node.targets] == ["__version__"]
+        and isinstance(node.value, ast.Constant)
+    )
     return {
         "ha_spark_addon/config.yaml": str(addon["version"]),
         "manifest.json": str(manifest["version"]),
         "pyproject.toml": str(pyproject["project"]["version"]),
+        "ha_spark/__init__.py": str(version),
     }
 
 
@@ -72,9 +82,9 @@ def test_release_versions_stay_in_lockstep() -> None:
     assert _release_versions()["manifest.json"] == "0.25.0"
 
 
-@pytest.mark.parametrize("stale", ["addon", "manifest", "project"])
+@pytest.mark.parametrize("stale", ["addon", "manifest", "project", "package"])
 def test_lockstep_check_fails_on_one_mismatched_version(tmp_path: Path, stale: str) -> None:
-    versions = dict.fromkeys(["addon", "manifest", "project"], "0.25.0")
+    versions = dict.fromkeys(["addon", "manifest", "project", "package"], "0.25.0")
     versions[stale] = "0.24.0"
     (tmp_path / ADDON_DIR).mkdir()
     (tmp_path / ADDON_DIR / "config.yaml").write_text(f"version: {versions['addon']}\n")
@@ -83,6 +93,10 @@ def test_lockstep_check_fails_on_one_mismatched_version(tmp_path: Path, stale: s
         json.dumps({"version": versions["manifest"]})
     )
     (tmp_path / "pyproject.toml").write_text(f'[project]\nversion = "{versions["project"]}"\n')
+    (tmp_path / "ha_spark").mkdir()
+    (tmp_path / "ha_spark" / "__init__.py").write_text(
+        f'"""Docstring."""\n\n__version__ = "{versions["package"]}"\n'
+    )
     assert not _in_lockstep(tmp_path)
 
 
