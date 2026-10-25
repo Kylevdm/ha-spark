@@ -36,6 +36,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
 
 async def async_unload_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> bool:
     """End this session before a new discovery loads new connection data."""
+    entry.runtime_data.async_stop()
     if await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         await entry.runtime_data.async_shutdown()
         return True

@@ -16,7 +16,7 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from .channel import Outcome, async_poll
+from .channel import Outcome, PollResult, async_poll
 from .wire import build_snapshot
 
 _LOGGER = logging.getLogger(__name__)
@@ -58,18 +58,32 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self._clear_deadline()
         await super().async_shutdown()
 
+    @callback
+    def async_stop(self) -> None:
+        """Fence off replies the moment unloading starts, before platforms go."""
+        self._running = False
+
     async def _async_update_data(self) -> bool:
         if not self._running or self._ended:
             return self.connected
         data = self.entry.data
-        result = await async_poll(
-            async_get_clientsession(self.hass),
-            url=f"http://{data['host']}:{data['port']}/integration/heartbeat",
-            token=data["auth_token"],
-            snapshot=build_snapshot(site_id=data["site_id"], release_version=self.release_version,
-                                    sent_at=dt_util.utcnow()),
-        )
-        if not self._running or self._ended:
+        try:
+            snapshot = build_snapshot(site_id=data["site_id"],
+                                      release_version=self.release_version,
+                                      sent_at=dt_util.utcnow())
+        except (KeyError, ValueError):
+            # Raised text would carry the stored value; HA logs an update's exceptions.
+            result = PollResult(Outcome.MALFORMED)
+        else:
+            result = await async_poll(
+                async_get_clientsession(self.hass),
+                url=f"http://{data['host']}:{data['port']}/integration/heartbeat",
+                token=data["auth_token"],
+                snapshot=snapshot,
+            )
+        # A new discovery replaces entry.data at once and reloads later: a reply to the old
+        # connection data must not count against the new session.
+        if not self._running or self._ended or self.entry.data is not data:
             return self.connected
         now = dt_util.utcnow()
         outcome = result.outcome

@@ -15,7 +15,7 @@ from homeassistant.config_entries import (
     ConfigFlowResult,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.data_entry_flow import FlowResultType, UnknownFlow
 from homeassistant.helpers.service_info.hassio import HassioServiceInfo
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -111,21 +111,20 @@ async def test_confirmation_racing_a_refresh_creates_one_entry(hass: HomeAssista
     pending = await start(hass, discovery())
     # Whichever runs first decides, and a refresh may abort the confirmation while its entry
     # is still being set up, so assert the end state, not which caller saw what.
-    await asyncio.gather(
+    results = await asyncio.gather(
         hass.config_entries.flow.async_configure(pending["flow_id"], {}),
         start(hass, discovery(auth_token="latest")),
         return_exceptions=True,
     )
+    assert all(not isinstance(r, BaseException) or isinstance(r, UnknownFlow) for r in results)
+    await hass.async_block_till_done()
+    # Confirm whatever is still pending: only the newer discovery's flow may survive.
+    for flow in hass.config_entries.flow.async_progress_by_handler(DOMAIN):
+        await hass.config_entries.flow.async_configure(flow["flow_id"], {})
     await hass.async_block_till_done()
     entries = hass.config_entries.async_entries(DOMAIN)
-    if entries:
-        # Never an entry holding the older boot's token.
-        assert len(entries) == 1
-        assert entries[0].data["auth_token"] == "latest"
-    else:
-        # The newer discovery aborted the confirmation before it created anything.
-        flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
-        assert [flow["step_id"] for flow in flows] == ["confirm"]
+    assert len(entries) == 1
+    assert entries[0].data["auth_token"] == "latest"
 
 
 async def test_existing_site_cannot_be_rebound_or_duplicated(hass: HomeAssistant) -> None:

@@ -131,6 +131,9 @@ async def test_liveness_outcomes(
     aioclient_mock.post(URL, json=summary())
     entry = await setup(hass)
     coordinator = entry.runtime_data
+    # The counted heartbeat's deadline is 120 s from setup; the outcome below lands 60 s in,
+    # so a regression that re-arms the deadline on it would keep the sensor on past 120 s.
+    freezer.tick(60)
     aioclient_mock.clear_requests()
     body = summary()
     if outcome in {"unreachable", "timeout"}:
@@ -173,7 +176,7 @@ async def test_liveness_outcomes(
     # Prevent periodic polls from extending the deadline.
     aioclient_mock.clear_requests()
     aioclient_mock.post(URL, status=503)
-    freezer.tick(119)
+    freezer.tick(59)
     async_fire_time_changed(hass)
     await hass.async_block_till_done()
     assert state_value(hass) == ("off" if ended else "on")
@@ -204,34 +207,77 @@ async def test_counted_refreshes_deadline(
     assert state_value(hass) == "off"
 
 
-async def test_hung_poll_and_unload_discard_result(
+async def test_hung_poll_cannot_hold_connected(
     hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, freezer: FrozenDateTimeFactory,
 ) -> None:
     aioclient_mock.post(URL, json=summary())
     entry = await setup(hass)
-    coordinator = entry.runtime_data
     waiting = asyncio.Event()
-    release = asyncio.Event()
 
-    response = AiohttpClientMockResponse("post", YarlURL(URL), json=summary())
-
-    async def hang(_method: str, _url: Any, _kwargs: Any) -> AiohttpClientMockResponse:
+    async def hang(_method: str, _url: Any, _data: Any) -> AiohttpClientMockResponse:
         waiting.set()
-        await release.wait()
-        return response
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
 
     aioclient_mock.clear_requests()
     aioclient_mock.post(URL, side_effect=hang)
-    poll = asyncio.create_task(coordinator.async_refresh())
+    poll = asyncio.create_task(entry.runtime_data.async_refresh())
     await waiting.wait()
     freezer.tick(121)
     async_fire_time_changed(hass)
-    await asyncio.sleep(0)
+    await hass.async_block_till_done()
     assert state_value(hass) == "off"
+    await poll
+
+
+async def pending_poll(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, entry: MockConfigEntry,
+) -> tuple["asyncio.Task[None]", asyncio.Event]:
+    """Start a poll whose countable reply (fresh tick, accepted session) waits for release."""
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hang(_method: str, _url: Any, _data: Any) -> AiohttpClientMockResponse:
+        waiting.set()
+        await release.wait()
+        return AiohttpClientMockResponse("post", YarlURL(URL), json=summary())
+
+    aioclient_mock.clear_requests()
+    aioclient_mock.post(URL, side_effect=hang)
+    poll = asyncio.create_task(entry.runtime_data.async_refresh())
+    await waiting.wait()
+    return poll, release
+
+
+async def test_reply_arriving_after_unload_is_discarded(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, freezer: FrozenDateTimeFactory,
+) -> None:
+    aioclient_mock.post(URL, status=503)
+    entry = await setup(hass)
+    coordinator = entry.runtime_data
+    poll, release = await pending_poll(hass, aioclient_mock, entry)
     assert await hass.config_entries.async_unload(entry.entry_id)
     release.set()
     await poll
     assert not coordinator.connected
+    assert coordinator.last_counted is None
+
+
+async def test_reply_to_replaced_connection_data_is_discarded(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+) -> None:
+    aioclient_mock.post(URL, status=503)
+    entry = await setup(hass)
+    coordinator = entry.runtime_data
+    poll, release = await pending_poll(hass, aioclient_mock, entry)
+    # What a newer discovery does before its scheduled reload runs.
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, "auth_token": "rotated", "session_id": "new-session"},
+    )
+    release.set()
+    await poll
+    assert not coordinator.connected
+    assert coordinator.last_counted is None
 
 
 @pytest.mark.parametrize("registered", [False, True])
@@ -339,3 +385,21 @@ async def test_summary_arriving_in_parts_counts(
     await entry.runtime_data.async_refresh()
     assert entry.runtime_data.last_outcome == "counted"
     assert state_value(hass) == "on"
+
+
+async def test_bad_stored_site_id_is_an_outcome_not_a_logged_error(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    aioclient_mock.post(URL, json=summary())
+    canary = "z" * 32  # not hex: UUID() would name it in its exception text
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=canary, data={
+        "site_id": canary, "host": "addon-test", "port": 8099, "slug": ADDON_SLUG,
+        "auth_token": TOKEN, "session_id": fixture("plan_summary")["session_id"],
+    })
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.runtime_data.last_outcome == "malformed"
+    assert aioclient_mock.call_count == 0
+    assert canary not in caplog.text and TOKEN not in caplog.text
