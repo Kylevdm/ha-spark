@@ -5,13 +5,11 @@ from typing import Any
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.components.binary_sensor.const import BinarySensorDeviceClass
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import SparkConfigEntry
-from .const import DOMAIN
 from .coordinator import SparkCoordinator
+from .entity import SparkEntity
 
 
 async def async_setup_entry(
@@ -21,7 +19,7 @@ async def async_setup_entry(
     async_add_entities([AddonConnected(entry.runtime_data)])
 
 
-class AddonConnected(CoordinatorEntity[SparkCoordinator], BinarySensorEntity):
+class AddonConnected(SparkEntity, BinarySensorEntity):
     """Whether a heartbeat has counted within the current deadline."""
 
     _attr_has_entity_name = True
@@ -29,12 +27,7 @@ class AddonConnected(CoordinatorEntity[SparkCoordinator], BinarySensorEntity):
     _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
 
     def __init__(self, coordinator: SparkCoordinator) -> None:
-        super().__init__(coordinator)
-        site_id = coordinator.entry.data["site_id"]
-        self._attr_unique_id = f"{site_id}_addon_connected"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, site_id)}, name="ha-spark", entry_type=DeviceEntryType.SERVICE,
-        )
+        super().__init__(coordinator, "addon_connected")
 
     @property
     def available(self) -> bool:

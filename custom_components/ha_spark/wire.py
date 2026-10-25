@@ -2,7 +2,7 @@
 
 Pure Python with no Home Assistant imports: this module holds the `api_version`
 the integration speaks, the identity-only site snapshot it sends, and the summary
-envelope it validates. Later tickets add the plan and authority display fields.
+and plan numbers it validates. Later tickets add authority display fields.
 `api_version` is an integer, separate from the release version. A receiver may
 ignore an unknown field only if ignoring it keeps
 every meaning and safety obligation it already has. A field the receiver must act
@@ -17,6 +17,7 @@ half can move a contract version alone.
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from math import isfinite
 from typing import Final
 from uuid import UUID
 
@@ -31,8 +32,34 @@ class MalformedSummary(ValueError):
 
 
 @dataclass(frozen=True)
+class PlanBlock:
+    """Allowlisted plan display values, never planning inputs."""
+
+    computed_at: datetime
+    soc_trusted: bool
+    charge_needed_kwh: float | None
+    target_soc_pct: float | None
+    forecast_load_kwh: float | None
+    solar_forecast_kwh: float | None
+    deficit_kwh: float | None
+    planned_cost_gbp: float | None
+    baseline_cost_gbp: float | None
+
+
+@dataclass(frozen=True)
+class V2LBlock:
+    """Current V2L session totals."""
+
+    energy_kwh: float
+    net_saving_gbp: float
+    avoided_gbp: float
+    refill_cost_gbp: float
+    peak_power_w: float
+
+
+@dataclass(frozen=True)
 class Summary:
-    """Validated summary envelope; plan fields arrive in later tickets."""
+    """Validated envelope and allowlisted plan/session display blocks."""
 
     api_version: int
     release_version: str
@@ -40,6 +67,8 @@ class Summary:
     loop_tick: datetime | None
     built_at: datetime
     commands_pending: bool
+    plan: PlanBlock | None
+    v2l: V2LBlock | None
 
 
 def build_snapshot(*, site_id: str, release_version: str, sent_at: datetime) -> dict[str, object]:
@@ -83,7 +112,7 @@ def parse_summary(body: object) -> Summary:
         or not isinstance(session, str) or not 1 <= len(session) <= 64
         or type(pending) is not bool
         or "plan" not in body or (body["plan"] is not None and not isinstance(body["plan"], dict))
-        or "loop_tick" not in body
+        or "loop_tick" not in body or "v2l" not in body
     ):
         raise MalformedSummary()
     return Summary(
@@ -93,4 +122,43 @@ def parse_summary(body: object) -> Summary:
         loop_tick=None if body["loop_tick"] is None else _timestamp(body["loop_tick"]),
         built_at=_timestamp(body.get("built_at")),
         commands_pending=pending,
+        plan=_plan(body["plan"]),
+        v2l=_v2l(body["v2l"]),
     )
+
+
+def _number(value: object) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise MalformedSummary()
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        raise MalformedSummary() from None
+    if not isfinite(number):
+        raise MalformedSummary()
+    return number
+
+
+def _plan(value: object) -> PlanBlock | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or type(value.get("soc_trusted")) is not bool:
+        raise MalformedSummary()
+    numbers: dict[str, float | None] = {}
+    for key in ("charge_needed_kwh", "target_soc_pct", "forecast_load_kwh", "solar_forecast_kwh",
+                "deficit_kwh", "planned_cost_gbp", "baseline_cost_gbp"):
+        if key not in value:
+            raise MalformedSummary()
+        numbers[key] = None if value[key] is None else _number(value[key])
+    return PlanBlock(computed_at=_timestamp(value.get("computed_at")),
+                     soc_trusted=value["soc_trusted"], **numbers)
+
+
+def _v2l(value: object) -> V2LBlock | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise MalformedSummary()
+    return V2LBlock(**{key: _number(value.get(key)) for key in (
+        "energy_kwh", "net_saving_gbp", "avoided_gbp", "refill_cost_gbp", "peak_power_w",
+    )})

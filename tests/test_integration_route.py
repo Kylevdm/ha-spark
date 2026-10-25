@@ -190,6 +190,21 @@ async def test_agent_token_cannot_open_integration(tmp_path, discovery, caplog):
 async def test_golden_envelope_and_no_mutation(state, discovery, monkeypatch):
     monkeypatch.setattr(server, "_heartbeat_now", lambda: datetime(2026, 10, 24, 12, tzinfo=UTC))
     state.loop_tick = datetime(2026, 10, 24, 11, 59, 30, tzinfo=UTC)
+    from ha_spark.energy.v2l import V2LSession, save_session
+    from tests.test_api import _plan
+
+    state.plan = _plan(planned_cost=1.234, baseline_cost=3.456, strategy=CANARY)
+    state.plan_at = datetime(2026, 10, 24, 11, 30, tzinfo=UTC)
+    state.soc_observation_ok = True
+    entity_settings = {key: f"sensor.{CANARY}" for key in type(state.settings).model_fields
+                       if key.endswith("_entity")}
+    state.settings = state.settings.model_copy(update=entity_settings | {
+        "v2l_power_entity": f"sensor.{CANARY}", "v2l_rectifier_efficiency": 1.0,
+        "charge_efficiency": 1.0, "v2l_round_trip_efficiency": 1.0,
+        "v2l_peak_rate_gbp": 0.3, "v2l_offpeak_rate_gbp": 0.1,
+    })
+    save_session(state.settings, V2LSession(day="2026-10-24", kwh_delivered=2.345,
+        peak_power_w=1234.5, last_sample_ts=state.loop_tick.isoformat()))
     before = (state.current_options(), state.settings_service.revision,
               state.settings.model_dump(), state.plan, state.plan_at)
     authority_before = load_authority(state.settings)
@@ -202,6 +217,7 @@ async def test_golden_envelope_and_no_mutation(state, discovery, monkeypatch):
     assert response.headers["Cache-Control"] == "no-store"
     golden = json.loads((FIXTURES / "plan_summary.json").read_text())
     assert response.json() == golden
+    assert CANARY not in response.text
     contract = json.loads((FIXTURES / "contract.json").read_text())
     assert golden["api_version"] == contract["api_version"]
     assert (state.current_options(), state.settings_service.revision,
@@ -307,3 +323,34 @@ def test_snapshot_normalises_uuid_and_time(state, discovery):
     assert stored.site_id == "6f1c2b3a-9d84-4e57-a1c0-2f3e4d5c6b7a"
     assert stored.sent_at == datetime(2026, 10, 24, 11, 59, 58, tzinfo=UTC)
     assert stored.sent_at.tzinfo == UTC
+
+
+@pytest.mark.parametrize("configured,sampled", [(False, False), (True, False), (True, True)])
+def test_number_blocks_nulls_and_current_soc(state, discovery, configured, sampled):
+    from ha_spark.energy.v2l import V2LSession, save_session
+    from tests.test_api import _plan
+
+    state.settings = state.settings.model_copy(update={
+        "v2l_power_entity": "sensor.private" if configured else "",
+    })
+    if sampled:
+        save_session(state.settings, V2LSession(day="2026-10-24", last_sample_ts="sample"))
+    with TestClient(build_app(state, ingress_peer="testclient", integration=discovery)) as client:
+        headers = {"Authorization": f"Bearer {discovery.auth_token}"}
+        def poll():
+            return client.post("/integration/heartbeat", content=SNAPSHOT_BODY,
+                               headers=headers).json()
+        body = poll()
+        assert body["plan"] is None
+        assert (body["v2l"] is None) == (not configured or not sampled)
+        state.plan = _plan()
+        state.plan_at = datetime(2026, 10, 24, 11, 30, tzinfo=UTC)
+        state.soc_observation_ok = True
+        assert poll()["plan"]["soc_trusted"] is True
+        state.soc_observation_ok = False
+        body = poll()
+        assert body["plan"]["soc_trusted"] is False
+        assert body["plan"]["charge_needed_kwh"] == 9.6
+        assert body["plan"]["planned_cost_gbp"] is None
+        assert body["plan"]["baseline_cost_gbp"] is None
+        assert "sensor.private" not in json.dumps(body)

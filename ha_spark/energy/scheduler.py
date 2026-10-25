@@ -2063,6 +2063,7 @@ async def _run_paired(
             # Sole SoC observation cadence (#114): one checked measurement per
             # minute in every operating state, reused by everything below.
             measurement = await soc_monitor_tick(settings, monitor)
+            state.soc_observation_ok = measurement is not None and measurement.ok
             solis_fallback_active = monitor.fallback_active and any(
                 device.type == "inverter" and device.driver == "solis"
                 for device in settings.devices

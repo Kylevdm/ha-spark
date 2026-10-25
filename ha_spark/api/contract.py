@@ -19,6 +19,9 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 from ha_spark import __version__
+from ha_spark.config import Settings
+from ha_spark.energy.models import ChargePlan
+from ha_spark.energy.v2l import V2LSession, delivered_fraction, savings
 
 API_VERSION: Final = 1
 SUPPORTED_API_VERSIONS: Final = frozenset({1})
@@ -99,8 +102,11 @@ def version_refusal() -> dict[str, object]:
 
 def plan_summary(
     *, session_id: str, built_at: datetime, loop_tick: datetime | None,
+    plan: ChargePlan | None = None, plan_at: datetime | None = None,
+    soc_observation_ok: bool = False, session: V2LSession | None = None,
+    settings: Settings | None = None,
 ) -> dict[str, object]:
-    """Project the phase-4 envelope without any household state."""
+    """Project only the envelope and allowlisted plan/session display numbers."""
     return {
         "api_version": API_VERSION,
         "release_version": __version__,
@@ -108,5 +114,43 @@ def plan_summary(
         "loop_tick": loop_tick.isoformat() if loop_tick is not None else None,
         "built_at": built_at.isoformat(),
         "commands_pending": False,
-        "plan": None,
+        "plan": plan_block(plan, plan_at, soc_observation_ok),
+        "v2l": v2l_block(session, settings),
+    }
+
+
+def plan_block(
+    plan: ChargePlan | None, computed_at: datetime | None, soc_observation_ok: bool,
+) -> dict[str, object] | None:
+    """No internal text, settings or device identifiers cross this projection."""
+    if plan is None or computed_at is None:
+        return None
+    return {
+        "computed_at": computed_at.isoformat(),
+        "soc_trusted": plan.soc.ok and soc_observation_ok,
+        "charge_needed_kwh": round(plan.required_kwh, 2),
+        "target_soc_pct": round(plan.target_soc, 0),
+        "forecast_load_kwh": round(plan.load_kwh, 2),
+        "solar_forecast_kwh": round(plan.effective_solar_kwh, 2),
+        "deficit_kwh": round(plan.deficit_kwh, 2),
+        "planned_cost_gbp": round(plan.planned_cost, 2) if plan.planned_cost is not None else None,
+        "baseline_cost_gbp": (
+            round(plan.baseline_cost, 2) if plan.baseline_cost is not None else None
+        ),
+    }
+
+
+def v2l_block(session: V2LSession | None, settings: Settings | None) -> dict[str, object] | None:
+    """Session values use the existing savings and reset semantics."""
+    if (settings is None or not settings.v2l_power_entity or session is None
+            or session.last_sample_ts is None):
+        return None
+    avoided, refill, net = savings(
+        session.kwh_delivered, settings.v2l_peak_rate_gbp, settings.v2l_offpeak_rate_gbp,
+        settings.v2l_round_trip_efficiency, delivered_fraction(settings),
+    )
+    return {
+        "energy_kwh": round(session.kwh_delivered, 2), "net_saving_gbp": round(net, 2),
+        "avoided_gbp": round(avoided, 2), "refill_cost_gbp": round(refill, 2),
+        "peak_power_w": round(session.peak_power_w, 0),
     }

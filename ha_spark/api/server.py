@@ -49,6 +49,7 @@ from ha_spark.api.contract import (
 from ha_spark.authority import OperatingMode, authority_view, load_authority
 from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import DaemonChannel
+from ha_spark.energy import v2l
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.integration_discovery import IntegrationDiscovery
@@ -136,6 +137,7 @@ class AppState:
         self.executor = executor
         self.integration_link = IntegrationLink(None, None, False)
         self.loop_tick: datetime | None = None
+        self.soc_observation_ok: bool = False
 
     def integration_link_view(self) -> dict[str, object]:
         """Read the current link without affecting authority or planning."""
@@ -650,6 +652,8 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
         return JSONResponse(
             plan_summary(
                 session_id=integration.session_id, built_at=now, loop_tick=state.loop_tick,
+                plan=state.plan, plan_at=state.plan_at, soc_observation_ok=state.soc_observation_ok,
+                session=v2l.load_session(state.settings), settings=state.settings,
             ),
             headers={"Cache-Control": "no-store"},
         )

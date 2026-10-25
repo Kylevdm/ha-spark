@@ -1,7 +1,41 @@
 {
   "entity": {
     "binary_sensor": {
-      "addon_connected": {"name": "Add-on connected"}
+      "addon_connected": {
+        "name": "Add-on connected"
+      }
+    },
+    "sensor": {
+      "charge_needed": {
+        "name": "Charge needed"
+      },
+      "target_soc": {
+        "name": "Target SoC"
+      },
+      "forecast_load": {
+        "name": "Forecast load"
+      },
+      "solar_forecast": {
+        "name": "Solar forecast"
+      },
+      "deficit": {
+        "name": "Deficit"
+      },
+      "planned_cost": {
+        "name": "Planned cost"
+      },
+      "baseline_cost": {
+        "name": "Baseline cost"
+      },
+      "v2l_energy": {
+        "name": "V2L energy"
+      },
+      "v2l_net_saving": {
+        "name": "V2L net saving"
+      },
+      "last_run": {
+        "name": "Last run"
+      }
     }
   },
   "config": {
