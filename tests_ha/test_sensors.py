@@ -10,18 +10,23 @@ from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import mock_restore_cache_with_extra_data
 from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker
 
-from custom_components.ha_spark.sensor import DESCRIPTIONS
+from custom_components.ha_spark.sensor import DESCRIPTIONS, SparkSensorDescription
 from custom_components.ha_spark.wire import MalformedSummary, parse_summary
 from tests_ha.test_polling import URL, fixture, setup, state_value, summary
 
 LAST = "sensor.ha_spark_last_run"
 
 
+def entity_id(desc: SparkSensorDescription) -> str:
+    return desc.requested_entity_id or "sensor.ha_spark_next_planned_change"
+
+
 async def test_golden_sensors_and_legacy_ids(
     hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
 ) -> None:
     for desc in DESCRIPTIONS:
-        hass.states.async_set(desc.requested_entity_id, "legacy")
+        if desc.requested_entity_id:
+            hass.states.async_set(desc.requested_entity_id, "legacy")
     aioclient_mock.post(URL, json=summary())
     entry = await setup(hass)
     # (state, unit, device class, state class), fixed independently of DESCRIPTIONS.
@@ -36,19 +41,34 @@ async def test_golden_sensors_and_legacy_ids(
         "sensor.ha_spark_v2l_energy_kwh": ("2.35", "kWh", "energy", "total_increasing"),
         "sensor.ha_spark_v2l_net_saving_gbp": ("0.47", "GBP", "monetary", None),
         "sensor.ha_spark_last_run": ("2026-10-24T11:30:00+00:00", None, "timestamp", None),
+        "sensor.ha_spark_plan_status": ("idle", None, "enum", None),
+        "sensor.ha_spark_next_planned_change": (
+            "2026-10-24T22:30:00+00:00", None, "timestamp", None),
     }
-    assert {desc.requested_entity_id for desc in DESCRIPTIONS} == set(expected)
+    assert {entity_id(desc) for desc in DESCRIPTIONS} == set(expected)
     for desc in DESCRIPTIONS:
-        value, unit, device_class, state_class = expected[desc.requested_entity_id]
-        state = hass.states.get(desc.requested_entity_id)
+        value, unit, device_class, state_class = expected[entity_id(desc)]
+        state = hass.states.get(entity_id(desc))
         assert state is not None and state.state == value
         assert state.attributes.get("device_class") == device_class
         assert state.attributes.get("unit_of_measurement") == unit
         assert state.attributes.get("state_class") == state_class
-        registered = er.async_get(hass).async_get(desc.requested_entity_id)
+        registered = er.async_get(hass).async_get(entity_id(desc))
         assert registered is not None
         assert registered.unique_id == f"{entry.data['site_id']}_{desc.key}"
-        assert hass.states.get(desc.requested_entity_id + "_2") is None
+        assert hass.states.get(entity_id(desc) + "_2") is None
+    status = hass.states.get("sensor.ha_spark_plan_status")
+    assert status is not None
+    assert status.attributes["options"] == ["hold", "export", "charge", "idle"]
+    for key, value in fixture("plan_summary")["plan"]["status"].items():
+        if key != "action" and value is not None:
+            assert status.attributes[key] == value
+    assert "operating_mode" not in status.attributes
+    assert "export_soc_needed_pct" not in status.attributes
+    next_change = hass.states.get("sensor.ha_spark_next_planned_change")
+    assert next_change is not None
+    for key in ("action", "reason"):
+        assert next_change.attributes[key] == fixture("plan_summary")["plan"]["next_change"][key]
     saving = hass.states.get("sensor.ha_spark_v2l_net_saving_gbp")
     assert saving is not None
     for key in ("avoided_gbp", "refill_cost_gbp", "peak_power_w"):
@@ -89,7 +109,7 @@ async def test_sensor_value_rules(
         async_fire_time_changed(hass, dt_util.utcnow())
         await hass.async_block_till_done()
     for desc in DESCRIPTIONS:
-        value = state_value(hass, desc.requested_entity_id)
+        value = state_value(hass, entity_id(desc))
         if desc.key == "last_run":
             # Only a counted summary with a plan advances Last run; nothing clears it.
             advanced = change not in {"401", "plan"}
@@ -119,7 +139,7 @@ async def test_last_run_restores_while_down(
     assert state_value(hass, LAST) == timestamp
     for desc in DESCRIPTIONS:
         if desc.key != "last_run":
-            assert state_value(hass, desc.requested_entity_id) == "unavailable"
+            assert state_value(hass, entity_id(desc)) == "unavailable"
 
 
 @pytest.mark.parametrize("block,key,value", [
@@ -143,13 +163,13 @@ async def test_registered_requested_ids_are_not_cleared(
     registry = er.async_get(hass)
     for desc in DESCRIPTIONS:
         registry.async_get_or_create("sensor", "other", desc.key,
-                                     suggested_object_id=desc.requested_entity_id.split(".")[1])
-        hass.states.async_set(desc.requested_entity_id, "owner-state")
+                                     suggested_object_id=entity_id(desc).split(".")[1])
+        hass.states.async_set(entity_id(desc), "owner-state")
     aioclient_mock.post(URL, json=summary())
     await setup(hass)
     for desc in DESCRIPTIONS:
-        assert state_value(hass, desc.requested_entity_id) == "owner-state"
-        assert hass.states.get(desc.requested_entity_id + "_2") is not None
+        assert state_value(hass, entity_id(desc)) == "owner-state"
+        assert hass.states.get(entity_id(desc) + "_2") is not None
 
 
 def test_informational_fields_are_ignored_in_number_blocks() -> None:
@@ -158,3 +178,44 @@ def test_informational_fields_are_ignored_in_number_blocks() -> None:
     body["plan"]["future_display"] = {"anything": True}
     body["v2l"]["future_display"] = [1, 2]
     assert parse_summary(body) == expected
+
+
+async def test_no_next_change_is_unknown_and_export_soc_attributes(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+) -> None:
+    body = summary()
+    body["plan"]["next_change"] = None
+    body["plan"]["status"].update({
+        "export_soc_needed_pct": 79.0, "export_soc_needed_at": "2026-10-24T14:00:00+00:00",
+    })
+    aioclient_mock.post(URL, json=body)
+    await setup(hass)
+    state = hass.states.get("sensor.ha_spark_next_planned_change")
+    assert state is not None and state.state == "unknown"
+    assert "action" not in state.attributes and "reason" not in state.attributes
+    status = hass.states.get("sensor.ha_spark_plan_status")
+    assert status is not None
+    assert status.attributes["export_soc_needed_pct"] == 79
+    assert status.attributes["export_soc_needed_at"] == "2026-10-24T14:00:00+00:00"
+
+
+@pytest.mark.parametrize("block,key,value", [
+    ("status", "action", "simulate"), ("status", "reason", "unsafe\u0001"),
+    ("status", "reason", ""), ("status", "reason", "x" * 256),
+    ("status", "model", "daily-v2"), ("status", "strategy", "FILL"),
+    ("status", "soc_status", "x" * 33), ("status", "soc_reason", "unsafe\n"),
+    ("status", "export_soc_needed_pct", 50),
+    ("next_change", "at", "2026-10-24T12:00:00"),
+    ("next_change", "action", "invalid"), ("next_change", "reason", "unsafe\u0000"),
+])
+async def test_malformed_status_is_no_heartbeat(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+    block: str, key: str, value: Any,
+) -> None:
+    body = summary()
+    body["plan"][block][key] = value
+    aioclient_mock.post(URL, json=body)
+    entry = await setup(hass)
+    assert entry.runtime_data.last_outcome == "malformed"
+    for entity in ("sensor.ha_spark_plan_status", "sensor.ha_spark_next_planned_change"):
+        assert state_value(hass, entity) == "unavailable"

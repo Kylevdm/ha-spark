@@ -379,7 +379,9 @@ async def test_non_finite_plan_number_is_null_and_heartbeat_counts(state, discov
         "baseline_cost": "baseline_cost_gbp",
     }[field]
     assert plan[wire_key] is None
-    assert all(value is not None for key, value in plan.items() if key != wire_key)
+    # The new next-change block is legitimately null when no charge can be scheduled.
+    assert all(value is not None for key, value in plan.items()
+               if key not in {wire_key, "next_change"})
 
 
 @pytest.mark.parametrize("session", [
@@ -406,3 +408,87 @@ async def test_session_file_unread_without_v2l(state, discovery, caplog):
     assert response.json()["v2l"] is None
     assert CANARY not in caplog.text
     assert "V2L session" not in caplog.text
+
+
+def test_status_uses_store_hold_in_observe_without_mutation(
+    state, discovery, monkeypatch, tmp_path,
+):
+    from ha_spark.authority import AuthorityStore
+    from tests.test_api import _plan
+    from tests.test_plan_status import at, record
+
+    monkeypatch.setattr(server, "_heartbeat_now", lambda: at(12))
+    monkeypatch.setattr("ha_spark.authority.resolve_data_dir", lambda _: tmp_path)
+    store = AuthorityStore(state.settings)
+    store.initialise()
+    store.save_holds((record("ev"),))
+    state.plan = _plan()
+    state.plan_at = at(11)
+    before = store.store_path.read_bytes()
+    with TestClient(build_app(state, ingress_peer="testclient", integration=discovery)) as client:
+        response = client.post("/integration/heartbeat", content=SNAPSHOT_BODY,
+                               headers={"Authorization": f"Bearer {discovery.auth_token}"})
+    assert response.status_code == 200
+    plan = response.json()["plan"]
+    assert plan["status"]["action"] == "hold"
+    assert plan["status"]["reason"] == "Battery held while the EV charges."
+    assert plan["next_change"] is None
+    assert CANARY not in response.text
+    assert store.store_path.read_bytes() == before
+    assert store.state.committed_mode == "observe"
+
+
+@pytest.mark.parametrize("soc_status", ["implausible", "unavailable"])
+def test_status_text_is_bounded_and_export_soc_is_paired(state, discovery, monkeypatch, soc_status):
+    from dataclasses import replace
+
+    from ha_spark.energy.soc_integrity import SocStatus
+    from tests.test_api import _plan
+    from tests.test_plan_status import at
+
+    monkeypatch.setattr(server, "_heartbeat_now", lambda: at(12))
+    plan = _plan(export_soc_needed_pct=78.6, export_soc_needed_at=at(14))
+    soc = replace(plan.soc, status=SocStatus(soc_status),
+                  raw_state="safe\u0001" + "x" * 300 + CANARY,
+                  energy_reason="safe\u0001" + "x" * 300 + CANARY)
+    state.plan = replace(plan, soc=soc)
+    state.plan_at = at(11)
+    with TestClient(build_app(state, ingress_peer="testclient", integration=discovery)) as client:
+        def poll():
+            response = client.post("/integration/heartbeat", content=SNAPSHOT_BODY,
+                                   headers={"Authorization": f"Bearer {discovery.auth_token}"})
+            assert response.status_code == 200
+            return response.json()["plan"]["status"]
+        status = poll()
+        assert len(status["soc_reason"]) == 200
+        assert status["soc_reason"].isprintable()
+        assert status["soc_reason"] == "".join(c for c in soc.reason if c.isprintable())[:200]
+        if soc_status == "implausible":
+            assert status["soc_reason"] == "safe" + "x" * 196
+        assert status["export_soc_needed_pct"] == 79
+        assert status["export_soc_needed_at"] == at(14).isoformat()
+        assert CANARY not in json.dumps(status)
+        for pct, end in ((None, at(14)), (78.6, None)):
+            state.plan = replace(state.plan, export_soc_needed_pct=pct, export_soc_needed_at=end)
+            status = poll()
+            assert status["export_soc_needed_pct"] is None
+            assert status["export_soc_needed_at"] is None
+
+
+async def test_unloadable_timezone_and_unprintable_soc_reason_degrade(state, discovery):
+    from dataclasses import replace
+
+    from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+    from tests.test_api import _plan
+
+    state.settings = state.settings.model_copy(update={"timezone": "Not/AZone"})
+    plan = _plan()
+    soc = SocMeasurement(SocStatus.MALFORMED, datetime(2026, 10, 24, 11, 30, tzinfo=UTC),
+                         raw_state="\x1b\x07")
+    state.plan = replace(plan, soc=soc, charge_intent=replace(plan.charge_intent, soc=soc))
+    state.plan_at = datetime(2026, 10, 24, 11, 30, tzinfo=UTC)
+    response = await request(state, discovery,
+                             headers={"Authorization": f"Bearer {discovery.auth_token}"})
+    assert response.status_code == 200
+    reason = response.json()["plan"]["status"]["soc_reason"]
+    assert reason and reason.isprintable()

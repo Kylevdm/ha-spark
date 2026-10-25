@@ -26,10 +26,10 @@ from .wire import Summary
 class SparkSensorDescription(SensorEntityDescription):
     """Fixed identity, availability and value projection for a site sensor."""
 
-    requested_entity_id: str
+    requested_entity_id: str | None = None
     soc_derived: bool = False
     v2l: bool = False
-    value_fn: Callable[[Summary], float | datetime | None]
+    value_fn: Callable[[Summary], float | str | datetime | None]
     attributes_fn: Callable[[Summary], dict[str, Any] | None] | None = None
 
 
@@ -99,6 +99,27 @@ DESCRIPTIONS = (
         } if s.v2l else None,
     ),
     SparkSensorDescription(
+        key="plan_status", translation_key="plan_status",
+        requested_entity_id="sensor.ha_spark_plan_status", device_class=SensorDeviceClass.ENUM,
+        options=["hold", "export", "charge", "idle"],
+        value_fn=lambda s: s.plan.status.action if s.plan else None,
+        attributes_fn=lambda s: {
+            "reason": s.plan.status.reason, "model": s.plan.status.model,
+            "strategy": s.plan.status.strategy, "soc_status": s.plan.status.soc_status,
+            "soc_reason": s.plan.status.soc_reason,
+            **({"export_soc_needed_pct": s.plan.status.export_soc_needed_pct,
+                "export_soc_needed_at": s.plan.status.export_soc_needed_at.isoformat()}
+               if s.plan.status.export_soc_needed_at is not None else {}),
+        } if s.plan else None,
+    ),
+    SparkSensorDescription(
+        key="next_change", translation_key="next_change", device_class=SensorDeviceClass.TIMESTAMP,
+        value_fn=lambda s: s.plan.next_change.at if s.plan and s.plan.next_change else None,
+        attributes_fn=lambda s: {
+            "action": s.plan.next_change.action, "reason": s.plan.next_change.reason,
+        } if s.plan and s.plan.next_change else None,
+    ),
+    SparkSensorDescription(
         key="last_run", translation_key="last_run",
         requested_entity_id="sensor.ha_spark_last_run", device_class=SensorDeviceClass.TIMESTAMP,
         value_fn=lambda s: s.plan.computed_at if s.plan else None,
@@ -112,7 +133,8 @@ async def async_setup_entry(
     """Free legacy pushed states before requesting their existing ids."""
     entities = []
     for description in DESCRIPTIONS:
-        async_clear_unregistered_state(hass, description.requested_entity_id)
+        if description.requested_entity_id is not None:
+            async_clear_unregistered_state(hass, description.requested_entity_id)
         cls = LastRun if description.key == "last_run" else SparkSensor
         entities.append(cls(entry.runtime_data, description))
     async_add_entities(entities)
@@ -126,7 +148,8 @@ class SparkSensor(SparkEntity, SensorEntity):
     def __init__(self, coordinator: SparkCoordinator, description: SparkSensorDescription) -> None:
         super().__init__(coordinator, description.key)
         self.entity_description = description
-        self.entity_id = description.requested_entity_id
+        if description.requested_entity_id is not None:
+            self.entity_id = description.requested_entity_id
 
     @property
     def available(self) -> bool:
@@ -139,7 +162,7 @@ class SparkSensor(SparkEntity, SensorEntity):
                     and not summary.plan.soc_trusted)
 
     @property
-    def native_value(self) -> float | datetime | None:
+    def native_value(self) -> float | str | datetime | None:
         summary = self.coordinator.summary
         return self.entity_description.value_fn(summary) if summary else None
 

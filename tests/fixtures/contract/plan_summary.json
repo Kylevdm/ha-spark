@@ -14,7 +14,22 @@
     "solar_forecast_kwh": 5.0,
     "deficit_kwh": 8.0,
     "planned_cost_gbp": 1.23,
-    "baseline_cost_gbp": 3.46
+    "baseline_cost_gbp": 3.46,
+    "status": {
+      "action": "idle",
+      "reason": "Nothing to charge, export or hold right now.",
+      "model": "daily",
+      "strategy": "deficit",
+      "soc_status": "ok",
+      "soc_reason": "SoC 40% reported 0s ago",
+      "export_soc_needed_pct": null,
+      "export_soc_needed_at": null
+    },
+    "next_change": {
+      "at": "2026-10-24T22:30:00+00:00",
+      "action": "charge",
+      "reason": "Charging 9.6 kWh to reach 90% by 05:30."
+    }
   },
   "v2l": {
     "energy_kwh": 2.35,

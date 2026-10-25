@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
-from typing import Final
+from typing import Final, Literal, cast
 from uuid import UUID
 
 API_VERSION: Final = 1
@@ -30,6 +30,32 @@ SUPPORTED_API_VERSIONS: Final = frozenset({1})
 
 class MalformedSummary(ValueError):
     """The summary does not match the wire contract (no payload in the error)."""
+
+
+Action = Literal["hold", "export", "charge", "idle"]
+
+
+@dataclass(frozen=True)
+class PlanStatusBlock:
+    """Current intended action and safe display attributes."""
+
+    action: Action
+    reason: str
+    model: str
+    strategy: str
+    soc_status: str
+    soc_reason: str
+    export_soc_needed_pct: float | None
+    export_soc_needed_at: datetime | None
+
+
+@dataclass(frozen=True)
+class NextChange:
+    """First scheduled change in intended action."""
+
+    at: datetime
+    action: Action
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -45,6 +71,8 @@ class PlanBlock:
     deficit_kwh: float | None
     planned_cost_gbp: float | None
     baseline_cost_gbp: float | None
+    status: PlanStatusBlock
+    next_change: NextChange | None
 
 
 @dataclass(frozen=True)
@@ -192,8 +220,53 @@ def _plan(value: object) -> PlanBlock | None:
         if key not in value:
             raise MalformedSummary()
         numbers[key] = None if value[key] is None else _number(value[key])
+    if "next_change" not in value:
+        raise MalformedSummary()
     return PlanBlock(computed_at=_timestamp(value.get("computed_at")),
-                     soc_trusted=value["soc_trusted"], **numbers)
+                     soc_trusted=value["soc_trusted"], status=_status(value.get("status")),
+                     next_change=_next_change(value["next_change"]), **numbers)
+
+
+def _text(value: object, *, code: bool = False) -> str:
+    if not isinstance(value, str) or not 1 <= len(value) <= 255 or not value.isprintable():
+        raise MalformedSummary()
+    if code and re.fullmatch(r"[a-z_]{1,32}", value) is None:
+        raise MalformedSummary()
+    return value
+
+
+def _action(value: object) -> Action:
+    if not isinstance(value, str) or value not in {"hold", "export", "charge", "idle"}:
+        raise MalformedSummary()
+    return cast(Action, value)
+
+
+def _status(value: object) -> PlanStatusBlock:
+    if not isinstance(value, dict):
+        raise MalformedSummary()
+    if "export_soc_needed_pct" not in value or "export_soc_needed_at" not in value:
+        raise MalformedSummary()
+    pct, at = value["export_soc_needed_pct"], value["export_soc_needed_at"]
+    if (pct is None) != (at is None):
+        raise MalformedSummary()
+    return PlanStatusBlock(
+        action=_action(value.get("action")), reason=_text(value.get("reason")),
+        model=_text(value.get("model"), code=True),
+        strategy=_text(value.get("strategy"), code=True),
+        soc_status=_text(value.get("soc_status"), code=True),
+        soc_reason=_text(value.get("soc_reason")),
+        export_soc_needed_pct=None if pct is None else _number(pct),
+        export_soc_needed_at=None if at is None else _timestamp(at),
+    )
+
+
+def _next_change(value: object) -> NextChange | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise MalformedSummary()
+    return NextChange(at=_timestamp(value.get("at")), action=_action(value.get("action")),
+                      reason=_text(value.get("reason")))
 
 
 def _v2l(value: object) -> V2LBlock | None:
