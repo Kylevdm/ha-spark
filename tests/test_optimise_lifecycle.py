@@ -46,7 +46,7 @@ async def test_optimise_activation_retries_without_preview_baseline(
             state, calls, device, measurement = rig
             # This observation ends the rig's initial monitor fallback so a
             # fresh entry measurement permits normal planning.
-            async def observe(settings, monitor):
+            async def observe(settings, monitor, on_observed=None):
                 monitor.fallback_active = False
                 monitor.recovery_blocked = False
                 return measurement
@@ -256,7 +256,7 @@ async def test_activation_completes_past_unverified_protection_notes_and_guard_m
         async with running_daemon(settings, tmp_path, monkeypatch) as rig:
             state, _, device, measurement = rig
 
-            async def observe(settings, monitor):
+            async def observe(settings, monitor, on_observed=None):
                 monitor.fallback_active = False
                 monitor.recovery_blocked = False
                 return measurement

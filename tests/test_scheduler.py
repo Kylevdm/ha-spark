@@ -5569,7 +5569,9 @@ async def test_restored_pending_failure_blocks_normal_run_until_checked_tick(
     checked = _passing_at(0)
     observations = iter([None, checked])
 
-    async def fake_monitor_tick(_settings: Settings, monitor: SocMonitor) -> SocMeasurement | None:
+    async def fake_monitor_tick(
+        _settings: Settings, monitor: SocMonitor, _on_observed: object = None,
+    ) -> SocMeasurement | None:
         measurement = next(observations)
         if measurement is not None:
             monitor.record(measurement, failure_threshold=3)
@@ -6162,3 +6164,30 @@ async def test_run_forever_restricts_the_ingress_listener(
     with pytest.raises(_Bound):
         await run_forever(Settings(**settings_kw), poll_seconds=0)  # type: ignore[arg-type]
     assert captured == {"peer": peer, "host": host, "port": scheduler.INGRESS_PORT}
+
+
+@respx.mock
+async def test_soc_verdict_is_published_before_the_tick_awaits_its_side_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(#481) The display verdict changes as soon as the observation is checked,
+    not after the fallback mirroring and integrity publishing that follow it."""
+    respx.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    _soc_get(["50"], [datetime.now(UTC) - timedelta(hours=1)])
+    settings = Settings(
+        ha_url="http://ha.test", ha_token="t", db_path=str(tmp_path / "ledger.db"),
+        soc_entity="sensor.soc", v2l_power_entity="",
+    )
+    seen: list[bool] = []
+    verdicts_at_mirror: list[list[bool]] = []
+
+    async def mirror(*args: object, **kwargs: object) -> None:
+        verdicts_at_mirror.append(list(seen))
+
+    monkeypatch.setattr(scheduler, "_mirror_fallback_authority", mirror)
+    monitor = SocMonitor(path=tmp_path / "ha_spark_soc_monitor.json")
+    measurement = await scheduler.soc_monitor_tick(
+        settings, monitor, lambda observed: seen.append(observed.ok),
+    )
+    assert measurement is not None and not measurement.ok
+    assert verdicts_at_mirror == [[False]]

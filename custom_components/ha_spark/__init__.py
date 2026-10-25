@@ -3,7 +3,7 @@
 One config entry per site (ADR-0011), paired through Supervisor discovery. The
 heartbeat coordinator loads even with the add-on down and exposes site connectivity.
 New discovery reloads the entry, fencing off the old session's in-flight replies.
-Plan sensors and the mode, fallback and hold mirrors arrive in later tickets.
+Plan numbers are read-only sensors; mode, fallback and hold mirrors arrive later.
 """
 
 from typing import TypeAlias
@@ -18,7 +18,7 @@ from .coordinator import SparkCoordinator
 from .entity import async_clear_unregistered_state
 
 SparkConfigEntry: TypeAlias = ConfigEntry[SparkCoordinator]
-PLATFORMS = [Platform.BINARY_SENSOR]
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> bool:

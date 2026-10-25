@@ -5,5 +5,22 @@
   "loop_tick": "2026-10-24T11:59:30+00:00",
   "built_at": "2026-10-24T12:00:00+00:00",
   "commands_pending": false,
-  "plan": null
+  "plan": {
+    "computed_at": "2026-10-24T11:30:00+00:00",
+    "soc_trusted": true,
+    "charge_needed_kwh": 9.6,
+    "target_soc_pct": 90.0,
+    "forecast_load_kwh": 10.0,
+    "solar_forecast_kwh": 5.0,
+    "deficit_kwh": 8.0,
+    "planned_cost_gbp": 1.23,
+    "baseline_cost_gbp": 3.46
+  },
+  "v2l": {
+    "energy_kwh": 2.35,
+    "net_saving_gbp": 0.47,
+    "avoided_gbp": 0.7,
+    "refill_cost_gbp": 0.23,
+    "peak_power_w": 1234.0
+  }
 }
