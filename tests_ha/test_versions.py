@@ -178,3 +178,32 @@ async def test_diagnostics_before_counted_heartbeat(
     assert data["last_outcome_at"] == entry.runtime_data.last_outcome_at.isoformat()
     assert TOKEN not in json.dumps(data)
     assert "addon-test" not in json.dumps(data)
+
+
+async def test_diagnostics_after_unload(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+    hass_client: ClientSessionGenerator,
+) -> None:
+    aioclient_mock.post(URL, json=summary())
+    entry = await setup(hass)
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    data = await get_diagnostics_for_config_entry(hass, hass_client, entry)
+    assert data["summary"] is None
+    assert data["last_outcome"] is None
+    assert data["entry"]["auth_token"] == "**REDACTED**"
+    assert TOKEN not in json.dumps(data)
+    assert "addon-test" not in json.dumps(data)
+
+
+@pytest.mark.parametrize("field", ["release_version", "supported_api_versions"])
+def test_refusal_rejects_subclassed_types(field: str) -> None:
+    class Str(str):
+        pass
+
+    class List(list[int]):
+        pass
+
+    body: dict[str, Any] = dict(fixture("version_refusal"))
+    body[field] = Str(body[field]) if field == "release_version" else List(body[field])
+    with pytest.raises(wire.MalformedSummary):
+        wire.parse_refusal(body)

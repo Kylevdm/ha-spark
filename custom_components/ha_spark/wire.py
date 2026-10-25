@@ -74,7 +74,7 @@ def parse_version_envelope(body: object) -> VersionEnvelope:
     release = body.get("release_version")
     if (
         type(version) is not int or version < 1
-        or not isinstance(release, str)
+        or type(release) is not str
         or re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}", release) is None
     ):
         raise MalformedSummary()
@@ -87,7 +87,7 @@ def parse_refusal(body: object) -> VersionEnvelope:
     assert isinstance(body, dict)
     supported = body.get("supported_api_versions")
     if (
-        not isinstance(supported, list) or not 1 <= len(supported) <= 16
+        type(supported) is not list or not 1 <= len(supported) <= 16
         or any(type(version) is not int or version < 1 for version in supported)
         or len(set(supported)) != len(supported)
     ):
