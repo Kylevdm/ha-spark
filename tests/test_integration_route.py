@@ -483,12 +483,46 @@ async def test_unloadable_timezone_and_unprintable_soc_reason_degrade(state, dis
 
     state.settings = state.settings.model_copy(update={"timezone": "Not/AZone"})
     plan = _plan()
-    soc = SocMeasurement(SocStatus.MALFORMED, datetime(2026, 10, 24, 11, 30, tzinfo=UTC),
-                         raw_state="\x1b\x07")
+    soc = SocMeasurement(SocStatus.IMPLAUSIBLE, datetime(2026, 10, 24, 11, 30, tzinfo=UTC),
+                         energy_reason="\x1b\x07\x00")
     state.plan = replace(plan, soc=soc, charge_intent=replace(plan.charge_intent, soc=soc))
     state.plan_at = datetime(2026, 10, 24, 11, 30, tzinfo=UTC)
     response = await request(state, discovery,
                              headers={"Authorization": f"Bearer {discovery.auth_token}"})
     assert response.status_code == 200
-    reason = response.json()["plan"]["status"]["soc_reason"]
-    assert reason and reason.isprintable()
+    assert response.json()["plan"]["status"]["soc_reason"] == "implausible"
+
+
+async def test_odd_plan_content_degrades_and_still_parses(state, discovery):
+    """Unrenderable SoC reason, unrepresentable export times and a naive export-SoC
+    time each degrade, and the heartbeat stays 200 (the harness parses a null action)."""
+    from dataclasses import replace
+    from datetime import timedelta, timezone
+
+    from ha_spark.energy.models import ExportIntent
+    from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+    from tests.test_api import _plan
+
+    soc = SocMeasurement(SocStatus.OK, datetime(2026, 10, 24, 11, 30, tzinfo=UTC), value=40)
+    plan = _plan()
+    export = ExportIntent(
+        event_identity=("e", datetime(2026, 10, 24, 14, tzinfo=UTC),
+                        datetime(2026, 10, 24, 15, tzinfo=UTC)),
+        window_start=datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=1))),
+        window_end=datetime(2026, 10, 24, 15, tzinfo=UTC), planned_export_kw=1,
+        dno_export_limit_kw=2, selected_slots=(), slot_export_kw=(),
+    )
+    state.plan = replace(
+        plan, soc=soc, export_soc_needed_pct=79.0,
+        export_soc_needed_at=datetime(2026, 10, 24, 14),
+        charge_intent=replace(plan.charge_intent, soc=soc, export=export),
+    )
+    state.plan_at = datetime(2026, 10, 24, 11, 30, tzinfo=UTC)
+    response = await request(state, discovery,
+                             headers={"Authorization": f"Bearer {discovery.auth_token}"})
+    assert response.status_code == 200
+    status = response.json()["plan"]["status"]
+    assert status["action"] is None and status["reason"] is None
+    assert status["soc_reason"] == "ok"
+    assert status["export_soc_needed_pct"] is None and status["export_soc_needed_at"] is None
+    assert response.json()["plan"]["next_change"] is None

@@ -4,6 +4,7 @@ Store holds are current facts, not the plan's older EV observation. This display
 projection grants no authority and never changes a hold or an execution input.
 """
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -28,6 +29,25 @@ class PlanStatus:
     next_reason: str | None
 
 
+def _number(value: object) -> float | None:
+    """A finite float, else None: odd plan numbers degrade the display, never raise."""
+    if not isinstance(value, (int, float)) or type(value) not in (int, float):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _amount(value: object, unit: str, ndigits: int) -> str | None:
+    """A bounded figure for a reason sentence, else None (the sentence drops it)."""
+    number = _number(value)
+    if number is None or abs(number) >= 1e5:
+        return None
+    return f"{number:.{ndigits}f}{unit}"
+
+
 def resolve(
     plan: ChargePlan, holds: Sequence[HoldRecord], now: datetime, tz: ZoneInfo,
 ) -> PlanStatus:
@@ -37,6 +57,11 @@ def resolve(
     today = now.astimezone(tz).date()
     charge = tuple(_window_bounds(today + timedelta(days=d), intent.window_start,
                                   intent.window_end, tz) for d in (-1, 0, 1, 2))
+    # Occurrences are only enumerated this far; a later boundary can't be resolved
+    # (with equal bounds the windows are back to back and charging never stops).
+    horizon = max(end for _, end in charge)
+    required = _number(plan.required_kwh)
+    needs_charge = required is not None and required > 0
     dispatch = tuple((s.astimezone(UTC), e.astimezone(UTC)) for s, e in intent.holds)
     export = intent.export
     # A record still awaiting release has no scheduled end once its end has passed.
@@ -62,7 +87,7 @@ def resolve(
             return "export", (
                 f"Exporting for the flexibility event until {clock(export.window_end)}."
             )
-        if plan.required_kwh > 0 and any(s <= t < e for s, e in charge):
+        if needs_charge and any(s <= t < e for s, e in charge):
             if plan.charge_funded_reservations:
                 reservation = plan.charge_funded_reservations[0]
                 phrase = {
@@ -70,10 +95,12 @@ def resolve(
                     "axle-export-event": "the flexibility export",
                     "reach-charge-window": "the run to the charge window",
                 }.get(reservation.obligation_kind, "planned demand")
-                return "charge", f"Charging {reservation.energy_kwh:.1f} kWh to cover {phrase}."
+                kwh = _amount(reservation.energy_kwh, " kWh", 1)
+                return "charge", f"Charging {kwh or 'the battery'} to cover {phrase}."
             end = next(e for s, e in charge if s <= t < e)
-            return "charge", (f"Charging {plan.required_kwh:.1f} kWh to reach "
-                              f"{plan.target_soc:.0f}% by {clock(end)}.")
+            kwh, soc = _amount(required, " kWh", 1), _amount(plan.target_soc, "%", 0)
+            return "charge", (f"Charging {kwh or 'the battery'} to reach "
+                              f"{soc or 'the target'} by {clock(end)}.")
         return "idle", "Nothing to charge, export or hold right now."
 
     action, reason = action_at(now)
@@ -82,7 +109,7 @@ def resolve(
     if export is not None:
         boundaries.update((export.window_start.astimezone(UTC), export.window_end.astimezone(UTC)))
     if not indefinite:
-        for boundary in sorted(b for b in boundaries if b > now):
+        for boundary in sorted(b for b in boundaries if now < b < horizon):
             next_action, next_reason = action_at(boundary)
             if next_action != action:
                 return PlanStatus(action, reason, boundary, next_action, next_reason)

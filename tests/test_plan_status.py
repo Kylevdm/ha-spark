@@ -35,16 +35,17 @@ def scenario():
     return replace(plan, charge_intent=intent)
 
 
-@pytest.mark.parametrize("hour,action,next_hour,next_action", [
-    (9, "charge", 10, "export"), (10, "export", 11, "hold"),
-    (11, "hold", 13, "export"), (12, "hold", 13, "export"),
-    (13, "export", 14, "charge"), (14, "charge", 16, "idle"),
-    (16, "idle", 10, "charge"),
+@pytest.mark.parametrize("hour,action,next_at,next_action", [
+    (9, "charge", at(10), "export"), (10, "export", at(11), "hold"),
+    (11, "hold", at(13), "export"), (12, "hold", at(13), "export"),
+    (13, "export", at(14), "charge"), (14, "charge", at(16), "idle"),
+    # 10:00 London the next day, after the clocks go back: 10:00 UTC, not 09:00.
+    (16, "idle", datetime(2026, 10, 25, 10, tzinfo=UTC), "charge"),
 ])
-def test_precedence_half_open_and_skipped_boundary(hour, action, next_hour, next_action):
+def test_precedence_half_open_and_skipped_boundary(hour, action, next_at, next_action):
     status = resolve(scenario(), (), at(hour), TZ)
     assert status.action == action
-    assert status.next_at.hour == next_hour
+    assert status.next_at == next_at
     assert status.next_action == next_action
     assert "CANARY" not in status.reason + status.next_reason
 
@@ -87,3 +88,26 @@ def test_funded_reason_is_fixed_template():
         obligation_kind="axle-export-event", reason="CANARY"),))
     status = resolve(plan, (), at(23), TZ)
     assert status.reason == "Charging 3.2 kWh to cover the flexibility export."
+
+
+def test_back_to_back_charge_windows_have_no_next_change():
+    plan = _plan(required_kwh=9.6)
+    plan = replace(plan, charge_intent=replace(plan.charge_intent, window_start=time(0),
+                                               window_end=time(0), holds=(), export=None))
+    status = resolve(plan, (), at(12), TZ)
+    assert status.action == "charge"
+    assert status.next_at is None
+
+
+@pytest.mark.parametrize("field,value", [
+    ("required_kwh", 10**400), ("required_kwh", float("inf")), ("required_kwh", 1e300),
+    ("target_soc", float("nan")), ("target_soc", 1e300),
+])
+def test_reason_numbers_are_bounded_and_finite(field, value):
+    plan = replace(_plan(), **{field: value})
+    plan = replace(plan, charge_intent=replace(plan.charge_intent, window_start=time(0),
+                                               window_end=time(23), holds=(), export=None))
+    status = resolve(plan, (), at(12), TZ)
+    for reason in (status.reason, status.next_reason or ""):
+        assert len(reason) <= 120
+        assert "inf" not in reason and "nan" not in reason

@@ -219,3 +219,29 @@ async def test_malformed_status_is_no_heartbeat(
     assert entry.runtime_data.last_outcome == "malformed"
     for entity in ("sensor.ha_spark_plan_status", "sensor.ha_spark_next_planned_change"):
         assert state_value(hass, entity) == "unavailable"
+
+
+class _UnhashableStr(str):
+    __hash__ = None  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize("key,value", [
+    ("action", _UnhashableStr("idle")), ("action", type("S", (str,), {})("idle")),
+    ("reason", type("S", (str,), {})("Fine.")), ("action", None),
+])
+def test_status_text_is_exact_str(key: str, value: Any) -> None:
+    body = fixture("plan_summary")
+    body["plan"]["status"][key] = value
+    with pytest.raises(MalformedSummary):
+        parse_summary(body)
+
+
+async def test_unresolved_action_shows_unknown(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+) -> None:
+    body = summary()
+    body["plan"]["status"]["action"] = body["plan"]["status"]["reason"] = None
+    aioclient_mock.post(URL, json=body)
+    entry = await setup(hass)
+    assert entry.runtime_data.last_outcome == "counted"
+    assert state_value(hass, "sensor.ha_spark_plan_status") == "unknown"

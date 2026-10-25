@@ -20,7 +20,7 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 from ha_spark import __version__
-from ha_spark.api.plan_status import resolve
+from ha_spark.api.plan_status import PlanStatus, resolve
 from ha_spark.authority import AuthorityState, HoldRecord
 from ha_spark.config import Settings
 from ha_spark.energy.forecast import load_timezone
@@ -154,10 +154,21 @@ def plan_block(
     """Allowlisted numbers and status; never device identifiers or driver text."""
     if plan is None or computed_at is None:
         return None
-    # An unloadable zone degrades to UTC, as everywhere else, never a failed heartbeat.
-    status = resolve(plan, holds, now, load_timezone(timezone))
+    # An unloadable zone degrades to UTC, as everywhere else, never a failed heartbeat;
+    # unrepresentable plan times leave the action unknown rather than fail it.
+    status: PlanStatus | None
+    try:
+        status = resolve(plan, holds, now, load_timezone(timezone))
+    except (ArithmeticError, TypeError, ValueError):
+        status = None
+    try:
+        soc_reason = "".join(c for c in plan.soc.reason if c.isprintable())[:200]
+    except (ArithmeticError, TypeError, ValueError):
+        soc_reason = ""
     export_pct = _finite(plan.export_soc_needed_pct, 0)
     export_at = plan.export_soc_needed_at if export_pct is not None else None
+    if export_at is not None and export_at.utcoffset() is None:
+        export_at = None
     return {
         "computed_at": computed_at.isoformat(),
         "soc_trusted": plan.soc.ok and soc_observation_ok,
@@ -169,22 +180,20 @@ def plan_block(
         "planned_cost_gbp": _finite(plan.planned_cost, 2),
         "baseline_cost_gbp": _finite(plan.baseline_cost, 2),
         "status": {
-            "action": status.action, "reason": status.reason,
+            "action": status.action if status else None,
+            "reason": status.reason if status else None,
             "model": plan.model if plan.model in {"daily", "slots"} else "daily",
             "strategy": plan.strategy if plan.strategy in {"deficit", "fill"} else "deficit",
             "soc_status": plan.soc.status.value,
             # The reason can embed the SoC entity's raw state: printable, bounded, never empty.
-            "soc_reason": (
-                "".join(c for c in plan.soc.reason if c.isprintable())[:200]
-                or plan.soc.status.value
-            ),
+            "soc_reason": soc_reason or plan.soc.status.value,
             "export_soc_needed_pct": export_pct if export_at is not None else None,
             "export_soc_needed_at": export_at.isoformat() if export_at is not None else None,
         },
         "next_change": {
             "at": status.next_at.isoformat(), "action": status.next_action,
             "reason": status.next_reason,
-        } if status.next_at is not None else None,
+        } if status is not None and status.next_at is not None else None,
     }
 
 

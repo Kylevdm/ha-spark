@@ -39,8 +39,8 @@ Action = Literal["hold", "export", "charge", "idle"]
 class PlanStatusBlock:
     """Current intended action and safe display attributes."""
 
-    action: Action
-    reason: str
+    action: Action | None  # None: the add-on couldn't resolve the plan's times
+    reason: str | None
     model: str
     strategy: str
     soc_status: str
@@ -228,7 +228,7 @@ def _plan(value: object) -> PlanBlock | None:
 
 
 def _text(value: object, *, code: bool = False) -> str:
-    if not isinstance(value, str) or not 1 <= len(value) <= 255 or not value.isprintable():
+    if type(value) is not str or not 1 <= len(value) <= 255 or not value.isprintable():
         raise MalformedSummary()
     if code and re.fullmatch(r"[a-z_]{1,32}", value) is None:
         raise MalformedSummary()
@@ -236,7 +236,7 @@ def _text(value: object, *, code: bool = False) -> str:
 
 
 def _action(value: object) -> Action:
-    if not isinstance(value, str) or value not in {"hold", "export", "charge", "idle"}:
+    if type(value) is not str or value not in {"hold", "export", "charge", "idle"}:
         raise MalformedSummary()
     return cast(Action, value)
 
@@ -247,10 +247,14 @@ def _status(value: object) -> PlanStatusBlock:
     if "export_soc_needed_pct" not in value or "export_soc_needed_at" not in value:
         raise MalformedSummary()
     pct, at = value["export_soc_needed_pct"], value["export_soc_needed_at"]
-    if (pct is None) != (at is None):
+    if (pct is None) != (at is None) or "action" not in value or "reason" not in value:
+        raise MalformedSummary()
+    action, reason = value["action"], value["reason"]
+    if (action is None) != (reason is None):
         raise MalformedSummary()
     return PlanStatusBlock(
-        action=_action(value.get("action")), reason=_text(value.get("reason")),
+        action=None if action is None else _action(action),
+        reason=None if reason is None else _text(reason),
         model=_text(value.get("model"), code=True),
         strategy=_text(value.get("strategy"), code=True),
         soc_status=_text(value.get("soc_status"), code=True),
