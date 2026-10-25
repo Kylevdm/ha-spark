@@ -7,11 +7,23 @@
   },
   "entity": {
     "binary_sensor": {
+      "fallback_active": {"name": "Fallback active"},
+      "ev_hold": {"name": "EV hold"},
+      "dispatch_hold": {"name": "Dispatch hold"},
       "addon_connected": {
         "name": "Add-on connected"
       }
     },
     "sensor": {
+      "operating_mode": {
+        "name": "Operating mode",
+        "state": {
+          "observe": "Observe",
+          "protect": "Protect",
+          "optimise": "Optimise",
+          "authority_unknown": "Authority unknown"
+        }
+      },
       "charge_needed": {
         "name": "Charge needed"
       },

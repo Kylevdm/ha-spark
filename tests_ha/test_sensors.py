@@ -26,6 +26,7 @@ async def test_golden_sensors_and_legacy_ids(
     entry = await setup(hass)
     # (state, unit, device class, state class), fixed independently of DESCRIPTIONS.
     expected = {
+        "sensor.ha_spark_operating_mode": ("authority_unknown", None, "enum", None),
         "sensor.ha_spark_charge_needed_kwh": ("9.6", "kWh", "energy", None),
         "sensor.ha_spark_target_soc": ("90.0", "%", "battery", None),
         "sensor.ha_spark_forecast_load_kwh": ("10.0", "kWh", "energy", None),
@@ -98,7 +99,7 @@ async def test_sensor_value_rules(
             change == "v2l" and desc.v2l
         ):
             assert value == "unavailable"
-        elif (change == "plan" and not desc.v2l) or (
+        elif (change == "plan" and not desc.v2l and desc.key != "operating_mode") or (
             change == "number" and desc.key == "charge_needed"
         ):
             assert value == "unknown"

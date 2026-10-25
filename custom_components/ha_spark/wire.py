@@ -2,7 +2,7 @@
 
 Pure Python with no Home Assistant imports: this module holds the `api_version`
 the integration speaks, the identity-only site snapshot it sends, and the summary
-and plan numbers it validates. Later tickets add authority display fields.
+and plan numbers and read-only authority mirrors it validates.
 `api_version` is an integer, separate from the release version. A receiver may
 ignore an unknown field only if ignoring it keeps
 every meaning and safety obligation it already has. A field the receiver must act
@@ -59,6 +59,35 @@ class V2LBlock:
 
 
 @dataclass(frozen=True)
+class FallbackBlock:
+    """Site fallback verdict, without per-device details."""
+
+    active: bool
+    causes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class HoldsBlock:
+    """One hold verdict per cause, not per device."""
+
+    ev: bool
+    dispatch: bool
+    trusted_end: datetime | None
+
+
+@dataclass(frozen=True)
+class AuthorityBlock:
+    """Read-only mirrors; this is not integration-owned authority."""
+
+    mode: str
+    transition_target: str | None
+    last_changed_at: datetime | None
+    save_failed: bool
+    fallback: FallbackBlock
+    holds: HoldsBlock
+
+
+@dataclass(frozen=True)
 class Summary:
     """Validated envelope and allowlisted plan/session display blocks."""
 
@@ -70,6 +99,7 @@ class Summary:
     commands_pending: bool
     plan: PlanBlock | None
     v2l: V2LBlock | None
+    authority: AuthorityBlock
 
 
 def build_snapshot(
@@ -165,6 +195,44 @@ def parse_summary(body: object) -> Summary:
         commands_pending=pending,
         plan=_plan(body["plan"]),
         v2l=_v2l(body["v2l"]),
+        authority=_authority(body.get("authority")),
+    )
+
+
+def _authority(value: object) -> AuthorityBlock:
+    if not isinstance(value, dict):
+        raise MalformedSummary()
+    mode, target = value.get("mode"), value.get("transition_target")
+    modes = {"observe", "protect", "optimise"}
+    if (type(mode) is not str or mode not in modes | {"authority_unknown"}
+            or "transition_target" not in value
+            or (target is not None and (type(target) is not str or target not in modes))):
+        raise MalformedSummary()
+    fallback, holds = value.get("fallback"), value.get("holds")
+    if not isinstance(fallback, dict) or not isinstance(holds, dict):
+        raise MalformedSummary()
+    ev, dispatch = holds.get("ev"), holds.get("dispatch")
+    if not isinstance(ev, dict) or not isinstance(dispatch, dict):
+        raise MalformedSummary()
+    causes = fallback.get("causes")
+    if (type(causes) is not list or len(causes) > 8
+            or any(type(cause) is not str or re.fullmatch(r"[a-z_]{1,32}", cause) is None
+                   for cause in causes)):
+        raise MalformedSummary()
+    if ("last_changed_at" not in value or "trusted_end" not in dispatch
+            or type(value.get("save_failed")) is not bool
+            or type(fallback.get("active")) is not bool
+            or type(ev.get("active")) is not bool or type(dispatch.get("active")) is not bool):
+        raise MalformedSummary()
+    return AuthorityBlock(
+        mode=mode, transition_target=target,
+        last_changed_at=(None if value["last_changed_at"] is None
+                         else _timestamp(value["last_changed_at"])),
+        save_failed=value["save_failed"],
+        fallback=FallbackBlock(fallback["active"], tuple(causes)),
+        holds=HoldsBlock(ev["active"], dispatch["active"],
+                         None if dispatch["trusted_end"] is None
+                         else _timestamp(dispatch["trusted_end"])),
     )
 
 
