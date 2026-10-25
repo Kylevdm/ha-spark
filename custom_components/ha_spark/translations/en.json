@@ -51,6 +51,12 @@
       "v2l_net_saving": {
         "name": "V2L net saving"
       },
+      "plan_status": {
+        "name": "Plan status"
+      },
+      "next_change": {
+        "name": "Next planned change"
+      },
       "last_run": {
         "name": "Last run"
       }

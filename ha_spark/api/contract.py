@@ -20,8 +20,10 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 from ha_spark import __version__
-from ha_spark.authority import AuthorityState
+from ha_spark.api.plan_status import PlanStatus, resolve
+from ha_spark.authority import AuthorityState, HoldRecord
 from ha_spark.config import Settings
+from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.v2l import V2LSession, delivered_fraction, savings
 
@@ -125,7 +127,11 @@ def plan_summary(
         "loop_tick": loop_tick.isoformat() if loop_tick is not None else None,
         "built_at": built_at.isoformat(),
         "commands_pending": False,
-        "plan": plan_block(plan, plan_at, soc_observation_ok),
+        "plan": plan_block(
+            plan, plan_at, soc_observation_ok, built_at,
+            settings.timezone if settings is not None else "UTC",
+            authority.state.holds if authority is not None and authority.state is not None else (),
+        ),
         "v2l": v2l_block(session, settings),
         "authority": authority_block(authority or AuthorityInputs(None, False, False)),
     }
@@ -170,10 +176,26 @@ def _finite(value: object, ndigits: int) -> float | None:
 
 def plan_block(
     plan: ChargePlan | None, computed_at: datetime | None, soc_observation_ok: bool,
+    now: datetime, timezone: str, holds: tuple[HoldRecord, ...],
 ) -> dict[str, object] | None:
-    """No internal text, settings or device identifiers cross this projection."""
+    """Allowlisted numbers and status; never device identifiers or driver text."""
     if plan is None or computed_at is None:
         return None
+    # An unloadable zone degrades to UTC, as everywhere else, never a failed heartbeat;
+    # unrepresentable plan times leave the action unknown rather than fail it.
+    status: PlanStatus | None
+    try:
+        status = resolve(plan, holds, now, load_timezone(timezone))
+    except (ArithmeticError, TypeError, ValueError):
+        status = None
+    try:
+        soc_reason = "".join(c for c in plan.soc.reason if c.isprintable())[:200]
+    except (ArithmeticError, TypeError, ValueError):
+        soc_reason = ""
+    export_pct = _finite(plan.export_soc_needed_pct, 0)
+    export_at = plan.export_soc_needed_at if export_pct is not None else None
+    if export_at is not None and export_at.utcoffset() is None:
+        export_at = None
     return {
         "computed_at": computed_at.isoformat(),
         "soc_trusted": plan.soc.ok and soc_observation_ok,
@@ -184,6 +206,21 @@ def plan_block(
         "deficit_kwh": _finite(plan.deficit_kwh, 2),
         "planned_cost_gbp": _finite(plan.planned_cost, 2),
         "baseline_cost_gbp": _finite(plan.baseline_cost, 2),
+        "status": {
+            "action": status.action if status else None,
+            "reason": status.reason if status else None,
+            "model": plan.model if plan.model in {"daily", "slots"} else "daily",
+            "strategy": plan.strategy if plan.strategy in {"deficit", "fill"} else "deficit",
+            "soc_status": plan.soc.status.value,
+            # The reason can embed the SoC entity's raw state: printable, bounded, never empty.
+            "soc_reason": soc_reason or plan.soc.status.value,
+            "export_soc_needed_pct": export_pct if export_at is not None else None,
+            "export_soc_needed_at": export_at.isoformat() if export_at is not None else None,
+        },
+        "next_change": {
+            "at": status.next_at.isoformat(), "action": status.next_action,
+            "reason": status.next_reason,
+        } if status is not None and status.next_at is not None else None,
     }
 
 
