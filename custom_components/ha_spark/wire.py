@@ -154,8 +154,14 @@ def parse_refusal(body: object) -> VersionEnvelope:
     return VersionEnvelope(envelope.api_version, envelope.release_version, frozenset(supported))
 
 
+# fromisoformat alone also takes other separators and out-of-range offset minutes.
+_ISO_8601 = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
+)
+
+
 def _timestamp(value: object) -> datetime:
-    if not isinstance(value, str):
+    if type(value) is not str or _ISO_8601.fullmatch(value) is None:
         raise MalformedSummary()
     try:
         parsed = datetime.fromisoformat(value)

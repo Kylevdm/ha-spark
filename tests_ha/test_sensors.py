@@ -159,3 +159,27 @@ def test_informational_fields_are_ignored_in_number_blocks() -> None:
     body["plan"]["future_display"] = {"anything": True}
     body["v2l"]["future_display"] = [1, 2]
     assert parse_summary(body) == expected
+
+
+@pytest.mark.parametrize("value", [
+    "2026-10-24T12:00:00+01:99", "2026-10-24X12:00:00Z", "2026-10-24 12:00:00+00:00",
+    "2026-10-24T12:00:00", "2026-10-24T12:00:00+24:00", "２０２６-10-24T12:00:00+00:00",
+    type("Str", (str,), {})("2026-10-24T12:00:00+00:00"),
+])
+@pytest.mark.parametrize("path", [("built_at",), ("plan", "computed_at"),
+                                  ("authority", "last_changed_at")])
+def test_timestamps_are_strict_iso_8601(path: tuple[str, ...], value: Any) -> None:
+    body = fixture("plan_summary")
+    target = body
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(MalformedSummary):
+        parse_summary(body)
+
+
+@pytest.mark.parametrize("value", ["2026-10-24T12:00:00Z", "2026-10-24T12:00:00.123456+05:30"])
+def test_strict_timestamps_still_accept_iso_8601(value: str) -> None:
+    body = fixture("plan_summary")
+    body["built_at"] = value
+    assert parse_summary(body).built_at.tzinfo is not None
