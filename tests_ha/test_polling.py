@@ -403,3 +403,27 @@ async def test_bad_stored_site_id_is_an_outcome_not_a_logged_error(
     assert entry.runtime_data.last_outcome == "malformed"
     assert aioclient_mock.call_count == 0
     assert canary not in caplog.text and TOKEN not in caplog.text
+
+
+async def test_setup_does_not_wait_for_a_hung_add_on(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+) -> None:
+    release = asyncio.Event()
+
+    async def hang(_method: str, _url: Any, _data: Any) -> AiohttpClientMockResponse:
+        await release.wait()
+        return AiohttpClientMockResponse("post", YarlURL(URL), status=503)
+
+    aioclient_mock.post(URL, side_effect=hang)
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=fixture("site_snapshot")["site_id"], data={
+        "site_id": fixture("site_snapshot")["site_id"], "host": "addon-test", "port": 8099,
+        "slug": ADDON_SLUG, "auth_token": TOKEN,
+        "session_id": fixture("plan_summary")["session_id"],
+    })
+    entry.add_to_hass(hass)
+    async with asyncio.timeout(1):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+    assert entry.state is ConfigEntryState.LOADED
+    assert state_value(hass) == "off"
+    release.set()
+    await hass.async_block_till_done()

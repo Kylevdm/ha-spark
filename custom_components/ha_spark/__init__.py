@@ -29,8 +29,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     entry.runtime_data = coordinator
     for key in ("soc_now", "soc_integrity", "v2l_power_w", "predictions"):
         async_clear_unregistered_state(hass, f"sensor.ha_spark_{key}")
-    await coordinator.async_refresh()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # The first poll runs after setup: a hung add-on must not hold setup open.
+    entry.async_create_task(hass, coordinator.async_refresh(), "ha-spark first heartbeat")
     return True
 
 
