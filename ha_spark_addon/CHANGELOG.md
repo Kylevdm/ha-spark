@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.26.0
+
+- **Update the add-on first, then the integration through HACS, then restart Home
+  Assistant (#472).** The add-on no longer pushes any Home Assistant states, so
+  install the companion integration to keep the plan sensors. Either order keeps
+  today's entity ids; see *Updating to 0.26.0* in the docs for a leftover `_2` id.
+- **Companion integration (read-only).** Install it from HACS as a custom
+  repository and accept the discovered **ha-spark** integration. The add-on
+  announces itself through Supervisor discovery with a per-boot token held only
+  in memory; the integration polls `POST /integration/heartbeat` on port 8099
+  every 30 seconds. One entry per site; standalone installs get no integration
+  yet. It shows the plan numbers, *Plan status*, *Next planned change*, *Last
+  run*, the V2L session totals, *Add-on connected*, and read-only mirrors of the
+  operating mode, fallback and holds on one **ha-spark** device. Nothing it shows
+  can change the mode, authority or any hardware write.
+- `sensor.ha_spark_plan_status` now shows the current action (`hold`, `export`,
+  `charge` or `idle`) instead of the model name, and no longer carries
+  `operating_mode`: change automations that matched model names, and use
+  *Operating mode* for the mode.
+- **Removed sensors:** `sensor.ha_spark_soc_now` (use the inverter's SoC entity),
+  `sensor.ha_spark_soc_integrity` (*Fallback active*, and SoC status in *Plan
+  status*), `sensor.ha_spark_v2l_power_w` (your V2L power source entity) and
+  `sensor.ha_spark_predictions` (none yet).
+- An incompatible add-on/integration API version raises a Home Assistant repair;
+  the integration's diagnostics redact the token and host. `ha-spark health` and
+  `GET /api/health` show the integration link; a missing integration is a
+  warning, not a failure.
+
 ## 0.25.0
 
 - **Before updating to 0.25.0: switch to Observe, copy your options YAML from
