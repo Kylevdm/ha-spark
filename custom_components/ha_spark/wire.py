@@ -280,6 +280,23 @@ def _authority(value: object) -> AuthorityBlock:
     )
 
 
+# Physical bounds where they are certain; other figures (deficit, costs, net saving)
+# can legitimately be negative.
+_RANGES: Final = {
+    "target_soc_pct": (0.0, 100.0), "export_soc_needed_pct": (0.0, 100.0),
+    "energy_kwh": (0.0, None), "avoided_gbp": (0.0, None), "refill_cost_gbp": (0.0, None),
+    "peak_power_w": (0.0, None),
+}
+
+
+def _ranged(key: str, value: object) -> float:
+    number = _number(value)
+    low, high = _RANGES.get(key, (None, None))
+    if (low is not None and number < low) or (high is not None and number > high):
+        raise MalformedSummary()
+    return number
+
+
 def _number(value: object) -> float:
     # Exact types: bool and other subclasses are refused before conversion.
     if not isinstance(value, (int, float)) or type(value) not in (int, float):
@@ -303,7 +320,7 @@ def _plan(value: object) -> PlanBlock | None:
                 "deficit_kwh", "planned_cost_gbp", "baseline_cost_gbp"):
         if key not in value:
             raise MalformedSummary()
-        numbers[key] = None if value[key] is None else _number(value[key])
+        numbers[key] = None if value[key] is None else _ranged(key, value[key])
     if "next_change" not in value:
         raise MalformedSummary()
     return PlanBlock(computed_at=_timestamp(value.get("computed_at")),
@@ -347,7 +364,7 @@ def _status(value: object) -> PlanStatusBlock:
         strategy=_code(value.get("strategy"), PLAN_STRATEGIES),
         soc_status=_code(value.get("soc_status"), SOC_STATUSES),
         soc_reason=_text(value.get("soc_reason")),
-        export_soc_needed_pct=None if pct is None else _number(pct),
+        export_soc_needed_pct=None if pct is None else _ranged("export_soc_needed_pct", pct),
         export_soc_needed_at=None if at is None else _timestamp(at),
     )
 
@@ -366,6 +383,6 @@ def _v2l(value: object) -> V2LBlock | None:
         return None
     if not isinstance(value, dict):
         raise MalformedSummary()
-    return V2LBlock(**{key: _number(value.get(key)) for key in (
+    return V2LBlock(**{key: _ranged(key, value.get(key)) for key in (
         "energy_kwh", "net_saving_gbp", "avoided_gbp", "refill_cost_gbp", "peak_power_w",
     )})

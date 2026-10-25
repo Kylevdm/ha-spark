@@ -460,9 +460,16 @@ def test_status_text_is_bounded_and_export_soc_is_paired(state, discovery, monke
             assert response.status_code == 200
             return response.json()["plan"]["status"]
         status = poll()
-        assert len(status["soc_reason"]) == 200
-        assert status["soc_reason"].isprintable()
-        assert status["soc_reason"] == "".join(c for c in soc.reason if c.isprintable())[:200]
+        assert CANARY not in status["soc_reason"]
+        if soc_status == "unavailable":
+            # A reason that would quote the raw HA state is replaced by fixed text.
+            assert status["soc_reason"] == "SoC sensor unavailable"
+        else:
+            assert len(status["soc_reason"]) == 200
+            assert status["soc_reason"].isprintable()
+            assert status["soc_reason"] == "".join(
+                c for c in soc.reason if c.isprintable()
+            )[:200]
         if soc_status == "implausible":
             assert status["soc_reason"] == "safe" + "x" * 196
         assert status["export_soc_needed_pct"] == 79
@@ -615,3 +622,46 @@ async def test_deeply_nested_session_file_nulls_v2l(state, discovery):
                              headers={"Authorization": f"Bearer {discovery.auth_token}"})
     assert response.status_code == 200
     assert response.json()["v2l"] is None
+
+
+
+@pytest.mark.parametrize("status", ["UNAVAILABLE", "MALFORMED", "NOT_FINITE"])
+async def test_soc_reason_never_quotes_the_raw_state(state, discovery, status):
+    from dataclasses import replace
+
+    from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+    from tests.test_api import _plan
+
+    soc = SocMeasurement(SocStatus[status], datetime(2026, 10, 24, 11, 30, tzinfo=UTC),
+                         raw_state=f"sensor.{CANARY}")
+    plan = _plan()
+    state.plan = replace(plan, soc=soc, charge_intent=replace(plan.charge_intent, soc=soc))
+    state.plan_at = datetime(2026, 10, 24, 11, 30, tzinfo=UTC)
+    response = await request(state, discovery,
+                             headers={"Authorization": f"Bearer {discovery.auth_token}"})
+    assert response.status_code == 200
+    assert CANARY not in response.text
+    assert response.json()["plan"]["status"]["soc_reason"].startswith("SoC ")
+
+
+@pytest.mark.parametrize("hour,action,next_hour,next_action", [
+    (10, "export", 11, "hold"), (12, "hold", 13, "export"), (14, "charge", 16, "idle"),
+])
+async def test_action_and_next_change_through_the_heartbeat(
+    state, discovery, monkeypatch, hour, action, next_hour, next_action,
+):
+    """The resolver's overlap and half-open cases, carried through summary
+    construction, the household time zone and JSON (tests/test_plan_status.py)."""
+    from tests.test_plan_status import at, scenario
+
+    monkeypatch.setattr(server, "_heartbeat_now", lambda: at(hour))
+    state.settings = state.settings.model_copy(update={"timezone": "Europe/London"})
+    state.plan = scenario()
+    state.plan_at = at(9)
+    response = await request(state, discovery,
+                             headers={"Authorization": f"Bearer {discovery.auth_token}"})
+    plan = response.json()["plan"]
+    assert plan["status"]["action"] == action
+    assert plan["next_change"]["at"] == at(next_hour).isoformat()
+    assert plan["next_change"]["action"] == next_action
+    assert CANARY not in response.text

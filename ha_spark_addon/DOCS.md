@@ -144,6 +144,10 @@ names to the appropriate action values; use the `model` attribute if the
 model itself matters. The `operating_mode` attribute is removed: use
 `sensor.ha_spark_operating_mode` instead.
 
+**V2L net saving** no longer has a state class: Home Assistant doesn't accept
+`measurement` on a monetary sensor, so it keeps no new long-term statistics.
+Its history and current value are unaffected.
+
 ## Updating to 0.25.0 (cutover)
 
 1. **Switch the operating mode to Observe before updating**, using the mode

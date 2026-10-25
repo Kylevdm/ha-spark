@@ -25,6 +25,7 @@ from ha_spark.authority import AuthorityState, HoldRecord
 from ha_spark.config import Settings
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.models import ChargePlan
+from ha_spark.energy.soc_integrity import SocStatus
 from ha_spark.energy.v2l import V2LSession, delivered_fraction, savings
 
 API_VERSION: Final = 1
@@ -137,6 +138,13 @@ def plan_summary(
     }
 
 
+_RAW_STATE_STATUSES: Final = {
+    SocStatus.UNAVAILABLE: "SoC sensor unavailable",
+    SocStatus.MALFORMED: "SoC state is not a number",
+    SocStatus.NOT_FINITE: "SoC state is not finite",
+}
+
+
 def _instant(value: datetime | None) -> str | None:
     """ISO 8601 for an aware instant the integration can normalise to UTC, else None."""
     if value is None or value.utcoffset() is None:
@@ -199,10 +207,14 @@ def plan_block(
         status = resolve(plan, holds, now, load_timezone(timezone))
     except (ArithmeticError, TypeError, ValueError):
         status = None
-    try:
-        soc_reason = "".join(c for c in plan.soc.reason if c.isprintable())[:200]
-    except (ArithmeticError, TypeError, ValueError):
-        soc_reason = ""
+    if plan.soc.status in _RAW_STATE_STATUSES:
+        # These reasons quote the SoC entity's raw state, which is household text.
+        soc_reason = _RAW_STATE_STATUSES[plan.soc.status]
+    else:
+        try:
+            soc_reason = "".join(c for c in plan.soc.reason if c.isprintable())[:200]
+        except (ArithmeticError, TypeError, ValueError):
+            soc_reason = ""
     export_pct = _finite(plan.export_soc_needed_pct, 0)
     export_at = _instant(plan.export_soc_needed_at) if export_pct is not None else None
     return {

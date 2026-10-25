@@ -286,3 +286,25 @@ def test_unknown_fallback_causes_are_dropped() -> None:
     body = fixture("plan_summary")
     body["authority"]["fallback"]["causes"] = ["soc_integrity", "private_hub"]
     assert parse_summary(body).authority.fallback.causes == ("soc_integrity",)
+
+
+@pytest.mark.parametrize("path,value", [
+    (("plan", "target_soc_pct"), 101), (("plan", "target_soc_pct"), -1),
+    (("v2l", "energy_kwh"), -10), (("v2l", "peak_power_w"), -1),
+    (("plan", "status", "export_soc_needed_pct"), 150),
+])
+async def test_out_of_range_numbers_do_not_count(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+    path: tuple[str, ...], value: float,
+) -> None:
+    body = summary()
+    target = body
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    if path[-1] == "export_soc_needed_pct":
+        target["export_soc_needed_at"] = "2026-10-24T14:00:00+00:00"
+    aioclient_mock.post(URL, json=body)
+    entry = await setup(hass)
+    assert entry.runtime_data.last_outcome == "malformed"
+    assert state_value(hass, "binary_sensor.ha_spark_add_on_connected") == "off"
