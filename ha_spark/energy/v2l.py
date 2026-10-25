@@ -269,7 +269,7 @@ def load_session(settings: Settings) -> V2LSession:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return V2LSession(**data)
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, RecursionError):
         log.warning("Reading V2L session failed; starting fresh", exc_info=True)
         return V2LSession(day="")
 

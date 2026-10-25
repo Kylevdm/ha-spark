@@ -526,3 +526,92 @@ async def test_odd_plan_content_degrades_and_still_parses(state, discovery):
     assert status["soc_reason"] == "ok"
     assert status["export_soc_needed_pct"] is None and status["export_soc_needed_at"] is None
     assert response.json()["plan"]["next_change"] is None
+
+
+
+def _wire_module():
+    """The integration's wire module, loaded by path (it imports no Home Assistant code)."""
+    import importlib.util
+
+    path = Path(__file__).parents[1] / "custom_components" / "ha_spark" / "wire.py"
+    spec = importlib.util.spec_from_file_location("ha_spark_wire_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_integration_display_codes_match_the_add_on():
+    from ha_spark.authority import FALLBACK_CAUSE_SOC_INTEGRITY
+    from ha_spark.energy.soc_integrity import SocStatus
+
+    wire = _wire_module()
+    assert wire.SOC_STATUSES == {status.value for status in SocStatus}
+    assert wire.PLAN_MODELS == {"daily", "slots"}
+    assert wire.PLAN_STRATEGIES == {"deficit", "fill"}
+    assert wire.FALLBACK_CAUSES == {FALLBACK_CAUSE_SOC_INTEGRITY}
+
+
+async def test_unrepresentable_instants_degrade_and_the_summary_still_parses(
+    state, discovery, tmp_path, monkeypatch,
+):
+    from dataclasses import replace
+    from datetime import timedelta, timezone
+
+    from ha_spark import authority
+    from ha_spark.api.contract import AuthorityInputs, plan_summary
+    from ha_spark.authority import AuthorityStore, HoldDevice, HoldRecord
+    from tests.test_api import _plan
+
+    edge = datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=14)))
+    monkeypatch.setattr(authority, "resolve_data_dir", lambda settings: tmp_path)
+    store = AuthorityStore(state.settings)
+    store.initialise()
+    assert store.state is not None
+    device = HoldDevice(driver="solis", power_switch="switch.x", hub="h", slave=1)
+    store.save(store.state.model_copy(update={
+        "last_changed_at": edge,
+        "holds": (HoldRecord(cause="dispatch", started_at=edge, device=device,
+                             trusted_end=edge),),
+    }))
+    plan = replace(_plan(), export_soc_needed_pct=50.0, export_soc_needed_at=edge)
+    body = plan_summary(
+        session_id=discovery.session_id, built_at=datetime(2026, 10, 24, 12, tzinfo=UTC),
+        loop_tick=datetime(2026, 10, 24, 11, 59, 30, tzinfo=UTC), plan=plan,
+        plan_at=datetime(2026, 10, 24, 11, 30, tzinfo=UTC), settings=state.settings,
+        authority=AuthorityInputs(store.state, True, False),
+    )
+    assert body["authority"]["last_changed_at"] is None
+    assert body["authority"]["holds"]["dispatch"] == {"active": True, "trusted_end": None}
+    status = body["plan"]["status"]
+    assert status["export_soc_needed_pct"] is None and status["export_soc_needed_at"] is None
+    summary = _wire_module().parse_summary(json.loads(json.dumps(body)))
+    assert summary.authority.holds.dispatch is True
+
+
+async def test_unfinished_heartbeat_body_times_out(state, discovery, monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(server, "_HEARTBEAT_BODY_TIMEOUT_S", 0.05)
+
+    async def stalled() -> AsyncIterator[bytes]:
+        yield b'{"api_version": 1,'
+        await asyncio.sleep(10)
+        yield b"}"
+
+    response = await asyncio.wait_for(request(
+        state, discovery, headers={"Authorization": f"Bearer {discovery.auth_token}"},
+        content=stalled(),
+    ), timeout=5)
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid heartbeat"}
+
+
+async def test_deeply_nested_session_file_nulls_v2l(state, discovery):
+    state.settings = state.settings.model_copy(update={"v2l_power_entity": "sensor.v2l"})
+    path = Path(state.settings.db_path).parent / "ha_spark_v2l_session.json"
+    path.write_text("[" * 100_000 + "]" * 100_000)
+    response = await request(state, discovery,
+                             headers={"Authorization": f"Bearer {discovery.auth_token}"})
+    assert response.status_code == 200
+    assert response.json()["v2l"] is None

@@ -602,6 +602,8 @@ def _has_origin(scope: Any) -> bool:
 
 
 _HEARTBEAT_MAX_BODY = 16 * 1024
+# A body that never finishes must not hold the handler: bytes and time are both bounded.
+_HEARTBEAT_BODY_TIMEOUT_S = 5.0
 
 
 def _heartbeat_now() -> datetime:
@@ -625,14 +627,15 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
             if length is not None and int(length) > _HEARTBEAT_MAX_BODY:
                 return invalid
             body = bytearray()
-            async for chunk in request.stream():
-                if len(body) + len(chunk) > _HEARTBEAT_MAX_BODY:
-                    return invalid
-                body.extend(chunk)
+            async with asyncio.timeout(_HEARTBEAT_BODY_TIMEOUT_S):
+                async for chunk in request.stream():
+                    if len(body) + len(chunk) > _HEARTBEAT_MAX_BODY:
+                        return invalid
+                    body.extend(chunk)
             payload = json.loads(body, parse_constant=_reject_constant)
             if not isinstance(payload, dict):
                 return invalid
-        except (ValueError, RecursionError):
+        except (ValueError, RecursionError, TimeoutError):
             return invalid
         version = payload.get("api_version")
         release = payload.get("release_version")

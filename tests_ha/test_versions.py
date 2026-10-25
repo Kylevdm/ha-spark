@@ -148,6 +148,8 @@ async def test_diagnostics_redacts_connection(
     assert "addon-test" not in encoded
     assert isinstance(data["entry"], dict)
     assert data["entry"]["auth_token"] == "**REDACTED**"
+    assert data["entry"]["session_id"] == "**REDACTED**"
+    assert entry.data["session_id"] not in encoded
     assert isinstance(data["summary"], dict)
     assert data["summary"]["api_version"] == 1
     assert data["last_outcome"] == "counted"

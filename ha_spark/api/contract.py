@@ -137,6 +137,17 @@ def plan_summary(
     }
 
 
+def _instant(value: datetime | None) -> str | None:
+    """ISO 8601 for an aware instant the integration can normalise to UTC, else None."""
+    if value is None or value.utcoffset() is None:
+        return None
+    try:
+        value.astimezone(UTC)
+    except OverflowError:
+        return None
+    return value.isoformat()
+
+
 def authority_block(authority: AuthorityInputs) -> dict[str, object]:
     """Aggregate store facts only; never relay per-device records or driver text."""
     state = authority.state if authority.known else None
@@ -146,7 +157,7 @@ def authority_block(authority: AuthorityInputs) -> dict[str, object]:
     return {
         "mode": state.committed_mode if state else "authority_unknown",
         "transition_target": transition.target if transition else None,
-        "last_changed_at": state.last_changed_at.isoformat() if state else None,
+        "last_changed_at": _instant(state.last_changed_at) if state else None,
         "save_failed": authority.save_failed,
         "fallback": {
             "active": state.fallback.active if state else False,
@@ -157,7 +168,7 @@ def authority_block(authority: AuthorityInputs) -> dict[str, object]:
             "ev": {"active": any(h.cause == "ev" for h in state.holds) if state else False},
             "dispatch": {
                 "active": any(h.cause == "dispatch" for h in state.holds) if state else False,
-                "trusted_end": max(dispatch_ends).isoformat() if dispatch_ends else None,
+                "trusted_end": _instant(max(dispatch_ends)) if dispatch_ends else None,
             },
         },
     }
@@ -193,9 +204,7 @@ def plan_block(
     except (ArithmeticError, TypeError, ValueError):
         soc_reason = ""
     export_pct = _finite(plan.export_soc_needed_pct, 0)
-    export_at = plan.export_soc_needed_at if export_pct is not None else None
-    if export_at is not None and export_at.utcoffset() is None:
-        export_at = None
+    export_at = _instant(plan.export_soc_needed_at) if export_pct is not None else None
     return {
         "computed_at": computed_at.isoformat(),
         "soc_trusted": plan.soc.ok and soc_observation_ok,
@@ -215,7 +224,7 @@ def plan_block(
             # The reason can embed the SoC entity's raw state: printable, bounded, never empty.
             "soc_reason": soc_reason or plan.soc.status.value,
             "export_soc_needed_pct": export_pct if export_at is not None else None,
-            "export_soc_needed_at": export_at.isoformat() if export_at is not None else None,
+            "export_soc_needed_at": export_at,
         },
         "next_change": {
             "at": status.next_at.isoformat(), "action": status.next_action,

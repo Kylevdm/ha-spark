@@ -270,3 +270,19 @@ async def test_unresolved_action_shows_unknown(
     entry = await setup(hass)
     assert entry.runtime_data.last_outcome == "counted"
     assert state_value(hass, "sensor.ha_spark_plan_status") == "unknown"
+
+
+@pytest.mark.parametrize("key,value", [
+    ("model", "private_driver"), ("strategy", "private"), ("soc_status", "private_hub"),
+])
+def test_status_codes_are_allowlisted(key: str, value: str) -> None:
+    body = fixture("plan_summary")
+    body["plan"]["status"][key] = value
+    with pytest.raises(MalformedSummary):
+        parse_summary(body)
+
+
+def test_unknown_fallback_causes_are_dropped() -> None:
+    body = fixture("plan_summary")
+    body["authority"]["fallback"]["causes"] = ["soc_integrity", "private_hub"]
+    assert parse_summary(body).authority.fallback.causes == ("soc_integrity",)

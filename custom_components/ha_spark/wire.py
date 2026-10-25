@@ -23,6 +23,14 @@ from typing import Final, Literal, cast
 from uuid import UUID
 
 API_VERSION: Final = 1
+# Display codes the add-on sends at this api_version (its planner, SoC check and fallback).
+PLAN_MODELS: Final = frozenset({"daily", "slots"})
+PLAN_STRATEGIES: Final = frozenset({"deficit", "fill"})
+SOC_STATUSES: Final = frozenset({
+    "ok", "implausible", "read_failed", "unavailable", "malformed", "not_finite",
+    "out_of_range", "report_time_unusable", "report_time_future", "stale", "unchanged_too_long",
+})
+FALLBACK_CAUSES: Final = frozenset({"soc_integrity"})
 
 # Every `api_version` this integration can send and accept replies to.
 SUPPORTED_API_VERSIONS: Final = frozenset({1})
@@ -253,6 +261,8 @@ def _authority(value: object) -> AuthorityBlock:
             or any(type(cause) is not str or re.fullmatch(r"[a-z_]{1,32}", cause) is None
                    for cause in causes)):
         raise MalformedSummary()
+    # Only known cause codes reach an attribute; a newer add-on's extra code is dropped.
+    causes = [cause for cause in causes if cause in FALLBACK_CAUSES]
     if ("last_changed_at" not in value or "trusted_end" not in dispatch
             or type(value.get("save_failed")) is not bool
             or type(fallback.get("active")) is not bool
@@ -301,10 +311,14 @@ def _plan(value: object) -> PlanBlock | None:
                      next_change=_next_change(value["next_change"]), **numbers)
 
 
-def _text(value: object, *, code: bool = False) -> str:
+def _text(value: object) -> str:
     if type(value) is not str or not 1 <= len(value) <= 255 or not value.isprintable():
         raise MalformedSummary()
-    if code and re.fullmatch(r"[a-z_]{1,32}", value) is None:
+    return value
+
+
+def _code(value: object, allowed: frozenset[str]) -> str:
+    if type(value) is not str or value not in allowed:
         raise MalformedSummary()
     return value
 
@@ -329,9 +343,9 @@ def _status(value: object) -> PlanStatusBlock:
     return PlanStatusBlock(
         action=None if action is None else _action(action),
         reason=None if reason is None else _text(reason),
-        model=_text(value.get("model"), code=True),
-        strategy=_text(value.get("strategy"), code=True),
-        soc_status=_text(value.get("soc_status"), code=True),
+        model=_code(value.get("model"), PLAN_MODELS),
+        strategy=_code(value.get("strategy"), PLAN_STRATEGIES),
+        soc_status=_code(value.get("soc_status"), SOC_STATUSES),
         soc_reason=_text(value.get("soc_reason")),
         export_soc_needed_pct=None if pct is None else _number(pct),
         export_soc_needed_at=None if at is None else _timestamp(at),
