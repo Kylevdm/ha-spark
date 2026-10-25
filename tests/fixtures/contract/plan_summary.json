@@ -16,6 +16,17 @@
     "planned_cost_gbp": 1.23,
     "baseline_cost_gbp": 3.46
   },
+  "authority": {
+    "mode": "authority_unknown",
+    "transition_target": null,
+    "last_changed_at": null,
+    "save_failed": false,
+    "fallback": {"active": false, "causes": []},
+    "holds": {
+      "ev": {"active": false},
+      "dispatch": {"active": false, "trusted_end": null}
+    }
+  },
   "v2l": {
     "energy_kwh": 2.35,
     "net_saving_gbp": 0.47,

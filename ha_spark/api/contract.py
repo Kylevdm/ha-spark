@@ -127,6 +127,33 @@ def plan_summary(
         "commands_pending": False,
         "plan": plan_block(plan, plan_at, soc_observation_ok),
         "v2l": v2l_block(session, settings),
+        "authority": authority_block(authority or AuthorityInputs(None, False, False)),
+    }
+
+
+def authority_block(authority: AuthorityInputs) -> dict[str, object]:
+    """Aggregate store facts only; never relay per-device records or driver text."""
+    state = authority.state if authority.known else None
+    transition = state.transition if state else None
+    dispatch_ends = [hold.trusted_end for hold in state.holds
+                     if hold.cause == "dispatch" and hold.trusted_end is not None] if state else []
+    return {
+        "mode": state.committed_mode if state else "authority_unknown",
+        "transition_target": transition.target if transition else None,
+        "last_changed_at": state.last_changed_at.isoformat() if state else None,
+        "save_failed": authority.save_failed,
+        "fallback": {
+            "active": state.fallback.active if state else False,
+            "causes": sorted({cause for cause in state.fallback.causes
+                              if cause in {"soc_integrity"}}) if state else [],
+        },
+        "holds": {
+            "ev": {"active": any(h.cause == "ev" for h in state.holds) if state else False},
+            "dispatch": {
+                "active": any(h.cause == "dispatch" for h in state.holds) if state else False,
+                "trusted_end": max(dispatch_ends).isoformat() if dispatch_ends else None,
+            },
+        },
     }
 
 

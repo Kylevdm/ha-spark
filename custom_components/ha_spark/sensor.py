@@ -1,4 +1,4 @@
-"""Read-only plan numbers and V2L session totals on the site device."""
+"""Read-only plan numbers, V2L totals and operating mode on the site device."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -29,11 +29,23 @@ class SparkSensorDescription(SensorEntityDescription):
     requested_entity_id: str
     soc_derived: bool = False
     v2l: bool = False
-    value_fn: Callable[[Summary], float | datetime | None]
+    value_fn: Callable[[Summary], float | datetime | str | None]
     attributes_fn: Callable[[Summary], dict[str, Any] | None] | None = None
 
 
 DESCRIPTIONS = (
+    SparkSensorDescription(
+        key="operating_mode", translation_key="operating_mode",
+        requested_entity_id="sensor.ha_spark_operating_mode", device_class=SensorDeviceClass.ENUM,
+        options=["observe", "protect", "optimise", "authority_unknown"],
+        value_fn=lambda s: s.authority.mode,
+        attributes_fn=lambda s: {
+            "transition_target": s.authority.transition_target,
+            "last_changed_at": (s.authority.last_changed_at.isoformat()
+                                if s.authority.last_changed_at else None),
+            "save_failed": s.authority.save_failed,
+        },
+    ),
     SparkSensorDescription(
         key="charge_needed", translation_key="charge_needed",
         requested_entity_id="sensor.ha_spark_charge_needed_kwh", soc_derived=True,
@@ -139,7 +151,7 @@ class SparkSensor(SparkEntity, SensorEntity):
                     and not summary.plan.soc_trusted)
 
     @property
-    def native_value(self) -> float | datetime | None:
+    def native_value(self) -> float | datetime | str | None:
         summary = self.coordinator.summary
         return self.entity_description.value_fn(summary) if summary else None
 
