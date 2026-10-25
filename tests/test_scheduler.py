@@ -964,6 +964,34 @@ def _patch_loop(
     return _StopLoop
 
 
+async def test_run_forever_records_control_loop_tick(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[AppState] = []
+
+    def capture_build_app(state: AppState) -> object:
+        assert state.loop_tick is None
+        captured.append(state)
+        return object()
+
+    async def fake_run_once(_s: Settings, **_kwargs: object) -> scheduler.RunResult:
+        plan = _plan()
+        return scheduler.RunResult(plan, plan)
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    stop = _patch_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0)])
+    monkeypatch.setattr(scheduler, "build_app", capture_build_app)
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    before = datetime.now(UTC)
+    with pytest.raises(stop):
+        await run_forever(Settings(ha_url="http://ha.test", ha_token="t"), poll_seconds=0)
+    tick = captured[0].loop_tick
+    assert tick is not None
+    assert tick.tzinfo == UTC
+    assert before <= tick <= datetime.now(UTC)
+
+
 async def test_run_forever_publishes_plan_to_api_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
