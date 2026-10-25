@@ -1810,7 +1810,7 @@ async def _serve_repair(
 ) -> None:
     """Configuration repair: serve only the fix until an import commits.
 
-    Only the socket (config show/import, authority status) and the ingress
+    Only the socket (config show/import, authority status, integration link) and the ingress
     app's config, health and mode-status routes answer. No scheduler, driver,
     SoC monitor, readiness recording, published port, transition, hold,
     shutdown safe-state or clock sync runs, and authority is only ever read.
@@ -1821,6 +1821,7 @@ async def _serve_repair(
     )
     state = AppState(settings=service.bootstrap, options_path=OPTIONS_PATH, executor=channel,
                      settings_service=service)
+    channel.link_view = state.integration_link_view
     server = _ingress_server(state) if discovery is None else _ingress_server(state, discovery)
     repaired = asyncio.Event()
     service.on_repaired = repaired.set
@@ -1840,6 +1841,7 @@ async def _serve_repair(
         raise
     finally:
         service.on_repaired = None
+        channel.link_view = None
         state.executor = None
         if serve_task is not None:
             await stop_server(server, serve_task)
@@ -1886,6 +1888,7 @@ async def _run_paired(
     warn_deprecated_notify_target(settings)
     state = AppState(settings=settings, options_path=OPTIONS_PATH, executor=channel,
                      settings_service=service)
+    channel.link_view = state.integration_link_view
     server = _ingress_server(state) if discovery is None else _ingress_server(state, discovery)
     authority = AuthorityStore(settings)
     try:
@@ -2398,3 +2401,4 @@ async def _run_paired(
         context.authority = None
         context.planned_epoch.set(None)
         channel.authority = None
+        channel.link_view = None

@@ -30,7 +30,10 @@ class SiteSnapshot(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     api_version: int = Field(strict=True, ge=1)
-    release_version: str = Field(strict=True, min_length=1, max_length=64)
+    # Version characters only: health and the CLI print it, so no control or escape sequences.
+    release_version: str = Field(
+        strict=True, min_length=1, max_length=64, pattern=r"^[0-9A-Za-z][0-9A-Za-z.+_-]*$",
+    )
     site_id: str = Field(strict=True)
     sent_at: AwareDatetime
 
@@ -64,6 +67,25 @@ class IntegrationLink:
     snapshot: SiteSnapshot | None
     received_at: datetime | None
     skew: bool
+
+
+def link_view(link: IntegrationLink, now: datetime) -> dict[str, object]:
+    """Allowlisted read-only diagnostics; liveness grants no authority."""
+    snapshot = link.snapshot
+    age = (now - link.received_at).total_seconds() if link.received_at is not None else None
+    state = "never_connected"
+    if link.skew:
+        state = "version_skew"
+    elif snapshot is not None:
+        state = "connected" if age is not None and age <= 90 else "unreachable"
+    return {
+        "state": state,
+        "site_id": snapshot.site_id if snapshot is not None else None,
+        "integration_release_version": snapshot.release_version if snapshot is not None else None,
+        "api_version": snapshot.api_version if snapshot is not None else None,
+        "sent_at": snapshot.sent_at.isoformat() if snapshot is not None else None,
+        "snapshot_age_s": max(0, int(age)) if snapshot is not None and age is not None else None,
+    }
 
 
 def version_refusal() -> dict[str, object]:

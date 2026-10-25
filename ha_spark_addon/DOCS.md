@@ -792,7 +792,8 @@ Forwarding headers such as `X-Forwarded-For` are ignored. In standalone/dev
 mode (`ha_url` + `ha_token`) it listens on `http://127.0.0.1:8099` only.
 Endpoints:
 
-- `GET /api/health`: liveness, and when the latest plan was computed
+- `GET /api/health`: liveness, when the latest plan was computed, and the read-only
+  integration link (state, site id, integration release and API versions, snapshot time and age)
 - `GET /api/plan`: the latest plan, as the same sensor payload the daemon
   publishes to Home Assistant
 - `GET /api/config`: the settings service's read view, with revision, field
@@ -864,7 +865,10 @@ every hardware decision.
 1. **Check the Log tab** after the first start. The add-on runs
    `ha-spark health` and prints one line per check: HA REST, HA WebSocket,
    Ollama, SQLite, load history, supply guard, tariff provider, household
-   clock, inverter clock (Solis only), notify service (when configured), and entity config.
+   clock, inverter clock (Solis only), notify service (when configured), entity config,
+   and integration link. The link is connected, never connected, unreachable after
+   90 seconds, or version skew. With no daemon running the link is unknown. A missing or
+   disconnected integration is a warning, never a failure, including in configuration repair.
 2. **Map your entities.** From a shell in the add-on container (e.g. the SSH
    add-on with `docker exec -it addon_<slug> sh`, or the add-on's own
    terminal), run `ha-spark onboard`. It scans your HA entities and proposes
