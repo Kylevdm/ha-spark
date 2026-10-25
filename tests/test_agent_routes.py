@@ -69,6 +69,15 @@ def test_token_required_when_configured(tmp_path: Path) -> None:
         assert ok.status_code == 200
 
 
+def test_non_ascii_token_is_a_plain_401(tmp_path: Path) -> None:
+    app = build_app(_state(tmp_path), require_token=True, token="sekret")
+    with TestClient(app) as client:
+        resp = client.get(
+            "/agent/plan", headers={"Authorization": "Bearer sékret".encode("latin-1")}
+        )
+    assert resp.status_code == 401
+
+
 def test_act_and_write_routes_absent_from_openapi_schema_in_read_mode(tmp_path: Path) -> None:
     """Read-mode must not advertise act/write tools via /openapi.json (design step #7)."""
     with TestClient(build_app(_state(tmp_path, exposure="read"))) as client:

@@ -49,6 +49,22 @@ async def test_call_service_sends_bearer_and_returns_changed() -> None:
     assert sent.headers["Authorization"] == "Bearer secret"
 
 
+@pytest.mark.parametrize(
+    ("domain", "service"),
+    [("notify", "../../states/sensor.x"), ("../states", "x"), ("notify", "a/b"), ("notify", "")],
+)
+@respx.mock
+async def test_call_service_refuses_a_path_in_a_name_without_a_request(
+    domain: str, service: str
+) -> None:
+    route = respx.route().mock(return_value=httpx.Response(200, json=[]))
+    async with HomeAssistantRest(BASE, "secret") as rest:
+        with pytest.raises(HomeAssistantRestError, match="service name was invalid"):
+            await rest.call_service(domain, service, {"message": "m"})
+
+    assert not route.called
+
+
 @pytest.mark.parametrize("failure", ["transport", "status", "malformed"])
 @respx.mock
 async def test_rest_failures_never_expose_the_auth_token(failure: str, caplog) -> None:

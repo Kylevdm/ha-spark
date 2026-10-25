@@ -829,7 +829,9 @@ saved file before importing it. Other Axle field names are unchanged.
 
 Set `notify_service` to the bare Home Assistant notify service name, such as
 `mobile_app_<device>` (without `notify.`), for all notifications, including V2L and
-export lifecycle notices sent to the person supervising. ha-spark sends one
+export lifecycle notices sent to the person supervising. The name may contain
+only lowercase letters, digits and underscores; anything else is refused when
+it is saved. ha-spark sends one
 notice when it accepts an event, one
 after a verified export start, one after verified cleanup, and one for a
 terminal abort. It deduplicates notices by event and lifecycle step. A notice

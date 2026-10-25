@@ -344,4 +344,8 @@ async def submit_socket(
         return Reply(error="daemon response unavailable; request may have executed")
     finally:
         writer.close()
-        await writer.wait_closed()
+        # The daemon may close first; the reply is already read or the failure reported (#490).
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass

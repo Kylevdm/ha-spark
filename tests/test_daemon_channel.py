@@ -93,6 +93,19 @@ def test_peer_uid_is_kernel_reported_uid() -> None:
     assert daemon_channel._peer_uid(SimpleNamespace(get_extra_info=lambda name: None)) is None  # type: ignore[arg-type]
 
 
+async def test_reset_on_close_still_returns_the_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def reset(self: asyncio.StreamWriter) -> None:
+        raise ConnectionResetError
+
+    settings = settings_at(tmp_path)
+    async with DaemonChannel(settings):
+        monkeypatch.setattr(asyncio.StreamWriter, "wait_closed", reset)
+        reply = await submit_socket(settings, "authority_status")
+    assert reply is not None and reply.authority is not None
+
+
 @pytest.mark.parametrize("uid", [None, os.getuid() + 1])
 async def test_foreign_or_unknown_peer_refused_before_reading(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uid: int | None

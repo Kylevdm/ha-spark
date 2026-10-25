@@ -33,4 +33,7 @@ def verify(header_value: str | None, token: str) -> bool:
     if not header_value or not header_value.startswith("Bearer "):
         return False
     presented = header_value[len("Bearer ") :]
-    return hmac.compare_digest(presented, token)
+    # compare_digest raises TypeError on non-ASCII str; bytes keep a bad header a plain 401 (#489).
+    return hmac.compare_digest(
+        presented.encode("utf-8", "surrogatepass"), token.encode("utf-8", "surrogatepass")
+    )
