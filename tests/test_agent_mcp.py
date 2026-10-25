@@ -176,6 +176,17 @@ async def test_published_mcp_requires_token_before_origin(
     assert response.status_code == 401
 
 
+async def test_published_mcp_non_ascii_token_is_a_plain_401(tmp_path: Path) -> None:
+    app = build_app(_state(tmp_path, "read_act", surface="off"), require_token=True, token="sekret")
+    headers: dict[str, str | bytes] = dict(_MCP_HEADERS)
+    headers["Authorization"] = "Bearer sékret".encode("latin-1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        response = await client.post("/mcp/", json=_INIT, headers=headers)
+    assert response.status_code == 401
+
+
 async def test_published_mcp_keeps_surface_404_after_valid_token(tmp_path: Path) -> None:
     app = build_app(_state(tmp_path, "read_act", surface="off"), require_token=True, token="sekret")
     async with httpx.AsyncClient(

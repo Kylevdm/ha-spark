@@ -30,3 +30,8 @@ def test_verify() -> None:
     assert verify("Bearer wrong", "abc") is False
     assert verify(None, "abc") is False
     assert verify("abc", "abc") is False  # missing scheme
+
+
+@pytest.mark.parametrize(("header", "token"), [("Bearer sékret", "sekret"), ("Bearer x", "sékret")])
+def test_verify_refuses_non_ascii_without_raising(header: str, token: str) -> None:
+    assert verify(header, token) is False

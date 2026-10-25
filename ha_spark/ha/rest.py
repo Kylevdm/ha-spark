@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from types import TracebackType
 from typing import Any
 
@@ -107,6 +108,9 @@ class HomeAssistantRest:
         self, domain: str, service: str, data: dict[str, Any] | None = None
     ) -> list[EntityState]:
         """Call a service and return the list of states changed as a result."""
+        # Both names become URL path segments, so a traversal can't reach another endpoint (#488).
+        if not all(re.fullmatch(r"[a-z0-9_]+", name) for name in (domain, service)):
+            raise HomeAssistantRestError("Home Assistant service name was invalid")
         log.info("call_service %s.%s", domain, service)
         resp = await self._post(f"/services/{domain}/{service}", data or {})
         try:

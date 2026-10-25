@@ -15,6 +15,7 @@ bootstrap values, never runtime settings.
 
 from __future__ import annotations
 
+import re
 from datetime import time
 from typing import Annotated, Any, Literal, TypedDict, cast
 
@@ -740,7 +741,11 @@ class Settings(BaseSettings):
     @field_validator("notify_service", "v2l_notify_service")
     @classmethod
     def _normalise_notify_service(cls, value: str) -> str:
-        return value.removeprefix("notify.")
+        value = value.removeprefix("notify.")
+        # The name becomes a URL path segment: refuse anything but a bare service name (#488).
+        if value and re.fullmatch(r"[a-z0-9_]+", value) is None:
+            raise ValueError("must be a notify service name such as mobile_app_phone")
+        return value
 
     @field_validator("solar_percentile", mode="before")
     @classmethod

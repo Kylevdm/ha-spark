@@ -251,6 +251,15 @@ def test_notify_service_loads_as_bare_name(field: str, value: str) -> None:
     assert getattr(settings, field) == "mobile_app_x"
 
 
+@pytest.mark.parametrize("field", ["notify_service", "v2l_notify_service"])
+@pytest.mark.parametrize(
+    "value", ["../../states/sensor.x", "notify.../x", "mobile_app/x", "Mobile_App", "a b", "a?b"]
+)
+def test_notify_service_refuses_anything_but_a_bare_name(field: str, value: str) -> None:
+    with pytest.raises(ValidationError, match="notify service name"):
+        Settings(**{field: value})
+
+
 def test_export_planner_limits_are_configurable_across_addon_surfaces() -> None:
     settings = Settings(battery_discharge_ceiling_kw=3.2, dno_export_limit_kw=7.36)
 

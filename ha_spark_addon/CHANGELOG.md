@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.26.1
+
+- **Security (#488):** `notify_service` and `v2l_notify_service` accept only a bare
+  service name (lowercase letters, digits and underscores, with an optional
+  `notify.` prefix), and every Home Assistant service call refuses any other
+  domain or service name before sending a request. Before 0.26.1 a name with
+  path characters could reach another Home Assistant REST endpoint. Any name
+  that worked as a notify service is still valid. A stored name with other
+  characters puts the add-on into configuration repair on update; check
+  `ha-spark config show` first if yours has one.
+- The agent port answers a bearer token with non-ASCII characters with 401
+  instead of 500 (#489).
+- `ha-spark health` no longer ends with a traceback when the daemon closes its
+  socket first (#490).
+
 ## 0.26.0
 
 - **Update the add-on first, then the integration through HACS, then restart Home
