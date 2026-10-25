@@ -1,4 +1,4 @@
-# ha-spark
+<h1 align="center"><img src="ha_spark_addon/logo.png" alt="ha-spark" width="360"></h1>
 
 Local-first energy autopilot for Home Assistant.
 
@@ -10,9 +10,10 @@ and a natural-language layer answers questions about the plan without changing
 it.
 
 ha-spark ships as a Home Assistant add-on and talks to Home Assistant (HAOS or
-Supervised) over the REST and WebSocket APIs. The natural-language features use
-one remote Ollama instance and fall back to a deterministic parser when Ollama
-is unreachable. There is no ha-spark cloud service or subscription. Apart from
+Supervised) over the REST and WebSocket APIs. A companion integration,
+installed from HACS, shows the plan in Home Assistant as entities. The
+natural-language features use one remote Ollama instance and fall back to a
+deterministic parser when Ollama is unreachable. There is no ha-spark cloud service or subscription. Apart from
 Home Assistant, ha-spark contacts only your Ollama server, Open-Meteo (weather
 for the ML load model), and the Octopus and Axle APIs if you configure them.
 
@@ -37,9 +38,11 @@ for the ML load model), and the Octopus and Axle APIs if you configure them.
   mechanics. [`docs/adding-an-inverter.md`](docs/adding-an-inverter.md)
   describes it.
 - **Quality gates.** ha-spark is Python 3.11+ on asyncio. Ruff, strict mypy,
-  and over 1,000 tests must pass before every merge. The tests use respx for
-  HTTP and fake servers for WebSocket. The add-on is a Docker image that Home
-  Assistant builds from a pinned release tag.
+  and over 2,800 tests must pass before every merge. The tests use respx for
+  HTTP and fake servers for WebSocket. The companion integration has its own
+  tests against a real Home Assistant, and passes hassfest and HACS validation.
+  The add-on is a Docker image that Home Assistant builds from a pinned release
+  tag.
 - **Written decisions.** Each architecture decision has an
   [ADR](docs/adr/), and [`CONTEXT.md`](CONTEXT.md) defines the domain terms.
 
@@ -64,6 +67,10 @@ for the ML load model), and the Octopus and Axle APIs if you configure them.
 > - Observe plan previews, readiness evidence and savings backtests
 > - onboarding, the NL copilot, and an optional API that external agents can
 >   use to read data and trigger gated actions (`agent_surface`)
+> - a read-only companion integration (0.26.0). It shows the plan, the plan
+>   status and next change, V2L totals, whether the add-on is connected, and
+>   mirrors of the operating mode, fallback and holds. The add-on finds it
+>   through Supervisor discovery and no longer pushes states to Home Assistant.
 >
 > Axle export completed its first paid export on real hardware on 2026-10-05
 > ([#134](https://github.com/Kylevdm/ha-spark/issues/134)). It stays a
@@ -241,7 +248,7 @@ made each decision, without configuring an optimization framework.
 |---|---|---|---|
 | Optimizes a plan | ✅ LP solver | ✅ | ✅ energy-balance planner ([why not LP](docs/adr/0002-auditable-over-optimal-planning.md)) |
 | Actuates hardware itself | ❌ user wires automations | ✅ | ✅ with guard rails (SoC validity, read-back, failure isolation) |
-| Setup effort | YAML + sensor templates + REST commands | YAML; docs assume HA/file-editing fluency | add-on options UI + onboarding wizard |
+| Setup effort | YAML + sensor templates + REST commands | YAML; docs assume HA/file-editing fluency | add-on + `ha-spark onboard` proposes entity mappings |
 | Explains decisions in plain language | ❌ | ❌ | ✅ local LLM over the deterministic plan |
 | Try-before-trust mode | ❌ | partial (read-only mode) | ✅ Observe mode + savings backtest |
 | Cloud dependence | none | none (paid cloud version exists) | none, by design |
@@ -260,8 +267,13 @@ made each decision, without configuring an optimization framework.
    Repositories** and add `https://github.com/Kylevdm/ha-spark`.
 2. Install **ha-spark**. Home Assistant builds the image locally, so the first
    install takes a few minutes.
-3. Set your entity IDs and tariff on the **Configuration** tab, then start the
-   add-on.
+3. Start the add-on, which begins in Observe. Set your entity IDs and tariff
+   with `ha-spark config` inside the add-on container; the **Configuration**
+   tab holds only `log_level`.
+4. For the plan sensors, add `https://github.com/Kylevdm/ha-spark` to HACS as a
+   custom repository (type **Integration**), install **ha-spark**, and restart
+   Home Assistant. Accept the discovered **ha-spark** integration under
+   **Settings → Devices & services**.
 
 The aim is a first Observe plan within 15 minutes of installing.
 `ha-spark onboard` proposes entity mappings from your HA registry,
@@ -269,8 +281,11 @@ The aim is a first Observe plan within 15 minutes of installing.
 overnight plan the same evening.
 
 [`ha_spark_addon/DOCS.md`](ha_spark_addon/DOCS.md) has the full option
-reference and the onboarding steps: health check, load-history backfill, first
-plan, then an owner-requested mode change.
+reference, the companion integration's entities, and the onboarding steps:
+health check, load-history backfill, first plan, then an owner-requested mode
+change. Upgrading from 0.25.x? Read
+[Updating to 0.26.0](ha_spark_addon/DOCS.md#updating-to-0260) first: some
+sensors were dropped and `sensor.ha_spark_plan_status` changed.
 
 A per-inverter driver controls battery charging. Set the `inverter` option to
 `solis` (the default) or `alphaess`. On Solis, ha-spark also checks the
