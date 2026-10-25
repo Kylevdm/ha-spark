@@ -79,7 +79,7 @@ def _in_lockstep(root: Path = REPO_ROOT) -> bool:
 
 def test_release_versions_stay_in_lockstep() -> None:
     assert _in_lockstep(), _release_versions()
-    assert _release_versions()["manifest.json"] == "0.26.0"
+    assert _release_versions()["manifest.json"] == "0.26.1"
 
 
 @pytest.mark.parametrize("stale", ["addon", "manifest", "project", "package"])
