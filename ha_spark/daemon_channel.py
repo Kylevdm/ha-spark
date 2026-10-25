@@ -163,6 +163,8 @@ class DaemonChannel:
         return self
 
     async def __aexit__(self, *args: object) -> None:
+        # A startup cancelled before its finally ran must not leave a departed AppState bound.
+        self.link_view = None
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()

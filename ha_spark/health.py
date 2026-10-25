@@ -10,6 +10,7 @@ which the deterministic offline parser is a valid fallback).
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -69,6 +70,10 @@ class CheckResult:
 _CRITICAL = frozenset({"HA REST", "HA WS", "SQLite", "Operating mode", "Configuration"})
 
 _GLYPH = {Status.OK: "✓", Status.WARN: "⚠", Status.FAIL: "✗"}
+
+
+# Matches SiteSnapshot.release_version: version characters only, safe to print.
+_RELEASE_VERSION = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
 
 
 async def check_ha_rest(settings: Settings) -> CheckResult:
@@ -423,22 +428,29 @@ async def check_operating_mode(settings: Settings) -> CheckResult:
 
 
 async def check_integration_link(settings: Settings) -> CheckResult:
-    """Read daemon-only liveness; a missing integration is never a failure."""
-    reply = await submit_socket(settings, "integration_link")
+    """Read daemon-only liveness; a missing integration is never a failure.
+
+    Only validated values are printed: the reply is another process's output.
+    """
+    try:
+        reply = await submit_socket(settings, "integration_link")
+    except OSError:
+        return CheckResult("Integration link", Status.WARN, "unknown (daemon connection lost)")
     if reply is None:
         return CheckResult("Integration link", Status.WARN, "unknown (no daemon running)")
     view = reply.integration_link
-    if reply.error is not None or view is None or view.get("state") not in (
+    state = view.get("state") if view is not None else None
+    if reply.error is not None or view is None or state not in (
         "connected", "never_connected", "unreachable", "version_skew",
     ):
         return CheckResult("Integration link", Status.WARN, "unknown")
-    state = view["state"]
     detail = str(state)
     version = view.get("integration_release_version")
-    if isinstance(version, str):
+    if isinstance(version, str) and _RELEASE_VERSION.fullmatch(version):
         detail += f"; integration {version}"
-    if state == "connected":
-        detail += f"; snapshot age {view.get('snapshot_age_s')}s"
+    age = view.get("snapshot_age_s")
+    if state == "connected" and type(age) is int and age >= 0:
+        detail += f"; snapshot age {age}s"
     return CheckResult(
         "Integration link", Status.OK if state == "connected" else Status.WARN, detail,
     )

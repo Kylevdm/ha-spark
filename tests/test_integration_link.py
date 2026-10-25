@@ -189,3 +189,45 @@ async def test_cli_health_link(
     assert code in (0, 2)  # Existing configuration warnings may also degrade health, never fail it.
     if expected != "connected":
         assert code == 2
+
+
+@pytest.mark.parametrize("hostile", [
+    {"integration_release_version": "\x1b[2J" + SESSION},
+    {"snapshot_age_s": {"session_id": SESSION}},
+    {"snapshot_age_s": True},
+])
+async def test_cli_prints_only_validated_link_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hostile: dict[str, object],
+) -> None:
+    async def submit(*args: object) -> Reply:
+        return Reply(integration_link={"state": "connected", **hostile})
+
+    monkeypatch.setattr(health, "submit_socket", submit)
+    result = await health.check_integration_link(
+        Settings(ha_url="http://ha.test", ha_token=TOKEN, db_path=str(tmp_path / "ha_spark.db")),
+    )
+    assert result.detail == "connected"
+    assert SESSION not in result.detail and "\x1b" not in result.detail
+
+
+async def test_lost_daemon_connection_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def submit(*args: object) -> Reply:
+        raise ConnectionResetError
+
+    monkeypatch.setattr(health, "submit_socket", submit)
+    result = await health.check_integration_link(
+        Settings(ha_url="http://ha.test", ha_token=TOKEN, db_path=str(tmp_path / "ha_spark.db")),
+    )
+    assert result.status is health.Status.WARN
+    assert result.detail == "unknown (daemon connection lost)"
+
+
+async def test_channel_exit_unbinds_the_link_view(tmp_path: Path) -> None:
+    settings = Settings(ha_url="http://ha.test", ha_token=TOKEN,
+                        db_path=str(tmp_path / "ha_spark.db"))
+    channel = DaemonChannel(settings)
+    async with channel:
+        channel.link_view = lambda: {"state": "connected"}
+    assert channel.link_view is None
