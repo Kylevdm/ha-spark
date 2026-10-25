@@ -129,7 +129,6 @@ async def test_live_current_horizon_ticks_skip_writes_then_absorb_new_inputs(
     monkeypatch.setattr(axle, "datetime", FixedDatetime)
     monkeypatch.setattr(solis, "_READ_BACK_DELAY_SECONDS", 0)
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
-    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
     monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
     respx.route(method="GET").mock(side_effect=get_state)
     respx.route(method="POST").mock(side_effect=write_register)
@@ -369,9 +368,7 @@ def _patch_run_once_io(
 
     monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_args: device)
-    monkeypatch.setattr(scheduler, "publish_plan", noop)
     monkeypatch.setattr(scheduler, "_record_forecast", noop)
-    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
     monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
 
 
@@ -705,9 +702,7 @@ async def test_run_once_skips_unchanged_command_after_fresh_soc(
 
     monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_args: FakeDevice())
-    monkeypatch.setattr(scheduler, "publish_plan", noop)
     monkeypatch.setattr(scheduler, "_record_forecast", noop)
-    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
     monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
 
     result = await run_once(Settings(), soc=current.soc, previous_plan=previous)
@@ -750,9 +745,7 @@ async def test_run_once_retries_after_untrusted_previous_plan(
 
     monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_args: FakeDevice())
-    monkeypatch.setattr(scheduler, "publish_plan", noop)
     monkeypatch.setattr(scheduler, "_record_forecast", noop)
-    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
     monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
 
     await run_once(Settings(), soc=current.soc, previous_plan=previous)
@@ -1388,7 +1381,7 @@ async def test_run_forever_samples_signals_every_interval(
 
 
 @respx.mock
-async def test_run_once_logs_proactive_decisions(
+async def test_agent_predictions_logs_proactive_decisions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
@@ -1411,9 +1404,12 @@ async def test_run_once_logs_proactive_decisions(
                 "occupancy_home_frac", 0.05,
             )
 
-    with caplog.at_level("INFO"):
-        await run_once(s)
+    from ha_spark.agent.tools import get_predictions
 
+    with caplog.at_level("INFO"):
+        result = await get_predictions(s)
+
+    assert result.decisions[0]["action"] == "suggest_away_context"
     assert any("Proactive decision" in r.message for r in caplog.records)
 
 
@@ -1579,14 +1575,43 @@ def _soc_get(states: list[str], reported: list[datetime]) -> None:
 
 
 def _integrity_posts() -> list[tuple[str, dict[str, object]]]:
-    """The (state, attributes) of every soc-integrity sensor push this test saw."""
-    out: list[tuple[str, dict[str, object]]] = []
-    for call in respx.calls:
-        if call.request.url.path != "/api/states/sensor.ha_spark_soc_integrity":
-            continue
-        body = json.loads(call.request.content)
-        out.append((body["state"], body["attributes"]))
-    return out
+    """Monitor results captured by the fixture, no longer REST sensor bodies."""
+    raise AssertionError("monitor result fixture not installed")
+
+
+@pytest.fixture(autouse=True)
+def monitor_results(monkeypatch):
+    """Observe public monitor results at each tick and recovery boundary."""
+    from dataclasses import fields
+
+    results = []
+    latest = None
+    for name in ("record", "complete_fallback", "complete_recovery"):
+        original = getattr(SocMonitor, name)
+
+        def capture(self, *args, _original=original, **kwargs):
+            nonlocal latest
+            latest = _original(self, *args, **kwargs)
+            return latest
+
+        monkeypatch.setattr(SocMonitor, name, capture)
+
+    for name in ("soc_monitor_tick", "finish_recovery"):
+        original_tick = getattr(scheduler, name)
+
+        async def tick(*args, _original=original_tick, **kwargs):
+            nonlocal latest
+            latest = None
+            value = await _original(*args, **kwargs)
+            if latest is not None:
+                results.append((latest.state.value, {
+                    field.name: getattr(latest, field.name) for field in fields(latest)
+                }))
+            return value
+
+        monkeypatch.setattr(scheduler, name, tick)
+    monkeypatch.setattr(__import__(__name__, fromlist=["_integrity_posts"]),
+                        "_integrity_posts", lambda: results)
 
 
 def _patch_monitor_loop(
@@ -1728,7 +1753,6 @@ async def test_loop_third_consecutive_failure_reaches_fallback_threshold(
     ]
     assert published[-1][1]["consecutive_failures"] == 3
     assert published[-1][1]["failure_threshold"] == 3
-    assert published[-1][1]["fallback_current_configured_a"] is None
     assert published[-1][1]["fallback_confirmed"] is False
     assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
         "consecutive_failures": 3,
@@ -1837,11 +1861,10 @@ async def test_loop_enters_configured_fallback_at_threshold_and_publishes_confir
     ]
     state, attrs = published[1]
     assert state == "fallback_verified"
-    assert attrs["fallback_current_configured_a"] == 42.0
     assert attrs["fallback_confirmed"] is True
-    assert attrs["fallback_actions"] == [
+    assert attrs["fallback_action"] == (
         "[FALLBACK] Solis fallback at 42 A in 23:30-05:30 read-back verified"
-    ]
+    )
     assert json.loads((tmp_path / "ha_spark_soc_monitor.json").read_text()) == {
         "consecutive_failures": 3,
         "fallback_status": "fallback_verified",
@@ -2409,7 +2432,7 @@ async def test_loop_never_requests_fallback_for_alphaess(
 
     assert fallback_states == [True]  # threshold blocks normal programming
     assert _integrity_posts()[-1][0] == "fallback_threshold"
-    assert _integrity_posts()[-1][1]["fallback_supported"] is False
+    assert _integrity_posts()[-1][1]["fallback_action"] is None
     assert not any(call.request.url.path.startswith("/api/services/") for call in respx.calls)
 
 
@@ -2478,7 +2501,8 @@ async def test_loop_observes_once_per_tick_and_reuses_the_measurement(
     }
     published = _integrity_posts()
     assert [state for state, _ in published] == ["pending_failure"]
-    assert published[0][1]["soc_status"] == "stale"
+    assert published[0][1]["measurement"] is run_socs[0]
+    assert run_socs[0].status is SocStatus.STALE
 
 
 @respx.mock
@@ -3005,9 +3029,7 @@ async def test_run_once_reconciles_an_untrusted_plan_against_the_trusted_holds(
 
     monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
     monkeypatch.setattr(scheduler, "inverter_device", lambda *_args: FakeDevice())
-    monkeypatch.setattr(scheduler, "publish_plan", noop)
     monkeypatch.setattr(scheduler, "_record_forecast", noop)
-    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
     monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
 
     await run_once(Settings(), soc=current.soc, trusted_holds=(_HOLD,))
@@ -3839,9 +3861,7 @@ async def test_run_once_applies_the_ev_hold_on_a_replan_tick(
         return None
 
     monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
-    monkeypatch.setattr(scheduler, "publish_plan", noop)
     monkeypatch.setattr(scheduler, "_record_forecast", noop)
-    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
     monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
     switch_url = "http://ha.test/api/states/select.solisac_power_switch"
     switch_reads = iter(("On", "Off"))
@@ -4674,9 +4694,7 @@ async def test_invalid_soc_never_blocks_the_ev_hold_switch_write(
         return None
 
     monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
-    monkeypatch.setattr(scheduler, "publish_plan", noop)
     monkeypatch.setattr(scheduler, "_record_forecast", noop)
-    monkeypatch.setattr(scheduler, "_run_orchestrator", noop)
     monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
     switch = _mock_power_switch(monkeypatch)
 
@@ -5826,12 +5844,7 @@ async def test_loop_recovers_with_a_fresh_plan_only_after_stable_duration(
     restored_attrs = _integrity_posts()[0][1]
     assert restored_attrs["restored_state"] is True
     assert restored_attrs["fresh_observation"] is True
-    assert restored_attrs["hardware_confirmation"] == "confirmed"
-    assert restored_attrs["integrity_actions"] == [
-        "[RESTORED] software integrity state",
-        "[OBSERVED] fresh checked SoC measurement",
-        "[CONFIRMED] Solis fallback hardware read-back",
-    ]
+    assert restored_attrs["fallback_confirmed"] is True
     _, attrs = _integrity_posts()[3]
     assert attrs["recovery_action"] == (
         "[RECOVERED] normal programming resumed: "
@@ -5958,7 +5971,7 @@ async def test_partial_recovered_apply_reapplies_fallback_same_tick_then_waits_f
     state, attrs = posts[3]
     assert state == "fallback_verified"
     assert attrs["fallback_confirmed"] is True
-    assert attrs["hardware_confirmation"] == "confirmed"
+    assert attrs["fresh_observation"] is True
     assert str(attrs["fallback_action"]).startswith("[FALLBACK]")
     assert posts[-1][1]["recovery_action"].startswith("[RECOVERED] normal programming resumed")
     # The fallback cleared only after the verified recovered apply: store
@@ -6019,7 +6032,7 @@ async def test_failed_fallback_reapply_stays_active_unconfirmed_and_retries_ever
     state, attrs = posts[3]
     assert state == "fallback_failed"
     assert attrs["fallback_confirmed"] is False
-    assert attrs["hardware_confirmation"] == "unconfirmed"
+    assert attrs["fresh_observation"] is True
     assert str(attrs["fallback_action"]).startswith("[FAILED]")
     # Every later post stays in the failed, unconfirmed fallback.
     for post_state, post_attrs in posts[4:]:

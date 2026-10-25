@@ -25,7 +25,6 @@ async def test_blocked_readiness_does_not_delay_next_guard_or_reconcile(tmp_path
     a = revision()
     monkeypatch.setattr(scheduler, "current_plan", AsyncMock(return_value=a.run))
     monkeypatch.setattr(scheduler, "soc_monitor_tick", AsyncMock(return_value=a.run.inputs.soc))
-    monkeypatch.setattr(scheduler, "_run_orchestrator", AsyncMock())
     monkeypatch.setattr(scheduler, "_run_derived_rerive", AsyncMock())
     started, cancelled = asyncio.Event(), asyncio.Event()
     calls = []
@@ -79,7 +78,6 @@ async def test_background_readiness_failure_is_logged_and_isolated(tmp_path, mon
     a = revision()
     monkeypatch.setattr(scheduler, "current_plan", AsyncMock(return_value=a.run))
     monkeypatch.setattr(scheduler, "soc_monitor_tick", AsyncMock(return_value=a.run.inputs.soc))
-    monkeypatch.setattr(scheduler, "_run_orchestrator", AsyncMock())
     monkeypatch.setattr(scheduler, "_run_derived_rerive", AsyncMock())
     calls = []
 
@@ -128,7 +126,6 @@ async def test_daemon_records_in_force_revision_after_mid_slot_request_and_faile
 
     monkeypatch.setattr(scheduler, "current_plan", compute)
     monkeypatch.setattr(scheduler, "soc_monitor_tick", AsyncMock(return_value=a.run.inputs.soc))
-    monkeypatch.setattr(scheduler, "_run_orchestrator", AsyncMock())
     monkeypatch.setattr(scheduler, "_run_derived_rerive", AsyncMock())
     # A daemon request arrives on the second tick, mid-slot.
     polls = 0

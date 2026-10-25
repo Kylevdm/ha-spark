@@ -2,9 +2,9 @@
 
 ha-spark reads the car's V2L discharge-power sensor (W), integrates it into the
 energy delivered this session, values it against the configured tariff (less
-conversion losses), publishes sensor.ha_spark_v2l_*, and fires timely HA
-notifications. V2L is a manual physical adapter with no control API: this is
-read/observe + notify only. The planner and chargers are untouched.
+conversion losses), and fires timely HA notifications. V2L is a manual physical
+adapter with no control API: this is read/observe + notify only. The planner and
+chargers are untouched.
 
 It also asks the owner for a V2L top-up when an Axle export event is
 underfunded and the charge window can't fix it (#208): the overnight charge
@@ -503,7 +503,7 @@ async def run_v2l_topup(
 
 
 async def run_v2l_tick(settings: Settings, now: datetime) -> None:
-    """One V2L pass: read, integrate, publish sensors, notify, persist.
+    """One V2L pass: read, integrate, notify, persist.
 
     Best-effort and self-contained (opens its own REST client), mirroring
     ``scheduler.sample_signals``. An unreadable sensor logs and returns; it
@@ -520,12 +520,6 @@ async def run_v2l_tick(settings: Settings, now: datetime) -> None:
             return
         power_w = _to_float(state.state, 0.0)
         session = apply_sample(session, power_w, now)
-
-        for entity_id, value, attrs in payload(session, settings):
-            try:
-                await rest.set_state(entity_id, value, attrs)
-            except Exception:  # noqa: BLE001 - publishing is best-effort
-                log.warning("Publishing %s failed", entity_id, exc_info=True)
 
         for notice in notifications(session, now, settings):
             try:

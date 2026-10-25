@@ -357,7 +357,7 @@ async def test_notify_calls_notify_service() -> None:
 
 
 @respx.mock
-async def test_run_v2l_tick_integrates_publishes_and_notifies(tmp_path: Path) -> None:
+async def test_run_v2l_tick_integrates_without_state_push_and_notifies(tmp_path: Path) -> None:
     s = Settings(
         ha_url="http://ha.test",
         ha_token="token",
@@ -372,6 +372,10 @@ async def test_run_v2l_tick_integrates_publishes_and_notifies(tmp_path: Path) ->
         )
     )
     posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+
+    pushes = respx.post(url__regex=r"http://ha\.test/api/states/.*").mock(
+        return_value=httpx.Response(200, json={})
+    )
 
     # Seed a prior sample 4 min earlier so this tick integrates ~0.13 kWh, and an
     # active session past cutoff so N1 fires.
@@ -390,7 +394,8 @@ async def test_run_v2l_tick_integrates_publishes_and_notifies(tmp_path: Path) ->
     assert back.notified_unplug is True  # N1 fired and was flagged
     paths = [c.request.url.path for c in posts.calls]
     assert any(p.endswith("/services/notify/mobile_app_x") for p in paths)
-    assert any("sensor.ha_spark_v2l_energy_kwh" in p for p in paths)
+    assert not any(p.startswith("/api/states/") for p in paths)
+    assert not pushes.called
 
 
 @respx.mock

@@ -28,7 +28,6 @@ async def test_capture_uses_post_handover_mode_and_driver_rate_capability(
     a = revision()
     monkeypatch.setattr(scheduler, "current_plan", AsyncMock(return_value=a.run))
     monkeypatch.setattr(scheduler, "soc_monitor_tick", AsyncMock(return_value=a.run.inputs.soc))
-    monkeypatch.setattr(scheduler, "_run_orchestrator", AsyncMock())
     monkeypatch.setattr(scheduler, "_run_derived_rerive", AsyncMock())
     monkeypatch.setattr(DaemonChannel, "next_request", lambda self: Pending(
         Request(op="mode", target="observe", expected_epoch=2),
