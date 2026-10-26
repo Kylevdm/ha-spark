@@ -170,6 +170,7 @@ def test_ingress_slots_preserve_remaining_numbers_and_household_offsets(tmp_path
             "cheap_frac": schedule.cheap_fracs[i],
             "load_kwh": pytest.approx(0.6 * (13 / 30 if i == 0 else 1)),
             "solar_kwh": pytest.approx(0.1 * (13 / 30 if i == 0 else 1)),
+            "solar_raw_kwh": pytest.approx(0.2 * (13 / 30 if i == 0 else 1)),
             "actions": list(source.actions),
         }
     assert timeline["slots"][0]["actions"] == ["charge"]

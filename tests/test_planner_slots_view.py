@@ -1,16 +1,16 @@
 """Slot view reads the planner's numbers and decisions without changing intent."""
 
 from dataclasses import replace
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, time
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from ha_spark.energy.horizon import SLOT, compute_horizon_geometry
-from ha_spark.energy.models import DispatchSlot, FlexibilityEvent, PlannerInputs
+from ha_spark.energy.models import DispatchSlot, PlannerInputs
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.tariff import fixed_schedule
-from tests.test_planner import _soc, _soc_unavailable, cfg
+from tests.test_planner import _reserve_trade_plan, _soc, _soc_unavailable, cfg
 
 LONDON = ZoneInfo("Europe/London")
 
@@ -95,19 +95,18 @@ def test_slot_view_holds_mid_slot_and_ignores_elapsed_evidence(trusted):
 
 
 def test_slot_view_export_skip_and_v2l_match_existing_decisions():
-    config = cfg(v2l_budget_kwh=15)
-    now = datetime(2026, 1, 12, 12, 0, tzinfo=UTC)
-    event = FlexibilityEvent(now + timedelta(hours=1), now + timedelta(hours=3),
-                             "export", now, 1.0)
-    inputs = replace(slot_inputs(now, config, flexibility_event=event, car_plugged_in=True),
-                     soc=_soc(60))
-    plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
-    assert plan.charge_intent.export is not None or plan.export_skips
-    selected = plan.charge_intent.export.selected_slots if plan.charge_intent.export else ()
+    # The planner selects two paid-export slots here (tests/test_planner.py).
+    plan = _reserve_trade_plan(rate=1.0)
+    assert plan.charge_intent.export is not None
+    selected = plan.charge_intent.export.selected_slots
+    assert selected
     for i, slot in enumerate(plan.view.slots):
         assert ("export" in slot.actions) == (slot.start in selected)
         assert ("skip" in slot.actions) == any(s.start == slot.start for s in plan.export_skips)
         assert ("v2l" in slot.actions) == any(r.slot == i for r in plan.v2l_refills)
+        # Without an export-price overlay the planner prices paid export at the event rate.
+        if slot.start in selected:
+            assert slot.export_price == 1.0
 
 
 def test_slot_view_v2l_refills_are_not_inferred_from_cheap_slots():
@@ -122,3 +121,14 @@ def test_slot_view_v2l_refills_are_not_inferred_from_cheap_slots():
     assert {i for i, slot in enumerate(plan.view.slots) if "v2l" in slot.actions} == {
         refill.slot for refill in plan.v2l_refills
     }
+
+
+def test_slot_view_reads_naive_hold_bounds_on_the_household_clock():
+    config = cfg()
+    now = datetime(2026, 6, 8, 12, 17, tzinfo=LONDON)
+    inputs = slot_inputs(now, config, dispatches=(
+        DispatchSlot(datetime(2026, 6, 8, 12, 30), datetime(2026, 6, 8, 13, 0)),
+    ))
+    plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
+    held = [slot.start for slot in plan.view.slots if "hold" in slot.actions]
+    assert held == [datetime(2026, 6, 8, 11, 30, tzinfo=UTC)]

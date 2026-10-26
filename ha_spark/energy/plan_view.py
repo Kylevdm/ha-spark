@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 
+from ha_spark.energy.models import _align
 from ha_spark.energy.soc_integrity import SocStatus
 
 if TYPE_CHECKING:
@@ -53,6 +54,8 @@ class PlanSlot:
     cheap_frac: float
     load_kwh: float
     solar_kwh: float
+    # Solcast's estimate before the planner's haircut, on the same slot-0 basis.
+    solar_raw_kwh: float
     actions: tuple[Action, ...]
 
 
@@ -100,6 +103,9 @@ def _slots(
     exports = {at.astimezone(UTC) for at in selected}
     skips = {skip.start.astimezone(UTC) for skip in plan.export_skips}
     refills = {refill.slot for refill in plan.v2l_refills}
+    # Naive hold bounds are read on the household clock, as ChargeIntent does.
+    clock = inputs.now or geometry.horizon_start
+    event_rate = inputs.flexibility_event.rate_gbp_kwh if inputs.flexibility_event else 0.0
     result = []
     for i, at in enumerate(geometry.slot_starts):
         start = at.astimezone(UTC)
@@ -115,8 +121,7 @@ def _slots(
             ) < min(end, geometry.window_end.astimezone(UTC)):
                 actions.append("charge")
         if any(
-            (a if a.tzinfo else a.replace(tzinfo=at.tzinfo)).astimezone(UTC) < end
-            and lo < (b if b.tzinfo else b.replace(tzinfo=at.tzinfo)).astimezone(UTC)
+            _align(a, clock).astimezone(UTC) < end and lo < _align(b, clock).astimezone(UTC)
             for a, b in plan.charge_intent.holds
         ):
             actions.append("hold")
@@ -129,10 +134,12 @@ def _slots(
                 actions.append("v2l")
         result.append(PlanSlot(
             start=start, import_price=schedule.prices[i],
+            # As the planner prices paid export: the schedule overlay, else the event rate.
             export_price=(schedule.export_prices[i] if schedule.export_prices
-                          else schedule.export_rate),
+                          else event_rate if start in exports else schedule.export_rate),
             cheap_frac=schedule.cheap_fracs[i], load_kwh=inputs.load_slots[i] * remaining,
-            solar_kwh=solar[i] * cfg.solar_haircut_k * remaining, actions=tuple(actions),
+            solar_kwh=solar[i] * cfg.solar_haircut_k * remaining,
+            solar_raw_kwh=solar[i] * remaining, actions=tuple(actions),
         ))
     return tuple(result)
 
