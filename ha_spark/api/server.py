@@ -13,11 +13,11 @@ socket peer is not HA's ingress proxy (which authenticates the user);
 forwarding headers cannot bypass the peer check. In standalone/dev mode the listener binds to
 loopback only. The published agent port is gated by a bearer token instead.
 
-Owner-only routes (the mode page, ``/api/mode`` and ``/api/config``) exist
+Owner-only routes (the app shell, ``/api/mode`` and ``/api/config``) exist
 only on the ingress app, never on the published port or the standalone
 listener: an agent token must never reach an owner write (#457).
 
-In configuration repair only the mode page and status, the config read,
+In configuration repair only the shell assets and mode status, the config read,
 ``POST /api/config/import`` and health answer; everything else is 503.
 """
 
@@ -47,6 +47,7 @@ from ha_spark.api.contract import (
     plan_summary,
     version_refusal,
 )
+from ha_spark.api.static_assets import packaged_assets
 from ha_spark.authority import OperatingMode, authority_view, load_authority
 from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import DaemonChannel
@@ -85,9 +86,8 @@ AGENT_CONFIG_REFUSAL: dict[str, str] = {
 _MODE_REPLY_TIMEOUT_S = 90
 _PAGE_HEADERS = {
     "Content-Security-Policy": (
-        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "connect-src 'self'; img-src 'self'; frame-ancestors 'self'; "
-        "base-uri 'none'; form-action 'none'"
+        "default-src 'self'; script-src 'self'; connect-src 'self'; "
+        "frame-ancestors 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
     ),
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
@@ -116,7 +116,7 @@ class ImportBody(BaseModel):
 
 # The routes configuration repair serves (method, path); everything else is 503.
 _REPAIR_ROUTES = frozenset({
-    ("GET", "/"), ("GET", "/mode.js"), ("GET", "/api/mode"), ("GET", "/api/config"),
+    ("GET", "/api/mode"), ("GET", "/api/config"),
     ("POST", "/api/config/import"), ("GET", "/api/health"),
 })
 
@@ -363,8 +363,12 @@ def build_app(
         gate_bindings=_gate_bindings(agent_router),
     )
     setattr(app.state, STATE_ATTR, state)
+    ingress = ingress_peer is not None and not require_token
+    app.state.ingress = ingress
+    assets = packaged_assets() if ingress else {}
+    ui_paths = {"/", *(f"/static/{name}" for name in assets)} if ingress else set()
     # Added first so the ingress peer check runs before it.
-    app.add_middleware(_RepairGate, state=state)
+    app.add_middleware(_RepairGate, state=state, ui_paths=ui_paths)
     if ingress_peer is not None:
         app.add_middleware(_PeerGate, peer=ingress_peer)
     if integration is not None:
@@ -378,21 +382,20 @@ def build_app(
 
         app.router.dependencies.append(Depends(_auth))
 
-    if ingress_peer is not None and not require_token:
+    if ingress:
+        def register_asset(path: str, name: str, content: bytes) -> None:
+            media_type = {
+                ".html": "text/html", ".js": "text/javascript", ".css": "text/css",
+            }.get(Path(name).suffix, "text/plain")
 
-        @app.get("/")
-        async def mode_page() -> Response:
-            return Response(
-                Path(__file__).with_name("mode.html").read_text(),
-                media_type="text/html", headers=_PAGE_HEADERS,
-            )
+            async def asset() -> Response:
+                return Response(content, media_type=media_type, headers=_PAGE_HEADERS)
 
-        @app.get("/mode.js")
-        async def mode_script() -> Response:
-            return Response(
-                Path(__file__).with_name("mode.js").read_text(),
-                media_type="text/javascript", headers=_PAGE_HEADERS,
-            )
+            app.add_api_route(path, asset, methods=["GET"], include_in_schema=False)
+
+        register_asset("/", "index.html", assets["index.html"])
+        for name, content in assets.items():
+            register_asset(f"/static/{name}", name, content)
 
         @app.get("/api/mode")
         async def get_mode(request: Request) -> JSONResponse:
@@ -539,6 +542,7 @@ def build_app(
         result: dict[str, Any] = {
             "status": "fail" if failed or repair is not None else "ok",
             "plan_at": _iso(st.plan_at),
+            "daemon": "running" if st.executor is not None else "unavailable",
             "integration_link": st.integration_link_view(),
             "operating_mode": authority["mode"], "authority": authority,
         }
@@ -724,15 +728,16 @@ class _IntegrationGate:
 class _RepairGate:
     """ASGI middleware: in configuration repair, 503 everything but :data:`_REPAIR_ROUTES`."""
 
-    def __init__(self, app: Any, state: AppState) -> None:
+    def __init__(self, app: Any, state: AppState, ui_paths: set[str]) -> None:
         self.app = app
         self.state = state
+        self.routes = _REPAIR_ROUTES | frozenset(("GET", path) for path in ui_paths)
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if (
             scope["type"] in ("http", "websocket")
             and self.state.settings_service.repair is not None
-            and (scope.get("method"), scope["path"]) not in _REPAIR_ROUTES
+            and (scope.get("method"), scope["path"]) not in self.routes
         ):
             if scope["type"] == "websocket":
                 await send({"type": "websocket.close", "code": 1013})

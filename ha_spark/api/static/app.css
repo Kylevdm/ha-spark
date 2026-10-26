@@ -1,0 +1,40 @@
+:root {
+    color-scheme: light dark;
+    --background: #f4f6f8;
+    --surface: #fff;
+    --text: #192330;
+    --muted: #4a5664;
+    --accent: #096b60;
+    --border: #ccd3da;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --background: #14191f;
+        --surface: #202830;
+        --text: #edf2f6;
+        --muted: #bdc8d2;
+        --accent: #7cddce;
+        --border: #4a5664;
+    }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 1rem system-ui, sans-serif; background: var(--background); color: var(--text); }
+.shell { display: flex; min-height: 100vh; }
+nav { width: 10rem; flex-shrink: 0; padding: 1rem; background: var(--surface); }
+nav strong, nav a { display: block; padding: .8rem .4rem; }
+a { color: var(--accent); }
+nav a[aria-current="page"] { font-weight: bold; border-inline-start: .2rem solid var(--accent); }
+.workspace { min-width: 0; flex: 1; }
+header { padding: 1rem 2rem; border-bottom: 1px solid var(--border); color: var(--muted); }
+header p { margin: .4rem 0; overflow-wrap: anywhere; }
+main { max-width: 60rem; padding: 1rem 2rem; }
+button { margin: .4rem; padding: .6rem; cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+dialog { max-width: min(36rem, 95vw); background: var(--surface); color: var(--text); }
+:focus-visible { outline: .2rem solid var(--accent); outline-offset: .15rem; }
+@media (max-width: 40rem) {
+    nav { width: 5rem; padding: .5rem; }
+    nav strong { font-size: .8rem; }
+    header, main { padding: 1rem; }
+}
