@@ -52,6 +52,7 @@ from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import DaemonChannel
 from ha_spark.energy import v2l
 from ha_spark.energy.models import ChargePlan
+from ha_spark.energy.plan_run import StoredPlanRun
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.integration_discovery import IntegrationDiscovery
 from ha_spark.logging import get_logger
@@ -134,6 +135,7 @@ class AppState:
     ) -> None:
         self.settings_service = settings_service or SettingsService(options_path, settings=settings)
         self.plan = plan
+        self.plan_run: StoredPlanRun | None = None
         self.plan_at = plan_at
         self.executor = executor
         self.integration_link = IntegrationLink(None, None, False)
@@ -153,9 +155,15 @@ class AppState:
         # Compatibility for tests; production publishes only through save.
         self.settings_service.settings = settings
 
-    def set_plan(self, plan: ChargePlan) -> None:
-        """Record the latest computed plan (called by the daemon each run)."""
+    def set_plan(self, plan: ChargePlan, plan_run: StoredPlanRun | None = None) -> None:
+        """Record the latest computed plan (called by the daemon each run).
+
+        ``plan_run`` is the run the plan came from, kept for view-only readers
+        (#496); plans from no run (synthetic startup or fallback plans, test
+        fakes) store none, which later readers treat as "no timeline".
+        """
         self.plan = plan
+        self.plan_run = plan_run
         self.plan_at = datetime.now(UTC)
 
     def current_options(self) -> dict[str, Any]:
