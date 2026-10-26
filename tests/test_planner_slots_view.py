@@ -39,7 +39,8 @@ def test_slot_view_charge_uses_remaining_window_overlap(now):
     plan = compute_plan(inputs, config, schedule)
     assert plan.required_kwh > 0
     assert plan.view is not None
-    assert plan.view.soc == ()
+    assert plan.view.soc[0].at == now.astimezone(UTC)
+    assert plan.view.soc[0].soc_pct == inputs.soc_now
     assert len(plan.view.slots) == len(inputs.geometry.slot_starts)
     for i, slot in enumerate(plan.view.slots):
         start = inputs.geometry.slot_starts[i]

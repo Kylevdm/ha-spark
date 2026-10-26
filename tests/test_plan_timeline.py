@@ -77,7 +77,14 @@ def test_ingress_timeline_contract_and_household_dst(tmp_path, slots, monkeypatc
         assert timeline["slots"][0]["load_kwh"] == 0.25
     else:
         assert timeline["slots"] is None
-    assert timeline["soc"] == ([] if slots else None)
+    if slots:
+        assert timeline["soc"][0] == {"at": timeline["now"], "soc_pct": 40}
+        assert timeline["soc"] == [
+            {"at": point.at.astimezone(LONDON).isoformat(), "soc_pct": point.soc_pct}
+            for point in record.run.plan.view.soc
+        ]
+    else:
+        assert timeline["soc"] is None
     for kwargs, headers in [({}, {}),
                             ({"require_token": True, "token": "valid"},
                              {"Authorization": "Bearer valid"})]:
@@ -161,7 +168,11 @@ def test_ingress_slots_preserve_remaining_numbers_and_household_offsets(tmp_path
     state.set_plan(plan, record)
     with owner_client(state) as client:
         timeline = client.get("/api/plan").json()["timeline"]
-    assert timeline["soc"] == []
+    assert timeline["soc"][0] == {"at": now.astimezone(LONDON).isoformat(), "soc_pct": 30}
+    assert timeline["soc"] == [
+        {"at": point.at.astimezone(LONDON).isoformat(), "soc_pct": point.soc_pct}
+        for point in plan.view.soc
+    ]
     for i, slot in enumerate(timeline["slots"]):
         source = plan.view.slots[i]
         assert slot == {

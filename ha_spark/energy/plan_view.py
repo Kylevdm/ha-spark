@@ -60,12 +60,18 @@ class PlanSlot:
 
 
 @dataclass(frozen=True)
+class SocPoint:
+    at: datetime
+    soc_pct: float
+
+
+@dataclass(frozen=True)
 class PlanView:
     headline: Headline
     costs: Costs
     lines: tuple[PlanLine, ...]
     slots: tuple[PlanSlot, ...] | None
-    soc: tuple[()] | None
+    soc: tuple[SocPoint, ...] | None
 
 
 # Fixed wording only: SocMeasurement.reason can contain raw upstream state.
@@ -146,6 +152,7 @@ def _slots(
 
 def build_plan_view(
     plan: ChargePlan, cfg: PlannerConfig, inputs: PlannerInputs, schedule: TariffSchedule,
+    soc: tuple[SocPoint, ...] = (),
 ) -> PlanView:
     """Describe the computed numbers without changing the control contract."""
     trusted = plan.soc.ok
@@ -167,5 +174,5 @@ def build_plan_view(
                      _SOC_WARNINGS.get(plan.soc.status, "SoC reading not trusted")),
         ),
         slots=_slots(plan, cfg, inputs, schedule),
-        soc=() if plan.model == "slots" else None,
+        soc=(soc if trusted else ()) if plan.model == "slots" else None,
     )
