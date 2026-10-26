@@ -42,7 +42,8 @@ def test_charge_reservation_and_dispatch_lines():
 @pytest.mark.parametrize("trusted", [True, False])
 def test_ev_hold_and_untrusted_lines(trusted):
     record = stored_run(measurement=_soc(40) if trusted else _soc_unavailable())
-    payload = timeline_payload(replace(record, ev_hold_active=True), "observe")
+    payload = timeline_payload(replace(record, ev_hold_active=True), "observe",
+                               datetime.now(UTC))
     ev = payload["lines"][-1]
     assert ev == {"kind": "hold", "start": payload["now"], "end": None,
                   "kwh": None, "text": "Hold the house battery while an EV hold is active."}

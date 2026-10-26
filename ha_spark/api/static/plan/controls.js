@@ -13,6 +13,7 @@ export function Controls({health, reload}) {
         setMessage("Waiting for the daemon…");
         try {
             const response = await fetch("api/replan", {
+                cache: "no-store",
                 method: "POST",
                 headers: {"Content-Type": "application/json", "X-HA-Spark-Request": "replan"},
                 body: JSON.stringify({})
