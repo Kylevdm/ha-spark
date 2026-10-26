@@ -1,6 +1,7 @@
 import {html, render, useState, useEffect, useRef, useCallback}
     from "./vendor/htm-3.1.1-preact-standalone.module.js";
 import {mountMode} from "./mode.js";
+import {Controls} from "./plan/controls.js";
 
 function screenFromHash() {
     return location.hash === "#/mode" ? "mode" : "plan";
@@ -21,6 +22,7 @@ function fmt(value, digits) {
 function Plan({health}) {
     const [payload, setPayload] = useState(null);
     const [failed, setFailed] = useState(false);
+    const [reloadCount, setReloadCount] = useState(0);
     const repair = health.configuration?.status === "configuration_repair";
     useEffect(() => {
         if (repair || health.daemon !== "running") return;
@@ -39,7 +41,7 @@ function Plan({health}) {
         }
         void load();
         return () => { active = false; };
-    }, [repair, health.daemon, health.plan_at]);
+    }, [repair, health.daemon, health.plan_at, reloadCount]);
     if (repair) {
         return html`<section><h1>Plan</h1><p>Configuration needs repair. Import a valid
             configuration with the CLI: <code>ha-spark config import FILE</code>.</p></section>`;
@@ -54,6 +56,7 @@ function Plan({health}) {
     const {headline, costs} = timeline;
     return html`<section>
         <h1>Plan</h1>
+        <${Controls} health=${health} reload=${() => setReloadCount(reloadCount + 1)}/>
         <p>Computed at <time datetime=${payload.generated_at}>${payload.generated_at}</time></p>
         <p>Model: ${timeline.model} · Strategy: ${timeline.strategy}</p>
         <dl class="plan-headline">

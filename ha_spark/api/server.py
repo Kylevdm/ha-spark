@@ -51,7 +51,7 @@ from ha_spark.api.static_assets import packaged_assets
 from ha_spark.api.timeline import timeline_payload
 from ha_spark.authority import OperatingMode, authority_view, load_authority
 from ha_spark.config import ConfigError, Settings
-from ha_spark.daemon_channel import DaemonChannel
+from ha_spark.daemon_channel import CONFIGURATION_REPAIR, DaemonChannel
 from ha_spark.energy import v2l
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.plan_run import StoredPlanRun
@@ -448,6 +448,42 @@ def build_app(
                     status_code=status,
                 )
             return JSONResponse(reply.authority or {})
+
+        @app.post("/api/replan")
+        async def post_replan(request: Request) -> JSONResponse:
+            """Ask the daemon for a fresh plan: the CLI `run` path, gated alike."""
+            user = request.headers.get("X-Remote-User-Id", "")
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user) is None:
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            if request.headers.get("X-HA-Spark-Request") != "replan":
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                return JSONResponse({"error": "application/json required"}, status_code=415)
+            st = _state_of(request)
+            if st.executor is None:
+                return JSONResponse({"error": "no daemon executor"}, status_code=503)
+            try:
+                # The channel logs the request under the validated user id only.
+                reply = await asyncio.wait_for(
+                    st.executor.submit("replan", ingress_user=user),
+                    timeout=_MODE_REPLY_TIMEOUT_S,
+                )
+            except TimeoutError:
+                return JSONResponse(
+                    {"error": "pending", "detail": "request queued; reload the plan"},
+                    status_code=504,
+                )
+            if reply.error:
+                if reply.error in ("daemon stopped", "daemon request queue full",
+                                   CONFIGURATION_REPAIR):
+                    return JSONResponse({"error": reply.error}, status_code=503)
+                # Fixed text only: never the reply's own wording or reasons.
+                return JSONResponse({"error": "replan failed"}, status_code=500)
+            return JSONResponse({
+                "generated_at": _iso(st.plan_at),
+                "lines": [line.text for line in reply.lines],
+            })
 
         @app.get("/api/config")
         async def get_config(request: Request) -> dict[str, Any]:
