@@ -40,6 +40,32 @@ dialog { max-width: min(36rem, 95vw); background: var(--surface); color: var(--t
 .plan-headline dd, .plan-costs dd { margin: .5rem 0 0; overflow-wrap: anywhere; }
 .plan-costs dd { font-size: 1.4rem; }
 .plan-warnings { padding-inline-start: 1.5rem; }
+.chart-scroll { overflow-x: auto; border: 1px solid var(--border); background: var(--surface); }
+.chart-scroll svg { display: block; font: 12px system-ui, sans-serif; }
+.slot-grid, .lane-rule { stroke: var(--border); stroke-width: 1; }
+.lane-label, .axis-label { fill: var(--muted); }
+.axis-label { font-size: 10px; }
+.series { fill: none; stroke-width: 2; }
+.series-key { font-weight: bold; }
+.series.solar_raw_kwh { stroke: #ca8a04; stroke-dasharray: 5 3; }
+.series-key.solar_raw_kwh { fill: #ca8a04; }
+.series.solar_kwh { stroke: #e0a92e; stroke-dasharray: 1 3; stroke-linecap: round; }
+.series-key.solar_kwh { fill: #e0a92e; }
+.series.load_kwh, .series.import_price { stroke: var(--accent); }
+.series-key.load_kwh, .series-key.import_price { fill: var(--accent); }
+.series.export_price { stroke: #a879df; }
+.series-key.export_price { fill: #a879df; }
+.action { fill: var(--accent); }
+.action.hold { fill: #ca8a04; }
+.action.export { fill: #a879df; }
+.action.skip { fill: var(--muted); }
+.action.v2l { fill: #398ecb; }
+.now-marker { stroke: var(--text); stroke-width: 2; stroke-dasharray: 3 3; }
+.now-label { fill: var(--text); }
+.slot-hit { fill: transparent; cursor: pointer; }
+.slot-hit:hover, .slot-hit.selected, .slot-hit:focus-visible { fill: var(--accent); fill-opacity: .12; }
+.slot-details dl { display: flex; flex-wrap: wrap; gap: 1rem; }
+.slot-details dd { margin: .3rem 0; }
 @media (max-width: 40rem) {
     nav { width: 5rem; padding: .5rem; }
     nav strong { font-size: .8rem; }

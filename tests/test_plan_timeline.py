@@ -17,6 +17,7 @@ from ha_spark.energy.tariff import fixed_schedule
 from tests.api_helpers import owner_client
 from tests.test_api import _soc, _state
 from tests.test_planner import cfg
+from tests.test_planner_slots_view import LONDON, slot_inputs
 
 
 def stored_run(*, slots=True, measurement=None):
@@ -69,7 +70,13 @@ def test_ingress_timeline_contract_and_household_dst(tmp_path, slots, monkeypatc
     assert timeline["slot_minutes"] == 30
     assert timeline["horizon_start"] == "2026-10-25T01:30:00+01:00"
     assert timeline["now"] == "2026-10-25T01:10:00+00:00"
-    assert timeline["slots"] == ([] if slots else None)
+    if slots:
+        assert len(timeline["slots"]) == 48
+        assert timeline["slots"][0]["start"] == "2026-10-25T01:30:00+01:00"
+        assert timeline["slots"][1]["start"] == "2026-10-25T01:00:00+00:00"
+        assert timeline["slots"][0]["load_kwh"] == 0.25
+    else:
+        assert timeline["slots"] is None
     assert timeline["soc"] == ([] if slots else None)
     for kwargs, headers in [({}, {}),
                             ({"require_token": True, "token": "valid"},
@@ -119,7 +126,11 @@ def test_ingress_timeline_untrusted_soc(tmp_path, slots):
         "kind": "warning", "start": None, "end": None, "kwh": None,
         "text": "SoC read from Home Assistant failed",
     }]
-    assert timeline["slots"] == ([] if slots else None)
+    if slots:
+        assert len(timeline["slots"]) == 48
+        assert all(slot["actions"] == [] for slot in timeline["slots"])
+    else:
+        assert timeline["slots"] is None
     assert timeline["soc"] == ([] if slots else None)
 
 
@@ -132,3 +143,35 @@ def test_ingress_timeline_uses_daemon_authority_mode(tmp_path):
     with owner_client(state) as client:
         timeline = client.get("/api/plan").json()["timeline"]
     assert timeline["operating_mode"] == "protect"
+
+
+@pytest.mark.parametrize("now", [
+    datetime(2026, 3, 29, 0, 17, tzinfo=UTC),
+    datetime(2026, 10, 25, 0, 17, tzinfo=UTC),
+])
+def test_ingress_slots_preserve_remaining_numbers_and_household_offsets(tmp_path, now):
+    config = cfg(solar_haircut_k=0.5)
+    inputs = slot_inputs(now, config)
+    schedule = fixed_schedule(inputs, config)
+    plan = compute_plan(inputs, config, schedule)
+    record = StoredPlanRun(PlanRun(
+        plan, inputs, config, schedule, "test", LoadForecast(12, None, "test"), LONDON,
+    ), False)
+    state = _state(tmp_path)
+    state.set_plan(plan, record)
+    with owner_client(state) as client:
+        timeline = client.get("/api/plan").json()["timeline"]
+    assert timeline["soc"] == []
+    for i, slot in enumerate(timeline["slots"]):
+        source = plan.view.slots[i]
+        assert slot == {
+            "start": source.start.astimezone(LONDON).isoformat(),
+            "import_price": schedule.prices[i], "export_price": schedule.export_rate,
+            "cheap_frac": schedule.cheap_fracs[i],
+            "load_kwh": pytest.approx(0.6 * (13 / 30 if i == 0 else 1)),
+            "solar_kwh": pytest.approx(0.1 * (13 / 30 if i == 0 else 1)),
+            "solar_raw_kwh": pytest.approx(0.2 * (13 / 30 if i == 0 else 1)),
+            "actions": list(source.actions),
+        }
+    assert timeline["slots"][0]["actions"] == ["charge"]
+    assert timeline["slots"][0]["start"][-6:] != timeline["slots"][6]["start"][-6:]
