@@ -139,3 +139,17 @@ def test_dispatch_line_clips_now_and_survives_untrusted_soc(trusted):
     assert hold.end == now.replace(hour=13, minute=0)
     if not trusted:
         assert {line.kind for line in plan.view.lines} == {"hold", "warning"}
+
+
+def test_elapsed_reservation_has_no_line():
+    from tests.test_planner import _pre_window_inputs
+
+    config = cfg(capacity_kwh=20)
+    inputs = replace(_pre_window_inputs(datetime(2026, 1, 6, 1, 0, tzinfo=UTC), 80, config),
+                     pre_window_drain_kwh=1.0)
+    plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
+    assert any(r.name == "reach-charge-window" for r in plan.reservations)
+    lines = [line for line in plan.view.lines if line.kind == "reserve"]
+    assert all(line.start is None or line.start < line.end for line in lines)
+    assert not any(line.end is not None and line.end <= inputs.now.astimezone(UTC)
+                   for line in lines)

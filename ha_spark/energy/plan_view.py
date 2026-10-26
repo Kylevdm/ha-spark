@@ -213,6 +213,8 @@ def _lines(plan: ChargePlan, cfg: PlannerConfig, inputs: PlannerInputs) -> tuple
             if target is None and absolute and geometry is not None:
                 if 0 <= reservation.target_slot < len(geometry.slot_starts):
                     target = instant(geometry.slot_starts[reservation.target_slot])
+            if target is not None and now is not None and target <= now:
+                continue  # its obligation has already fallen due
             rows.append((PlanLine("reserve", now if target is not None else None, target,
                                   reservation.reason, reservation.energy_kwh), ""))
         export = plan.charge_intent.export
