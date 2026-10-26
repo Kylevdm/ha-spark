@@ -53,6 +53,7 @@ from ha_spark.authority import OperatingMode, authority_view, load_authority
 from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import DaemonChannel
 from ha_spark.energy import v2l
+from ha_spark.energy.carbon import carbon_payload
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.plan_run import StoredPlanRun
 from ha_spark.energy.publish import plan_to_payload
@@ -397,6 +398,13 @@ def build_app(
         register_asset("/", "index.html", assets["index.html"])
         for name, content in assets.items():
             register_asset(f"/static/{name}", name, content)
+
+        @app.get("/api/carbon")
+        async def get_carbon(request: Request) -> JSONResponse:
+            settings = _state_of(request).settings
+            return JSONResponse(await carbon_payload(
+                settings.db_path, settings.carbon_region, datetime.now(UTC),
+            ), headers={"Cache-Control": "no-store"})
 
         @app.get("/api/mode")
         async def get_mode(request: Request) -> JSONResponse:

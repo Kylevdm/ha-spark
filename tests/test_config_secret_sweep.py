@@ -69,7 +69,8 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
             assert plan_response.status_code == 200
             assert plan_response.json()["timeline"] is not None
             surfaces.append(plan_response.text)
-            for path in ["/", "/api/health", *(f"/static/{name}" for name in packaged_assets())]:
+            for path in ["/", "/api/health", "/api/carbon",
+                         *(f"/static/{name}" for name in packaged_assets())]:
                 response = client.get(path)
                 assert response.status_code == 200
                 surfaces.append(response.text)
@@ -80,6 +81,7 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
                 })
                 assert response.status_code == (200 if region in (1, None) else 400)
                 surfaces.append(response.text)
+                surfaces.append(client.get("/api/carbon").text)
             surfaces.extend([client.get("/api/config").text, service.export()])
             for response in (
                 client.get("/api/config"),
