@@ -67,7 +67,12 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
             state.set_plan(record.run.plan, record)
             plan_response = client.get("/api/plan")
             assert plan_response.status_code == 200
-            assert plan_response.json()["timeline"] is not None
+            timeline = plan_response.json()["timeline"]
+            assert timeline is not None
+            assert len(timeline["slots"]) == 48
+            assert timeline["slots"][0]["load_kwh"] == 0.25
+            # Include the newly populated slots and every new chart asset in
+            # the same response/log canary sweep as the configuration surfaces.
             surfaces.append(plan_response.text)
             for path in ["/", "/api/health", *(f"/static/{name}" for name in packaged_assets())]:
                 response = client.get(path)

@@ -1,6 +1,7 @@
 import {html, render, useState, useEffect, useRef, useCallback}
     from "./vendor/htm-3.1.1-preact-standalone.module.js";
 import {mountMode} from "./mode.js";
+import {PlanParts} from "./plan/registry.js";
 
 function screenFromHash() {
     return location.hash === "#/mode" ? "mode" : "plan";
@@ -69,8 +70,7 @@ function Plan({health}) {
             ${costs.export_revenue != null && costs.export_revenue !== 0 ? html`
                 <div><dt>Export revenue</dt><dd>£ ${fmt(costs.export_revenue, 2)}</dd></div>` : null}
         </dl>
-        <ul class="plan-warnings">${timeline.lines.map(line => html`
-            <li>${line.text}</li>`)}</ul>
+        <${PlanParts} health=${health} timeline=${timeline}/>
     </section>`;
 }
 

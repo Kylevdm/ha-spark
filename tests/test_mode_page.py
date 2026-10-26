@@ -22,6 +22,8 @@ ASSET_PATHS = [
     "/", "/static/index.html", "/static/app.js", "/static/mode.js", "/static/app.css",
     "/static/vendor/htm-3.1.1-preact-standalone.module.js",
     "/static/VENDOR.txt", "/static/MANIFEST.sha256",
+    "/static/plan/axis.js", "/static/plan/lanes.js", "/static/plan/soc.js",
+    "/static/plan/today.js", "/static/plan/lines.js", "/static/plan/registry.js",
 ]
 
 
