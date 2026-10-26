@@ -10,26 +10,148 @@ import pytest
 
 from ha_spark import daemon_channel
 from ha_spark.config import Settings
-from ha_spark.daemon_channel import DaemonChannel, Reply, Request, submit_socket
+from ha_spark.daemon_channel import DaemonChannel, Pending, Reply, Request, submit_socket
 
 
 def settings_at(path: Path) -> Settings:
     return Settings(ha_url="http://ha.test", ha_token="secret", db_path=str(path / "t.db"))
 
 
-async def test_settings_replan_is_best_effort_normal_queued_work(tmp_path: Path) -> None:
-    channel = DaemonChannel(settings_at(tmp_path))
-    channel.request_replan()
-    assert channel.next_request() is None
-    async with channel:
+async def test_settings_replan_is_best_effort_normal_queued_work(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("INFO"):
+        channel = DaemonChannel(settings_at(tmp_path))
         channel.request_replan()
+        assert channel.next_request() is None
+        async with channel:
+            channel.request_replan()
+            pending = channel.next_request()
+            assert pending is not None
+            assert pending.request == Request(op="replan")
+            assert "requester=settings" in caplog.text
+            pending.future.set_result(Reply())
+            for _ in range(channel.queue.maxsize + 1):
+                channel.request_replan()
+            # Close-together replans join the queued one instead of filling the queue.
+            assert channel.queue.qsize() == 1
+            joined = channel.next_request()
+            assert joined is not None and joined.request == Request(op="replan")
+            joined.future.set_result(Reply())
+            assert channel.next_request() is None
+
+
+async def test_replan_burst_combines_into_one_run_and_shared_reply(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("INFO"):
+        async with DaemonChannel(settings_at(tmp_path)) as channel:
+            callers = [asyncio.create_task(channel.submit("replan", ingress_user=user))
+                       for user in ("owner-a", "owner-b", "owner-c")]
+            await asyncio.sleep(0)
+            assert channel.queue.qsize() == 1
+            pending = channel.next_request()
+            assert pending is not None and pending.request == Request(op="replan")
+            pending.future.set_result(Reply(text="replanned"))
+            replies = await asyncio.gather(*callers)
+    assert [reply.text for reply in replies] == ["replanned"] * 3
+    assert caplog.text.count("Replan requested") == 3
+    for user in ("owner-a", "owner-b", "owner-c"):
+        assert f"requester={user}" in caplog.text
+
+
+async def test_timed_out_replan_caller_neither_cancels_work_nor_other_replies(
+    tmp_path: Path,
+) -> None:
+    async with DaemonChannel(settings_at(tmp_path)) as channel:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                channel.submit("replan", ingress_user="owner-a"), timeout=0.01
+            )
+        later = asyncio.create_task(channel.submit("replan", ingress_user="owner-b"))
+        await asyncio.sleep(0)
+        # The still-queued replan was not cancelled by the first caller's timeout.
+        assert channel.queue.qsize() == 1
         pending = channel.next_request()
         assert pending is not None
-        assert pending.request == Request(op="replan")
-        pending.future.set_result(Reply())
-        for _ in range(channel.queue.maxsize + 1):
-            channel.request_replan()
-        assert channel.queue.qsize() == channel.queue.maxsize
+        pending.future.set_result(Reply(text="shared"))
+        assert (await later).text == "shared"
+
+
+async def test_replan_shutdown_resolves_every_waiter(tmp_path: Path) -> None:
+    channel = DaemonChannel(settings_at(tmp_path))
+    async with channel:
+        channel.request_replan()  # settings-triggered: nobody awaits its future
+        settings_work = channel._pending_replan
+        assert settings_work is not None
+        waiters = [asyncio.create_task(channel.submit("replan", ingress_user=f"user-{i}"))
+                   for i in range(3)]
+        await asyncio.sleep(0)
+        assert channel.queue.qsize() == 1
+    replies = await asyncio.gather(*waiters)
+    assert [reply.error for reply in replies] == ["daemon stopped"] * 3
+    assert settings_work.future.result().error == "daemon stopped"
+    assert channel._pending_replan is None
+
+
+async def test_full_queue_neither_joins_nor_points_at_unqueued_replan(tmp_path: Path) -> None:
+    async with DaemonChannel(settings_at(tmp_path)) as channel:
+        loop = asyncio.get_running_loop()
+        for _ in range(channel.queue.maxsize):
+            channel.queue.put_nowait(Pending(Request(op="apply"), loop.create_future()))
+        channel.request_replan()
+        assert channel._pending_replan is None
+        assert (await channel.submit("replan")).error == "daemon request queue full"
+        assert channel._pending_replan is None
+        while channel.next_request() is not None:
+            pass
+        later = asyncio.create_task(channel.submit("replan"))
+        await asyncio.sleep(0)
+        pending = channel.next_request()
+        assert pending is not None and pending.request == Request(op="replan")
+        pending.future.set_result(Reply(text="ran"))
+        assert (await later).text == "ran"
+
+
+async def test_settings_replan_is_refused_in_repair(tmp_path: Path) -> None:
+    async with DaemonChannel(settings_at(tmp_path)) as channel:
+        channel.settings_service = type("Repairing", (), {"repair": ["broken"]})()
+        channel.request_replan()
+        assert channel.next_request() is None
+        assert channel._pending_replan is None
+
+
+async def test_replan_after_work_started_creates_new_work(tmp_path: Path) -> None:
+    async with DaemonChannel(settings_at(tmp_path)) as channel:
+        first = asyncio.create_task(channel.submit("replan", ingress_user="owner-a"))
+        await asyncio.sleep(0)
+        taken = channel.next_request()
+        assert taken is not None
+        later = asyncio.create_task(channel.submit("replan", ingress_user="owner-b"))
+        await asyncio.sleep(0)
+        assert channel.queue.qsize() == 1
+        fresh = channel.next_request()
+        assert fresh is not None and fresh is not taken
+        taken.future.set_result(Reply(text="first"))
+        fresh.future.set_result(Reply(text="second"))
+        assert (await first).text == "first"
+        assert (await later).text == "second"
+
+
+async def test_mode_request_keeps_priority_over_combined_replans(tmp_path: Path) -> None:
+    async with DaemonChannel(settings_at(tmp_path)) as channel:
+        replans = [asyncio.create_task(channel.submit("replan", ingress_user=f"user-{i}"))
+                   for i in range(3)]
+        mode = asyncio.create_task(channel.submit_mode("observe", 4))
+        await asyncio.sleep(0)
+        assert channel.queue.qsize() == 1
+        first = channel.next_request()
+        assert first is not None and first.request.op == "mode"
+        combined = channel.next_request()
+        assert combined is not None and combined.request.op == "replan"
+        first.future.set_result(Reply())
+        combined.future.set_result(Reply())
+        await asyncio.gather(mode, *replans)
 
 
 async def test_private_socket_and_exclusive_daemon(tmp_path: Path) -> None:

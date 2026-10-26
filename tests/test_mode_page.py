@@ -20,6 +20,7 @@ from tests.test_owner_mode import settings_at
 
 ASSET_PATHS = [
     "/", "/static/index.html", "/static/app.js", "/static/mode.js", "/static/app.css",
+    "/static/plan/controls.js",
     "/static/vendor/htm-3.1.1-preact-standalone.module.js",
     "/static/VENDOR.txt", "/static/MANIFEST.sha256",
     "/static/plan/axis.js", "/static/plan/lanes.js", "/static/plan/soc.js",

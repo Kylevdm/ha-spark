@@ -47,6 +47,10 @@ dialog { max-width: min(36rem, 95vw); background: var(--surface); color: var(--t
 .axis-label { font-size: 10px; }
 .series { fill: none; stroke-width: 2; }
 .series-key { font-weight: bold; }
+.soc-forecast { stroke: var(--accent); }
+.soc-point { fill: var(--accent); }
+.soc-min { stroke: var(--muted); stroke-dasharray: 3 3; }
+.soc-target { stroke: var(--accent); stroke-dasharray: 6 3; }
 .series.solar_raw_kwh { stroke: #ca8a04; stroke-dasharray: 5 3; }
 .series-key.solar_raw_kwh { fill: #ca8a04; }
 .series.solar_kwh { stroke: #e0a92e; stroke-dasharray: 1 3; stroke-linecap: round; }

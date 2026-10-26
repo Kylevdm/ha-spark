@@ -4,6 +4,8 @@ The owner-only socket authenticates CLI mode requests by kernel peer uid and
 0600 permissions. Socket callers cannot claim an ingress identity. Only the daemon
 loop persists grants or runs device work; ordinary work requests add no permission.
 Config requests call the shared settings service inline and never enter the work queue.
+Replan requests that arrive while one is queued and not yet started join it: every
+caller shares one run and one reply (CONTEXT.md "Replan request").
 In configuration repair only ``config_show``, ``config_import`` and a read-only
 ``authority_status`` and ``integration_link`` answer; everything else is refused
 with ``configuration_repair``.
@@ -17,7 +19,7 @@ import os
 import socket
 import struct
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -33,7 +35,10 @@ from ha_spark.authority import (
 )
 from ha_spark.config import _SECRET_OPTION_KEYS, ConfigError, Settings
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome
+from ha_spark.logging import get_logger
 from ha_spark.settings_service import RepairTokenConflict, RevisionConflict, SettingsService
+
+log = get_logger(__name__)
 
 MAX_CONFIG_BYTES = 256 * 1024
 Op = Literal[
@@ -123,6 +128,9 @@ class Pending:
     request: Request
     future: asyncio.Future[Reply]
     ingress_user: str | None = None
+    # Requesters that joined a queued, not-yet-started replan; each is logged
+    # under its own id, and the shared reply serves them all.
+    joined_users: list[str | None] = field(default_factory=list)
 
 
 class DaemonChannel:
@@ -137,6 +145,9 @@ class DaemonChannel:
         self._fd: int | None = None
         self._server: asyncio.AbstractServer | None = None
         self._handlers: set[asyncio.Task[None]] = set()
+        # A queued replan that has not been handed to the daemon yet; later
+        # replans join it instead of creating new work.
+        self._pending_replan: Pending | None = None
 
     async def __aenter__(self) -> DaemonChannel:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,6 +188,7 @@ class DaemonChannel:
                 pending = queue.get_nowait()
                 if not pending.future.done():
                     pending.future.set_result(Reply(error="daemon stopped"))
+        self._pending_replan = None
         if self._fd is not None:
             self.path.unlink(missing_ok=True)
             os.close(self._fd)
@@ -217,21 +229,41 @@ class DaemonChannel:
         """The next request for this tick: an owner mode request before any work."""
         for queue in (self.mode_queue, self.queue):
             if not queue.empty():
-                return queue.get_nowait()
+                pending = queue.get_nowait()
+                if pending is self._pending_replan:
+                    # The replan work started; later requests create new work.
+                    self._pending_replan = None
+                return pending
         return None
+
+    def _log_replan(self, requester: str) -> None:
+        # Only a channel identity is logged: the route validates the user id
+        # before submitting, and socket callers cannot claim one.
+        log.info("Replan requested requester=%s", requester)
+
+    def _join_pending_replan(self, ingress_user: str | None, requester: str) -> None:
+        assert self._pending_replan is not None
+        self._pending_replan.joined_users.append(ingress_user)
+        self._log_replan(requester)
 
     def request_replan(self) -> None:
         """Best-effort settings notification; ordinary queued work grants no authority."""
-        if self._server is None or not self._server.is_serving():
+        if self._server is None or not self._server.is_serving() or self._repairing():
+            return
+        if self._pending_replan is not None:
+            self._join_pending_replan(None, "settings")
             return
         future: asyncio.Future[Reply] = asyncio.get_running_loop().create_future()
+        pending = Pending(Request(op="replan"), future)
         try:
-            self.queue.put_nowait(Pending(Request(op="replan"), future))
+            self.queue.put_nowait(pending)
         except asyncio.QueueFull:
-            pass
+            return
+        self._pending_replan = pending
+        self._log_replan("settings")
 
-    async def submit(self, op: Op) -> Reply:
-        return await self._submit(Request(op=op))
+    async def submit(self, op: Op, *, ingress_user: str | None = None) -> Reply:
+        return await self._submit(Request(op=op), ingress_user)
 
     async def _submit(self, request: Request, ingress_user: str | None = None) -> Reply:
         if request.op == "authority_status":
@@ -274,11 +306,20 @@ class DaemonChannel:
             except ConfigError as exc:
                 return Reply(error="invalid configuration", reasons=[str(exc)])
         future = asyncio.get_running_loop().create_future()
+        if request.op == "replan" and self._pending_replan is not None:
+            # Close-together replans join the queued one: one run, one shared reply.
+            shared = self._pending_replan
+            self._join_pending_replan(ingress_user, ingress_user or "cli")
+            return await asyncio.shield(shared.future)
+        pending = Pending(request, future, ingress_user)
         try:
             queue = self.mode_queue if request.op == "mode" else self.queue
-            queue.put_nowait(Pending(request, future, ingress_user))
+            queue.put_nowait(pending)
         except asyncio.QueueFull:
             return Reply(error="daemon request queue full")
+        if request.op == "replan":
+            self._pending_replan = pending
+            self._log_replan(ingress_user or "cli")
         # Disconnecting a caller must not cancel an in-flight device sequence.
         return await asyncio.shield(future)
 

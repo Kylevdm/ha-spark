@@ -27,23 +27,25 @@ export function Axis({timeline}) {
     return html`<section aria-label="Plan timeline">
         <p>Household clock · select a half-hour for its numbers</p>
         <div class="chart-scroll" tabindex="0" aria-label="Scrollable plan chart">
-            <svg viewBox=${`0 0 ${width} 530`} width=${width} height="530"
+            <svg viewBox=${`0 0 ${width} 630`} width=${width} height="630"
                  role="group" aria-label="Half-hour plan forecast">
                 ${slots.map((slot, i) => html`<g key=${slot.start}>
-                    <line class="slot-grid" x1=${x(slot.start)} x2=${x(slot.start)} y1="35" y2="475"/>
-                    ${i % 6 === 0 ? html`<text class="axis-label" x=${x(slot.start)} y="495">
+                    <line class="slot-grid" x1=${x(slot.start)} x2=${x(slot.start)} y1="35" y2="575"/>
+                    ${i % 6 === 0 ? html`<text class="axis-label" x=${x(slot.start)} y="595">
                         <tspan x=${x(slot.start)}>${slot.start.slice(11, 16)} ${slot.start.slice(19)}</tspan>
                         <tspan x=${x(slot.start)} dy="16">${slot.start.slice(0, 10)}</tspan>
                     </text>` : null}
                 </g>`)}
                 <${SocLane} timeline=${timeline} x=${x} left=${left} right=${right}/>
-                <${ActionLanes} timeline=${timeline} x=${x} slotWidth=${slotWidth}
-                    left=${left} right=${right}/>
-                <line class="now-marker" x1=${x(timeline.now)} x2=${x(timeline.now)} y1="24" y2="475"/>
+                <g transform="translate(0 100)">
+                    <${ActionLanes} timeline=${timeline} x=${x} slotWidth=${slotWidth}
+                        left=${left} right=${right}/>
+                </g>
+                <line class="now-marker" x1=${x(timeline.now)} x2=${x(timeline.now)} y1="24" y2="575"/>
                 <text class="now-label" x=${x(timeline.now)} y="18">now</text>
                 ${slots.map((slot, i) => html`<rect key=${slot.start}
                     class=${selected === i ? "slot-hit selected" : "slot-hit"}
-                    x=${x(slot.start)} y="35" width=${slotWidth} height="440"
+                    x=${x(slot.start)} y="35" width=${slotWidth} height="540"
                     tabindex="0" role="button" aria-label=${clock(slot.start)}
                     aria-pressed=${selected === i}
                     onClick=${() => setSelected(i)}
