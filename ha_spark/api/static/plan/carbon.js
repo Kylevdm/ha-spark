@@ -70,7 +70,7 @@ export function CarbonStrip({health, timeline}) {
         }
         void load();
         return () => { active = false; };
-    }, [available, config?.settings.carbon_region, timeline?.now]);
+    }, [available, config?.settings.carbon_region, config?.revision, timeline?.now]);
     async function save() {
         if (!config || busy || conflict || !available) return;
         setBusy(true);

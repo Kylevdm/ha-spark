@@ -45,7 +45,9 @@ async def test_carbon_strip_payload(tmp_path, monkeypatch):
     assert payload["region"] == region
     assert payload["fetched_at"] == NOW.isoformat()
     assert payload["ends_at"] == rows[-1][1].isoformat()
-    assert "CC BY 4.0" in payload["attribution"]
+    assert payload["attribution"] == (
+        "Carbon intensity data: NESO Carbon Intensity API, CC BY 4.0"
+    )
     assert payload["rows"] == [
         {"start": rows[0][0].isoformat(), "end": rows[0][1].isoformat(),
          "gco2": 50.0, "index": "very low", "estimated": True},

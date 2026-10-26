@@ -6,6 +6,11 @@
     --muted: #4a5664;
     --accent: #096b60;
     --border: #ccd3da;
+    --carbon-very-low: #22c55e;
+    --carbon-low: #84cc16;
+    --carbon-moderate: #eab308;
+    --carbon-high: #f97316;
+    --carbon-very-high: #ef4444;
 }
 @media (prefers-color-scheme: dark) {
     :root {
@@ -15,6 +20,11 @@
         --muted: #bdc8d2;
         --accent: #7cddce;
         --border: #4a5664;
+        --carbon-very-low: #16a34a;
+        --carbon-low: #65a30d;
+        --carbon-moderate: #ca8a04;
+        --carbon-high: #ea580c;
+        --carbon-very-high: #dc2626;
     }
 }
 * { box-sizing: border-box; }
@@ -70,18 +80,18 @@ dialog { max-width: min(36rem, 95vw); background: var(--surface); color: var(--t
 .slot-hit:hover, .slot-hit.selected, .slot-hit:focus-visible { fill: var(--accent); fill-opacity: .12; }
 .slot-details dl { display: flex; flex-wrap: wrap; gap: 1rem; }
 .slot-details dd { margin: .3rem 0; }
-.carbon-cell { stroke: var(--border); stroke-width: 1; }
+.carbon-very-low { --band: var(--carbon-very-low); }
+.carbon-low { --band: var(--carbon-low); }
+.carbon-moderate { --band: var(--carbon-moderate); }
+.carbon-high { --band: var(--carbon-high); }
+.carbon-very-high { --band: var(--carbon-very-high); }
+.carbon-cell { fill: var(--band); stroke: var(--border); stroke-width: 1; }
 .carbon-estimated { fill-opacity: .4; }
-.carbon-very-low { fill: #22c55e; background-color: #22c55e; }
-.carbon-low { fill: #84cc16; background-color: #84cc16; }
-.carbon-moderate { fill: #eab308; background-color: #eab308; }
-.carbon-high { fill: #f97316; background-color: #f97316; }
-.carbon-very-high { fill: #ef4444; background-color: #ef4444; }
 .carbon-end { stroke: var(--text); stroke-width: 2; stroke-dasharray: 3 3; }
 .carbon-end-label { fill: var(--muted); font-size: 10px; }
 .carbon-legend { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; margin-top: .5rem; }
 .carbon-swatch { display: inline-flex; align-items: center; gap: .3rem; font-size: .9rem; }
-.carbon-swatch::before { content: ""; display: inline-block; width: 1rem; height: 1rem; border: 1px solid var(--border); }
+.carbon-swatch::before { content: ""; display: inline-block; width: 1rem; height: 1rem; border: 1px solid var(--border); background-color: var(--band); }
 .carbon-attribution { font-size: .85rem; color: var(--muted); }
 @media (max-width: 40rem) {
     nav { width: 5rem; padding: .5rem; }
