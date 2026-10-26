@@ -130,7 +130,7 @@ from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
-from ha_spark.energy.plan_run import StoredPlanRun, current_plan
+from ha_spark.energy.plan_run import PlanRun, StoredPlanRun, current_plan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.energy.readiness import readiness_tick
 from ha_spark.energy.readiness_ledger import PlanRevision, record_guard, record_slot, slot_start
@@ -138,6 +138,7 @@ from ha_spark.energy.readiness_measurements import record_closed_days
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor, SocMonitorSnapshot, observe_soc
+from ha_spark.energy.solar_forecasts import SolarForecastStore
 from ha_spark.energy.sources import (
     ev_hold_status_from_read,
     parse_time,
@@ -333,6 +334,39 @@ async def _record_forecast(
         log.exception("Recording forecast failed")
 
 
+async def _record_solar_forecasts(settings: Settings, run: PlanRun) -> None:
+    """Record the raw solar forecast this plan was issued with, best-effort.
+
+    One row per slot that actually carried a forecast (#496 provenance): a
+    missing reading or an uncovered date is not stored, so it later reads as
+    null, never as zero. ``issued_at`` is the planning input snapshot's time —
+    the forecast the plan was using before each slot began — never the
+    post-apply write time. View-only: it never feeds the planner, a baseline
+    or a write, and a failure logs and leaves the run alone.
+    """
+    solar = getattr(run.inputs, "solar_slots", None)
+    known = getattr(run.inputs, "solar_slots_known", None)
+    geometry = getattr(run.inputs, "geometry", None)
+    issued_at = getattr(run.inputs, "now", None)
+    if (
+        solar is None or known is None or geometry is None or issued_at is None
+        or len(solar) != len(known) or len(geometry.slot_starts) != len(solar)
+    ):
+        return
+    slots = [
+        (start, kwh)
+        for start, kwh, exists in zip(geometry.slot_starts, solar, known, strict=True)
+        if exists
+    ]
+    if not slots:
+        return
+    try:
+        async with SolarForecastStore(settings.db_path) as store:
+            await store.record(issued_at.astimezone(UTC), slots)
+    except Exception:
+        log.exception("Recording solar forecast failed")
+
+
 async def run_once(
     settings: Settings,
     *,
@@ -445,6 +479,7 @@ async def run_once(
             except Exception:  # noqa: BLE001 - a request never breaks a plan run
                 log.warning("V2L top-up request failed", exc_info=True)
     await _record_forecast(settings, plan, run.forecast, getattr(run.inputs, "geometry", None))
+    await _record_solar_forecasts(settings, run)
     await _run_derived_rerive(settings)
     return RunResult(
         plan, applied_plan, tuple(apply_lines),

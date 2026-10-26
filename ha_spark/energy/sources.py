@@ -231,6 +231,22 @@ def _solar_slots(
     return tuple(values)
 
 
+def _solar_slots_known(
+    readings: dict[date, _SolarDayReading | None],
+    slot_starts: tuple[datetime, ...],
+    tz: ZoneInfo,
+) -> tuple[bool, ...]:
+    """Which slots actually carried a forecast — the mirror of :func:`_solar_slots`.
+
+    Provenance only, never planner input: a slot whose date has a valid reading
+    is known even at a genuine 0.0 kWh, while a missing reading, or a date the
+    solar entities don't cover, reads as missing — the planner still lays both
+    onto zero in ``solar_slots`` (#496).
+    """
+    covered = {day for day, reading in readings.items() if reading is not None}
+    return tuple(start.astimezone(tz).date() in covered for start in slot_starts)
+
+
 def pre_window_drain(
     forecast: LoadForecast, now: datetime, window_start: time, window_end: time
 ) -> float:
@@ -719,6 +735,7 @@ async def gather_inputs(
 
     load_slots: tuple[float, ...] | None = None
     solar_slots: tuple[float, ...] | None = None
+    solar_slots_known: tuple[bool, ...] | None = None
     horizon_start: datetime | None = None
     if forecast.slots is not None:
         horizon_start = geometry.horizon_start
@@ -728,6 +745,7 @@ async def gather_inputs(
             for local in (start.astimezone(tz),)
         )
         solar_slots = _solar_slots(readings, geometry.slot_starts, tz)
+        solar_slots_known = _solar_slots_known(readings, geometry.slot_starts, tz)
     else:
         drain = pre_window_drain(forecast, now, window_start, window_end)
 
@@ -745,6 +763,7 @@ async def gather_inputs(
         ha_template_needed=_opt_float(ha_needed.state) if ha_needed else None,
         load_slots=load_slots,
         solar_slots=solar_slots,
+        solar_slots_known=solar_slots_known,
         horizon_start=horizon_start,
         geometry=geometry if load_slots is not None else None,
         now=now,
