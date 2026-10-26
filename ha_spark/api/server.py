@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +47,7 @@ from ha_spark.api.contract import (
     plan_summary,
     version_refusal,
 )
+from ha_spark.api.history import bucket_starts, history_payload
 from ha_spark.api.static_assets import packaged_assets
 from ha_spark.api.timeline import timeline_payload
 from ha_spark.authority import OperatingMode, authority_view, load_authority
@@ -54,9 +55,11 @@ from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import CONFIGURATION_REPAIR, DaemonChannel
 from ha_spark.energy import v2l
 from ha_spark.energy.carbon import carbon_payload
+from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.plan_run import StoredPlanRun
 from ha_spark.energy.publish import plan_to_payload
+from ha_spark.energy.solar_forecasts import recorded_solar
 from ha_spark.integration_discovery import IntegrationDiscovery
 from ha_spark.logging import get_logger
 from ha_spark.mode_preconditions import entry_preconditions
@@ -573,6 +576,53 @@ def build_app(
                 log.warning("Config import failed: %s", type(exc).__name__)
                 return JSONResponse({"error": "config import failed"}, status_code=400)
             return JSONResponse(result)
+
+        @app.get("/api/history")
+        async def get_history(request: Request) -> JSONResponse:
+            """The today-so-far series for the plan view (#496): `slot`, today only.
+
+            Measured solar joins in phase 12's ticket: until then the series
+            says why it is unavailable, with a fixed reason code.
+            """
+            params = request.query_params
+            if params.get("resolution") != "slot":
+                return JSONResponse({"error": "unsupported resolution"}, status_code=400)
+            invalid = JSONResponse({"error": "invalid history range"}, status_code=400)
+            st = _state_of(request)
+            tz = load_timezone(st.settings.timezone)
+            now = datetime.now(tz)
+            # The day's first local midnight, even when midnight itself repeats.
+            midnight = now.replace(
+                hour=0, minute=0, second=0, microsecond=0, fold=0
+            ).astimezone(UTC)
+            # Omitted bounds mean "today so far", so the browser never has to
+            # work out the household's midnight offset itself.
+            try:
+                start = (datetime.fromisoformat(params["from"]) if "from" in params
+                         else midnight)
+                end = datetime.fromisoformat(params["to"]) if "to" in params else now
+                if start.tzinfo is None or end.tzinfo is None:
+                    return invalid  # an instant needs its offset; naive times are refused
+                start, end = start.astimezone(UTC), end.astimezone(UTC)
+            except (ValueError, OverflowError):
+                return invalid
+            if start < midnight or end > now.astimezone(UTC) or start > end:
+                return JSONResponse(
+                    {"error": "history range must be inside today"}, status_code=400
+                )
+            reason = (
+                "no_entity" if not st.settings.derive_solar_generation_entity
+                else "not_implemented"
+            )
+            # The midnight grid, from the half-hour holding `from`.
+            starts = [at for at in bucket_starts(midnight, end)
+                      if at + timedelta(minutes=30) > start]
+            try:
+                recorded = await recorded_solar(st.settings.db_path, starts)
+            except Exception:  # noqa: BLE001 - the series degrades, never 500s the view
+                log.warning("Recorded solar forecast read failed")
+                recorded = {}
+            return JSONResponse(history_payload(starts, recorded, tz, reason))
 
     @app.get("/api/health")
     async def health(request: Request) -> dict[str, Any]:

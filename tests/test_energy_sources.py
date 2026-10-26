@@ -806,6 +806,85 @@ async def test_invalid_tomorrow_solar_counts_only_that_date_as_zero(
     assert inputs.solar_tomorrow_kwh == 0.0
 
 
+@respx.mock
+async def test_solar_slot_provenance_separates_missing_from_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provenance beside the numbers: a covered date's zeros are real, gaps stay gaps.
+
+    Frozen at a daytime replan, the horizon spans three dates: today (a valid
+    today's-solar reading, including a genuine 0.0 slot), tomorrow (an invalid
+    payload, which the planner zeroes) and the day after (no entity covers it).
+    ``solar_slots`` stays exactly the zero-laid values the planner reads; the
+    parallel ``solar_slots_known`` records which slots actually carried a
+    forecast (#496).
+    """
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=12.0, slots=(0.25,) * 48, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    monkeypatch.setattr(sources, "datetime", _frozen_clock(_DAYTIME_NOW))
+    respx.get(f"{BASE}/states/sensor.soc").mock(return_value=_state("sensor.soc", "50"))
+    respx.get(f"{BASE}/states/sensor.solar_today").mock(
+        return_value=_state(
+            "sensor.solar_today",
+            "3.0",
+            {"detailedForecast": [
+                {"period_start": "2026-06-08T17:00:00+01:00", "pv_estimate": 1.0},
+                {"period_start": "2026-06-08T17:30:00+01:00", "pv_estimate": 0.0},
+            ]},
+        )
+    )
+    # Tomorrow's payload is malformed, so that date's slots have no forecast.
+    respx.get(f"{BASE}/states/sensor.solar").mock(
+        return_value=_state(
+            "sensor.solar", "8.0", {"detailedForecast": ["not-a-list"]}
+        )
+    )
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    s = _settings().model_copy(update={"solar_today_entity": "sensor.solar_today"})
+    async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
+        inputs, _, _ = await gather_inputs(s, rest)
+
+    assert inputs.geometry is not None
+    known = inputs.solar_slots_known
+    assert known is not None
+    assert len(known) == len(inputs.geometry.slot_starts) == len(inputs.solar_slots)
+    for start, solar, exists in zip(
+        inputs.geometry.slot_starts, inputs.solar_slots, known, strict=True
+    ):
+        local = start.astimezone(_HOUSEHOLD_TZ)
+        if local.date() == date(2026, 6, 8):  # today: a valid reading
+            # Only the slots the detailed forecast listed existed, its 0.0 included.
+            assert exists is (local.hour == 17)
+            expected = 3.0 if local == datetime(2026, 6, 8, 17, 0, tzinfo=_HOUSEHOLD_TZ) else 0.0
+            assert solar == expected
+        else:  # tomorrow's invalid payload, and the uncovered day after
+            assert exists is False
+            assert solar == 0.0
+    assert inputs.solar_tomorrow_kwh == 0.0
+
+
+@respx.mock
+async def test_daily_path_carries_no_solar_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without slot data there is nothing to record: both solar fields stay None."""
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=None, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    monkeypatch.setattr(sources, "datetime", _frozen_clock(_DAYTIME_NOW))
+    respx.route(method="GET").mock(return_value=httpx.Response(404))
+
+    async with HomeAssistantRest(_settings().ha_rest_url, _settings().auth_token) as rest:
+        inputs, _, _ = await gather_inputs(_settings(), rest)
+
+    assert inputs.solar_slots is None
+    assert inputs.solar_slots_known is None
+
+
 def test_parse_detailed_forecast_percentile_key() -> None:
     raw = [
         {"period_start": "2026-06-11T12:00:00+01:00", "pv_estimate": 2.0, "pv_estimate10": 1.0}
@@ -1683,3 +1762,23 @@ async def test_disabled_export_provider_never_reads_axle(
     assert inputs.flexibility_event is None
     assert inputs.flexibility_event_trusted
     assert build_schedule(settings, inputs, cfg).export_prices == ()
+
+
+@pytest.mark.parametrize("state", ["unavailable", "unknown", "not-a-number"])
+def test_non_numeric_solar_state_is_not_a_known_zero(state: str) -> None:
+    """The planner still counts 0.0, but no forecast existed for that date."""
+    from ha_spark.ha.rest import EntityState
+
+    def entity(value: str) -> EntityState:
+        return EntityState(entity_id="sensor.solar", state=value, attributes={})
+
+    reading = sources._solar_reading(entity(state), 50)
+    assert reading is not None and reading.total_kwh == 0.0
+    starts = tuple(datetime(2026, 6, 8, 12, tzinfo=UTC) + timedelta(minutes=30 * i)
+                   for i in range(4))
+    readings = {date(2026, 6, 8): reading}
+    assert sources._solar_slots(readings, starts, _HOUSEHOLD_TZ) == (0.0,) * 4
+    assert sources._solar_slots_known(readings, starts, _HOUSEHOLD_TZ) == (False,) * 4
+    numeric = sources._solar_reading(entity("0.0"), 50)
+    assert sources._solar_slots_known({date(2026, 6, 8): numeric}, starts,
+                                      _HOUSEHOLD_TZ) == (True,) * 4
