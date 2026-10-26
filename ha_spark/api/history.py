@@ -2,7 +2,7 @@
 
 Buckets step by absolute half-hours from local midnight in the household
 zone, so a daylight-saving day keeps its real slots. Every displayed value is
-the recorded forecast per slot; nothing is interpolated or invented here.
+a recorded forecast or validated measurement; nothing is interpolated or invented here.
 """
 
 from __future__ import annotations
@@ -30,23 +30,36 @@ def history_payload(
     starts: Sequence[datetime],
     recorded: Mapping[datetime, float],
     tz: tzinfo,
-    measured_reason: str,
+    measured_reason: str | None,
+    measured: Mapping[datetime, float] | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Buckets and totals in one pass; measured solar is ticket 10's to fill."""
+    """Buckets, totals and completed-half-hour coverage from the same values."""
+    measured = measured or {}
     buckets: list[dict[str, Any]] = []
     total = 0.0
+    measured_total = 0.0
+    completed = trustworthy = 0
     for start in starts:
         value = recorded.get(start)
         if value is not None:
             total += value
+        measurement = measured.get(start) if measured_reason is None else None
+        if measurement is not None:
+            measured_total += measurement
+        if now is not None and start + timedelta(minutes=30) <= now:
+            completed += 1
+            trustworthy += measurement is not None
         buckets.append({
             "start": start.astimezone(tz).isoformat(),
             "solar_forecast_kwh": value,
-            "solar_measured_kwh": None,
+            "solar_measured_kwh": measurement,
         })
     return {
         "buckets": buckets,
-        "totals": {"solar_forecast_kwh": total, "solar_measured_kwh": None},
-        "coverage": None,
-        "unavailable": {"solar_measured": measured_reason},
+        "totals": {"solar_forecast_kwh": total,
+                   "solar_measured_kwh": measured_total if measured_reason is None else None},
+        "coverage": (trustworthy / completed
+                     if completed and measured_reason is None else None),
+        "unavailable": {"solar_measured": measured_reason} if measured_reason else {},
     }
