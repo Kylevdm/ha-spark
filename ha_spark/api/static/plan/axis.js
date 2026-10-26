@@ -11,7 +11,7 @@ export function number(value, digits = 2) {
     return value == null ? "—" : Number(value).toFixed(digits);
 }
 
-export function Axis({timeline}) {
+export function Axis({timeline, selectedLine}) {
     const [selected, setSelected] = useState(null);
     const slots = timeline.slots;
     if (!slots?.length) return null;
@@ -36,6 +36,10 @@ export function Axis({timeline}) {
                         <tspan x=${x(slot.start)} dy="16">${slot.start.slice(0, 10)}</tspan>
                     </text>` : null}
                 </g>`)}
+                ${selectedLine ? html`<rect class="line-span"
+                    x=${Math.max(left, x(selectedLine.start))} y="35"
+                    width=${Math.max(0, Math.min(right, x(selectedLine.end))
+                        - Math.max(left, x(selectedLine.start)))} height="540"/>` : null}
                 <${SocLane} timeline=${timeline} x=${x} left=${left} right=${right}/>
                 <g transform="translate(0 100)">
                     <${ActionLanes} timeline=${timeline} x=${x} slotWidth=${slotWidth}

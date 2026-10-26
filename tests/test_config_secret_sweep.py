@@ -3,18 +3,21 @@
 import asyncio
 import io
 import json
+from dataclasses import replace
 from datetime import datetime
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
+from fastapi.testclient import TestClient
 
 from ha_spark import cli
-from ha_spark.api.server import AppState
+from ha_spark.api.server import AppState, build_app
 from ha_spark.api.static_assets import packaged_assets
 from ha_spark.config import _SECRET_OPTION_KEYS, ConfigError, Settings
 from ha_spark.daemon_channel import DaemonChannel, Reply, submit_socket
 from ha_spark.devices.execution import execution_context
+from ha_spark.energy.solar_measured import MeasuredSolar
 from ha_spark.settings_service import ConfigurationRepair, SettingsService
 from tests.api_helpers import owner_client
 from tests.authority_helpers import seed_authority, seed_settings
@@ -66,7 +69,7 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
             surfaces.append(reply.model_dump())
         state = AppState(bootstrap, tmp_path / "options.json", settings_service=service)
         with owner_client(state) as client:
-            record = stored_run()
+            record = replace(stored_run(), ev_hold_active=True)
             state.set_plan(record.run.plan, record)
             plan_response = client.get("/api/plan")
             assert plan_response.status_code == 200
@@ -76,6 +79,7 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
             assert timeline["slots"][0]["load_kwh"] == 0.25
             assert timeline["soc"][0] == {"at": timeline["now"], "soc_pct": 40}
             assert all(set(point) == {"at", "soc_pct"} for point in timeline["soc"])
+            assert {line["kind"] for line in timeline["lines"]} >= {"charge", "hold", "reserve"}
             # Include the populated SoC forecast, slots and every new chart asset in
             # the same response/log canary sweep as the configuration surfaces.
             surfaces.append(plan_response.text)
@@ -211,4 +215,30 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
         captured = capsys.readouterr()
         surfaces.append(captured.out + captured.err)
     assert CANARY not in json.dumps(surfaces)
+    assert CANARY not in caplog.text
+
+
+def test_measured_history_secret_sweep(tmp_path, caplog):
+    settings = Settings(ha_url="http://ha.test", ha_token=CANARY,
+                        derive_solar_generation_entity="sensor.solar",
+                        db_path=str(tmp_path / "solar.db"))
+    service = seed_settings(tmp_path, settings=settings)
+    state = AppState(service.settings, tmp_path / "options.json", settings_service=service)
+    calls = 0
+
+    async def hostile_reader(settings, start):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError({"error": CANARY, "body": CANARY})
+
+    app = build_app(state, ingress_peer="testclient",
+                    measured_solar=MeasuredSolar(reader=hostile_reader))
+    with TestClient(app) as client:
+        for _ in range(2):
+            response = client.get("/api/history?resolution=slot")
+            assert response.status_code == 200
+            assert response.json()["unavailable"] == {"solar_measured": "read_failed"}
+            assert CANARY not in response.text
+    assert calls == 2
+    assert "Measured solar statistics read failed" in caplog.text
     assert CANARY not in caplog.text
