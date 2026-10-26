@@ -8,6 +8,7 @@ import pytest
 
 from ha_spark import cli
 from ha_spark.api.server import AppState
+from ha_spark.api.static_assets import packaged_assets
 from ha_spark.config import _SECRET_OPTION_KEYS, ConfigError, Settings
 from ha_spark.daemon_channel import DaemonChannel, submit_socket
 from ha_spark.devices.execution import execution_context
@@ -61,6 +62,10 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
             surfaces.append(reply.model_dump())
         state = AppState(bootstrap, tmp_path / "options.json", settings_service=service)
         with owner_client(state) as client:
+            for path in ["/", "/api/health", *(f"/static/{name}" for name in packaged_assets())]:
+                response = client.get(path)
+                assert response.status_code == 200
+                surfaces.append(response.text)
             for response in (
                 client.get("/api/config"),
                 client.post("/api/config", json={"expected_revision": service.revision,
@@ -110,6 +115,10 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
         surfaces.append(reply.model_dump())
         state = AppState(bootstrap, tmp_path / "options.json", settings_service=repairing)
         with owner_client(state) as client:
+            for path in ["/", *(f"/static/{name}" for name in packaged_assets())]:
+                response = client.get(path)
+                assert response.status_code == 200
+                surfaces.append(response.text)
             surfaces.append(client.get("/api/config").text)
             health = client.get("/api/health")
             assert health.json()["status"] == "fail"
