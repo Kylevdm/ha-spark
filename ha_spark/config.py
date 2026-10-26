@@ -360,6 +360,7 @@ class FieldMeta(TypedDict):
     owner: Literal["addon", "integration"]
     secret: bool
     reload: Literal["live", "restart"]
+    display_only: bool
 
 
 def _metadata(
@@ -367,8 +368,11 @@ def _metadata(
     reload: Literal["live", "restart"] = "live",
     *,
     secret: bool = False,
+    display_only: bool = False,
 ) -> Any:
-    return Field(json_schema_extra={"owner": owner, "secret": secret, "reload": reload})
+    return Field(json_schema_extra={
+        "owner": owner, "secret": secret, "reload": reload, "display_only": display_only,
+    })
 
 
 class Settings(BaseSettings):
@@ -406,7 +410,8 @@ class Settings(BaseSettings):
 
     # Display-only grid carbon; never an actuation input.
     carbon_region: Annotated[
-        Annotated[int, Field(strict=True, ge=1, le=17)] | None, _metadata("addon")
+        Annotated[int, Field(strict=True, ge=1, le=17)] | None,
+        _metadata("addon", display_only=True),
     ] = None
 
     # --- Home Assistant ---

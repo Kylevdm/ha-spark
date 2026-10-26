@@ -804,7 +804,11 @@ class SettingsService:
                     context.config_generation += 1
                 self._settings = candidate
                 self._live_inputs = frozenset(inputs)
-                if self.request_replan is not None and changed != ["carbon_region"]:
+                metadata = field_metadata()
+                display_only = bool(changed) and all(
+                    key in metadata and metadata[key]["display_only"] for key in changed
+                )
+                if self.request_replan is not None and not display_only:
                     try:
                         self.request_replan()
                     except Exception:
