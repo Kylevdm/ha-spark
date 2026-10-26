@@ -73,6 +73,14 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
                 response = client.get(path)
                 assert response.status_code == 200
                 surfaces.append(response.text)
+            for region in (1, CANARY, {"untrusted": CANARY}, None):
+                response = client.post("/api/config", json={
+                    "expected_revision": service.revision,
+                    "changes": {"carbon_region": region},
+                })
+                assert response.status_code == (200 if region in (1, None) else 400)
+                surfaces.append(response.text)
+            surfaces.extend([client.get("/api/config").text, service.export()])
             for response in (
                 client.get("/api/config"),
                 client.post("/api/config", json={"expected_revision": service.revision,
