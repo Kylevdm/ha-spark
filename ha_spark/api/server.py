@@ -181,6 +181,19 @@ class AppState:
         return self.settings_service.save(updates, expected_revision, actor)
 
 
+def _owner_request(request: Request, kind: str) -> str | JSONResponse:
+    """The validated ingress user id, or the refusal: owner, request kind, then media type."""
+    user = request.headers.get("X-Remote-User-Id", "")
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user) is None:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    if request.headers.get("X-HA-Spark-Request") != kind:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        return JSONResponse({"error": "application/json required"}, status_code=415)
+    return user
+
+
 def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt is not None else None
 
@@ -433,14 +446,9 @@ def build_app(
 
         @app.post("/api/mode")
         async def post_mode(request: Request) -> JSONResponse:
-            user = request.headers.get("X-Remote-User-Id", "")
-            if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user) is None:
-                return JSONResponse({"error": "forbidden"}, status_code=403)
-            if request.headers.get("X-HA-Spark-Request") != "mode":
-                return JSONResponse({"error": "forbidden"}, status_code=403)
-            content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-            if content_type != "application/json":
-                return JSONResponse({"error": "application/json required"}, status_code=415)
+            user = _owner_request(request, "mode")
+            if isinstance(user, JSONResponse):
+                return user
             try:
                 body = ModeBody.model_validate(await request.json())
             except (ValueError, ValidationError):
@@ -469,14 +477,9 @@ def build_app(
         @app.post("/api/replan")
         async def post_replan(request: Request) -> JSONResponse:
             """Ask the daemon for a fresh plan: the CLI `run` path, gated alike."""
-            user = request.headers.get("X-Remote-User-Id", "")
-            if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user) is None:
-                return JSONResponse({"error": "forbidden"}, status_code=403)
-            if request.headers.get("X-HA-Spark-Request") != "replan":
-                return JSONResponse({"error": "forbidden"}, status_code=403)
-            content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-            if content_type != "application/json":
-                return JSONResponse({"error": "application/json required"}, status_code=415)
+            user = _owner_request(request, "replan")
+            if isinstance(user, JSONResponse):
+                return user
             st = _state_of(request)
             if st.executor is None:
                 return JSONResponse({"error": "no daemon executor"}, status_code=503)
@@ -513,14 +516,9 @@ def build_app(
         @app.post("/api/config")
         async def post_config(request: Request) -> JSONResponse:
             """Commit a revisioned partial update and publish the daemon's new snapshot."""
-            user = request.headers.get("X-Remote-User-Id", "")
-            if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user) is None:
-                return JSONResponse({"error": "forbidden"}, status_code=403)
-            if request.headers.get("X-HA-Spark-Request") != "config":
-                return JSONResponse({"error": "forbidden"}, status_code=403)
-            content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-            if content_type != "application/json":
-                return JSONResponse({"error": "application/json required"}, status_code=415)
+            user = _owner_request(request, "config")
+            if isinstance(user, JSONResponse):
+                return user
             try:
                 updates = await request.json()
             except Exception:  # noqa: BLE001 - malformed body is a client error
@@ -550,14 +548,9 @@ def build_app(
         @app.post("/api/config/import")
         async def post_config_import(request: Request) -> JSONResponse:
             """Replace the configuration; in repair the only write, with the repair token."""
-            user = request.headers.get("X-Remote-User-Id", "")
-            if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user) is None:
-                return JSONResponse({"error": "forbidden"}, status_code=403)
-            if request.headers.get("X-HA-Spark-Request") != "config":
-                return JSONResponse({"error": "forbidden"}, status_code=403)
-            content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-            if content_type != "application/json":
-                return JSONResponse({"error": "application/json required"}, status_code=415)
+            user = _owner_request(request, "config")
+            if isinstance(user, JSONResponse):
+                return user
             try:
                 body = ImportBody.model_validate(await request.json())
             except Exception:  # noqa: BLE001 - malformed body is a client error
