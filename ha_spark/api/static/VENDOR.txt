@@ -1,0 +1,9 @@
+htm 3.1.1 preact/standalone.module.js
+Preact 10.x as bundled by htm 3.1.1; exact version not published
+htm 3.1.1 declares preact ^10.2.0 as a development dependency.
+Supplied bundle SHA-256:
+72284e8e9079c87817145df1110f74e8a2aa040b2fc384922e18dfcb46fc1fd7
+htm and Preact are MIT licensed.
+
+Regenerate MANIFEST.sha256 after asset changes:
+python -m ha_spark.api.static_assets

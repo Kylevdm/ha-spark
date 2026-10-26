@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.28.0
+
+- **App shell and plan view (#381).** **Open Web UI** now opens an app with a
+  side rail: **Plan** is the default and **Mode** is the existing operating-mode
+  page. Every screen shows the site's operating mode, whether authority is known
+  and the fallback state. A reload keeps the screen you were on, and the app
+  follows your light or dark preference.
+- **Plan screen.** The plan's headline and cost tiles sit above a half-hour
+  chart on your household clock: the expected SoC against the minimum and target
+  lines, the raw solar forecast dashed, the plan's after-haircut solar dotted,
+  house load, one lane each for charge, hold, export, skip and V2L, and import
+  and export price steps. The reason lines below are the planner's own wording;
+  selecting one highlights its span, and selecting a half-hour shows that slot's
+  numbers. A "today so far" span compares the forecast recorded before each
+  half-hour with measured solar when `derive_solar_generation_entity` has Home
+  Assistant five-minute statistics. When the SoC reading isn't trusted, the
+  SoC-derived lane, numbers, costs and actions are blanked with the planner's
+  warning; the daily planning model still shows the headline, costs and reasons.
+- **Replan.** A **Replan** button asks for a fresh plan through the same path as
+  the CLI's `run` and the agent's `run_plan`, so it plans exactly as the
+  operating mode allows and unchanged setpoints write nothing. Presses close
+  together combine into one replan, and each request is recorded under your Home
+  Assistant user. A "still queued" reply means reload rather than press again.
+- **Grid carbon strip (optional).** Off until you pick a region in the plan
+  view. It then polls NESO every 30 minutes and draws NESO's own index labels,
+  with passed periods marked estimated, a "carbon forecast ends here" tick and a
+  note when the data is stale. Clearing the region stops the calls. Carbon never
+  affects the plan, the operating mode, Protect or Optimise, or readiness.
+- The app and its routes are ingress-only; the agent port and standalone listener
+  do not serve the plan view, its timeline, Replan or carbon. No add-on
+  configuration options changed.
+- **Security (#496):** at `log_level: DEBUG`, the websockets library's frame trace
+  logged Home Assistant's WebSocket authentication message, including its access
+  token. That trace is now kept off at every log level. If you ran at DEBUG and
+  shared or kept those logs, rotate the token they contain (standalone `ha_token`).
+- Downgrading: once a carbon region has been saved in the plan view (including
+  turning it off), the stored configuration carries `carbon_region`, which
+  0.26.x doesn't recognise. A downgrade to 0.26.x then starts in configuration
+  repair until `ha-spark config import` restores a configuration without it.
+
 ## 0.26.1
 
 - **Security (#488):** `notify_service` and `v2l_notify_service` accept only a bare

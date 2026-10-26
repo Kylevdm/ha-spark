@@ -11,6 +11,7 @@ from ha_spark.energy.soc_integrity import SocMeasurement
 
 if TYPE_CHECKING:
     from ha_spark.energy.horizon import HorizonGeometry
+    from ha_spark.energy.plan_view import PlanView
 
 # Half-hour slots in a (non-DST-transition) day; the planner horizon is always 48.
 SLOTS_PER_DAY = 48
@@ -231,6 +232,12 @@ class PlannerInputs:
     # the v1 daily balance.
     load_slots: tuple[float, ...] | None = None
     solar_slots: tuple[float, ...] | None = None
+    # Which ``solar_slots`` carried a real forecast (#496): True where the
+    # slot's date had a valid reading (a genuine 0.0 kWh counts), False where
+    # a missing or invalid reading, or a date the solar entities don't cover,
+    # was laid onto zero. View-only provenance recorded beside the numbers;
+    # the planner keeps reading ``solar_slots`` alone.
+    solar_slots_known: tuple[bool, ...] | None = None
     horizon_start: datetime | None = None
     # When these inputs were read, on the household clock. Places elapsed
     # time within slot 0 and formats plan times locally.
@@ -396,6 +403,7 @@ class V2LRefill:
     kwh: float
     rate_kw: float
     reason: str
+    reservation: str = ""
 
 
 @dataclass(frozen=True)
@@ -453,6 +461,7 @@ class ChargePlan:
     # plan is followed (slot model only). Lets a later reading show the plan
     # was wrong (#208).
     soc_path: tuple[tuple[datetime, float], ...] = ()
+    view: PlanView | None = None
 
     @property
     def served_day_solar_kwh(self) -> float:

@@ -65,6 +65,9 @@ releases owned holds only for Observe before committing the target mode.
 With `inverter_clock_dst_sync` on, the first tick after the household zone's
 UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
 
+A separate carbon refresh task caches display-only NESO regional estimates. Each
+control-loop tick reads the live region; network I/O never delays planning.
+
 Readiness captures the revision and rates in force on each boundary tick, in
 all modes, and separate read-only guard evidence in Observe. Missed boundaries
 stay gaps; mid-slot requests never rewrite a slot. Recording failures are isolated.
@@ -117,6 +120,7 @@ from ha_spark.devices.inverters.solis import (
     validated_fallback_current_a,
 )
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome, is_verified, legacy_action_line
+from ha_spark.energy.carbon import CarbonRefresher
 from ha_spark.energy.derived_base_load import (
     BACKFILL_NAME,
     BACKFILL_STATISTIC_ID,
@@ -130,7 +134,7 @@ from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
-from ha_spark.energy.plan_run import current_plan
+from ha_spark.energy.plan_run import PlanRun, StoredPlanRun, current_plan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.energy.readiness import readiness_tick
 from ha_spark.energy.readiness_ledger import PlanRevision, record_guard, record_slot, slot_start
@@ -138,6 +142,7 @@ from ha_spark.energy.readiness_measurements import record_closed_days
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor, SocMonitorSnapshot, observe_soc
+from ha_spark.energy.solar_forecasts import SolarForecastStore
 from ha_spark.energy.sources import (
     ev_hold_status_from_read,
     parse_time,
@@ -264,6 +269,11 @@ class RunResult(NamedTuple):
     text: str = ""
     action_lines: tuple[str, ...] = ()
     revision: PlanRevision | None = None
+    # The run the plan came from, with the EV hold observed on a local copy of
+    # its intent. View-only (#496): never fed back into ``plan`` or
+    # ``applied_plan``. ``None`` for results with no run (synthetic plans,
+    # test fakes).
+    plan_run: StoredPlanRun | None = None
 
 
 def _apply_failed(lines: list[str]) -> bool:
@@ -326,6 +336,39 @@ async def _record_forecast(
             )
     except Exception:
         log.exception("Recording forecast failed")
+
+
+async def _record_solar_forecasts(settings: Settings, run: PlanRun) -> None:
+    """Record the raw solar forecast this plan was issued with, best-effort.
+
+    One row per slot that actually carried a forecast (#496 provenance): a
+    missing reading or an uncovered date is not stored, so it later reads as
+    null, never as zero. ``issued_at`` is the planning input snapshot's time —
+    the forecast the plan was using before each slot began — never the
+    post-apply write time. View-only: it never feeds the planner, a baseline
+    or a write, and a failure logs and leaves the run alone.
+    """
+    solar = getattr(run.inputs, "solar_slots", None)
+    known = getattr(run.inputs, "solar_slots_known", None)
+    geometry = getattr(run.inputs, "geometry", None)
+    issued_at = getattr(run.inputs, "now", None)
+    if (
+        solar is None or known is None or geometry is None or issued_at is None
+        or len(solar) != len(known) or len(geometry.slot_starts) != len(solar)
+    ):
+        return
+    slots = [
+        (start, kwh)
+        for start, kwh, exists in zip(geometry.slot_starts, solar, known, strict=True)
+        if exists
+    ]
+    if not slots:
+        return
+    try:
+        async with SolarForecastStore(settings.db_path) as store:
+            await store.record(issued_at.astimezone(UTC), slots)
+    except Exception:  # noqa: BLE001 - fixed text only, never the exception's
+        log.warning("Recording solar forecast failed")
 
 
 async def run_once(
@@ -440,12 +483,14 @@ async def run_once(
             except Exception:  # noqa: BLE001 - a request never breaks a plan run
                 log.warning("V2L top-up request failed", exc_info=True)
     await _record_forecast(settings, plan, run.forecast, getattr(run.inputs, "geometry", None))
+    await _record_solar_forecasts(settings, run)
     await _run_derived_rerive(settings)
     return RunResult(
         plan, applied_plan, tuple(apply_lines),
         format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz),
         tuple(lines),
         revision,
+        StoredPlanRun(run, ev_hold_active),
     )
 
 
@@ -1908,6 +1953,7 @@ async def _run_paired(
     last_readiness_slot: datetime | None = None
     readiness_evaluated: date | None = None
     readiness_task: asyncio.Task[None] | None = None
+    carbon = CarbonRefresher(settings.db_path, lambda: state.settings.carbon_region)
 
     async def record_readiness(tick_settings: Settings, tick_now: datetime) -> None:
         nonlocal readiness_evaluated
@@ -1991,6 +2037,14 @@ async def _run_paired(
                     await _charger_supports_live_rate(settings)
                 )
             now = datetime.now(tz)
+            record = state.plan_run
+            geometry = (record.run.inputs.geometry
+                        if record is not None and record.run.plan.model == "slots" else None)
+            try:
+                carbon.tick(now, tz.key,
+                            geometry.horizon_end if geometry is not None else None)
+            except Exception:  # noqa: BLE001 - display-only; never delays or breaks planning
+                log.warning("Carbon refresh scheduling failed")
             if not startup_reconciled:
                 startup_reconciled = True
                 # No planner or fallback write may precede restart reconciliation.
@@ -2177,7 +2231,7 @@ async def _run_paired(
                         if backed_off:
                             recovery_retry_not_before = now + RECOVERY_RETRY_DELAY
                     replanned = True
-                    state.set_plan(plan)
+                    state.set_plan(plan, result.plan_run)
                     last_run_slot = _slot_start(now)
                     last_plan = plan
                     last_revision = result.revision
@@ -2313,6 +2367,7 @@ async def _run_paired(
             state.loop_tick = utc_datetime.now(UTC)
             await asyncio.sleep(poll_seconds)
     finally:
+        await carbon.close()
         if discovery is not None:
             await discovery.cancel_announcement()
         if readiness_task is not None:

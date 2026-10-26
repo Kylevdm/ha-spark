@@ -148,14 +148,16 @@ def normalise_legacy(
         ]
     if retired:
         log.warning("Ignoring deprecated options: %s", ", ".join(retired))
-    unknown = len(raw.keys() - _OPTION_KEYS - {"proactive_mode"})
+    # Imports accept the settings-document vocabulary; legacy seeding stays frozen.
+    keys = _OPTION_KEYS | _KEYS if strict else _OPTION_KEYS
+    unknown = len(raw.keys() - keys - {"proactive_mode"})
     if unknown:
         if strict:
             raise ConfigError(f"Unknown configuration fields: {unknown}")
         log.warning("Ignoring %d unknown legacy options", unknown)
     return {
         k: v for k, v in raw.items()
-        if k in _OPTION_KEYS and (v is not None or k == "db_path")
+        if k in keys and (v is not None or k == "db_path")
         and not (k in _SECRET_OPTION_KEYS and v == "")
         and not (k == "devices" and v == [])
     }
@@ -802,7 +804,7 @@ class SettingsService:
                     context.config_generation += 1
                 self._settings = candidate
                 self._live_inputs = frozenset(inputs)
-                if self.request_replan is not None:
+                if self.request_replan is not None and changed != ["carbon_region"]:
                     try:
                         self.request_replan()
                     except Exception:

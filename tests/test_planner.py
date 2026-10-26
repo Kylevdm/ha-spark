@@ -2318,3 +2318,58 @@ def test_solar_export_counts_only_the_rest_of_slot_0() -> None:
 
     assert at_start.export_revenue == pytest.approx(1.0 * 0.15)
     assert midslot.export_revenue == pytest.approx(0.5 * 0.15)
+
+
+@pytest.mark.parametrize("slots", [False, True])
+def test_plan_view_headline_costs_and_model(slots: bool) -> None:
+    inputs = PlannerInputs(
+        soc=_soc(40), solar_tomorrow_kwh=4, predicted_home_load_kwh=12,
+        load_slots=(0.25,) * 48 if slots else None,
+    )
+    plan = _plan(inputs, cfg())
+    view = plan.view
+    assert view is not None
+    assert view.headline.soc_now == plan.soc_now
+    assert view.headline.target_soc == plan.target_soc
+    assert view.headline.required_kwh == plan.required_kwh
+    assert view.headline.min_soc == cfg().min_soc
+    assert view.headline.capacity_kwh == plan.capacity_kwh
+    assert view.costs.planned == plan.planned_cost
+    assert view.costs.baseline == plan.baseline_cost
+    assert view.costs.export_revenue == plan.export_revenue
+    assert any(line.kind == "charge" and line.kwh == plan.required_kwh for line in view.lines)
+    assert all(line.start is None and line.end is None for line in view.lines)
+    assert view.slots == (() if slots else None)
+    assert view.soc == (() if slots else None)
+
+
+def test_plan_view_untrusted_soc_hides_derived_values() -> None:
+    plan = _plan(PlannerInputs(
+        soc=_soc_unavailable(), solar_tomorrow_kwh=4, predicted_home_load_kwh=12,
+    ), cfg())
+    view = plan.view
+    assert view is not None
+    assert (view.headline.soc_now, view.headline.target_soc,
+            view.headline.required_kwh) == (None, None, None)
+    assert view.headline.min_soc == cfg().min_soc
+    assert view.headline.capacity_kwh == cfg().capacity_kwh
+    assert (view.costs.planned, view.costs.baseline, view.costs.export_revenue) == (None,) * 3
+    assert len(view.lines) == 1
+    warning = view.lines[0]
+    assert warning.kind == "warning"
+    assert warning.start is warning.end is None
+    assert warning.text == "SoC sensor unavailable"
+
+
+@pytest.mark.parametrize("status", [status for status in SocStatus if status is not SocStatus.OK])
+def test_plan_view_soc_warning_never_echoes_upstream_detail(status: SocStatus) -> None:
+    measurement = replace(_soc_unavailable(), status=status,
+                          raw_state="SECRET-VIEW-CANARY", energy_reason="SECRET-VIEW-CANARY")
+    plan = _plan(PlannerInputs(
+        soc=measurement, solar_tomorrow_kwh=4, predicted_home_load_kwh=12,
+        load_slots=(0.25,) * 48,
+    ), cfg())
+    assert plan.view is not None
+    assert "SECRET-VIEW-CANARY" not in repr(plan.view)
+    assert plan.view.headline.soc_now is None
+    assert plan.view.lines[0].kind == "warning"
