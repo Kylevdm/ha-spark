@@ -95,7 +95,7 @@ def resolve(
                     "axle-export-event": "the flexibility export",
                     "reach-charge-window": "the run to the charge window",
                 }.get(reservation.obligation_kind, "planned demand")
-                kwh = _amount(reservation.energy_kwh, " kWh", 1)
+                kwh = _amount(required, " kWh", 1)
                 return "charge", f"Charging {kwh or 'the battery'} to cover {phrase}."
             end = next(e for s, e in charge if s <= t < e)
             kwh, soc = _amount(required, " kWh", 1), _amount(plan.target_soc, "%", 0)
