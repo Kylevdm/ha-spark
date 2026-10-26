@@ -248,7 +248,7 @@ class DaemonChannel:
 
     def request_replan(self) -> None:
         """Best-effort settings notification; ordinary queued work grants no authority."""
-        if self._server is None or not self._server.is_serving():
+        if self._server is None or not self._server.is_serving() or self._repairing():
             return
         if self._pending_replan is not None:
             self._join_pending_replan(None, "settings")

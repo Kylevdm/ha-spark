@@ -10,7 +10,7 @@ import pytest
 
 from ha_spark import daemon_channel
 from ha_spark.config import Settings
-from ha_spark.daemon_channel import DaemonChannel, Reply, Request, submit_socket
+from ha_spark.daemon_channel import DaemonChannel, Pending, Reply, Request, submit_socket
 
 
 def settings_at(path: Path) -> Settings:
@@ -81,12 +81,44 @@ async def test_timed_out_replan_caller_neither_cancels_work_nor_other_replies(
 async def test_replan_shutdown_resolves_every_waiter(tmp_path: Path) -> None:
     channel = DaemonChannel(settings_at(tmp_path))
     async with channel:
+        channel.request_replan()  # settings-triggered: nobody awaits its future
+        settings_work = channel._pending_replan
+        assert settings_work is not None
         waiters = [asyncio.create_task(channel.submit("replan", ingress_user=f"user-{i}"))
                    for i in range(3)]
         await asyncio.sleep(0)
         assert channel.queue.qsize() == 1
     replies = await asyncio.gather(*waiters)
     assert [reply.error for reply in replies] == ["daemon stopped"] * 3
+    assert settings_work.future.result().error == "daemon stopped"
+    assert channel._pending_replan is None
+
+
+async def test_full_queue_neither_joins_nor_points_at_unqueued_replan(tmp_path: Path) -> None:
+    async with DaemonChannel(settings_at(tmp_path)) as channel:
+        loop = asyncio.get_running_loop()
+        for _ in range(channel.queue.maxsize):
+            channel.queue.put_nowait(Pending(Request(op="apply"), loop.create_future()))
+        channel.request_replan()
+        assert channel._pending_replan is None
+        assert (await channel.submit("replan")).error == "daemon request queue full"
+        assert channel._pending_replan is None
+        while channel.next_request() is not None:
+            pass
+        later = asyncio.create_task(channel.submit("replan"))
+        await asyncio.sleep(0)
+        pending = channel.next_request()
+        assert pending is not None and pending.request == Request(op="replan")
+        pending.future.set_result(Reply(text="ran"))
+        assert (await later).text == "ran"
+
+
+async def test_settings_replan_is_refused_in_repair(tmp_path: Path) -> None:
+    async with DaemonChannel(settings_at(tmp_path)) as channel:
+        channel.settings_service = type("Repairing", (), {"repair": ["broken"]})()
+        channel.request_replan()
+        assert channel.next_request() is None
+        assert channel._pending_replan is None
 
 
 async def test_replan_after_work_started_creates_new_work(tmp_path: Path) -> None:

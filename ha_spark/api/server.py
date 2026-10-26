@@ -474,6 +474,9 @@ def build_app(
                     {"error": "pending", "detail": "request queued; reload the plan"},
                     status_code=504,
                 )
+            except Exception:  # noqa: BLE001 - fixed text; never the exception's own
+                log.warning("Replan request failed")
+                return JSONResponse({"error": "replan failed"}, status_code=500)
             if reply.error:
                 if reply.error in ("daemon stopped", "daemon request queue full",
                                    CONFIGURATION_REPAIR):

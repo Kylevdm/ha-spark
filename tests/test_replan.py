@@ -40,7 +40,10 @@ def test_replan_route_absent_outside_ingress(tmp_path: Path, token: bool, peer: 
 def test_replan_requires_a_valid_user_id(tmp_path: Path, user: str | None) -> None:
     executor = AsyncMock(spec=DaemonChannel)
     app = build_app(ingress_state(tmp_path, executor), ingress_peer="testclient")
-    headers = {} if user is None else {"X-Remote-User-Id": user}
+    # The custom header is valid, so the user id is the only reason to refuse.
+    headers = {"X-HA-Spark-Request": "replan"}
+    if user is not None:
+        headers["X-Remote-User-Id"] = user
     with TestClient(app) as client:
         response = client.post("/api/replan", json={}, headers=headers)
     assert response.status_code == 403
