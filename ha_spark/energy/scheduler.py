@@ -65,6 +65,9 @@ releases owned holds only for Observe before committing the target mode.
 With `inverter_clock_dst_sync` on, the first tick after the household zone's
 UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
 
+A separate carbon refresh task caches display-only NESO regional estimates. Each
+control-loop tick reads the live region; network I/O never delays planning.
+
 Readiness captures the revision and rates in force on each boundary tick, in
 all modes, and separate read-only guard evidence in Observe. Missed boundaries
 stay gaps; mid-slot requests never rewrite a slot. Recording failures are isolated.
@@ -117,6 +120,7 @@ from ha_spark.devices.inverters.solis import (
     validated_fallback_current_a,
 )
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome, is_verified, legacy_action_line
+from ha_spark.energy.carbon import CarbonRefresher
 from ha_spark.energy.derived_base_load import (
     BACKFILL_NAME,
     BACKFILL_STATISTIC_ID,
@@ -1914,6 +1918,7 @@ async def _run_paired(
     last_readiness_slot: datetime | None = None
     readiness_evaluated: date | None = None
     readiness_task: asyncio.Task[None] | None = None
+    carbon = CarbonRefresher(settings.db_path, lambda: state.settings.carbon_region)
 
     async def record_readiness(tick_settings: Settings, tick_now: datetime) -> None:
         nonlocal readiness_evaluated
@@ -1997,6 +2002,14 @@ async def _run_paired(
                     await _charger_supports_live_rate(settings)
                 )
             now = datetime.now(tz)
+            record = state.plan_run
+            geometry = (record.run.inputs.geometry
+                        if record is not None and record.run.plan.model == "slots" else None)
+            try:
+                carbon.tick(now, tz.key,
+                            geometry.horizon_end if geometry is not None else None)
+            except Exception:  # noqa: BLE001 - display-only; never delays or breaks planning
+                log.warning("Carbon refresh scheduling failed")
             if not startup_reconciled:
                 startup_reconciled = True
                 # No planner or fallback write may precede restart reconciliation.
@@ -2319,6 +2332,7 @@ async def _run_paired(
             state.loop_tick = utc_datetime.now(UTC)
             await asyncio.sleep(poll_seconds)
     finally:
+        await carbon.close()
         if discovery is not None:
             await discovery.cancel_announcement()
         if readiness_task is not None:
