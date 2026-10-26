@@ -1179,4 +1179,4 @@ def compute_plan(
         overnight_charge_capped=overnight_charge_capped,
         soc_path=soc_path,
     )
-    return replace(plan, view=build_plan_view(plan, cfg))
+    return replace(plan, view=build_plan_view(plan, cfg, inputs, schedule))
