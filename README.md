@@ -15,7 +15,8 @@ installed from HACS, shows the plan in Home Assistant as entities. The
 natural-language features use one remote Ollama instance and fall back to a
 deterministic parser when Ollama is unreachable. There is no ha-spark cloud service or subscription. Apart from
 Home Assistant, ha-spark contacts only your Ollama server, Open-Meteo (weather
-for the ML load model), and the Octopus and Axle APIs if you configure them.
+for the ML load model), NESO carbon intensity if you pick a region, and the
+Octopus and Axle APIs if you configure them.
 
 ## Engineering highlights
 
