@@ -31,6 +31,7 @@ from ha_spark.energy.models import (
     ChargePlan,
     LoadForecast,
 )
+from ha_spark.energy.plan_run import PlanRun, StoredPlanRun
 from ha_spark.energy.scheduler import (
     SIGNAL_SAMPLE_INTERVAL,
     charge_current_changed,
@@ -1021,6 +1022,74 @@ async def test_run_forever_publishes_plan_to_api_state(
     state = captured["state"]
     assert isinstance(state, AppState)
     assert state.plan is not None
+
+
+async def test_run_forever_stores_the_plan_run_beside_the_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each replan stores the whole plan run it acted on beside the plan.
+
+    A result with no run (a test fake, or a synthetic plan) stores no run:
+    a later reader sees "no timeline", never an error (#496 prefactor).
+    """
+    captured: dict[str, object] = {}
+
+    def capture_build_app(state: object) -> object:
+        captured["state"] = state
+        return object()  # never actually served; make_server is stubbed too
+
+    results: list[scheduler.RunResult] = []
+
+    async def fake_run_once(_s: Settings, **_kwargs: object) -> scheduler.RunResult:
+        # The first run has been stored by the time the second begins: pin
+        # what the API state held right after that replan.
+        if results:
+            state = captured["state"]
+            assert isinstance(state, AppState)
+            captured["after_first"] = (state.plan, state.plan_run)
+        plan = _plan()
+        if not results:
+            record = StoredPlanRun(
+                run=PlanRun(
+                    plan=plan,
+                    inputs=SimpleNamespace(),
+                    cfg=SimpleNamespace(),
+                    schedule=SimpleNamespace(),
+                    load_source="test",
+                    forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
+                ),
+                ev_hold_active=True,
+            )
+            results.append(scheduler.RunResult(plan, plan, plan_run=record))
+        else:
+            results.append(scheduler.RunResult(plan, plan))
+        return results[-1]
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+    monkeypatch.setattr(scheduler, "build_app", capture_build_app)
+    stop = _patch_loop(monkeypatch, [datetime(2026, 6, 10, 22, 0), datetime(2026, 6, 10, 22, 30)])
+
+    s = Settings(ha_url="http://ha.test", ha_token="t", plan_run_time="22:00")
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+    state = captured["state"]
+    assert isinstance(state, AppState)
+    first_plan, first_run = captured["after_first"]
+    first_result = results[0]
+    assert first_result.plan_run is not None
+    # After the first replan the state holds the run whose plan is the stored
+    # plan, with the observed EV hold recorded beside it.
+    assert first_plan is first_result.plan
+    assert first_run is first_result.plan_run
+    assert first_run.run.plan is first_plan
+    assert first_run.ev_hold_active is True
+    # A result with no plan run stores no run.
+    assert state.plan is results[1].plan
+    assert state.plan_run is None
 
 
 async def test_run_forever_guard_ticks_only_inside_window(
@@ -3896,6 +3965,92 @@ async def test_run_once_applies_the_ev_hold_on_a_replan_tick(
         "entity_id": "select.solisac_power_switch",
         "option": "Off",
     }
+
+
+@respx.mock
+async def test_run_once_records_the_plan_run_and_keeps_the_ev_hold_view_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The result carries the whole plan run with the observed EV hold; the
+    stored ``ChargePlan`` and the applied-plan baseline never learn of it.
+
+    The hold reaches the device through a local copy of the intent only
+    (#420); the observation rides beside the plan in the run's record, so a
+    later view-only reader can show it without any write feeding back (#496).
+    """
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            return cls(2026, 6, 10, 12, 0, tzinfo=tz)
+
+    monkeypatch.setattr(scheduler, "datetime", _FrozenDatetime)
+    monkeypatch.setattr("ha_spark.devices.inverters.solis._READ_BACK_DELAY_SECONDS", 0)
+    plan = _plan(replace(_INTENT, holds=()))
+
+    async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> PlanRun:
+        return PlanRun(
+            plan=plan,
+            inputs=SimpleNamespace(
+                ev_hold_charging=True,
+                evidence_freshness={
+                    "ev_status": _fresh(datetime(2026, 6, 10, 12, 0, tzinfo=UTC))
+                },
+                battery_direction="unknown",
+            ),
+            cfg=SimpleNamespace(),
+            schedule=SimpleNamespace(),
+            load_source="test",
+            forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
+        )
+
+    async def noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
+    monkeypatch.setattr(scheduler, "_record_forecast", noop)
+    monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
+    switch_url = "http://ha.test/api/states/select.solisac_power_switch"
+    switch_reads = iter(("On", "Off"))
+    respx.get(switch_url).mock(
+        side_effect=lambda _request: httpx.Response(
+            200,
+            json={
+                "entity_id": "select.solisac_power_switch",
+                "state": next(switch_reads),
+                "attributes": {},
+            },
+        )
+    )
+    switch_write = respx.post(
+        "http://ha.test/api/services/select/select_option"
+    ).mock(return_value=httpx.Response(200, json=[]))
+    settings = _dispatch_settings(
+        dispatch_entity="",
+        ev_status_entity="sensor.ev",
+        inverter_power_switch_entity="select.solisac_power_switch",
+        authority_mode="optimise",
+    )
+
+    result = await run_once(
+        settings,
+        previous_plan=plan,
+        ev_hold_state=scheduler.EvHoldState(),
+    )
+
+    # The observation reached the device through the local copy of the intent...
+    assert switch_write.called is True
+    # ...while the returned plan and the applied-plan baseline stay free of it.
+    assert result.plan is plan
+    assert result.plan.charge_intent is not None
+    assert result.plan.charge_intent.ev_hold_active is False
+    assert result.applied_plan is plan
+    assert result.applied_plan.charge_intent.ev_hold_active is False
+    # The run records both the plan it planned with and the observed hold,
+    # view-only, beside them.
+    assert result.plan_run is not None
+    assert result.plan_run.run.plan is result.plan
+    assert result.plan_run.ev_hold_active is True
 
 
 @respx.mock

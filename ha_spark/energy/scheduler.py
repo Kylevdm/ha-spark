@@ -130,7 +130,7 @@ from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
-from ha_spark.energy.plan_run import current_plan
+from ha_spark.energy.plan_run import StoredPlanRun, current_plan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.energy.readiness import readiness_tick
 from ha_spark.energy.readiness_ledger import PlanRevision, record_guard, record_slot, slot_start
@@ -264,6 +264,11 @@ class RunResult(NamedTuple):
     text: str = ""
     action_lines: tuple[str, ...] = ()
     revision: PlanRevision | None = None
+    # The run the plan came from, with the EV hold observed on a local copy of
+    # its intent. View-only (#496): never fed back into ``plan`` or
+    # ``applied_plan``. ``None`` for results with no run (synthetic plans,
+    # test fakes).
+    plan_run: StoredPlanRun | None = None
 
 
 def _apply_failed(lines: list[str]) -> bool:
@@ -446,6 +451,7 @@ async def run_once(
         format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz),
         tuple(lines),
         revision,
+        StoredPlanRun(run, ev_hold_active),
     )
 
 
@@ -2177,7 +2183,7 @@ async def _run_paired(
                         if backed_off:
                             recovery_retry_not_before = now + RECOVERY_RETRY_DELAY
                     replanned = True
-                    state.set_plan(plan)
+                    state.set_plan(plan, result.plan_run)
                     last_run_slot = _slot_start(now)
                     last_plan = plan
                     last_revision = result.revision

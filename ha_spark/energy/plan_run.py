@@ -42,6 +42,20 @@ class PlanRun:
     tz: tzinfo | None = None
 
 
+@dataclass(frozen=True)
+class StoredPlanRun:
+    """A plan run the daemon acted on, kept beside its plan for view-only
+    readers (#496).
+
+    ``ev_hold_active`` is what ``run_once`` observed on a local copy of the
+    charge intent: it is recorded here only, never fed back into the stored
+    ``ChargePlan``, the applied-plan baseline or any write.
+    """
+
+    run: PlanRun
+    ev_hold_active: bool
+
+
 async def current_plan(
     settings: Settings, rest: HomeAssistantRest, *, soc: SocMeasurement | None = None
 ) -> PlanRun:
