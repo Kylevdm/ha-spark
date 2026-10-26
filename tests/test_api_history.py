@@ -261,3 +261,18 @@ def test_measured_history_totals_coverage_and_repeat(tmp_path, monkeypatch, minu
     assert body["totals"]["solar_measured_kwh"] == pytest.approx(.6 if minutes >= 30 else 0)
     assert body["buckets"][0]["solar_measured_kwh"] == (
         pytest.approx(.6) if minutes >= 30 else None)
+
+
+def test_overflowing_measured_total_is_unknown_not_a_500():
+    import json as _json
+    from datetime import UTC, datetime, timedelta
+
+    from ha_spark.api.history import history_payload
+
+    start = datetime(2026, 10, 14, tzinfo=UTC)
+    starts = [start + timedelta(minutes=30 * i) for i in range(4)]
+    payload = history_payload(starts, {}, UTC, None, {s: 6e307 for s in starts},
+                              now=start + timedelta(hours=3))
+    assert payload["totals"]["solar_measured_kwh"] is None
+    assert [b["solar_measured_kwh"] for b in payload["buckets"]] == [6e307] * 4
+    _json.dumps(payload, allow_nan=False)

@@ -19,7 +19,7 @@ import os
 import socket
 import struct
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -128,9 +128,6 @@ class Pending:
     request: Request
     future: asyncio.Future[Reply]
     ingress_user: str | None = None
-    # Requesters that joined a queued, not-yet-started replan; each is logged
-    # under its own id, and the shared reply serves them all.
-    joined_users: list[str | None] = field(default_factory=list)
 
 
 class DaemonChannel:
@@ -241,9 +238,10 @@ class DaemonChannel:
         # before submitting, and socket callers cannot claim one.
         log.info("Replan requested requester=%s", requester)
 
-    def _join_pending_replan(self, ingress_user: str | None, requester: str) -> None:
+    def _join_pending_replan(self, requester: str) -> None:
+        # A requester joining a queued, not-yet-started replan is logged under
+        # its own id; the shared reply serves them all and nothing is retained.
         assert self._pending_replan is not None
-        self._pending_replan.joined_users.append(ingress_user)
         self._log_replan(requester)
 
     def request_replan(self) -> None:
@@ -251,7 +249,7 @@ class DaemonChannel:
         if self._server is None or not self._server.is_serving() or self._repairing():
             return
         if self._pending_replan is not None:
-            self._join_pending_replan(None, "settings")
+            self._join_pending_replan("settings")
             return
         future: asyncio.Future[Reply] = asyncio.get_running_loop().create_future()
         pending = Pending(Request(op="replan"), future)
@@ -309,7 +307,7 @@ class DaemonChannel:
         if request.op == "replan" and self._pending_replan is not None:
             # Close-together replans join the queued one: one run, one shared reply.
             shared = self._pending_replan
-            self._join_pending_replan(ingress_user, ingress_user or "cli")
+            self._join_pending_replan(ingress_user or "cli")
             return await asyncio.shield(shared.future)
         pending = Pending(request, future, ingress_user)
         try:

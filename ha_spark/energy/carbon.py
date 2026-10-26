@@ -7,6 +7,7 @@ without awaiting network I/O; the ingress reader uses only the durable cache.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from collections.abc import Callable
@@ -22,6 +23,8 @@ from ha_spark.logging import get_logger
 NESO_BASE_URL = "https://api.carbonintensity.org.uk"
 ATTRIBUTION = "Carbon intensity data: NESO Carbon Intensity API, CC BY 4.0"
 _LABELS = {"very low", "low", "moderate", "high", "very high"}
+# A full regional fetch is about 20 KB; anything far larger is refused unparsed.
+_MAX_BODY = 1_000_000
 log = get_logger(__name__)
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS carbon_periods (
@@ -186,6 +189,18 @@ class CarbonRefresher:
                else now + timedelta(hours=48))
         self._task = asyncio.create_task(self._fetch(region, now, start, end))
 
+    async def _get(self, client: httpx.AsyncClient, url: str) -> tuple[int, bytes | None]:
+        # Streamed so an oversized body is never buffered or parsed whole.
+        async with client.stream("GET", url) as response:
+            if response.status_code != 200:
+                return response.status_code, None
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body += chunk
+                if len(body) > _MAX_BODY:
+                    return 200, None
+            return 200, bytes(body)
+
     async def _fetch(self, region: int, now: datetime, start: datetime, end: datetime) -> None:
         url = (f"{NESO_BASE_URL}/regional/intensity/{start:%Y-%m-%dT%H:%MZ}/"
                f"{end:%Y-%m-%dT%H:%MZ}/regionid/{region}")
@@ -194,13 +209,16 @@ class CarbonRefresher:
                 asyncio.timeout(20),
                 httpx.AsyncClient(timeout=20, trust_env=False) as client,
             ):
-                response = await client.get(url)
-                if response.status_code == 500 and self._region() == region:
-                    response = await client.get(url)
-                if response.status_code != 200:
+                status, body = await self._get(client, url)
+                if status == 500 and self._region() == region:
+                    status, body = await self._get(client, url)
+                if status != 200:
                     log.warning("Carbon fetch failed: http_status")
                     return
-                rows = _validate(response.json(), region, start, end)
+                if body is None:
+                    log.warning("Carbon fetch failed: oversized")
+                    return
+                rows = _validate(json.loads(body), region, start, end)
                 if not rows:
                     log.warning("Carbon fetch failed: invalid_payload")
                     return

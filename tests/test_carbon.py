@@ -363,3 +363,18 @@ async def test_region_cleared_before_retry_or_commit_is_not_fetched_or_stored(tm
     assert (await carbon_payload(path, 12, NOW))["status"] == "unavailable"
     await late.close()
     await refresher.close()
+
+
+@respx.mock
+async def test_oversized_neso_body_is_refused_unparsed(tmp_path, caplog):
+    path = str(tmp_path / "carbon.db")
+    refresher = CarbonRefresher(path, lambda: 12)
+    body = json.dumps(envelope([row()] * 20_000)).encode()
+    assert len(body) > 1_000_000
+    respx.get(url__startswith="https://api.carbonintensity.org.uk/").mock(
+        return_value=httpx.Response(200, content=body))
+    refresher.tick(NOW, "Europe/London", None)
+    await refresher.wait()
+    assert (await carbon_payload(path, 12, NOW))["rows"] == []
+    assert "Carbon fetch failed: oversized" in caplog.text
+    await refresher.close()

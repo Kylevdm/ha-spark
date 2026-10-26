@@ -7,6 +7,7 @@ a recorded forecast or validated measurement; nothing is interpolated or invente
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any
@@ -57,8 +58,10 @@ def history_payload(
         })
     return {
         "buckets": buckets,
-        "totals": {"solar_forecast_kwh": total,
-                   "solar_measured_kwh": measured_total if measured_reason is None else None},
+        # Finite values can still sum past float range; an overflowed total is unknown.
+        "totals": {"solar_forecast_kwh": total if math.isfinite(total) else None,
+                   "solar_measured_kwh": (measured_total if measured_reason is None
+                                          and math.isfinite(measured_total) else None)},
         "coverage": (trustworthy / completed
                      if completed and measured_reason is None else None),
         "unavailable": {"solar_measured": measured_reason} if measured_reason else {},
