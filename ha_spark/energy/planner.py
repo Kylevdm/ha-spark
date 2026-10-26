@@ -72,7 +72,7 @@ from ha_spark.energy.models import (
     Reservation,
     V2LRefill,
 )
-from ha_spark.energy.plan_view import SocPoint, build_plan_view
+from ha_spark.energy.plan_view import SocPoint, build_plan_view, v2l_refill_reason
 from ha_spark.energy.tariff import TariffSchedule, _controlled_windows
 
 
@@ -891,8 +891,8 @@ def _v2l_refills(
             saving += amount * (schedule.prices[target] - price)
             actions.append(V2LRefill(
                 slot=slot, kwh=amount, rate_kw=rate,
-                reason=(f"Refill the house battery with {amount:.2f} kWh from V2L for "
-                        f"the {reservation.name} reservation."),
+                reason=v2l_refill_reason(amount, reservation.name),
+                reservation=reservation.name,
             ))
             stored, _ = ledger()
             if need <= 1e-9 or budget <= 1e-9:

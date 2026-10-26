@@ -403,6 +403,7 @@ class V2LRefill:
     kwh: float
     rate_kw: float
     reason: str
+    reservation: str = ""
 
 
 @dataclass(frozen=True)

@@ -2337,7 +2337,8 @@ def test_plan_view_headline_costs_and_model(slots: bool) -> None:
     assert view.costs.planned == plan.planned_cost
     assert view.costs.baseline == plan.baseline_cost
     assert view.costs.export_revenue == plan.export_revenue
-    assert view.lines == ()
+    assert any(line.kind == "charge" and line.kwh == plan.required_kwh for line in view.lines)
+    assert all(line.start is None and line.end is None for line in view.lines)
     assert view.slots == (() if slots else None)
     assert view.soc == (() if slots else None)
 
