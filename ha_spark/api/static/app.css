@@ -33,6 +33,13 @@ button:disabled { cursor: not-allowed; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 dialog { max-width: min(36rem, 95vw); background: var(--surface); color: var(--text); }
 :focus-visible { outline: .2rem solid var(--accent); outline-offset: .15rem; }
+.plan-headline, .plan-costs { display: flex; flex-wrap: wrap; gap: 1rem; }
+.plan-headline > div, .plan-costs > div { padding: 1rem; }
+.plan-costs > div { background: var(--surface); border: 1px solid var(--border); border-radius: .5rem; }
+.plan-headline dt, .plan-costs dt { color: var(--muted); }
+.plan-headline dd, .plan-costs dd { margin: .5rem 0 0; overflow-wrap: anywhere; }
+.plan-costs dd { font-size: 1.4rem; }
+.plan-warnings { padding-inline-start: 1.5rem; }
 @media (max-width: 40rem) {
     nav { width: 5rem; padding: .5rem; }
     nav strong { font-size: .8rem; }

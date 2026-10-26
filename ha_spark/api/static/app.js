@@ -13,15 +13,65 @@ function Mode({health, refresh}) {
     return html`<div ref=${root}></div>`;
 }
 
+// Display rounding only; the values themselves come from the timeline.
+function fmt(value, digits) {
+    return value == null ? "—" : Number(value).toFixed(digits);
+}
+
 function Plan({health}) {
-    if (health.configuration?.status === "configuration_repair") {
+    const [payload, setPayload] = useState(null);
+    const [failed, setFailed] = useState(false);
+    const repair = health.configuration?.status === "configuration_repair";
+    useEffect(() => {
+        if (repair || health.daemon !== "running") return;
+        let active = true;
+        setPayload(null);
+        setFailed(false);
+        async function load() {
+            try {
+                const response = await fetch("api/plan", {cache: "no-store"});
+                if (!response.ok) throw new Error("plan unavailable");
+                const result = await response.json();
+                if (active) setPayload(result);
+            } catch {
+                if (active) setFailed(true);
+            }
+        }
+        void load();
+        return () => { active = false; };
+    }, [repair, health.daemon, health.plan_at]);
+    if (repair) {
         return html`<section><h1>Plan</h1><p>Configuration needs repair. Import a valid
             configuration with the CLI: <code>ha-spark config import FILE</code>.</p></section>`;
     }
     if (health.daemon !== "running") {
         return html`<section><h1>Plan</h1><p>daemon not running</p></section>`;
     }
-    return html`<section><h1>Plan</h1><p>no plan yet</p></section>`;
+    if (failed) return html`<section><h1>Plan</h1><p>Plan unavailable. Reload to try again.</p></section>`;
+    if (!payload) return html`<section><h1>Plan</h1><p>Loading plan…</p></section>`;
+    const timeline = payload.timeline;
+    if (!timeline) return html`<section><h1>Plan</h1><p>no plan yet</p></section>`;
+    const {headline, costs} = timeline;
+    return html`<section>
+        <h1>Plan</h1>
+        <p>Computed at <time datetime=${payload.generated_at}>${payload.generated_at}</time></p>
+        <p>Model: ${timeline.model} · Strategy: ${timeline.strategy}</p>
+        <dl class="plan-headline">
+            <div><dt>Battery SoC</dt><dd>${fmt(headline.soc_now, 0)} %</dd></div>
+            <div><dt>Target SoC</dt><dd>${fmt(headline.target_soc, 0)} %</dd></div>
+            <div><dt>Charge needed</dt><dd>${fmt(headline.required_kwh, 2)} kWh</dd></div>
+            <div><dt>Minimum SoC</dt><dd>${fmt(headline.min_soc, 0)} %</dd></div>
+            <div><dt>Battery capacity</dt><dd>${fmt(headline.capacity_kwh, 1)} kWh</dd></div>
+        </dl>
+        <dl class="plan-costs">
+            <div><dt>Planned cost</dt><dd>£ ${fmt(costs.planned, 2)}</dd></div>
+            <div><dt>Without battery</dt><dd>£ ${fmt(costs.baseline, 2)}</dd></div>
+            ${costs.export_revenue != null && costs.export_revenue !== 0 ? html`
+                <div><dt>Export revenue</dt><dd>£ ${fmt(costs.export_revenue, 2)}</dd></div>` : null}
+        </dl>
+        <ul class="plan-warnings">${timeline.lines.map(line => html`
+            <li>${line.text}</li>`)}</ul>
+    </section>`;
 }
 
 function App() {

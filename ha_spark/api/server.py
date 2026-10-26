@@ -48,6 +48,7 @@ from ha_spark.api.contract import (
     version_refusal,
 )
 from ha_spark.api.static_assets import packaged_assets
+from ha_spark.api.timeline import timeline_payload
 from ha_spark.authority import OperatingMode, authority_view, load_authority
 from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import DaemonChannel
@@ -554,13 +555,25 @@ def build_app(
     async def get_plan(request: Request) -> dict[str, Any]:
         """The latest plan as the same sensor payload the daemon would push."""
         st = _state_of(request)
-        if st.plan is None:
-            return {"plan": None, "generated_at": None}
-        entities = [
-            {"entity_id": eid, "state": value, "attributes": attrs}
-            for eid, value, attrs in plan_to_payload(st.plan, st.settings)
-        ]
-        return {"plan": entities, "generated_at": _iso(st.plan_at)}
+        result: dict[str, Any] = {"plan": None, "generated_at": None}
+        if st.plan is not None:
+            result = {
+                "plan": [
+                    {"entity_id": eid, "state": value, "attributes": attrs}
+                    for eid, value, attrs in plan_to_payload(st.plan, st.settings)
+                ],
+                "generated_at": _iso(st.plan_at),
+            }
+        if ingress:
+            if st.executor is not None:
+                mode = st.executor.authority_status()["mode"]
+            else:
+                loaded = load_authority(st.settings)
+                mode = authority_view(loaded.state, known=loaded.status == "known")["mode"]
+            result["timeline"] = (
+                timeline_payload(st.plan_run, mode) if st.plan is not None else None
+            )
+        return result
 
     app.include_router(agent_router)
     # FastAPI router dependencies (the ``_auth`` gate above) do NOT propagate to a

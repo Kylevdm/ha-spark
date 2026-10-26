@@ -56,6 +56,7 @@ the battery holds (doesn't discharge) while cheap grid covers the house.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
@@ -71,6 +72,7 @@ from ha_spark.energy.models import (
     Reservation,
     V2LRefill,
 )
+from ha_spark.energy.plan_view import build_plan_view
 from ha_spark.energy.tariff import TariffSchedule, _controlled_windows
 
 
@@ -1134,7 +1136,7 @@ def compute_plan(
         ),
     )
 
-    return ChargePlan(
+    plan = ChargePlan(
         soc=inputs.soc,
         capacity_kwh=cfg.capacity_kwh,
         solar_kwh=inputs.served_day_solar_kwh,
@@ -1177,3 +1179,4 @@ def compute_plan(
         overnight_charge_capped=overnight_charge_capped,
         soc_path=soc_path,
     )
+    return replace(plan, view=build_plan_view(plan, cfg))
