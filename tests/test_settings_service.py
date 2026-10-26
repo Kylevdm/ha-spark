@@ -69,7 +69,7 @@ def test_carbon_region_save_and_export_import(service, region):
     service.import_document(document, service.revision, "import")
     assert service.settings.carbon_region == region
     assert service.read_view()["metadata"]["carbon_region"] == {
-        "owner": "addon", "secret": False, "reload": "live",
+        "owner": "addon", "secret": False, "reload": "live", "display_only": True,
     }
 
 
@@ -102,6 +102,28 @@ def test_carbon_region_only_save_does_not_replan_or_fence(service):
     save(service, {"carbon_region": 3, "min_soc": 25})
     assert snapshots == [service.settings]
     assert execution_context().config_generation == generation + 1
+
+
+@pytest.mark.parametrize("other_field", ["min_soc", "notify_service"])
+def test_carbon_region_mixed_save_requests_replan(service, other_field):
+    snapshots = []
+    service.request_replan = lambda: snapshots.append(service.settings)
+    value = 25 if other_field == "min_soc" else "phone"
+    result = save(service, {"carbon_region": 3, other_field: value})
+    assert result["changed"] == sorted(["carbon_region", other_field])
+    assert snapshots == [service.settings]
+    assert service.settings.carbon_region == 3
+    assert getattr(service.settings, other_field) == value
+
+
+@pytest.mark.parametrize("changes", [{}, {"carbon_region": 3}])
+def test_unchanged_save_still_requests_replan(service, changes):
+    save(service, {"carbon_region": 3})
+    snapshots = []
+    service.request_replan = lambda: snapshots.append(service.settings)
+    result = save(service, changes)
+    assert result["changed"] == []
+    assert snapshots == [service.settings]
 
 
 def test_read_view_masks_only_set_secrets(service):
@@ -381,5 +403,5 @@ def test_removing_a_running_restart_input_stays_pending(service):
 def test_read_view_carries_field_metadata(service):
     metadata = service.read_view()["metadata"]
     assert metadata["solis_modbus_slave"] == {"owner": "integration", "secret": False,
-                                              "reload": "restart"}
+                                              "reload": "restart", "display_only": False}
     assert metadata["octopus_api_key"]["secret"] is True
