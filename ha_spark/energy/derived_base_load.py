@@ -36,10 +36,10 @@ from datetime import UTC, datetime, timedelta
 
 from ha_spark.config import Settings
 from ha_spark.energy.onboarding import (
-    _ENERGY_FACTORS,
-    _POWER_FACTORS,
     BACKFILL_NAME,
     BACKFILL_STATISTIC_ID,
+    ENERGY_FACTORS,
+    POWER_FACTORS,
     SUPPORTED_UNITS,
     statistic_unit,
     to_import_stats,
@@ -304,7 +304,7 @@ def build_component_series(
 ) -> ComponentSeries:
     """Convert one component's raw hourly rows to a canonical-direction series.
 
-    Unit handling stays in one place (``_POWER_FACTORS`` / ``_ENERGY_FACTORS``
+    Unit handling stays in one place (``POWER_FACTORS`` / ``ENERGY_FACTORS``
     in ``energy/onboarding.py``) — the same constants the source-entity
     backfill uses — but here we deliberately *do not* clamp negatives to
     zero before applying the invert flag. The legacy
@@ -318,10 +318,10 @@ def build_component_series(
     ``negative_clamped`` counter now reports any sign-convention warning
     it actually produces, instead of always-zero contributions hiding it.
     """
-    if unit in _POWER_FACTORS:
-        factor, key = _POWER_FACTORS[unit], "mean"
-    elif unit in _ENERGY_FACTORS:
-        factor, key = _ENERGY_FACTORS[unit], "change"
+    if unit in POWER_FACTORS:
+        factor, key = POWER_FACTORS[unit], "mean"
+    elif unit in ENERGY_FACTORS:
+        factor, key = ENERGY_FACTORS[unit], "change"
     else:
         raise ValueError(
             f"Unsupported unit {unit!r} for {spec.entity_id}; "

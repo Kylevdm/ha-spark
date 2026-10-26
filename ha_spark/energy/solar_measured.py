@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, TypeGuard
 
 from ha_spark.config import Settings
-from ha_spark.energy.onboarding import _ENERGY_FACTORS, _POWER_FACTORS, statistic_unit
+from ha_spark.energy.onboarding import ENERGY_FACTORS, POWER_FACTORS, statistic_unit
 from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.logging import get_logger
 
@@ -46,7 +46,7 @@ async def read_statistics(settings: Settings, start: datetime) -> tuple[
     if match is None:
         return None, []
     unit = statistic_unit(match)
-    if unit not in _ENERGY_FACTORS and unit not in _POWER_FACTORS:
+    if unit not in ENERGY_FACTORS and unit not in POWER_FACTORS:
         return unit, []
     rows = await statistics_during_period(
         settings.ha_websocket_url, settings.auth_token, entity, start,
@@ -67,9 +67,9 @@ def _number(value: object) -> TypeGuard[int | float]:
 def _measure(
     rows: list[dict[str, Any]], unit: str, start: datetime, end: datetime,
 ) -> dict[datetime, float]:
-    key = "change" if unit in _ENERGY_FACTORS else "mean"
-    factor = (_ENERGY_FACTORS[unit] if unit in _ENERGY_FACTORS
-              else _POWER_FACTORS[unit] / 12)
+    key = "change" if unit in ENERGY_FACTORS else "mean"
+    factor = (ENERGY_FACTORS[unit] if unit in ENERGY_FACTORS
+              else POWER_FACTORS[unit] / 12)
     values: dict[datetime, float] = {}
     seen: set[datetime] = set()
     invalid: set[datetime] = set()
@@ -149,7 +149,7 @@ class MeasuredSolar:
                 unit, rows = await self.reader(settings, start)
                 if unit is None:
                     return MeasuredResult({}, "no_statistics")
-                if unit not in _ENERGY_FACTORS and unit not in _POWER_FACTORS:
+                if unit not in ENERGY_FACTORS and unit not in POWER_FACTORS:
                     return MeasuredResult({}, "unsupported_unit")
                 if not rows:
                     return MeasuredResult({}, "no_statistics")

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, time
+from datetime import UTC, date, datetime, time
 from typing import TYPE_CHECKING
 
 from ha_spark.energy.evidence_freshness import EvidenceFreshness
@@ -22,6 +22,11 @@ def window_hours(start: time, end: time) -> float:
     s = start.hour + start.minute / 60
     e = end.hour + end.minute / 60
     return (e - s) % 24 or 24.0
+
+
+def utc_iso(at: datetime) -> str:
+    """Format an instant as UTC ISO-8601, regardless of input timezone."""
+    return at.astimezone(UTC).isoformat()
 
 
 @dataclass(frozen=True)
@@ -339,7 +344,7 @@ class ChargeIntent:
         already resolved.
         """
         return self.ev_hold_active or any(
-            _align(start, now) <= now < _align(end, now) for start, end in self.holds
+            align(start, now) <= now < align(end, now) for start, end in self.holds
         )
 
     def hold_overlaps(self, start: datetime, end: datetime) -> bool:
@@ -351,12 +356,12 @@ class ChargeIntent:
         reach and admits windows a later hold will interrupt.
         """
         return self.ev_hold_active or any(
-            _align(hold_start, start) < end and start < _align(hold_end, start)
+            align(hold_start, start) < end and start < align(hold_end, start)
             for hold_start, hold_end in self.holds
         )
 
 
-def _align(moment: datetime, reference: datetime) -> datetime:
+def align(moment: datetime, reference: datetime) -> datetime:
     """Read a naive hold bound on ``reference``'s clock.
 
     Hold bounds come from a dispatch attribute HA renders itself, so they may
