@@ -44,6 +44,7 @@ def test_ingress_timeline_contract_and_household_dst(tmp_path, slots, monkeypatc
             return datetime(2026, 10, 25, 1, 10, tzinfo=UTC)
 
     monkeypatch.setattr("ha_spark.energy.publish.datetime", Clock)
+    monkeypatch.setattr("ha_spark.api.server.datetime", Clock)
     state = _state(tmp_path)
     record = stored_run(slots=slots)
     state.set_plan(record.run.plan, record)
@@ -53,7 +54,7 @@ def test_ingress_timeline_contract_and_household_dst(tmp_path, slots, monkeypatc
     timeline = body.pop("timeline")
     assert set(timeline) == {
         "model", "operating_mode", "strategy", "headline", "costs", "lines",
-        "horizon_start", "slot_minutes", "now", "slots", "soc",
+        "horizon_start", "today_start", "slot_minutes", "now", "slots", "soc",
     }
     assert timeline["model"] == ("slots" if slots else "daily")
     assert timeline["operating_mode"] == mode
@@ -73,6 +74,7 @@ def test_ingress_timeline_contract_and_household_dst(tmp_path, slots, monkeypatc
     assert timeline["slot_minutes"] == 30
     assert timeline["horizon_start"] == "2026-10-25T01:30:00+01:00"
     assert timeline["now"] == "2026-10-25T01:10:00+00:00"
+    assert timeline["today_start"] == "2026-10-25T00:00:00+01:00"
     if slots:
         assert len(timeline["slots"]) == 48
         assert timeline["slots"][0]["start"] == "2026-10-25T01:30:00+01:00"
@@ -102,6 +104,34 @@ def test_ingress_timeline_contract_and_household_dst(tmp_path, slots, monkeypatc
         assert client.get("/api/plan", headers={
             "X-Forwarded-For": INGRESS_PROXY_IP, "X-Remote-User-Id": "owner",
         }).status_code == 403
+
+
+@pytest.mark.parametrize("now,expected", [
+    # The request's clock decides today_start, on both DST days ...
+    (datetime(2026, 3, 29, 12, tzinfo=UTC), "2026-03-29T00:00:00+00:00"),
+    (datetime(2026, 10, 25, 12, tzinfo=UTC), "2026-10-25T00:00:00+01:00"),
+    # ... and for a plan computed yesterday, whose horizon starts before today.
+    (datetime(2026, 10, 26, 12, tzinfo=UTC), "2026-10-26T00:00:00+00:00"),
+])
+def test_ingress_timeline_today_start_for_dst_and_stale_horizon(
+    tmp_path, monkeypatch, now, expected,
+):
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz is not None else now
+
+    monkeypatch.setattr("ha_spark.api.server.datetime", Clock)
+    state = _state(tmp_path)
+    record = stored_run()
+    state.set_plan(record.run.plan, record)
+    with owner_client(state) as client:
+        timeline = client.get("/api/plan").json()["timeline"]
+    assert timeline["today_start"] == expected
+    assert timeline["now"] == record.run.inputs.now.astimezone(LONDON).isoformat()
+    assert timeline["horizon_start"] == "2026-10-25T01:30:00+01:00"
+    if now.day == 26:
+        assert datetime.fromisoformat(timeline["horizon_start"]) < datetime.fromisoformat(expected)
 
 
 def test_ingress_timeline_null_without_stored_run(tmp_path):

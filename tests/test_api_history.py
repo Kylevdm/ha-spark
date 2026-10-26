@@ -46,26 +46,29 @@ def _midnight(now: datetime) -> datetime:
 
 
 @pytest.mark.parametrize(
-    ("params",),
+    ("params", "error"),
     [
-        ({"to": "2026-01-12T15:10:00+00:00"},),  # no resolution
-        ({"resolution": "day", "from": "x", "to": "x"},),
-        ({"resolution": "slot", "from": "2026-01-12T00:00:00"},),  # naive from, no to
+        ({"to": "2026-01-12T15:10:00+00:00"}, "unsupported resolution"),  # no resolution
+        ({"resolution": "day", "from": "x", "to": "x"}, "unsupported resolution"),
+        # Naive from, no to.
+        ({"resolution": "slot", "from": "2026-01-12T00:00:00"}, "invalid history range"),
         # Parseable but unrepresentable in UTC: a 400, never a 500.
-        ({"resolution": "slot", "from": "0001-01-01T00:00:00+14:00"},),
-        ({"resolution": "slot", "to": "9999-12-31T23:59:59-14:00"},),
+        ({"resolution": "slot", "from": "0001-01-01T00:00:00+14:00"}, "invalid history range"),
+        ({"resolution": "slot", "to": "9999-12-31T23:59:59-14:00"}, "invalid history range"),
         # Naive timestamps are rejected: an instant needs its offset.
         ({"resolution": "slot", "from": "2026-01-12T00:00:00",
-          "to": "2026-01-12T15:10:00"},),
-        ({"resolution": "slot", "from": "not-a-time", "to": "not-a-time"},),
-        ({"resolution": "slot", "from": "2026-01-12", "to": "2026-01-12"},),
+          "to": "2026-01-12T15:10:00"}, "invalid history range"),
+        ({"resolution": "slot", "from": "not-a-time", "to": "not-a-time"},
+         "invalid history range"),
+        ({"resolution": "slot", "from": "2026-01-12", "to": "2026-01-12"},
+         "invalid history range"),
     ],
 )
-def test_history_rejects_malformed_queries(tmp_path, params):
+def test_history_rejects_malformed_queries(tmp_path, params, error):
     with owner_client(_state(tmp_path)) as client:
         response = client.get("/api/history", params=params)
     assert response.status_code == 400
-    assert response.json()["error"] in {"unsupported resolution", "invalid history range"}
+    assert response.json() == {"error": error}
 
 
 @pytest.mark.parametrize(
@@ -88,8 +91,9 @@ def test_history_rejects_ranges_outside_today(tmp_path, monkeypatch, from_iso, t
     assert response.json() == {"error": "history range must be inside today"}
 
 
-def test_history_serves_a_range_inside_today_with_any_zone_offset(tmp_path):
-    now = datetime.now(LONDON)
+def test_history_serves_a_range_inside_today_with_any_zone_offset(tmp_path, monkeypatch):
+    now = datetime(2026, 10, 25, 15, 10, tzinfo=LONDON)
+    _frozen_server_clock(monkeypatch, now)
     midnight = _midnight(now)
     with owner_client(_state(tmp_path)) as client:
         response = client.get("/api/history", params={
@@ -99,6 +103,9 @@ def test_history_serves_a_range_inside_today_with_any_zone_offset(tmp_path):
             "to": now.isoformat(),
         })
     assert response.status_code == 200
+    buckets = response.json()["buckets"]
+    assert datetime.fromisoformat(buckets[0]["start"]) == midnight
+    assert datetime.fromisoformat(buckets[-1]["start"]) < now
 
 
 async def test_history_buckets_and_totals(tmp_path, monkeypatch):

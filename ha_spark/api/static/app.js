@@ -3,7 +3,7 @@ import {html, render, useState, useEffect, useRef, useCallback}
 import {mountMode} from "./mode.js";
 import {Controls} from "./plan/controls.js";
 import {PlanParts} from "./plan/registry.js";
-import {TodaySpan} from "./plan/today.js";
+import {number} from "./plan/axis.js";
 
 function screenFromHash() {
     return location.hash === "#/mode" ? "mode" : "plan";
@@ -14,11 +14,6 @@ function Mode({health, refresh}) {
     const repair = health.configuration?.status;
     useEffect(() => mountMode(root.current, health, refresh), [health.daemon, repair]);
     return html`<div ref=${root}></div>`;
-}
-
-// Display rounding only; the values themselves come from the timeline.
-function fmt(value, digits) {
-    return value == null ? "—" : Number(value).toFixed(digits);
 }
 
 function Plan({health}) {
@@ -49,13 +44,16 @@ function Plan({health}) {
             configuration with the CLI: <code>ha-spark config import FILE</code>.</p></section>`;
     }
     if (health.daemon !== "running") {
-        return html`<section><h1>Plan</h1><p>daemon not running</p></section>`;
+        return html`<section><h1>Plan</h1><p>daemon not running</p>
+            <${Controls} health=${health} reload=${() => setReloadCount(reloadCount + 1)}/>
+        </section>`;
     }
     if (failed) return html`<section><h1>Plan</h1><p>Plan unavailable. Reload to try again.</p></section>`;
     if (!payload) return html`<section><h1>Plan</h1><p>Loading plan…</p></section>`;
     const timeline = payload.timeline;
     if (!timeline) return html`<section><h1>Plan</h1><p>no plan yet</p>
-        <${TodaySpan} timeline=${null}/></section>`;
+        <${Controls} health=${health} reload=${() => setReloadCount(reloadCount + 1)}/>
+        <${PlanParts} health=${health} timeline=${null}/></section>`;
     const {headline, costs} = timeline;
     return html`<section>
         <h1>Plan</h1>
@@ -63,17 +61,17 @@ function Plan({health}) {
         <p>Computed at <time datetime=${payload.generated_at}>${payload.generated_at}</time></p>
         <p>Model: ${timeline.model} · Strategy: ${timeline.strategy}</p>
         <dl class="plan-headline">
-            <div><dt>Battery SoC</dt><dd>${fmt(headline.soc_now, 0)} %</dd></div>
-            <div><dt>Target SoC</dt><dd>${fmt(headline.target_soc, 0)} %</dd></div>
-            <div><dt>Charge needed</dt><dd>${fmt(headline.required_kwh, 2)} kWh</dd></div>
-            <div><dt>Minimum SoC</dt><dd>${fmt(headline.min_soc, 0)} %</dd></div>
-            <div><dt>Battery capacity</dt><dd>${fmt(headline.capacity_kwh, 1)} kWh</dd></div>
+            <div><dt>Battery SoC</dt><dd>${number(headline.soc_now, 0)} %</dd></div>
+            <div><dt>Target SoC</dt><dd>${number(headline.target_soc, 0)} %</dd></div>
+            <div><dt>Charge needed</dt><dd>${number(headline.required_kwh, 2)} kWh</dd></div>
+            <div><dt>Minimum SoC</dt><dd>${number(headline.min_soc, 0)} %</dd></div>
+            <div><dt>Battery capacity</dt><dd>${number(headline.capacity_kwh, 1)} kWh</dd></div>
         </dl>
         <dl class="plan-costs">
-            <div><dt>Planned cost</dt><dd>£ ${fmt(costs.planned, 2)}</dd></div>
-            <div><dt>Without battery</dt><dd>£ ${fmt(costs.baseline, 2)}</dd></div>
+            <div><dt>Planned cost</dt><dd>£ ${number(costs.planned, 2)}</dd></div>
+            <div><dt>Without battery</dt><dd>£ ${number(costs.baseline, 2)}</dd></div>
             ${costs.export_revenue != null && costs.export_revenue !== 0 ? html`
-                <div><dt>Export revenue</dt><dd>£ ${fmt(costs.export_revenue, 2)}</dd></div>` : null}
+                <div><dt>Export revenue</dt><dd>£ ${number(costs.export_revenue, 2)}</dd></div>` : null}
         </dl>
         <${PlanParts} health=${health} timeline=${timeline}/>
     </section>`;

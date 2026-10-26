@@ -49,7 +49,7 @@ from ha_spark.api.contract import (
 )
 from ha_spark.api.history import bucket_starts, history_payload
 from ha_spark.api.static_assets import packaged_assets
-from ha_spark.api.timeline import timeline_payload
+from ha_spark.api.timeline import household_midnight, timeline_payload
 from ha_spark.authority import OperatingMode, authority_view, load_authority
 from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import CONFIGURATION_REPAIR, DaemonChannel
@@ -593,10 +593,7 @@ def build_app(
             st = _state_of(request)
             tz = load_timezone(st.settings.timezone)
             now = datetime.now(tz)
-            # The day's first local midnight, even when midnight itself repeats.
-            midnight = now.replace(
-                hour=0, minute=0, second=0, microsecond=0, fold=0
-            ).astimezone(UTC)
+            midnight = household_midnight(now).astimezone(UTC)
             # Omitted bounds mean "today so far", so the browser never has to
             # work out the household's midnight offset itself.
             try:
@@ -671,7 +668,8 @@ def build_app(
                 loaded = load_authority(st.settings)
                 mode = authority_view(loaded.state, known=loaded.status == "known")["mode"]
             result["timeline"] = (
-                timeline_payload(st.plan_run, mode) if st.plan is not None else None
+                timeline_payload(st.plan_run, mode, datetime.now(UTC))
+                if st.plan is not None else None
             )
         return result
 
