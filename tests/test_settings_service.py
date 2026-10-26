@@ -60,6 +60,50 @@ def test_load_overlays_options_and_can_skip_validation(service, monkeypatch):
     assert fresh.settings is settings
 
 
+@pytest.mark.parametrize("region", [*range(1, 18), None])
+def test_carbon_region_save_and_export_import(service, region):
+    save(service, {"carbon_region": region})
+    assert service.settings.carbon_region == region
+    document = service.export()
+    save(service, {"carbon_region": 2 if region != 2 else 3})
+    service.import_document(document, service.revision, "import")
+    assert service.settings.carbon_region == region
+    assert service.read_view()["metadata"]["carbon_region"] == {
+        "owner": "addon", "secret": False, "reload": "live",
+    }
+
+
+@pytest.mark.parametrize("region", [0, 18, True, False, "1", 1.0, 1.5])
+def test_carbon_region_refuses_non_region_values_atomically(service, region):
+    before = pair(service)
+    snapshot, revision = service.settings, service.revision
+    with pytest.raises(ConfigError, match="carbon_region"):
+        save(service, {"carbon_region": region})
+    assert pair(service) == before
+    assert service.settings is snapshot
+    assert service.revision == revision
+
+
+def test_carbon_region_only_save_does_not_replan_or_fence(service):
+    snapshots = []
+    service.request_replan = lambda: snapshots.append(service.settings)
+    generation = execution_context().config_generation
+    revision = service.revision
+    authority = seed_authority(service.settings, "observe")
+    before = authority.store_path.read_bytes()
+    for region in (1, 17, None):
+        result = save(service, {"carbon_region": region})
+        revision += 1
+        assert result == {"revision": revision, "changed": ["carbon_region"], "status": "live"}
+        assert service.settings.carbon_region == region
+        assert execution_context().config_generation == generation
+        assert snapshots == []
+        assert authority.store_path.read_bytes() == before
+    save(service, {"carbon_region": 3, "min_soc": 25})
+    assert snapshots == [service.settings]
+    assert execution_context().config_generation == generation + 1
+
+
 def test_read_view_masks_only_set_secrets(service):
     view = service.read_view()["settings"]
     assert view["octopus_api_key"] == {"secret": True, "set": True}

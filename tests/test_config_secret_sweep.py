@@ -68,7 +68,12 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
             state.set_plan(record.run.plan, record)
             plan_response = client.get("/api/plan")
             assert plan_response.status_code == 200
-            assert plan_response.json()["timeline"] is not None
+            timeline = plan_response.json()["timeline"]
+            assert timeline is not None
+            assert len(timeline["slots"]) == 48
+            assert timeline["slots"][0]["load_kwh"] == 0.25
+            # Include the newly populated slots and every new chart asset in
+            # the same response/log canary sweep as the configuration surfaces.
             surfaces.append(plan_response.text)
             # The replan route: no executor on this state, and an invalid user id
             # is refused (and never logged) before anything else.
@@ -84,6 +89,14 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
                 response = client.get(path)
                 assert response.status_code == 200
                 surfaces.append(response.text)
+            for region in (1, CANARY, {"untrusted": CANARY}, None):
+                response = client.post("/api/config", json={
+                    "expected_revision": service.revision,
+                    "changes": {"carbon_region": region},
+                })
+                assert response.status_code == (200 if region in (1, None) else 400)
+                surfaces.append(response.text)
+            surfaces.extend([client.get("/api/config").text, service.export()])
             for response in (
                 client.get("/api/config"),
                 client.post("/api/config", json={"expected_revision": service.revision,

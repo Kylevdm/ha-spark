@@ -404,6 +404,11 @@ class Settings(BaseSettings):
             }
         return init_settings, env_settings, dotenv_settings
 
+    # Display-only grid carbon; never an actuation input.
+    carbon_region: Annotated[
+        Annotated[int, Field(strict=True, ge=1, le=17)] | None, _metadata("addon")
+    ] = None
+
     # --- Home Assistant ---
     # Add-on mode is the default (URLs/token derived from the Supervisor).
     # Setting both ha_url and ha_token switches to standalone/dev mode.
