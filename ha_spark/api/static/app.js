@@ -3,6 +3,7 @@ import {html, render, useState, useEffect, useRef, useCallback}
 import {mountMode} from "./mode.js";
 import {Controls} from "./plan/controls.js";
 import {PlanParts} from "./plan/registry.js";
+import {TodaySpan} from "./plan/today.js";
 
 function screenFromHash() {
     return location.hash === "#/mode" ? "mode" : "plan";
@@ -53,7 +54,8 @@ function Plan({health}) {
     if (failed) return html`<section><h1>Plan</h1><p>Plan unavailable. Reload to try again.</p></section>`;
     if (!payload) return html`<section><h1>Plan</h1><p>Loading plan…</p></section>`;
     const timeline = payload.timeline;
-    if (!timeline) return html`<section><h1>Plan</h1><p>no plan yet</p></section>`;
+    if (!timeline) return html`<section><h1>Plan</h1><p>no plan yet</p>
+        <${TodaySpan} timeline=${null}/></section>`;
     const {headline, costs} = timeline;
     return html`<section>
         <h1>Plan</h1>

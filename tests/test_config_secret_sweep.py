@@ -4,7 +4,9 @@ import asyncio
 import io
 import json
 from dataclasses import replace
+from datetime import datetime
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -94,6 +96,21 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
                 response = client.get(path)
                 assert response.status_code == 200
                 surfaces.append(response.text)
+            # The history response joins the sweep: a valid range today, and a
+            # malformed one whose reply is pinned to fixed text (never the input).
+            now = datetime.now(ZoneInfo(bootstrap.timezone))
+            midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            history = client.get("/api/history", params={
+                "resolution": "slot", "from": midnight.isoformat(), "to": now.isoformat(),
+            })
+            assert history.status_code == 200
+            surfaces.append(history.text)
+            refused = client.get("/api/history", params={
+                "resolution": "slot", "from": "not-a-time", "to": "not-a-time",
+            })
+            assert refused.status_code == 400
+            assert refused.json() == {"error": "invalid history range"}
+            surfaces.append(refused.text)
             for region in (1, CANARY, {"untrusted": CANARY}, None):
                 response = client.post("/api/config", json={
                     "expected_revision": service.revision,
