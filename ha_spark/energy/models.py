@@ -11,6 +11,7 @@ from ha_spark.energy.soc_integrity import SocMeasurement
 
 if TYPE_CHECKING:
     from ha_spark.energy.horizon import HorizonGeometry
+    from ha_spark.energy.plan_view import PlanView
 
 # Half-hour slots in a (non-DST-transition) day; the planner horizon is always 48.
 SLOTS_PER_DAY = 48
@@ -453,6 +454,7 @@ class ChargePlan:
     # plan is followed (slot model only). Lets a later reading show the plan
     # was wrong (#208).
     soc_path: tuple[tuple[datetime, float], ...] = ()
+    view: PlanView | None = None
 
     @property
     def served_day_solar_kwh(self) -> float:

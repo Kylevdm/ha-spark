@@ -15,6 +15,7 @@ from ha_spark.devices.execution import execution_context
 from ha_spark.settings_service import ConfigurationRepair, SettingsService
 from tests.api_helpers import owner_client
 from tests.authority_helpers import seed_authority, seed_settings
+from tests.test_plan_timeline import stored_run
 
 CANARY = "SECRET-SWEEP-466-DO-NOT-ECHO"
 
@@ -62,6 +63,12 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
             surfaces.append(reply.model_dump())
         state = AppState(bootstrap, tmp_path / "options.json", settings_service=service)
         with owner_client(state) as client:
+            record = stored_run()
+            state.set_plan(record.run.plan, record)
+            plan_response = client.get("/api/plan")
+            assert plan_response.status_code == 200
+            assert plan_response.json()["timeline"] is not None
+            surfaces.append(plan_response.text)
             for path in ["/", "/api/health", *(f"/static/{name}" for name in packaged_assets())]:
                 response = client.get(path)
                 assert response.status_code == 200
