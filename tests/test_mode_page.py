@@ -73,12 +73,13 @@ def test_page_assets_security(tmp_path, path):
 @pytest.mark.parametrize("path", [
     "/static/", "/static/vendor/", "/static/../server.py", "/static/%2e%2e/server.py",
     "/api/server.py", "/mode.js", "/mode.html", "/missing", "/static/missing.js",
+    "/static/app.js/", "/static/plan/axis.js/", "/api/plan/",
 ])
 def test_shell_has_no_fallback_or_directory_routes(tmp_path, path):
     app = build_app(AppState(settings_at(tmp_path), tmp_path / "options.json"),
                     ingress_peer="testclient")
     with TestClient(app) as client:
-        assert client.get(path).status_code == 404
+        assert client.get(path, follow_redirects=False).status_code == 404
 
 
 def test_packaged_asset_manifest():

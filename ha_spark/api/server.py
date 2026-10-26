@@ -372,6 +372,9 @@ def build_app(
     setattr(app.state, STATE_ATTR, state)
     ingress = ingress_peer is not None and not require_token
     app.state.ingress = ingress
+    if ingress:
+        # A slash redirect would answer a UI path without the page headers.
+        app.router.redirect_slashes = False
     solar_reader = measured_solar if measured_solar is not None else MeasuredSolar()
     assets = packaged_assets() if ingress else {}
     ui_paths = {"/", *(f"/static/{name}" for name in assets)} if ingress else set()
