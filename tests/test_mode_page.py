@@ -24,6 +24,7 @@ ASSET_PATHS = [
     "/static/VENDOR.txt", "/static/MANIFEST.sha256",
     "/static/plan/axis.js", "/static/plan/lanes.js", "/static/plan/soc.js",
     "/static/plan/today.js", "/static/plan/lines.js", "/static/plan/registry.js",
+    "/static/plan/carbon.js",
 ]
 
 
