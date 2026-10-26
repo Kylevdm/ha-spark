@@ -3,6 +3,7 @@
 import asyncio
 import io
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -10,7 +11,7 @@ from ha_spark import cli
 from ha_spark.api.server import AppState
 from ha_spark.api.static_assets import packaged_assets
 from ha_spark.config import _SECRET_OPTION_KEYS, ConfigError, Settings
-from ha_spark.daemon_channel import DaemonChannel, submit_socket
+from ha_spark.daemon_channel import DaemonChannel, Reply, submit_socket
 from ha_spark.devices.execution import execution_context
 from ha_spark.settings_service import ConfigurationRepair, SettingsService
 from tests.api_helpers import owner_client
@@ -74,6 +75,16 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
             # Include the newly populated slots and every new chart asset in
             # the same response/log canary sweep as the configuration surfaces.
             surfaces.append(plan_response.text)
+            # The replan route: no executor on this state, and an invalid user id
+            # is refused (and never logged) before anything else.
+            replan = client.post("/api/replan", json={}, headers={
+                "X-Remote-User-Id": "owner", "X-HA-Spark-Request": "replan"})
+            assert replan.status_code == 503
+            surfaces.append(replan.text)
+            forged = client.post("/api/replan", json={}, headers={
+                "X-Remote-User-Id": CANARY + "!", "X-HA-Spark-Request": "replan"})
+            assert forged.status_code == 403
+            surfaces.append(forged.text)
             for path in ["/", "/api/health", *(f"/static/{name}" for name in packaged_assets())]:
                 response = client.get(path)
                 assert response.status_code == 200
@@ -100,6 +111,16 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
                                     headers={"Content-Type": "application/json"})
             assert malformed.status_code == 400
             surfaces.append(malformed.text)
+        executor = AsyncMock(spec=DaemonChannel)
+        executor.submit = AsyncMock(return_value=Reply(
+            error="daemon plan request failed", text=CANARY, reasons=[CANARY]))
+        replan_state = AppState(bootstrap, tmp_path / "options.json", settings_service=service,
+                                executor=executor)
+        with owner_client(replan_state) as client:
+            failed = client.post("/api/replan", json={}, headers={
+                "X-Remote-User-Id": "owner", "X-HA-Spark-Request": "replan"})
+            assert failed.status_code == 500
+            surfaces.append(failed.text)
         document = tmp_path / "import.yaml"
         document.write_text(json.dumps(secrets))
         commands = [(["config", "show"], 0), (["config", "export"], 0),
