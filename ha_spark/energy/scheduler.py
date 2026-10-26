@@ -348,10 +348,10 @@ async def _record_solar_forecasts(settings: Settings, run: PlanRun) -> None:
     post-apply write time. View-only: it never feeds the planner, a baseline
     or a write, and a failure logs and leaves the run alone.
     """
-    solar = getattr(run.inputs, "solar_slots", None)
-    known = getattr(run.inputs, "solar_slots_known", None)
-    geometry = getattr(run.inputs, "geometry", None)
-    issued_at = getattr(run.inputs, "now", None)
+    solar = run.inputs.solar_slots
+    known = run.inputs.solar_slots_known
+    geometry = run.inputs.geometry
+    issued_at = run.inputs.now
     if (
         solar is None or known is None or geometry is None or issued_at is None
         or len(solar) != len(known) or len(geometry.slot_starts) != len(solar)

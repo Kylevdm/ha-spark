@@ -9,6 +9,7 @@ load-forecast revision.
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import aiosqlite
@@ -19,7 +20,8 @@ import respx
 from ha_spark.config import Settings
 from ha_spark.energy import scheduler, sources
 from ha_spark.energy.ledger import ForecastLedger
-from ha_spark.energy.models import LoadForecast
+from ha_spark.energy.models import LoadForecast, PlannerInputs
+from ha_spark.energy.plan_run import PlanRun
 from ha_spark.energy.readiness import load_readiness
 from ha_spark.energy.readiness_ledger import ReadinessLedger
 from ha_spark.energy.readiness_measurements import ReadinessDays
@@ -27,6 +29,7 @@ from ha_spark.energy.scheduler import run_once
 from ha_spark.energy.solar_forecasts import SolarForecastStore, recorded_solar
 from tests.authority_helpers import legacy_settings
 from tests.test_readiness import fixture as readiness_fixture
+from tests.test_scheduler import _AmpsDevice, _plan_at
 
 BASE = "http://ha.test/api"
 LONDON = ZoneInfo("Europe/London")
@@ -112,7 +115,7 @@ async def test_run_once_records_the_solar_forecast_it_planned_with(
 
 @respx.mock
 async def test_run_once_records_nothing_without_solar_provenance(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+    tmp_path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):
     """A run whose solar entities are all unreadable stores no rows at all."""
     s = legacy_settings(
@@ -134,12 +137,69 @@ async def test_run_once_records_nothing_without_solar_provenance(
     monkeypatch.setattr(sources, "datetime", _frozen_clock(frozen))
     monkeypatch.setattr(scheduler, "datetime", _frozen_clock(frozen))
     respx.route(method="GET").mock(return_value=httpx.Response(404))
-    await run_once(s)
+    with caplog.at_level("WARNING"):
+        await run_once(s)
     async with aiosqlite.connect(s.db_path) as db:
         tables = {row[0] for row in await db.execute_fetchall(
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )}
     assert "solar_forecasts" not in tables
+    assert not [r for r in caplog.records if "Recording solar forecast failed" in r.message]
+
+
+async def test_run_once_records_nothing_without_geometry(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """Without a horizon geometry there is nowhere to place the slots: no rows, no log."""
+    s = legacy_settings(
+        ha_url="http://ha.test",
+        ha_token="t",
+        db_path=str(tmp_path / "ledger.db"),
+    )
+    plan = _plan_at(31.0)
+    inputs = PlannerInputs(
+        soc=plan.soc,
+        solar_tomorrow_kwh=0.75,
+        predicted_home_load_kwh=0.0,
+        solar_slots=(0.5, 0.25),
+        solar_slots_known=(True, True),
+        now=datetime(2026, 1, 12, 1, 0, tzinfo=LONDON),
+    )
+    run = PlanRun(
+        plan=plan,
+        inputs=inputs,
+        cfg=SimpleNamespace(),
+        schedule=SimpleNamespace(),
+        load_source="test",
+        forecast=LoadForecast(total_kwh=0.75, slots=(0.5, 0.25), source="test"),
+        tz=LONDON,
+    )
+
+    async def fake_current_plan(*_args: object, **_kwargs: object) -> PlanRun:
+        return run
+
+    async def noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    class _Device(_AmpsDevice):
+        capabilities = frozenset()
+
+    monkeypatch.setattr(scheduler, "current_plan", fake_current_plan)
+    monkeypatch.setattr(
+        scheduler, "inverter_device", lambda *_args: _Device({31.0: 38.0}, s.battery_voltage_v)
+    )
+    monkeypatch.setattr(scheduler, "_record_forecast", noop)
+    monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
+
+    with caplog.at_level("WARNING"):
+        await run_once(s, soc=plan.soc)
+
+    async with aiosqlite.connect(s.db_path) as db:
+        tables = {row[0] for row in await db.execute_fetchall(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )}
+    assert "solar_forecasts" not in tables
+    assert not [r for r in caplog.records if "Recording solar forecast failed" in r.message]
 
 
 @respx.mock
