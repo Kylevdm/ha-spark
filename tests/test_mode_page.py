@@ -56,6 +56,8 @@ def test_page_assets_security(tmp_path, path):
         assert response.headers["Content-Type"].startswith("text/css")
     elif path == "/" or path.endswith(".html"):
         assert response.headers["Content-Type"].startswith("text/html")
+        assert 'src="static/app.js"' in response.text
+        assert 'href="static/app.css"' in response.text
     with TestClient(build_app(AppState(settings_at(tmp_path), tmp_path / "options.json"),
                               ingress_peer="other")) as client:
         assert client.get(path, headers={

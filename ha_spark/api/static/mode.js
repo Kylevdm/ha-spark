@@ -91,6 +91,10 @@ export function mountMode(root, health, refreshHealth) {
             const response = await fetch("api/mode", {cache: "no-store"});
             if (!response.ok) throw new Error("status unavailable");
             const body = await response.json();
+            // A status without preconditions can't back a request; treat it as a failed read.
+            if (!body.preconditions && !readOnly && body.suspended !== "configuration_repair") {
+                throw new Error("status incomplete");
+            }
             if (active) show(body);
         } catch {
             message.textContent = "Could not load current authority. Refresh before requesting a change.";
