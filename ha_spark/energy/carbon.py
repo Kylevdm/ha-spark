@@ -17,6 +17,15 @@ from zoneinfo import ZoneInfo
 
 import aiosqlite
 import httpx
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+    field_validator,
+)
 
 from ha_spark.logging import get_logger
 
@@ -61,35 +70,85 @@ def _boundary(value: object) -> datetime:
     return at.astimezone(UTC)
 
 
+class _RegionalData(BaseModel):
+    model_config = {"strict": True}
+
+    regionid: StrictInt
+    data: list[object]
+
+    @field_validator("regionid", mode="before")
+    @classmethod
+    def valid_region(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("Invalid carbon region")
+        return value
+
+
+class _Envelope(BaseModel):
+    model_config = {"strict": True}
+
+    data: _RegionalData
+
+
+class _Intensity(BaseModel):
+    model_config = {"strict": True}
+
+    forecast: StrictInt | StrictFloat
+    index: StrictStr
+
+    @field_validator("forecast", mode="before")
+    @classmethod
+    def valid_forecast(cls, value: object) -> int | float:
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not 0 <= value <= 2000 or not math.isfinite(value)):
+            raise ValueError("Invalid carbon forecast")
+        return value
+
+    @field_validator("index")
+    @classmethod
+    def valid_index(cls, value: str) -> str:
+        if value not in _LABELS:
+            raise ValueError("Invalid carbon index")
+        return value
+
+
+class _Period(BaseModel):
+    model_config = {"strict": True}
+
+    first: datetime = Field(alias="from")
+    last: datetime = Field(alias="to")
+    intensity: _Intensity
+
+    @field_validator("first", "last", mode="before")
+    @classmethod
+    def valid_boundary(cls, value: object) -> datetime:
+        try:
+            return _boundary(value)
+        except (ValueError, OverflowError):
+            raise ValueError("Invalid carbon period boundary") from None
+
+
 def _validate(
     payload: object, region: int, start: datetime, end: datetime,
 ) -> list[tuple[str, str, float, str]]:
-    if not isinstance(payload, dict):
+    try:
+        data = _Envelope.model_validate(payload).data
+    except ValidationError:
         return []
-    data = payload.get("data")
-    if (not isinstance(data, dict) or type(data.get("regionid")) is not int
-            or data["regionid"] != region or not isinstance(data.get("data"), list)):
+    if data.regionid != region:
         return []
     rows: dict[str, tuple[str, str, float, str]] = {}
-    for raw in data["data"]:
-        if not isinstance(raw, dict):
-            continue
+    for raw in data.data:
         try:
-            first, last = _boundary(raw.get("from")), _boundary(raw.get("to"))
-            intensity = raw.get("intensity")
-            if not isinstance(intensity, dict):
-                continue
-            value, band = intensity.get("forecast"), intensity.get("index")
-            if (first < start or last > end or last - first != timedelta(minutes=30)
-                    or isinstance(value, bool) or not isinstance(value, (int, float))
-                    or not 0 <= value <= 2000 or not math.isfinite(value)
-                    or not isinstance(band, str) or band not in _LABELS):
-                continue
-            key = _iso(first)
-            if key in rows or len(rows) < 300:
-                rows[key] = (key, _iso(last), float(value), band)
-        except (ValueError, OverflowError):
+            period = _Period.model_validate(raw)
+        except ValidationError:
             continue
+        first, last = period.first, period.last
+        if first < start or last > end or last - first != timedelta(minutes=30):
+            continue
+        key = _iso(first)
+        if key in rows or len(rows) < 300:
+            rows[key] = (key, _iso(last), float(period.intensity.forecast), period.intensity.index)
     return [rows[key] for key in sorted(rows)]
 
 
