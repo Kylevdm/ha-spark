@@ -66,7 +66,10 @@ def test_ingress_timeline_contract_and_household_dst(tmp_path, slots, monkeypatc
         "planned": record.run.plan.planned_cost, "baseline": record.run.plan.baseline_cost,
         "export_revenue": record.run.plan.export_revenue,
     }
-    assert timeline["lines"] == []
+    assert [line["text"] for line in timeline["lines"]] == [
+        line.text for line in record.run.plan.view.lines
+    ]
+    assert any(line["kind"] == "charge" for line in timeline["lines"])
     assert timeline["slot_minutes"] == 30
     assert timeline["horizon_start"] == "2026-10-25T01:30:00+01:00"
     assert timeline["now"] == "2026-10-25T01:10:00+00:00"

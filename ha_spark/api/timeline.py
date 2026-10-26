@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ha_spark.energy.plan_run import StoredPlanRun
+from ha_spark.energy.plan_view import ev_hold_line
 
 
 def timeline_payload(record: StoredPlanRun | None, operating_mode: str) -> dict[str, Any] | None:
@@ -24,6 +25,7 @@ def timeline_payload(record: StoredPlanRun | None, operating_mode: str) -> dict[
             return None
         return value.astimezone(UTC).astimezone(run.tz or UTC).isoformat()
 
+    lines = view.lines + ((ev_hold_line(run.inputs.now),) if record.ev_hold_active else ())
     geometry = run.inputs.geometry
     horizon_start = geometry.horizon_start if geometry is not None else run.inputs.horizon_start
     return {
@@ -33,7 +35,7 @@ def timeline_payload(record: StoredPlanRun | None, operating_mode: str) -> dict[
         "headline": asdict(view.headline),
         "costs": asdict(view.costs),
         "lines": [dict(asdict(line), start=instant(line.start), end=instant(line.end))
-                  for line in view.lines],
+                  for line in lines],
         "horizon_start": instant(horizon_start),
         "slot_minutes": 30,
         "now": instant(run.inputs.now),

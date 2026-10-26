@@ -1,4 +1,4 @@
-import {html} from "../vendor/htm-3.1.1-preact-standalone.module.js";
+import {html, useState, useEffect} from "../vendor/htm-3.1.1-preact-standalone.module.js";
 import {Axis} from "./axis.js";
 import {TodaySpan} from "./today.js";
 import {LinesList} from "./lines.js";
@@ -9,5 +9,8 @@ import {CarbonStrip} from "./carbon.js";
 const parts = [TodaySpan, Axis, CarbonStrip, LinesList];
 
 export function PlanParts(props) {
-    return html`${parts.map(Part => html`<${Part} ...${props}/>` )}`;
+    const [selectedLine, selectLine] = useState(null);
+    useEffect(() => selectLine(null), [props.timeline]);
+    return html`${parts.map(Part => html`<${Part} ...${props}
+        selectedLine=${selectedLine} selectLine=${selectLine}/>` )}`;
 }
