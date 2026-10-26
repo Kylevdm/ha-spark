@@ -13,6 +13,9 @@ def setup_logging(level: str = "INFO") -> None:
     # httpcore's DEBUG trace logs response status lines and headers, which can
     # carry a Supervisor's or supplier's reason phrase; it never logs above DEBUG.
     logging.getLogger("httpcore").setLevel(logging.INFO)
+    # httpx logs every request URL at INFO, some carrying an Octopus account
+    # number or home coordinates; failures surface through our own errors.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     # websockets' DEBUG trace logs every frame, including HA's auth message
     # with its access token and raw HA error objects.
     logging.getLogger("websockets").setLevel(logging.INFO)
