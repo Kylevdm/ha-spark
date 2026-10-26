@@ -163,10 +163,12 @@ async def test_solar_recording_failure_never_breaks_the_plan_run(
         solar_tomorrow_entity="sensor.solar",
         db_path=str(tmp_path / "ledger.db"),
     )
-    with caplog.at_level("ERROR"):
+    with caplog.at_level("WARNING"):
         result, _ = await _run_plan(s, monkeypatch)
     assert result.plan.charge_intent is not None
-    assert any("Recording solar forecast failed" in r.message for r in caplog.records)
+    failures = [r for r in caplog.records if "Recording solar forecast failed" in r.message]
+    # Fixed text only: no exception text or traceback reaches the log.
+    assert failures and all(r.exc_info is None for r in failures)
 
 
 async def test_readiness_and_ledger_readers_ignore_solar_forecasts(tmp_path):

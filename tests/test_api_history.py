@@ -101,7 +101,7 @@ def test_history_serves_a_range_inside_today_with_any_zone_offset(tmp_path):
 
 
 async def test_history_buckets_and_totals(tmp_path, monkeypatch):
-    """Buckets start at local midnight whatever `from` says; totals agree with them."""
+    """Buckets follow the midnight grid from `from`'s half-hour; totals agree with them."""
     frozen = datetime(2026, 1, 12, 15, 10, tzinfo=LONDON)
     _frozen_server_clock(monkeypatch, frozen)
     midnight = _midnight(frozen).astimezone(UTC)
@@ -115,20 +115,20 @@ async def test_history_buckets_and_totals(tmp_path, monkeypatch):
         await store.record(slot_b, [(slot_b, 7.0)])
     with owner_client(state) as client:
         response = client.get("/api/history", params={
-            "resolution": "slot", "from": (midnight + timedelta(hours=2)).isoformat(),
+            "resolution": "slot", "from": (midnight + timedelta(minutes=40)).isoformat(),
             "to": frozen.isoformat(),
         })
     assert response.status_code == 200
     body = response.json()
     starts = [datetime.fromisoformat(bucket["start"]) for bucket in body["buckets"]]
     expected = []
-    at = midnight
+    at = slot_a  # the half-hour holding `from`, on the midnight grid
     while at < frozen:
         expected.append(at)
         at += timedelta(minutes=30)
-    assert starts == expected  # 31 buckets, from midnight, not from `from`
+    assert starts == expected
     values = [bucket["solar_forecast_kwh"] for bucket in body["buckets"]]
-    assert values == [None, 1.0, None, *[None] * (len(values) - 3)]
+    assert values == [1.0, None, *[None] * (len(values) - 2)]
     assert all(bucket["solar_measured_kwh"] is None for bucket in body["buckets"])
     assert body["totals"] == {"solar_forecast_kwh": 1.0, "solar_measured_kwh": None}
     assert body["coverage"] is None

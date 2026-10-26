@@ -363,8 +363,8 @@ async def _record_solar_forecasts(settings: Settings, run: PlanRun) -> None:
     try:
         async with SolarForecastStore(settings.db_path) as store:
             await store.record(issued_at.astimezone(UTC), slots)
-    except Exception:
-        log.exception("Recording solar forecast failed")
+    except Exception:  # noqa: BLE001 - fixed text only, never the exception's
+        log.warning("Recording solar forecast failed")
 
 
 async def run_once(

@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -561,7 +561,9 @@ def build_app(
                 "no_entity" if not st.settings.derive_solar_generation_entity
                 else "not_implemented"
             )
-            starts = bucket_starts(midnight, end)
+            # The midnight grid, from the half-hour holding `from`.
+            starts = [at for at in bucket_starts(midnight, end)
+                      if at + timedelta(minutes=30) > start]
             try:
                 recorded = await recorded_solar(st.settings.db_path, starts)
             except Exception:  # noqa: BLE001 - the series degrades, never 500s the view
