@@ -72,7 +72,7 @@ from ha_spark.energy.models import (
     Reservation,
     V2LRefill,
 )
-from ha_spark.energy.plan_view import build_plan_view
+from ha_spark.energy.plan_view import SocPoint, build_plan_view
 from ha_spark.energy.tariff import TariffSchedule, _controlled_windows
 
 
@@ -726,6 +726,88 @@ def _soc_path(
     return tuple(path)
 
 
+def _soc_series(
+    plan: ChargePlan,
+    inputs: PlannerInputs,
+    cfg: PlannerConfig,
+    schedule: TariffSchedule,
+    net: list[float],
+) -> tuple[SocPoint, ...]:
+    """View-only forecast through the window, then the unchanged V2L ledger.
+
+    All arithmetic is on absolute instants. ``net`` already carries the solar
+    haircut and slot-0 remainder used for sizing; ``required_kwh`` is stored
+    energy, so charging efficiency must not be applied a second time.
+    """
+    geometry = inputs.geometry_for(cfg)
+    if (not plan.soc.ok or geometry is None or cfg.capacity_kwh <= 0
+            or geometry.horizon_start.tzinfo is None):
+        return ()
+    now = (inputs.now or geometry.horizon_start).astimezone(UTC)
+    window_start = geometry.window_start.astimezone(UTC)
+    window_end = geometry.window_end.astimezone(UTC)
+    charge_start = max(now, window_start)
+    charge_seconds = max(0.0, (window_end - charge_start).total_seconds())
+    path = {at.astimezone(UTC): value for at, value in plan.soc_path}
+    times = {now, *(at.astimezone(UTC) for at in geometry.slot_starts if at > now),
+             *(at for at in (window_start, window_end) if at > now)}
+    if not path:
+        times = {at for at in times if at <= window_end}
+    exported = dict(zip(
+        plan.charge_intent.export.selected_slots, plan.charge_intent.export.slot_export_kw,
+        strict=True,
+    )) if plan.charge_intent.export else {}
+    soc = inputs.soc_now
+    points = [SocPoint(now, soc)]
+    previous = now
+    for at in sorted(times - {now}):
+        if at <= window_end:
+            drain = 0.0
+            for i, start in enumerate(geometry.slot_starts[:len(net)]):
+                lo = max(start.astimezone(UTC), now)
+                hi = start.astimezone(UTC) + timedelta(minutes=30)
+                before_end = min(hi, window_start)
+                before_seconds = max(0.0, (before_end - lo).total_seconds())
+                before_load = min(_pre_window_share(geometry, i),
+                                  1.0 - schedule.cheap_fracs[i]) * net[i]
+                before_export = exported.get(start, 0.0) * _slot_hours(geometry, i) \
+                    if start < window_start else 0.0
+                overlap = max(0.0, (min(at, before_end) - max(previous, lo)).total_seconds())
+                if before_seconds > 0:
+                    drain += (before_load + before_export) * overlap / before_seconds
+                inside_start, inside_end = max(lo, window_start), min(hi, window_end)
+                inside_seconds = max(0.0, (inside_end - inside_start).total_seconds())
+                overlap = max(0.0, (min(at, inside_end)
+                                   - max(previous, inside_start)).total_seconds())
+                if inside_seconds > 0:
+                    # Uncovered load after the window closes is not due yet.
+                    after_share = max(0.0, (hi - max(lo, window_end)).total_seconds()) \
+                        / max(1.0, (hi - lo).total_seconds())
+                    after_load = min(after_share, 1.0 - schedule.cheap_fracs[i]) * net[i]
+                    inside_load = max(0.0, (1.0 - schedule.cheap_fracs[i]) * net[i]
+                                      - before_load - after_load)
+                    if start >= window_start and start in exported:
+                        inside_load = (net[i] + exported[start] * _slot_hours(geometry, i)) \
+                            * inside_seconds / max(1.0, (hi - lo).total_seconds())
+                    drain += inside_load * overlap / inside_seconds
+            # Legacy inputs can carry a pre-window drain outside the slots.
+            lead = (window_start - now).total_seconds()
+            if inputs.pre_window_drain_kwh and lead > 0:
+                drain += inputs.pre_window_drain_kwh * max(0.0, (
+                    min(at, window_start) - previous).total_seconds()) / lead
+            seconds = max(0.0, (min(at, window_end)
+                                - max(previous, charge_start)).total_seconds())
+            added = plan.required_kwh * seconds / charge_seconds if charge_seconds else 0.0
+            soc = min(cfg.target_cap, max(min(soc, cfg.min_soc),
+                                         soc + (added - drain) / cfg.capacity_kwh * 100))
+        # Never feed the forecast back into soc_path or V2L sizing. At matching
+        # instants that ledger is authoritative, including the window end.
+        soc = path.get(at, soc)
+        points.append(SocPoint(at, soc))
+        previous = at
+    return tuple(points)
+
+
 def _v2l_refills(
     inputs: PlannerInputs,
     cfg: PlannerConfig,
@@ -1179,4 +1261,5 @@ def compute_plan(
         overnight_charge_capped=overnight_charge_capped,
         soc_path=soc_path,
     )
-    return replace(plan, view=build_plan_view(plan, cfg, inputs, schedule))
+    series = _soc_series(plan, inputs, cfg, schedule, net) if model == "slots" else ()
+    return replace(plan, view=build_plan_view(plan, cfg, inputs, schedule, series))

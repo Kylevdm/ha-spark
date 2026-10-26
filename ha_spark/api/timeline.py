@@ -39,5 +39,6 @@ def timeline_payload(record: StoredPlanRun | None, operating_mode: str) -> dict[
         "now": instant(run.inputs.now),
         "slots": [dict(asdict(slot), start=instant(slot.start)) for slot in view.slots]
                  if view.slots is not None else None,
-        "soc": list(view.soc) if view.soc is not None else None,
+        "soc": [{"at": instant(point.at), "soc_pct": point.soc_pct} for point in view.soc]
+               if view.soc is not None else None,
     }

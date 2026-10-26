@@ -72,7 +72,9 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
             assert timeline is not None
             assert len(timeline["slots"]) == 48
             assert timeline["slots"][0]["load_kwh"] == 0.25
-            # Include the newly populated slots and every new chart asset in
+            assert timeline["soc"][0] == {"at": timeline["now"], "soc_pct": 40}
+            assert all(set(point) == {"at", "soc_pct"} for point in timeline["soc"])
+            # Include the populated SoC forecast, slots and every new chart asset in
             # the same response/log canary sweep as the configuration surfaces.
             surfaces.append(plan_response.text)
             # The replan route: no executor on this state, and an invalid user id
