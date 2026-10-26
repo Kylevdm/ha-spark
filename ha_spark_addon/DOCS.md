@@ -114,6 +114,92 @@ CLI equivalents are `ha-spark mode show`, `ha-spark mode set protect`,
 `ha-spark mode set optimise`, `ha-spark mode set observe`, and
 `ha-spark mode confirm-observe`. Only the running daemon changes authority.
 
+## Plan view
+
+Open **ha-spark → Open Web UI** in Home Assistant. The app opens on **Plan**, and
+the side rail switches to **Mode**. A reload keeps the screen you were on, and
+the app follows your light or dark preference. The header shows the site's
+operating mode, whether authority is known and the fallback state, so you can
+tell whether ha-spark may write to hardware. If the daemon isn't running, the
+header says **daemon not running**, and Replan and the mode buttons are
+disabled. The Plan screen is ingress-only; it is not served on the agent port or
+the standalone listener.
+
+The Plan screen shows what the planner decided for the current plan. The
+headline gives the battery's SoC now, the target SoC, the charge needed, the
+minimum SoC and the battery capacity. The cost tiles give the planned cost, the
+cost without a battery and, when there is any, export revenue.
+
+The half-hour chart is on your household clock. It shows:
+
+- the expected SoC for every half-hour, as a forecast, with the minimum-SoC and
+  target lines;
+- the raw solar forecast (dashed), the plan's after-haircut solar (dotted) and
+  the forecast house load;
+- a lane each for charge, hold, export, skip and V2L;
+- import and export price steps.
+
+The reason lines below the chart are the planner's own wording. Reservations
+show their kWh and reason, a hold names its cause, and back-to-back V2L refills
+or export skips with the same reason are folded together. Select a line to
+highlight its span on the chart, or select a half-hour to see that slot's
+prices, solar, load, SoC and actions. The plan view displays the planner's
+numbers and wording; it makes no decisions of its own.
+
+When the SoC reading isn't trusted, the SoC lane, SoC-derived numbers, costs and
+the charge, export, skip and V2L actions and lines are blank, and the planner's
+SoC warning is shown. On the daily planning model, the headline, costs and
+reasons still appear, without the per-slot chart. Before the first plan exists,
+the screen says **no plan yet** rather than looking broken.
+
+### Today so far
+
+The span before the plan's horizon compares today's solar with what was
+forecast. The forecast is the value the plan was using before each half-hour
+began, not a forecast revised afterwards. Measured solar comes from the
+`derive_solar_generation_entity` statistic, and appears only when Home Assistant
+has five-minute statistics for that entity; otherwise the span says measured
+solar isn't available and why. Half-hours without a trustworthy measurement are
+left blank. A **now** marker separates today so far from the plan.
+
+### Replan
+
+**Replan** asks the daemon for a fresh plan through the same path as
+`ha-spark run` and the agent's `run_plan`, so it plans exactly as the current
+operating mode allows. It never writes more than the mode permits, and
+unchanged setpoints write nothing. Several presses close together, from you or
+another owner, combine into one replan. Each request is recorded under your Home
+Assistant user, and the plan view refreshes with the new plan when it finishes.
+
+If the reply times out, the page says the request is still queued: reload rather
+than press again. Replan is disabled while the daemon isn't running, and
+configuration repair blocks it.
+
+### Grid carbon
+
+The carbon strip is off until you pick a region. With no region set, ha-spark
+makes no NESO requests. Pick a region from the link where the strip would be;
+the list uses NESO's own region names (ids 1–14 are the DNO regions, and 15–17
+are England, Scotland and Wales). The choice saves through the same revisioned
+configuration path as the CLI and never sends a postcode or location. To find
+your region, use the **Find My Region** postcode search at
+<https://carbonintensity.org.uk/>; that lookup happens in your browser, not in
+ha-spark.
+
+Once a region is set, the add-on refreshes NESO's regional forecast every 30
+minutes, caches it and draws the strip from midnight to the end of the plan. The strip uses
+NESO's index labels (very low to very high). Past periods are labelled
+**estimated**, the strip stops where NESO's forecast ends with a "carbon
+forecast ends here" tick, and a note says when the last successful fetch is more
+than two hours old. Gaps stay gaps. While NESO is unreachable the cached
+forecast keeps showing, with that note, as long as it covers the current
+half-hour; after that the strip says grid carbon is unavailable. Clearing the
+region turns the strip off and stops the calls.
+
+The strip is display only. Carbon never affects the plan, the operating mode,
+Protect or Optimise, or readiness. Carbon intensity data: NESO Carbon Intensity
+API, CC BY 4.0 (see <https://github.com/carbon-intensity/terms/>).
+
 ## Updating to 0.26.0
 
 Update the add-on first, then the integration through HACS, then restart Home
@@ -905,7 +991,15 @@ standalone/dev mode (`ha_url` + `ha_token`) the listener binds only to
 
 - `GET /api/health`: liveness, when the latest plan was computed, and the read-only
   integration link (state, site id, integration release and API versions, snapshot time and age)
-- `GET /api/plan`: the latest plan as sensor-style rows used by the API and agent
+- `GET /api/plan`: the latest plan as sensor-style rows used by the API and agent,
+  plus the plan view's `timeline` on ingress
+- `GET /api/history?resolution=slot[&from=&to=]`: recorded solar forecast and
+  measured solar for today so far; values outside today are a 400
+- `GET /api/carbon`: the cached NESO regional carbon rows for the selected region
+- `POST /api/replan`: ask the daemon for a fresh plan. It requires the ingress
+  proxy's valid `X-Remote-User-Id`, `X-HA-Spark-Request: replan` and
+  `Content-Type: application/json`; 504 means the request is still queued, and
+  503 means no daemon, configuration repair or a full request queue.
 - `GET /api/config`: the settings service's read view, with revision, field
   metadata, input keys and pending-restart status; secrets are set/unset only.
   In repair it returns reasons and a repair token instead.
@@ -917,7 +1011,7 @@ standalone/dev mode (`ha_url` + `ha_token`) the listener binds only to
   `{"expected": 1, "document": {...}}`, or use the current repair token as
   `expected` in repair. This is the only configuration write accepted in repair.
 
-Both POST endpoints require the ingress proxy's valid `X-Remote-User-Id`,
+The config POST endpoints require the ingress proxy's valid `X-Remote-User-Id`,
 `X-HA-Spark-Request: config` and `Content-Type: application/json`. Failed request
 checks return 403 or 415. All writes use the same validation and save guards;
 no settings page is added in this phase.
