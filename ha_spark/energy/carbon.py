@@ -7,6 +7,7 @@ without awaiting network I/O; the ingress reader uses only the durable cache.
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -31,6 +32,16 @@ CREATE TABLE IF NOT EXISTS carbon_fetches (
     region INTEGER PRIMARY KEY, fetched_at TEXT NOT NULL
 );
 """
+
+
+class _HideNesoRequests(logging.Filter):
+    """httpx logs each request line, URL included, at INFO; carbon logs fixed text only."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return NESO_BASE_URL not in record.getMessage()
+
+
+logging.getLogger("httpx").addFilter(_HideNesoRequests())
 
 
 def _iso(at: datetime) -> str:
@@ -81,6 +92,7 @@ def _validate(
 
 async def _store(
     path: str, region: int, now: datetime, rows: list[tuple[str, str, float, str]],
+    current: Callable[[], bool] = lambda: True,
 ) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(path) as db:
@@ -98,7 +110,8 @@ async def _store(
         )
         await db.execute("DELETE FROM carbon_periods WHERE start < ?",
                          (_iso(now - timedelta(days=2)),))
-        await db.commit()
+        if current():  # The region may have changed while the write awaited.
+            await db.commit()
 
 
 async def carbon_payload(path: str, region: int | None, now: datetime) -> dict[str, object]:
@@ -182,7 +195,7 @@ class CarbonRefresher:
                 httpx.AsyncClient(timeout=20, trust_env=False) as client,
             ):
                 response = await client.get(url)
-                if response.status_code == 500:
+                if response.status_code == 500 and self._region() == region:
                     response = await client.get(url)
                 if response.status_code != 200:
                     log.warning("Carbon fetch failed: http_status")
@@ -192,7 +205,8 @@ class CarbonRefresher:
                     log.warning("Carbon fetch failed: invalid_payload")
                     return
                 if self._region() == region:
-                    await _store(self._path, region, now, rows)
+                    await _store(self._path, region, now, rows,
+                                 lambda: self._region() == region)
         except Exception:  # noqa: BLE001 - fixed text only, never the exception's
             log.warning("Carbon fetch failed: unavailable")
 

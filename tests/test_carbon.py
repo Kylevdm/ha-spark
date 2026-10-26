@@ -315,3 +315,51 @@ async def test_request_timeout_and_shutdown(tmp_path):
     await refresher.wait()
     assert (await carbon_payload(path, 12, NOW))["status"] == "unavailable"
     await refresher.close()
+
+
+@respx.mock
+async def test_request_lines_never_log_the_url(tmp_path, caplog):
+    caplog.set_level("DEBUG")
+    path = str(tmp_path / "carbon.db")
+    respx.get(url__startswith="https://api.carbonintensity.org.uk/").mock(
+        return_value=httpx.Response(200, json=envelope([row()])))
+    refresher = CarbonRefresher(path, lambda: 12)
+    refresher.tick(NOW, "UTC", None)
+    await refresher.wait()
+    assert (await carbon_payload(path, 12, NOW))["rows"]
+    assert "carbonintensity" not in caplog.text
+    await refresher.close()
+
+
+@respx.mock
+async def test_region_cleared_before_retry_or_commit_is_not_fetched_or_stored(tmp_path):
+    path = str(tmp_path / "carbon.db")
+    region = 12
+
+    def first(request):
+        nonlocal region
+        region = None
+        return httpx.Response(500)
+
+    route = respx.get(url__startswith="https://api.carbonintensity.org.uk/").mock(
+        side_effect=first)
+    refresher = CarbonRefresher(path, lambda: region)
+    refresher.tick(NOW, "UTC", None)
+    await refresher.wait()
+    assert route.call_count == 1
+
+    region = 12
+    calls = 0
+
+    def current() -> int | None:
+        # Current for the pre-store check, cleared by the time the write commits.
+        nonlocal calls
+        calls += 1
+        return 12 if calls == 1 else None
+
+    route.mock(side_effect=None, return_value=httpx.Response(200, json=envelope([row()])))
+    late = CarbonRefresher(path, current)
+    await late._fetch(12, NOW, NOW, NOW + timedelta(hours=1))
+    assert (await carbon_payload(path, 12, NOW))["status"] == "unavailable"
+    await late.close()
+    await refresher.close()
