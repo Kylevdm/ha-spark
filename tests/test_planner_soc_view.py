@@ -79,6 +79,7 @@ def test_soc_forecast_floor_no_purchase_and_untrusted_daily():
                     solar_slots=(0.0,) * len(inputs.load_slots))
     plan = compute_plan(empty, config, fixed_schedule(empty, config))
     assert plan.required_kwh == 0
+    assert plan.view.soc
     assert all(p.soc_pct == 90 for p in plan.view.soc)
 
 
@@ -127,3 +128,38 @@ def test_soc_forecast_post_window_matches_v2l_path():
     assert plan.v2l_refills
     values = {p.at: p.soc_pct for p in plan.view.soc}
     assert all(values[at] == soc for at, soc in plan.soc_path)
+
+
+def test_soc_forecast_window_end_mid_slot_without_soc_path():
+    # With an empty soc_path (export overlapping the charge), the series ends at
+    # the window end: the uncovered load after 05:15 in that slot is not yet due.
+    from ha_spark.energy.planner import _soc_series
+
+    config = cfg(window_start=time(23, 45), window_end=time(5, 15), strategy="fill")
+    inputs = slot_inputs(datetime(2026, 1, 11, 23, 10, tzinfo=LONDON), config)
+    schedule = fixed_schedule(inputs, config)
+    plan = replace(compute_plan(inputs, config, schedule), soc_path=())
+    geometry = inputs.geometry
+    net = [max(0.0, load - solar * config.solar_haircut_k)
+           for load, solar in zip(inputs.load_slots, inputs.solar_slots, strict=True)]
+    net[0] *= geometry.slot0_remaining_frac
+    points = _soc_series(plan, inputs, config, schedule, net)
+    assert points[-1].at == geometry.window_end
+    clock = inputs.now.astimezone(UTC)
+    before_kwh = (geometry.window_start - clock).total_seconds() / 1800 * 0.4
+    start_soc = max(config.min_soc, inputs.soc_now - before_kwh / config.capacity_kwh * 100)
+    assert points[-1].soc_pct == pytest.approx(min(
+        config.target_cap, start_soc + plan.required_kwh / config.capacity_kwh * 100,
+    ))
+
+
+def test_soc_forecast_counts_a_legacy_pre_window_drain():
+    config = cfg(window_start=time(23, 45), window_end=time(5, 15))
+    inputs = replace(slot_inputs(datetime(2026, 1, 11, 22, 10, tzinfo=LONDON), config),
+                     pre_window_drain_kwh=1.0)
+    plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
+    values = {p.at: p.soc_pct for p in plan.view.soc}
+    assert values[inputs.geometry.window_start] == pytest.approx(max(
+        config.min_soc,
+        inputs.soc_now - plan.pre_window_drain_kwh / config.capacity_kwh * 100,
+    ))

@@ -780,11 +780,21 @@ def _soc_series(
                 overlap = max(0.0, (min(at, inside_end)
                                    - max(previous, inside_start)).total_seconds())
                 if inside_seconds > 0:
+                    # Uncovered load after the window closes is not due yet.
+                    after_share = max(0.0, (hi - max(lo, window_end)).total_seconds()) \
+                        / max(1.0, (hi - lo).total_seconds())
+                    after_load = min(after_share, 1.0 - schedule.cheap_fracs[i]) * net[i]
                     inside_load = max(0.0, (1.0 - schedule.cheap_fracs[i]) * net[i]
-                                      - before_load)
+                                      - before_load - after_load)
                     if start >= window_start and start in exported:
-                        inside_load = net[i] + exported[start] * _slot_hours(geometry, i)
+                        inside_load = (net[i] + exported[start] * _slot_hours(geometry, i)) \
+                            * inside_seconds / max(1.0, (hi - lo).total_seconds())
                     drain += inside_load * overlap / inside_seconds
+            # Legacy inputs can carry a pre-window drain outside the slots.
+            lead = (window_start - now).total_seconds()
+            if inputs.pre_window_drain_kwh and lead > 0:
+                drain += inputs.pre_window_drain_kwh * max(0.0, (
+                    min(at, window_start) - previous).total_seconds()) / lead
             seconds = max(0.0, (min(at, window_end)
                                 - max(previous, charge_start)).total_seconds())
             added = plan.required_kwh * seconds / charge_seconds if charge_seconds else 0.0
