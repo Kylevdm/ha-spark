@@ -3,7 +3,7 @@
 Phase 6 serves the `slot` resolution over a range inside today only, on the
 ingress app. Buckets step by absolute half-hours from local midnight in the
 household zone, the recorded solar forecast reads per slot, and measured solar
-is unavailable until ticket 10 fills it.
+is validated from five-minute statistics.
 """
 
 from __future__ import annotations
@@ -136,9 +136,12 @@ async def test_history_buckets_and_totals(tmp_path, monkeypatch):
     assert body["unavailable"] == {"solar_measured": "no_entity"}
 
 
-def test_history_unavailable_reasons(tmp_path):
+def test_history_unavailable_reasons(tmp_path, monkeypatch):
+    async def no_metadata(*args, **kwargs):
+        return []
+    monkeypatch.setattr("ha_spark.energy.solar_measured.list_statistic_ids", no_metadata)
     entity = {"derive_solar_generation_entity": "sensor.solar_gen"}
-    for extra, reason in (({}, "no_entity"), (entity, "not_implemented")):
+    for extra, reason in (({}, "no_entity"), (entity, "no_statistics")):
         now = datetime.now(LONDON)
         with owner_client(_state(tmp_path, **extra)) as client:
             body = client.get("/api/history", params={
@@ -230,3 +233,31 @@ def test_history_repeated_midnight_starts_at_the_first_one(tmp_path, monkeypatch
     starts = [b["start"] for b in response.json()["buckets"]]
     assert starts[0] == "2026-11-01T00:00:00-04:00"
     assert len(starts) == 4  # both occurrences of the repeated hour
+
+
+@pytest.mark.parametrize("minutes,coverage", [(10, None), (40, 1.0), (70, .5)])
+def test_measured_history_totals_coverage_and_repeat(tmp_path, monkeypatch, minutes, coverage):
+    from ha_spark.energy.solar_measured import MeasuredSolar
+
+    start = datetime(2026, 1, 12, tzinfo=UTC)
+    frozen = start + timedelta(minutes=minutes)
+    _frozen_server_clock(monkeypatch, frozen)
+    calls = 0
+
+    async def reader(settings, at):
+        nonlocal calls
+        calls += 1
+        return "Wh", [{"start": (start + timedelta(minutes=i * 5)).timestamp() * 1000,
+                       "change": 100} for i in range(6)]
+
+    app = build_app(_state(tmp_path, derive_solar_generation_entity="sensor.solar"),
+                    ingress_peer="testclient", measured_solar=MeasuredSolar(reader=reader))
+    with TestClient(app) as client:
+        body = client.get("/api/history?resolution=slot").json()
+        assert client.get("/api/history?resolution=slot").json() == body
+    assert calls == 1
+    assert body["unavailable"] == {}
+    assert body["coverage"] == coverage
+    assert body["totals"]["solar_measured_kwh"] == pytest.approx(.6 if minutes >= 30 else 0)
+    assert body["buckets"][0]["solar_measured_kwh"] == (
+        pytest.approx(.6) if minutes >= 30 else None)

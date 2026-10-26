@@ -60,6 +60,7 @@ from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.plan_run import StoredPlanRun
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.energy.solar_forecasts import recorded_solar
+from ha_spark.energy.solar_measured import MeasuredSolar
 from ha_spark.integration_discovery import IntegrationDiscovery
 from ha_spark.logging import get_logger
 from ha_spark.mode_preconditions import entry_preconditions
@@ -334,6 +335,7 @@ def build_app(
     token: str = "",
     ingress_peer: str | None = None,
     integration: IntegrationDiscovery | None = None,
+    measured_solar: MeasuredSolar | None = None,
 ) -> FastAPI:
     """Build the FastAPI app with the API routes bound to ``state``.
 
@@ -370,6 +372,7 @@ def build_app(
     setattr(app.state, STATE_ATTR, state)
     ingress = ingress_peer is not None and not require_token
     app.state.ingress = ingress
+    solar_reader = measured_solar if measured_solar is not None else MeasuredSolar()
     assets = packaged_assets() if ingress else {}
     ui_paths = {"/", *(f"/static/{name}" for name in assets)} if ingress else set()
     # Added first so the ingress peer check runs before it.
@@ -579,11 +582,7 @@ def build_app(
 
         @app.get("/api/history")
         async def get_history(request: Request) -> JSONResponse:
-            """The today-so-far series for the plan view (#496): `slot`, today only.
-
-            Measured solar joins in phase 12's ticket: until then the series
-            says why it is unavailable, with a fixed reason code.
-            """
+            """Recorded and measured solar: `slot`, today only, display-only."""
             params = request.query_params
             if params.get("resolution") != "slot":
                 return JSONResponse({"error": "unsupported resolution"}, status_code=400)
@@ -610,10 +609,6 @@ def build_app(
                 return JSONResponse(
                     {"error": "history range must be inside today"}, status_code=400
                 )
-            reason = (
-                "no_entity" if not st.settings.derive_solar_generation_entity
-                else "not_implemented"
-            )
             # The midnight grid, from the half-hour holding `from`.
             starts = [at for at in bucket_starts(midnight, end)
                       if at + timedelta(minutes=30) > start]
@@ -622,7 +617,12 @@ def build_app(
             except Exception:  # noqa: BLE001 - the series degrades, never 500s the view
                 log.warning("Recorded solar forecast read failed")
                 recorded = {}
-            return JSONResponse(history_payload(starts, recorded, tz, reason))
+            measured = await solar_reader.read(
+                st.settings, starts[0] if starts else start, end,
+            )
+            return JSONResponse(history_payload(
+                starts, recorded, tz, measured.reason, measured.values, now.astimezone(UTC),
+            ), headers={"Cache-Control": "no-store"})
 
     @app.get("/api/health")
     async def health(request: Request) -> dict[str, Any]:

@@ -53,6 +53,7 @@ dialog { max-width: min(36rem, 95vw); background: var(--surface); color: var(--t
 .soc-target { stroke: var(--accent); stroke-dasharray: 6 3; }
 .series.solar_raw_kwh { stroke: #ca8a04; stroke-dasharray: 5 3; }
 .series-key.solar_raw_kwh { fill: #ca8a04; }
+.series.solar_measured_kwh { stroke: #ca8a04; }
 .series.solar_kwh { stroke: #e0a92e; stroke-dasharray: 1 3; stroke-linecap: round; }
 .series-key.solar_kwh { fill: #e0a92e; }
 .series.load_kwh, .series.import_price { stroke: var(--accent); }
