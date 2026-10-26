@@ -158,6 +158,9 @@ class _SolarDayReading(NamedTuple):
     total_kwh: float
     # Solcast detailed-forecast weights, or None to use the fallback shape.
     detailed: list[tuple[datetime, float]] | None
+    # False when the total fell back to a non-numeric sensor state: the planner
+    # still counts 0.0, but no forecast existed (view-only provenance, #496).
+    known: bool = True
 
 
 def _solar_reading(
@@ -174,6 +177,7 @@ def _solar_reading(
     """
     if state is None:
         return None
+    known = True
     estimate_key = "estimate" if percentile == 50 else f"estimate{percentile}"
     percentile_total = _opt_float(state.attributes.get(estimate_key))
     total: float
@@ -186,6 +190,7 @@ def _solar_reading(
             estimate_key,
         )
         total = _to_float(state.state, 0.0)
+        known = _opt_float(state.state) is not None
     if not isfinite(total) or total < 0:
         log.warning(
             "Solcast solar day total %s is negative or not a number; "
@@ -203,7 +208,7 @@ def _solar_reading(
                 "value; counting that day's solar as zero",
             )
             return None
-    return _SolarDayReading(total, detailed)
+    return _SolarDayReading(total, detailed, known)
 
 
 def _solar_slots(
@@ -243,8 +248,28 @@ def _solar_slots_known(
     solar entities don't cover, reads as missing — the planner still lays both
     onto zero in ``solar_slots`` (#496).
     """
-    covered = {day for day, reading in readings.items() if reading is not None}
-    return tuple(start.astimezone(tz).date() in covered for start in slot_starts)
+    # Per covered date: the slot-of-day indices a detailed forecast listed, or
+    # None when the day's total was laid onto the fallback shape (every slot).
+    covered: dict[date, set[int] | None] = {}
+    for day, reading in readings.items():
+        if reading is None or not reading.known:
+            continue
+        listed = {
+            local.hour * 2 + local.minute // 30
+            for period_start, _ in reading.detailed or ()
+            for local in (period_start.astimezone(tz) if period_start.tzinfo else period_start,)
+            if local.date() == day
+        }
+        covered[day] = listed or None
+    known: list[bool] = []
+    for start in slot_starts:
+        local = start.astimezone(tz)
+        if local.date() not in covered:
+            known.append(False)
+            continue
+        day_slots = covered[local.date()]
+        known.append(day_slots is None or local.hour * 2 + local.minute // 30 in day_slots)
+    return tuple(known)
 
 
 def pre_window_drain(

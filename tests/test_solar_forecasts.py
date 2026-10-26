@@ -80,8 +80,8 @@ async def test_run_once_records_the_solar_forecast_it_planned_with(
     """One row per slot that carried a forecast, stamped with the input snapshot.
 
     Frozen at 01:00 inside Monday night's window, the horizon spans Monday
-    (today's entity, valid — a genuine 0.0 kWh counts) and Tuesday (no valid
-    reading, so nothing is stored). Slot 0's own row is issued exactly at its
+    (today's entity, valid, its detailed forecast listing only 02:00) and
+    Tuesday (no valid reading, so nothing is stored). Slot 0's own row is issued exactly at its
     start, so it never reads back: only a later plan's earlier issue does.
     """
     s = legacy_settings(
@@ -97,11 +97,12 @@ async def test_run_once_records_the_solar_forecast_it_planned_with(
     for start in starts:
         if start == datetime(2026, 1, 12, 1, 0, tzinfo=UTC):
             assert start not in values  # issued exactly at the slot's start
-        elif start.date() == date(2026, 1, 12):
-            expected = 2.0 if start == datetime(2026, 1, 12, 2, 0, tzinfo=UTC) else 0.0
-            assert values[start] == expected
+        elif start == datetime(2026, 1, 12, 2, 0, tzinfo=UTC):
+            assert values[start] == 2.0
         else:
-            assert start not in values  # Tuesday: no forecast was stored
+            # Monday's other slots weren't in the detailed forecast, and Tuesday
+            # had no valid reading: neither is stored as a zero.
+            assert start not in values
     async with aiosqlite.connect(s.db_path) as db:
         issues = {row[0] for row in await db.execute_fetchall(
             "SELECT DISTINCT issued_at FROM solar_forecasts"

@@ -8,40 +8,26 @@ const MEASURED_UNAVAILABLE = {
     not_implemented: "Measured solar is not available in this version yet.",
 };
 
-// Local midnight on the household clock, in the offset the timeline reported
-// for `instant` (the browser's zone is not the household's). On the
-// spring-forward night that lands an hour before local midnight; the fetch
-// below retries an hour later rather than giving up for the whole day.
-function midnightOf(instant) {
-    return instant.slice(0, 10) + "T00:00:00" + instant.slice(19);
-}
-
-function plusAnHour(instant) {
-    return new Date(Date.parse(instant) + 3600000).toISOString();
-}
-
-async function fetchHistory(from, to) {
-    const response = await fetch(
-        `api/history?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`
-            + "&resolution=slot",
-        {cache: "no-store"},
-    );
+// Omitting `from` asks the server for the household's own midnight, so the
+// browser never guesses the offset (it differs from now's on DST days).
+async function fetchHistory(to) {
+    const range = to ? `&to=${encodeURIComponent(to)}` : "";
+    const response = await fetch(`api/history?resolution=slot${range}`, {cache: "no-store"});
     return response.ok ? await response.json() : null;
 }
 
 export function TodaySpan({timeline}) {
     const [payload, setPayload] = useState(null);
     const [failed, setFailed] = useState(false);
-    const to = timeline.horizon_start ?? timeline.now;
-    const from = midnightOf(timeline.now);
+    // Without a plan the span runs to now (the server's default `to`).
+    const to = timeline?.horizon_start ?? null;
     useEffect(() => {
         let active = true;
         setPayload(null);
         setFailed(false);
         async function load() {
             try {
-                let result = await fetchHistory(from, to);
-                if (result === null) result = await fetchHistory(plusAnHour(from), to);
+                const result = await fetchHistory(to);
                 if (result === null) throw new Error("history unavailable");
                 if (active) setPayload(result);
             } catch {
@@ -50,7 +36,7 @@ export function TodaySpan({timeline}) {
         }
         void load();
         return () => { active = false; };
-    }, [from, to]);
+    }, [to, timeline?.now]);
     if (failed) return html`<section aria-label="Today so far">
         <h2>Today so far</h2>
         <p>History unavailable. Reload to try again.</p>
@@ -90,7 +76,7 @@ export function TodaySpan({timeline}) {
         dashed.push(`${drawing ? "L" : "M"}${x0},${y(value)} L${x0 + slotWidth},${y(value)}`);
         drawing = true;
     }
-    const nowX = Math.min(x(timeline.now), right);
+    const nowX = timeline ? Math.min(x(timeline.now), right) : right;
     return html`<section aria-label="Today so far">${header}
         <div class="chart-scroll" tabindex="0" aria-label="Scrollable history chart">
             <svg viewBox=${`0 0 ${width} 150`} width=${width} height="150"

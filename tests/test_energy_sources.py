@@ -856,7 +856,8 @@ async def test_solar_slot_provenance_separates_missing_from_zero(
     ):
         local = start.astimezone(_HOUSEHOLD_TZ)
         if local.date() == date(2026, 6, 8):  # today: a valid reading
-            assert exists is True
+            # Only the slots the detailed forecast listed existed, its 0.0 included.
+            assert exists is (local.hour == 17)
             expected = 3.0 if local == datetime(2026, 6, 8, 17, 0, tzinfo=_HOUSEHOLD_TZ) else 0.0
             assert solar == expected
         else:  # tomorrow's invalid payload, and the uncovered day after
@@ -1761,3 +1762,23 @@ async def test_disabled_export_provider_never_reads_axle(
     assert inputs.flexibility_event is None
     assert inputs.flexibility_event_trusted
     assert build_schedule(settings, inputs, cfg).export_prices == ()
+
+
+@pytest.mark.parametrize("state", ["unavailable", "unknown", "not-a-number"])
+def test_non_numeric_solar_state_is_not_a_known_zero(state: str) -> None:
+    """The planner still counts 0.0, but no forecast existed for that date."""
+    from ha_spark.ha.rest import EntityState
+
+    def entity(value: str) -> EntityState:
+        return EntityState(entity_id="sensor.solar", state=value, attributes={})
+
+    reading = sources._solar_reading(entity(state), 50)
+    assert reading is not None and reading.total_kwh == 0.0
+    starts = tuple(datetime(2026, 6, 8, 12, tzinfo=UTC) + timedelta(minutes=30 * i)
+                   for i in range(4))
+    readings = {date(2026, 6, 8): reading}
+    assert sources._solar_slots(readings, starts, _HOUSEHOLD_TZ) == (0.0,) * 4
+    assert sources._solar_slots_known(readings, starts, _HOUSEHOLD_TZ) == (False,) * 4
+    numeric = sources._solar_reading(entity("0.0"), 50)
+    assert sources._solar_slots_known({date(2026, 6, 8): numeric}, starts,
+                                      _HOUSEHOLD_TZ) == (True,) * 4

@@ -39,11 +39,12 @@ CREATE INDEX IF NOT EXISTS solar_forecasts_slot ON solar_forecasts (slot_start, 
 
 _INSERT = "INSERT INTO solar_forecasts (issued_at, slot_start, kwh) VALUES (?, ?, ?)"
 # The forecast the plan was using before the slot began: the latest issue
-# strictly before the slot's start, insertion order breaking ties.
+# strictly before the slot's start, insertion order breaking ties. Every value
+# is written by ``_iso`` (UTC isoformat), so text order is instant order.
 _SELECT_SLOT = """
 SELECT kwh FROM solar_forecasts
 WHERE slot_start = ? AND issued_at < ?
-ORDER BY julianday(issued_at) DESC, id DESC
+ORDER BY issued_at DESC, id DESC
 LIMIT 1
 """
 _PRUNE = "DELETE FROM solar_forecasts WHERE slot_start < ?"

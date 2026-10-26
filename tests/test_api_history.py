@@ -50,9 +50,10 @@ def _midnight(now: datetime) -> datetime:
     [
         ({"to": "2026-01-12T15:10:00+00:00"},),  # no resolution
         ({"resolution": "day", "from": "x", "to": "x"},),
-        ({"resolution": "slot"},),  # no from/to
-        ({"resolution": "slot", "to": "2026-01-12T15:10:00+00:00"},),  # no from
-        ({"resolution": "slot", "from": "2026-01-12T00:00:00"},),  # no to
+        ({"resolution": "slot", "from": "2026-01-12T00:00:00"},),  # naive from, no to
+        # Parseable but unrepresentable in UTC: a 400, never a 500.
+        ({"resolution": "slot", "from": "0001-01-01T00:00:00+14:00"},),
+        ({"resolution": "slot", "to": "9999-12-31T23:59:59-14:00"},),
         # Naive timestamps are rejected: an instant needs its offset.
         ({"resolution": "slot", "from": "2026-01-12T00:00:00",
           "to": "2026-01-12T15:10:00"},),
@@ -197,3 +198,35 @@ def test_history_refuses_a_non_ingress_peer(tmp_path):
             "to": "2026-01-12T01:10:00+00:00",
         }, headers={"X-Forwarded-For": INGRESS_PROXY_IP, "X-Remote-User-Id": "owner"})
     assert response.status_code == 403
+
+
+def test_history_omitted_bounds_mean_today_so_far(tmp_path, monkeypatch):
+    # The browser asks for "today so far" without working out the midnight
+    # offset: on the fall-back day that is 00:00+01:00, not 00:00+00:00.
+    frozen = datetime(2026, 10, 25, 2, 10, tzinfo=LONDON)
+    _frozen_server_clock(monkeypatch, frozen)
+    with owner_client(_state(tmp_path)) as client:
+        both = client.get("/api/history", params={"resolution": "slot"}).json()
+        upto = client.get("/api/history", params={
+            "resolution": "slot", "to": "2026-10-25T01:30:00+00:00"}).json()
+    assert [b["start"] for b in both["buckets"]][0] == "2026-10-25T00:00:00+01:00"
+    assert len(both["buckets"]) == 7
+    assert [b["start"] for b in upto["buckets"]][-1] == "2026-10-25T01:00:00+00:00"
+    assert len(upto["buckets"]) == 5
+
+
+def test_history_repeated_midnight_starts_at_the_first_one(tmp_path, monkeypatch):
+    havana = ZoneInfo("America/Havana")
+    # 00:40 in the second occurrence of the repeated midnight hour.
+    frozen = datetime(2026, 11, 1, 5, 40, tzinfo=UTC).astimezone(havana)
+    assert frozen.fold == 1
+    _frozen_server_clock(monkeypatch, frozen)
+    with owner_client(_state(tmp_path, timezone="America/Havana")) as client:
+        response = client.get("/api/history", params={
+            "resolution": "slot", "from": "2026-11-01T00:00:00-04:00",
+            "to": frozen.isoformat(),
+        })
+    assert response.status_code == 200
+    starts = [b["start"] for b in response.json()["buckets"]]
+    assert starts[0] == "2026-11-01T00:00:00-04:00"
+    assert len(starts) == 4  # both occurrences of the repeated hour

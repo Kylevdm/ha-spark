@@ -541,18 +541,24 @@ def build_app(
             if params.get("resolution") != "slot":
                 return JSONResponse({"error": "unsupported resolution"}, status_code=400)
             invalid = JSONResponse({"error": "invalid history range"}, status_code=400)
-            try:
-                start = datetime.fromisoformat(params["from"])
-                end = datetime.fromisoformat(params["to"])
-            except (KeyError, ValueError):
-                return invalid
-            if start.tzinfo is None or end.tzinfo is None:
-                return invalid  # an instant needs its offset; naive times are refused
-            start, end = start.astimezone(UTC), end.astimezone(UTC)
             st = _state_of(request)
             tz = load_timezone(st.settings.timezone)
             now = datetime.now(tz)
-            midnight = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
+            # The day's first local midnight, even when midnight itself repeats.
+            midnight = now.replace(
+                hour=0, minute=0, second=0, microsecond=0, fold=0
+            ).astimezone(UTC)
+            # Omitted bounds mean "today so far", so the browser never has to
+            # work out the household's midnight offset itself.
+            try:
+                start = (datetime.fromisoformat(params["from"]) if "from" in params
+                         else midnight)
+                end = datetime.fromisoformat(params["to"]) if "to" in params else now
+                if start.tzinfo is None or end.tzinfo is None:
+                    return invalid  # an instant needs its offset; naive times are refused
+                start, end = start.astimezone(UTC), end.astimezone(UTC)
+            except (ValueError, OverflowError):
+                return invalid
             if start < midnight or end > now.astimezone(UTC) or start > end:
                 return JSONResponse(
                     {"error": "history range must be inside today"}, status_code=400
