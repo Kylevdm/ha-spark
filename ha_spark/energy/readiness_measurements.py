@@ -23,8 +23,8 @@ from ha_spark.config import Settings
 from ha_spark.energy.derived_base_load import ComponentSeries, derive_base_load
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.onboarding import (
-    _ENERGY_FACTORS,
-    _POWER_FACTORS,
+    ENERGY_FACTORS,
+    POWER_FACTORS,
     SUPPORTED_UNITS,
     statistic_unit,
 )
@@ -147,12 +147,12 @@ def measurement_series(
     unit: str, invert: bool = False, timezone: str = "UTC",
 ) -> dict[datetime, Measurement]:
     """Convert recorder rows to half-hours, without scaling partial coverage."""
-    if unit not in _POWER_FACTORS and unit not in _ENERGY_FACTORS:
+    if unit not in POWER_FACTORS and unit not in ENERGY_FACTORS:
         raise ValueError(
             f"Unsupported unit {unit!r}; need one of {sorted(SUPPORTED_UNITS)}"
         )
-    power = unit in _POWER_FACTORS
-    factor = (_POWER_FACTORS if power else _ENERGY_FACTORS)[unit] * (-1 if invert else 1)
+    power = unit in POWER_FACTORS
+    factor = (POWER_FACTORS if power else ENERGY_FACTORS)[unit] * (-1 if invert else 1)
 
     def converted(rows: list[dict[str, object]], duration: float) -> dict[datetime, float]:
         result = {}

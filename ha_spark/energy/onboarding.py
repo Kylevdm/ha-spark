@@ -23,9 +23,9 @@ BACKFILL_LOOKBACK_DAYS = 730
 
 # kWh per hourly row: power sensors use the hourly mean (mean power x 1h),
 # energy sensors use the per-hour change.
-_POWER_FACTORS = {"W": 0.001, "kW": 1.0}
-_ENERGY_FACTORS = {"kWh": 1.0, "Wh": 0.001}
-SUPPORTED_UNITS = frozenset(_POWER_FACTORS) | frozenset(_ENERGY_FACTORS)
+POWER_FACTORS = {"W": 0.001, "kW": 1.0}
+ENERGY_FACTORS = {"kWh": 1.0, "Wh": 0.001}
+SUPPORTED_UNITS = frozenset(POWER_FACTORS) | frozenset(ENERGY_FACTORS)
 
 
 def statistic_unit(meta: dict[str, Any]) -> str:
@@ -39,10 +39,10 @@ def hourly_kwh_from_stats(
     rows: list[dict[str, Any]], unit: str, entity: str
 ) -> list[tuple[datetime, float]]:
     """Convert hourly statistics rows to (hour start UTC, kWh) per the source unit."""
-    if unit in _POWER_FACTORS:
-        factor, key = _POWER_FACTORS[unit], "mean"
-    elif unit in _ENERGY_FACTORS:
-        factor, key = _ENERGY_FACTORS[unit], "change"
+    if unit in POWER_FACTORS:
+        factor, key = POWER_FACTORS[unit], "mean"
+    elif unit in ENERGY_FACTORS:
+        factor, key = ENERGY_FACTORS[unit], "change"
     else:
         raise ValueError(
             f"Unsupported unit {unit!r} for {entity}; "
