@@ -40,6 +40,9 @@ dialog { max-width: min(36rem, 95vw); background: var(--surface); color: var(--t
 .plan-headline dd, .plan-costs dd { margin: .5rem 0 0; overflow-wrap: anywhere; }
 .plan-costs dd { font-size: 1.4rem; }
 .plan-warnings { padding-inline-start: 1.5rem; }
+.plan-lines button { text-align: start; color: var(--text); background: var(--surface); }
+.plan-lines button[aria-pressed="true"] { border-color: var(--accent); }
+.line-span { fill: var(--accent); fill-opacity: .18; pointer-events: none; }
 .chart-scroll { overflow-x: auto; border: 1px solid var(--border); background: var(--surface); }
 .chart-scroll svg { display: block; font: 12px system-ui, sans-serif; }
 .slot-grid, .lane-rule { stroke: var(--border); stroke-width: 1; }

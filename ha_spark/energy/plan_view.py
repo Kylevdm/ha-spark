@@ -36,7 +36,7 @@ class Costs:
 
 @dataclass(frozen=True)
 class PlanLine:
-    kind: Literal["warning"]
+    kind: Literal["charge", "hold", "reserve", "export", "skip", "v2l", "warning"]
     start: datetime | None
     end: datetime | None
     text: str
@@ -150,6 +150,129 @@ def _slots(
     return tuple(result)
 
 
+def v2l_refill_reason(kwh: float, reservation_name: str) -> str:
+    """Word both an individual refill and a folded view without changing CLI text."""
+    return (f"Refill the house battery with {kwh:.2f} kWh from V2L for "
+            f"the {reservation_name} reservation.")
+
+
+def ev_hold_line(now: datetime | None) -> PlanLine:
+    """Describe the recorded observation, never a control input or scheduled end."""
+    start = now.astimezone(UTC) if now is not None and now.tzinfo is not None else None
+    return PlanLine("hold", start, None,
+                    "Hold the house battery while an EV hold is active.")
+
+
+def _lines(plan: ChargePlan, cfg: PlannerConfig, inputs: PlannerInputs) -> tuple[PlanLine, ...]:
+    geometry = inputs.geometry_for(cfg)
+    absolute = (plan.model == "slots" and geometry is not None
+                and geometry.horizon_start.tzinfo is not None)
+    clock = inputs.now or (geometry.horizon_start if geometry is not None else None)
+
+    def instant(at: datetime | None) -> datetime | None:
+        if at is None or clock is None or clock.tzinfo is None:
+            return None
+        return _align(at, clock).astimezone(UTC)
+
+    now = instant(clock)
+
+    def slot_span(index: int) -> tuple[datetime | None, datetime | None]:
+        if not absolute or geometry is None or not 0 <= index < len(geometry.slot_starts):
+            return None, None
+        start = instant(geometry.slot_starts[index])
+        if start is None:
+            return None, None
+        return max(start, now) if now is not None else start, start + timedelta(minutes=30)
+
+    # The second item is the reservation identity, used only to fold V2L refills.
+    rows: list[tuple[PlanLine, str]] = []
+    for a, b in plan.charge_intent.holds:
+        start, end = instant(a), instant(b)
+        if now is not None and end is not None and end <= now:
+            continue
+        if start is not None and now is not None:
+            start = max(start, now)
+        rows.append((PlanLine("hold", start, end,
+                              "Hold the house battery during a smart-charge dispatch."), ""))
+    if not plan.soc.ok:
+        rows.append((PlanLine("warning", None, None,
+                              _SOC_WARNINGS.get(plan.soc.status, "SoC reading not trusted")), ""))
+    else:
+        if plan.required_kwh > 0:
+            start = instant(geometry.window_start) if absolute and geometry else None
+            end = instant(geometry.window_end) if absolute and geometry else None
+            if start is not None and now is not None:
+                start = max(start, now)
+            if start is None or end is None or start < end:
+                rows.append((PlanLine("charge", start, end,
+                                      f"Charge the house battery with {plan.required_kwh:.2f} kWh "
+                                      f"to reach {plan.target_soc:.0f}% SoC.",
+                                      plan.required_kwh), ""))
+        for reservation in plan.reservations:
+            target = instant(reservation.target_time)
+            if target is None and absolute and geometry is not None:
+                if 0 <= reservation.target_slot < len(geometry.slot_starts):
+                    target = instant(geometry.slot_starts[reservation.target_slot])
+            rows.append((PlanLine("reserve", now if target is not None else None, target,
+                                  reservation.reason, reservation.energy_kwh), ""))
+        export = plan.charge_intent.export
+        if export is not None and len(export.selected_slots) == len(export.slot_export_kw):
+            for at, kw in zip(export.selected_slots, export.slot_export_kw, strict=True):
+                start = instant(at)
+                end = start + timedelta(minutes=30) if start is not None else None
+                if start is not None and now is not None:
+                    start = max(start, now)
+                if start is not None and end is not None and start >= end:
+                    continue
+                hours = (end - start).total_seconds() / 3600 if start and end else 0.5
+                kwh = kw * hours
+                rows.append((PlanLine("export", start, end,
+                                      f"Export {kwh:.2f} kWh from the house battery.", kwh), ""))
+        for skip in plan.export_skips:
+            start = instant(skip.start)
+            end = start + timedelta(minutes=30) if start else None
+            if start is not None and now is not None:
+                start = max(start, now)
+            if start is None or end is None or start < end:
+                rows.append((PlanLine("skip", start, end, skip.reason), ""))
+        for refill in plan.v2l_refills:
+            if geometry is None or not 0 <= refill.slot < len(geometry.slot_starts):
+                continue
+            start, end = slot_span(refill.slot)
+            if start is not None and end is not None and start >= end:
+                continue
+            rows.append((PlanLine("v2l", start, end, refill.reason, refill.kwh),
+                         refill.reservation))
+
+    kinds = ("warning", "charge", "hold", "reserve", "export", "skip", "v2l")
+    folded: list[PlanLine] = []
+    for kind in kinds:
+        group = sorted((row for row in rows if row[0].kind == kind),
+                       key=lambda row: row[0].start or datetime.max.replace(tzinfo=UTC))
+        previous_identity = ""
+        for line, identity in group:
+            previous = folded[-1] if folded and folded[-1].kind == kind else None
+            adjacent = (previous is not None and previous.end is not None
+                        and previous.end == line.start)
+            merge = (kind == "export" or kind in ("skip", "hold")
+                     and previous is not None and previous.text == line.text
+                     or kind == "v2l" and bool(identity) and identity == previous_identity)
+            if adjacent and merge and previous is not None:
+                kwh = (previous.kwh or 0) + (line.kwh or 0)
+                text = (v2l_refill_reason(kwh, identity) if kind == "v2l" else
+                        f"Export {kwh:.2f} kWh from the house battery." if kind == "export"
+                        else line.text)
+                folded[-1] = PlanLine(line.kind, previous.start, line.end, text,
+                                      kwh if line.kwh is not None else None)
+            else:
+                folded.append(line)
+            previous_identity = identity
+    return tuple(sorted(folded, key=lambda line: (
+        line.kind != "warning", line.start or datetime.max.replace(tzinfo=UTC),
+        kinds.index(line.kind),
+    )))
+
+
 def build_plan_view(
     plan: ChargePlan, cfg: PlannerConfig, inputs: PlannerInputs, schedule: TariffSchedule,
     soc: tuple[SocPoint, ...] = (),
@@ -169,10 +292,7 @@ def build_plan_view(
             baseline=plan.baseline_cost if trusted else None,
             export_revenue=plan.export_revenue if trusted else None,
         ),
-        lines=() if trusted else (
-            PlanLine("warning", None, None,
-                     _SOC_WARNINGS.get(plan.soc.status, "SoC reading not trusted")),
-        ),
+        lines=_lines(plan, cfg, inputs),
         slots=_slots(plan, cfg, inputs, schedule),
         soc=(soc if trusted else ()) if plan.model == "slots" else None,
     )
