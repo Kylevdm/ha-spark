@@ -21,6 +21,7 @@ from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
+_HALF_HOUR = timedelta(minutes=30)
 Reader = Callable[[Settings, datetime], Awaitable[tuple[str | None, list[dict[str, Any]]]]]
 Key = tuple[datetime, datetime, str, str, bool]
 
@@ -55,7 +56,12 @@ async def read_statistics(settings: Settings, start: datetime) -> tuple[
 
 
 def _number(value: object) -> TypeGuard[int | float]:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an int too large for a float
+        return False
 
 
 def _measure(
@@ -75,15 +81,16 @@ def _measure(
             elif isinstance(raw, str):
                 at = datetime.fromisoformat(raw)
             else:
-                # Unlocatable rows cannot establish a trustworthy measurement.
-                return {}
+                continue  # an unlocatable row can't count towards any half-hour
             aware = at.tzinfo is not None and at.utcoffset() is not None
             at = at.replace(tzinfo=UTC) if not aware else at.astimezone(UTC)
         except (ValueError, OverflowError, OSError):
-            return {}
+            continue
         if at < start or at >= end:
             continue
-        half = at.replace(minute=at.minute // 30 * 30, second=0, microsecond=0)
+        # The half-hour on the requested grid (household midnight need not be
+        # a UTC half-hour, e.g. +05:45).
+        half = start + (at - start) // _HALF_HOUR * _HALF_HOUR
         value = row.get(key)
         if (not aware or at.minute % 5 or at.second or at.microsecond
                 or not _number(value) or at in seen):
@@ -123,7 +130,10 @@ class MeasuredSolar:
         entity = settings.derive_solar_generation_entity
         if not entity:
             return MeasuredResult({}, "no_entity")
-        key = (start, end, entity, settings.timezone, settings.derive_invert_solar_generation)
+        # A default `to` is "now" to the microsecond: key on the grid's next
+        # half-hour so repeats within the cache's five minutes share one read.
+        key_end = start + -((start - end) // _HALF_HOUR) * _HALF_HOUR
+        key = (start, key_end, entity, settings.timezone, settings.derive_invert_solar_generation)
         self._cache = {k: v for k, v in self._cache.items() if self.clock() - v[0] < 300}
         if key in self._cache:
             return self._cache[key][1]

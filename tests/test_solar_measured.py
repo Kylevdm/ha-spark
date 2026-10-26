@@ -124,3 +124,55 @@ async def test_websocket_reader_requests_five_minute_rows(monkeypatch):
         START + timedelta(minutes=30))
     assert result.values == {START: pytest.approx(.6)}
     assert calls == ["metadata", "rows"]
+
+
+async def _measure_with(data, start=START, end=None, unit="Wh"):
+    async def reader(settings, at):
+        return unit, data
+    return await MeasuredSolar(reader=reader).read(
+        Settings(derive_solar_generation_entity="sensor.solar"), start,
+        end or start + timedelta(minutes=60))
+
+
+@pytest.mark.parametrize("start", ["garbage", 10**400, True, None, "2026-01-12T00:00:00+25:00"])
+async def test_unlocatable_row_only_drops_itself(start):
+    later = [{"start": (START + timedelta(minutes=30 + i * 5)).isoformat(), "change": 100}
+             for i in range(6)]
+    result = await _measure_with([*rows(), {"start": start, "change": 100}, *later])
+    assert result.reason is None
+    assert result.values == {START: pytest.approx(.6),
+                             START + timedelta(minutes=30): pytest.approx(.6)}
+
+
+async def test_overflowing_value_blanks_only_its_half_hour():
+    data = rows() + [{"start": (START + timedelta(minutes=30 + i * 5)).isoformat(),
+                      "change": 100} for i in range(6)]
+    data[0]["change"] = 10**400
+    result = await _measure_with(data)
+    assert result.reason is None
+    assert result.values == {START + timedelta(minutes=30): pytest.approx(.6)}
+
+
+async def test_half_hours_follow_a_non_utc_aligned_grid():
+    # Kathmandu's midnight is 18:15 UTC: an off-boundary row in 18:15-18:45 nulls that half.
+    grid = datetime(2026, 1, 11, 18, 15, tzinfo=UTC)
+    data = [{"start": (grid + timedelta(minutes=i * 5)).isoformat(), "change": 100}
+            for i in range(6)]
+    assert (await _measure_with(data, grid, grid + timedelta(minutes=30))).values == {
+        grid: pytest.approx(.6)}
+    data.append({"start": (grid + timedelta(minutes=1)).isoformat(), "change": 100})
+    assert (await _measure_with(data, grid, grid + timedelta(minutes=30))).values == {}
+
+
+async def test_a_moving_now_shares_one_cached_read():
+    calls = 0
+    async def reader(settings, at):
+        nonlocal calls
+        calls += 1
+        return "Wh", rows()
+    cache = MeasuredSolar(reader=reader)
+    settings = Settings(derive_solar_generation_entity="sensor.solar")
+    first = await cache.read(settings, START, START + timedelta(minutes=12, microseconds=5))
+    second = await cache.read(settings, START, START + timedelta(minutes=13, microseconds=9))
+    assert calls == 1
+    assert first == second
