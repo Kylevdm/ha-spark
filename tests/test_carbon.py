@@ -3,13 +3,14 @@
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import aiosqlite
 import httpx
 import pytest
 import respx
 
-from ha_spark.energy.carbon import CarbonRefresher, carbon_payload
+from ha_spark.energy.carbon import CarbonRefresher, _validate, carbon_payload
 from tests.test_config_secret_sweep import CANARY
 
 NOW = datetime(2026, 10, 14, 12, tzinfo=UTC)
@@ -22,6 +23,47 @@ def row(start=NOW, value=132, index="moderate"):
 
 def envelope(rows, region=12):
     return {"data": {"regionid": region, "data": rows}}
+
+
+@pytest.mark.parametrize("bad", [
+    envelope([row(value="132")]), envelope([row(value=True)]),
+    envelope([row()], True), envelope([row()], 12.0),
+    envelope([row(value=float("nan"))]), envelope([row(value=2001)]),
+    envelope([row(index="unknown")]), envelope([row(value=Decimal("132"))]),
+])
+def test_validate_rejects_non_strict_or_invalid_values(bad):
+    assert _validate(bad, 12, NOW, NOW + timedelta(hours=1)) == []
+
+
+@pytest.mark.parametrize("value", [0, 132, 132.5, 2000])
+def test_validate_preserves_numeric_values(value):
+    assert _validate(envelope([row(value=value)]), 12, NOW, NOW + timedelta(hours=1)) == [
+        (NOW.isoformat(), (NOW + timedelta(minutes=30)).isoformat(), float(value), "moderate"),
+    ]
+
+
+def test_validate_skips_bad_elements_and_ignores_extra_keys():
+    good = row()
+    good["extra"] = CANARY
+    good["intensity"]["extra"] = CANARY
+    payload = envelope([None, "bad", good])
+    payload["extra"] = CANARY
+    payload["data"]["extra"] = CANARY
+    assert _validate(payload, 12, NOW, NOW + timedelta(hours=1)) == [
+        (NOW.isoformat(), (NOW + timedelta(minutes=30)).isoformat(), 132.0, "moderate"),
+    ]
+
+
+def test_validate_cap_keeps_first_300_keys_but_later_duplicates_win():
+    rows = [row(NOW + timedelta(minutes=30 * i)) for i in reversed(range(301))]
+    rows.append(row(NOW + timedelta(minutes=30), value=199))
+    result = _validate(envelope(rows), 12, NOW, NOW + timedelta(days=7))
+    assert result == [
+        (start.isoformat(), (start + timedelta(minutes=30)).isoformat(),
+         199.0 if i == 1 else 132.0, "moderate")
+        for i in range(1, 301)
+        for start in [NOW + timedelta(minutes=30 * i)]
+    ]
 
 
 @respx.mock
