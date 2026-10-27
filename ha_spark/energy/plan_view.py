@@ -53,9 +53,9 @@ class PlanSlot:
     export_price: float
     cheap_frac: float
     load_kwh: float
-    solar_kwh: float
+    solar_kwh: float | None
     # Solcast's estimate before the planner's haircut, on the same slot-0 basis.
-    solar_raw_kwh: float
+    solar_raw_kwh: float | None
     actions: tuple[Action, ...]
 
 
@@ -138,14 +138,17 @@ def _slots(
                 actions.append("skip")
             if i in refills:
                 actions.append("v2l")
+        known = inputs.solar_slots_known is None or (
+            i < len(inputs.solar_slots_known) and inputs.solar_slots_known[i]
+        )
         result.append(PlanSlot(
             start=start, import_price=schedule.prices[i],
             # As the planner prices paid export: the schedule overlay, else the event rate.
             export_price=(schedule.export_prices[i] if schedule.export_prices
                           else event_rate if start in exports else schedule.export_rate),
             cheap_frac=schedule.cheap_fracs[i], load_kwh=inputs.load_slots[i] * remaining,
-            solar_kwh=solar[i] * cfg.solar_haircut_k * remaining,
-            solar_raw_kwh=solar[i] * remaining, actions=tuple(actions),
+            solar_kwh=solar[i] * cfg.solar_haircut_k * remaining if known else None,
+            solar_raw_kwh=solar[i] * remaining if known else None, actions=tuple(actions),
         ))
     return tuple(result)
 

@@ -87,12 +87,13 @@ async def get_plan(settings: Settings) -> PlanResult:
 
 
 async def get_state(settings: Settings) -> StateResult:
+    source = solar_source_from_store(settings)
     async with _rest(settings) as rest:
-        inputs, _cfg, _forecast = await gather_inputs(
-            settings, rest, source=solar_source_from_store(settings)
-        )
+        inputs, _cfg, _forecast = await gather_inputs(settings, rest, source=source)
     data = jsonable_encoder(dataclasses.asdict(inputs))
     data.pop("load_slots", None)  # large; available via get_forecast
+    if source.kind == "native":
+        data["solar_note"] = NATIVE_PREVIEW_NOTE
     devices = [
         {"id": d.id, "type": d.type, "driver": d.driver}
         for d in settings.devices

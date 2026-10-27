@@ -14,7 +14,7 @@ from __future__ import annotations
 from ha_spark.config import Settings
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.report import format_plan
-from ha_spark.energy.solar_source import solar_source_from_store
+from ha_spark.energy.solar_source import NATIVE_PREVIEW_NOTE, solar_source_from_store
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -39,11 +39,15 @@ async def build_grounding(settings: Settings, rest: HomeAssistantRest) -> str | 
     same decision the planner would apply — and never crashes the chat path.
     """
     try:
-        run = await current_plan(settings, rest, source=solar_source_from_store(settings))
-        return format_plan(
+        source = solar_source_from_store(settings)
+        run = await current_plan(settings, rest, source=source)
+        text = format_plan(
             run.plan, run.load_source, forecast_date=run.forecast.target_date,
             tz=run.tz,
         )
+        if source.kind == "native":
+            text += "\n" + NATIVE_PREVIEW_NOTE
+        return text
     except Exception as exc:  # noqa: BLE001 - grounding is best-effort
         log.warning("Could not build copilot grounding (%s); answering ungrounded", exc)
         return None

@@ -146,11 +146,14 @@ async def test_native_inputs(
     view = build_plan_view(run.plan, run.cfg, run.inputs, run.schedule)
     assert view.slots is not None
     assert [slot.solar_kwh for slot in view.slots] == [
-        slot.solar_raw_kwh * 0.7 for slot in view.slots
+        slot.solar_raw_kwh * 0.7 if slot.solar_raw_kwh is not None else None
+        for slot in view.slots
     ]
     assert [slot.solar_raw_kwh for slot in view.slots] == [
-        kwh * (run.inputs.geometry.slot0_remaining_frac if i == 0 else 1)
-        for i, kwh in enumerate(run.inputs.solar_slots)
+        kwh * (run.inputs.geometry.slot0_remaining_frac if i == 0 else 1) if known else None
+        for i, (kwh, known) in enumerate(zip(
+            run.inputs.solar_slots, run.inputs.solar_slots_known, strict=True,
+        ))
     ]
 
 
