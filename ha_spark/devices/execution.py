@@ -23,6 +23,8 @@ from weakref import WeakKeyDictionary
 from ha_spark.authority import HoldDevice
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from ha_spark.authority import AuthorityStore
     from ha_spark.config import DeviceConfig, Settings
 
@@ -96,6 +98,18 @@ class WriteGate:
 
 class AuthorityRevoked(RuntimeError):
     """Authority no longer permits the write this action was granted; nothing was sent."""
+
+
+@dataclass
+class ReleaseBackoff:
+    """Consecutive refused hold releases on one device (#448), and the last refusal.
+
+    In memory only: a restart starts from 0, which costs at most five more attempts.
+    """
+
+    refusals: int = 0
+    last_at: datetime | None = None
+    line: str = ""
 
 
 @dataclass
@@ -196,6 +210,7 @@ class ExecutionContext:
         )
         self.handover_step: ContextVar[str | None] = ContextVar("handover_step", default=None)
         self.gate = WriteGate(self)
+        self.release_backoff: dict[HoldDevice, ReleaseBackoff] = {}
         self._buses: dict[tuple[str, str, str], BusCoordinator] = {}
 
     @contextmanager

@@ -57,6 +57,7 @@ from ha_spark.devices.base import Capability, HoldContract, HoldValidation, fmt_
 from ha_spark.devices.execution import (
     ExecutionContext,
     Ownership,
+    ReleaseBackoff,
     device_action,
     execution_context,
 )
@@ -131,6 +132,10 @@ _MAX_CHARGE_CURRENT_A = 62.5
 # so a stale overlay can never hold the caller.
 _READ_BACK_ATTEMPTS = 16
 _READ_BACK_DELAY_SECONDS = 1.0
+# After this many consecutive refused releases, the schedule check that a
+# release needs runs at most once per interval (#448). Starting defaults.
+_RELEASE_BACKOFF_AFTER = 5
+_RELEASE_BACKOFF_INTERVAL = timedelta(minutes=10)
 # The gap must outlast the ~4 s spurious 0.0 the overlay reports around program
 # writes (#178); five reads assume _READ_BACK_DELAY_SECONDS stays at 1.0 s.
 _ZERO_CONFIRM_GAP_READS = 5
@@ -1094,6 +1099,8 @@ class SolisDevice:
         SoC-derived magnitude. Releasing is not (#424): in Optimise the On waits
         for this plan to apply and read back, or for the verified fallback
         schedule (Q3), so a dead SoC sensor keeps a held switch ``Off``, visibly.
+        After five refused releases in a row the schedule check runs at most
+        every 10 minutes (#448); holding and ``Off`` retries are never delayed.
 
         It must never read export state. If the switch is ``On`` during a paid
         export that is because no hold is active, not because export asked —
@@ -1122,6 +1129,9 @@ class SolisDevice:
         )
         wanted = "Off" if intent.hold_active(now) or retained else "On"
         desc = f"set inverter power switch to {wanted}"
+        if wanted == "Off":
+            # Holding again ends the refused-release episode; Off is never backed off.
+            self._execution.release_backoff.pop(identity, None)
         mode = self._coordinator.mode
         if mode.startswith("refuse:"):
             return [_refused(mode)]
@@ -1146,6 +1156,7 @@ class SolisDevice:
             try:
                 current = (await self._rest.get_state(entity)).state.strip().lower()
                 if current == wanted.lower():
+                    self._execution.release_backoff.pop(identity, None)
                     if wanted == "Off" and records and store is not None:
                         # Confirm our existing requests by this read; never open
                         # a new cause on a switch someone else already turned Off.
@@ -1202,16 +1213,32 @@ class SolisDevice:
             assert store is not None and store.state is not None
             schedule_lines: list[ActionLine] = []
             if wanted == "On":
+                backoff = self._execution.release_backoff.get(identity)
+                if (
+                    backoff is not None and backoff.last_at is not None
+                    and backoff.refusals >= _RELEASE_BACKOFF_AFTER
+                    and now < backoff.last_at + _RELEASE_BACKOFF_INTERVAL
+                ):
+                    # No schedule writes or re-reads until the interval passes; the
+                    # same refusal line again, so the daemon logs it only at DEBUG.
+                    return [ActionLine(backoff.line, ActionOutcome.REFUSED)]
                 schedule_lines, refusal = await self._confirm_restore_schedule(
                     intent, store.state
                 )
                 if refusal is not None:
                     log.warning("[REFUSED] %s: %s; hold kept", desc, refusal)
                     self._mark_release_refused(store, identity, "schedule_unverified", now)
-                    return [*schedule_lines, ActionLine(
-                        f"[REFUSED] {desc} refused: {refusal}; hold kept",
-                        ActionOutcome.REFUSED,
-                    )]
+                    backoff = self._execution.release_backoff.setdefault(
+                        identity, ReleaseBackoff()
+                    )
+                    backoff.refusals += 1
+                    backoff.last_at = now
+                    backoff.line = f"[REFUSED] {desc} refused: {refusal}; hold kept" + (
+                        "; retrying every 10 min"
+                        if backoff.refusals >= _RELEASE_BACKOFF_AFTER else ""
+                    )
+                    return [*schedule_lines, ActionLine(backoff.line, ActionOutcome.REFUSED)]
+                self._execution.release_backoff.pop(identity, None)
             if wanted == "Off":
                 self._save_hold_request(store, identity, intent, now, records, confirmed=False)
             else:
