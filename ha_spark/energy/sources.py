@@ -42,6 +42,7 @@ from ha_spark.energy.octopus import (
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.energy.soc_monitor import observe_soc
 from ha_spark.energy.solar import distribute_solar
+from ha_spark.energy.solar_source import SolarSource
 from ha_spark.energy.tariff import (
     AxleTariffProvider,
     DynamicTariffProvider,
@@ -586,7 +587,11 @@ def ev_hold_status_from_read(state: EntityState | None, trusted: bool) -> bool |
 
 
 async def gather_inputs(
-    settings: Settings, rest: HomeAssistantRest, *, soc: SocMeasurement | None = None
+    settings: Settings,
+    rest: HomeAssistantRest,
+    *,
+    soc: SocMeasurement | None = None,
+    source: SolarSource,
 ) -> tuple[PlannerInputs, PlannerConfig, LoadForecast]:
     """Read live HA state and build (inputs, config, load forecast).
 
@@ -594,6 +599,13 @@ async def gather_inputs(
     it is used as-is, so the plan is sized from the exact observation the
     loop made (no independent reread). Otherwise one observation is made
     here through the same shared :func:`observe_soc` path.
+
+    ``source`` states where the plan's solar comes from (#519): the kind, the
+    parsed native forecast or its absence, the snapshot's received instant,
+    and the plan's ``now`` as the caller states it. With kind ``entities``
+    (the only kind today) the forecast entities are read and the clock is
+    kept exactly as before, byte-for-byte; a native source, once built, will
+    judge forecast age at the context's ``now``.
     """
 
     async def state(entity_id: str) -> EntityState | None:
@@ -721,7 +733,7 @@ async def gather_inputs(
     tz = load_timezone(settings.timezone)
     window_start = parse_time(settings.charge_window_start)
     window_end = parse_time(settings.charge_window_end)
-    now = datetime.now(tz)
+    now = datetime.now(tz)  # the entities path keeps its own clock, byte-for-byte
     geometry = compute_horizon_geometry(now, window_start, window_end, tz)
     served_day = geometry.served_day
     forecast = await predict_home_load(settings, lat=lat, lon=lon, target=served_day)

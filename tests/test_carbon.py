@@ -102,6 +102,7 @@ async def test_region_does_not_change_planner_inputs_plan_or_readiness(tmp_path,
     from ha_spark.energy.readiness import evaluate_readiness
     from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
     from ha_spark.ha.rest import HomeAssistantRest
+    from tests.solar_source_helpers import entities_source
     from tests.test_readiness import fixture
 
     class Clock(datetime):
@@ -121,8 +122,11 @@ async def test_region_does_not_change_planner_inputs_plan_or_readiness(tmp_path,
     soc = SocMeasurement(status=SocStatus.OK, value=50, observed_at=NOW,
                          raw_state="50", reported_at=NOW, age_s=0, max_age_s=600)
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        off = await current_plan(settings, rest, soc=soc)
-        on = await current_plan(settings.model_copy(update={"carbon_region": 12}), rest, soc=soc)
+        source = entities_source(settings)
+        off = await current_plan(settings, rest, soc=soc, source=source)
+        on = await current_plan(
+            settings.model_copy(update={"carbon_region": 12}), rest, soc=soc, source=source
+        )
     assert off.inputs == on.inputs
     assert off.cfg == on.cfg
     assert off.plan == on.plan

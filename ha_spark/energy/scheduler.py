@@ -143,6 +143,7 @@ from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor, SocMonitorSnapshot, observe_soc
 from ha_spark.energy.solar_forecasts import SolarForecastStore
+from ha_spark.energy.solar_source import SolarSource, load_solar_source_kind
 from ha_spark.energy.sources import (
     ev_hold_status_from_read,
     parse_time,
@@ -380,6 +381,7 @@ async def run_once(
     ev_hold_state: EvHoldState | None = None,
     fallback_active: bool = False,
     execution: ExecutionContext | None = None,
+    source: SolarSource,
 ) -> RunResult:
     """Compute the charge plan, log it, and apply it under site authority.
 
@@ -388,6 +390,10 @@ async def run_once(
     (no independent reread); a failed measurement blocks real writes at the
     charger gate. Without one (CLI/agent callers) the plan makes its own
     observation through the same shared path.
+
+    ``source`` states where the plan's solar comes from (#519): the daemon
+    builds it per plan from its last accepted snapshot; callers without
+    daemon state read the persisted kind.
 
     ``trusted_holds`` is the daemon's last trusted hold set, used by the
     reconcile when this plan's hold data is untrusted (#143 §3).
@@ -403,7 +409,7 @@ async def run_once(
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        run = await current_plan(settings, rest, soc=soc)
+        run = await current_plan(settings, rest, soc=soc, source=source)
         plan, inputs, load_source = run.plan, run.inputs, run.load_source
         log.info(
             "Charge plan:\n%s",
@@ -2170,6 +2176,16 @@ async def _run_paired(
                     # Recovery never compares against a baseline: the resident
                     # program is the fallback, not any earlier plan.
                     previous_plan = None if reapply or recovering else last_applied_plan
+                    # The plan's solar source (#519): the persisted kind (the
+                    # daemon's own record, entities until a snapshot says
+                    # otherwise) plus the last accepted snapshot's received
+                    # instant, at this tick's now.
+                    solar_source = SolarSource(
+                        kind=load_solar_source_kind(settings),
+                        forecast=None,
+                        received_at=state.integration_link.received_at,
+                        now=now,
+                    )
                     async with AsyncExitStack() as activation:
                         if activating:
                             config = next(d for d in settings.devices if d.type == "inverter")
@@ -2184,6 +2200,7 @@ async def _run_paired(
                             previous_plan=previous_plan,
                             trusted_holds=last_trusted_holds,
                             ev_hold_state=ev_hold_state,
+                            source=solar_source,
                             # A failed first tick after restart cannot delegate the
                             # observation to run_once and lift a restored block.
                             fallback_active=(

@@ -61,6 +61,7 @@ from ha_spark.energy.readiness_ledger import ReadinessLedger, slot_start
 from ha_spark.energy.readiness_measurements import COMPONENTS, ReadinessDays
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever
+from ha_spark.energy.solar_source import solar_source_from_store
 from ha_spark.energy.sources import _to_float
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.energy.v2l import delivered_fraction, load_session, savings
@@ -329,7 +330,7 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        run = await current_plan(settings, rest)
+        run = await current_plan(settings, rest, source=solar_source_from_store(settings))
         plan, load_source = run.plan, run.load_source
         print(format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz))
         if apply:
@@ -636,7 +637,7 @@ async def _cmd_backtest(settings: Settings, *, days: int) -> int:
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        run = await current_plan(settings, rest)
+        run = await current_plan(settings, rest, source=solar_source_from_store(settings))
     summary = backtest_cost(
         intervals, schedule=run.schedule, tz=load_timezone(settings.timezone)
     )

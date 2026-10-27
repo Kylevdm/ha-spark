@@ -16,6 +16,7 @@ from ha_spark.energy.soc_integrity import MAX_UNCHANGED
 from ha_spark.ha.models import EntityState
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.health import check_evidence_freshness
+from tests.solar_source_helpers import entities_source
 
 NOW = datetime(2026, 10, 20, tzinfo=UTC)
 SOURCES = (
@@ -257,7 +258,7 @@ async def test_supplier_fetch_time_carried_through_gather(
                         tariff_provider="octopus_intelligent")
     before = datetime.now(UTC)
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        inputs, _, _ = await sources.gather_inputs(settings, rest)
+        inputs, _, _ = await sources.gather_inputs(settings, rest, source=entities_source(settings))
     after = datetime.now(UTC)
     freshness = inputs.evidence_freshness["octopus_dispatch"]
     assert inputs.dispatches == ()

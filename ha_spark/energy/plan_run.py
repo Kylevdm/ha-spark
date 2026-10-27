@@ -18,6 +18,7 @@ from ha_spark.config import Settings
 from ha_spark.energy.models import ChargePlan, LoadForecast, PlannerConfig, PlannerInputs
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement
+from ha_spark.energy.solar_source import SolarSource
 from ha_spark.energy.sources import build_schedule, gather_inputs
 from ha_spark.energy.tariff import TariffSchedule
 from ha_spark.ha.rest import HomeAssistantRest
@@ -57,7 +58,11 @@ class StoredPlanRun:
 
 
 async def current_plan(
-    settings: Settings, rest: HomeAssistantRest, *, soc: SocMeasurement | None = None
+    settings: Settings,
+    rest: HomeAssistantRest,
+    *,
+    soc: SocMeasurement | None = None,
+    source: SolarSource,
 ) -> PlanRun:
     """Compute tonight's plan under the configured tariff provider.
 
@@ -66,9 +71,10 @@ async def current_plan(
     deterministic planner against it. The caller owns ``rest`` — the scheduler
     and CLI reuse it to apply the resulting plan afterwards. ``soc`` is the
     daemon tick's checked measurement, reused as-is so the plan carries the
-    exact observation the loop made (no independent reread).
+    exact observation the loop made (no independent reread). ``source`` is
+    the solar source context every plan must state explicitly (#519).
     """
-    inputs, cfg, forecast = await gather_inputs(settings, rest, soc=soc)
+    inputs, cfg, forecast = await gather_inputs(settings, rest, soc=soc, source=source)
     schedule = build_schedule(settings, inputs, cfg)
     plan = compute_plan(inputs, cfg, schedule)
     return PlanRun(

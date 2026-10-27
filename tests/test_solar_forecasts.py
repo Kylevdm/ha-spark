@@ -28,6 +28,7 @@ from ha_spark.energy.readiness_measurements import ReadinessDays
 from ha_spark.energy.scheduler import run_once
 from ha_spark.energy.solar_forecasts import SolarForecastStore, recorded_solar
 from tests.authority_helpers import legacy_settings
+from tests.solar_source_helpers import entities_source
 from tests.test_readiness import fixture as readiness_fixture
 from tests.test_scheduler import _AmpsDevice, _plan_at
 
@@ -70,7 +71,7 @@ async def _run_plan(
         },
     }))
     respx.route(method="GET").mock(return_value=httpx.Response(404))
-    result = await run_once(s)
+    result = await run_once(s, source=entities_source(s))
     geometry = result.plan_run.run.inputs.geometry
     assert geometry is not None
     return result, geometry.slot_starts
@@ -138,7 +139,7 @@ async def test_run_once_records_nothing_without_solar_provenance(
     monkeypatch.setattr(scheduler, "datetime", _frozen_clock(frozen))
     respx.route(method="GET").mock(return_value=httpx.Response(404))
     with caplog.at_level("WARNING"):
-        await run_once(s)
+        await run_once(s, source=entities_source(s))
     async with aiosqlite.connect(s.db_path) as db:
         tables = {row[0] for row in await db.execute_fetchall(
             "SELECT name FROM sqlite_master WHERE type = 'table'"
@@ -192,7 +193,7 @@ async def test_run_once_records_nothing_without_geometry(
     monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
 
     with caplog.at_level("WARNING"):
-        await run_once(s, soc=plan.soc)
+        await run_once(s, soc=plan.soc, source=entities_source(s))
 
     async with aiosqlite.connect(s.db_path) as db:
         tables = {row[0] for row in await db.execute_fetchall(

@@ -14,6 +14,7 @@ from __future__ import annotations
 from ha_spark.config import Settings
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.report import format_plan
+from ha_spark.energy.solar_source import solar_source_from_store
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -38,7 +39,7 @@ async def build_grounding(settings: Settings, rest: HomeAssistantRest) -> str | 
     same decision the planner would apply — and never crashes the chat path.
     """
     try:
-        run = await current_plan(settings, rest)
+        run = await current_plan(settings, rest, source=solar_source_from_store(settings))
         return format_plan(
             run.plan, run.load_source, forecast_date=run.forecast.target_date,
             tz=run.tz,

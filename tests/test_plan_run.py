@@ -11,6 +11,7 @@ from ha_spark.config import Settings
 from ha_spark.energy.plan_run import PlanRun, current_plan
 from ha_spark.energy.tariff import fixed_schedule
 from ha_spark.ha.rest import HomeAssistantRest
+from tests.solar_source_helpers import entities_source
 
 
 def _settings(tmp_path: Path, **kw: object) -> Settings:
@@ -24,7 +25,7 @@ async def test_current_plan_bundles_plan_inputs_and_schedule(tmp_path: Path) -> 
     respx.route(method="GET").mock(return_value=httpx.Response(404))
     settings = _settings(tmp_path)
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        run = await current_plan(settings, rest)
+        run = await current_plan(settings, rest, source=entities_source(settings))
     assert isinstance(run, PlanRun)
     # The bundled schedule is the one the planner actually costed against.
     assert run.plan is not None
@@ -38,5 +39,5 @@ async def test_current_plan_costs_against_the_configured_provider(tmp_path: Path
     respx.route(method="GET").mock(return_value=httpx.Response(404))
     settings = _settings(tmp_path, tariff_provider="fixed")
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        run = await current_plan(settings, rest)
+        run = await current_plan(settings, rest, source=entities_source(settings))
     assert run.schedule == fixed_schedule(run.inputs, run.cfg)
