@@ -38,11 +38,12 @@ async def test_setup_heartbeat_does_not_wait_for_solcast_store(
     with patch("custom_components.ha_spark.solcast_coordinator.Store.async_load", load):
         task = asyncio.create_task(hass.config_entries.async_setup(entry.entry_id))
         await entered.wait()
+        # Setup finishes while the Solcast store load is still blocked.
+        assert await asyncio.wait_for(task, timeout=5)
         await hass.async_block_till_done()
-        assert task.done()
         assert entry.runtime_data.connected
+        assert not release.is_set()
         release.set()
-        assert await task
         await hass.async_block_till_done(wait_background_tasks=True)
     await hass.config_entries.async_unload(entry.entry_id)
 
