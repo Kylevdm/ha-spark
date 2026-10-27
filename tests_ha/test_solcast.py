@@ -126,7 +126,7 @@ async def test_invalid_store_fails_closed(hass: HomeAssistant, raw: dict[str, An
     gate = SolcastBudget(hass, "entry")
     await gate.store.async_save(raw)
     request = AsyncMock()
-    assert (await gate.async_request(request, calls_limit=10)).outcome == Outcome.STALE
+    assert (await gate.async_request(request, calls_limit=10)).outcome == Outcome.QUOTA_EXHAUSTED
     request.assert_not_called()
 
 

@@ -14,7 +14,7 @@ from typing import Annotated
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
 from .const import DOMAIN
 from .solcast import Outcome, SiteResult
@@ -25,10 +25,10 @@ class QuotaState(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     utc_day: date
-    calls_used: Annotated[int, Field(strict=True, ge=0, le=1000)] = 0
-    exhausted_until: AwareDatetime | None = None
-    window_start: time | None = None
-    first_fetch_pending: bool = Field(default=False, strict=True)
+    calls_used: Annotated[int, Field(strict=True, ge=0, le=1000)]
+    exhausted_until: AwareDatetime | None
+    window_start: time | None
+    first_fetch_pending: bool = Field(strict=True)
 
 
 class SolcastBudget:
@@ -53,20 +53,24 @@ class SolcastBudget:
             return False
         if self._state is None:
             try:
-                # Store returns None for corrupt JSON after renaming it. Neither
-                # that nor a previous corruption may mint a fresh daily allowance.
+                # Store returns None for corrupt JSON after renaming it. Spend
+                # today conservatively, then recover at the next UTC midnight.
                 path = Path(self.store.path)
-                existed = await self._hass.async_add_executor_job(
-                    lambda: path.exists() or any(path.parent.glob(f"{path.name}.corrupt.*")),
-                )
+                existed = await self._hass.async_add_executor_job(path.exists)
                 raw = await self.store.async_load()
-                if raw is None and existed:
-                    self._failed = True
-                    return False
-                self._state = (
-                    QuotaState.model_validate(raw) if raw is not None
-                    else QuotaState(utc_day=dt_util.utcnow().date())
-                )
+                corrupt = raw is None and existed
+                if raw is not None:
+                    try:
+                        self._state = QuotaState.model_validate(raw)
+                    except ValidationError:
+                        corrupt = True
+                if self._state is None:
+                    self._state = QuotaState(
+                        utc_day=dt_util.utcnow().date(), calls_used=1000 if corrupt else 0,
+                        exhausted_until=None, window_start=None, first_fetch_pending=False,
+                    )
+                if corrupt:
+                    return await self._save()
             except Exception:
                 self._failed = True
                 return False
@@ -110,28 +114,39 @@ class SolcastBudget:
     ) -> SiteResult:
         """Charge and save before dispatch; a broken store refuses all work."""
         async with self._lock:
+            if type(calls_limit) is not int or calls_limit not in {10, 50}:
+                return SiteResult(Outcome.STALE)
             if not await self._load():
                 return SiteResult(Outcome.STALE)
             assert self._state is not None
-            now = dt_util.utcnow()
-            if self._state.utc_day > now.date():
-                return SiteResult(Outcome.STALE)
-            if self._state.utc_day < now.date():
-                self._state.utc_day = now.date()
-                self._state.calls_used = 0
-                self._state.exhausted_until = None
-            if (
-                self._state.exhausted_until is not None
-                and self._state.exhausted_until > now
-            ) or self._state.calls_used >= calls_limit:
-                return SiteResult(Outcome.QUOTA_EXHAUSTED)
-            self._state.calls_used += 1
-            if not await self._save():
-                return SiteResult(Outcome.STALE)
+            while True:
+                now = dt_util.utcnow()
+                if self._state.utc_day > now.date():
+                    return SiteResult(Outcome.STALE)
+                if self._state.utc_day < now.date():
+                    self._state.utc_day = now.date()
+                    self._state.calls_used = 0
+                    self._state.exhausted_until = None
+                if (
+                    self._state.exhausted_until is not None
+                    and self._state.exhausted_until > now
+                ) or self._state.calls_used >= calls_limit:
+                    return SiteResult(Outcome.QUOTA_EXHAUSTED)
+                self._state.calls_used += 1
+                if not await self._save():
+                    return SiteResult(Outcome.STALE)
+                # Persistence can straddle midnight. Charge the new day before
+                # dispatch instead of spending its first call on yesterday.
+                if dt_util.utcnow().date() == self._state.utc_day:
+                    break
             result = await request()
             if result.outcome == Outcome.QUOTA_EXHAUSTED:
+                received_at = dt_util.utcnow()
+                if self._state.utc_day < received_at.date():
+                    self._state.utc_day = received_at.date()
+                    self._state.calls_used = 0
                 self._state.exhausted_until = datetime.combine(
-                    now.date() + timedelta(days=1), time(), UTC,
+                    received_at.date() + timedelta(days=1), time(), UTC,
                 )
                 if not await self._save():
                     return SiteResult(Outcome.STALE)

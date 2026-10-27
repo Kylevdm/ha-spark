@@ -18,6 +18,7 @@ from homeassistant.config_entries import (
     OptionsFlowWithReload,
 )
 from homeassistant.core import callback
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import TextSelector, TextSelectorConfig, TextSelectorType
 from homeassistant.helpers.service_info.hassio import HassioServiceInfo
@@ -140,14 +141,17 @@ class HaSparkConfigFlow(ConfigFlow, domain=DOMAIN):
             return self.async_show_form(step_id="clear_solcast", data_schema=probatio.Schema({}))
         entry = self._get_reconfigure_entry()
         gate = async_get_budget(self.hass, entry.entry_id)
-        if not await gate.async_set_first_fetch_pending(False):
-            return self.async_show_form(
-                step_id="clear_solcast", data_schema=probatio.Schema({}), errors={"base": "stale"},
-            )
+        # Removing credentials must remain possible even when quota storage fails.
+        await gate.async_set_first_fetch_pending(False)
         data = dict(entry.data)
         data.pop("solcast_api_key", None)
         data.pop("solcast_resource_ids", None)
-        return self.async_update_reload_and_abort(entry, data=data)
+        result = self.async_update_reload_and_abort(entry, data=data)
+        registry = dr.async_get(self.hass)
+        identifier = (DOMAIN, f"{entry.data['site_id']}_solcast")
+        if device := registry.async_get_device_by_identifier(identifier, entry.entry_id):
+            registry.async_update_device(device.id, remove_config_entry_id=entry.entry_id)
+        return result
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None

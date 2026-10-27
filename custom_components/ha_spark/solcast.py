@@ -32,13 +32,13 @@ class Outcome(StrEnum):
 class Site(BaseModel):
     """Only the resource id is consumed; other Solcast metadata is ignored."""
 
-    resource_id: Annotated[str, Field(strict=True, pattern=r"^[A-Za-z0-9-]{1,64}$")]
+    resource_id: Annotated[str, Field(strict=True, pattern=r"^[A-Za-z0-9-]{1,64}$", repr=False)]
 
 
 class SiteList(BaseModel):
     """Validate the complete list before allowing any id into entry data."""
 
-    sites: list[Site] = Field(max_length=1000)
+    sites: list[Site] = Field(repr=False)
 
     @field_validator("sites")
     @classmethod
