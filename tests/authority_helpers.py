@@ -133,7 +133,9 @@ def cleanup_authority() -> None:
         context.planned_epoch.set(None)
         context.planned_generation.set(None)
         context.config_generation = 0
+        context.release_backoff.clear()
     _contexts.clear()
+    execution_context().release_backoff.clear()
     for directory in _directories:
         directory.cleanup()
     _directories.clear()
