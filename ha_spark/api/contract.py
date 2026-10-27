@@ -115,14 +115,14 @@ class AuthorityInputs:
 
 
 def plan_summary(
-    *, session_id: str, built_at: datetime, loop_tick: datetime | None,
+    *, api_version: int, session_id: str, built_at: datetime, loop_tick: datetime | None,
     plan: ChargePlan | None = None, plan_at: datetime | None = None,
     soc_observation_ok: bool = False, session: V2LSession | None = None,
     settings: Settings | None = None, authority: AuthorityInputs | None = None,
 ) -> dict[str, object]:
-    """Project only the envelope and allowlisted plan/session display numbers."""
+    """Project the envelope and allowlisted display numbers for the request's api_version."""
     return {
-        "api_version": API_VERSION,
+        "api_version": api_version,
         "release_version": __version__,
         "session_id": session_id,
         "loop_tick": loop_tick.isoformat() if loop_tick is not None else None,

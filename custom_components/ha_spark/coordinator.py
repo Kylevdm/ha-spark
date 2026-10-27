@@ -95,10 +95,16 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                     if not self._running or self._ended or self.entry.data is not data:
                         return self.connected
                     api_version = max(common)
-                    snapshot = {**snapshot, "api_version": api_version}
-                    result = await async_poll(
-                        session, url=url, token=data["auth_token"], snapshot=snapshot,
-                    )
+                    try:
+                        snapshot = build_snapshot(site_id=data["site_id"],
+                                                  release_version=self.release_version,
+                                                  sent_at=dt_util.utcnow(), api_version=api_version)
+                    except (KeyError, ValueError):
+                        result = PollResult(Outcome.MALFORMED)
+                    else:
+                        result = await async_poll(
+                            session, url=url, token=data["auth_token"], snapshot=snapshot,
+                        )
                     envelope = result.envelope or envelope
                 if result.outcome is Outcome.VERSION_REFUSED:
                     result = PollResult(Outcome.VERSION_SKEW, envelope=envelope)

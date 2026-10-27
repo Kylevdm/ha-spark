@@ -2,6 +2,7 @@
 
 import json
 import logging
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -17,7 +18,7 @@ from pytest_homeassistant_custom_component.test_util.aiohttp import (
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
 from yarl import URL as YarlURL
 
-from custom_components.ha_spark import wire
+from custom_components.ha_spark import coordinator, wire
 from custom_components.ha_spark.const import DOMAIN
 from tests_ha.test_polling import TOKEN, URL, fixture, setup, state_value, summary
 
@@ -48,6 +49,69 @@ async def test_negotiate_and_keep_version(
     aioclient_mock.post(URL, side_effect=respond)
     await entry.runtime_data.async_refresh()
     assert [call[2]["api_version"] for call in aioclient_mock.mock_calls] == [1]
+    assert (DOMAIN, "api_version_skew") not in ir.async_get(hass).issues
+    assert TOKEN not in caplog.text
+
+
+@pytest.mark.freeze_time("2026-10-24T12:00:00+00:00")
+async def test_downgrade_rebuilds_version_specific_snapshot(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wire, "SUPPORTED_API_VERSIONS", frozenset({1, 2}))
+
+    def snapshot_for_version(
+        *, site_id: str, release_version: str, sent_at: datetime, api_version: int,
+    ) -> dict[str, object]:
+        body = wire.build_snapshot(site_id=site_id, release_version=release_version,
+                                   sent_at=sent_at, api_version=api_version)
+        if api_version == 2:
+            body["new_version_only"] = True
+        return body
+
+    monkeypatch.setattr(coordinator, "build_snapshot", snapshot_for_version)
+
+    async def respond(_method: str, _url: Any, data: Any) -> AiohttpClientMockResponse:
+        if data["api_version"] == 2:
+            return AiohttpClientMockResponse("post", YarlURL(URL), status=409,
+                                            json=fixture("version_refusal"))
+        return AiohttpClientMockResponse("post", YarlURL(URL), json=summary())
+
+    aioclient_mock.post(URL, side_effect=respond)
+    await setup(hass)
+    bodies = [call[2] for call in aioclient_mock.mock_calls]
+    assert len(bodies) == 2
+    assert bodies[0]["new_version_only"] is True
+    assert bodies[1] == wire.build_snapshot(
+        site_id=bodies[0]["site_id"], release_version=bodies[0]["release_version"],
+        sent_at=datetime.fromisoformat(bodies[1]["sent_at"]), api_version=1,
+    )
+    assert state_value(hass) == "on"
+
+
+@pytest.mark.freeze_time("2026-10-24T12:00:00+00:00")
+@pytest.mark.parametrize("error", [KeyError, ValueError])
+async def test_downgrade_build_failure_is_malformed(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    error: type[Exception],
+) -> None:
+    monkeypatch.setattr(wire, "SUPPORTED_API_VERSIONS", frozenset({1, 2}))
+
+    def snapshot_for_version(
+        *, site_id: str, release_version: str, sent_at: datetime, api_version: int,
+    ) -> dict[str, object]:
+        if api_version == 1:
+            raise error(TOKEN)
+        return wire.build_snapshot(site_id=site_id, release_version=release_version,
+                                   sent_at=sent_at, api_version=api_version)
+
+    monkeypatch.setattr(coordinator, "build_snapshot", snapshot_for_version)
+    aioclient_mock.post(URL, status=409, json=fixture("version_refusal"))
+    entry = await setup(hass)
+    assert aioclient_mock.call_count == 1
+    assert entry.runtime_data.last_outcome == "malformed"
+    assert state_value(hass) == "off"
     assert (DOMAIN, "api_version_skew") not in ir.async_get(hass).issues
     assert TOKEN not in caplog.text
 

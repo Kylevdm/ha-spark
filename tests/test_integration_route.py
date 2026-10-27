@@ -89,6 +89,20 @@ async def test_authenticated_peer(state, discovery, peer):
     assert response.status_code == 200
 
 
+@pytest.mark.parametrize("version", [1, 2])
+def test_summary_uses_request_version(state, discovery, monkeypatch, version):
+    monkeypatch.setattr(server, "SUPPORTED_API_VERSIONS", frozenset({1, 2}))
+    monkeypatch.setattr(server, "_heartbeat_now", lambda: datetime(2026, 10, 24, 12, tzinfo=UTC))
+    snapshot = {**json.loads(SNAPSHOT_BODY), "api_version": version}
+    with TestClient(build_app(state, ingress_peer="proxy", integration=discovery)) as client:
+        response = client.post(
+            "/integration/heartbeat", json=snapshot,
+            headers={"Authorization": f"Bearer {discovery.auth_token}"},
+        )
+    assert response.status_code == 200
+    assert response.json()["api_version"] == version
+
+
 @pytest.mark.parametrize("method,path", [("GET", "/api/mode"), ("POST", "/api/mode"),
     ("GET", "/api/config"), ("GET", "/api/health"), ("GET", "/"),
     ("GET", "/agent/health"), ("POST", "/mcp")])
@@ -583,7 +597,8 @@ async def test_unrepresentable_instants_degrade_and_the_summary_still_parses(
     }))
     plan = replace(_plan(), export_soc_needed_pct=50.0, export_soc_needed_at=edge)
     body = plan_summary(
-        session_id=discovery.session_id, built_at=datetime(2026, 10, 24, 12, tzinfo=UTC),
+        api_version=1, session_id=discovery.session_id,
+        built_at=datetime(2026, 10, 24, 12, tzinfo=UTC),
         loop_tick=datetime(2026, 10, 24, 11, 59, 30, tzinfo=UTC), plan=plan,
         plan_at=datetime(2026, 10, 24, 11, 30, tzinfo=UTC), settings=state.settings,
         authority=AuthorityInputs(store.state, True, False),
