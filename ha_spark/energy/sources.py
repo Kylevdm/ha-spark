@@ -66,6 +66,34 @@ _EV_HOLD_ACTIVE = {"charging", "boosting", "delivering"}
 
 
 NATIVE_MAX_AGE = timedelta(hours=36)
+EXPORT_P90_MAX_AGE = timedelta(hours=6)
+EXPORT_SNAPSHOT_MAX_AGE = timedelta(seconds=90)
+
+
+def _native_export_p90(
+    source: SolarSource, starts: tuple[datetime, ...], tz: ZoneInfo,
+) -> tuple[float | None, ...] | None:
+    """Fresh raw P90 power for covered today slots, independent of sizing."""
+    forecast = source.forecast
+    instants = (source.now, source.received_at, forecast.fetched_at if forecast else None)
+    if any(instant is None or instant.utcoffset() is None for instant in instants):
+        return None  # A naive or missing instant can't prove freshness.
+    now = source.now.astimezone(UTC)
+    if (
+        source.kind != "native" or forecast is None
+        or forecast.status not in {"ok", "quota_exhausted"}
+        or source.received_at is None or forecast.fetched_at is None
+        or not timedelta(0) <= now - source.received_at.astimezone(UTC)
+        <= EXPORT_SNAPSHOT_MAX_AGE
+        or not timedelta(0) <= now - forecast.fetched_at.astimezone(UTC) <= EXPORT_P90_MAX_AGE
+    ):
+        return None
+    values = {start: p90 for start, _, _, p90 in forecast.slots}
+    today = now.astimezone(tz).date()
+    return tuple(
+        values.get(start.astimezone(UTC)) if start.astimezone(tz).date() == today else None
+        for start in starts
+    )
 
 
 def _native_solar(
@@ -846,6 +874,7 @@ async def gather_inputs(
         load_slots=load_slots,
         solar_slots=solar_slots,
         solar_slots_known=solar_slots_known,
+        export_p90_kw=_native_export_p90(source, geometry.slot_starts, tz),
         horizon_start=horizon_start,
         geometry=geometry if load_slots is not None else None,
         now=now,

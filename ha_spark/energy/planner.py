@@ -342,6 +342,12 @@ def _export_soc_needed(
     return needed_pct, counted_slots[0].start
 
 
+_EXPORT_LIMIT_REFUSAL = (
+    "Skipped paid slot: the fixed discharge command would exceed "
+    "the DNO or supply limit."
+)
+
+
 def _select_export_suffix(
     slots: list[_EventSlot],
     available: float,
@@ -386,8 +392,7 @@ def _select_export_suffix(
             skips.append(
                 ExportSkip(
                     start,
-                    "Skipped paid slot: the fixed discharge command would exceed "
-                    "the DNO or supply limit.",
+                    _EXPORT_LIMIT_REFUSAL,
                 )
             )
         elif export_kw <= 1e-9:
@@ -605,13 +610,28 @@ def _event_export_plan(
         efficiency=cfg.charge_efficiency if cfg.charge_efficiency > 0 else 1.0,
         price_for=shortfall_price,
     )
+    # P90 bounds the fixed command without load credit or a slot-0 fraction.
+    # It never enters solar_kw, funding, or selected export power.
+    refusals = {i: _DAYLIGHT_REFUSAL for i in daylight_slots}
+    if inputs.export_p90_kw is not None:
+        supply_ceiling_kw = max(0.0, cfg.supply_max_current_a * cfg.supply_voltage_v / 1000.0)
+        for i in today_slots:
+            # A horizon the evidence doesn't align with gives no evidence.
+            p90 = inputs.export_p90_kw[i] if i < len(inputs.export_p90_kw) else None
+            if p90 is not None:
+                if cfg.battery_discharge_ceiling_kw + p90 > min(
+                    cfg.dno_export_limit_kw, supply_ceiling_kw,
+                ) + 1e-9:
+                    refusals[i] = _EXPORT_LIMIT_REFUSAL
+                else:
+                    refusals.pop(i, None)
     slots = [
         _EventSlot(
             geometry.slot_starts[i],
             0.0 if i in today_slots else solar_slots[i] * cfg.solar_haircut_k * 2,
             inputs.load_slots[i] * 2 if inputs.load_slots is not None else 0.0,
             _slot_hours(geometry, i),
-            refused=_DAYLIGHT_REFUSAL if i in daylight_slots else None,
+            refused=refusals.get(i),
         )
         for i in event_slots
     ]

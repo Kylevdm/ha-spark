@@ -243,6 +243,8 @@ class PlannerInputs:
     # was laid onto zero. View-only provenance recorded beside the numbers;
     # the planner keeps reading ``solar_slots`` alone.
     solar_slots_known: tuple[bool, ...] | None = None
+    # Fresh native P90 kW per today-dated slot; admission only, never energy.
+    export_p90_kw: tuple[float | None, ...] | None = None
     horizon_start: datetime | None = None
     # When these inputs were read, on the household clock. Places elapsed
     # time within slot 0 and formats plan times locally.
