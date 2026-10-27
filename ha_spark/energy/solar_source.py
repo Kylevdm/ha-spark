@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, TypeAlias
+
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from ha_spark.config import Settings
 from ha_spark.energy.forecast import load_timezone
@@ -31,8 +34,94 @@ log = get_logger(__name__)
 
 SolarSourceKind: TypeAlias = Literal["native", "entities"]
 
-# Placeholder until #519 ticket 05 defines the parsed native forecast type.
-NativeForecast: TypeAlias = object
+
+@dataclass(frozen=True)
+class NativeForecast:
+    """One complete, immutable last-good fetch, in UTC mean kW."""
+
+    status: str
+    fetched_at: datetime | None
+    calls_used: int
+    calls_limit: int
+    slots: tuple[tuple[datetime, float, float, float], ...]
+
+
+@dataclass(frozen=True)
+class ParsedSolarForecast:
+    """An invalid field still selects native; only explicit null selects entities."""
+
+    kind: SolarSourceKind
+    forecast: NativeForecast | None = None
+
+
+class _ForecastField(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    status: Literal["ok", "stale", "auth_failed", "quota_exhausted", "no_data"]
+    fetched_at: AwareDatetime | None
+    calls_used: int = Field(ge=0, le=1000)
+    calls_limit: int
+    slots: list[list[object]] = Field(max_length=120)
+
+    @field_validator("fetched_at", mode="before")
+    @classmethod
+    def timestamp(cls, value: object) -> datetime | None:
+        if value is None:
+            return None
+        return _utc_instant(value)
+
+
+def _utc_instant(value: object) -> datetime:
+    if not isinstance(value, str) or re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+        r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)", value,
+    ) is None:
+        raise ValueError("invalid_timestamp")
+    parsed = datetime.fromisoformat(value)
+    if parsed.utcoffset() != timedelta(0):
+        raise ValueError("invalid_timestamp")
+    return parsed.astimezone(UTC)
+
+
+def parse_native_forecast(value: object, *, received_at: datetime) -> ParsedSolarForecast:
+    """Validate independently: never expose payloads or reject a heartbeat."""
+    if value is None:
+        return ParsedSolarForecast("entities")
+    try:
+        field = _ForecastField.model_validate(value)
+        if type(field.calls_limit) is not int or field.calls_limit not in {10, 50}:
+            raise ValueError("invalid_limit")
+        if field.fetched_at is not None and field.fetched_at > received_at + timedelta(seconds=5):
+            raise ValueError("future_fetch")
+        slots: list[tuple[datetime, float, float, float]] = []
+        for row in field.slots:
+            if len(row) != 4:
+                raise ValueError("invalid_slot")
+            start = _utc_instant(row[0])
+            if start.minute % 30 or start.second or start.microsecond:
+                raise ValueError("unaligned_slot")
+            if slots and start != slots[-1][0] + timedelta(minutes=30):
+                raise ValueError("noncontiguous_slots")
+            numbers: list[float] = []
+            for raw in row[1:]:
+                if type(raw) not in (int, float) or not isinstance(raw, (int, float)):
+                    raise ValueError("invalid_power")
+                number = float(raw)
+                if not 0 <= number <= 100:
+                    raise ValueError("invalid_power")
+                numbers.append(number)
+            p10, p50, p90 = numbers
+            if not p10 <= p50 <= p90:
+                raise ValueError("invalid_percentiles")
+            slots.append((start, p10, p50, p90))
+        if slots and field.fetched_at is None:
+            raise ValueError("missing_fetch")
+        return ParsedSolarForecast("native", NativeForecast(
+            field.status, field.fetched_at, field.calls_used, field.calls_limit, tuple(slots),
+        ))
+    except (ValidationError, ValueError, TypeError, OverflowError):
+        return ParsedSolarForecast("native")
+
 
 _KIND_FILE = "ha_spark_solar_source.json"
 
@@ -87,8 +176,11 @@ def save_solar_source_kind(settings: Settings, kind: SolarSourceKind) -> None:
         tmp_path.write_text(json.dumps({"kind": kind}), encoding="utf-8")
         os.replace(tmp_path, path)  # stdlib atomic rename, as the V2L session store
     except OSError:
-        log.warning("Saving solar source kind failed", exc_info=True)
-        tmp_path.unlink(missing_ok=True)
+        log.warning("Saving solar source kind failed")
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def solar_source_from_store(settings: Settings) -> SolarSource:

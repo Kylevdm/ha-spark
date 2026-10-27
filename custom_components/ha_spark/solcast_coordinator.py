@@ -162,6 +162,35 @@ class SolcastCoordinator(DataUpdateCoordinator[ForecastCache]):
         except Exception:
             self.data.status = "stale"
 
+    def snapshot_forecast(self, now: datetime) -> dict[str, object]:
+        """Bounded, contiguous last-good slots; never clip an oversized site sum."""
+        utc_now = now.astimezone(UTC)
+        start = utc_now.replace(minute=utc_now.minute // 30 * 30, second=0, microsecond=0)
+        local = dt_util.as_local(now)
+        end = datetime.combine(local.date() + timedelta(days=2), time(), local.tzinfo)
+        periods = {p.start: p for p in self.data.periods}
+        slots: list[list[object]] = []
+        while start < end and len(slots) < 120:
+            period = periods.get(start)
+            if period is None or period.p90 > 100:
+                break
+            slots.append([start.isoformat(), round(period.p10, 3), round(period.p50, 3),
+                          round(period.p90, 3)])
+            start += timedelta(minutes=30)
+        return {
+            "status": self.data.status,
+            "fetched_at": self.data.fetched_at.isoformat() if self.data.fetched_at else None,
+            "calls_used": self.budget.calls_used, "calls_limit": self.calls_limit,
+            "slots": slots,
+        }
+
+    async def async_learn_window_start(self, value: datetime) -> None:
+        """A summary adjusts timers only, independently of heartbeat liveness."""
+        if not self._stopped and await self.budget.async_set_window_start(
+            dt_util.as_local(value).time(), active=self._active,
+        ):
+            self._schedule()
+
     def day_totals(self, day: date) -> tuple[float, float, float] | None:
         """Day totals in kWh, or no reading when the day has no cached periods."""
         periods = [p for p in self.data.periods if dt_util.as_local(p.start).date() == day]

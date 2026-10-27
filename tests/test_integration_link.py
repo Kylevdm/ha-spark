@@ -138,7 +138,7 @@ def test_heartbeat_health_and_skew_recovery(tmp_path: Path) -> None:
         initial = client.get("/api/health").json()
         assert initial["integration_link"]["state"] == "never_connected"
         body = snapshot().model_dump(mode="json")
-        for version, status, expected in [(1, 200, "connected"), (2, 409, "version_skew"),
+        for version, status, expected in [(1, 200, "connected"), (3, 409, "version_skew"),
                                            (1, 200, "connected")]:
             body["api_version"] = version
             assert client.post("/integration/heartbeat", json=body, headers={
