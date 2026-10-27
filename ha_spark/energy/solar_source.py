@@ -166,7 +166,10 @@ def load_solar_source_kind(settings: Settings) -> SolarSourceKind:
     if not path.is_file():
         return "entities"
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        with path.open("rb") as stream:
+            if os.fstat(stream.fileno()).st_size > 1024:
+                return "entities"
+            data = json.loads(stream.read(1024))
     except (OSError, ValueError, TypeError, RecursionError):
         log.warning("Reading solar source kind failed; using entities", exc_info=True)
         return "entities"

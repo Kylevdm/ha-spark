@@ -89,6 +89,7 @@ import httpx
 import uvicorn
 
 from ha_spark.agent.auth import resolve_token
+from ha_spark.api.contract import IntegrationLink
 from ha_spark.api.server import (
     AGENT_PORT,
     INGRESS_PORT,
@@ -173,6 +174,16 @@ REPLAN_INTERVAL = timedelta(minutes=30)
 # #423: after a recovered apply that is not fully verified re-applied the
 # fallback on the same tick, the next recovery attempt waits this long.
 RECOVERY_RETRY_DELAY = timedelta(minutes=5)
+
+
+def solar_source_for(link: IntegrationLink, now: datetime) -> SolarSource:
+    """Freeze the accepted snapshot's solar source at this plan's instant."""
+    return SolarSource(
+        kind=link.solar_forecast.kind,
+        forecast=link.solar_forecast.forecast,
+        received_at=link.received_at,
+        now=now,
+    )
 
 
 def _slot_start(now: datetime) -> datetime:
@@ -2180,13 +2191,7 @@ async def _run_paired(
                     # persisted kind until the first accepted snapshot, then that
                     # snapshot's, even if persisting it failed) plus its forecast
                     # and received instant, at this tick's now.
-                    link = state.integration_link
-                    solar_source = SolarSource(
-                        kind=link.solar_forecast.kind,
-                        forecast=link.solar_forecast.forecast,
-                        received_at=link.received_at,
-                        now=now,
-                    )
+                    solar_source = solar_source_for(state.integration_link, now)
                     async with AsyncExitStack() as activation:
                         if activating:
                             config = next(d for d in settings.devices if d.type == "inverter")

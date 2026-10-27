@@ -640,7 +640,10 @@ async def _cmd_backtest(settings: Settings, *, days: int) -> int:
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        run = await current_plan(settings, rest, source=solar_source_from_store(settings))
+        source = solar_source_from_store(settings)
+        run = await current_plan(settings, rest, source=source)
+    if source.kind == "native":
+        print(NATIVE_PREVIEW_NOTE)
     summary = backtest_cost(
         intervals, schedule=run.schedule, tz=load_timezone(settings.timezone)
     )

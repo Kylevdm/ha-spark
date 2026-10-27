@@ -15,9 +15,15 @@ rules:
   docs-actions:
     status: exempt
     comment: The integration provides no actions.
+  docs-conditions:
+    status: exempt
+    comment: The integration provides no conditions.
   docs-high-level-description: todo
   docs-installation-instructions: todo
   docs-removal-instructions: todo
+  docs-triggers:
+    status: exempt
+    comment: The integration provides no triggers.
   entity-event-setup:
     status: exempt
     comment: Entities follow their coordinators and subscribe to no events.

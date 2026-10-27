@@ -174,8 +174,11 @@ class SolcastCoordinator(DataUpdateCoordinator[ForecastCache]):
             period = periods.get(start)
             if period is None or period.p90 > 100:
                 break
+            p90 = math.ceil(round(period.p90 * 1000, 6)) / 1000
+            if p90 > 100:
+                break
             slots.append([start.isoformat(), round(period.p10, 3), round(period.p50, 3),
-                          round(period.p90, 3)])
+                          p90])
             start += timedelta(minutes=30)
         return {
             "status": self.data.status,
