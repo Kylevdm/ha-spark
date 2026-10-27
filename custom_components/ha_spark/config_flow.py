@@ -123,6 +123,7 @@ class HaSparkConfigFlow(ConfigFlow, domain=DOMAIN):
                         return self.async_update_reload_and_abort(entry, data_updates={
                             "solcast_api_key": key,
                             "solcast_resource_ids": list(result.resource_ids),
+                            "solcast_cache_generation": uuid4().hex,
                         })
                     errors["base"] = "stale"
                 else:
@@ -146,6 +147,7 @@ class HaSparkConfigFlow(ConfigFlow, domain=DOMAIN):
         data = dict(entry.data)
         data.pop("solcast_api_key", None)
         data.pop("solcast_resource_ids", None)
+        data.pop("solcast_cache_generation", None)
         result = self.async_update_reload_and_abort(entry, data=data)
         registry = dr.async_get(self.hass)
         identifier = (DOMAIN, f"{entry.data['site_id']}_solcast")

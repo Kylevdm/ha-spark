@@ -57,6 +57,10 @@
       "next_change": {
         "name": "Next planned change"
       },
+      "forecast_today": {"name": "Forecast today"},
+      "forecast_tomorrow": {"name": "Forecast tomorrow"},
+      "last_fetch": {"name": "Last fetch"},
+      "api_calls_used": {"name": "API calls used"},
       "last_run": {
         "name": "Last run"
       }
