@@ -1,8 +1,8 @@
-"""Read-only plan numbers, V2L totals and operating mode on the site device."""
+"""Read-only plan sensors and independent cached forecasts on the Solcast device."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -12,13 +12,18 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import PERCENTAGE, UnitOfEnergy
+from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfEnergy
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from . import SparkConfigEntry
+from .const import DOMAIN
 from .coordinator import SparkCoordinator
 from .entity import SparkEntity, async_clear_unregistered_state
+from .solcast_coordinator import SolcastCoordinator
 from .wire import Summary
 
 
@@ -150,6 +155,9 @@ async def async_setup_entry(
         cls = LastRun if description.key == "last_run" else SparkSensor
         entities.append(cls(entry.runtime_data, description))
     async_add_entities(entities)
+    if entry.runtime_data.solcast is not None:
+        async_add_entities(SolcastSensor(entry.runtime_data.solcast, description)
+                           for description in SOLCAST_DESCRIPTIONS)
 
 
 class SparkSensor(SparkEntity, SensorEntity):
@@ -214,3 +222,73 @@ class LastRun(SparkSensor, RestoreSensor):
     def _handle_coordinator_update(self) -> None:
         self._remember_plan()
         super()._handle_coordinator_update()
+
+
+SOLCAST_DESCRIPTIONS = (
+    SensorEntityDescription(
+        key="forecast_today", translation_key="forecast_today",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+    ),
+    SensorEntityDescription(
+        key="forecast_tomorrow", translation_key="forecast_tomorrow",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+    ),
+    SensorEntityDescription(
+        key="last_fetch", translation_key="last_fetch",
+        device_class=SensorDeviceClass.TIMESTAMP, entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorEntityDescription(
+        key="api_calls_used", translation_key="api_calls_used",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+)
+
+
+class SolcastSensor(CoordinatorEntity[SolcastCoordinator], SensorEntity):
+    """Cached forecasts remain visible independently of add-on connectivity."""
+
+    _attr_has_entity_name = True
+
+    def __init__(
+        self, coordinator: SolcastCoordinator, description: SensorEntityDescription,
+    ) -> None:
+        super().__init__(coordinator)
+        self.entity_description = description
+        site_id = coordinator.entry.data["site_id"]
+        self._attr_unique_id = f"{site_id}_solcast_{description.key}"
+        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, f"{site_id}_solcast")})
+
+    def _totals(self) -> tuple[float, float, float] | None:
+        day = dt_util.as_local(dt_util.utcnow()).date()
+        if self.entity_description.key == "forecast_tomorrow":
+            day += timedelta(days=1)
+        return self.coordinator.day_totals(day)
+
+    @property
+    def available(self) -> bool:
+        if self.entity_description.key == "api_calls_used":
+            return self.coordinator.budget.state is not None
+        if self.entity_description.key == "last_fetch":
+            return self.coordinator.data.fetched_at is not None
+        return self._totals() is not None
+
+    @property
+    def native_value(self) -> float | datetime | None:
+        if self.entity_description.key == "api_calls_used":
+            return self.coordinator.budget.calls_used
+        if self.entity_description.key == "last_fetch":
+            return self.coordinator.data.fetched_at
+        totals = self._totals()
+        return round(totals[1], 3) if totals else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        if self.entity_description.key == "api_calls_used":
+            return {"limit": self.coordinator.calls_limit}
+        if self.entity_description.key == "last_fetch":
+            return None
+        totals = self._totals()
+        return ({"estimate10": round(totals[0], 3), "estimate90": round(totals[2], 3)}
+                if totals else None)

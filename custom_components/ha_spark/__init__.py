@@ -13,11 +13,13 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.storage import Store
 from homeassistant.loader import async_get_integration
 
 from .const import DOMAIN
 from .coordinator import SparkCoordinator
 from .entity import async_clear_unregistered_state
+from .solcast_coordinator import SolcastCoordinator
 
 SparkConfigEntry: TypeAlias = ConfigEntry[SparkCoordinator]
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
@@ -29,6 +31,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     assert integration.version is not None
     coordinator = SparkCoordinator(hass, entry, integration.version)
     entry.runtime_data = coordinator
+    if entry.data.get("solcast_api_key"):
+        coordinator.solcast = SolcastCoordinator(hass, entry)
+        # Loading stores is local I/O only; polling runs independently after setup.
+        await coordinator.solcast.async_start()
+    else:
+        try:
+            await Store[dict[str, object]](
+                hass, 1, f"{DOMAIN}.solcast_cache.{entry.entry_id}", atomic_writes=True,
+            ).async_remove()
+        except Exception:
+            # Cache housekeeping must not interrupt heartbeat liveness.
+            pass
     for key in ("soc_now", "soc_integrity", "v2l_power_w", "predictions"):
         async_clear_unregistered_state(hass, f"sensor.ha_spark_{key}")
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -50,6 +64,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
 async def async_unload_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> bool:
     """End this session before a new discovery loads new connection data."""
     entry.runtime_data.async_stop()
+    if entry.runtime_data.solcast is not None:
+        await entry.runtime_data.solcast.async_shutdown()
     if await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         await entry.runtime_data.async_shutdown()
         return True

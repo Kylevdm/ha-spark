@@ -7,7 +7,7 @@ or hardware write path. Unloading fences off replies from the previous discovery
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -22,6 +22,9 @@ from .channel import Outcome, PollResult, async_poll
 from .const import DOMAIN
 from .wire import Summary, build_snapshot
 
+if TYPE_CHECKING:
+    from .solcast_coordinator import SolcastCoordinator
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -32,6 +35,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         super().__init__(hass, _LOGGER, config_entry=entry, name="ha-spark",
                          update_interval=timedelta(seconds=30))
         self.entry = entry
+        self.solcast: SolcastCoordinator | None = None
         self.release_version = release_version
         self.api_version = max(wire.SUPPORTED_API_VERSIONS)
         self.addon_api_version: int | None = None

@@ -9,7 +9,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, TypeVar
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
@@ -18,6 +18,8 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationErro
 
 from .const import DOMAIN
 from .solcast import Outcome, SiteResult
+
+ResultT = TypeVar("ResultT", bound=SiteResult)
 
 
 class QuotaState(BaseModel):
@@ -29,6 +31,7 @@ class QuotaState(BaseModel):
     exhausted_until: AwareDatetime | None
     window_start: time | None
     first_fetch_pending: bool = Field(strict=True)
+    reserved_day: date | None = None
 
 
 class SolcastBudget:
@@ -42,11 +45,28 @@ class SolcastBudget:
         self._lock = asyncio.Lock()
         self._state: QuotaState | None = None
         self._failed = False
+        self.reserved_sites = 0
 
     @property
     def calls_used(self) -> int:
         """The last loaded count, for diagnostic display."""
-        return self._state.calls_used if self._state else 0
+        if self._state is None or self._state.utc_day < dt_util.utcnow().date():
+            return 0
+        return self._state.calls_used
+
+    @property
+    def state(self) -> QuotaState | None:
+        """A copy for scheduling; mutations must use the locked store methods."""
+        return self._state.model_copy() if self._state else None
+
+    async def async_finish_reserved(self) -> bool:
+        """Release today's reservation after its poll has been attempted."""
+        async with self._lock:
+            if not await self._load():
+                return False
+            assert self._state is not None
+            self._state.reserved_day = dt_util.utcnow().date()
+            return await self._save()
 
     async def _load(self) -> bool:
         if self._failed:
@@ -79,7 +99,15 @@ class SolcastBudget:
     async def async_load(self) -> bool:
         """Load without spending quota or dispatching any request."""
         async with self._lock:
-            return await self._load()
+            if not await self._load():
+                return False
+            assert self._state is not None
+            if self._state.utc_day < dt_util.utcnow().date():
+                self._state.utc_day = dt_util.utcnow().date()
+                self._state.calls_used = 0
+                self._state.exhausted_until = None
+                return await self._save()
+            return True
 
     async def _save(self) -> bool:
         assert self._state is not None
@@ -110,8 +138,9 @@ class SolcastBudget:
             return await self._save()
 
     async def async_request(
-        self, request: Callable[[], Awaitable[SiteResult]], *, calls_limit: int,
-    ) -> SiteResult:
+        self, request: Callable[[], Awaitable[ResultT]], *, calls_limit: int,
+        reserved: bool = False,
+    ) -> ResultT | SiteResult:
         """Charge and save before dispatch; a broken store refuses all work."""
         async with self._lock:
             if type(calls_limit) is not int or calls_limit not in {10, 50}:
@@ -131,6 +160,11 @@ class SolcastBudget:
                     self._state.exhausted_until is not None
                     and self._state.exhausted_until > now
                 ) or self._state.calls_used >= calls_limit:
+                    return SiteResult(Outcome.QUOTA_EXHAUSTED)
+                if (
+                    not reserved and self._state.reserved_day != now.date()
+                    and calls_limit - self._state.calls_used - 1 < self.reserved_sites
+                ):
                     return SiteResult(Outcome.QUOTA_EXHAUSTED)
                 self._state.calls_used += 1
                 if not await self._save():
@@ -159,4 +193,8 @@ def async_get_budget(hass: HomeAssistant, entry_id: str) -> SolcastBudget:
     gates: dict[str, SolcastBudget] = hass.data.setdefault(f"{DOMAIN}_solcast_budgets", {})
     if entry_id not in gates:
         gates[entry_id] = SolcastBudget(hass, entry_id)
-    return gates[entry_id]
+    gate = gates[entry_id]
+    entry = hass.config_entries.async_get_entry(entry_id)
+    if entry is not None:
+        gate.reserved_sites = len(entry.data.get("solcast_resource_ids", []))
+    return gate
