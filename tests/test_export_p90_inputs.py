@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -76,3 +77,15 @@ async def test_export_evidence_inputs(
     assert inputs.export_p90_kw == expected
     assert inputs.export_p90_kw[0] is None
     assert 3.0 in inputs.export_p90_kw
+
+
+@pytest.mark.parametrize("naive", ["now", "received_at", "fetched_at"])
+def test_naive_instants_give_no_evidence(naive: str) -> None:
+    at = datetime(2026, 1, 5, 17, tzinfo=UTC)
+    instants = {"now": at, "received_at": at, "fetched_at": at}
+    instants[naive] = instants[naive].replace(tzinfo=None)
+    forecast = NativeForecast("ok", instants["fetched_at"], 1, 10, ((at, 0.1, 0.2, 0.3),))
+    source = SolarSource("native", forecast, instants["received_at"], instants["now"])
+    assert sources._native_export_p90(source, (at,), ZoneInfo("Europe/London")) is None
+    aware = SolarSource("native", NativeForecast("ok", at, 1, 10, forecast.slots), at, at)
+    assert sources._native_export_p90(aware, (at,), ZoneInfo("Europe/London")) == (0.3,)

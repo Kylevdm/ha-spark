@@ -75,6 +75,9 @@ def _native_export_p90(
 ) -> tuple[float | None, ...] | None:
     """Fresh raw P90 power for covered today slots, independent of sizing."""
     forecast = source.forecast
+    instants = (source.now, source.received_at, forecast.fetched_at if forecast else None)
+    if any(instant is None or instant.utcoffset() is None for instant in instants):
+        return None  # A naive or missing instant can't prove freshness.
     now = source.now.astimezone(UTC)
     if (
         source.kind != "native" or forecast is None
