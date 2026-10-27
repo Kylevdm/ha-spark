@@ -6,7 +6,6 @@ Cache keys are UTC instants so the autumn fold remains two distinct half-hours.
 """
 
 import asyncio
-import hashlib
 import logging
 import math
 import random
@@ -34,10 +33,10 @@ Status = Literal["ok", "stale", "auth_failed", "quota_exhausted", "no_data"]
 
 
 class ForecastCache(BaseModel):
-    """Version-one cache; identity is a digest, never a credential or site id."""
+    """Version-one cache belongs to a non-secret config-entry generation."""
 
     model_config = ConfigDict(extra="forbid")
-    identity: str
+    generation: str
     periods: list[Period] = Field(max_length=2000)
     fetched_at: AwareDatetime | None
     status: Status
@@ -78,36 +77,56 @@ class SolcastCoordinator(DataUpdateCoordinator[ForecastCache]):
         self._key: str = entry.data["solcast_api_key"]
         self._sites: tuple[str, ...] = tuple(entry.data["solcast_resource_ids"])
         self.budget.reserved_sites = len(self._sites)
-        self._identity = hashlib.sha256(
-            (self._key + "\0" + "\0".join(sorted(self._sites))).encode()
-        ).hexdigest()
+        self._generation: str = entry.data.get("solcast_cache_generation", "")
         self.store: Store[dict[str, Any]] = Store(
             hass, 1, f"{DOMAIN}.solcast_cache.{entry.entry_id}", atomic_writes=True,
         )
         self.data = self._empty()
         self._cancel: Callable[[], None] | None = None
         self._stopped = False
-        self._reserved = False
+        self._poll_lock = asyncio.Lock()
+        self._tasks: set[asyncio.Task[Any]] = set()
+
+    def _active(self) -> bool:
+        return not self._stopped
 
     def _empty(self) -> ForecastCache:
-        return ForecastCache(identity=self._identity, periods=[], fetched_at=None, status="no_data")
+        return ForecastCache(
+            generation=self._generation, periods=[], fetched_at=None, status="no_data",
+        )
 
     async def async_start(self) -> None:
         """Load and validate stores without polling on a normal restart."""
+        task = asyncio.current_task()
+        assert task is not None
+        self._tasks.add(task)
+        try:
+            await self._async_start()
+        finally:
+            self._tasks.discard(task)
+
+    async def _async_start(self) -> None:
         try:
             raw = await self.store.async_load()
             cache = ForecastCache.model_validate(raw)
-            if cache.identity == self._identity:
+            if cache.generation == self._generation and not self._stopped:
                 self.data = cache
         except Exception:
             pass  # Store failure must never expose its exception text.
+        if self._stopped:
+            return
         self._prune()
-        await self._save()
-        loaded = await self.budget.async_load()
+        loaded = await self.budget.async_load(active=self._active)
+        if self._stopped:
+            return
+        self.async_update_listeners()
+        if self.data.status == "auth_failed":
+            self.entry.async_start_reauth(self.hass)
+            return
         state = self.budget.state
         if loaded and state is not None and state.first_fetch_pending:
             # Consume durably before dispatch: even a crash cannot replay this fetch.
-            if await self.budget.async_set_first_fetch_pending(False):
+            if await self.budget.async_set_first_fetch_pending(False, active=self._active):
                 self.entry.async_create_background_task(
                     self.hass, self.async_refresh(), "Solcast first fetch",
                 )
@@ -119,8 +138,27 @@ class SolcastCoordinator(DataUpdateCoordinator[ForecastCache]):
                              if dt_util.as_local(p.start).date() >= cutoff]
 
     async def _save(self) -> None:
+        if self._stopped:
+            return
         try:
-            await self.store.async_save(self.data.model_dump(mode="json"))
+            data = self.data.model_dump(mode="json")
+
+            async def write() -> None:
+                if not self._stopped:
+                    await self.store.async_save(data)
+
+            write_task = asyncio.create_task(write())
+            try:
+                await asyncio.shield(write_task)
+            except asyncio.CancelledError:
+                # Drain any disk write already in flight before shutdown returns.
+                await write_task
+                raise
+            persisted = await Store[dict[str, Any]](
+                self.hass, 1, self.store.key, atomic_writes=True,
+            ).async_load()
+            if persisted != data:
+                self.data.status = "stale"
         except Exception:
             self.data.status = "stale"
 
@@ -132,17 +170,17 @@ class SolcastCoordinator(DataUpdateCoordinator[ForecastCache]):
         return (sum(p.p10 for p in periods) * 0.5, sum(p.p50 for p in periods) * 0.5,
                 sum(p.p90 for p in periods) * 0.5)
 
-    def _schedule(self) -> None:
+    def _schedule(self, *, after_poll: bool = False) -> None:
         if self._cancel:
             self._cancel()
             self._cancel = None
-        if self._stopped:
+        if self._stopped or self.data.status == "auth_failed":
             return
         now = dt_util.utcnow()
         local = dt_util.as_local(now)
         state = self.budget.state
         candidates: list[tuple[datetime, bool]] = []
-        for offset in range(0 if self.data.status == "auth_failed" else 3):
+        for offset in range(3):
             day = local.date() + timedelta(days=offset)
             candidates.extend(poll_schedule(
                 day, zone=local.tzinfo, calls_limit=self.calls_limit, sites=len(self._sites),
@@ -158,6 +196,13 @@ class SolcastCoordinator(DataUpdateCoordinator[ForecastCache]):
             datetime.combine(now.date() + timedelta(days=1), time(), UTC): None,
         }
         for instant, reserved in candidates:
+            # A poll that overran today's reserved instant must not lose it: run it
+            # now, while tonight's window has not started. A startup never polls.
+            if (
+                after_poll and reserved and instant <= now < instant + timedelta(minutes=20)
+                and state is not None and state.reserved_day != now.date()
+            ):
+                future[now] = True
             if instant > now and not (
                 state and state.exhausted_until and instant < state.exhausted_until
             ):
@@ -166,18 +211,26 @@ class SolcastCoordinator(DataUpdateCoordinator[ForecastCache]):
         scheduled_reserved = future[at]
 
         async def poll() -> None:
-            self._reserved = bool(scheduled_reserved)
+            task = asyncio.current_task()
+            assert task is not None
+            self._tasks.add(task)
             try:
                 if scheduled_reserved is None:
-                    await self.budget.async_load()
+                    await self.budget.async_load(active=self._active)
                     self._prune()
                     await self._save()
                     self.async_update_listeners()
                 else:
-                    await self.async_refresh()
+                    try:
+                        data = await self._async_poll(reserved=bool(scheduled_reserved))
+                    except ConfigEntryAuthFailed:
+                        self.entry.async_start_reauth(self.hass)
+                    else:
+                        if not self._stopped:
+                            self.async_set_updated_data(data)
             finally:
-                self._reserved = False
-                self._schedule()
+                self._tasks.discard(task)
+                self._schedule(after_poll=True)
 
         @callback
         def fire(_now: datetime) -> None:
@@ -188,6 +241,19 @@ class SolcastCoordinator(DataUpdateCoordinator[ForecastCache]):
         self._cancel = async_track_point_in_utc_time(self.hass, fire, at)
 
     async def _async_update_data(self) -> ForecastCache:
+        return await self._async_poll()
+
+    async def _async_poll(self, *, reserved: bool = False) -> ForecastCache:
+        task = asyncio.current_task()
+        assert task is not None
+        self._tasks.add(task)
+        try:
+            async with self._poll_lock:
+                return await self._async_poll_locked(reserved=reserved)
+        finally:
+            self._tasks.discard(task)
+
+    async def _async_poll_locked(self, *, reserved: bool) -> ForecastCache:
         if self._stopped or self.data.status == "auth_failed":
             return self.data
         now = dt_util.utcnow()
@@ -196,9 +262,10 @@ class SolcastCoordinator(DataUpdateCoordinator[ForecastCache]):
         hours = math.ceil((end.astimezone(UTC) - now).total_seconds() / 3600)
         results: list[ForecastResult] = []
         outcome = Outcome.OK
+        retries = 0
         try:
             for site in self._sites:
-                for attempt in range(3):
+                while True:
                     if self._stopped:
                         return self.data
                     async def request(resource_id: str = site) -> ForecastResult:
@@ -206,12 +273,14 @@ class SolcastCoordinator(DataUpdateCoordinator[ForecastCache]):
                             async_get_clientsession(self.hass), self._key, resource_id, hours=hours,
                         )
                     result = await self.budget.async_request(
-                        request, calls_limit=self.calls_limit, reserved=self._reserved,
+                        request, calls_limit=self.calls_limit, reserved=reserved,
+                        active=self._active,
                     )
                     outcome = result.outcome
-                    if outcome != Outcome.BUSY or attempt == 2:
+                    if outcome != Outcome.BUSY or retries == 2:
                         break
-                    await asyncio.sleep((attempt + 1) * 15 + random.uniform(0, 15))
+                    retries += 1
+                    await asyncio.sleep(retries * 15 + random.uniform(0, 15))
                 if outcome != Outcome.OK or not isinstance(result, ForecastResult):
                     break
                 results.append(result)
@@ -244,8 +313,8 @@ class SolcastCoordinator(DataUpdateCoordinator[ForecastCache]):
             self._prune()
             await self._save()
         finally:
-            if self._reserved:
-                await self.budget.async_finish_reserved()
+            if reserved and not self._stopped:
+                await self.budget.async_finish_reserved(active=self._active)
         if self.data.status == "auth_failed":
             if self._cancel:
                 self._cancel()
@@ -259,4 +328,8 @@ class SolcastCoordinator(DataUpdateCoordinator[ForecastCache]):
         if self._cancel:
             self._cancel()
             self._cancel = None
+        tasks = self._tasks - {asyncio.current_task()}
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await super().async_shutdown()

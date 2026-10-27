@@ -157,8 +157,10 @@ async def test_past_periods_retained_pruned_and_identity_change_clears(
     assert reloaded.data.periods == []
     await reloaded.async_shutdown()
     # A new key or site set never reuses a previous owner's periods.
-    hass.config_entries.async_update_entry(c.entry, data={**c.entry.data,
-                                                         "solcast_api_key": "replacement"})
+    hass.config_entries.async_update_entry(c.entry, data={
+        **c.entry.data, "solcast_api_key": "replacement",
+        "solcast_cache_generation": "replacement-generation",
+    })
     changed = SolcastCoordinator(hass, c.entry)
     await changed.async_start()
     assert changed.data.fetched_at is None

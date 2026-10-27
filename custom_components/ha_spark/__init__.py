@@ -7,6 +7,7 @@ Plan numbers are read-only sensors; mode, fallback and hold mirrors arrive later
 The optional Solcast service device is registered only while its key is configured.
 """
 
+import logging
 from typing import TypeAlias
 
 from homeassistant.config_entries import ConfigEntry
@@ -23,6 +24,7 @@ from .solcast_coordinator import SolcastCoordinator
 
 SparkConfigEntry: TypeAlias = ConfigEntry[SparkCoordinator]
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> bool:
@@ -33,16 +35,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     entry.runtime_data = coordinator
     if entry.data.get("solcast_api_key"):
         coordinator.solcast = SolcastCoordinator(hass, entry)
-        # Loading stores is local I/O only; polling runs independently after setup.
-        await coordinator.solcast.async_start()
-    else:
-        try:
-            await Store[dict[str, object]](
-                hass, 1, f"{DOMAIN}.solcast_cache.{entry.entry_id}", atomic_writes=True,
-            ).async_remove()
-        except Exception:
-            # Cache housekeeping must not interrupt heartbeat liveness.
-            pass
+
     for key in ("soc_now", "soc_integrity", "v2l_power_w", "predictions"):
         async_clear_unregistered_state(hass, f"sensor.ha_spark_{key}")
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -58,6 +51,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
         registry.async_update_device(device.id, remove_config_entry_id=entry.entry_id)
     # The first poll runs after setup: a hung add-on must not hold setup open.
     entry.async_create_task(hass, coordinator.async_refresh(), "ha-spark first heartbeat")
+
+    async def start_solcast() -> None:
+        try:
+            if coordinator.solcast is not None:
+                await coordinator.solcast.async_start()
+            else:
+                await Store[dict[str, object]](
+                    hass, 1, f"{DOMAIN}.solcast_cache.{entry.entry_id}", atomic_writes=True,
+                ).async_remove()
+        except Exception:
+            _LOGGER.warning("Solcast startup failed")
+
+    entry.async_create_background_task(hass, start_solcast(), "Solcast startup")
     return True
 
 

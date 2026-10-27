@@ -74,9 +74,9 @@ class Period(BaseModel):
     """A cached mean-power triple keyed by its real UTC start instant."""
 
     start: AwareDatetime
-    p10: Power
-    p50: Power
-    p90: Power
+    p10: Annotated[float, Field(ge=0, le=200, allow_inf_nan=False, strict=True)]
+    p50: Annotated[float, Field(ge=0, le=200, allow_inf_nan=False, strict=True)]
+    p90: Annotated[float, Field(ge=0, le=200, allow_inf_nan=False, strict=True)]
 
     @field_validator("start")
     @classmethod
@@ -191,5 +191,5 @@ async def async_fetch_forecast(
         if len({p.start for p in periods}) != len(periods):
             return ForecastResult(Outcome.MALFORMED)
         return ForecastResult(Outcome.OK, periods=tuple(sorted(periods, key=lambda p: p.start)))
-    except (ValidationError, ValueError, UnicodeError):
+    except (ValidationError, ValueError, UnicodeError, OverflowError):
         return ForecastResult(Outcome.MALFORMED)

@@ -59,17 +59,17 @@ class SolcastBudget:
         """A copy for scheduling; mutations must use the locked store methods."""
         return self._state.model_copy() if self._state else None
 
-    async def async_finish_reserved(self) -> bool:
+    async def async_finish_reserved(self, *, active: Callable[[], bool] = lambda: True) -> bool:
         """Release today's reservation after its poll has been attempted."""
         async with self._lock:
-            if not await self._load():
+            if not await self._load(active):
                 return False
             assert self._state is not None
             self._state.reserved_day = dt_util.utcnow().date()
-            return await self._save()
+            return await self._save(active)
 
-    async def _load(self) -> bool:
-        if self._failed:
+    async def _load(self, active: Callable[[], bool] = lambda: True) -> bool:
+        if self._failed or not active():
             return False
         if self._state is None:
             try:
@@ -90,30 +90,43 @@ class SolcastBudget:
                         exhausted_until=None, window_start=None, first_fetch_pending=False,
                     )
                 if corrupt:
-                    return await self._save()
+                    return await self._save(active)
             except Exception:
                 self._failed = True
                 return False
         return True
 
-    async def async_load(self) -> bool:
+    async def async_load(self, *, active: Callable[[], bool] = lambda: True) -> bool:
         """Load without spending quota or dispatching any request."""
         async with self._lock:
-            if not await self._load():
+            if not await self._load(active):
                 return False
             assert self._state is not None
             if self._state.utc_day < dt_util.utcnow().date():
                 self._state.utc_day = dt_util.utcnow().date()
                 self._state.calls_used = 0
                 self._state.exhausted_until = None
-                return await self._save()
+                return await self._save(active)
             return True
 
-    async def _save(self) -> bool:
+    async def _save(self, active: Callable[[], bool] = lambda: True) -> bool:
+        if not active():
+            return False
         assert self._state is not None
         try:
             data = self._state.model_dump(mode="json")
-            await self.store.async_save(data)
+
+            async def write() -> None:
+                if active():
+                    await self.store.async_save(data)
+
+            write_task = asyncio.create_task(write())
+            try:
+                await asyncio.shield(write_task)
+            except asyncio.CancelledError:
+                # An executor-backed Store write cannot be cancelled safely.
+                await write_task
+                raise
             # HA Store logs and swallows disk-write errors. Read via a separate
             # Store instance (not this instance's pending-write buffer) to prove
             # the increment landed before allowing outbound I/O.
@@ -128,24 +141,26 @@ class SolcastBudget:
             return False
         return True
 
-    async def async_set_first_fetch_pending(self, pending: bool) -> bool:
+    async def async_set_first_fetch_pending(
+        self, pending: bool, *, active: Callable[[], bool] = lambda: True,
+    ) -> bool:
         """Persist the marker before a credential save (consumed by polling)."""
         async with self._lock:
-            if not await self._load():
+            if not await self._load(active):
                 return False
             assert self._state is not None
             self._state.first_fetch_pending = pending
-            return await self._save()
+            return await self._save(active)
 
     async def async_request(
         self, request: Callable[[], Awaitable[ResultT]], *, calls_limit: int,
-        reserved: bool = False,
+        reserved: bool = False, active: Callable[[], bool] = lambda: True,
     ) -> ResultT | SiteResult:
         """Charge and save before dispatch; a broken store refuses all work."""
         async with self._lock:
-            if type(calls_limit) is not int or calls_limit not in {10, 50}:
+            if not active() or type(calls_limit) is not int or calls_limit not in {10, 50}:
                 return SiteResult(Outcome.STALE)
-            if not await self._load():
+            if not await self._load(active):
                 return SiteResult(Outcome.STALE)
             assert self._state is not None
             while True:
@@ -167,12 +182,14 @@ class SolcastBudget:
                 ):
                     return SiteResult(Outcome.QUOTA_EXHAUSTED)
                 self._state.calls_used += 1
-                if not await self._save():
+                if not await self._save(active):
                     return SiteResult(Outcome.STALE)
                 # Persistence can straddle midnight. Charge the new day before
                 # dispatch instead of spending its first call on yesterday.
                 if dt_util.utcnow().date() == self._state.utc_day:
                     break
+            if not active():
+                return SiteResult(Outcome.STALE)
             result = await request()
             if result.outcome == Outcome.QUOTA_EXHAUSTED:
                 received_at = dt_util.utcnow()
@@ -182,7 +199,7 @@ class SolcastBudget:
                 self._state.exhausted_until = datetime.combine(
                     received_at.date() + timedelta(days=1), time(), UTC,
                 )
-                if not await self._save():
+                if not await self._save(active):
                     return SiteResult(Outcome.STALE)
             return result
 
