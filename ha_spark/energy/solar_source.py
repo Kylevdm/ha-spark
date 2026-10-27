@@ -34,6 +34,10 @@ log = get_logger(__name__)
 
 SolarSourceKind: TypeAlias = Literal["native", "entities"]
 
+NATIVE_PREVIEW_NOTE = (
+    "solar: native Solcast forecast is only available inside the daemon; planning with zero solar"
+)
+
 
 @dataclass(frozen=True)
 class NativeForecast:

@@ -61,7 +61,7 @@ from ha_spark.energy.readiness_ledger import ReadinessLedger, slot_start
 from ha_spark.energy.readiness_measurements import COMPONENTS, ReadinessDays
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever
-from ha_spark.energy.solar_source import solar_source_from_store
+from ha_spark.energy.solar_source import NATIVE_PREVIEW_NOTE, solar_source_from_store
 from ha_spark.energy.sources import _to_float
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.energy.v2l import delivered_fraction, load_session, savings
@@ -327,12 +327,15 @@ async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
         if reply is not None:
             _print_reply(reply)
             return 1 if reply.error else 0
+    source = solar_source_from_store(settings)
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        run = await current_plan(settings, rest, source=solar_source_from_store(settings))
+        run = await current_plan(settings, rest, source=source)
         plan, load_source = run.plan, run.load_source
         print(format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz))
+        if source.kind == "native":
+            print(NATIVE_PREVIEW_NOTE)
         if apply:
             print(REFUSED)
     return 0

@@ -90,7 +90,19 @@ def link_view(link: IntegrationLink, now: datetime) -> dict[str, object]:
         state = "version_skew"
     elif snapshot is not None:
         state = "connected" if age is not None and age <= 90 else "unreachable"
+    forecast = link.solar_forecast.forecast
+    solar_age = (
+        (now - forecast.fetched_at).total_seconds()
+        if forecast is not None and forecast.fetched_at is not None else None
+    )
+    solar: dict[str, object] = {"solar_source": link.solar_forecast.kind}
+    if link.solar_forecast.kind == "native":
+        solar.update(
+            solar_status=forecast.status if forecast is not None else "no_data",
+            solar_fetch_age_s=max(0, int(solar_age)) if solar_age is not None else None,
+        )
     return {
+        **solar,
         "state": state,
         "site_id": snapshot.site_id if snapshot is not None else None,
         "integration_release_version": snapshot.release_version if snapshot is not None else None,
