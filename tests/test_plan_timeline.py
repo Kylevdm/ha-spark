@@ -134,6 +134,24 @@ def test_ingress_timeline_today_start_for_dst_and_stale_horizon(
         assert datetime.fromisoformat(timeline["horizon_start"]) < datetime.fromisoformat(expected)
 
 
+@pytest.mark.parametrize("known", [None, (False, True)])
+def test_ingress_timeline_unknown_solar_is_null_not_genuine_zero(tmp_path, known):
+    record = stored_run()
+    inputs = replace(
+        record.run.inputs, solar_slots=(0.0,) * 48,
+        solar_slots_known=(known + (True,) * 46 if known is not None else None),
+    )
+    plan = compute_plan(inputs, record.run.cfg, record.run.schedule)
+    record = replace(record, run=replace(record.run, inputs=inputs, plan=plan))
+    state = _state(tmp_path)
+    state.set_plan(plan, record)
+    with owner_client(state) as client:
+        slots = client.get("/api/plan").json()["timeline"]["slots"]
+    for field in ("solar_kwh", "solar_raw_kwh"):
+        assert slots[0][field] == (None if known is not None else 0.0)
+        assert slots[1][field] == 0.0
+
+
 def test_ingress_timeline_null_without_stored_run(tmp_path):
     state = _state(tmp_path)
     with owner_client(state) as client:

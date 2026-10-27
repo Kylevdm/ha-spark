@@ -19,6 +19,7 @@ from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.sources import build_config, build_schedule, gather_inputs, pre_window_drain
 from ha_spark.energy.tariff import fixed_schedule
 from ha_spark.ha.rest import HomeAssistantRest
+from tests.solar_source_helpers import entities_source
 
 BASE = "http://ha.test/api"
 _HOUSEHOLD_TZ = ZoneInfo("Europe/London")
@@ -180,7 +181,7 @@ async def test_gather_inputs_starts_now_and_locates_the_running_or_next_window(
         "charge_window_end": window_end.strftime("%H:%M"),
     })
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        inputs, _, _ = await gather_inputs(settings, rest)
+        inputs, _, _ = await gather_inputs(settings, rest, source=entities_source(settings))
     assert inputs.geometry is not None
     assert inputs.geometry.window_start == expected_start
     assert expected_start.hour * 2 + expected_start.minute // 30 == expected_first_slot
@@ -222,7 +223,7 @@ async def test_gather_inputs_parses_live_state(monkeypatch: pytest.MonkeyPatch) 
 
     s = _settings()
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, cfg, forecast = await gather_inputs(s, rest)
+        inputs, cfg, forecast = await gather_inputs(s, rest, source=entities_source(s))
 
     assert inputs.soc_now == 30.0
     assert inputs.soc.ok is True
@@ -286,7 +287,7 @@ async def test_disconnected_ev_evidence_drops_dispatch_from_every_planner_use(
     )
     caplog.set_level("INFO", logger="ha_spark.energy.sources")
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        inputs, cfg, _src = await gather_inputs(settings, rest)
+        inputs, cfg, _src = await gather_inputs(settings, rest, source=entities_source(settings))
 
     assert inputs.dispatches == ()
     assert len(inputs.unrated_dispatches) == 1
@@ -371,7 +372,7 @@ async def test_live_dispatch_beats_disconnected_plug_in_gather_inputs(
     )
 
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        inputs, _cfg, _src = await gather_inputs(settings, rest)
+        inputs, _cfg, _src = await gather_inputs(settings, rest, source=entities_source(settings))
 
     assert len(inputs.dispatches) == expected_count
     dispatch_reads = [
@@ -420,7 +421,7 @@ async def test_adjusted_rate_evidence_is_strictly_coerced(
     )
 
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        inputs, _cfg, _src = await gather_inputs(settings, rest)
+        inputs, _cfg, _src = await gather_inputs(settings, rest, source=entities_source(settings))
 
     assert len(inputs.dispatches) == expected_count
 
@@ -481,7 +482,7 @@ async def test_gather_inputs_skips_plug_and_rate_reads_without_dispatches(
     )
 
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        inputs, _cfg, _src = await gather_inputs(settings, rest)
+        inputs, _cfg, _src = await gather_inputs(settings, rest, source=entities_source(settings))
 
     assert inputs.dispatches == ()
     assert ev_status.call_count == 1
@@ -501,7 +502,7 @@ async def test_gather_inputs_tolerates_missing_entities(
 
     s = _settings()
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, cfg, _ = await gather_inputs(s, rest)
+        inputs, cfg, _ = await gather_inputs(s, rest, source=entities_source(s))
 
     assert inputs.soc_now == 0.0
     assert inputs.soc.ok is False
@@ -534,7 +535,7 @@ async def test_gather_inputs_skips_unset_optional_entities(
         }
     )
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, cfg, _ = await gather_inputs(s, rest)
+        inputs, cfg, _ = await gather_inputs(s, rest, source=entities_source(s))
 
     assert blank_entity.called is False
     assert not any("Could not read  (" in record.getMessage() for record in caplog.records)
@@ -570,7 +571,7 @@ async def test_gather_inputs_reads_axle_event_source(monkeypatch: pytest.MonkeyP
         axle_api_key="secret-token",
     )
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, _, _ = await gather_inputs(s, rest)
+        inputs, _, _ = await gather_inputs(s, rest, source=entities_source(s))
 
     assert inputs.flexibility_event is not None
     assert inputs.flexibility_event.direction == "export"
@@ -598,7 +599,7 @@ async def test_gather_inputs_degrades_on_malformed_axle_event(
         axle_api_key="secret-token",
     )
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, cfg, _ = await gather_inputs(s, rest)
+        inputs, cfg, _ = await gather_inputs(s, rest, source=entities_source(s))
 
     assert inputs.flexibility_event is None
     assert inputs.flexibility_event_trusted is False
@@ -652,7 +653,7 @@ async def test_solar_percentile_prefers_estimate_attributes(
 
     s = Settings(**{**_settings().model_dump(), "solar_percentile": percentile})
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, _, _ = await gather_inputs(s, rest)
+        inputs, _, _ = await gather_inputs(s, rest, source=entities_source(s))
     assert inputs.solar_tomorrow_kwh == expected
 
 
@@ -680,7 +681,7 @@ async def test_solar_percentile_falls_back_to_state(
 
     s = Settings(**{**_settings().model_dump(), "solar_percentile": percentile})
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, _, _ = await gather_inputs(s, rest)
+        inputs, _, _ = await gather_inputs(s, rest, source=entities_source(s))
     assert inputs.solar_tomorrow_kwh == 8.75
     assert "using sensor state with unknown percentile" in caplog.text
 
@@ -750,7 +751,7 @@ async def test_invalid_today_solar_counts_today_as_zero(
 
     s = _settings().model_copy(update={"solar_today_entity": "sensor.solar_today"})
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, _, _ = await gather_inputs(s, rest)
+        inputs, _, _ = await gather_inputs(s, rest, source=entities_source(s))
 
     assert inputs.geometry is not None
     assert inputs.horizon_start == datetime(2026, 6, 8, 1, 0, tzinfo=_HOUSEHOLD_TZ)
@@ -793,7 +794,7 @@ async def test_invalid_tomorrow_solar_counts_only_that_date_as_zero(
 
     s = _settings().model_copy(update={"solar_today_entity": "sensor.solar_today"})
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, _, _ = await gather_inputs(s, rest)
+        inputs, _, _ = await gather_inputs(s, rest, source=entities_source(s))
 
     assert inputs.geometry is not None
     assert inputs.horizon_start == _DAYTIME_NOW.replace(minute=0, second=0, microsecond=0)
@@ -845,7 +846,7 @@ async def test_solar_slot_provenance_separates_missing_from_zero(
 
     s = _settings().model_copy(update={"solar_today_entity": "sensor.solar_today"})
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, _, _ = await gather_inputs(s, rest)
+        inputs, _, _ = await gather_inputs(s, rest, source=entities_source(s))
 
     assert inputs.geometry is not None
     known = inputs.solar_slots_known
@@ -879,7 +880,7 @@ async def test_daily_path_carries_no_solar_provenance(
     respx.route(method="GET").mock(return_value=httpx.Response(404))
 
     async with HomeAssistantRest(_settings().ha_rest_url, _settings().auth_token) as rest:
-        inputs, _, _ = await gather_inputs(_settings(), rest)
+        inputs, _, _ = await gather_inputs(_settings(), rest, source=entities_source(_settings()))
 
     assert inputs.solar_slots is None
     assert inputs.solar_slots_known is None
@@ -914,7 +915,7 @@ async def test_gather_inputs_flags_unavailable_soc(monkeypatch: pytest.MonkeyPat
 
     s = _settings()
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, _, _ = await gather_inputs(s, rest)
+        inputs, _, _ = await gather_inputs(s, rest, source=entities_source(s))
 
     assert inputs.soc_now == 0.0
     assert inputs.soc.ok is False
@@ -935,7 +936,7 @@ async def test_quantile_buffer_derived_from_ml_p90(
 
     s = Settings(ha_url="http://ha.test", ha_token="t", buffer_mode="quantile")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        _, cfg, _ = await gather_inputs(s, rest)
+        _, cfg, _ = await gather_inputs(s, rest, source=entities_source(s))
     assert cfg.buffer_pct == pytest.approx(15.0)  # (23/20 - 1) * 100
 
 
@@ -951,7 +952,7 @@ async def test_fixed_buffer_ignores_p90(monkeypatch: pytest.MonkeyPatch) -> None
 
     s = Settings(ha_url="http://ha.test", ha_token="t", charge_buffer_pct=20.0)
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        _, cfg, _ = await gather_inputs(s, rest)
+        _, cfg, _ = await gather_inputs(s, rest, source=entities_source(s))
     assert cfg.buffer_pct == 20.0
 
 
@@ -973,7 +974,7 @@ async def test_gather_inputs_reads_location_from_ha_config(
 
     s = Settings(ha_url="http://ha.test", ha_token="t")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        await gather_inputs(s, rest)
+        await gather_inputs(s, rest, source=entities_source(s))
     assert (seen["lat"], seen["lon"]) == (51.5, -0.1)
     assert isinstance(seen["target"], date)  # the served day (#397)
 
@@ -993,7 +994,7 @@ async def test_explicit_coordinates_override_ha_config(
 
     s = Settings(ha_url="http://ha.test", ha_token="t", latitude=55.9, longitude=-3.2)
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        await gather_inputs(s, rest)
+        await gather_inputs(s, rest, source=entities_source(s))
     assert (seen["lat"], seen["lon"]) == (55.9, -3.2)
     assert isinstance(seen["target"], date)  # the served day (#397)
 
@@ -1034,7 +1035,7 @@ async def test_gather_inputs_parses_dynamic_rates(monkeypatch: pytest.MonkeyPatc
 
     s = _dynamic_settings()
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, _cfg, _src = await gather_inputs(s, rest)
+        inputs, _cfg, _src = await gather_inputs(s, rest, source=entities_source(s))
     assert [p.price for p in inputs.dynamic_prices] == [0.12, 0.09]
 
 
@@ -1064,7 +1065,7 @@ async def test_gather_inputs_merges_today_and_tomorrow_rates(
 
     s = _dynamic_settings(dynamic_rates_entity_tomorrow="event.rates_tomorrow")
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, _cfg, _src = await gather_inputs(s, rest)
+        inputs, _cfg, _src = await gather_inputs(s, rest, source=entities_source(s))
     # Sorted by start: today's slot, then tomorrow's.
     assert [p.price for p in inputs.dynamic_prices] == [0.20, 0.05]
 
@@ -1089,7 +1090,7 @@ async def test_gather_inputs_tolerates_malformed_rates(monkeypatch: pytest.Monke
 
     s = _dynamic_settings()
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, _cfg, _src = await gather_inputs(s, rest)
+        inputs, _cfg, _src = await gather_inputs(s, rest, source=entities_source(s))
     assert inputs.dynamic_prices == ()
 
 
@@ -1105,7 +1106,7 @@ async def test_gather_inputs_dynamic_unavailable_sensor_degrades(
 
     s = _dynamic_settings()
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, cfg, _src = await gather_inputs(s, rest)
+        inputs, cfg, _src = await gather_inputs(s, rest, source=entities_source(s))
     assert inputs.dynamic_prices == ()
     # Never blocks a plan: the schedule falls back to fixed.
     assert build_schedule(s, inputs, cfg) == fixed_schedule(inputs, cfg)
@@ -1126,7 +1127,7 @@ async def test_gather_inputs_skips_dynamic_fetch_when_fixed_provider(
             ha_url="http://ha.test", ha_token="t", dynamic_rates_entity="event.rates_today"
         )
         async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-            inputs, _cfg, _src = await gather_inputs(s, rest)
+            inputs, _cfg, _src = await gather_inputs(s, rest, source=entities_source(s))
         assert inputs.dynamic_prices == ()
 
 
@@ -1189,7 +1190,7 @@ async def test_gather_inputs_octopus_intelligent_fetches_dispatches_and_prices(
 
     s = _octopus_settings()
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, _cfg, _src = await gather_inputs(s, rest)
+        inputs, _cfg, _src = await gather_inputs(s, rest, source=entities_source(s))
     assert len(inputs.dispatches) == 1
     assert inputs.dispatches[0].source == "smart-charge"
     assert [p.price for p in inputs.dynamic_prices] == [0.12]
@@ -1254,7 +1255,7 @@ async def test_octopus_dispatches_use_configured_ha_live_evidence(
         octopus_rate_entity="sensor.rate",
     )
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        inputs, _cfg, _src = await gather_inputs(settings, rest)
+        inputs, _cfg, _src = await gather_inputs(settings, rest, source=entities_source(settings))
 
     assert len(inputs.dispatches) == expected_count
 
@@ -1274,7 +1275,7 @@ async def test_gather_inputs_octopus_intelligent_degrades_on_api_failure(
 
     s = _octopus_settings()
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, cfg, _src = await gather_inputs(s, rest)
+        inputs, cfg, _src = await gather_inputs(s, rest, source=entities_source(s))
     # Never crashes or blocks the plan: dispatches/prices degrade to empty,
     # and the schedule falls back to fixed.
     assert inputs.dispatches == ()
@@ -1298,7 +1299,7 @@ async def test_gather_inputs_reads_configured_live_dispatch_for_octopus_intellig
         respx.route(url__startswith="http://octo.test").mock(return_value=httpx.Response(401))
         s = _octopus_settings(dispatch_entity="binary_sensor.dispatch")
         async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-            await gather_inputs(s, rest)
+            await gather_inputs(s, rest, source=entities_source(s))
         assert any(
             str(c.request.url).endswith("/states/binary_sensor.dispatch")
             for c in respx.calls
@@ -1317,7 +1318,7 @@ async def _gather_with_soc(
 
     s = _settings().model_copy(update=overrides)
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, _, _ = await gather_inputs(s, rest)
+        inputs, _, _ = await gather_inputs(s, rest, source=entities_source(s))
     return inputs
 
 
@@ -1377,7 +1378,7 @@ async def _gather_with_dispatch(
         respx.route(method="GET").mock(return_value=httpx.Response(404))
         s = _settings().model_copy(update=kw)
         async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-            inputs, _cfg, _src = await gather_inputs(s, rest)
+            inputs, _cfg, _src = await gather_inputs(s, rest, source=entities_source(s))
     return inputs
 
 
@@ -1461,7 +1462,7 @@ async def test_a_failed_octopus_dispatch_fetch_is_untrusted(
 
     s = _octopus_settings()
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, _cfg, _src = await gather_inputs(s, rest)
+        inputs, _cfg, _src = await gather_inputs(s, rest, source=entities_source(s))
 
     assert inputs.dispatches == ()
     assert inputs.dispatches_trusted is False
@@ -1612,7 +1613,7 @@ async def test_an_evening_axle_event_is_planned_on_its_own_day(
     )
 
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
-        inputs, cfg, _ = await gather_inputs(s, rest, soc=soc)
+        inputs, cfg, _ = await gather_inputs(s, rest, soc=soc, source=entities_source(s))
     plan = compute_plan(inputs, cfg, build_schedule(s, inputs, cfg))
 
     export = plan.charge_intent.export
@@ -1712,7 +1713,7 @@ async def test_axle_overlay_preserves_tariff_and_plans_export(
         load_model="median",
     )
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        inputs, cfg, _ = await gather_inputs(settings, rest)
+        inputs, cfg, _ = await gather_inputs(settings, rest, source=entities_source(settings))
     inputs = replace(inputs, horizon_start=start, load_slots=(0.0,) * 8, solar_slots=(0.0,) * 8)
     schedule = build_schedule(settings, inputs, cfg)
     assert schedule.export_prices == (0.05, 0.05, 0.05, 0.05, 1.25, 1.25, 0.05, 0.05)
@@ -1756,7 +1757,7 @@ async def test_disabled_export_provider_never_reads_axle(
         load_model="median",
     )
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        inputs, cfg, _ = await gather_inputs(settings, rest)
+        inputs, cfg, _ = await gather_inputs(settings, rest, source=entities_source(settings))
     assert not axle.called
     assert not mirror.called
     assert inputs.flexibility_event is None

@@ -61,6 +61,12 @@ from ha_spark.energy.plan_run import StoredPlanRun
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.energy.solar_forecasts import recorded_solar
 from ha_spark.energy.solar_measured import MeasuredSolar
+from ha_spark.energy.solar_source import (
+    ParsedSolarForecast,
+    load_solar_source_kind,
+    parse_native_forecast,
+    save_solar_source_kind,
+)
 from ha_spark.integration_discovery import IntegrationDiscovery
 from ha_spark.logging import get_logger
 from ha_spark.mode_preconditions import entry_preconditions
@@ -144,7 +150,9 @@ class AppState:
         self.plan_run: StoredPlanRun | None = None
         self.plan_at = plan_at
         self.executor = executor
-        self.integration_link = IntegrationLink(None, None, False)
+        self.integration_link = IntegrationLink(
+            None, None, False, ParsedSolarForecast(load_solar_source_kind(settings)),
+        )
         self.loop_tick: datetime | None = None
         self.soc_observation_ok: bool = False
 
@@ -760,7 +768,9 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
             return invalid
         if version not in SUPPORTED_API_VERSIONS:
             previous = state.integration_link
-            state.integration_link = IntegrationLink(previous.snapshot, previous.received_at, True)
+            state.integration_link = IntegrationLink(
+                previous.snapshot, previous.received_at, True, previous.solar_forecast,
+            )
             return JSONResponse(version_refusal(), status_code=409,
                                 headers={"Cache-Control": "no-store"})
         try:
@@ -768,7 +778,12 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
         except ValidationError:
             return invalid
         now = _heartbeat_now()
-        state.integration_link = IntegrationLink(snapshot, now, False)
+        # Missing v2 is a field-local schema violation, never a legacy fallback.
+        raw = payload.get("solar_forecast", {}) if version >= 2 else None
+        parsed = parse_native_forecast(raw, received_at=now)
+        state.integration_link = IntegrationLink(snapshot, now, False, parsed)
+        if load_solar_source_kind(state.settings) != parsed.kind:
+            save_solar_source_kind(state.settings, parsed.kind)
         if state.executor is not None:
             authority = state.executor.authority_inputs()
         else:
@@ -776,7 +791,8 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
             authority = AuthorityInputs(loaded.state, loaded.status == "known", False)
         return JSONResponse(
             plan_summary(
-                session_id=integration.session_id, built_at=now, loop_tick=state.loop_tick,
+                api_version=version, session_id=integration.session_id,
+                built_at=now, loop_tick=state.loop_tick,
                 plan=state.plan, plan_at=state.plan_at, soc_observation_ok=state.soc_observation_ok,
                 session=(
                     v2l.load_session(state.settings) if state.settings.v2l_power_entity else None

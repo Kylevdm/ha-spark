@@ -89,6 +89,20 @@ async def test_authenticated_peer(state, discovery, peer):
     assert response.status_code == 200
 
 
+@pytest.mark.parametrize("version", [1, 2])
+def test_summary_uses_request_version(state, discovery, monkeypatch, version):
+    monkeypatch.setattr(server, "SUPPORTED_API_VERSIONS", frozenset({1, 2}))
+    monkeypatch.setattr(server, "_heartbeat_now", lambda: datetime(2026, 10, 24, 12, tzinfo=UTC))
+    snapshot = {**json.loads(SNAPSHOT_BODY), "api_version": version}
+    with TestClient(build_app(state, ingress_peer="proxy", integration=discovery)) as client:
+        response = client.post(
+            "/integration/heartbeat", json=snapshot,
+            headers={"Authorization": f"Bearer {discovery.auth_token}"},
+        )
+    assert response.status_code == 200
+    assert response.json()["api_version"] == version
+
+
 @pytest.mark.parametrize("method,path", [("GET", "/api/mode"), ("POST", "/api/mode"),
     ("GET", "/api/config"), ("GET", "/api/health"), ("GET", "/"),
     ("GET", "/agent/health"), ("POST", "/mcp")])
@@ -187,7 +201,8 @@ async def test_agent_token_cannot_open_integration(tmp_path, discovery, caplog):
     assert CANARY not in response.text + caplog.text
 
 
-async def test_golden_envelope_and_no_mutation(state, discovery, monkeypatch):
+@pytest.mark.parametrize("version", [1, 2])
+async def test_golden_envelope_and_no_mutation(state, discovery, monkeypatch, version):
     monkeypatch.setattr(server, "_heartbeat_now", lambda: datetime(2026, 10, 24, 12, tzinfo=UTC))
     state.loop_tick = datetime(2026, 10, 24, 11, 59, 30, tzinfo=UTC)
     from ha_spark.energy.v2l import V2LSession, save_session
@@ -209,17 +224,20 @@ async def test_golden_envelope_and_no_mutation(state, discovery, monkeypatch):
               state.settings.model_dump(), state.plan, state.plan_at)
     authority_before = load_authority(state.settings)
     # Planning-input-like fields ride along; they must be dropped, never applied.
-    injected = json.loads(SNAPSHOT_BODY) | {"mode": "optimise", "operating_mode": "optimise",
+    injected = json.loads(SNAPSHOT_BODY) | {"api_version": version,
+                                            "mode": "optimise", "operating_mode": "optimise",
                                             "fallback": {"active": True}, "holds": [CANARY]}
     response = await request(state, discovery, content=json.dumps(injected).encode(),
                              headers={"Authorization": f"Bearer {discovery.auth_token}"})
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
-    golden = json.loads((FIXTURES / "plan_summary.json").read_text())
+    name = "plan_summary_v1.json" if version == 1 else "plan_summary.json"
+    golden = json.loads((FIXTURES / name).read_text())
     assert response.json() == golden
     assert CANARY not in response.text
     contract = json.loads((FIXTURES / "contract.json").read_text())
-    assert golden["api_version"] == contract["api_version"]
+    assert golden["api_version"] == version
+    assert contract["api_version"] == 2
     assert (state.current_options(), state.settings_service.revision,
             state.settings.model_dump(), state.plan, state.plan_at) == before
     assert load_authority(state.settings) == authority_before
@@ -257,7 +275,7 @@ def test_http_reports_loop_tick_without_refreshing(state, discovery, monkeypatch
     assert state.loop_tick == tick
 
 
-@pytest.mark.parametrize("version", [2, 99])
+@pytest.mark.parametrize("version", [3, 99])
 def test_version_skew_keeps_snapshot_and_returns_refusal(state, discovery, version):
     snapshot = json.loads((FIXTURES / "site_snapshot.json").read_text())
     with TestClient(build_app(state, ingress_peer="testclient", integration=discovery)) as client:
@@ -270,7 +288,7 @@ def test_version_skew_keeps_snapshot_and_returns_refusal(state, discovery, versi
             "api_version": version, "release_version": "1.0.0", "site_id": [],
             "sent_at": False, "v2": {"new": True}})
     assert response.status_code == 409
-    refusal = json.loads((FIXTURES / "version_refusal.json").read_text())
+    refusal = json.loads((FIXTURES / "version_refusal_v2.json").read_text())
     assert response.json() == refusal
     assert refusal["api_version"] == json.loads((FIXTURES / "contract.json").read_text())[
         "api_version"]
@@ -583,7 +601,8 @@ async def test_unrepresentable_instants_degrade_and_the_summary_still_parses(
     }))
     plan = replace(_plan(), export_soc_needed_pct=50.0, export_soc_needed_at=edge)
     body = plan_summary(
-        session_id=discovery.session_id, built_at=datetime(2026, 10, 24, 12, tzinfo=UTC),
+        api_version=1, session_id=discovery.session_id,
+        built_at=datetime(2026, 10, 24, 12, tzinfo=UTC),
         loop_tick=datetime(2026, 10, 24, 11, 59, 30, tzinfo=UTC), plan=plan,
         plan_at=datetime(2026, 10, 24, 11, 30, tzinfo=UTC), settings=state.settings,
         authority=AuthorityInputs(store.state, True, False),

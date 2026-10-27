@@ -19,6 +19,7 @@ from ha_spark.energy.context import ContextEntry, ContextStore
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.report import format_plan
+from ha_spark.energy.solar_source import NATIVE_PREVIEW_NOTE, solar_source_from_store
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -89,20 +90,22 @@ async def parse_offline(
 
     # Everything else needs the computed plan.
     try:
-        run = await current_plan(settings, rest)
+        source = solar_source_from_store(settings)
+        run = await current_plan(settings, rest, source=source)
         plan, load_source = run.plan, run.load_source
     except Exception as exc:  # noqa: BLE001 - the fallback path must never crash
         log.warning("Offline parser could not compute the plan: %r", exc)
         return IntentResult(f"Could not compute the charge plan: {exc}", matched=True)
 
     if _contains(text, "soc", "battery", "state of charge"):
-        return IntentResult(_soc_line(plan), matched=True)
-    if _contains(text, "solar", "forecast"):
-        return IntentResult(_solar_line(plan, run.forecast.target_date), matched=True)
-    return IntentResult(
-        format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz),
-        matched=True,
-    )
+        answer = _soc_line(plan)
+    elif _contains(text, "solar", "forecast"):
+        answer = _solar_line(plan, run.forecast.target_date)
+    else:
+        answer = format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz)
+    if source.kind == "native":
+        answer += "\n" + NATIVE_PREVIEW_NOTE
+    return IntentResult(answer, matched=True)
 
 
 # --- Phase 6D: offline context extraction + query (the no-LLM fallback) ---

@@ -66,7 +66,7 @@ def state_value(hass: HomeAssistant, entity_id: str = ENTITY) -> str:
 
 def test_summary_fixture() -> None:
     parsed = parse_summary(fixture("plan_summary"))
-    assert parsed.api_version == 1
+    assert parsed.api_version == 2
     assert parsed.loop_tick is not None
 
 
@@ -81,7 +81,8 @@ def test_bad_summary(updates: dict[str, Any]) -> None:
         parse_summary({**fixture("plan_summary"), **updates})
 
 
-@pytest.mark.parametrize("key", list(fixture("plan_summary")))
+@pytest.mark.parametrize("key", [key for key in fixture("plan_summary")
+                                 if key != "charge_window_start"])
 def test_missing_summary_key(key: str) -> None:
     body = fixture("plan_summary")
     del body[key]
@@ -153,7 +154,7 @@ async def test_liveness_outcomes(
         elif outcome == "session":
             body["session_id"] = "another-session"
         elif outcome == "incompatible":
-            body["api_version"] = 2
+            body["api_version"] = 3
         aioclient_mock.post(URL, json=body)
     await coordinator.async_refresh()
     expected = {

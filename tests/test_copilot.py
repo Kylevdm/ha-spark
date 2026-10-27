@@ -44,7 +44,7 @@ def _plan() -> ChargePlan:
 
 
 async def test_build_grounding_renders_plan(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_current_plan(settings: Settings, rest: Any) -> PlanRun:
+    async def fake_current_plan(settings: Settings, rest: Any, **_kw: Any) -> PlanRun:
         return PlanRun(
             plan=_plan(), inputs=object(), cfg=object(), schedule=object(),  # type: ignore[arg-type]
             load_source="slot profile (14d hourly house stats)",

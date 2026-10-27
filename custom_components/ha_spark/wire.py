@@ -1,7 +1,7 @@
 """The integration's half of the add-on/integration wire contract (#324).
 
 Pure Python with no Home Assistant imports: this module holds the `api_version`
-the integration speaks, the identity-only site snapshot it sends, and the summary
+the integration speaks, the site snapshot it sends, and the summary
 and plan numbers and read-only authority mirrors it validates.
 `api_version` is an integer, separate from the release version. A receiver may
 ignore an unknown field only if ignoring it keeps
@@ -22,7 +22,7 @@ from math import isfinite
 from typing import Final, Literal, cast
 from uuid import UUID
 
-API_VERSION: Final = 1
+API_VERSION: Final = 2
 # Display codes the add-on sends at this api_version (its planner, SoC check and fallback).
 PLAN_MODELS: Final = frozenset({"daily", "slots"})
 PLAN_STRATEGIES: Final = frozenset({"deficit", "fill"})
@@ -33,7 +33,7 @@ SOC_STATUSES: Final = frozenset({
 FALLBACK_CAUSES: Final = frozenset({"soc_integrity"})
 
 # Every `api_version` this integration can send and accept replies to.
-SUPPORTED_API_VERSIONS: Final = frozenset({1})
+SUPPORTED_API_VERSIONS: Final = frozenset({1, 2})
 
 
 class MalformedSummary(ValueError):
@@ -136,20 +136,25 @@ class Summary:
     plan: PlanBlock | None
     v2l: V2LBlock | None
     authority: AuthorityBlock
+    charge_window_start: datetime | None = None
 
 
 def build_snapshot(
-    *, site_id: str, release_version: str, sent_at: datetime, api_version: int = API_VERSION,
+    *, site_id: str, release_version: str, sent_at: datetime, api_version: int,
+    solar_forecast: object = None,
 ) -> dict[str, object]:
-    """Build the identity-only snapshot for api_version 1."""
+    """Build only fields supported by the negotiated api_version."""
     if str(UUID(site_id)) != site_id or sent_at.utcoffset() is None:
         raise ValueError("Invalid snapshot identity or time")
-    return {
+    result: dict[str, object] = {
         "api_version": api_version,
         "release_version": release_version,
         "site_id": site_id,
         "sent_at": sent_at.astimezone(UTC).isoformat(),
     }
+    if api_version >= 2:
+        result["solar_forecast"] = solar_forecast
+    return result
 
 
 @dataclass(frozen=True)
@@ -228,6 +233,12 @@ def parse_summary(body: object) -> Summary:
         or "loop_tick" not in body or "v2l" not in body
     ):
         raise MalformedSummary()
+    window = None
+    if version >= 2:
+        try:
+            window = _timestamp(body.get("charge_window_start"))
+        except MalformedSummary:
+            pass
     return Summary(
         api_version=version,
         release_version=release,
@@ -238,6 +249,7 @@ def parse_summary(body: object) -> Summary:
         plan=_plan(body["plan"]),
         v2l=_v2l(body["v2l"]),
         authority=_authority(body.get("authority")),
+        charge_window_start=window,
     )
 
 

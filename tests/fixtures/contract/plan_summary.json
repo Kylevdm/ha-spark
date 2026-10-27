@@ -1,6 +1,6 @@
 {
-  "api_version": 1,
-  "release_version": "0.28.1",
+  "api_version": 2,
+  "release_version": "0.29.0",
   "session_id": "b79156f6-2fbe-4c30-ae3a-6b7fb4dd18d1",
   "loop_tick": "2026-10-24T11:59:30+00:00",
   "built_at": "2026-10-24T12:00:00+00:00",
@@ -36,10 +36,18 @@
     "transition_target": null,
     "last_changed_at": null,
     "save_failed": false,
-    "fallback": {"active": false, "causes": []},
+    "fallback": {
+      "active": false,
+      "causes": []
+    },
     "holds": {
-      "ev": {"active": false},
-      "dispatch": {"active": false, "trusted_end": null}
+      "ev": {
+        "active": false
+      },
+      "dispatch": {
+        "active": false,
+        "trusted_end": null
+      }
     }
   },
   "v2l": {
@@ -48,5 +56,6 @@
     "avoided_gbp": 0.7,
     "refill_cost_gbp": 0.23,
     "peak_power_w": 1234.0
-  }
+  },
+  "charge_window_start": "2026-10-24T22:30:00+00:00"
 }

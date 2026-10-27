@@ -57,13 +57,51 @@
       "next_change": {
         "name": "Next planned change"
       },
+      "forecast_today": {"name": "Forecast today"},
+      "forecast_tomorrow": {"name": "Forecast tomorrow"},
+      "last_fetch": {"name": "Last fetch"},
+      "api_calls_used": {"name": "API calls used"},
       "last_run": {
         "name": "Last run"
       }
     }
   },
-  "config": {
+  "options": {
     "step": {
+      "init": {
+        "title": "Solcast daily allowance",
+        "description": "Choose 50 only for a legacy account with that allowance. Calls reset at midnight UTC.",
+        "data": {"calls_limit": "Daily API call limit"}
+      }
+    }
+  },
+  "config": {
+    "error": {
+      "auth_failed": "Solcast rejected the API key.",
+      "no_sites": "This Solcast account has no rooftop sites.",
+      "too_many_sites": "This Solcast account has more than two rooftop sites.",
+      "malformed": "Solcast returned an invalid site list.",
+      "quota_exhausted": "The daily Solcast call allowance is exhausted. Try after midnight UTC.",
+      "busy": "Solcast is busy. Try again later.",
+      "server_error": "Solcast is unavailable. Try again later.",
+      "unreachable": "Cannot reach Solcast. Try again later.",
+      "stale": "The Solcast quota store could not be read or saved. Requests are stopped."
+    },
+    "step": {
+      "reconfigure": {
+        "title": "Configure Solcast",
+        "description": "Enter your Solcast API key. Leave it empty to remove native Solcast after confirmation. Turn off other Solcast pollers before saving.",
+        "data": {"solcast_api_key": "Solcast API key"}
+      },
+      "reauth_confirm": {
+        "title": "Reconnect Solcast",
+        "description": "Enter a replacement Solcast API key.",
+        "data": {"solcast_api_key": "Solcast API key"}
+      },
+      "clear_solcast": {
+        "title": "Remove native Solcast?",
+        "description": "Remove the saved key and sites? The add-on will use its legacy forecast entity settings."
+      },
       "confirm": {
         "title": "ha-spark discovered",
         "description": "Connect the ha-spark add-on to this Home Assistant site?"

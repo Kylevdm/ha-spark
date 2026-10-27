@@ -89,6 +89,7 @@ import httpx
 import uvicorn
 
 from ha_spark.agent.auth import resolve_token
+from ha_spark.api.contract import IntegrationLink
 from ha_spark.api.server import (
     AGENT_PORT,
     INGRESS_PORT,
@@ -143,6 +144,7 @@ from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor, SocMonitorSnapshot, observe_soc
 from ha_spark.energy.solar_forecasts import SolarForecastStore
+from ha_spark.energy.solar_source import SolarSource
 from ha_spark.energy.sources import (
     ev_hold_status_from_read,
     parse_time,
@@ -172,6 +174,16 @@ REPLAN_INTERVAL = timedelta(minutes=30)
 # #423: after a recovered apply that is not fully verified re-applied the
 # fallback on the same tick, the next recovery attempt waits this long.
 RECOVERY_RETRY_DELAY = timedelta(minutes=5)
+
+
+def solar_source_for(link: IntegrationLink, now: datetime) -> SolarSource:
+    """Freeze the accepted snapshot's solar source at this plan's instant."""
+    return SolarSource(
+        kind=link.solar_forecast.kind,
+        forecast=link.solar_forecast.forecast,
+        received_at=link.received_at,
+        now=now,
+    )
 
 
 def _slot_start(now: datetime) -> datetime:
@@ -380,6 +392,7 @@ async def run_once(
     ev_hold_state: EvHoldState | None = None,
     fallback_active: bool = False,
     execution: ExecutionContext | None = None,
+    source: SolarSource,
 ) -> RunResult:
     """Compute the charge plan, log it, and apply it under site authority.
 
@@ -388,6 +401,10 @@ async def run_once(
     (no independent reread); a failed measurement blocks real writes at the
     charger gate. Without one (CLI/agent callers) the plan makes its own
     observation through the same shared path.
+
+    ``source`` states where the plan's solar comes from (#519): the daemon
+    builds it per plan from its last accepted snapshot; callers without
+    daemon state read the persisted kind.
 
     ``trusted_holds`` is the daemon's last trusted hold set, used by the
     reconcile when this plan's hold data is untrusted (#143 §3).
@@ -403,7 +420,7 @@ async def run_once(
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        run = await current_plan(settings, rest, soc=soc)
+        run = await current_plan(settings, rest, soc=soc, source=source)
         plan, inputs, load_source = run.plan, run.inputs, run.load_source
         log.info(
             "Charge plan:\n%s",
@@ -2170,6 +2187,11 @@ async def _run_paired(
                     # Recovery never compares against a baseline: the resident
                     # program is the fallback, not any earlier plan.
                     previous_plan = None if reapply or recovering else last_applied_plan
+                    # The plan's solar source (#519): the link's kind (the
+                    # persisted kind until the first accepted snapshot, then that
+                    # snapshot's, even if persisting it failed) plus its forecast
+                    # and received instant, at this tick's now.
+                    solar_source = solar_source_for(state.integration_link, now)
                     async with AsyncExitStack() as activation:
                         if activating:
                             config = next(d for d in settings.devices if d.type == "inverter")
@@ -2184,6 +2206,7 @@ async def _run_paired(
                             previous_plan=previous_plan,
                             trusted_holds=last_trusted_holds,
                             ev_hold_state=ev_hold_state,
+                            source=solar_source,
                             # A failed first tick after restart cannot delegate the
                             # observation to run_once and lift a restored block.
                             fallback_active=(

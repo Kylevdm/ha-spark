@@ -179,7 +179,9 @@ async def test_backtest_rates_seeded_store(
         window_start=time(23, 30),
     )
 
-    async def fake_current_plan(_settings: Settings, _rest: object) -> object:
+    async def fake_current_plan(
+        _settings: Settings, _rest: object, **_kw: object
+    ) -> object:
         return SimpleNamespace(schedule=schedule)
 
     monkeypatch.setattr(cli, "current_plan", fake_current_plan)

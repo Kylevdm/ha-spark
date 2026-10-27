@@ -7,7 +7,7 @@ or hardware write path. Unloading fences off replies from the previous discovery
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -22,6 +22,9 @@ from .channel import Outcome, PollResult, async_poll
 from .const import DOMAIN
 from .wire import Summary, build_snapshot
 
+if TYPE_CHECKING:
+    from .solcast_coordinator import SolcastCoordinator
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -32,6 +35,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         super().__init__(hass, _LOGGER, config_entry=entry, name="ha-spark",
                          update_interval=timedelta(seconds=30))
         self.entry = entry
+        self.solcast: SolcastCoordinator | None = None
         self.release_version = release_version
         self.api_version = max(wire.SUPPORTED_API_VERSIONS)
         self.addon_api_version: int | None = None
@@ -70,6 +74,17 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         """Fence off replies the moment unloading starts, before platforms go."""
         self._running = False
 
+    def _solar_forecast(self, api_version: int) -> dict[str, object] | None:
+        """The snapshot's forecast field; a failure to build it never blocks the heartbeat."""
+        if api_version < 2 or self.solcast is None:
+            return None
+        try:
+            return self.solcast.snapshot_forecast(dt_util.utcnow())
+        except Exception:  # noqa: BLE001 - its text may never reach HA's update logging
+            # Still configured: the add-on stays native and plans with zero solar.
+            return {"status": "stale", "fetched_at": None, "calls_used": 0,
+                    "calls_limit": self.solcast.calls_limit, "slots": []}
+
     async def _async_update_data(self) -> bool:
         if not self._running or self._ended:
             return self.connected
@@ -79,7 +94,8 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         try:
             snapshot = build_snapshot(site_id=data["site_id"],
                                       release_version=self.release_version,
-                                      sent_at=dt_util.utcnow(), api_version=api_version)
+                                      sent_at=dt_util.utcnow(), api_version=api_version,
+                                      solar_forecast=self._solar_forecast(api_version))
         except (KeyError, ValueError):
             # Raised text would carry the stored value; HA logs an update's exceptions.
             result = PollResult(Outcome.MALFORMED)
@@ -95,10 +111,17 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                     if not self._running or self._ended or self.entry.data is not data:
                         return self.connected
                     api_version = max(common)
-                    snapshot = {**snapshot, "api_version": api_version}
-                    result = await async_poll(
-                        session, url=url, token=data["auth_token"], snapshot=snapshot,
-                    )
+                    try:
+                        snapshot = build_snapshot(site_id=data["site_id"],
+                                                  release_version=self.release_version,
+                                                  sent_at=dt_util.utcnow(), api_version=api_version,
+                                                  solar_forecast=self._solar_forecast(api_version))
+                    except (KeyError, ValueError):
+                        result = PollResult(Outcome.MALFORMED)
+                    else:
+                        result = await async_poll(
+                            session, url=url, token=data["auth_token"], snapshot=snapshot,
+                        )
                     envelope = result.envelope or envelope
                 if result.outcome is Outcome.VERSION_REFUSED:
                     result = PollResult(Outcome.VERSION_SKEW, envelope=envelope)
@@ -130,6 +153,14 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             self.summary = summary
             self._clear_deadline()
             self._cancel_deadline = async_call_later(self.hass, 120, self._expire)
+            if (self.solcast is not None and summary is not None
+                    and summary.charge_window_start is not None):
+                # Even a hung quota store must not delay heartbeat completion.
+                self.entry.async_create_background_task(
+                    self.hass,
+                    self.solcast.async_learn_window_start(summary.charge_window_start),
+                    "Solcast charge window",
+                )
         elif outcome in {
             Outcome.UNAUTHORIZED, Outcome.SESSION_MISMATCH,
             Outcome.VERSION_SKEW, Outcome.INCOMPATIBLE,

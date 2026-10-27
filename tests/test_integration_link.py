@@ -18,7 +18,7 @@ from tests.api_helpers import owner_client
 
 NOW = datetime(2026, 10, 24, 12, tzinfo=UTC)
 KEYS = {"state", "site_id", "integration_release_version", "api_version", "sent_at",
-        "snapshot_age_s"}
+        "snapshot_age_s", "solar_source"}
 TOKEN = "TOKEN-CANARY-480"
 SESSION = "SESSION-CANARY-480"
 
@@ -41,6 +41,7 @@ def test_link_view(age: int | None, skew: bool, expected: str) -> None:
                            NOW - timedelta(seconds=age) if age is not None else None, skew)
     view = link_view(link, NOW)
     assert view == {
+        "solar_source": "entities",
         "state": expected,
         "site_id": snapshot().site_id if age is not None else None,
         "integration_release_version": "0.25.0" if age is not None else None,
@@ -138,7 +139,7 @@ def test_heartbeat_health_and_skew_recovery(tmp_path: Path) -> None:
         initial = client.get("/api/health").json()
         assert initial["integration_link"]["state"] == "never_connected"
         body = snapshot().model_dump(mode="json")
-        for version, status, expected in [(1, 200, "connected"), (2, 409, "version_skew"),
+        for version, status, expected in [(1, 200, "connected"), (3, 409, "version_skew"),
                                            (1, 200, "connected")]:
             body["api_version"] = version
             assert client.post("/integration/heartbeat", json=body, headers={

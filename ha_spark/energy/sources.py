@@ -42,6 +42,7 @@ from ha_spark.energy.octopus import (
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.energy.soc_monitor import observe_soc
 from ha_spark.energy.solar import distribute_solar
+from ha_spark.energy.solar_source import SolarSource
 from ha_spark.energy.tariff import (
     AxleTariffProvider,
     DynamicTariffProvider,
@@ -62,6 +63,68 @@ _EV_ACTIVE = {"charging", "delivering", "boosting", "diverting"}
 # States that stop the house battery discharging while the EV is charging.
 # Eco+ diversion is solar-led and intentionally does not trigger an EV hold.
 _EV_HOLD_ACTIVE = {"charging", "boosting", "delivering"}
+
+
+NATIVE_MAX_AGE = timedelta(hours=36)
+EXPORT_P90_MAX_AGE = timedelta(hours=6)
+EXPORT_SNAPSHOT_MAX_AGE = timedelta(seconds=90)
+
+
+def _native_export_p90(
+    source: SolarSource, starts: tuple[datetime, ...], tz: ZoneInfo,
+) -> tuple[float | None, ...] | None:
+    """Fresh raw P90 power for covered today slots, independent of sizing."""
+    forecast = source.forecast
+    instants = (source.now, source.received_at, forecast.fetched_at if forecast else None)
+    if any(instant is None or instant.utcoffset() is None for instant in instants):
+        return None  # A naive or missing instant can't prove freshness.
+    now = source.now.astimezone(UTC)
+    if (
+        source.kind != "native" or forecast is None
+        or forecast.status not in {"ok", "quota_exhausted"}
+        or source.received_at is None or forecast.fetched_at is None
+        or not timedelta(0) <= now - source.received_at.astimezone(UTC)
+        <= EXPORT_SNAPSHOT_MAX_AGE
+        or not timedelta(0) <= now - forecast.fetched_at.astimezone(UTC) <= EXPORT_P90_MAX_AGE
+    ):
+        return None
+    values = {start: p90 for start, _, _, p90 in forecast.slots}
+    today = now.astimezone(tz).date()
+    return tuple(
+        values.get(start.astimezone(UTC)) if start.astimezone(tz).date() == today else None
+        for start in starts
+    )
+
+
+def _native_solar(
+    source: SolarSource, starts: tuple[datetime, ...], tz: ZoneInfo, percentile: int,
+) -> tuple[dict[date, float], tuple[float, ...], tuple[bool, ...]]:
+    """Validate whole local dates and place full-slot kWh by UTC instant."""
+    forecast = source.forecast
+    values: dict[datetime, float] = {}
+    if (
+        forecast is not None and forecast.fetched_at is not None
+        and timedelta(0) <= source.now - forecast.fetched_at <= NATIVE_MAX_AGE
+    ):
+        index = {10: 0, 50: 1, 90: 2}[percentile]
+        values = {start: (p10, p50, p90)[index] * 0.5
+                  for start, p10, p50, p90 in forecast.slots}
+    totals: dict[date, float] = {}
+    today = source.now.astimezone(tz).date()
+    for day in (today, today + timedelta(days=1)):
+        start = datetime.combine(day, time(), tz).astimezone(UTC)
+        end = datetime.combine(day + timedelta(days=1), time(), tz).astimezone(UTC)
+        if day == today:
+            start = max(start, starts[0].astimezone(UTC))
+        required = tuple(start + timedelta(minutes=30 * i)
+                         for i in range(int((end - start).total_seconds() / 1800)))
+        if required and all(instant in values for instant in required):
+            totals[day] = sum(kwh for instant, kwh in values.items()
+                              if instant.astimezone(tz).date() == day)
+    known = tuple(start.astimezone(tz).date() in totals and start in values for start in starts)
+    solar = tuple(values[start] if exists else 0.0
+                  for start, exists in zip(starts, known, strict=True))
+    return totals, solar, known
 
 
 def _to_float(value: Any, default: float) -> float:
@@ -586,7 +649,11 @@ def ev_hold_status_from_read(state: EntityState | None, trusted: bool) -> bool |
 
 
 async def gather_inputs(
-    settings: Settings, rest: HomeAssistantRest, *, soc: SocMeasurement | None = None
+    settings: Settings,
+    rest: HomeAssistantRest,
+    *,
+    soc: SocMeasurement | None = None,
+    source: SolarSource,
 ) -> tuple[PlannerInputs, PlannerConfig, LoadForecast]:
     """Read live HA state and build (inputs, config, load forecast).
 
@@ -594,6 +661,12 @@ async def gather_inputs(
     it is used as-is, so the plan is sized from the exact observation the
     loop made (no independent reread). Otherwise one observation is made
     here through the same shared :func:`observe_soc` path.
+
+    ``source`` states where the plan's solar comes from (#519): the kind, the
+    parsed native forecast or its absence, the snapshot's received instant,
+    and the plan's ``now`` as the caller states it. With kind ``entities``
+    the forecast entities are read and the clock is kept exactly as before;
+    native sizing and horizon placement use the context's ``now``.
     """
 
     async def state(entity_id: str) -> EntityState | None:
@@ -609,8 +682,8 @@ async def gather_inputs(
     if not soc_measurement.ok:
         log.warning("SoC measurement failed integrity check: %s", soc_measurement.reason)
     voltage = await state(settings.battery_voltage_entity)
-    solar = await state(settings.solar_tomorrow_entity)
-    solar_today = await state(settings.solar_today_entity)
+    solar = await state(settings.solar_tomorrow_entity) if source.kind == "entities" else None
+    solar_today = await state(settings.solar_today_entity) if source.kind == "entities" else None
     ha_needed = await state(settings.ha_template_charge_needed_entity)
 
     voltage_v = _to_float(voltage.state if voltage else None, settings.battery_voltage_v)
@@ -721,7 +794,7 @@ async def gather_inputs(
     tz = load_timezone(settings.timezone)
     window_start = parse_time(settings.charge_window_start)
     window_end = parse_time(settings.charge_window_end)
-    now = datetime.now(tz)
+    now = datetime.now(tz) if source.kind == "entities" else source.now.astimezone(tz)
     geometry = compute_horizon_geometry(now, window_start, window_end, tz)
     served_day = geometry.served_day
     forecast = await predict_home_load(settings, lat=lat, lon=lon, target=served_day)
@@ -731,14 +804,23 @@ async def gather_inputs(
     # :func:`_solar_reading`, counts as zero that day.
     today_date = now.date()
     tomorrow_date = (now + timedelta(days=1)).date()
-    readings: dict[date, _SolarDayReading | None] = {
-        today_date: _solar_reading(solar_today, settings.solar_percentile),
-        tomorrow_date: _solar_reading(solar, settings.solar_percentile),
-    }
+    readings: dict[date, _SolarDayReading | None] = {}
+    if source.kind == "entities":
+        readings = {
+            today_date: _solar_reading(solar_today, settings.solar_percentile),
+            tomorrow_date: _solar_reading(solar, settings.solar_percentile),
+        }
     # The plan's day-total solar is the served day's: today's while its charge
     # window is still running, otherwise the day the next window serves.
     served_solar = readings.get(served_day)
     solar_kwh = served_solar.total_kwh if served_solar is not None else 0.0
+    native_slots: tuple[float, ...] = ()
+    native_known: tuple[bool, ...] = ()
+    if source.kind == "native":
+        totals, native_slots, native_known = _native_solar(
+            source, geometry.slot_starts, tz, settings.solar_percentile,
+        )
+        solar_kwh = totals.get(served_day, 0.0)
 
     unrated_dispatches = dispatches
     dispatches, dropped_dispatches = partition_dispatches(
@@ -769,8 +851,11 @@ async def gather_inputs(
             for start in geometry.slot_starts
             for local in (start.astimezone(tz),)
         )
-        solar_slots = _solar_slots(readings, geometry.slot_starts, tz)
-        solar_slots_known = _solar_slots_known(readings, geometry.slot_starts, tz)
+        if source.kind == "native":
+            solar_slots, solar_slots_known = native_slots, native_known
+        else:
+            solar_slots = _solar_slots(readings, geometry.slot_starts, tz)
+            solar_slots_known = _solar_slots_known(readings, geometry.slot_starts, tz)
     else:
         drain = pre_window_drain(forecast, now, window_start, window_end)
 
@@ -789,6 +874,7 @@ async def gather_inputs(
         load_slots=load_slots,
         solar_slots=solar_slots,
         solar_slots_known=solar_slots_known,
+        export_p90_kw=_native_export_p90(source, geometry.slot_starts, tz),
         horizon_start=horizon_start,
         geometry=geometry if load_slots is not None else None,
         now=now,

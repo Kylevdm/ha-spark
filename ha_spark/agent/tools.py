@@ -21,6 +21,7 @@ from ha_spark.energy.orchestrator import orchestrate
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.energy.report import format_plan
+from ha_spark.energy.solar_source import NATIVE_PREVIEW_NOTE, solar_source_from_store
 from ha_spark.energy.sources import gather_inputs
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.health import run_health
@@ -69,24 +70,30 @@ def _rest(settings: Settings) -> HomeAssistantRest:
 
 
 async def get_plan(settings: Settings) -> PlanResult:
+    source = solar_source_from_store(settings)
     async with _rest(settings) as rest:
-        run = await current_plan(settings, rest)
+        run = await current_plan(settings, rest, source=source)
     plan = run.plan
     entities = [
         {"entity_id": eid, "state": value, "attributes": attrs}
         for eid, value, attrs in plan_to_payload(plan, settings)
     ]
+    text = format_plan(plan, run.load_source, forecast_date=run.forecast.target_date, tz=run.tz)
+    if source.kind == "native":
+        text += "\n" + NATIVE_PREVIEW_NOTE
     return PlanResult(
-        plan=entities, generated_at=datetime.now(UTC).isoformat(),
-        text=format_plan(plan, run.load_source, forecast_date=run.forecast.target_date, tz=run.tz),
+        plan=entities, generated_at=datetime.now(UTC).isoformat(), text=text,
     )
 
 
 async def get_state(settings: Settings) -> StateResult:
+    source = solar_source_from_store(settings)
     async with _rest(settings) as rest:
-        inputs, _cfg, _forecast = await gather_inputs(settings, rest)
+        inputs, _cfg, _forecast = await gather_inputs(settings, rest, source=source)
     data = jsonable_encoder(dataclasses.asdict(inputs))
     data.pop("load_slots", None)  # large; available via get_forecast
+    if source.kind == "native":
+        data["solar_note"] = NATIVE_PREVIEW_NOTE
     devices = [
         {"id": d.id, "type": d.type, "driver": d.driver}
         for d in settings.devices
@@ -97,7 +104,7 @@ async def get_state(settings: Settings) -> StateResult:
 async def get_forecast(settings: Settings) -> ForecastResult:
     """The served day's load forecast: 48 day-order slot values plus its date."""
     async with _rest(settings) as rest:
-        run = await current_plan(settings, rest)
+        run = await current_plan(settings, rest, source=solar_source_from_store(settings))
     forecast = run.forecast
     return ForecastResult(
         load_kwh=run.plan.load_kwh,
