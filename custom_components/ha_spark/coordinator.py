@@ -74,6 +74,17 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         """Fence off replies the moment unloading starts, before platforms go."""
         self._running = False
 
+    def _solar_forecast(self, api_version: int) -> dict[str, object] | None:
+        """The snapshot's forecast field; a failure to build it never blocks the heartbeat."""
+        if api_version < 2 or self.solcast is None:
+            return None
+        try:
+            return self.solcast.snapshot_forecast(dt_util.utcnow())
+        except Exception:  # noqa: BLE001 - its text may never reach HA's update logging
+            # Still configured: the add-on stays native and plans with zero solar.
+            return {"status": "stale", "fetched_at": None, "calls_used": 0,
+                    "calls_limit": self.solcast.calls_limit, "slots": []}
+
     async def _async_update_data(self) -> bool:
         if not self._running or self._ended:
             return self.connected
@@ -84,8 +95,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             snapshot = build_snapshot(site_id=data["site_id"],
                                       release_version=self.release_version,
                                       sent_at=dt_util.utcnow(), api_version=api_version,
-                                      solar_forecast=(self.solcast.snapshot_forecast(dt_util.utcnow())
-                                                      if self.solcast else None))
+                                      solar_forecast=self._solar_forecast(api_version))
         except (KeyError, ValueError):
             # Raised text would carry the stored value; HA logs an update's exceptions.
             result = PollResult(Outcome.MALFORMED)
@@ -105,9 +115,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                         snapshot = build_snapshot(site_id=data["site_id"],
                                                   release_version=self.release_version,
                                                   sent_at=dt_util.utcnow(), api_version=api_version,
-                                                  solar_forecast=(
-                                                      self.solcast.snapshot_forecast(dt_util.utcnow())
-                                                      if self.solcast else None))
+                                                  solar_forecast=self._solar_forecast(api_version))
                     except (KeyError, ValueError):
                         result = PollResult(Outcome.MALFORMED)
                     else:

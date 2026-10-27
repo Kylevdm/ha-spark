@@ -1,6 +1,6 @@
 """Native forecast validation stays local to the heartbeat field."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -51,6 +51,9 @@ def test_native_forecast_configured_without_data():
     {"fetched_at": None},
     {"fetched_at": 123},
     {"slots": [[NOW.isoformat(), -1, 1, 2]]},
+    {"slots": [["2000-01-01T00:00:00+00:00", 1, 2, 3]]},
+    {"slots": [[(NOW - timedelta(hours=1)).isoformat(), 1, 2, 3]]},
+    {"slots": [[(NOW + timedelta(hours=1)).isoformat(), 1, 2, 3]]},
 ])
 def test_native_forecast_unusable(updates):
     result = parse_native_forecast(VALID | updates, received_at=NOW)

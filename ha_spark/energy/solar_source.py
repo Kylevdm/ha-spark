@@ -116,6 +116,13 @@ def parse_native_forecast(value: object, *, received_at: datetime) -> ParsedSola
             slots.append((start, p10, p50, p90))
         if slots and field.fetched_at is None:
             raise ValueError("missing_fetch")
+        # The integration sends from its current half-hour (contiguous, at most 120);
+        # allow one half-hour of clock and transit skew at the start.
+        current = received_at.astimezone(UTC).replace(
+            minute=received_at.astimezone(UTC).minute // 30 * 30, second=0, microsecond=0,
+        )
+        if slots and not current - timedelta(minutes=30) <= slots[0][0] <= current:
+            raise ValueError("outside_horizon")
         return ParsedSolarForecast("native", NativeForecast(
             field.status, field.fetched_at, field.calls_used, field.calls_limit, tuple(slots),
         ))

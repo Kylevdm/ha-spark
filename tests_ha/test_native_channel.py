@@ -141,3 +141,22 @@ def test_window_is_field_local(bad: Any) -> None:
     assert parsed.charge_window_start is None
     assert parsed.api_version == 2
     assert wire.parse_summary(fixture("plan_summary_v1")).charge_window_start is None
+
+
+async def test_forecast_build_failure_keeps_heartbeat_and_hides_text(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+    freezer: FrozenDateTimeFactory, caplog: pytest.LogCaptureFixture,
+) -> None:
+    freezer.move_to(NOW)
+    aioclient_mock.post(HEARTBEAT, json=summary())
+    entry = await setup_native(hass)
+    c = entry.runtime_data.solcast
+    assert c is not None
+    with patch.object(c, "snapshot_forecast", side_effect=RuntimeError("canary-build-text")):
+        await entry.runtime_data.async_refresh()
+    body = aioclient_mock.mock_calls[-1][2]["solar_forecast"]
+    assert body["status"] == "stale" and body["slots"] == []
+    assert entry.runtime_data.connected
+    assert "canary-build-text" not in caplog.text
+    await hass.async_block_till_done(wait_background_tasks=True)
+    await c.async_shutdown()
