@@ -13,7 +13,7 @@ so neither half can move a contract version alone.
 
 import math
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from typing import Final
 from uuid import UUID
 
@@ -24,16 +24,18 @@ from ha_spark.api.plan_status import PlanStatus, resolve
 from ha_spark.authority import AuthorityState, HoldRecord
 from ha_spark.config import Settings
 from ha_spark.energy.forecast import load_timezone
+from ha_spark.energy.horizon import compute_horizon_geometry
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.soc_integrity import SocStatus
+from ha_spark.energy.solar_source import ParsedSolarForecast
 from ha_spark.energy.v2l import V2LSession, delivered_fraction, savings
 
-API_VERSION: Final = 1
-SUPPORTED_API_VERSIONS: Final = frozenset({1})
+API_VERSION: Final = 2
+SUPPORTED_API_VERSIONS: Final = frozenset({1, 2})
 
 
 class SiteSnapshot(BaseModel):
-    """Validated v1 identity only; no authority or planning input is consumed."""
+    """Strict identity and a raw, independently validated native forecast field."""
 
     model_config = ConfigDict(extra="ignore", frozen=True)
 
@@ -44,6 +46,7 @@ class SiteSnapshot(BaseModel):
     )
     site_id: str = Field(strict=True)
     sent_at: AwareDatetime
+    solar_forecast: object = None
 
     @field_validator("site_id")
     @classmethod
@@ -75,6 +78,7 @@ class IntegrationLink:
     snapshot: SiteSnapshot | None
     received_at: datetime | None
     skew: bool
+    solar_forecast: ParsedSolarForecast = ParsedSolarForecast("entities")
 
 
 def link_view(link: IntegrationLink, now: datetime) -> dict[str, object]:
@@ -121,7 +125,7 @@ def plan_summary(
     settings: Settings | None = None, authority: AuthorityInputs | None = None,
 ) -> dict[str, object]:
     """Project the envelope and allowlisted display numbers for the request's api_version."""
-    return {
+    result: dict[str, object] = {
         "api_version": api_version,
         "release_version": __version__,
         "session_id": session_id,
@@ -136,6 +140,18 @@ def plan_summary(
         "v2l": v2l_block(session, settings),
         "authority": authority_block(authority or AuthorityInputs(None, False, False)),
     }
+    if api_version >= 2:
+        start = None
+        if settings is not None:
+            geometry = compute_horizon_geometry(
+                built_at, time.fromisoformat(settings.charge_window_start),
+                time.fromisoformat(settings.charge_window_end),
+                load_timezone(settings.timezone),
+            )
+            start = (geometry.window_start if geometry.window_start > built_at
+                     else geometry.horizon_end).isoformat()
+        result["charge_window_start"] = start
+    return result
 
 
 _RAW_STATE_STATUSES: Final = {

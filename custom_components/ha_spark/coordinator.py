@@ -74,6 +74,17 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         """Fence off replies the moment unloading starts, before platforms go."""
         self._running = False
 
+    def _solar_forecast(self, api_version: int) -> dict[str, object] | None:
+        """The snapshot's forecast field; a failure to build it never blocks the heartbeat."""
+        if api_version < 2 or self.solcast is None:
+            return None
+        try:
+            return self.solcast.snapshot_forecast(dt_util.utcnow())
+        except Exception:  # noqa: BLE001 - its text may never reach HA's update logging
+            # Still configured: the add-on stays native and plans with zero solar.
+            return {"status": "stale", "fetched_at": None, "calls_used": 0,
+                    "calls_limit": self.solcast.calls_limit, "slots": []}
+
     async def _async_update_data(self) -> bool:
         if not self._running or self._ended:
             return self.connected
@@ -83,7 +94,8 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         try:
             snapshot = build_snapshot(site_id=data["site_id"],
                                       release_version=self.release_version,
-                                      sent_at=dt_util.utcnow(), api_version=api_version)
+                                      sent_at=dt_util.utcnow(), api_version=api_version,
+                                      solar_forecast=self._solar_forecast(api_version))
         except (KeyError, ValueError):
             # Raised text would carry the stored value; HA logs an update's exceptions.
             result = PollResult(Outcome.MALFORMED)
@@ -102,7 +114,8 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                     try:
                         snapshot = build_snapshot(site_id=data["site_id"],
                                                   release_version=self.release_version,
-                                                  sent_at=dt_util.utcnow(), api_version=api_version)
+                                                  sent_at=dt_util.utcnow(), api_version=api_version,
+                                                  solar_forecast=self._solar_forecast(api_version))
                     except (KeyError, ValueError):
                         result = PollResult(Outcome.MALFORMED)
                     else:
@@ -140,6 +153,14 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             self.summary = summary
             self._clear_deadline()
             self._cancel_deadline = async_call_later(self.hass, 120, self._expire)
+            if (self.solcast is not None and summary is not None
+                    and summary.charge_window_start is not None):
+                # Even a hung quota store must not delay heartbeat completion.
+                self.entry.async_create_background_task(
+                    self.hass,
+                    self.solcast.async_learn_window_start(summary.charge_window_start),
+                    "Solcast charge window",
+                )
         elif outcome in {
             Outcome.UNAUTHORIZED, Outcome.SESSION_MISMATCH,
             Outcome.VERSION_SKEW, Outcome.INCOMPATIBLE,

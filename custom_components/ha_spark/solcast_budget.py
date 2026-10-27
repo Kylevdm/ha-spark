@@ -59,6 +59,19 @@ class SolcastBudget:
         """A copy for scheduling; mutations must use the locked store methods."""
         return self._state.model_copy() if self._state else None
 
+    async def async_set_window_start(
+        self, value: time, *, active: Callable[[], bool] = lambda: True,
+    ) -> bool:
+        """Persist a learned household-clock time; report only a durable change."""
+        async with self._lock:
+            if not await self._load(active):
+                return False
+            assert self._state is not None
+            if self._state.window_start == value:
+                return False
+            self._state.window_start = value
+            return await self._save(active)
+
     async def async_finish_reserved(self, *, active: Callable[[], bool] = lambda: True) -> bool:
         """Release today's reservation after its poll has been attempted."""
         async with self._lock:

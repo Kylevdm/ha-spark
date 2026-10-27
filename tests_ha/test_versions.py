@@ -20,7 +20,20 @@ from yarl import URL as YarlURL
 
 from custom_components.ha_spark import coordinator, wire
 from custom_components.ha_spark.const import DOMAIN
-from tests_ha.test_polling import TOKEN, URL, fixture, setup, state_value, summary
+from tests_ha.test_polling import TOKEN, URL, fixture, setup, state_value
+
+
+def summary() -> dict[str, Any]:
+    """Old add-on replies remain usable by a v2 integration."""
+    from homeassistant.util import dt as dt_util
+
+    return fixture("plan_summary_v1") | {"loop_tick": dt_util.utcnow().isoformat()}
+
+
+@pytest.fixture(autouse=True)
+def old_integration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the original v1 skew cases; negotiation tests override this set."""
+    monkeypatch.setattr(wire, "SUPPORTED_API_VERSIONS", frozenset({1}))
 
 
 @pytest.mark.parametrize("supported", [{1}, {1, 2}])
@@ -62,6 +75,7 @@ async def test_downgrade_rebuilds_version_specific_snapshot(
 
     def snapshot_for_version(
         *, site_id: str, release_version: str, sent_at: datetime, api_version: int,
+        solar_forecast: object = None,
     ) -> dict[str, object]:
         body = wire.build_snapshot(site_id=site_id, release_version=release_version,
                                    sent_at=sent_at, api_version=api_version)
@@ -100,6 +114,7 @@ async def test_downgrade_build_failure_is_malformed(
 
     def snapshot_for_version(
         *, site_id: str, release_version: str, sent_at: datetime, api_version: int,
+        solar_forecast: object = None,
     ) -> dict[str, object]:
         if api_version == 1:
             raise error(TOKEN)
