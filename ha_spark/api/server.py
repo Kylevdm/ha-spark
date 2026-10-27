@@ -776,7 +776,8 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
             authority = AuthorityInputs(loaded.state, loaded.status == "known", False)
         return JSONResponse(
             plan_summary(
-                session_id=integration.session_id, built_at=now, loop_tick=state.loop_tick,
+                api_version=version, session_id=integration.session_id,
+                built_at=now, loop_tick=state.loop_tick,
                 plan=state.plan, plan_at=state.plan_at, soc_observation_ok=state.soc_observation_ok,
                 session=(
                     v2l.load_session(state.settings) if state.settings.v2l_power_entity else None

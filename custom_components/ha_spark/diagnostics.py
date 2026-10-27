@@ -20,7 +20,9 @@ async def async_get_config_entry_diagnostics(
 ) -> dict[str, Any]:
     """Return the last accepted summary and connection outcomes without credentials."""
     # The session id is the channel's comparison value; it never leaves the entry.
-    redacted = async_redact_data(dict(entry.data), {"auth_token", "host", "session_id"})
+    redacted = async_redact_data(dict(entry.data), {
+        "auth_token", "host", "session_id", "solcast_api_key", "solcast_resource_ids",
+    })
     # Home Assistant deletes runtime_data on unload but still serves diagnostics.
     coordinator = getattr(entry, "runtime_data", None)
     if coordinator is None:
