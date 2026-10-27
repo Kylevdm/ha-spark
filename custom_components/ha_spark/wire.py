@@ -139,9 +139,9 @@ class Summary:
 
 
 def build_snapshot(
-    *, site_id: str, release_version: str, sent_at: datetime, api_version: int = API_VERSION,
+    *, site_id: str, release_version: str, sent_at: datetime, api_version: int,
 ) -> dict[str, object]:
-    """Build the identity-only snapshot for api_version 1."""
+    """Build the identity-only snapshot for the negotiated api_version."""
     if str(UUID(site_id)) != site_id or sent_at.utcoffset() is None:
         raise ValueError("Invalid snapshot identity or time")
     return {
