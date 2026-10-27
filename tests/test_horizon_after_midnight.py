@@ -25,6 +25,7 @@ from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.sources import build_config, build_schedule
 from ha_spark.ha.rest import HomeAssistantRest
+from tests.solar_source_helpers import entities_source
 
 TZ = ZoneInfo("Europe/London")
 SUNDAY = date(2026, 1, 4)
@@ -130,7 +131,9 @@ async def _gather(
     )
     soc = SocMeasurement(status=SocStatus.OK, observed_at=now, value=50.0)
     async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
-        inputs, _cfg, forecast_out = await sources.gather_inputs(settings, rest, soc=soc)
+        inputs, _cfg, forecast_out = await sources.gather_inputs(
+            settings, rest, soc=soc, source=entities_source(settings)
+        )
     return inputs, forecast_out, observed
 
 

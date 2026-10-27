@@ -53,7 +53,7 @@ def _plan(**kw: object) -> ChargePlan:
 
 
 def _patch_plan(monkeypatch: pytest.MonkeyPatch, plan: ChargePlan) -> None:
-    async def fake_current_plan(settings: Settings, rest: Any) -> PlanRun:
+    async def fake_current_plan(settings: Settings, rest: Any, **_kw: Any) -> PlanRun:
         return PlanRun(
             plan=plan, inputs=object(), cfg=object(), schedule=object(),  # type: ignore[arg-type]
             load_source="test",
@@ -237,7 +237,7 @@ async def test_answer_context_query_empty(tmp_path: Any) -> None:
 async def test_solar_query_names_served_day(monkeypatch: pytest.MonkeyPatch) -> None:
     from datetime import date
 
-    async def fake_current_plan(settings: Settings, rest: Any) -> PlanRun:
+    async def fake_current_plan(settings: Settings, rest: Any, **_kw: Any) -> PlanRun:
         return PlanRun(
             plan=_plan(), inputs=object(), cfg=object(), schedule=object(),  # type: ignore[arg-type]
             load_source="test",

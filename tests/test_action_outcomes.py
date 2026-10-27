@@ -64,6 +64,7 @@ def test_fallback_confirmation_does_not_trust_typed_line_prefix(
 async def test_real_write_baseline_uses_outcomes(monkeypatch, outcome: ActionOutcome) -> None:
     from ha_spark.energy.scheduler import run_once
     from tests.authority_helpers import legacy_settings as Settings
+    from tests.solar_source_helpers import entities_source
     from tests.test_scheduler import _AmpsDevice, _patch_run_once_io, _plan_at
 
     settings = Settings(authority_mode="optimise")
@@ -71,7 +72,7 @@ async def test_real_write_baseline_uses_outcomes(monkeypatch, outcome: ActionOut
     device = _AmpsDevice({31.0: 38.0}, settings.battery_voltage_v)
     device.results = [[ActionLine("[APPLIED] presentation only", outcome)]]
     _patch_run_once_io(monkeypatch, plan, device)
-    result = await run_once(settings, soc=plan.soc)
+    result = await run_once(settings, soc=plan.soc, source=entities_source(settings))
     verified = outcome in (ActionOutcome.VERIFIED, ActionOutcome.UNCHANGED_VERIFIED)
     assert result.applied_plan is (plan if verified else None)
 
@@ -128,13 +129,14 @@ async def test_production_solis_paths_emit_typed_lines(tmp_path, monkeypatch, mo
 async def test_real_write_baseline_rejects_plain_apply_results(monkeypatch) -> None:
     from ha_spark.energy.scheduler import run_once
     from tests.authority_helpers import legacy_settings as Settings
+    from tests.solar_source_helpers import entities_source
     from tests.test_scheduler import _AmpsDevice, _patch_run_once_io, _plan_at
 
     settings = Settings(authority_mode="optimise")
     plan = _plan_at(31.0)
     device = _AmpsDevice({31.0: 38.0}, settings.battery_voltage_v)
     _patch_run_once_io(monkeypatch, plan, device)
-    result = await run_once(settings, soc=plan.soc)
+    result = await run_once(settings, soc=plan.soc, source=entities_source(settings))
     assert result.applied_plan is None
 
 

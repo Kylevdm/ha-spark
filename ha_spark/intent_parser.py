@@ -19,6 +19,7 @@ from ha_spark.energy.context import ContextEntry, ContextStore
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.report import format_plan
+from ha_spark.energy.solar_source import solar_source_from_store
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -89,7 +90,7 @@ async def parse_offline(
 
     # Everything else needs the computed plan.
     try:
-        run = await current_plan(settings, rest)
+        run = await current_plan(settings, rest, source=solar_source_from_store(settings))
         plan, load_source = run.plan, run.load_source
     except Exception as exc:  # noqa: BLE001 - the fallback path must never crash
         log.warning("Offline parser could not compute the plan: %r", exc)

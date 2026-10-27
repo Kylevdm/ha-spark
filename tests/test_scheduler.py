@@ -43,10 +43,12 @@ from ha_spark.energy.scheduler import (
 )
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor
+from ha_spark.energy.solar_source import SolarSource
 from ha_spark.ha.rest import HomeAssistantRest
 from tests.authority_helpers import legacy_settings as Settings
 from tests.authority_helpers import run_daemon as run_forever
 from tests.authority_helpers import seed_authority
+from tests.solar_source_helpers import entities_source
 
 
 @respx.mock
@@ -147,7 +149,9 @@ async def test_live_current_horizon_ticks_skip_writes_then_absorb_new_inputs(
             raw_state=str(value), age_s=0.0, max_age_s=600.0,
         )
 
-    baseline = await run_once(settings, soc=checked_soc(initial_soc))
+    baseline = await run_once(
+        settings, soc=checked_soc(initial_soc), source=entities_source(settings)
+    )
     assert baseline.applied_plan is baseline.plan
     if initial_soc == 45.0:
         assert baseline.plan.required_kwh > 0
@@ -163,7 +167,10 @@ async def test_live_current_horizon_ticks_skip_writes_then_absorb_new_inputs(
     for slot in (36, 37):
         observed_soc -= profile[slot] / settings.battery_capacity_kwh * 100
         now += timedelta(minutes=30)
-        result = await run_once(settings, soc=checked_soc(observed_soc), previous_plan=previous)
+        result = await run_once(
+            settings, soc=checked_soc(observed_soc), previous_plan=previous,
+            source=entities_source(settings),
+        )
         assert result.plan.target_soc == pytest.approx(target)
         assert result.plan.charge_intent is not None
         assert _planned_w(settings, result.plan.charge_intent) == rate
@@ -189,7 +196,10 @@ async def test_live_current_horizon_ticks_skip_writes_then_absorb_new_inputs(
         })
     observed_soc -= profile[38] / settings.battery_capacity_kwh * 100
     now += timedelta(minutes=30)
-    changed = await run_once(settings, soc=checked_soc(observed_soc), previous_plan=previous)
+    changed = await run_once(
+        settings, soc=checked_soc(observed_soc), previous_plan=previous,
+        source=entities_source(settings),
+    )
     assert changed.plan.charge_intent is not None
     if new_input == "dispatch":
         assert changed.plan.charge_intent.holds == ((
@@ -204,7 +214,8 @@ async def test_live_current_horizon_ticks_skip_writes_then_absorb_new_inputs(
     if new_input == "event":
         # Once armed, even an identical replan must still take apply (#148).
         repeated = await run_once(
-            settings, soc=checked_soc(observed_soc), previous_plan=changed.applied_plan
+            settings, soc=checked_soc(observed_soc), previous_plan=changed.applied_plan,
+            source=entities_source(settings),
         )
         assert repeated.plan.charge_intent == changed.plan.charge_intent
         assert repeated.apply_lines
@@ -394,7 +405,9 @@ async def test_run_once_reapplies_an_unchanged_target_when_the_amps_move(
     previous, current = _plan_at(31.0), _plan_at(current_soc)
     _patch_run_once_io(monkeypatch, current, device)
 
-    await run_once(settings, soc=current.soc, previous_plan=previous)
+    await run_once(
+        settings, soc=current.soc, previous_plan=previous, source=entities_source(settings)
+    )
 
     assert device.applied == ([current.charge_intent] if applies else [])
 
@@ -409,7 +422,9 @@ async def test_run_once_ignores_amps_sized_from_an_untrusted_soc(
     device = _AmpsDevice({31.0: 38.0, 0.0: 62.5}, settings.battery_voltage_v)
     _patch_run_once_io(monkeypatch, current, device)
 
-    await run_once(settings, soc=failed, previous_plan=_plan_at(31.0))
+    await run_once(
+        settings, soc=failed, previous_plan=_plan_at(31.0), source=entities_source(settings)
+    )
 
     assert device.applied == []
 
@@ -424,7 +439,8 @@ async def test_run_once_keeps_the_fallback_program_when_monitor_says_active(
 
     caplog.set_level("INFO")
     result = await run_once(
-        settings, soc=current.soc, previous_plan=_plan_at(30.0), fallback_active=True
+        settings, soc=current.soc, previous_plan=_plan_at(30.0), fallback_active=True,
+        source=entities_source(settings),
     )
 
     assert device.applied == []
@@ -451,7 +467,9 @@ async def test_run_once_reports_whether_the_apply_left_the_plan_resident(
     current = _plan_at(31.0)
     _patch_run_once_io(monkeypatch, current, device)
 
-    result = await run_once(settings, soc=current.soc, previous_plan=None)
+    result = await run_once(
+        settings, soc=current.soc, previous_plan=None, source=entities_source(settings)
+    )
 
     assert result.plan is current
     assert result.applied_plan is (current if resident else None)
@@ -566,7 +584,7 @@ async def test_run_once_computes_and_applies_plan(
     )
 
     with caplog.at_level("INFO"):
-        plan = (await run_once(s)).plan
+        plan = (await run_once(s, source=entities_source(s))).plan
 
     assert plan.charge_intent.target_soc_pct >= 0
     assert any("Charge plan" in r.message for r in caplog.records)
@@ -624,7 +642,7 @@ async def test_run_once_records_the_served_day_forecast_in_day_order(
         timezone="Europe/London",
         load_model="median",
     )
-    plan = (await run_once(s)).plan
+    plan = (await run_once(s, source=entities_source(s))).plan
 
     assert observed == [date(2026, 1, 12)]  # Monday, not Tuesday (#200)
     async with ForecastLedger(s.db_path) as ledger:
@@ -662,7 +680,7 @@ async def test_run_once_records_paired_forecast_horizon(
         ha_url="http://ha.test", ha_token="t", authority_mode="observe",
         db_path=str(tmp_path / "paired.db"), load_model="median",
     )
-    await run_once(settings)
+    await run_once(settings, source=entities_source(settings))
     async with ForecastLedger(settings.db_path) as ledger:
         rows = await ledger.forecast_history(date(2000, 1, 1))
     assert len(rows) == 1
@@ -716,7 +734,10 @@ async def test_run_once_skips_unchanged_command_after_fresh_soc(
     monkeypatch.setattr(scheduler, "_record_forecast", noop)
     monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
 
-    result = await run_once(Settings(), soc=current.soc, previous_plan=previous)
+    result = await run_once(
+        Settings(), soc=current.soc, previous_plan=previous,
+        source=entities_source(Settings()),
+    )
 
     assert result.plan is current
     assert result.applied_plan is previous
@@ -764,7 +785,9 @@ async def test_run_once_retries_after_untrusted_previous_plan(
     monkeypatch.setattr(scheduler, "_record_forecast", noop)
     monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
 
-    await run_once(Settings(), soc=current.soc, previous_plan=previous)
+    await run_once(
+        Settings(), soc=current.soc, previous_plan=previous, source=entities_source(Settings())
+    )
 
     assert applied == [current.charge_intent]
     assert reconciled == [current.charge_intent]
@@ -832,7 +855,7 @@ async def test_dynamic_plan_parity_between_scheduler_and_agent_plan(
         tariff_provider="dynamic", dynamic_rates_entity="sensor.dynamic_rates",
     )
 
-    plan = (await run_once(s)).plan
+    plan = (await run_once(s, source=entities_source(s))).plan
     # The dynamic schedule actually flowed through the daemon's plan.
     assert plan.model == "slots"
     # The live horizon runs from the current half-hour, so its length follows the clock.
@@ -862,6 +885,7 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
         fallback_active: bool = False,
+        source: SolarSource,
     ) -> scheduler.RunResult:
         calls.append("run")
         if len(calls) == 1:
@@ -1019,6 +1043,7 @@ async def test_run_forever_publishes_plan_to_api_state(
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
         fallback_active: bool = False,
+        source: SolarSource,
     ) -> scheduler.RunResult:
         plan = _plan()
         return scheduler.RunResult(plan, plan)
@@ -1120,6 +1145,7 @@ async def test_run_forever_guard_ticks_only_inside_window(
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
         fallback_active: bool = False,
+        source: SolarSource,
     ) -> scheduler.RunResult:
         plan = _plan()
         return scheduler.RunResult(plan, plan)
@@ -1172,6 +1198,7 @@ async def test_run_forever_no_guard_when_entity_unset(
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
         fallback_active: bool = False,
+        source: SolarSource,
     ) -> scheduler.RunResult:
         plan = _plan()
         return scheduler.RunResult(plan, plan)
@@ -1211,6 +1238,7 @@ async def test_run_forever_no_guard_when_charger_has_no_live_rate(
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
         fallback_active: bool = False,
+        source: SolarSource,
     ) -> scheduler.RunResult:
         plan = _plan()
         return scheduler.RunResult(plan, plan)
@@ -1252,6 +1280,7 @@ async def test_run_forever_guard_failure_does_not_kill_loop(
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
         fallback_active: bool = False,
+        source: SolarSource,
     ) -> scheduler.RunResult:
         plan = _plan()
         return scheduler.RunResult(plan, plan)
@@ -1434,6 +1463,7 @@ async def test_run_forever_samples_signals_every_interval(
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
         fallback_active: bool = False,
+        source: SolarSource,
     ) -> scheduler.RunResult:
         plan = _plan()
         return scheduler.RunResult(plan, plan)
@@ -1542,7 +1572,7 @@ async def test_run_once_triggers_derived_rerive_when_configured(
         derive_grid_import_entity="sensor.grid_import",
     )
     with caplog.at_level("INFO"):
-        await run_once(s)
+        await run_once(s, source=entities_source(s))
     assert len(rerive_calls) == 1
     assert "10 rows upserted" in caplog.text
 
@@ -1572,7 +1602,7 @@ async def test_run_once_skips_derived_rerive_without_grid_import(
         ha_url="http://ha.test", ha_token="t", authority_mode="observe",
         db_path=str(tmp_path / "ledger.db"),
     )
-    await run_once(s)
+    await run_once(s, source=entities_source(s))
     assert rerive_calls == []
 
 
@@ -1601,7 +1631,7 @@ async def test_run_once_rerive_failure_does_not_block_plan(
         derive_grid_import_entity="sensor.grid_import",
     )
     with caplog.at_level("INFO"):
-        await run_once(s)
+        await run_once(s, source=entities_source(s))
     assert any("Derived base-load rerive failed" in r.message for r in caplog.records)
     # The plan still ran successfully.
     assert any("Charge plan" in r.message for r in caplog.records)
@@ -1719,7 +1749,8 @@ def _patch_monitor_loop(
             trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
             ev_hold_state: scheduler.EvHoldState | None = None,
             fallback_active: bool = False,
-        ) -> scheduler.RunResult:
+            source: SolarSource,
+    ) -> scheduler.RunResult:
             run_once_socs.append(soc)
             if fallback_states is not None:
                 fallback_states.append(fallback_active)
@@ -1734,7 +1765,8 @@ def _patch_monitor_loop(
             trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
             ev_hold_state: scheduler.EvHoldState | None = None,
             fallback_active: bool = False,
-        ) -> scheduler.RunResult:
+            source: SolarSource,
+    ) -> scheduler.RunResult:
             if fallback_states is not None:
                 fallback_states.append(fallback_active)
             plan = _plan()
@@ -2646,7 +2678,7 @@ async def test_run_once_failed_soc_leaves_solis_resident_program_untouched(
     )
     failed = _failed_soc()
     with caplog.at_level("WARNING"):
-        plan = (await run_once(s, soc=failed)).plan
+        plan = (await run_once(s, soc=failed, source=entities_source(s))).plan
 
     # The plan carries the exact tick measurement (no independent reread).
     assert plan.soc is failed
@@ -2675,7 +2707,7 @@ async def test_run_once_failed_soc_blocks_alphaess_programming(
         inverter="alphaess", alphaess_serial="SN1",
     )
     with caplog.at_level("INFO"):
-        plan = (await run_once(s, soc=_failed_soc())).plan
+        plan = (await run_once(s, soc=_failed_soc(), source=entities_source(s))).plan
 
     assert not plan.soc.ok
     assert any("[BLOCKED]" in r.message and "not charge to" in r.message
@@ -2703,6 +2735,7 @@ async def test_loop_blocked_plan_rate_never_becomes_guard_target(
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
         fallback_active: bool = False,
+        source: SolarSource,
     ) -> scheduler.RunResult:
         # A plan computed from the tick's failed measurement: blocked at the
         # charger gate, but still a plan object (existence != applied).
@@ -3121,8 +3154,10 @@ async def test_run_once_reconciles_an_untrusted_plan_against_the_trusted_holds(
     monkeypatch.setattr(scheduler, "_record_forecast", noop)
     monkeypatch.setattr(scheduler, "_run_derived_rerive", noop)
 
-    await run_once(Settings(), soc=current.soc, trusted_holds=(_HOLD,))
-    await run_once(Settings(), soc=current.soc)
+    await run_once(
+        Settings(), soc=current.soc, trusted_holds=(_HOLD,), source=entities_source(Settings())
+    )
+    await run_once(Settings(), soc=current.soc, source=entities_source(Settings()))
 
     # With a trusted set it substitutes; without one it does not reconcile at all.
     assert [intent.holds for intent in reconciled] == [(_HOLD,)]
@@ -3979,6 +4014,7 @@ async def test_run_once_applies_the_ev_hold_on_a_replan_tick(
         settings,
         previous_plan=plan,
         ev_hold_state=scheduler.EvHoldState(),
+        source=entities_source(settings),
     )
 
     assert switch_write.called is True
@@ -4058,6 +4094,7 @@ async def test_run_once_records_the_plan_run_and_keeps_the_ev_hold_view_only(
         settings,
         previous_plan=plan,
         ev_hold_state=scheduler.EvHoldState(),
+        source=entities_source(settings),
     )
 
     # The observation reached the device through the local copy of the intent...
@@ -4879,6 +4916,7 @@ async def test_invalid_soc_never_blocks_the_ev_hold_switch_write(
     result = await run_once(
         _ev_hold_settings(authority_mode=mode),
         ev_hold_state=scheduler.EvHoldState(),
+        source=entities_source(_ev_hold_settings(authority_mode=mode)),
     )
 
     assert any("[BLOCKED]" in line and "not charging to" in line for line in result.action_lines)
@@ -5717,6 +5755,7 @@ async def test_run_forever_syncs_the_inverter_clock_at_a_clock_change_when_opted
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
         fallback_active: bool = False,
+        source: SolarSource,
     ) -> scheduler.RunResult:
         plan = _plan()
         return scheduler.RunResult(plan, plan)
@@ -5856,6 +5895,7 @@ def _patch_recovery_loop(
         trusted_holds: tuple[tuple[datetime, datetime], ...] | None = None,
         ev_hold_state: scheduler.EvHoldState | None = None,
         fallback_active: bool = False,
+        source: SolarSource,
     ) -> scheduler.RunResult:
         runs.append({"soc": soc, "previous": previous_plan, "held": fallback_active})
         plan = _plan(replace(_INTENT, soc=soc or _INTENT.soc))

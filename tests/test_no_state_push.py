@@ -12,6 +12,7 @@ from ha_spark.energy import scheduler
 from ha_spark.energy.models import LoadForecast
 from ha_spark.energy.v2l import event_id, load_topup
 from tests.authority_helpers import run_daemon
+from tests.solar_source_helpers import entities_source
 from tests.test_scheduler import _AmpsDevice, _patch_recovery_loop
 from tests.test_v2l import _EVENT, _overnight_plan, _topup_settings
 
@@ -54,7 +55,9 @@ async def test_plan_run_never_pushes_states_and_still_requests_v2l_topup(
         return_value=httpx.Response(200, json=[])
     )
 
-    result = await scheduler.run_once(settings, soc=plan.soc)
+    result = await scheduler.run_once(
+        settings, soc=plan.soc, source=entities_source(settings)
+    )
 
     assert result.plan == plan
     assert device.applied

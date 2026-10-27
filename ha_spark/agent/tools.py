@@ -21,6 +21,7 @@ from ha_spark.energy.orchestrator import orchestrate
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.energy.report import format_plan
+from ha_spark.energy.solar_source import solar_source_from_store
 from ha_spark.energy.sources import gather_inputs
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.health import run_health
@@ -70,7 +71,7 @@ def _rest(settings: Settings) -> HomeAssistantRest:
 
 async def get_plan(settings: Settings) -> PlanResult:
     async with _rest(settings) as rest:
-        run = await current_plan(settings, rest)
+        run = await current_plan(settings, rest, source=solar_source_from_store(settings))
     plan = run.plan
     entities = [
         {"entity_id": eid, "state": value, "attributes": attrs}
@@ -84,7 +85,9 @@ async def get_plan(settings: Settings) -> PlanResult:
 
 async def get_state(settings: Settings) -> StateResult:
     async with _rest(settings) as rest:
-        inputs, _cfg, _forecast = await gather_inputs(settings, rest)
+        inputs, _cfg, _forecast = await gather_inputs(
+            settings, rest, source=solar_source_from_store(settings)
+        )
     data = jsonable_encoder(dataclasses.asdict(inputs))
     data.pop("load_slots", None)  # large; available via get_forecast
     devices = [
@@ -97,7 +100,7 @@ async def get_state(settings: Settings) -> StateResult:
 async def get_forecast(settings: Settings) -> ForecastResult:
     """The served day's load forecast: 48 day-order slot values plus its date."""
     async with _rest(settings) as rest:
-        run = await current_plan(settings, rest)
+        run = await current_plan(settings, rest, source=solar_source_from_store(settings))
     forecast = run.forecast
     return ForecastResult(
         load_kwh=run.plan.load_kwh,
