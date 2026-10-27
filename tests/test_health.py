@@ -618,6 +618,14 @@ async def test_check_ha_timezone_warns_when_unreadable() -> None:
 _READ_AT = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=5)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_read_at() -> None:
+    # Per test, not once at import: in a long suite run the reading would
+    # otherwise age past the clock check's 60 s staleness limit.
+    global _READ_AT
+    _READ_AT = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=5)
+
+
 def _clock_state(value: str, age: timedelta = timedelta(seconds=5)) -> httpx.Response:
     return httpx.Response(
         200,

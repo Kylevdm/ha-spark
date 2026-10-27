@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 
-from ha_spark.energy.models import _align
+from ha_spark.energy.models import align
 from ha_spark.energy.soc_integrity import SocStatus
 
 if TYPE_CHECKING:
@@ -127,7 +127,7 @@ def _slots(
             ) < min(end, geometry.window_end.astimezone(UTC)):
                 actions.append("charge")
         if any(
-            _align(a, clock).astimezone(UTC) < end and lo < _align(b, clock).astimezone(UTC)
+            align(a, clock).astimezone(UTC) < end and lo < align(b, clock).astimezone(UTC)
             for a, b in plan.charge_intent.holds
         ):
             actions.append("hold")
@@ -172,7 +172,7 @@ def _lines(plan: ChargePlan, cfg: PlannerConfig, inputs: PlannerInputs) -> tuple
     def instant(at: datetime | None) -> datetime | None:
         if at is None or clock is None or clock.tzinfo is None:
             return None
-        return _align(at, clock).astimezone(UTC)
+        return align(at, clock).astimezone(UTC)
 
     now = instant(clock)
 

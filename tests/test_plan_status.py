@@ -82,12 +82,33 @@ def test_dst_window(day, start, end, instant, action):
     assert resolve(plan, (), datetime.fromisoformat(f"{day}T{instant}+00:00"), TZ).action == action
 
 
-def test_funded_reason_is_fixed_template():
-    plan = _plan(charge_funded_reservations=(Reservation(
+def test_funded_reason_quotes_the_planned_charge_not_the_reservation():
+    # The live 0.26.0 bug: 13.09 kWh reserved vs 11.31 kWh planned charge.
+    plan = _plan(required_kwh=11.31, charge_funded_reservations=(Reservation(
+        name="CANARY", target_slot=1, energy_kwh=13.09,
+        obligation_kind="reach-next-cheap-slot", reason="CANARY"),))
+    status = resolve(plan, (), at(23), TZ)
+    assert status.reason == "Charging 11.3 kWh to cover the run to the next cheap slot."
+
+
+@pytest.mark.parametrize("kind,phrase", [
+    ("reach-next-cheap-slot", "the run to the next cheap slot"),
+    ("axle-export-event", "the flexibility export"),
+    ("reach-charge-window", "the run to the charge window"),
+    ("something-new", "planned demand"),
+])
+def test_funded_reason_phrase_per_reservation_kind(kind, phrase):
+    plan = _plan(required_kwh=9.6, charge_funded_reservations=(Reservation(
+        name="CANARY", target_slot=1, energy_kwh=3.25, obligation_kind=kind, reason="CANARY"),))
+    assert resolve(plan, (), at(23), TZ).reason == f"Charging 9.6 kWh to cover {phrase}."
+
+
+def test_funded_reason_bounded_figure_fallback_is_the_battery():
+    plan = _plan(required_kwh=1e300, charge_funded_reservations=(Reservation(
         name="CANARY", target_slot=1, energy_kwh=3.25,
         obligation_kind="axle-export-event", reason="CANARY"),))
     status = resolve(plan, (), at(23), TZ)
-    assert status.reason == "Charging 3.2 kWh to cover the flexibility export."
+    assert status.reason == "Charging the battery to cover the flexibility export."
 
 
 def test_back_to_back_charge_windows_have_no_next_change():

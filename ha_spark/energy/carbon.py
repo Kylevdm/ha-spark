@@ -27,6 +27,7 @@ from pydantic import (
     field_validator,
 )
 
+from ha_spark.energy.models import utc_iso
 from ha_spark.logging import get_logger
 
 NESO_BASE_URL = "https://api.carbonintensity.org.uk"
@@ -54,10 +55,6 @@ class _HideNesoRequests(logging.Filter):
 
 
 logging.getLogger("httpx").addFilter(_HideNesoRequests())
-
-
-def _iso(at: datetime) -> str:
-    return at.astimezone(UTC).isoformat()
 
 
 def _boundary(value: object) -> datetime:
@@ -146,9 +143,14 @@ def _validate(
         first, last = period.first, period.last
         if first < start or last > end or last - first != timedelta(minutes=30):
             continue
-        key = _iso(first)
+        key = utc_iso(first)
         if key in rows or len(rows) < 300:
-            rows[key] = (key, _iso(last), float(period.intensity.forecast), period.intensity.index)
+            rows[key] = (
+                key,
+                utc_iso(last),
+                float(period.intensity.forecast),
+                period.intensity.index,
+            )
     return [rows[key] for key in sorted(rows)]
 
 
@@ -168,10 +170,10 @@ async def _store(
         await db.execute(
             "INSERT INTO carbon_fetches VALUES (?, ?) "
             "ON CONFLICT(region) DO UPDATE SET fetched_at=excluded.fetched_at",
-            (region, _iso(now)),
+            (region, utc_iso(now)),
         )
         await db.execute("DELETE FROM carbon_periods WHERE start < ?",
-                         (_iso(now - timedelta(days=2)),))
+                         (utc_iso(now - timedelta(days=2)),))
         if current():  # The region may have changed while the write awaited.
             await db.commit()
 
@@ -194,7 +196,7 @@ async def carbon_payload(path: str, region: int | None, now: datetime) -> dict[s
             async with db.execute(
                 "SELECT start, end, gco2, band FROM carbon_periods "
                 "WHERE region = ? AND start >= ? ORDER BY start",
-                (region, _iso(now - timedelta(days=2))),
+                (region, utc_iso(now - timedelta(days=2))),
             ) as cursor:
                 rows = list(await cursor.fetchall())
         payload["rows"] = [

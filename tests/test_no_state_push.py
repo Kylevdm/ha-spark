@@ -31,7 +31,11 @@ async def test_plan_run_never_pushes_states_and_still_requests_v2l_topup(
 
     async def current_plan(*_args, **_kwargs):
         return SimpleNamespace(
-            plan=plan, inputs=SimpleNamespace(ev_hold_charging=None, flexibility_event=_EVENT),
+            plan=plan,
+            inputs=SimpleNamespace(
+                ev_hold_charging=None, flexibility_event=_EVENT,
+                solar_slots=None, solar_slots_known=None, geometry=None, now=None,
+            ),
             load_source="test", tz=None,
             forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )

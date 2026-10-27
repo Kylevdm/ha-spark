@@ -164,6 +164,14 @@ def test_addon_supervisor_seed_uses_default_role_api_access() -> None:
     assert addon.get("hassio_role", "default") == "default"
 
 
+def test_display_only_fields() -> None:
+    metadata = field_metadata()
+    assert all(type(meta["display_only"]) is bool for meta in metadata.values())
+    assert {name for name, meta in metadata.items() if meta["display_only"]} == {
+        "carbon_region",
+    }
+
+
 def test_restart_fields_match_startup_bindings() -> None:
     metadata = field_metadata()
     assert {name for name, meta in metadata.items() if meta["reload"] == "restart"} == {

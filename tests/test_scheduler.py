@@ -359,7 +359,12 @@ def _patch_run_once_io(
         if isinstance(plan, Exception):
             raise plan
         return SimpleNamespace(
-            plan=plan, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test",
+            plan=plan,
+            inputs=SimpleNamespace(
+                ev_hold_charging=None, solar_slots=None, solar_slots_known=None,
+                geometry=None, now=None,
+            ),
+            load_source="test",
             tz=None,
             forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )
@@ -681,7 +686,12 @@ async def test_run_once_skips_unchanged_command_after_fresh_soc(
 
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
         return SimpleNamespace(
-            plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test",
+            plan=current,
+            inputs=SimpleNamespace(
+                ev_hold_charging=None, solar_slots=None, solar_slots_known=None,
+                geometry=None, now=None,
+            ),
+            load_source="test",
             tz=None,
             forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )
@@ -727,7 +737,12 @@ async def test_run_once_retries_after_untrusted_previous_plan(
 
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
         return SimpleNamespace(
-            plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test",
+            plan=current,
+            inputs=SimpleNamespace(
+                ev_hold_charging=None, solar_slots=None, solar_slots_known=None,
+                geometry=None, now=None,
+            ),
+            load_source="test",
             tz=None,
             forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )
@@ -3080,7 +3095,12 @@ async def test_run_once_reconciles_an_untrusted_plan_against_the_trusted_holds(
 
     async def fake_current_plan(_s: Settings, _rest: object, **_kw: object) -> object:
         return SimpleNamespace(
-            plan=current, inputs=SimpleNamespace(ev_hold_charging=None), load_source="test",
+            plan=current,
+            inputs=SimpleNamespace(
+                ev_hold_charging=None, solar_slots=None, solar_slots_known=None,
+                geometry=None, now=None,
+            ),
+            load_source="test",
             tz=None,
             forecast=LoadForecast(total_kwh=24.0, slots=None, source="test"),
         )
@@ -3920,6 +3940,7 @@ async def test_run_once_applies_the_ev_hold_on_a_replan_tick(
                 ev_hold_charging=True,
                 evidence_freshness={"ev_status": _fresh(datetime(2026, 6, 10, 12, 0, tzinfo=UTC))},
                 battery_direction="unknown",
+                solar_slots=None, solar_slots_known=None, geometry=None, now=None,
             ),
             load_source="test",
             tz=None,
@@ -3997,6 +4018,7 @@ async def test_run_once_records_the_plan_run_and_keeps_the_ev_hold_view_only(
                     "ev_status": _fresh(datetime(2026, 6, 10, 12, 0, tzinfo=UTC))
                 },
                 battery_direction="unknown",
+                solar_slots=None, solar_slots_known=None, geometry=None, now=None,
             ),
             cfg=SimpleNamespace(),
             schedule=SimpleNamespace(),
@@ -4839,6 +4861,7 @@ async def test_invalid_soc_never_blocks_the_ev_hold_switch_write(
                 ev_hold_charging=True,
                 evidence_freshness={"ev_status": _fresh(at)},
                 battery_direction="unknown",
+                solar_slots=None, solar_slots_known=None, geometry=None, now=None,
             ),
             load_source="test",
             tz=None,

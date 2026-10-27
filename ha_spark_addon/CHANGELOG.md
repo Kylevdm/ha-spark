@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.28.1
+
+- **Refused hold releases back off (#448).** In Optimise, when the battery
+  schedule a hold release needs keeps failing its read-back, ha-spark now
+  retries the release at most every 10 minutes after five refusals in a row,
+  instead of rewriting the schedule every minute. The battery stays held
+  throughout, and starting a hold is never delayed.
+- **Quieter, more private log (#493).** At the default `log_level: INFO` the add-on
+  log no longer lists every HTTP request. Those lines came to about five a minute
+  and some URLs carried your Octopus account number or home coordinates, which
+  then ended up in any log you shared. Failed requests are still reported by
+  ha-spark's own error lines.
+- **Charge reason quotes the planned charge (#494).** *Next planned change* and
+  *Plan status* now say how much the plan will actually charge (the same figure
+  as *Charge needed*), not the size of the reservation it covers.
+
 ## 0.28.0
 
 - **App shell and plan view (#381).** **Open Web UI** now opens an app with a

@@ -236,3 +236,138 @@ async def test_holding_again_ends_the_refusal_episode_but_keeps_the_notice_flag(
     assert kept.release_refused_since is None
     assert kept.release_refused_reason is None
     assert kept.release_refused_notified
+
+
+def _refusing_device(tmp_path):
+    """Optimise, an owned hold to release, and a schedule that never reads back."""
+    rest = FakeRest(switch="Off")
+    device = _device(rest, tmp_path)
+    _seed_owned_hold(device)
+    rest.states["sensor.solis_control_timed_charge_start_hours"] = "unavailable"
+    rest.reads = []
+    original = rest.get_state
+
+    async def counted(entity_id):
+        rest.reads.append(entity_id)
+        return await original(entity_id)
+
+    rest.get_state = counted
+    return rest, device
+
+
+def _attempts(rest):
+    """Reads beyond the switch's own: a release attempt checks the schedule."""
+    return sum(entity != _SWITCH for entity in rest.reads)
+
+
+async def _refuse_five_times(device, rest, start):
+    for minute in range(5):
+        attempts = _attempts(rest)
+        lines = await device.reconcile_holds(_intent(), start + timedelta(minutes=minute))
+        assert _attempts(rest) > attempts
+        assert any("[REFUSED]" in line and "hold kept" in line for line in lines)
+    return lines
+
+
+async def test_refused_releases_back_off_after_five(tmp_path, caplog):
+    rest, device = _refusing_device(tmp_path)
+    start = _now()
+    last = await _refuse_five_times(device, rest, start)
+    calls, attempts = len(rest.calls), _attempts(rest)
+    caplog.clear()
+    for minute in range(5, 14):
+        lines = await device.reconcile_holds(_intent(), start + timedelta(minutes=minute))
+        # The same refusal line as the last attempt: the daemon logs a repeat at DEBUG.
+        assert lines == [last[-1]]
+    assert len(rest.calls) == calls
+    assert _attempts(rest) == attempts
+    assert _options(rest) == []
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    assert device._execution.authority.state.holds
+    lines = await device.reconcile_holds(_intent(), start + timedelta(minutes=14))
+    assert _attempts(rest) > attempts
+    assert any("[REFUSED]" in line for line in lines)
+
+
+async def test_back_off_never_delays_a_hold_start(tmp_path):
+    rest, device = _refusing_device(tmp_path)
+    start = _now()
+    await _refuse_five_times(device, rest, start)
+    rest.states[_SWITCH] = "On"
+    at = start + timedelta(minutes=6)
+    held = replace(_intent(), holds=((at - timedelta(minutes=1), at + timedelta(hours=1)),))
+    await device.reconcile_holds(held, at)
+    assert _options(rest) == ["Off"]
+
+
+async def test_holding_again_resets_the_back_off(tmp_path):
+    rest, device = _refusing_device(tmp_path)
+    start = _now()
+    await _refuse_five_times(device, rest, start)
+    at = start + timedelta(minutes=6)
+    held = replace(_intent(), holds=((at - timedelta(minutes=1), at + timedelta(hours=1)),))
+    await device.reconcile_holds(held, at)
+    attempts = _attempts(rest)
+    lines = await device.reconcile_holds(_intent(), at + timedelta(minutes=1))
+    assert _attempts(rest) > attempts
+    assert any("[REFUSED]" in line and "hold kept" in line for line in lines)
+
+
+async def test_a_verified_release_resets_the_back_off(tmp_path):
+    rest, device = _refusing_device(tmp_path)
+    start = _now()
+    await _refuse_five_times(device, rest, start)
+    rest.states["sensor.solis_control_timed_charge_start_hours"] = "23"
+    await device.reconcile_holds(_intent(), start + timedelta(minutes=14))
+    assert _options(rest) == ["On"]
+    assert not device._execution.authority.state.holds
+    # A new episode starts from zero: its first refusal doesn't wait.
+    rest.states[_SWITCH] = "Off"
+    _seed_owned_hold(device)
+    rest.states["sensor.solis_control_timed_charge_start_hours"] = "unavailable"
+    for minute in (15, 16):
+        # Still inside the old interval: a stale count would skip the second.
+        attempts = _attempts(rest)
+        await device.reconcile_holds(_intent(), start + timedelta(minutes=minute))
+        assert _attempts(rest) > attempts
+
+
+async def test_an_unverified_on_keeps_the_back_off_count(tmp_path):
+    rest, device = _refusing_device(tmp_path)
+    start = _now()
+    await _refuse_five_times(device, rest, start)
+    rest.states["sensor.solis_control_timed_charge_start_hours"] = "23"
+    original = rest.call_service
+
+    async def on_never_lands(domain, service, data=None):
+        if (domain, service) == ("select", "select_option"):
+            rest.calls.append((domain, service, data or {}))
+            return []
+        return await original(domain, service, data)
+
+    rest.call_service = on_never_lands
+    await device.reconcile_holds(_intent(), start + timedelta(minutes=14))
+    assert _options(rest) == ["On"]
+    assert device._execution.authority.state.holds
+    rest.call_service = original
+    rest.states["sensor.solis_control_timed_charge_start_hours"] = "unavailable"
+    await device.reconcile_holds(_intent(), start + timedelta(minutes=15))
+    # The sixth refusal in the episode: backed off again at once.
+    attempts = _attempts(rest)
+    await device.reconcile_holds(_intent(), start + timedelta(minutes=16))
+    assert _attempts(rest) == attempts
+
+
+async def test_back_off_keeps_the_refusal_reason_current(tmp_path):
+    rest, device = _refusing_device(tmp_path)
+    start = _now()
+    await _refuse_five_times(device, rest, start)
+    rest.states[_SWITCH] = "unavailable"
+    await device.reconcile_holds(_intent(), start + timedelta(minutes=5))
+    (held,) = device._execution.authority.state.holds
+    assert held.release_refused_reason == "switch_unreadable"
+    rest.states[_SWITCH] = "Off"
+    await device.reconcile_holds(_intent(), start + timedelta(minutes=6))
+    (kept,) = device._execution.authority.state.holds
+    assert kept.release_refused_reason == "schedule_unverified"
+    assert kept.release_refused_since == held.release_refused_since

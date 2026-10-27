@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import TracebackType
 
 import aiosqlite
+
+from ha_spark.energy.models import utc_iso
 
 # A slot older than this at write time is pruned.
 _RETENTION = timedelta(days=7)
@@ -40,7 +42,7 @@ CREATE INDEX IF NOT EXISTS solar_forecasts_slot ON solar_forecasts (slot_start, 
 _INSERT = "INSERT INTO solar_forecasts (issued_at, slot_start, kwh) VALUES (?, ?, ?)"
 # The forecast the plan was using before the slot began: the latest issue
 # strictly before the slot's start, insertion order breaking ties. Every value
-# is written by ``_iso`` (UTC isoformat), so text order is instant order.
+# is written by ``utc_iso`` (UTC isoformat), so text order is instant order.
 _SELECT_SLOT = """
 SELECT kwh FROM solar_forecasts
 WHERE slot_start = ? AND issued_at < ?
@@ -48,10 +50,6 @@ ORDER BY issued_at DESC, id DESC
 LIMIT 1
 """
 _PRUNE = "DELETE FROM solar_forecasts WHERE slot_start < ?"
-
-
-def _iso(dt: datetime) -> str:
-    return dt.astimezone(UTC).isoformat()
 
 
 class SolarForecastStore:
@@ -94,10 +92,10 @@ class SolarForecastStore:
         """
         if self._db is None:
             raise RuntimeError("SolarForecastStore used outside 'async with'")
-        rows = [(_iso(issued_at), _iso(start), kwh) for start, kwh in slots]
+        rows = [(utc_iso(issued_at), utc_iso(start), kwh) for start, kwh in slots]
         if rows:
             await self._db.executemany(_INSERT, rows)
-        await self._db.execute(_PRUNE, (_iso(issued_at - _RETENTION),))
+        await self._db.execute(_PRUNE, (utc_iso(issued_at - _RETENTION),))
         await self._db.commit()
 
 
@@ -118,7 +116,7 @@ async def recorded_solar(db_path: str, starts: Sequence[datetime]) -> dict[datet
             if await cursor.fetchone() is None:
                 return values
         for start in starts:
-            async with db.execute(_SELECT_SLOT, (_iso(start), _iso(start))) as cursor:
+            async with db.execute(_SELECT_SLOT, (utc_iso(start), utc_iso(start))) as cursor:
                 row = await cursor.fetchone()
             if row is not None:
                 values[start] = row[0]
