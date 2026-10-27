@@ -62,6 +62,7 @@ from ha_spark.energy.publish import plan_to_payload
 from ha_spark.energy.solar_forecasts import recorded_solar
 from ha_spark.energy.solar_measured import MeasuredSolar
 from ha_spark.energy.solar_source import (
+    ParsedSolarForecast,
     load_solar_source_kind,
     parse_native_forecast,
     save_solar_source_kind,
@@ -149,7 +150,9 @@ class AppState:
         self.plan_run: StoredPlanRun | None = None
         self.plan_at = plan_at
         self.executor = executor
-        self.integration_link = IntegrationLink(None, None, False)
+        self.integration_link = IntegrationLink(
+            None, None, False, ParsedSolarForecast(load_solar_source_kind(settings)),
+        )
         self.loop_tick: datetime | None = None
         self.soc_observation_ok: bool = False
 

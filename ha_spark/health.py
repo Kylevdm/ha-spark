@@ -37,6 +37,7 @@ from ha_spark.energy.octopus import (
     fetch_standard_unit_rates,
 )
 from ha_spark.energy.profile import history_coverage
+from ha_spark.energy.solar_source import load_solar_source_kind
 from ha_spark.energy.sources import (
     read_dispatch_evidence,
     read_dispatches_and_live,
@@ -251,7 +252,9 @@ _REQUIRED_ENTITY_FIELDS = (
 
 def check_entity_config(settings: Settings) -> CheckResult:
     """Flag required entity fields left blank (ships unconfigured by default)."""
-    unset = [f for f in _REQUIRED_ENTITY_FIELDS if not getattr(settings, f)]
+    native = load_solar_source_kind(settings) == "native"
+    unset = [f for f in _REQUIRED_ENTITY_FIELDS if not getattr(settings, f)
+             and not (native and f == "solar_tomorrow_entity")]
     if not settings.battery_power_entity:
         unset.append("battery_power_entity (glitch and stuck-SoC protection are off)")
     if not unset:
@@ -452,6 +455,16 @@ async def check_integration_link(settings: Settings) -> CheckResult:
     age = view.get("snapshot_age_s")
     if state == "connected" and type(age) is int and age >= 0:
         detail += f"; snapshot age {age}s"
+    source = view.get("solar_source")
+    if source in ("native", "entities"):
+        detail += f"; solar: {source}"
+    if source == "native":
+        solar_status = view.get("solar_status")
+        if solar_status in ("ok", "stale", "auth_failed", "quota_exhausted", "no_data"):
+            detail += f"; {solar_status}"
+        fetch_age = view.get("solar_fetch_age_s")
+        if type(fetch_age) is int and fetch_age >= 0:
+            detail += f"; fetch age {fetch_age}s"
     return CheckResult(
         "Integration link", Status.OK if state == "connected" else Status.WARN, detail,
     )

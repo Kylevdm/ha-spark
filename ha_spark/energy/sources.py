@@ -65,6 +65,40 @@ _EV_ACTIVE = {"charging", "delivering", "boosting", "diverting"}
 _EV_HOLD_ACTIVE = {"charging", "boosting", "delivering"}
 
 
+NATIVE_MAX_AGE = timedelta(hours=36)
+
+
+def _native_solar(
+    source: SolarSource, starts: tuple[datetime, ...], tz: ZoneInfo, percentile: int,
+) -> tuple[dict[date, float], tuple[float, ...], tuple[bool, ...]]:
+    """Validate whole local dates and place full-slot kWh by UTC instant."""
+    forecast = source.forecast
+    values: dict[datetime, float] = {}
+    if (
+        forecast is not None and forecast.fetched_at is not None
+        and timedelta(0) <= source.now - forecast.fetched_at <= NATIVE_MAX_AGE
+    ):
+        index = {10: 0, 50: 1, 90: 2}[percentile]
+        values = {start: (p10, p50, p90)[index] * 0.5
+                  for start, p10, p50, p90 in forecast.slots}
+    totals: dict[date, float] = {}
+    today = source.now.astimezone(tz).date()
+    for day in (today, today + timedelta(days=1)):
+        start = datetime.combine(day, time(), tz).astimezone(UTC)
+        end = datetime.combine(day + timedelta(days=1), time(), tz).astimezone(UTC)
+        if day == today:
+            start = max(start, starts[0].astimezone(UTC))
+        required = tuple(start + timedelta(minutes=30 * i)
+                         for i in range(int((end - start).total_seconds() / 1800)))
+        if required and all(instant in values for instant in required):
+            totals[day] = sum(kwh for instant, kwh in values.items()
+                              if instant.astimezone(tz).date() == day)
+    known = tuple(start.astimezone(tz).date() in totals and start in values for start in starts)
+    solar = tuple(values[start] if exists else 0.0
+                  for start, exists in zip(starts, known, strict=True))
+    return totals, solar, known
+
+
 def _to_float(value: Any, default: float) -> float:
     try:
         return float(value)
@@ -603,9 +637,8 @@ async def gather_inputs(
     ``source`` states where the plan's solar comes from (#519): the kind, the
     parsed native forecast or its absence, the snapshot's received instant,
     and the plan's ``now`` as the caller states it. With kind ``entities``
-    (the only kind today) the forecast entities are read and the clock is
-    kept exactly as before, byte-for-byte; a native source, once built, will
-    judge forecast age at the context's ``now``.
+    the forecast entities are read and the clock is kept exactly as before;
+    native sizing and horizon placement use the context's ``now``.
     """
 
     async def state(entity_id: str) -> EntityState | None:
@@ -621,8 +654,8 @@ async def gather_inputs(
     if not soc_measurement.ok:
         log.warning("SoC measurement failed integrity check: %s", soc_measurement.reason)
     voltage = await state(settings.battery_voltage_entity)
-    solar = await state(settings.solar_tomorrow_entity)
-    solar_today = await state(settings.solar_today_entity)
+    solar = await state(settings.solar_tomorrow_entity) if source.kind == "entities" else None
+    solar_today = await state(settings.solar_today_entity) if source.kind == "entities" else None
     ha_needed = await state(settings.ha_template_charge_needed_entity)
 
     voltage_v = _to_float(voltage.state if voltage else None, settings.battery_voltage_v)
@@ -733,7 +766,7 @@ async def gather_inputs(
     tz = load_timezone(settings.timezone)
     window_start = parse_time(settings.charge_window_start)
     window_end = parse_time(settings.charge_window_end)
-    now = datetime.now(tz)  # the entities path keeps its own clock, byte-for-byte
+    now = datetime.now(tz) if source.kind == "entities" else source.now.astimezone(tz)
     geometry = compute_horizon_geometry(now, window_start, window_end, tz)
     served_day = geometry.served_day
     forecast = await predict_home_load(settings, lat=lat, lon=lon, target=served_day)
@@ -743,14 +776,23 @@ async def gather_inputs(
     # :func:`_solar_reading`, counts as zero that day.
     today_date = now.date()
     tomorrow_date = (now + timedelta(days=1)).date()
-    readings: dict[date, _SolarDayReading | None] = {
-        today_date: _solar_reading(solar_today, settings.solar_percentile),
-        tomorrow_date: _solar_reading(solar, settings.solar_percentile),
-    }
+    readings: dict[date, _SolarDayReading | None] = {}
+    if source.kind == "entities":
+        readings = {
+            today_date: _solar_reading(solar_today, settings.solar_percentile),
+            tomorrow_date: _solar_reading(solar, settings.solar_percentile),
+        }
     # The plan's day-total solar is the served day's: today's while its charge
     # window is still running, otherwise the day the next window serves.
     served_solar = readings.get(served_day)
     solar_kwh = served_solar.total_kwh if served_solar is not None else 0.0
+    native_slots: tuple[float, ...] = ()
+    native_known: tuple[bool, ...] = ()
+    if source.kind == "native":
+        totals, native_slots, native_known = _native_solar(
+            source, geometry.slot_starts, tz, settings.solar_percentile,
+        )
+        solar_kwh = totals.get(served_day, 0.0)
 
     unrated_dispatches = dispatches
     dispatches, dropped_dispatches = partition_dispatches(
@@ -781,8 +823,11 @@ async def gather_inputs(
             for start in geometry.slot_starts
             for local in (start.astimezone(tz),)
         )
-        solar_slots = _solar_slots(readings, geometry.slot_starts, tz)
-        solar_slots_known = _solar_slots_known(readings, geometry.slot_starts, tz)
+        if source.kind == "native":
+            solar_slots, solar_slots_known = native_slots, native_known
+        else:
+            solar_slots = _solar_slots(readings, geometry.slot_starts, tz)
+            solar_slots_known = _solar_slots_known(readings, geometry.slot_starts, tz)
     else:
         drain = pre_window_drain(forecast, now, window_start, window_end)
 

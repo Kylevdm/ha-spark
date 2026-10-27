@@ -143,7 +143,7 @@ from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor, SocMonitorSnapshot, observe_soc
 from ha_spark.energy.solar_forecasts import SolarForecastStore
-from ha_spark.energy.solar_source import SolarSource, load_solar_source_kind
+from ha_spark.energy.solar_source import SolarSource
 from ha_spark.energy.sources import (
     ev_hold_status_from_read,
     parse_time,
@@ -2176,14 +2176,15 @@ async def _run_paired(
                     # Recovery never compares against a baseline: the resident
                     # program is the fallback, not any earlier plan.
                     previous_plan = None if reapply or recovering else last_applied_plan
-                    # The plan's solar source (#519): the persisted kind (the
-                    # daemon's own record, entities until a snapshot says
-                    # otherwise) plus the last accepted snapshot's received
-                    # instant, at this tick's now.
+                    # The plan's solar source (#519): the link's kind (the
+                    # persisted kind until the first accepted snapshot, then that
+                    # snapshot's, even if persisting it failed) plus its forecast
+                    # and received instant, at this tick's now.
+                    link = state.integration_link
                     solar_source = SolarSource(
-                        kind=load_solar_source_kind(settings),
-                        forecast=None,
-                        received_at=state.integration_link.received_at,
+                        kind=link.solar_forecast.kind,
+                        forecast=link.solar_forecast.forecast,
+                        received_at=link.received_at,
                         now=now,
                     )
                     async with AsyncExitStack() as activation:
