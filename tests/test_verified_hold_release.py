@@ -328,3 +328,44 @@ async def test_a_verified_release_resets_the_back_off(tmp_path):
     attempts = _attempts(rest)
     await device.reconcile_holds(_intent(), start + timedelta(minutes=15))
     assert _attempts(rest) > attempts
+
+
+async def test_an_unverified_on_keeps_the_back_off_count(tmp_path):
+    rest, device = _refusing_device(tmp_path)
+    start = _now()
+    await _refuse_five_times(device, rest, start)
+    rest.states["sensor.solis_control_timed_charge_start_hours"] = "23"
+    original = rest.call_service
+
+    async def on_never_lands(domain, service, data=None):
+        if (domain, service) == ("select", "select_option"):
+            rest.calls.append((domain, service, data or {}))
+            return []
+        return await original(domain, service, data)
+
+    rest.call_service = on_never_lands
+    await device.reconcile_holds(_intent(), start + timedelta(minutes=14))
+    assert _options(rest) == ["On"]
+    assert device._execution.authority.state.holds
+    rest.call_service = original
+    rest.states["sensor.solis_control_timed_charge_start_hours"] = "unavailable"
+    await device.reconcile_holds(_intent(), start + timedelta(minutes=15))
+    # The sixth refusal in the episode: backed off again at once.
+    attempts = _attempts(rest)
+    await device.reconcile_holds(_intent(), start + timedelta(minutes=16))
+    assert _attempts(rest) == attempts
+
+
+async def test_back_off_keeps_the_refusal_reason_current(tmp_path):
+    rest, device = _refusing_device(tmp_path)
+    start = _now()
+    await _refuse_five_times(device, rest, start)
+    rest.states[_SWITCH] = "unavailable"
+    await device.reconcile_holds(_intent(), start + timedelta(minutes=5))
+    (held,) = device._execution.authority.state.holds
+    assert held.release_refused_reason == "switch_unreadable"
+    rest.states[_SWITCH] = "Off"
+    await device.reconcile_holds(_intent(), start + timedelta(minutes=6))
+    (kept,) = device._execution.authority.state.holds
+    assert kept.release_refused_reason == "schedule_unverified"
+    assert kept.release_refused_since == held.release_refused_since

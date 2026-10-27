@@ -1221,6 +1221,7 @@ class SolisDevice:
                 ):
                     # No schedule writes or re-reads until the interval passes; the
                     # same refusal line again, so the daemon logs it only at DEBUG.
+                    self._mark_release_refused(store, identity, "schedule_unverified", now)
                     return [ActionLine(backoff.line, ActionOutcome.REFUSED)]
                 schedule_lines, refusal = await self._confirm_restore_schedule(
                     intent, store.state
@@ -1238,7 +1239,6 @@ class SolisDevice:
                         if backoff.refusals >= _RELEASE_BACKOFF_AFTER else ""
                     )
                     return [*schedule_lines, ActionLine(backoff.line, ActionOutcome.REFUSED)]
-                self._execution.release_backoff.pop(identity, None)
             if wanted == "Off":
                 self._save_hold_request(store, identity, intent, now, records, confirmed=False)
             else:
@@ -1254,6 +1254,7 @@ class SolisDevice:
                     )
                 else:
                     store.save_holds(tuple(h for h in store.state.holds if h.device != identity))
+                    self._execution.release_backoff.pop(identity, None)
         except Exception:  # noqa: BLE001 - isolate this action's failure
             log.error("[FAILED] %s", desc)
             return [ActionLine(f"[FAILED] {desc}", ActionOutcome.FAILED)]
