@@ -15,8 +15,9 @@ installed from HACS, shows the plan in Home Assistant as entities. The
 natural-language features use one remote Ollama instance and fall back to a
 deterministic parser when Ollama is unreachable. There is no ha-spark cloud service or subscription. Apart from
 Home Assistant, ha-spark contacts only your Ollama server, Open-Meteo (weather
-for the ML load model), NESO carbon intensity if you pick a region, and the
-Octopus and Axle APIs if you configure them.
+for the ML load model), NESO carbon intensity if you pick a region, Solcast if
+you give the integration a key, and the Octopus and Axle APIs if you configure
+them.
 
 ## Engineering highlights
 
@@ -72,6 +73,11 @@ Octopus and Axle APIs if you configure them.
 >   status and next change, V2L totals, whether the add-on is connected, and
 >   mirrors of the operating mode, fallback and holds. The add-on finds it
 >   through Supervisor discovery and no longer pushes states to Home Assistant.
+> - native Solcast in the companion integration (0.29.0). Enter the key through
+>   **Reconfigure**, set a legacy account's 50-call limit in **Options**, and
+>   the add-on plans from the integration's P10/P50/P90 forecast. Sites without
+>   native Solcast keep the legacy `solar_today_entity` and
+>   `solar_tomorrow_entity` settings.
 >
 > Axle export completed its first paid export on real hardware on 2026-10-05
 > ([#134](https://github.com/Kylevdm/ha-spark/issues/134)). It stays a
@@ -174,9 +180,6 @@ Open work on the feature itself:
 
 - per-inverter current limits in place of one hard-coded model limit
   ([#241](https://github.com/Kylevdm/ha-spark/issues/241));
-- reading today's solar forecast, so ha-spark can accept same-day daytime
-  events and check them against the DNO limit
-  ([#201](https://github.com/Kylevdm/ha-spark/issues/201));
 - counting a V2L refill from the car when funding an event
   ([#188](https://github.com/Kylevdm/ha-spark/issues/188));
 - estimating what each event earned and counting it in the day's cost
@@ -190,10 +193,11 @@ UI ([#247](https://github.com/Kylevdm/ha-spark/issues/247)). It adds:
 - an ingress web app for onboarding, statistics, a visual plan, chat, a manual
   override, and settings, giving every owner task a home in the UI
   ([CLI parity](https://github.com/Kylevdm/ha-spark/issues/364#issuecomment-6241994831));
-- a companion HACS integration, now shipping read-only plan sensors and
-  mirrors of the add-on's mode, fallback and holds. In later v1 phases it
-  takes over Solis and AlphaESS control and replaces the Solcast integration.
-  The add-on keeps the planner and the UI; the integration makes no planning decisions
+- a companion HACS integration, now shipping read-only plan sensors,
+  mirrors of the add-on's mode, fallback and holds, and its own Solcast client
+  (0.29.0). In later v1 phases it takes over Solis and AlphaESS control; sites
+  without native Solcast keep the legacy forecast entity settings. The add-on
+  keeps the planner and the UI; the integration makes no planning decisions
   ([ADR 0005](docs/adr/0005-integration-authority-and-operating-modes.md));
 - configuration that you edit in the UI, with the Supervisor options cut down
   to the keys needed to start the add-on;

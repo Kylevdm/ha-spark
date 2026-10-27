@@ -34,6 +34,53 @@ Adding the integration manually points you to the add-on; there is no manual
 host, port or token form. Standalone installs do not have an integration yet.
 Installing it does not change the operating mode or any hardware control.
 
+### Native Solcast
+
+The integration can fetch Solcast itself, so the add-on no longer has to read
+another integration's forecast entities. Without a saved Solcast key everything
+below is off and the legacy entity path is unchanged.
+
+- **Add or replace the key.** Open **Settings → Devices & services**, select
+  **ha-spark**, then **Reconfigure**. The flow checks the key, finds your rooftop
+  sites (up to two) and saves their resource ids. Entering an empty key asks for
+  confirmation before removing native Solcast. A key Solcast rejects raises
+  Home Assistant's reauthentication prompt.
+- **Daily call limit.** The integration's **Options** flow sets the account
+  allowance: 10 calls per UTC day by default, or 50 for a legacy account. The
+  key itself stays in the config entry and is never copied to the add-on.
+- **Quota and polling.** Every Solcast request, including key checks and retries,
+  is counted and persisted before it is sent. The count survives restarts and
+  resets at 00:00 UTC. A restart reuses the saved forecast and makes no call. One
+  poll is reserved daily for 20 minutes before the charge window, at 20:40 local
+  until the add-on has reported a window start. The remaining polls are spread
+  from sunrise to sunset. A busy reply is retried a bounded number of times
+  within the quota; a rejected key is not retried. Once Solcast reports the daily
+  quota spent, polling stops until 00:00 UTC. The last good forecast is kept
+  across restarts.
+- **What you see.** The **Solcast** device has *Forecast today* and *Forecast
+  tomorrow* in kWh at P50, with the P10 and P90 day totals as attributes, plus
+  diagnostic *Last fetch* and *API calls used* sensors. Select ha-spark's
+  forecast in the Energy dashboard's solar forecast setting. The diagnostics
+  download shows Solcast status, quota and fetch age with the key and resource
+  ids redacted.
+- **What the add-on does.** Once the integration reports Solcast as configured,
+  the add-on plans from the snapshot's forecast and never reads
+  `solar_today_entity` or `solar_tomorrow_entity`. `solar_percentile` picks P10,
+  P50 or P90 from the raw, undampened values, and `solar_haircut_k` still
+  applies. A missing, incomplete or older-than-36-hours forecast counts as zero
+  solar, which oversizes the charge rather than undersizing it. `ha-spark health`
+  reports the solar source and the native forecast's status and age.
+- **Same-day Axle export.** A today-dated daytime slot is admitted only when
+  fresh native P90 evidence shows that the fixed discharge command plus that
+  slot's P90 solar stays within the DNO and supply limits. The check gives no
+  credit for house load and uses P90 without the haircut. Without fresh evidence
+  the existing daylight refusal applies. Today's solar never funds an event slot.
+
+Known limitations: native Solcast needs a household time zone whose UTC offset
+is a whole number of half-hours (otherwise native solar counts as zero); and the
+add-on's own CLI and agent previews plan with zero solar on a native site,
+because only the daemon has the forecast.
+
 ### Entities
 
 These are the initial entity ids; you can rename them in Home Assistant.
@@ -392,8 +439,8 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `solis_fallback_current_a` | Optional fallback-current ceiling in amps. When set, a sustained SoC failure programs only the configured `charge_window_start`–`charge_window_end` and this current, capped by `max_charge_current_a` and the Solis 62.5 A register limit. It is disabled when blank; there is no implicit current default. Only a successful Solis read-back is reported as verified |
 | `battery_power_entity` | Optional battery power in W, sampled each minute to check SoC against energy flow. The Solis preset uses `sensor.solisac_battery_power`. Both power signs count. Jumps unexplained by energy flow by more than 2 percentage points fail; unchanged SoC fails after more than 2 points of energy flows. Two consecutive reads of a rejected changed value accept a possible BMS recalibration with a warning. Missing power skips that interval; without this setting these checks are off. The baseline resets on restart |
 | `battery_voltage_entity` | Battery voltage (V). ha-spark also uses it to tell whether the SoC's source is live, so pick the voltage sensor from the same integration as `soc_entity` |
-| `solar_tomorrow_entity` | Solcast "forecast tomorrow" sensor (with `detailedForecast` attribute) |
-| `solar_today_entity` | Optional Solcast "forecast today" sensor; recommended for accurate charge sizing. Honours `solar_percentile` and `detailedForecast`, like the tomorrow sensor. If missing or invalid, today's solar counts as zero: this oversizes the charge, never undersizes it. |
+| `solar_tomorrow_entity` | Solcast "forecast tomorrow" sensor (with `detailedForecast` attribute). Used only by sites without native Solcast; ignored once a Solcast key is configured |
+| `solar_today_entity` | Optional Solcast "forecast today" sensor; recommended for accurate charge sizing on sites without native Solcast. Honours `solar_percentile` and `detailedForecast`, like the tomorrow sensor. If missing or invalid, today's solar counts as zero: this oversizes the charge, never undersizes it. Ignored once a Solcast key is configured |
 | `octopus_rate_entity` | Octopus current electricity rate sensor |
 | `dispatch_entity` | Octopus Intelligent dispatching binary sensor |
 | `ev_plug_entity` / `ev_status_entity` | EV charger plug/status sensors; `ev_status_entity` also drives the charging hold |
@@ -551,10 +598,11 @@ devices:
 - `charge_buffer_pct`, `charge_efficiency`, `solar_haircut_k`,
   `solar_percentile`, `expected_load_kwh`: forecast and sizing settings. You can
   usually leave them at their defaults.
-- `solar_haircut_k` (default `1.0`) multiplies the forecast reported by the
-  Solcast entity. Any dampening or hard limit configured in the Solcast
+- `solar_haircut_k` (default `1.0`) multiplies the solar forecast. Native
+  Solcast values are raw and undampened, so this is the only correction. On the
+  legacy entity path, any dampening or hard limit configured in the Solcast
   integration has already been applied, so the corrections stack. Use one
-  correction: leave Solcast dampening and hard limit off and tune
+  correction there: leave Solcast dampening and hard limit off and tune
   `solar_haircut_k`, or keep them on and leave `solar_haircut_k` at `1.0`.
 - `charge_window_start` / `charge_window_end`: your cheap-rate window.
 - `plan_run_time`: no longer used, and kept so existing configs still load. The
