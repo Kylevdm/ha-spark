@@ -125,8 +125,9 @@ def test_owner_request_preserves_validated_user(guarded_state, path, kind, body)
 @pytest.mark.parametrize("listener", ["agent", "standalone"])
 def test_owner_posts_are_ingress_only(guarded_state, path, kind, body, listener):
     state, save, import_document = guarded_state
-    kwargs = {"require_token": True, "token": "test-token", "ingress_peer": "testclient"}
-    app = build_app(state, **kwargs) if listener == "agent" else build_app(state)
+    # As the daemon builds the published agent port: a token and no ingress peer.
+    app = (build_app(state, require_token=True, token="test-token") if listener == "agent"
+           else build_app(state))
     with TestClient(app) as client:
         response = client.post(path, json=body, headers={
             "Authorization": "Bearer test-token", "X-Remote-User-Id": "owner",

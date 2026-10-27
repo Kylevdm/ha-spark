@@ -325,9 +325,11 @@ async def test_a_verified_release_resets_the_back_off(tmp_path):
     rest.states[_SWITCH] = "Off"
     _seed_owned_hold(device)
     rest.states["sensor.solis_control_timed_charge_start_hours"] = "unavailable"
-    attempts = _attempts(rest)
-    await device.reconcile_holds(_intent(), start + timedelta(minutes=15))
-    assert _attempts(rest) > attempts
+    for minute in (15, 16):
+        # Still inside the old interval: a stale count would skip the second.
+        attempts = _attempts(rest)
+        await device.reconcile_holds(_intent(), start + timedelta(minutes=minute))
+        assert _attempts(rest) > attempts
 
 
 async def test_an_unverified_on_keeps_the_back_off_count(tmp_path):

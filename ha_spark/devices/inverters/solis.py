@@ -1220,7 +1220,7 @@ class SolisDevice:
                     and now < backoff.last_at + _RELEASE_BACKOFF_INTERVAL
                 ):
                     # No schedule writes or re-reads until the interval passes; the
-                    # same refusal line again, so the daemon logs it only at DEBUG.
+                    # same refusal line again, so the per-minute reconcile logs it at DEBUG.
                     self._mark_release_refused(store, identity, "schedule_unverified", now)
                     return [ActionLine(backoff.line, ActionOutcome.REFUSED)]
                 schedule_lines, refusal = await self._confirm_restore_schedule(
@@ -1235,7 +1235,7 @@ class SolisDevice:
                     backoff.refusals += 1
                     backoff.last_at = now
                     backoff.line = f"[REFUSED] {desc} refused: {refusal}; hold kept" + (
-                        "; retrying every 10 min"
+                        f"; retrying every {_RELEASE_BACKOFF_INTERVAL.seconds // 60} min"
                         if backoff.refusals >= _RELEASE_BACKOFF_AFTER else ""
                     )
                     return [*schedule_lines, ActionLine(backoff.line, ActionOutcome.REFUSED)]

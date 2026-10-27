@@ -25,6 +25,8 @@ async def test_info_logs_no_request_url(caplog):
     root = logging.getLogger().level
     try:
         setup_logging("INFO")
+        # basicConfig is a no-op under pytest's handlers: set INFO explicitly.
+        caplog.set_level(logging.INFO)
         with respx.mock:
             respx.get("https://api.example/v1/accounts/A-CANARY01/").respond(200, json={})
             async with httpx.AsyncClient() as client:
