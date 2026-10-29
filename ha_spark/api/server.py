@@ -822,6 +822,7 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
                     v2l.load_session(state.settings) if state.settings.v2l_power_entity else None
                 ),
                 settings=state.settings, authority=authority,
+                guard_limited=guard is not None and guard.limiting,
             ),
             headers={"Cache-Control": "no-store"},
         )

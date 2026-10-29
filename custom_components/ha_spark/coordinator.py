@@ -115,6 +115,38 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                 readings.append({"id": load.id, "draw_kw": draw, "reported_at": reported})
         return block, readings
 
+    def _guard_snapshot(self) -> dict[str, object] | None:
+        """The v3 guard block; a failure to build it never blocks the heartbeat.
+
+        The revision is the topology revision the guard was started with: options
+        edits reload the entry, so the two can never disagree. Ids are the
+        topology's connection ids, or the add-on drops the whole block.
+        """
+        guard = self.guard
+        if guard is None or not guard.started or not guard.states:
+            return None
+        try:
+            revision = self.entry.options.get("topology_revision")
+            if type(revision) is not int or revision < 0:
+                return None
+            allowances = guard.allowance_kw
+            connections: list[dict[str, object]] = []
+            for connection in guard.topology.connections:
+                allowance = allowances.get(connection.id)
+                if allowance is not None and not (isfinite(allowance) and 0 <= allowance <= 60):
+                    # Never invented or clamped: an out-of-contract value sends no
+                    # block, which the add-on reads as "no guard information".
+                    return None
+                connections.append({"id": connection.id, "allowance_kw": allowance})
+            return {
+                "limiting": guard.limiting,
+                "connections": connections,
+                "restores_left": min(guard.restores_left.values()),
+                "revision": revision,
+            }
+        except Exception:  # noqa: BLE001 - its text may never reach HA's update logging
+            return None
+
     async def _async_update_data(self) -> bool:
         if not self._running or self._ended:
             return self.connected
@@ -127,7 +159,8 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                                       release_version=self.release_version,
                                       sent_at=dt_util.utcnow(), api_version=api_version,
                                       solar_forecast=self._solar_forecast(api_version),
-                                      topology=topology, major_loads=major_loads)
+                                      topology=topology, major_loads=major_loads,
+                                      supply_guard=self._guard_snapshot())
         except (KeyError, ValueError):
             # Raised text would carry the stored value; HA logs an update's exceptions.
             result = PollResult(Outcome.MALFORMED)
@@ -148,7 +181,8 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                                                   release_version=self.release_version,
                                                   sent_at=dt_util.utcnow(), api_version=api_version,
                                                   solar_forecast=self._solar_forecast(api_version),
-                                                  topology=topology, major_loads=major_loads)
+                                                  topology=topology, major_loads=major_loads,
+                                                  supply_guard=self._guard_snapshot())
                     except (KeyError, ValueError):
                         result = PollResult(Outcome.MALFORMED)
                     else:

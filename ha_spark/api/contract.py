@@ -155,6 +155,7 @@ def plan_summary(
     plan: ChargePlan | None = None, plan_at: datetime | None = None,
     soc_observation_ok: bool = False, session: V2LSession | None = None,
     settings: Settings | None = None, authority: AuthorityInputs | None = None,
+    guard_limited: bool = False,
 ) -> dict[str, object]:
     """Project the envelope and allowlisted display numbers for the request's api_version."""
     result: dict[str, object] = {
@@ -168,6 +169,7 @@ def plan_summary(
             plan, plan_at, soc_observation_ok, built_at,
             settings.timezone if settings is not None else "UTC",
             authority.state.holds if authority is not None and authority.state is not None else (),
+            guard_limited=guard_limited,
         ),
         "v2l": v2l_block(session, settings),
         "authority": authority_block(authority or AuthorityInputs(None, False, False)),
@@ -247,6 +249,7 @@ def _finite(value: object, ndigits: int) -> float | None:
 def plan_block(
     plan: ChargePlan | None, computed_at: datetime | None, soc_observation_ok: bool,
     now: datetime, timezone: str, holds: tuple[HoldRecord, ...],
+    *, guard_limited: bool = False,
 ) -> dict[str, object] | None:
     """Allowlisted numbers and status; never device identifiers or driver text."""
     if plan is None or computed_at is None:
@@ -255,7 +258,7 @@ def plan_block(
     # unrepresentable plan times leave the action unknown rather than fail it.
     status: PlanStatus | None
     try:
-        status = resolve(plan, holds, now, load_timezone(timezone))
+        status = resolve(plan, holds, now, load_timezone(timezone), guard_limited=guard_limited)
     except (ArithmeticError, TypeError, ValueError):
         status = None
     if plan.soc.status in _RAW_STATE_STATUSES:

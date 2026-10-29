@@ -42,7 +42,21 @@ async def test_power_report_crosses_snapshot(
     assert body["major_loads"][0] == {
         "id": raw["major_loads"][0]["id"], "draw_kw": expected, "reported_at": reported,
     }
+    # The first poll's snapshot is built before the guard's startup task runs.
     assert "supply_guard" not in body
+    await hass.async_block_till_done(wait_background_tasks=True)
+    guard = entry.runtime_data.guard
+    assert guard is not None and guard.started
+    aioclient_mock.clear_requests()
+    aioclient_mock.post(URL, json=summary())
+    await entry.runtime_data.async_refresh()
+    body = aioclient_mock.mock_calls[-1][2]
+    assert body["supply_guard"] == {
+        "limiting": False,
+        "connections": [{"id": c["id"], "allowance_kw": None} for c in raw["connections"]],
+        "restores_left": 48,
+        "revision": 7,
+    }
 
 
 def test_maximum_v3_contract() -> None:

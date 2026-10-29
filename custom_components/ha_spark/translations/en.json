@@ -10,6 +10,7 @@
       "fallback_active": {"name": "Fallback active"},
       "ev_hold": {"name": "EV hold"},
       "dispatch_hold": {"name": "Dispatch hold"},
+      "supply_guard_limiting": {"name": "Supply guard limiting"},
       "addon_connected": {
         "name": "Add-on connected"
       }
@@ -61,6 +62,8 @@
       "forecast_tomorrow": {"name": "Forecast tomorrow"},
       "last_fetch": {"name": "Last fetch"},
       "api_calls_used": {"name": "API calls used"},
+      "charging_allowance": {"name": "Charging allowance"},
+      "guard_restores_left_today": {"name": "Guard restores left today"},
       "last_run": {
         "name": "Last run"
       }
