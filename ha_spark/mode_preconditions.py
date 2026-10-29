@@ -11,9 +11,11 @@ from typing import Any
 
 from ha_spark.config import Settings
 from ha_spark.devices import get_device
+from ha_spark.devices.execution import execution_context
 from ha_spark.devices.inverters.solis import validate_fallback_schedule
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.energy.soc_monitor import SocMonitor, observe_soc
+from ha_spark.energy.topology_record import load_topology_record, unconfirmed_limits
 from ha_spark.ha.rest import HomeAssistantRest, HomeAssistantRestError
 from ha_spark.transitions import PreconditionReport
 
@@ -96,6 +98,12 @@ async def check_preconditions(
         option = f"{source}_max_age_seconds"
         if configured and getattr(settings, option) is None:
             failures.append(f"{option} must be configured for protection evidence")
+    # ADR-0008: one controllable inverter with unconfirmed limits blocks entry
+    # for the whole site (#542). The daemon's accepted record, else the durable one.
+    record = execution_context().limits_record or load_topology_record(settings)
+    unconfirmed = unconfirmed_limits(record)
+    if unconfirmed is not None:
+        failures.append(unconfirmed)
     optimise = list(failures)
     fallback = fallback_schedule_problem(settings)
     if fallback is not None:

@@ -154,6 +154,7 @@ from ha_spark.energy.sources import (
 from ha_spark.energy.supply_guard import SupplyGuard
 from ha_spark.energy.tariff import _controlled_windows
 from ha_spark.energy.tariff import _in_overnight_window as in_window
+from ha_spark.energy.topology_record import LoadedTopology
 from ha_spark.energy.v2l import run_v2l_tick, run_v2l_topup, warn_deprecated_notify_target
 from ha_spark.ha.notifier import send_notification
 from ha_spark.ha.rest import HomeAssistantRest
@@ -412,6 +413,11 @@ async def run_once(
     ``execution`` defaults to the process-shared driver context, as do the
     guard, reconcile, fallback, DST and shutdown entry points. Per-call REST
     clients and driver instances therefore never create independent bus locks.
+
+    The plan uses the context's accepted limits record and major-load
+    observations (#542); a record superseded after this tick's fence was
+    captured refuses at write time. An unavailable record holds normal
+    programming, as the fallback branch does.
     """
     context = execution or execution_context()
     generation = context.planned_generation.get()
@@ -420,7 +426,10 @@ async def run_once(
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
-        run = await current_plan(settings, rest, soc=soc, source=source)
+        run = await current_plan(
+            settings, rest, soc=soc, source=source,
+            limits=context.limits_record or LoadedTopology(), major_loads=context.major_loads,
+        )
         plan, inputs, load_source = run.plan, run.inputs, run.load_source
         log.info(
             "Charge plan:\n%s",
@@ -482,6 +491,12 @@ async def run_once(
             )
             lines.append(ActionLine(
                 f"[SKIP] normal programming held while {reason}", ActionOutcome.BLOCKED
+            ))
+            applied_plan = None
+        elif getattr(run, "limits", None) is not None and run.limits.source == "unavailable":
+            lines.append(ActionLine(
+                "[SKIP] normal programming held while the accepted topology record "
+                "is unavailable", ActionOutcome.BLOCKED,
             ))
             applied_plan = None
         elif needs_apply(previous_plan, intent, rate_w, settings.battery_voltage_v):
@@ -1933,6 +1948,8 @@ async def _run_paired(
         log.warning("Authority persistence failed; hardware writes refused")
     context = execution_context()
     context.authority = authority
+    # The accepted limits record; the heartbeat replaces it on every change.
+    context.limits_record = state.integration_link.topology
     channel.authority = authority
     faults: set[str] = set()
     serve_task: asyncio.Task[None] | None = None
@@ -2017,6 +2034,9 @@ async def _run_paired(
             settings = state.settings  # hot-reloaded by POST /api/config
             # Capture with the settings snapshot, before any I/O can accept a save.
             context.planned_generation.set(context.config_generation)
+            # The accepted limits this tick plans under, captured with their key so
+            # a write planned under a superseded revision is refused (#542).
+            context.planned_limits.set(context.limits_key())
             current_faults = set()
             if not authority.known:
                 current_faults.add("authority unknown")

@@ -136,6 +136,9 @@ def cleanup_authority() -> None:
         context.release_backoff.clear()
     _contexts.clear()
     execution_context().release_backoff.clear()
+    execution_context().limits_record = None
+    execution_context().major_loads = ()
+    execution_context().planned_limits.set(("legacy", None))
     for directory in _directories:
         directory.cleanup()
     _directories.clear()

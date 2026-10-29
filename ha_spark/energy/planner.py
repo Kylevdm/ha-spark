@@ -1031,6 +1031,7 @@ def compute_plan(
     inputs: PlannerInputs, cfg: PlannerConfig, schedule: TariffSchedule,
     *, topology: Topology | None = None, limits: EffectiveLimits | None = None,
     major_loads: tuple[MajorLoadObservation, ...] = (),
+    limits_unavailable: str | None = None,
 ) -> ChargePlan:
     """Compute the charge plan from live inputs, config, and a tariff schedule.
 
@@ -1040,8 +1041,9 @@ def compute_plan(
     that let callers describe a different plan than the daemon applied (#91).
     For the legacy fixed-window two-rate behaviour, pass ``fixed_schedule``.
     Omitted topology and limits use the legacy adapter; unsupported shapes or
-    invalid limits fail closed. Major-load observations are evaluated once at
-    ``inputs.now``; expected EV demand comes only from planned dispatch slots.
+    invalid limits fail closed, as does ``limits_unavailable`` (its reason).
+    Major-load observations are evaluated once at ``inputs.now``; expected EV
+    demand comes only from planned dispatch slots.
     """
     effective_solar = inputs.served_day_solar_kwh * cfg.solar_haircut_k
 
@@ -1070,6 +1072,8 @@ def compute_plan(
     no_reserve_limit = 0.0
     advisory = None
     try:
+        if limits_unavailable is not None:
+            raise ValueError("limits_unavailable")
         topology = topology if topology is not None else legacy_topology(cfg, cfg.driver_kind)
         limits = limits if limits is not None else effective_limits(topology)
         planning_limits = _planning_limits(topology, limits)
@@ -1093,7 +1097,7 @@ def compute_plan(
                 advisory = reserve_advisory(topology, planning_limits.connection, max(window_loads))
     except (ValidationError, ValueError):
         topology, limits = None, None
-        limits_reason = LIMITS_UNAVAILABLE_REASON
+        limits_reason = limits_unavailable or LIMITS_UNAVAILABLE_REASON
         charge_limit = 0.0
         planning_limits = _PlanningLimits(
             BankLimits(id="", connection_id="", charge_a=0, charge_kw=0,
