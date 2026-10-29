@@ -8,7 +8,12 @@ from typing import TYPE_CHECKING, Literal
 
 from ha_spark.energy.evidence_freshness import EvidenceFreshness
 from ha_spark.energy.soc_integrity import SocMeasurement
-from ha_spark.energy.topology import DriverKind, EffectiveLimits, Topology
+from ha_spark.energy.topology import (
+    DriverKind,
+    EffectiveLimits,
+    InverterAllocation,
+    Topology,
+)
 
 if TYPE_CHECKING:
     from ha_spark.energy.horizon import HorizonGeometry
@@ -481,6 +486,10 @@ class ChargePlan:
     # Display only (#542): the plan on the legacy device's bank of a topology
     # the writer cannot follow yet. This plan, not the preview, is applied.
     limits_preview: ChargePlan | None = None
+    # Per-inverter commanded currents for a native topology's planned bank
+    # (see :func:`ha_spark.energy.topology.split_bank_allocation`). Legacy and
+    # fail-closed plans keep ``()``.
+    inverter_allocations: tuple[InverterAllocation, ...] = ()
 
     @property
     def served_day_solar_kwh(self) -> float:

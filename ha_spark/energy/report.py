@@ -5,10 +5,17 @@ from __future__ import annotations
 from datetime import date, datetime, time, tzinfo
 
 from ha_spark.energy.models import ChargePlan
+from ha_spark.energy.topology import InverterAllocation
 
 
 def _fmt(t: time) -> str:
     return f"{t.hour:02d}:{t.minute:02d}"
+
+
+def _allocation_share(allocation: InverterAllocation) -> str:
+    if allocation.charge_a is None:
+        return "no charge command"
+    return f"{allocation.charge_a:g} A"
 
 
 def format_plan(
@@ -53,6 +60,17 @@ def format_plan(
             f"discharge {bank.discharge_kw:.2f} kW; import {connection.import_kw:.2f} kW; "
             f"site export {connection.site_export_kw:.2f} kW"
         )
+    if plan.inverter_allocations:
+        shares = ", ".join(_allocation_share(a) for a in plan.inverter_allocations)
+        if for_logging:  # owner-entered inverter ids never reach logs
+            lines.append(
+                f"  Charge allocation  {len(plan.inverter_allocations)} inverters: {shares}"
+            )
+        else:
+            named = ", ".join(
+                f"{a.inverter_id} {_allocation_share(a)}" for a in plan.inverter_allocations
+            )
+            lines.append(f"  Charge allocation  {named}")
     hardware_reason = plan.hardware_limit_reason
     if for_logging and hardware_reason is not None:
         hardware_reason = "Charging limited by hardware."

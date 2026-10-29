@@ -232,6 +232,17 @@ class InverterLimits(FrozenModel):
     discharge_a: float
 
 
+class InverterAllocation(FrozenModel):
+    """One inverter's share of its bank's charging current.
+
+    ``charge_a`` is a whole-driver-step setpoint, never above the inverter's own
+    effective limit; ``None`` is a driver with no settable charge rate.
+    """
+
+    inverter_id: str
+    charge_a: float | None
+
+
 class BankLimits(FrozenModel):
     """DC power capped by the bank and sum of its inverters."""
 
@@ -345,6 +356,37 @@ def charge_setpoint_a(
     if caps.charge_ceiling_a is not None:
         ceiling = min(ceiling, caps.charge_ceiling_a)
     return setpoint_a(requested_a, ceiling, caps.setpoint_step_a)
+
+
+def split_bank_allocation(
+    bank_a: float, topology: Topology, limits: EffectiveLimits, bank_id: str,
+) -> tuple[InverterAllocation, ...]:
+    """Divide a bank's charging current across its inverters, in topology order.
+
+    Shares are proportional to the inverters' effective charge limits, then
+    rounded down to each driver's setpoint step and capped at its own limit, so
+    they never sum above ``bank_a``. A driver with no settable charge rate gets
+    ``None``: no charge command exists for it. A bank whose inverters together
+    have no effective limit splits nothing.
+    """
+    if not isfinite(bank_a) or bank_a < 0:
+        raise ValueError("invalid_allocation_input")
+    by_id = {limit.id: limit for limit in limits.inverters}
+    inverters = [inverter for inverter in topology.inverters if inverter.bank_id == bank_id]
+    if any(inverter.id not in by_id for inverter in inverters):
+        raise ValueError("invalid_inverter_limits")
+    total_a = sum(by_id[inverter.id].charge_a for inverter in inverters)
+    return tuple(
+        InverterAllocation(
+            inverter_id=inverter.id,
+            charge_a=charge_setpoint_a(
+                bank_a * by_id[inverter.id].charge_a / total_a if total_a > 0 else 0.0,
+                inverter,
+                by_id[inverter.id],
+            ),
+        )
+        for inverter in inverters
+    )
 
 
 def charge_capacity_kw(
