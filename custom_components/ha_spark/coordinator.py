@@ -6,7 +6,8 @@ or hardware write path. Unloading fences off replies from the previous discovery
 
 import logging
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from math import isfinite
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -20,9 +21,11 @@ from homeassistant.util import dt as dt_util
 from . import wire
 from .channel import Outcome, PollResult, async_poll
 from .const import DOMAIN
+from .topology import Topology, validate_topology
 from .wire import Summary, build_snapshot
 
 if TYPE_CHECKING:
+    from .guard_loop import SupplyGuardLoop
     from .solcast_coordinator import SolcastCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -36,6 +39,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                          update_interval=timedelta(seconds=30))
         self.entry = entry
         self.solcast: SolcastCoordinator | None = None
+        self.guard: SupplyGuardLoop | None = None
         self.release_version = release_version
         self.api_version = max(wire.SUPPORTED_API_VERSIONS)
         self.addon_api_version: int | None = None
@@ -85,17 +89,78 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             return {"status": "stale", "fetched_at": None, "calls_used": 0,
                     "calls_limit": self.solcast.calls_limit, "slots": []}
 
+    def _topology_snapshot(self) -> tuple[dict[str, object], list[dict[str, object]]]:
+        """Read stored configuration and source timestamps; never echo invalid state."""
+        options = self.entry.options
+        if "topology_revision" not in options:
+            return {"configured": False}, []
+        raw = options.get("topology")
+        block = {"configured": True, "revision": options["topology_revision"], "topology": raw}
+        topology = validate_topology(raw)
+        readings: list[dict[str, object]] = []
+        if isinstance(topology, Topology):
+            for load in topology.major_loads:
+                state = self.hass.states.get(load.power_entity) if load.power_entity else None
+                draw = None
+                reported = None
+                if state is not None:
+                    reported = state.last_reported.astimezone(UTC).isoformat()
+                    try:
+                        value = float(state.state)
+                        unit = state.attributes.get("unit_of_measurement")
+                        if isfinite(value) and value >= 0 and unit in ("W", "kW"):
+                            draw = value / 1000 if unit == "W" else value
+                    except (ValueError, TypeError, OverflowError):
+                        pass
+                readings.append({"id": load.id, "draw_kw": draw, "reported_at": reported})
+        return block, readings
+
+    def _guard_snapshot(self) -> dict[str, object] | None:
+        """The v3 guard block; a failure to build it never blocks the heartbeat.
+
+        The revision is the topology revision the guard was started with: options
+        edits reload the entry, so the two can never disagree. Ids are the
+        topology's connection ids, or the add-on drops the whole block.
+        """
+        guard = self.guard
+        if guard is None or not guard.started or not guard.states:
+            return None
+        try:
+            revision = self.entry.options.get("topology_revision")
+            if type(revision) is not int or revision < 0:
+                return None
+            allowances = guard.allowance_kw
+            connections: list[dict[str, object]] = []
+            for connection in guard.topology.connections:
+                allowance = allowances.get(connection.id)
+                if allowance is not None and not (isfinite(allowance) and 0 <= allowance <= 60):
+                    # Never invented or clamped: an out-of-contract value sends no
+                    # block, which the add-on reads as "no guard information".
+                    return None
+                connections.append({"id": connection.id, "allowance_kw": allowance})
+            return {
+                "limiting": guard.limiting,
+                "connections": connections,
+                "restores_left": min(guard.restores_left.values()),
+                "revision": revision,
+            }
+        except Exception:  # noqa: BLE001 - its text may never reach HA's update logging
+            return None
+
     async def _async_update_data(self) -> bool:
         if not self._running or self._ended:
             return self.connected
         data = self.entry.data
         api_version = self.api_version
         envelope = None
+        topology, major_loads = self._topology_snapshot()
         try:
             snapshot = build_snapshot(site_id=data["site_id"],
                                       release_version=self.release_version,
                                       sent_at=dt_util.utcnow(), api_version=api_version,
-                                      solar_forecast=self._solar_forecast(api_version))
+                                      solar_forecast=self._solar_forecast(api_version),
+                                      topology=topology, major_loads=major_loads,
+                                      supply_guard=self._guard_snapshot())
         except (KeyError, ValueError):
             # Raised text would carry the stored value; HA logs an update's exceptions.
             result = PollResult(Outcome.MALFORMED)
@@ -115,7 +180,9 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                         snapshot = build_snapshot(site_id=data["site_id"],
                                                   release_version=self.release_version,
                                                   sent_at=dt_util.utcnow(), api_version=api_version,
-                                                  solar_forecast=self._solar_forecast(api_version))
+                                                  solar_forecast=self._solar_forecast(api_version),
+                                                  topology=topology, major_loads=major_loads,
+                                                  supply_guard=self._guard_snapshot())
                     except (KeyError, ValueError):
                         result = PollResult(Outcome.MALFORMED)
                     else:

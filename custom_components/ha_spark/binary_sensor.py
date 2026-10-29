@@ -1,4 +1,4 @@
-"""Site connectivity and read-only fallback and hold mirrors."""
+"""Site connectivity and read-only fallback, hold and supply-guard mirrors."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,6 +12,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from . import SparkConfigEntry
 from .coordinator import SparkCoordinator
 from .entity import SparkEntity
+from .guard_loop import SupplyGuardLoop
 from .wire import Summary
 
 
@@ -51,10 +52,13 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: SparkConfigEntry, async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Register connectivity and summary-fed mirrors on the site device."""
-    async_add_entities([
+    entities: list[BinarySensorEntity] = [
         AddonConnected(entry.runtime_data),
         *(SparkBinarySensor(entry.runtime_data, description) for description in DESCRIPTIONS),
-    ])
+    ]
+    if entry.runtime_data.guard is not None:
+        entities.append(SupplyGuardLimiting(entry.runtime_data, entry.runtime_data.guard))
+    async_add_entities(entities)
 
 
 class SparkBinarySensor(SparkEntity, BinarySensorEntity):
@@ -81,6 +85,27 @@ class SparkBinarySensor(SparkEntity, BinarySensorEntity):
     def extra_state_attributes(self) -> dict[str, Any] | None:
         summary = self.coordinator.summary
         return self.entity_description.attributes_fn(summary) if summary else None
+
+
+class SupplyGuardLimiting(SparkEntity, BinarySensorEntity):
+    """Whether the independent supply guard holds a cut, add-on or not."""
+
+    _attr_translation_key = "supply_guard_limiting"
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+
+    def __init__(
+        self, coordinator: SparkCoordinator, guard: SupplyGuardLoop,
+    ) -> None:
+        super().__init__(coordinator, "supply_guard_limiting")
+        self._guard = guard
+
+    @property
+    def available(self) -> bool:
+        return self._guard.started
+
+    @property
+    def is_on(self) -> bool | None:
+        return self._guard.limiting if self._guard.started else None
 
 
 class AddonConnected(SparkEntity, BinarySensorEntity):

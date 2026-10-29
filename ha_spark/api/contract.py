@@ -21,6 +21,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validato
 
 from ha_spark import __version__
 from ha_spark.api.plan_status import PlanStatus, resolve
+from ha_spark.api.topology_intake import MajorLoadReading, SupplyGuardBlock
 from ha_spark.authority import AuthorityState, HoldRecord
 from ha_spark.config import Settings
 from ha_spark.energy.forecast import load_timezone
@@ -28,10 +29,12 @@ from ha_spark.energy.horizon import compute_horizon_geometry
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.soc_integrity import SocStatus
 from ha_spark.energy.solar_source import ParsedSolarForecast
+from ha_spark.energy.topology import MajorLoadObservation
+from ha_spark.energy.topology_record import LoadedTopology
 from ha_spark.energy.v2l import V2LSession, delivered_fraction, savings
 
-API_VERSION: Final = 2
-SUPPORTED_API_VERSIONS: Final = frozenset({1, 2})
+API_VERSION: Final = 3
+SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3})
 
 
 class SiteSnapshot(BaseModel):
@@ -79,6 +82,18 @@ class IntegrationLink:
     received_at: datetime | None
     skew: bool
     solar_forecast: ParsedSolarForecast = ParsedSolarForecast("entities")
+    topology: LoadedTopology = LoadedTopology()
+    major_loads: tuple[MajorLoadReading, ...] = ()
+    supply_guard: SupplyGuardBlock | None = None
+    major_loads_reason: str | None = None
+    supply_guard_reason: str | None = None
+
+
+def major_load_observations(link: IntegrationLink) -> tuple[MajorLoadObservation, ...]:
+    """The accepted snapshot's major-load readings as planner observations (#542)."""
+    return tuple(
+        MajorLoadObservation(r.id, r.draw_kw, r.reported_at) for r in link.major_loads
+    )
 
 
 def link_view(link: IntegrationLink, now: datetime) -> dict[str, object]:
@@ -103,6 +118,11 @@ def link_view(link: IntegrationLink, now: datetime) -> dict[str, object]:
         )
     return {
         **solar,
+        "topology_source": link.topology.kind,
+        "topology_revision": link.topology.revision,
+        "topology_reason": link.topology.reason,
+        "major_loads_reason": link.major_loads_reason,
+        "supply_guard_reason": link.supply_guard_reason,
         "state": state,
         "site_id": snapshot.site_id if snapshot is not None else None,
         "integration_release_version": snapshot.release_version if snapshot is not None else None,
@@ -135,6 +155,7 @@ def plan_summary(
     plan: ChargePlan | None = None, plan_at: datetime | None = None,
     soc_observation_ok: bool = False, session: V2LSession | None = None,
     settings: Settings | None = None, authority: AuthorityInputs | None = None,
+    guard_limited: bool = False,
 ) -> dict[str, object]:
     """Project the envelope and allowlisted display numbers for the request's api_version."""
     result: dict[str, object] = {
@@ -148,6 +169,7 @@ def plan_summary(
             plan, plan_at, soc_observation_ok, built_at,
             settings.timezone if settings is not None else "UTC",
             authority.state.holds if authority is not None and authority.state is not None else (),
+            guard_limited=guard_limited,
         ),
         "v2l": v2l_block(session, settings),
         "authority": authority_block(authority or AuthorityInputs(None, False, False)),
@@ -163,6 +185,9 @@ def plan_summary(
             start = (geometry.window_start if geometry.window_start > built_at
                      else geometry.horizon_end).isoformat()
         result["charge_window_start"] = start
+    if api_version >= 3 and settings is not None:
+        # Omitted rather than guessed: the integration then keeps HA's configured zone.
+        result["household_timezone"] = settings.timezone
     return result
 
 
@@ -224,6 +249,7 @@ def _finite(value: object, ndigits: int) -> float | None:
 def plan_block(
     plan: ChargePlan | None, computed_at: datetime | None, soc_observation_ok: bool,
     now: datetime, timezone: str, holds: tuple[HoldRecord, ...],
+    *, guard_limited: bool = False,
 ) -> dict[str, object] | None:
     """Allowlisted numbers and status; never device identifiers or driver text."""
     if plan is None or computed_at is None:
@@ -232,7 +258,7 @@ def plan_block(
     # unrepresentable plan times leave the action unknown rather than fail it.
     status: PlanStatus | None
     try:
-        status = resolve(plan, holds, now, load_timezone(timezone))
+        status = resolve(plan, holds, now, load_timezone(timezone), guard_limited=guard_limited)
     except (ArithmeticError, TypeError, ValueError):
         status = None
     if plan.soc.status in _RAW_STATE_STATUSES:

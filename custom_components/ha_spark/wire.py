@@ -22,7 +22,7 @@ from math import isfinite
 from typing import Final, Literal, cast
 from uuid import UUID
 
-API_VERSION: Final = 2
+API_VERSION: Final = 3
 # Display codes the add-on sends at this api_version (its planner, SoC check and fallback).
 PLAN_MODELS: Final = frozenset({"daily", "slots"})
 PLAN_STRATEGIES: Final = frozenset({"deficit", "fill"})
@@ -33,7 +33,7 @@ SOC_STATUSES: Final = frozenset({
 FALLBACK_CAUSES: Final = frozenset({"soc_integrity"})
 
 # Every `api_version` this integration can send and accept replies to.
-SUPPORTED_API_VERSIONS: Final = frozenset({1, 2})
+SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3})
 
 
 class MalformedSummary(ValueError):
@@ -137,11 +137,13 @@ class Summary:
     v2l: V2LBlock | None
     authority: AuthorityBlock
     charge_window_start: datetime | None = None
+    household_timezone: str | None = None
 
 
 def build_snapshot(
     *, site_id: str, release_version: str, sent_at: datetime, api_version: int,
-    solar_forecast: object = None,
+    solar_forecast: object = None, topology: object = None,
+    major_loads: object = None, supply_guard: object = None,
 ) -> dict[str, object]:
     """Build only fields supported by the negotiated api_version."""
     if str(UUID(site_id)) != site_id or sent_at.utcoffset() is None:
@@ -154,6 +156,11 @@ def build_snapshot(
     }
     if api_version >= 2:
         result["solar_forecast"] = solar_forecast
+    if api_version >= 3:
+        result["topology"] = topology
+        result["major_loads"] = major_loads
+        if supply_guard is not None:
+            result["supply_guard"] = supply_guard
     return result
 
 
@@ -239,6 +246,9 @@ def parse_summary(body: object) -> Summary:
             window = _timestamp(body.get("charge_window_start"))
         except MalformedSummary:
             pass
+    zone = body.get("household_timezone") if version >= 3 else None
+    if not isinstance(zone, str) or re.fullmatch(r"[A-Za-z0-9_+/-]{1,64}", zone) is None:
+        zone = None
     return Summary(
         api_version=version,
         release_version=release,
@@ -250,6 +260,7 @@ def parse_summary(body: object) -> Summary:
         v2l=_v2l(body["v2l"]),
         authority=_authority(body.get("authority")),
         charge_window_start=window,
+        household_timezone=zone,
     )
 
 

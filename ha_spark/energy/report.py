@@ -5,10 +5,17 @@ from __future__ import annotations
 from datetime import date, datetime, time, tzinfo
 
 from ha_spark.energy.models import ChargePlan
+from ha_spark.energy.topology import InverterAllocation
 
 
 def _fmt(t: time) -> str:
     return f"{t.hour:02d}:{t.minute:02d}"
+
+
+def _allocation_share(allocation: InverterAllocation) -> str:
+    if allocation.charge_a is None:
+        return "no charge command"
+    return f"{allocation.charge_a:g} A"
 
 
 def format_plan(
@@ -16,13 +23,14 @@ def format_plan(
     load_source: str,
     forecast_date: date | None = None,
     tz: tzinfo | None = None,
+    *, for_logging: bool = False,
 ) -> str:
     """Render the plan as an aligned, scannable block.
 
     ``forecast_date`` is the served day the load forecast targets (#397):
     naming it keeps a plan made at 01:00 from being read as "tomorrow's".
     ``tz`` is the household zone: horizon instants are UTC, so their clock
-    times are shown in it.
+    times are shown in it. ``for_logging`` removes owner-entered limit ids.
     """
 
     def clock(t: datetime) -> time:
@@ -44,6 +52,47 @@ def format_plan(
         f"  {solar_label}     {solar}{served}",
         f"  Home load forecast {plan.load_kwh:.2f} kWh{served}  ({load_source})",
     ]
+    if plan.effective_limits is not None:
+        bank = plan.effective_limits.banks[0]
+        connection = plan.effective_limits.connections[0]
+        lines.append(
+            f"  Effective limits   {plan.limits_source}: charge {bank.charge_kw:.2f} kW DC; "
+            f"discharge {bank.discharge_kw:.2f} kW; import {connection.import_kw:.2f} kW; "
+            f"site export {connection.site_export_kw:.2f} kW"
+        )
+    if plan.inverter_allocations:
+        shares = ", ".join(_allocation_share(a) for a in plan.inverter_allocations)
+        if for_logging:  # owner-entered inverter ids never reach logs
+            lines.append(
+                f"  Charge allocation  {len(plan.inverter_allocations)} inverters: {shares}"
+            )
+        else:
+            named = ", ".join(
+                f"{a.inverter_id} {_allocation_share(a)}" for a in plan.inverter_allocations
+            )
+            lines.append(f"  Charge allocation  {named}")
+    hardware_reason = plan.hardware_limit_reason
+    if for_logging and hardware_reason is not None:
+        hardware_reason = "Charging limited by hardware."
+    for reason in (plan.limits_reason, hardware_reason,
+                   plan.reserve_limit_reason, plan.reserve_advisory):
+        if reason is not None:
+            lines.append(f"  Limits             {reason}")
+    preview = plan.limits_preview
+    if preview is not None:
+        if preview.effective_limits is not None:
+            bank = preview.effective_limits.banks[0]
+            connection = preview.effective_limits.connections[0]
+            lines.append(
+                f"  Preview limits     {preview.limits_source}: charge {bank.charge_kw:.2f} kW "
+                f"DC; discharge {bank.discharge_kw:.2f} kW; import {connection.import_kw:.2f} kW; "
+                f"site export {connection.site_export_kw:.2f} kW"
+            )
+        lines.append(
+            f"  Preview target     {preview.target_soc:.0f}% (display only, not applied)"
+        )
+        if preview.limits_reason is not None:
+            lines.append(f"  Limits             {preview.limits_reason}")
     if plan.cheap_covered_kwh > 0:
         lines.append(f"  Cheap-covered load {plan.cheap_covered_kwh:.2f} kWh (daytime dispatch)")
     if plan.expensive_load_kwh is not None:

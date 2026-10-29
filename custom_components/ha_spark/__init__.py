@@ -5,6 +5,7 @@ heartbeat coordinator loads even with the add-on down and exposes site connectiv
 New discovery reloads the entry, fencing off the old session's in-flight replies.
 Plan numbers are read-only sensors; mode, fallback and hold mirrors arrive later.
 The optional Solcast service device is registered only while its key is configured.
+A configured topology starts an independent supply guard; no native writer is attached.
 """
 
 import logging
@@ -20,7 +21,9 @@ from homeassistant.loader import async_get_integration
 from .const import DOMAIN
 from .coordinator import SparkCoordinator
 from .entity import async_clear_unregistered_state
+from .guard_loop import SupplyGuardLoop
 from .solcast_coordinator import SolcastCoordinator
+from .topology import Topology, validate_topology
 
 SparkConfigEntry: TypeAlias = ConfigEntry[SparkCoordinator]
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
@@ -33,6 +36,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     assert integration.version is not None
     coordinator = SparkCoordinator(hass, entry, integration.version)
     entry.runtime_data = coordinator
+    if "topology_revision" in entry.options:
+        topology = validate_topology(entry.options.get("topology"))
+        if isinstance(topology, Topology):
+            coordinator.guard = SupplyGuardLoop(hass, entry, coordinator, topology)
     if entry.data.get("solcast_api_key"):
         coordinator.solcast = SolcastCoordinator(hass, entry)
 
@@ -65,12 +72,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
             _LOGGER.warning("Solcast startup failed")
 
     entry.async_create_background_task(hass, start_solcast(), "Solcast startup")
+    if coordinator.guard is not None:
+        entry.async_create_background_task(hass, coordinator.guard.async_start(),
+                                           "Supply guard startup")
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> bool:
     """End this session before a new discovery loads new connection data."""
     entry.runtime_data.async_stop()
+    if entry.runtime_data.guard is not None:
+        await entry.runtime_data.guard.async_stop()
     if entry.runtime_data.solcast is not None:
         await entry.runtime_data.solcast.async_shutdown()
     if await hass.config_entries.async_unload_platforms(entry, PLATFORMS):

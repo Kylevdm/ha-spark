@@ -33,6 +33,20 @@ from ha_spark.health import (
     exit_code,
     format_report,
 )
+from tests.test_planner_reserve import site
+
+
+@pytest.mark.parametrize("base, warned", [(3, True), (1, False), (None, False),
+                                         (float("nan"), False)])
+async def test_reserve_advisory_for_tight_supply(base, warned) -> None:
+    result = await health.check_effective_limits(
+        Settings(ha_url="http://ha.test", ha_token="t"),
+        topology=site(), overnight_base_load_kw=base,
+    )
+    assert (result.status == health.Status.WARN) == warned
+    if warned:
+        assert "Major-load reserve exceeds supply room" in result.detail
+
 
 HA = "http://ha.test"
 OLLAMA = "http://ollama.test"
@@ -43,6 +57,28 @@ def _r(name: str, status: Status) -> CheckResult:
 
 
 # --- exit_code mapping (the core decision logic) ---
+
+
+async def test_effective_limits_show_legacy_driver_and_site_caps() -> None:
+    result = await health.check_effective_limits(Settings(
+        ha_url=HA, ha_token="t", battery_voltage_v=52, max_charge_current_a=200,
+        dno_export_limit_kw=7.36, supply_max_current_a=15,
+    ))
+    assert result.status is Status.OK
+    assert result.detail == (
+        "legacy: charge 3.25 kW DC; discharge 3.20 kW; import 3.60 kW; site export 3.60 kW"
+    )
+
+
+@pytest.mark.parametrize("changes", [
+    {"supply_voltage_v": 199.123}, {"charge_efficiency": 1.1},
+])
+async def test_effective_limits_warn_without_rejected_values(changes: dict[str, float]) -> None:
+    result = await health.check_effective_limits(Settings(ha_url=HA, ha_token="t", **changes))
+    assert result.status is Status.WARN
+    assert result.detail == (
+        "Planning limits are unavailable: the limit settings are outside the supported range."
+    )
 
 
 def test_exit_code_all_ok() -> None:

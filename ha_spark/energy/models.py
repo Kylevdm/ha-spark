@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from ha_spark.energy.evidence_freshness import EvidenceFreshness
 from ha_spark.energy.soc_integrity import SocMeasurement
+from ha_spark.energy.topology import (
+    DriverKind,
+    EffectiveLimits,
+    InverterAllocation,
+    Topology,
+)
 
 if TYPE_CHECKING:
     from ha_spark.energy.horizon import HorizonGeometry
@@ -195,6 +201,7 @@ class PlannerConfig:
     v2l_offpeak_rate_gbp: float = 0.07
     v2l_max_rate_kw: float = 3.0
     v2l_preferred_rate_kw: float = 1.5
+    driver_kind: DriverKind = "solis"
 
     @property
     def window_hours(self) -> float:
@@ -469,6 +476,20 @@ class ChargePlan:
     # was wrong (#208).
     soc_path: tuple[tuple[datetime, float], ...] = ()
     view: PlanView | None = None
+    limits_source: Literal["legacy", "native", "native (preview only)", "unavailable"] = "legacy"
+    topology: Topology | None = None
+    effective_limits: EffectiveLimits | None = None
+    limits_reason: str | None = None
+    hardware_limit_reason: str | None = None
+    reserve_limit_reason: str | None = None
+    reserve_advisory: str | None = None
+    # Display only (#542): the plan on the legacy device's bank of a topology
+    # the writer cannot follow yet. This plan, not the preview, is applied.
+    limits_preview: ChargePlan | None = None
+    # Per-inverter commanded currents for a native topology's planned bank
+    # (see :func:`ha_spark.energy.topology.split_bank_allocation`). Legacy and
+    # fail-closed plans keep ``()``.
+    inverter_allocations: tuple[InverterAllocation, ...] = ()
 
     @property
     def served_day_solar_kwh(self) -> float:

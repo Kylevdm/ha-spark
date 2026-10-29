@@ -1,5 +1,6 @@
 """Native cache snapshots and learned reserved windows at the HTTP seam."""
 
+import json
 from datetime import datetime, time, timedelta
 from typing import Any
 from unittest.mock import patch
@@ -36,9 +37,11 @@ def test_v2_snapshot_fixtures(name: str) -> None:
     body = fixture(name)
     assert wire.build_snapshot(
         site_id=body["site_id"], release_version=body["release_version"],
-        sent_at=datetime.fromisoformat(body["sent_at"]), api_version=2,
-        solar_forecast=body["solar_forecast"],
+        sent_at=datetime.fromisoformat(body["sent_at"]), api_version=body["api_version"],
+        solar_forecast=body["solar_forecast"], topology=body.get("topology"),
+        major_loads=body.get("major_loads"), supply_guard=body.get("supply_guard"),
     ) == body
+    assert len(json.dumps(body)) < 32 * 1024
     assert "solar_forecast" not in wire.build_snapshot(
         site_id=body["site_id"], release_version=body["release_version"],
         sent_at=datetime.fromisoformat(body["sent_at"]), api_version=1,
@@ -139,7 +142,7 @@ async def test_learned_window_moves_reserved_poll_and_bad_value_keeps_it(
 def test_window_is_field_local(bad: Any) -> None:
     parsed = wire.parse_summary(fixture("plan_summary") | {"charge_window_start": bad})
     assert parsed.charge_window_start is None
-    assert parsed.api_version == 2
+    assert parsed.api_version == 3
     assert wire.parse_summary(fixture("plan_summary_v1")).charge_window_start is None
 
 

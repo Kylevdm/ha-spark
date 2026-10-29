@@ -1,0 +1,89 @@
+{
+  "topology": {
+    "connections": [
+      {
+        "id": "grid",
+        "supply_voltage_v": 240,
+        "import_limit_a": 75,
+        "export_limit_a": 16,
+        "dno_export_limit_kw": 0
+      }
+    ],
+    "banks": [
+      {
+        "id": "bank",
+        "connection_id": "grid",
+        "usable_capacity_kwh": 14,
+        "nominal_voltage_v": 50,
+        "min_soc": 10,
+        "target_cap": 100,
+        "charge_limit_a": 0,
+        "discharge_limit_a": 0,
+        "served_load_share_pct": 100
+      }
+    ],
+    "inverters": [
+      {
+        "id": "one",
+        "bank_id": "bank",
+        "driver_kind": "solis",
+        "charge_limit_a": 100,
+        "discharge_limit_a": 100,
+        "confirmed": true
+      },
+      {
+        "id": "two",
+        "bank_id": "bank",
+        "driver_kind": "solis",
+        "charge_limit_a": 100,
+        "discharge_limit_a": 100,
+        "confirmed": true
+      }
+    ]
+  },
+  "limits": {
+    "inverters": [
+      {
+        "id": "one",
+        "bank_id": "bank",
+        "charge_a": 62.5,
+        "discharge_a": 62.5
+      },
+      {
+        "id": "two",
+        "bank_id": "bank",
+        "charge_a": 62.5,
+        "discharge_a": 62.5
+      }
+    ],
+    "banks": [
+      {
+        "id": "bank",
+        "connection_id": "grid",
+        "charge_a": 0,
+        "charge_kw": 0,
+        "bank_charge_kw": 0,
+        "discharge_kw": 0
+      }
+    ],
+    "connections": [
+      {
+        "id": "grid",
+        "import_kw": 18,
+        "site_export_kw": 0
+      }
+    ]
+  },
+  "setpoints": [
+    {
+      "inverter": "one",
+      "requested_a": 100,
+      "expected_a": 62
+    },
+    {
+      "inverter": "two",
+      "requested_a": 42.6,
+      "expected_a": 42
+    }
+  ]
+}

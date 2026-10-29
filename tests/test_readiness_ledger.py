@@ -190,3 +190,34 @@ async def test_kathmandu_capture_uses_household_half_hour_grid(tmp_path):
     rows = await ReadinessLedger(path).slots(now - timedelta(hours=1), now + timedelta(hours=1))
     assert len(rows) == 1
     assert rows[0].slot_start == now.replace(minute=0).astimezone(UTC)
+
+
+async def test_slot_records_effective_limits_not_later_flat_settings(tmp_path):
+    path = str(tmp_path / "ledger.db")
+    a = revision()
+    cfg = replace(a.run.cfg, max_current_a=200)
+    plan = compute_plan(a.run.inputs, cfg, a.run.schedule)
+    # A later settings edit cannot change what this revision used.
+    a = replace(a, run=replace(a.run, plan=plan, cfg=replace(cfg, max_current_a=1)))
+    await record_slot(path, START, a, "observe", a.run.inputs.soc)
+    (row,) = await ReadinessLedger(path).slots(START, START + timedelta(minutes=30))
+    assert row.max_current_a == 62.5
+    assert row.limits_source == "legacy"
+    assert row.effective_limits == plan.effective_limits
+
+
+async def test_old_slot_json_loads_and_replays_identically(tmp_path):
+    from ha_spark.energy.readiness_ledger import SlotRecord
+    from ha_spark.energy.readiness_replay import replay_day
+    from tests.test_readiness_replay import FIXTURE_BLOCKS, day_from_blocks
+
+    day = day_from_blocks(FIXTURE_BLOCKS)
+    slots = []
+    for slot in day.slots:
+        assert slot.intent is not None
+        old_json = slot.intent.model_dump_json(exclude={"limits_source", "effective_limits"})
+        loaded = SlotRecord.model_validate_json(old_json)
+        assert loaded.limits_source is None
+        assert loaded.effective_limits is None
+        slots.append(slot.model_copy(update={"intent": loaded}))
+    assert replay_day(day.model_copy(update={"slots": tuple(slots)})) == replay_day(day)

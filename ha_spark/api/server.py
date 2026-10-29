@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -44,15 +45,18 @@ from ha_spark.api.contract import (
     IntegrationLink,
     SiteSnapshot,
     link_view,
+    major_load_observations,
     plan_summary,
     version_refusal,
 )
 from ha_spark.api.history import bucket_starts, history_payload
 from ha_spark.api.static_assets import packaged_assets
 from ha_spark.api.timeline import household_midnight, timeline_payload
+from ha_spark.api.topology_intake import accept_topology, parse_major_loads, parse_supply_guard
 from ha_spark.authority import OperatingMode, authority_view, load_authority
 from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import CONFIGURATION_REPAIR, DaemonChannel
+from ha_spark.devices.execution import execution_context
 from ha_spark.energy import v2l
 from ha_spark.energy.carbon import carbon_payload
 from ha_spark.energy.forecast import load_timezone
@@ -67,6 +71,7 @@ from ha_spark.energy.solar_source import (
     parse_native_forecast,
     save_solar_source_kind,
 )
+from ha_spark.energy.topology_record import load_topology_record
 from ha_spark.integration_discovery import IntegrationDiscovery
 from ha_spark.logging import get_logger
 from ha_spark.mode_preconditions import entry_preconditions
@@ -152,6 +157,7 @@ class AppState:
         self.executor = executor
         self.integration_link = IntegrationLink(
             None, None, False, ParsedSolarForecast(load_solar_source_kind(settings)),
+            topology=load_topology_record(settings),
         )
         self.loop_tick: datetime | None = None
         self.soc_observation_ok: bool = False
@@ -725,7 +731,7 @@ def _has_origin(scope: Any) -> bool:
     return any(name.lower() == b"origin" for name, _ in scope.get("headers", []))
 
 
-_HEARTBEAT_MAX_BODY = 16 * 1024
+_HEARTBEAT_MAX_BODY = 32 * 1024
 # A body that never finishes must not hold the handler: bytes and time are both bounded.
 _HEARTBEAT_BODY_TIMEOUT_S = 5.0
 
@@ -768,9 +774,7 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
             return invalid
         if version not in SUPPORTED_API_VERSIONS:
             previous = state.integration_link
-            state.integration_link = IntegrationLink(
-                previous.snapshot, previous.received_at, True, previous.solar_forecast,
-            )
+            state.integration_link = replace(previous, skew=True)
             return JSONResponse(version_refusal(), status_code=409,
                                 headers={"Cache-Control": "no-store"})
         try:
@@ -781,7 +785,27 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
         # Missing v2 is a field-local schema violation, never a legacy fallback.
         raw = payload.get("solar_forecast", {}) if version >= 2 else None
         parsed = parse_native_forecast(raw, received_at=now)
-        state.integration_link = IntegrationLink(snapshot, now, False, parsed)
+        previous = state.integration_link
+        topology, changed = accept_topology(
+            state.settings, previous.topology, payload.get("topology") if version >= 3 else None,
+        )
+        readings, readings_reason = parse_major_loads(
+            payload.get("major_loads") if version >= 3 else None, topology,
+        )
+        guard, guard_reason = parse_supply_guard(
+            payload.get("supply_guard") if version >= 3 else None, topology,
+        )
+        state.integration_link = IntegrationLink(
+            snapshot, now, False, parsed, topology, readings, guard, readings_reason, guard_reason,
+        )
+        # Planning inputs for the daemon and in-process agent previews (#542). A
+        # changed record supersedes the limits any in-flight write was planned
+        # under; never an authority change.
+        execution_context().major_loads = major_load_observations(state.integration_link)
+        if changed:
+            execution_context().limits_record = topology
+        if changed and state.executor is not None:
+            state.executor.request_replan()
         if load_solar_source_kind(state.settings) != parsed.kind:
             save_solar_source_kind(state.settings, parsed.kind)
         if state.executor is not None:
@@ -798,6 +822,7 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
                     v2l.load_session(state.settings) if state.settings.v2l_power_entity else None
                 ),
                 settings=state.settings, authority=authority,
+                guard_limited=guard is not None and guard.limiting,
             ),
             headers={"Cache-Control": "no-store"},
         )

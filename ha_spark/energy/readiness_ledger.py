@@ -25,6 +25,7 @@ from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.energy.sources import parse_time
 from ha_spark.energy.supply_guard import throttled_rate_w
 from ha_spark.energy.tariff import _in_overnight_window
+from ha_spark.energy.topology import EffectiveLimits
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -78,6 +79,8 @@ class SlotRecord(BaseModel):
     event_rate: float | None
     forecast_model: str
     config_generation: int
+    limits_source: str | None = None
+    effective_limits: EffectiveLimits | None = None
 
 
 class GuardRecord(BaseModel):
@@ -203,6 +206,8 @@ async def record_slot(
         i = starts.index(start)
         if i >= len(schedule.prices):
             return
+        topology, limits = run.plan.topology, run.plan.effective_limits
+        voltage = topology.banks[0].nominal_voltage_v if topology is not None else 0.0
         intent = run.plan.charge_intent
         held = intent.hold_active(start)
         if ev_hold_active is not None:
@@ -235,7 +240,8 @@ async def record_slot(
             issued_at=revision.issued_at,
             charge_window_fraction=overlap / timedelta(minutes=30),
             charge_current_a=(
-                revision.target_w / cfg.voltage_v if revision.target_w is not None else None
+                revision.target_w / voltage
+                if revision.target_w is not None and voltage > 0 else None
             ),
             export_kw=export_kw,
             hold_state=("held" if held else "not_held") if intent.hold_trusted else "unknown",
@@ -244,9 +250,11 @@ async def record_slot(
                 cfg.capacity_kwh * soc.soc_now / 100 if soc is not None and soc.ok else None
             ),
             capacity_kwh=cfg.capacity_kwh, min_soc=cfg.min_soc, target_cap=cfg.target_cap,
-            voltage_v=cfg.voltage_v, charge_efficiency=cfg.charge_efficiency,
-            max_current_a=cfg.max_current_a,
-            battery_discharge_ceiling_kw=cfg.battery_discharge_ceiling_kw,
+            voltage_v=voltage, charge_efficiency=run.plan.charge_efficiency,
+            max_current_a=limits.banks[0].charge_a if limits is not None else 0,
+            battery_discharge_ceiling_kw=limits.banks[0].discharge_kw if limits is not None else 0,
+            limits_source=run.plan.limits_source,
+            effective_limits=limits,
             import_rate=schedule.prices[i],
             export_rate=(
                 schedule.export_rate if event_rate is not None
@@ -277,11 +285,22 @@ async def record_guard(
     supply: float | None = None
     setpoint: float | None = None
     target: float | None = None
+    limit_a = 0.0
+    supply_voltage = 0.0
+    import_w = 0.0
     try:
         if revision is not None:
             geometry = revision.run.inputs.geometry_for(revision.run.cfg)
-            if geometry is not None and slot_start(now) in geometry.slot_starts:
+            plan = revision.run.plan
+            if (
+                geometry is not None and slot_start(now) in geometry.slot_starts
+                and plan.topology is not None and plan.effective_limits is not None
+            ):
                 target = revision.target_w
+                connection = plan.topology.connections[0]
+                limit_a = connection.import_limit_a
+                supply_voltage = connection.supply_voltage_v
+                import_w = plan.effective_limits.connections[0].import_kw * 1000
     except Exception:
         log.exception("Readiness guard target unavailable")
     try:
@@ -302,12 +321,10 @@ async def record_guard(
         breach: bool | None = None
         if supply is not None and setpoint is not None and target is not None:
             throttle = throttled_rate_w(
-                supply, setpoint, target, limit_a=settings.supply_max_current_a,
-                supply_voltage_v=settings.supply_voltage_v,
+                supply, setpoint, target, limit_a=limit_a,
+                supply_voltage_v=supply_voltage,
             )
-            breach = supply - setpoint + throttle > (
-                settings.supply_max_current_a * settings.supply_voltage_v
-            )
+            breach = supply - setpoint + throttle > import_w
         await ReadinessLedger(settings.db_path).record(GuardRecord(
             observed_at=now.astimezone(UTC), slot_start=slot_start(now),
             revision_id=revision.revision_id if revision else None, sample_valid=valid,

@@ -10,6 +10,7 @@
       "fallback_active": {"name": "Fallback active"},
       "ev_hold": {"name": "EV hold"},
       "dispatch_hold": {"name": "Dispatch hold"},
+      "supply_guard_limiting": {"name": "Supply guard limiting"},
       "addon_connected": {
         "name": "Add-on connected"
       }
@@ -61,17 +62,226 @@
       "forecast_tomorrow": {"name": "Forecast tomorrow"},
       "last_fetch": {"name": "Last fetch"},
       "api_calls_used": {"name": "API calls used"},
+      "charging_allowance": {"name": "Charging allowance"},
+      "guard_restores_left_today": {"name": "Guard restores left today"},
       "last_run": {
         "name": "Last run"
       }
     }
   },
   "options": {
+    "error": {
+      "invalid_number": "Enter a finite number.",
+      "out_of_range": "Enter a number in the valid range for this field.",
+      "invalid_id": "Use 1-64 letters, numbers, underscores or hyphens.",
+      "duplicate_id": "This identifier is already in use.",
+      "invalid_entity": "Enter a valid entity id.",
+      "unknown_bank": "Choose one of the configured battery banks.",
+      "unknown_connection": "Choose one of the configured grid connections.",
+      "duplicate_v2l_bank": "This bank already has a V2L charger.",
+      "invalid_soc_range": "The minimum SoC must not exceed the target cap.",
+      "invalid_load_attribution": "Enter either a served-load share or a load source, not both and not neither.",
+      "invalid_load_demand": "Enter the demand fields for this kind of load.",
+      "multiple_dispatch_loads": "Only one EV charger can be marked as the one dispatches drive.",
+      "invalid_load_shares": "The served-load shares of banks without a load source on one connection must sum to 100%.",
+      "incomplete_topology": "The site needs at least one connection, bank and inverter.",
+      "invalid_topology": "The topology is not valid. Check the entries and try again.",
+      "invalid_item": "This entry is not valid.",
+      "remove_last": "The site needs at least one of these; it cannot be removed.",
+      "connection_in_use": "Banks or major loads still use this connection.",
+      "bank_in_use": "Inverters or a V2L charger still use this bank."
+    },
     "step": {
       "init": {
+        "title": "ha-spark options",
+        "menu_options": {
+          "solcast": "Solcast daily allowance",
+          "topology": "Site topology and limits"
+        }
+      },
+      "solcast": {
         "title": "Solcast daily allowance",
         "description": "Choose 50 only for a legacy account with that allowance. Calls reset at midnight UTC.",
         "data": {"calls_limit": "Daily API call limit"}
+      },
+      "topology": {
+        "title": "Site topology and limits",
+        "description": "Describe the site's grid connections, battery banks, inverters, V2L charger and major loads. Save applies the whole document at once.",
+        "menu_options": {
+          "connections": "Grid connections",
+          "banks": "Battery banks",
+          "inverters": "Inverters",
+          "v2l_chargers": "V2L charger",
+          "major_loads": "Major loads",
+          "save": "Save topology"
+        }
+      },
+      "connections": {
+        "title": "Grid connections",
+        "menu_options": {
+          "connections_add": "Add a connection",
+          "connections_edit": "Edit a connection",
+          "connections_remove": "Remove a connection",
+          "connections_done": "Back to the topology"
+        }
+      },
+      "connections_item": {
+        "title": "Grid connection",
+        "description": "One grid connection with its AC supply limits.",
+        "data": {
+          "id": "Identifier",
+          "supply_voltage_v": "Supply voltage (V)",
+          "import_limit_a": "Supply import limit (A)",
+          "export_limit_a": "Supply export limit (A)",
+          "dno_export_limit_kw": "DNO export permission (kW)",
+          "grid_power_entity": "Grid power sensor"
+        }
+      },
+      "connections_edit": {
+        "title": "Edit a connection",
+        "data": {"id": "Connection"}
+      },
+      "connections_remove": {
+        "title": "Remove a connection",
+        "data": {"id": "Connection"}
+      },
+      "banks": {
+        "title": "Battery banks",
+        "menu_options": {
+          "banks_add": "Add a bank",
+          "banks_edit": "Edit a bank",
+          "banks_remove": "Remove a bank",
+          "banks_done": "Back to the topology"
+        }
+      },
+      "banks_item": {
+        "title": "Battery bank",
+        "description": "One energy store with its DC limits. Enter either a served-load share or a load source.",
+        "data": {
+          "id": "Identifier",
+          "connection_id": "Grid connection",
+          "usable_capacity_kwh": "Usable capacity (kWh)",
+          "nominal_voltage_v": "Nominal DC voltage (V)",
+          "min_soc": "Minimum SoC (%)",
+          "target_cap": "Target cap (%)",
+          "charge_limit_a": "DC charge limit (A)",
+          "discharge_limit_a": "DC discharge limit (A)",
+          "served_load_share_pct": "Served-load share (%)",
+          "load_source_entity": "Load source sensor"
+        }
+      },
+      "banks_edit": {
+        "title": "Edit a bank",
+        "data": {"id": "Bank"}
+      },
+      "banks_remove": {
+        "title": "Remove a bank",
+        "data": {"id": "Bank"}
+      },
+      "inverters": {
+        "title": "Inverters",
+        "menu_options": {
+          "inverters_add": "Add an inverter",
+          "inverters_edit": "Edit an inverter",
+          "inverters_remove": "Remove an inverter",
+          "inverters_done": "Back to the topology"
+        }
+      },
+      "inverters_item": {
+        "title": "Inverter",
+        "description": "One inverter with its owner-entered DC limits. Unconfirmed limits count as zero.",
+        "data": {
+          "id": "Identifier",
+          "bank_id": "Battery bank",
+          "driver_kind": "Driver",
+          "charge_limit_a": "DC charge limit (A)",
+          "discharge_limit_a": "DC discharge limit (A)",
+          "confirmed": "Limits confirmed",
+          "grid_port_power_entity": "Grid-port power sensor",
+          "battery_power_entity": "Battery power sensor",
+          "power_sign": "Power sign convention"
+        }
+      },
+      "inverters_edit": {
+        "title": "Edit an inverter",
+        "data": {"id": "Inverter"}
+      },
+      "inverters_remove": {
+        "title": "Remove an inverter",
+        "data": {"id": "Inverter"}
+      },
+      "v2l_chargers": {
+        "title": "V2L charger",
+        "menu_options": {
+          "v2l_chargers_add": "Add a V2L charger",
+          "v2l_chargers_edit": "Edit the V2L charger",
+          "v2l_chargers_remove": "Remove the V2L charger",
+          "v2l_chargers_done": "Back to the topology"
+        }
+      },
+      "v2l_chargers_item": {
+        "title": "V2L charger",
+        "description": "One V2L charger as a DC source into a bank; at most one per bank.",
+        "data": {
+          "id": "Identifier",
+          "bank_id": "Battery bank",
+          "max_current_a": "Maximum DC current (A)"
+        }
+      },
+      "v2l_chargers_edit": {
+        "title": "Edit the V2L charger",
+        "data": {"id": "V2L charger"}
+      },
+      "v2l_chargers_remove": {
+        "title": "Remove the V2L charger",
+        "data": {"id": "V2L charger"}
+      },
+      "major_loads": {
+        "title": "Major loads",
+        "menu_options": {
+          "major_loads_add": "Add a major load",
+          "major_loads_edit": "Edit a major load",
+          "major_loads_remove": "Remove a major load",
+          "major_loads_done": "Back to the topology"
+        }
+      },
+      "major_load_kind": {
+        "title": "Kind of major load",
+        "data": {"kind": "Kind"}
+      },
+      "major_load_ev": {
+        "title": "EV charger",
+        "description": "One EV charger with its demand. At most one can be marked as the one dispatches drive.",
+        "data": {
+          "id": "Identifier",
+          "connection_id": "Grid connection",
+          "demand_kw": "Demand (kW)",
+          "power_entity": "Power sensor",
+          "dispatch_driven": "The one dispatches drive"
+        }
+      },
+      "major_load_heat": {
+        "title": "Heat pump",
+        "description": "One heat pump with both seasonal demands; it counts at the larger.",
+        "data": {
+          "id": "Identifier",
+          "connection_id": "Grid connection",
+          "heating_demand_kw": "Heating demand (kW)",
+          "cooling_demand_kw": "Cooling demand (kW)",
+          "power_entity": "Power sensor"
+        }
+      },
+      "major_loads_edit": {
+        "title": "Edit a major load",
+        "data": {"id": "Major load"}
+      },
+      "major_loads_remove": {
+        "title": "Remove a major load",
+        "data": {"id": "Major load"}
+      },
+      "save": {
+        "title": "Save topology",
+        "description": "Apply the whole topology document, or return to fix what is refused."
       }
     }
   },
