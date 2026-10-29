@@ -19,8 +19,9 @@ Settings, presets and agent requests cannot change the operating mode.
 
 ## Companion integration
 
-The read-only companion integration gives ha-spark's entities a place in Home
-Assistant's entity registry, on one **ha-spark** service device.
+The companion integration holds the site's topology and limits, runs the supply
+guard, and gives ha-spark's entities a place in Home Assistant's entity
+registry, on one **ha-spark** service device.
 
 1. In HACS, open **Custom repositories**, add
    `https://github.com/Kylevdm/ha-spark`, and choose category **Integration**.
@@ -32,7 +33,9 @@ The add-on announces itself through Supervisor discovery. There is one entry
 per site, and an add-on restart reconnects it without another confirmation.
 Adding the integration manually points you to the add-on; there is no manual
 host, port or token form. Standalone installs do not have an integration yet.
-Installing it does not change the operating mode or any hardware control.
+Describe your grid connections, battery banks, inverters, V2L charger and major
+loads under **Options → Site topology and limits** (see below). Installing the
+integration does not change the operating mode or any hardware control.
 
 ### Native Solcast
 
@@ -45,9 +48,10 @@ below is off and the legacy entity path is unchanged.
   sites (up to two) and saves their resource ids. Entering an empty key asks for
   confirmation before removing native Solcast. A key Solcast rejects raises
   Home Assistant's reauthentication prompt.
-- **Daily call limit.** The integration's **Options** flow sets the account
+- **Daily call limit.** **Options → Solcast daily allowance** sets the account
   allowance: 10 calls per UTC day by default, or 50 for a legacy account. The
-  key itself stays in the config entry and is never copied to the add-on.
+  key itself stays in the config entry and is never copied to the add-on. The
+  same **Options** menu also opens **Site topology and limits**.
 - **Quota and polling.** Every Solcast request, including key checks and retries,
   is counted and persisted before it is sent. The count survives restarts and
   resets at 00:00 UTC. A restart reuses the saved forecast and makes no call. One
@@ -108,6 +112,9 @@ These are the initial entity ids; you can rename them in Home Assistant.
 | Fallback active | `binary_sensor.ha_spark_fallback_active` | Read-only mirror; causes attribute |
 | EV hold | `binary_sensor.ha_spark_ev_hold` | Read-only mirror; cause attribute |
 | Dispatch hold | `binary_sensor.ha_spark_dispatch_hold` | Read-only mirror; cause and trusted end attributes |
+| Supply guard limiting | `binary_sensor.ha_spark_supply_guard_limiting` | Problem; on while the integration's supply guard holds a cut |
+| Charging allowance | `sensor.ha_spark_charging_allowance` | kW; diagnostic; total of the guards in force, `unknown` when none is limiting |
+| Guard restores left today | `sensor.ha_spark_guard_restores_left_today` | Diagnostic, disabled by default; fewest restores left on any connection |
 
 Plan status describes the plan's intended action, not device read-back. Its
 attributes give the reason, model, strategy, SoC status and reason, and export
@@ -122,9 +129,12 @@ heartbeat. A rejected token, changed session or incompatible API version ends
 the session at once. Losing the connection changes no authority or fallback
 behaviour in the add-on.
 
-All summary-fed entities show `unavailable` without a counted heartbeat,
-except **Last run**, which keeps its last value even when no plan exists after
-an add-on restart. **Add-on connected** itself is always available. SoC-derived
+*Supply guard limiting*, *Charging allowance* and *Guard restores left today* are
+created only after a topology is saved. They become available when the
+integration's guard loop starts, independently of the add-on link; the other
+summary-fed entities show `unavailable` without a counted heartbeat, except
+**Last run**, which keeps its last value even when no plan exists after an
+add-on restart. **Add-on connected** itself is always available. SoC-derived
 sensors also show `unavailable` while SoC is not trusted; the V2L sensors do so
 while V2L is unconfigured or has no valid sample. A missing plan value shows
 `unknown`; **Next planned change** is `unknown` when no change is scheduled.
@@ -152,7 +162,11 @@ hardware has verified it.
 Protect and Optimise require confirmation. Before enabling Optimise, disable
 any pre-existing automations or manual schedules that write the same devices.
 Entering Optimise also requires no SoC fallback or recovery in progress; wait
-for SoC recovery before requesting the change.
+for SoC recovery before requesting the change. Entering Protect or Optimise is
+also refused while any saved inverter's limits are unconfirmed, with *every
+controllable inverter's limits must be confirmed*. An unusable accepted
+topology record refuses both with its own reason. Leaving a mode is never
+blocked, and editing limits never changes the mode or grants authority.
 Axle export remains supervised: ha-spark will arm configured export windows,
 but a person must be present for preparation and verified cleanup (see the
 [supervised-export runbook](../docs/runbooks/supervised-axle-export.md)).
@@ -356,6 +370,141 @@ fields concerned. The whole candidate waits: no live part of the same save
 runs ahead, and later saves remain pending while restart-field differences
 remain. Restart loads and checks the committed candidate as a whole.
 
+### Site topology and limits (companion integration)
+
+The companion integration owns the site's topology and limits in its config
+entry (ADR-0006), so they remain available while the add-on is down. Open
+**Settings → Devices & services → ha-spark → Options**. The menu offers
+**Solcast daily allowance** and **Site topology and limits**. The topology menu
+edits **Grid connections**, **Battery banks**, **Inverters**, **V2L charger**
+and **Major loads**, then **Save topology**; each collection has Add, Edit,
+Remove and Back.
+
+Edits stay in a draft and nothing applies until **Save topology**. A save
+validates the whole document and stores it with a revision that goes up by one,
+and reloads the integration; a newly accepted revision triggers one replan. It
+never changes the operating mode or authority. A refused save shows the error
+and keeps the previous topology live; the draft is lost if you close the flow.
+Removing a connection still used by a bank or major load, a bank still used by
+an inverter or V2L charger, or the last connection, bank or inverter is refused.
+The site holds at
+most 4 connections, 6 banks, 8 inverters, one V2L charger per bank and 12 major
+loads. Identifiers are unique across the site and are 1–64 letters, digits, `_`
+or `-`; sensors must be Home Assistant entity ids. Each inverter belongs to
+exactly one bank and each bank to exactly one connection. Every number must be
+finite and within its field's range.
+
+- **Grid connection:** supply voltage 200–260 V; supply import and export
+  limits 0–200 A AC (default 0); DNO export permission 0–100 kW (default 0,
+  meaning no export); optional grid-power sensor.
+- **Battery bank:** grid connection; usable capacity over 0 up to 200 kWh;
+  nominal DC voltage 12–1000 V; minimum SoC and target cap 0–100% (minimum no
+  greater than the cap); DC charge and discharge limits 0–500 A (default 0,
+  where 0 disables that direction); exactly one of a served-load share or a
+  load source sensor. Shares of banks without a load source on one connection
+  must total 100%.
+- **Inverter:** bank; driver `solis` or `alphaess`; DC charge and discharge
+  limits 0–500 A (default 0); **Limits confirmed** (default off, and
+  unconfirmed limits count as 0 A); optional grid-port power and battery power
+  sensors, with power sign `positive_import` or `negative_import`.
+- **V2L charger:** bank; maximum DC current 0–500 A. At most one per bank.
+- **Major load:** kind EV charger or heat pump; grid connection; optional power
+  sensor. An EV charger has demand over 0 up to 50 kW (default 7.4 kW) and can
+  be marked **The one dispatches drive** (at most one site-wide). A heat pump
+  needs both heating and cooling demand over 0 up to 50 kW, with no default,
+  and counts at the larger. Induction hobs and electric showers are not major
+  loads; they stay in base load.
+
+**Effective limits.** The add-on recomputes effective limits from the validated
+topology; the integration sends only owner values and never a computed limit.
+Per inverter, the effective limit is the smaller of the owner-entered limit and
+the driver's known ceiling, and 0 A while unconfirmed. The legacy Solis driver
+declares the verified 62.5 A register limit as its charge and discharge ceiling
+and a 1 A setpoint step; AlphaESS declares no settable charge rate. Per bank,
+the DC limits are capped by the sum of its inverters, with the bank's nominal
+voltage converting DC amps to kW. Per grid connection, the supply import budget
+is the import limit times the supply voltage, and the site export limit is the
+stricter of the DNO export permission and the export limit times voltage.
+Charge currents are rounded down to the driver's setpoint step, so rounding
+never goes over a ceiling (Solis uses whole amps).
+
+`ha-spark health` shows the effective limits under **Effective limits**, and
+`ha-spark plan` shows **Effective limits**, **Charge allocation** and, when
+needed, **Limits** lines. The source is one of:
+
+- `legacy`: no topology is saved. The flat add-on settings
+  (`max_charge_current_a`, `battery_discharge_ceiling_kw`,
+  `dno_export_limit_kw`, `supply_max_current_a`, `supply_voltage_v` and
+  `battery_voltage_v`) act as one inverter, one bank and one connection with no
+  major loads. Plans are unchanged apart from rounding down, the fixed-command
+  export refusal and the 62.5 A Solis ceiling for owner limits above it; a
+  configuration whose supply import genuinely limits charging now sees that
+  limit too.
+- `native`: the saved topology is exactly one connection, one bank and one
+  inverter whose driver matches the add-on's `inverter`. It drives planning,
+  the Solis charge, fallback and restore currents, fallback validation and the
+  add-on's supply guard. A write planned under a superseded limits revision is
+  refused as stale limits.
+- `native (preview only)`: any other topology. The plan is computed for display
+  with the reason *planning across several banks or connections arrives with
+  per-bank SoC*, plus **Preview limits** and **Preview target … (display only,
+  not applied)**. Hardware keeps the last accepted single-inverter topology,
+  else the legacy settings; health adds *the writer keeps the native limits*
+  or *the writer keeps the legacy limits*. Several inverters on one bank are
+  planned with the bank allocation split across them; any topology that does
+  not match the live writer's exact single-inverter shape is preview-only for
+  hardware, including several banks or connections until per-bank SoC arrives.
+
+The add-on stores the last accepted topology durably in
+`ha_spark_topology.json`, with an initialisation marker, beside the database in
+`/data`. Once a native topology is accepted it never returns to the legacy
+fields, even across restarts or an older integration. An unreadable record
+after acceptance fails closed: *Planning limits are unavailable: the accepted
+topology record cannot be read.*, with no limit- or SoC-derived writes, no
+normal programming and no fallback current until the next valid snapshot.
+Out-of-range legacy settings similarly show *Planning limits are unavailable:
+the limit settings are outside the supported range.* (zero charge, no export).
+`health` **Topology** shows `legacy`, `native` or `unavailable`, with the
+revision and any reason. The **Integration link** check can add
+`invalid_topology`, `topology_not_configured`, `topology_save_failed`,
+`topology_record_unavailable`, `invalid_major_loads` or `invalid_supply_guard`.
+A new accepted revision triggers one replan.
+
+In 0.30.0, several banks or connections are preview-only until per-bank SoC
+arrives; re-adding the integration restarts its topology revision at 1, and the
+add-on keeps the old accepted topology until a save passes that revision; V2L
+refills and bank capacity, minimum SoC and target cap still come from the
+add-on settings. There is no native integration writer yet (see **Supply
+guard**).
+
+### Major-load reserve
+
+Major loads are the declared EV chargers and heat pumps on a grid connection.
+In every slot, charging capacity leaves unused the larger of the biggest major
+load and half of all major loads that are neither running nor expected. A
+running load counts at its measured draw and leaves the reserve; one with no
+power sensor, or with a missing, stale or invalid reading, stays in the reserve,
+so a load ha-spark cannot see is never assumed off. Running means a reading
+reported within 60 s, finite, non-negative, not in the future and at least 10%
+of demand. Expected means the one EV charger marked **The one dispatches
+drive**, in planned dispatch slots; an expected EV without a power sensor
+counts at its demand and leaves the reserve. Each load's reserve comes out of
+its own grid connection.
+
+If the reserve stops the bank reaching its target, the plan says *Charging
+limited by the major-load reserve.* A hardware limit says *Charging limited by
+hardware: <id>.*, naming the binding inverter, bank or connection. Neither
+reason appears when it did not cause the shortfall. When the latest recorded
+load forecast's peak overnight base load plus the reserve exceeds a
+connection's import limit, `health` and the plan diagnostics warn *Major-load
+reserve exceeds supply room after forecast overnight base load.*; the warning
+never blocks. The plan never uses an owner-entered figure for this check.
+
+With a saved native topology, planned in-window V2L power comes out of its
+bank's charge room, never site import. Two inverters on one bank share the
+bank allocation in proportion to their effective limits, each within its own,
+so 125 A is used only when the bank and connection allow it.
+
 ### Owner CLI
 
 Run these inside the add-on container, or in your standalone environment:
@@ -440,7 +589,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `soc_max_report_age_minutes` | How old Home Assistant's `last_reported` for `soc_entity` may be before ha-spark treats the SoC as stale and blocks real charge writes (default `10.0`). Some integrations never re-report an unchanged SoC, so an older SoC still counts as fresh if `battery_voltage_entity` reported within this age, which shows the integration is live. That exception lasts up to 12 hours. ha-spark does not check whether the battery is idle |
 | `soc_failure_threshold` | How many consecutive failed SoC observations trigger the configured Solis fallback (default `3`). Before fallback entry, one good observation resets the count. Once fallback is requested, verified, or unconfirmed, a passing observation leaves it in place until recovery (`soc_recovery_minutes`) |
 | `soc_recovery_minutes` | How many minutes of continuously passing SoC observations an active Solis fallback needs before ha-spark recovers (default `10`). Any failed observation restarts the count. The SoC may move, but its `last_reported` must never go backwards and must advance at least once; the battery-voltage liveness exception does not count. ha-spark then computes a fresh plan from the current SoC and the remaining cheap-rate window. The fallback stays in place until that plan is written and read back; a failed or mismatched read-back keeps the fallback and retries every minute. In Observe nothing is written, so recovery completes once the fresh plan is computed |
-| `solis_fallback_current_a` | Optional fallback-current ceiling in amps. When set, a sustained SoC failure programs only the configured `charge_window_start`–`charge_window_end` and this current, capped by `max_charge_current_a` and the Solis 62.5 A register limit. It is disabled when blank; there is no implicit current default. Only a successful Solis read-back is reported as verified |
+| `solis_fallback_current_a` | Optional fallback-current ceiling in amps. When set, a sustained SoC failure programs only the configured `charge_window_start`–`charge_window_end` and this current. It is checked against the effective charge limit (your setting and the 62.5 A Solis register limit, or the saved native inverter and bank limits) and the effective site supply, and refused with a named reason when above either. The setting remains bounded at 1–62.5 A. It is disabled when blank; there is no implicit current default. Only a successful Solis read-back is reported as verified |
 | `battery_power_entity` | Optional battery power in W, sampled each minute to check SoC against energy flow. The Solis preset uses `sensor.solisac_battery_power`. Both power signs count. Jumps unexplained by energy flow by more than 2 percentage points fail; unchanged SoC fails after more than 2 points of energy flows. Two consecutive reads of a rejected changed value accept a possible BMS recalibration with a warning. Missing power skips that interval; without this setting these checks are off. The baseline resets on restart |
 | `battery_voltage_entity` | Battery voltage (V). ha-spark also uses it to tell whether the SoC's source is live, so pick the voltage sensor from the same integration as `soc_entity` |
 | `solar_tomorrow_entity` | Solcast "forecast tomorrow" sensor (with `detailedForecast` attribute). Used only by sites without native Solcast; ignored once a Solcast key is configured |
@@ -449,7 +598,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `dispatch_entity` | Octopus Intelligent dispatching binary sensor |
 | `ev_plug_entity` / `ev_status_entity` | EV charger plug/status sensors; `ev_status_entity` also drives the charging hold |
 | `consumption_energy_entity` | Household load energy statistic, excluding battery and EV charging |
-| `grid_power_entity` | Optional whole-house supply power sensor (W); enables the supply guard |
+| `grid_power_entity` | Optional whole-house supply power sensor (W); enables the add-on's daemon supply guard |
 | `charge_current_entity` | Optional inverter timed-charge current `number` entity for dashboards and telemetry. ha-spark controls the Solis natively (see below) |
 | `inverter_power_switch_entity` | Inverter power switch `select` entity that the per-minute dispatch-hold check writes |
 | `ha_template_charge_needed_entity` | Optional HA template sensor; the plan report shows its value next to ha-spark's for comparison |
@@ -577,7 +726,13 @@ run report gives the reason.
 Single-inverter installs need no change here. ha-spark still reads the flat
 `inverter` and entity-ID settings above, deriving devices in memory without
 persisting that derived list in the settings document. `devices` is the structured alternative for installs
-that need explicit device definitions. The site operating mode covers them all:
+that need explicit device definitions. The site operating mode covers them all.
+The companion integration's saved topology is the native source of planning
+limits, while this setting still defines the devices the add-on writes. The two
+drive the plan together only when the topology has exactly one connection, one
+bank and one inverter whose driver matches `inverter`; any other topology is
+preview-only for planning and hardware keeps the last accepted supported
+limits.
 
 ```yaml
 devices:
@@ -595,7 +750,13 @@ devices:
 
 - `battery_capacity_kwh`, `battery_voltage_v`, `min_soc`, `target_soc_cap`,
   `max_charge_current_a`, `solis_fallback_current_a`: the battery and inverter
-  model. The fallback current is optional and has no default.
+  model. The fallback current is optional and has no default. With a saved
+  native topology, the plan and the Solis charge, fallback and restore currents
+  use the effective inverter and bank charge limits, capped by the 62.5 A driver
+  ceiling and rounded down to whole amps; battery capacity, voltage, minimum SoC
+  and target cap still come from these add-on settings. Without a topology the
+  flat settings act as one inverter, one bank and one connection (see **Site
+  topology and limits**).
 - `charge_strategy`: `deficit` buys only the forecast shortfall; `fill`
   charges to `target_soc_cap` every night, which pays once the export rate is
   higher than the off-peak rate.
@@ -632,16 +793,54 @@ compute and return the plan, but refuse hardware writes with a clear reason.
 CLI plan/run exit successfully after printing that refusal; `sync-clock`
 returns 1 because no sync was verified (2 for a non-Solis install).
 
-### Supply guard (optional)
+### Supply guard
 
-If an EV dispatch overlaps the battery's timed charge, total supply draw can
-exceed what the main fuse should carry. Set `grid_power_entity` to a
-whole-house supply power sensor (W). On every tick inside the charge window,
-the daemon then lowers the timed-charge current to keep total draw under
-`supply_max_current_a` (default 75 A), and raises it back toward the planned
-current as headroom returns. `supply_voltage_v` (default 240) converts the
-sensor's watts to amps. The guard's writes follow the site operating mode and
-safety checks, as the plan's do. Leave `grid_power_entity` empty to turn the guard off.
+Two guards exist in 0.30.0. Only the add-on's daemon guard writes, and it only
+lowers controlled charging; neither guard ever starts a charge.
+
+**Companion integration guard.** Saving a topology starts the integration's own
+guard loop for each grid connection. It reacts to grid-power reports rather
+than a fixed tick and keeps running while the add-on is down. It needs a supply
+import limit above 0, a grid-power sensor (W or kW, positive import) and an
+inverter grid-port or battery power sensor on that connection; other load is
+site import minus the inverters' measured import. A reading counts as missing
+when it is unavailable, non-numeric or older than 60 s. The V2L charger is
+ignored, because car energy is not grid import.
+
+**In 0.30.0 it has no hardware writer** and never changes the inverter; the
+add-on's daemon guard below is still what lowers the charge current. From the
+readings alone it marks a cut after 2 consecutive readings with site import
+more than 200 W above the supply limit, showing an allowance of the supply limit
+minus measured other load (never below zero), and clears it after 5 continuous
+minutes with at least 200 W of supply headroom. Clearing a displayed cut spends
+no restore. The writer's rules (writes only in Protect or Optimise with the mode
+taken from the add-on's authority mirror, at most 48 restores per household day,
+and one latched 50% cut after 2 minutes of missing readings when supply headroom
+was already short) arrive with it in a later release.
+
+The site device gets **Supply guard limiting** (problem), **Charging
+allowance** (diagnostic, kW, `unknown` when not limiting) and **Guard restores
+left today** (diagnostic, disabled by default), created only when a topology is
+saved and available whenever the guard loop runs, even without the add-on link.
+The diagnostics download adds each connection's cut state, the last 48 cut and
+restore events and the raw readings. While limiting, the add-on's *Plan status*
+adds *Charging limited by the supply guard.* for display only; the planner
+never plans from the live allowance. Dormancy reasons shown in diagnostics are
+`no_supply_limit`, `no_grid_source`, `no_inverter_measurement`,
+`awaiting_reading` and `missing_reading`; warn reasons are
+`authority_unavailable`, `guard_save_failed` and `guard_write_failed`.
+
+**Add-on daemon guard.** If an EV dispatch overlaps the battery's timed charge,
+total supply draw can exceed what the main fuse should carry. Set
+`grid_power_entity` to a whole-house supply power sensor (W). On every tick
+inside the charge window, the daemon then lowers the timed-charge current to
+keep total draw under the effective connection import limit
+(`supply_max_current_a`, default 75 A, under the legacy settings), and raises
+it back toward the planned current as supply headroom returns.
+`supply_voltage_v` (default 240) converts the sensor's watts to amps. The
+guard's writes follow the site operating mode and safety checks, as the plan's
+do. Leave `grid_power_entity` empty to turn this daemon guard off. For now it
+is the only guard that writes.
 
 ### SoC integrity and fallback
 
@@ -673,6 +872,13 @@ lines give the detailed operating state and recovery progress:
   fallback remains the reported state until that plan reads back clean, logged
   as `[RECOVERED]`. If it doesn't, the fallback is kept but marked unconfirmed,
   and ha-spark retries each minute.
+
+The fallback current is checked again before every apply against the effective
+inverter and bank charge limit and the effective site supply. An above-limit
+value is refused with its named reason, for example *solis_fallback_current_a (X
+A) is above the effective charge limit (Y A)*, and unusable limits with *the
+legacy limits are outside the supported topology*; it is never silently
+clamped.
 
 A computed plan is not a confirmed program. While the SoC is untrusted, the
 SoC-dependent plan sensors show `unavailable`, and only a matching read-back
@@ -763,12 +969,15 @@ The pure slot planner can schedule V2L refills when overnight charge and solar
 leave a named reservation short, and the car's fill price divided by
 `v2l_round_trip_efficiency` is cheaper than grid import for that shortfall.
 Refill kWh and rates describe energy delivered into the house battery. Refills
-finish before the load they fund, respect battery headroom, run at the preferred
-rate (possibly for part of a slot), and share `v2l_budget_kwh` across the plan.
+finish before the load they fund, respect the battery's spare capacity, run at
+the preferred rate (possibly for part of a slot), and share `v2l_budget_kwh`
+across the plan.
 A zero budget disables planning. The explicit `car_plugged_in` planner input
 defaults to false; an economic, feasible refill then sets
-`v2l_wanted_but_unavailable` instead of scheduling energy. HA plugged-in sensing
-and rectifier actuation are separate work; these actions are plan data only.
+`v2l_wanted_but_unavailable` instead of scheduling energy. With a saved native
+topology, planned in-window V2L power comes out of its bank's charge room, never
+site import. HA plugged-in sensing and rectifier actuation are separate work;
+these actions are plan data only.
 
 V2L is a manual physical adapter with no control API, so ha-spark only reads
 it. When `v2l_power_entity` is set, each daemon tick reads the car's V2L
@@ -812,7 +1021,7 @@ V2L when a paid export slot would still be skipped for funding, even after
 spending the post-event reserve. It asks only when the charge window can't fix
 the gap, which means one of these:
 
-- the overnight charge was capped by `max_charge_current_a` for the window;
+- the overnight charge was capped by the effective charge limit for the window;
 - on the event day, live SoC is more than `v2l_soc_tolerance_pct` points below
   what the last overnight plan expected for that time.
 
@@ -846,8 +1055,10 @@ The daemon captures half-hour slot intent and the import, export and event rates
 from the plan revision in force on the boundary tick. The ledger includes the
 operating mode, forecast model and config generation, battery parameters, checked
 start energy, charge-window fraction and current, export, hold intent and V2L
-availability. Untrusted hold evidence is recorded as unknown; an untrusted SoC
-leaves the energy estimate missing, never zero.
+availability. It stores the effective limits and limits source the plan used,
+and guard samples are measured against the effective connection import limit.
+Untrusted hold evidence is recorded as unknown; an untrusted SoC leaves the
+energy estimate missing, never zero.
 
 Records are write-once in the existing SQLite database. Mid-slot replans do not
 replace them. The first daemon tick in a slot can capture it within the five-minute
@@ -988,13 +1199,20 @@ the inverter clock from the household clock and reads it back. It writes only
 when the site operating mode authorises clock changes. ha-spark never runs it on its own, except after
 a daylight-saving change when `inverter_clock_dst_sync` is on.
 
-For paid export, the planner uses `battery_discharge_ceiling_kw` (default 3.2)
-as a conservative battery output and `dno_export_limit_kw` as your
-installation's grid-export limit. That defaults to 3.68 kW, the G98
-fit-and-inform limit (16 A single-phase); raise it only to the limit in your
-DNO's G99 approval. Both caps are separate from the Solis prototype's fixed
-62.5 A timed-discharge command. The export path is supervised and has not been
-validated on hardware for unattended use. Follow the
+For paid export, the planner uses the effective discharge each bank can give,
+capped by both the bank and its inverters, as its battery output. It uses the
+site export limit as your installation's grid-export limit: the stricter of your
+DNO export permission and the export direction of the supply current limit.
+Under the legacy settings the permission defaults to 3.68 kW (16 A
+single-phase); set it to the permission in your DNO's approval. In a saved
+topology the DNO field defaults to 0, meaning no export. These caps are separate
+from the Solis prototype's fixed 62.5 A timed-discharge command. Under a saved
+native topology that command is refused when it exceeds the effective inverter
+or bank discharge ceiling; the legacy settings keep it unchanged. The planner
+applies the same fixed-command check and skips such a slot with
+*Skipped paid slot: fixed export command exceeds the effective discharge
+ceiling.* The export path is supervised and has not been validated on hardware
+for unattended use. Follow the
 [`supervised Axle export runbook`](../docs/runbooks/supervised-axle-export.md)
 for every live test.
 
@@ -1034,6 +1252,11 @@ ingress headers get `403`, missing or bad tokens get `401`, unsupported API
 versions get a `409` version refusal, and authenticated requests in
 configuration repair get `503`. The route is not served on the agent port or
 in standalone mode. The port is not mapped to the host network.
+
+The snapshot is `api_version` 3 and may carry the site topology, the major-load
+readings and the supply guard's state. Both halves support versions 1–3, so
+either update order works. A snapshot without those blocks means the legacy
+limits, and nothing changes until you save a topology.
 
 The separate `/api/*` ingress endpoints answer only connections from Home
 Assistant's ingress proxy (`172.30.32.2`); requests from any other address get
@@ -1120,9 +1343,10 @@ every hardware decision.
 
 1. **Check the Log tab** after the first start. The add-on runs
    `ha-spark health` and prints one line per check: HA REST, HA WebSocket,
-   Ollama, SQLite, load history, supply guard, tariff provider, household
-   clock, inverter clock (Solis only), notify service (when configured), entity config,
-   and integration link. The link is connected, never connected, unreachable after
+   Ollama, SQLite, load history, supply guard, effective limits, topology,
+   tariff provider, household clock, inverter clock (Solis only), notify
+   service (when configured), entity config, and integration link. The link is
+   connected, never connected, unreachable after
    90 seconds, or version skew. With no daemon running (as in the startup check, which runs
    before the daemon) the link is unknown and not flagged. A missing or disconnected integration
    is a warning, never a failure, including in configuration repair.
@@ -1263,7 +1487,10 @@ The SQLite store lives at the fixed `/data/ha_spark.db` in the add-on and
 survives restarts and updates. It holds history, not settings. Standalone/dev
 uses bootstrap `DB_PATH` to fix the database and data directory at startup.
 `db_path` is not a runtime setting: neither a save nor an import can move the
-data directory or database. Settings and secrets live beside it.
+data directory or database. Settings and secrets live beside it. The add-on
+also keeps the last accepted native topology in `ha_spark_topology.json`, with
+an initialisation marker (`ha_spark_topology.initialised`), beside the database.
+The daemon is its only writer; the CLI and agent previews only read it.
 
 Dispatch power evidence: `ev_power_entity` reads direct car draw (W or kW).
 `dispatch_grid_power_entity` supplies an independent grid-import reading;
