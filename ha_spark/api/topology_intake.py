@@ -14,8 +14,8 @@ from ha_spark.config import Settings
 from ha_spark.energy.topology import FrozenModel, SafeId, Topology, effective_limits
 from ha_spark.energy.topology_record import (
     LoadedTopology,
+    drives_writer,
     save_topology_record,
-    single_inverter,
 )
 
 
@@ -92,12 +92,12 @@ def accept_topology(
     if previous.revision is not None and block.revision < previous.revision:
         return replace(previous, reason="invalid_topology"), False
     supported: tuple[int, Topology] | None = None
-    if single_inverter(block.topology):
+    if drives_writer(block.topology, settings):
         supported = (block.revision, block.topology)
     elif previous.supported_revision is not None and previous.supported_topology is not None:
         supported = (previous.supported_revision, previous.supported_topology)
     elif (previous.kind == "native" and previous.revision is not None
-          and previous.topology is not None and single_inverter(previous.topology)):
+          and previous.topology is not None and drives_writer(previous.topology, settings)):
         supported = (previous.revision, previous.topology)
     try:
         save_topology_record(settings, block.revision, block.topology, supported)

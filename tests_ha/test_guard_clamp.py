@@ -121,3 +121,43 @@ def test_v2l_is_not_grid_draw() -> None:
     results = [clamp_intent(intent, allowance_kw=1, last_requested_a={inv.id: 40}, topology=s,
                             limits=effective_limits(s)) for s in (site, other)]
     assert results[0] == results[1]
+
+
+@pytest.mark.parametrize("requests", [
+    [("one", 20), ("two", 20)],
+    [("two", 20), ("one", 20)],
+    [("one", 20), ("two", 20), ("one", 5), ("two", 40)],
+])
+async def test_resident_total_never_exceeds_the_allowance(
+    requests: list[tuple[str, float]],
+) -> None:
+    """A later request re-shares the allowance: earlier writes are narrowed first."""
+    site = topology()
+    bank = site.banks[0]
+
+    class Guard:
+        def __init__(self) -> None:
+            self.lock = asyncio.Lock()
+            self.topology = site
+            self.limits = effective_limits(site)
+            self.last_requested_a: dict[str, float] = {}
+
+        def allowance_for(self, bank_id: str) -> float | None:
+            return 1.0
+
+        def permits_writes(self) -> bool:
+            return True
+
+    resident: dict[str, float] = {}
+
+    class ResidentWriter(FakeWriter):
+        async def async_write(self, intent: DeviceIntent) -> None:
+            resident[intent.inverter_id] = intent.charge_a
+            assert sum(resident.values()) * bank.nominal_voltage_v <= 1000
+            await super().async_write(intent)
+
+    writer = ClampedWriter(ResidentWriter(), Guard())
+    for inverter_id, amps in requests:
+        await writer.async_write(DeviceIntent(inverter_id, bank.id, amps))
+        assert sum(resident.values()) * bank.nominal_voltage_v <= 1000
+        assert resident[inverter_id] <= amps

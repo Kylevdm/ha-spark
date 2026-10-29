@@ -171,7 +171,8 @@ async def test_diagnostics_hold_history_and_raw_readings(
     connection = guard_data["connections"][0]
     assert connection["id"] == "grid"
     assert connection["cut_kw"] is None and connection["latched"] is False
-    assert connection["restores_left"] == 47
+    # No writer in this phase: the readings-based all-clear spends no restore.
+    assert connection["restores_left"] == 48
     encoded = json.dumps(data)
     assert TOKEN not in encoded
     assert entry.data["site_id"] not in encoded
@@ -201,3 +202,20 @@ async def test_guard_change_sends_an_immediate_heartbeat(
     assert isinstance(block["limiting"], bool)
     assert 0 <= block["restores_left"] <= 48
     assert [c["id"] for c in block["connections"]] == [c.id for c in guard.topology.connections]
+
+
+async def test_production_guard_without_a_writer_goes_live_from_readings(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, freezer: FrozenDateTimeFactory,
+) -> None:
+    """No requested allocation exists in this phase: readings alone drive the entities."""
+    aioclient_mock.post(URL, exc=aiohttp.ClientError())
+    entry = await guarded_entry(hass)
+    guard = entry.runtime_data.guard
+    assert guard is not None and guard.writer is None and not guard.last_requested_a
+    await drive_cut(hass, freezer)
+    assert state(hass, LIMITING) == "on"
+    assert state(hass, ALLOWANCE) == "1.0"
+    await drive_restore(hass, freezer, entry)
+    assert state(hass, LIMITING) == "off"
+    assert guard.restores_left == {"grid": 48}  # nothing written, nothing spent
+    await guard.async_stop()

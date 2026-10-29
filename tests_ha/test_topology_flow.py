@@ -492,3 +492,33 @@ async def test_topology_flow_translations(hass: HomeAssistant) -> None:
         "remove_last", "connection_in_use", "bank_in_use",
     ):
         assert translations[f"{prefix}error.{error}"], error
+
+
+async def test_refused_save_returns_to_the_menu_with_the_draft(hass: HomeAssistant) -> None:
+    """Submitting a refused save goes back to editing; the draft is kept."""
+    entry = entry_for(hass, topology=STORED_TOPOLOGY, topology_revision=3)
+    flow_id = await open_topology(hass, entry)
+    await choose(hass, flow_id, "banks")
+    await choose(hass, flow_id, "banks_edit")
+    await hass.config_entries.options.async_configure(flow_id, {"id": "bank"})
+    result = await hass.config_entries.options.async_configure(
+        flow_id, {"id": "bank", "served_load_share_pct": 50})
+    assert result["type"] is FlowResultType.MENU
+    await choose(hass, flow_id, "banks_done")
+    result = await choose(hass, flow_id, "save")
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "invalid_load_shares"}
+    result = await hass.config_entries.options.async_configure(flow_id, {})
+    assert result["type"] is FlowResultType.MENU and result["step_id"] == "topology"
+    # The draft survived: fix the share and save.
+    await choose(hass, flow_id, "banks")
+    await choose(hass, flow_id, "banks_edit")
+    await hass.config_entries.options.async_configure(flow_id, {"id": "bank"})
+    await hass.config_entries.options.async_configure(
+        flow_id, {"id": "bank", "served_load_share_pct": 100})
+    await choose(hass, flow_id, "banks_done")
+    with patch.object(hass.config_entries, "async_reload", return_value=True):
+        result = await choose(hass, flow_id, "save")
+        await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options["topology_revision"] == 4

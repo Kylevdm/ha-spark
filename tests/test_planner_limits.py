@@ -232,3 +232,13 @@ def test_unsupported_topology_fails_closed() -> None:
     assert plan.required_kwh == 0
     assert plan.charge_intent.export is None
     assert plan.limits_reason is not None
+
+
+def test_zero_charge_limit_keeps_a_lower_capped_target() -> None:
+    """The zero-capacity branch only narrows: SoC 95% above a 90% cap keeps 90% (#536)."""
+    cfg, inp = config(max_current_a=0), inputs()
+    soc = replace(inp.soc, value=95, raw_state="95")
+    inp = replace(inp, soc=soc)
+    plan = compute_plan(inp, cfg, fixed_schedule(inp, cfg))
+    assert plan.required_kwh == 0
+    assert plan.target_soc == pytest.approx(90)

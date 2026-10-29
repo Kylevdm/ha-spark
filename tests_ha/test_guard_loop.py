@@ -227,7 +227,9 @@ async def test_missing_timer_uses_reserve_excluding_running_loads(
                                    "major_loads": (load,)})
     entry = MockConfigEntry(domain="ha_spark", data={})
     entry.add_to_hass(hass)
-    loop = SupplyGuardLoop(hass, entry, SparkCoordinator(hass, entry, "0.0.0"), site)
+    # The 50% missing-reading cut needs a controlled allocation, so a (fake) writer.
+    loop = SupplyGuardLoop(hass, entry, SparkCoordinator(hass, entry, "0.0.0"), site,
+                           writer=FakeWriter())
     loop.last_requested_a[inv.id] = 40
     await loop.async_start()
     hass.states.async_set("sensor.inverter", "2000", {"unit_of_measurement": "W"})
@@ -310,4 +312,25 @@ async def test_apply_through_clamp_needs_permitting_mirror(
     assert loop.writer is not None
     await loop.writer.async_write(DeviceIntent(inv.id, inv.bank_id, 40))
     assert bool(fake.intents) == expected
+    await loop.async_stop()
+
+
+async def test_connection_set_change_keeps_matching_cuts(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory,
+) -> None:
+    """A topology edit that renames or drops a connection keeps the others' cuts."""
+    freezer.move_to("2026-10-29T12:00:00+00:00")
+    site = topology()
+    key = site.connections[0].id
+    entry = MockConfigEntry(domain="ha_spark", data={})
+    entry.add_to_hass(hass)
+    coordinator = SparkCoordinator(hass, entry, "0.0.0")
+    loop = SupplyGuardLoop(hass, entry, coordinator, site)
+    stored = {"cut_kw": 1.5, "latched": True, "missing_since": None, "restores_used": 40,
+              "restore_day": "2026-10-29", "epoch": None}
+    await loop.store.async_save({key: stored, "removed_connection": stored})
+    await loop.async_start()
+    assert loop.states[key].cut_kw == 1.5
+    assert loop.states[key].restores_used == 40
+    assert set(loop.states) == {key}
     await loop.async_stop()

@@ -208,10 +208,14 @@ class SupplyGuardLoop:
             try:
                 raw = await self.store.async_load()
                 if raw is not None:
-                    if not isinstance(raw, dict) or set(raw) != set(self.states):
+                    if not isinstance(raw, dict):
                         raise ValueError("invalid_guard_store")
-                    loaded = {}
+                    # A topology edit keeps the cuts of connections that still
+                    # exist; new ones start fresh and removed ones are dropped.
+                    loaded = dict(self.states)
                     for key, value in raw.items():
+                        if key not in self.states:
+                            continue
                         record = StoredGuard.model_validate(value)
                         loaded[key] = GuardState(
                             cut_kw=record.cut_kw, latched=record.latched,
@@ -342,6 +346,7 @@ class SupplyGuardLoop:
                     mirror=mirror, grid_configured=connection.grid_power_entity is not None,
                     controllable=any(driver_capabilities(i.driver_kind).setpoint_step_a is not None
                                      for i in inverters), household_day=now.date(),
+                    observe_only=self.writer is None,
                 ), now)
                 self.states[connection.id] = state
                 self.decisions[connection.id] = decision
@@ -387,7 +392,7 @@ class SupplyGuardLoop:
                 prior = before.get(key)
                 if prior is None:
                     continue
-                if guard_state.restores_used > prior.restores_used:
+                if prior.cut_kw is not None and guard_state.cut_kw is None:
                     self._history.append({"at": now.isoformat(), "connection_id": key,
                                           "event": "restore",
                                           "allowance_kw": guard_state.allowance_kw})

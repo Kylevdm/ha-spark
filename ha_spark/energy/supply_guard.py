@@ -35,7 +35,11 @@ from ha_spark.devices.execution import (
     device_action,
     execution_context,
 )
-from ha_spark.devices.inverters.solis import active_limits, validated_fallback_current_a
+from ha_spark.devices.inverters.solis import (
+    active_limits,
+    charge_voltage_v,
+    validated_fallback_current_a,
+)
 from ha_spark.devices.outcomes import ActionLine
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.ha.rest import HomeAssistantRest
@@ -118,7 +122,7 @@ class SupplyGuard:
             else:
                 target_w = min(
                     target_w,
-                    fallback_a * s.battery_voltage_v,
+                    fallback_a * charge_voltage_v(s, self._execution),
                 )
         elif soc is not None and not soc.ok:
             target_w = min(target_w, setpoint_w)

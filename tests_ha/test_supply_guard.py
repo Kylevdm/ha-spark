@@ -198,3 +198,30 @@ def test_new_cut_after_restart_writes_in_current_epoch() -> None:
     state, decision = step(state, replace(inputs(at), mirror=unknown), at)
     assert decision.write and decision.allowance_kw == 3 and decision.warn_reason is None
     assert not state.restored
+
+
+def test_without_a_writer_readings_alone_cut_and_clear_without_writes() -> None:
+    """No writer (this phase): limit - other load goes live; nothing is written or spent."""
+    state = GuardState(restore_day=NOW.date())
+    for seconds in range(2):
+        at = NOW + timedelta(seconds=seconds)
+        state, decision = step(state, replace(inputs(at), requested_kw=0, observe_only=True), at)
+        assert not decision.write
+    # 11 kW import less 4 kW inverter import is 7 kW other load: 3 kW left of 10 kW.
+    assert state.limiting and state.allowance_kw == 3
+    for seconds in range(2, 303, 30):
+        at = NOW + timedelta(seconds=seconds)
+        state, decision = step(
+            state, replace(inputs(at, 9800), requested_kw=0, observe_only=True), at)
+        assert not decision.write
+    assert not state.limiting and state.restores_used == 0
+
+
+def test_without_a_writer_a_short_dip_keeps_the_cut() -> None:
+    state = GuardState(restore_day=NOW.date(), cut_kw=3)
+    for seconds, watts in ((0, 9000), (120, 9000), (150, 9900), (310, 9000)):
+        at = NOW + timedelta(seconds=seconds)
+        state, decision = step(
+            state, replace(inputs(at, watts), requested_kw=4, observe_only=True), at)
+        assert not decision.write
+    assert state.cut_kw == 3

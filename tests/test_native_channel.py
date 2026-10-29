@@ -111,3 +111,10 @@ def test_summary_next_window(built, expected):
     legacy = plan_summary(api_version=1, session_id="test", built_at=datetime.fromisoformat(built),
                           loop_tick=None, settings=settings)
     assert "charge_window_start" not in legacy
+
+
+def test_v2_fixture_is_still_accepted_without_v3_blocks():
+    body = json.loads((FIXTURES / "site_snapshot_v2.json").read_text())
+    snapshot = SiteSnapshot.model_validate(body)
+    assert snapshot.api_version == 2
+    assert not {"topology", "major_loads", "supply_guard"} & set(body)

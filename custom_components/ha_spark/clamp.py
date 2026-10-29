@@ -93,21 +93,51 @@ class ClampedWriter:
     def __init__(self, inner: ChargeWriter, guard: ClampGuard) -> None:
         self.inner = inner
         self.guard = guard
+        # Last current written per inverter: what is resident behind the boundary.
+        self.written_a: dict[str, float] = {}
+
+    def _clamp(self, intent: DeviceIntent) -> DeviceIntent | None:
+        return clamp_intent(
+            intent, allowance_kw=self.guard.allowance_for(intent.bank_id),
+            last_requested_a=self.guard.last_requested_a,
+            topology=self.guard.topology, limits=self.guard.limits,
+        )
+
+    async def _write(self, clamped: DeviceIntent) -> None:
+        await self.inner.async_write(clamped)
+        self.written_a[clamped.inverter_id] = clamped.charge_a
 
     async def async_write(self, intent: DeviceIntent) -> None:
-        """All fake writes pass the clamp while holding the guard update lock."""
+        """All fake writes pass the clamp while holding the guard update lock.
+
+        A new request moves every share on its connection, so each inverter
+        already written there is re-clamped too, reductions before increases:
+        the resident total never exceeds the allowance between writes.
+        """
         async with self.guard.lock:
             self.guard.last_requested_a[intent.inverter_id] = _current(intent.charge_a)
-            await self.async_write_locked(intent)
+            if not self.guard.permits_writes():
+                return
+            banks = {b.id: b for b in self.guard.topology.banks}
+            target = banks.get(intent.bank_id)
+            peers = [
+                DeviceIntent(i.id, i.bank_id, self.guard.last_requested_a.get(i.id, 0))
+                for i in self.guard.topology.inverters
+                if target is not None and i.id != intent.inverter_id and i.id in self.written_a
+                and i.bank_id in banks
+                and banks[i.bank_id].connection_id == target.connection_id
+            ]
+            planned = [c for c in (self._clamp(p) for p in (*peers, intent)) if c is not None]
+            planned.sort(key=lambda c: c.charge_a >= self.written_a.get(c.inverter_id, 0))
+            for clamped in planned:
+                if (clamped.inverter_id == intent.inverter_id
+                        or clamped.charge_a != self.written_a.get(clamped.inverter_id)):
+                    await self._write(clamped)
 
     async def async_write_locked(self, intent: DeviceIntent) -> None:
         """Guard re-apply with an unchanged request, under the already-held lock."""
         if not self.guard.permits_writes():
             return
-        clamped = clamp_intent(
-            intent, allowance_kw=self.guard.allowance_for(intent.bank_id),
-            last_requested_a=self.guard.last_requested_a,
-            topology=self.guard.topology, limits=self.guard.limits,
-        )
+        clamped = self._clamp(intent)
         if clamped is not None:
-            await self.inner.async_write(clamped)
+            await self._write(clamped)

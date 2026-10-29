@@ -143,7 +143,8 @@ def _legacy_driver(settings: Settings) -> str | None:
     return inverters[0].driver if len(inverters) == 1 else None
 
 
-def _drives_writer(topology: Topology, settings: Settings) -> bool:
+def drives_writer(topology: Topology, settings: Settings) -> bool:
+    """One inverter whose driver kind matches the single legacy device: a supported topology."""
     return single_inverter(topology) and (
         topology.inverters[0].driver_kind == _legacy_driver(settings)
     )
@@ -183,10 +184,10 @@ def select_limits(loaded: LoadedTopology | None, settings: Settings) -> LimitsSe
         return LimitsSelection("legacy")
     if loaded.kind == "unavailable" or loaded.topology is None:
         return LimitsSelection("unavailable", reason=UNAVAILABLE_REASON)
-    if _drives_writer(loaded.topology, settings):
+    if drives_writer(loaded.topology, settings):
         return LimitsSelection("native", loaded.topology)
     kept = loaded.supported_topology
-    if kept is not None and not _drives_writer(kept, settings):
+    if kept is not None and not drives_writer(kept, settings):
         kept = None
     return LimitsSelection(
         "native (preview only)", kept, _preview(loaded.topology, settings), PREVIEW_REASON,

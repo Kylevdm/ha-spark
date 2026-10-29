@@ -287,3 +287,74 @@ def test_heartbeat_change_is_never_an_authority_change(tmp_path) -> None:
     accept_topology(settings, LoadedTopology(), {
         "configured": True, "revision": 1, "topology": single().model_dump(mode="json")})
     assert store.state == before
+
+
+def _bank_limited(bank_a: float, voltage_v: float = 52.0) -> Topology:
+    """One 40 A Solis inverter on a bank whose own DC charge limit is ``bank_a``."""
+    bank = {**_bank(), "charge_limit_a": bank_a, "nominal_voltage_v": voltage_v}
+    return Topology.model_validate({
+        "connections": [_connection()], "banks": [bank], "inverters": [_inverter()],
+    })
+
+
+def test_normal_current_is_capped_at_the_bank_charge_limit(record) -> None:
+    from tests.test_solis_limits import _saturating_intent
+
+    settings = Settings(battery_voltage_v=52.0, max_charge_current_a=62.5)
+    record(native(_bank_limited(30.0)))
+    assert solis_current_a(_saturating_intent(), settings) == pytest.approx(30)
+    record(native(_bank_limited(0.0)))
+    assert solis_current_a(_saturating_intent(), settings) == 0
+
+
+@pytest.mark.parametrize(("bank_a", "written_raw"), [(30.0, 300), (0.0, 0)])
+async def test_restore_current_is_capped_at_the_bank_charge_limit(
+    tmp_path, record, bank_a: float, written_raw: int,
+) -> None:
+    from tests.test_solis_limits import FakeRest as ExportRest
+    from tests.test_solis_limits import _current_writes
+    from tests.test_solis_limits import _device as limits_device
+
+    rest = ExportRest()
+    rest.states["sensor.solis_control_timed_charge_current"] = "40"
+    device = limits_device(rest, tmp_path, battery_voltage_v=52.0)
+    record(native(_bank_limited(bank_a)))
+    await device.set_charge_rate(40.0 * 52.0)
+    assert _current_writes(rest) == [written_raw]
+
+
+async def test_native_currents_convert_at_the_bank_nominal_voltage(tmp_path, record) -> None:
+    from tests.test_solis_limits import FakeRest as ExportRest
+    from tests.test_solis_limits import _current_writes
+    from tests.test_solis_limits import _device as limits_device
+
+    rest = ExportRest()
+    device = limits_device(rest, tmp_path, battery_voltage_v=52.0)
+    record(native(_bank_limited(100.0, voltage_v=100.0)))
+    # 1 kW DC at the bank's 100 V is 10 A, not 19 A at the settings' 52 V.
+    await device.set_charge_rate(1000.0)
+    assert _current_writes(rest) == [100]
+    assert await device.read_charge_rate() == pytest.approx(
+        float(rest.states["sensor.solis_control_timed_charge_current"]) * 100.0)
+
+
+def test_wrong_driver_single_inverter_never_replaces_the_supported_topology(
+    tmp_path, record,
+) -> None:
+    """A single AlphaESS inverter can't drive the Solis writer, so it is not 'supported'."""
+    settings = Settings(db_path=str(tmp_path / "events.db"), max_charge_current_a=62.5)
+    first, _ = accept_topology(settings, LoadedTopology(), {
+        "configured": True, "revision": 1, "topology": single(10.0).model_dump(mode="json")})
+    alpha = Topology.model_validate({
+        "connections": [_connection()], "banks": [_bank()],
+        "inverters": [_inverter(kind="alphaess")],
+    })
+    second, changed = accept_topology(settings, first, {
+        "configured": True, "revision": 2, "topology": alpha.model_dump(mode="json")})
+    assert changed and second.topology == alpha
+    assert second.supported_topology == single(10.0) and second.supported_revision == 1
+    assert load_topology_record(settings).supported_topology == single(10.0)
+    record(second)
+    limits = active_limits(settings)
+    assert not isinstance(limits, str)
+    assert limits[1].inverters[0].charge_a == 10  # never the legacy 62.5 A

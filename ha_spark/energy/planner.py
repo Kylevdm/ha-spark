@@ -1364,9 +1364,10 @@ def compute_plan(
 
     if limits_reason is not None or charge_limit <= 0:
         # Zero capacity must not leave a positive charge target through the
-        # reservation-only target branch above.
-        target_soc = (
-            expected_window_start_soc if expected_window_start_soc is not None else inputs.soc_now
+        # reservation-only target branch above; it only ever narrows the target.
+        target_soc = min(
+            target_soc,
+            expected_window_start_soc if expected_window_start_soc is not None else inputs.soc_now,
         )
 
     refills, v2l_unavailable, v2l_saving = _v2l_refills(

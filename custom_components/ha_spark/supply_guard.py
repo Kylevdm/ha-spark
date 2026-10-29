@@ -93,6 +93,9 @@ class GuardInputs:
     grid_configured: bool = True
     controllable: bool = True
     household_day: date | None = None
+    # No writer exists (this phase): readings alone set and clear the ceiling for
+    # display, with no requested allocation, no write and no restore spent.
+    observe_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -137,7 +140,8 @@ def step(state: GuardState, inputs: GuardInputs, now: datetime) -> tuple[GuardSt
         # A loaded cut is only re-written in its own epoch; a new cut is current.
         return not state.restored or (epoch is not None and epoch == state.epoch)
 
-    requested = inputs.requested_kw
+    observe = inputs.observe_only
+    requested = 0 if observe else inputs.requested_kw
     if not isfinite(requested) or requested < 0:
         requested = 0
     fresh = _fresh(inputs.reading.import_w, inputs.reading.reported_at, now) and all(
@@ -178,12 +182,25 @@ def step(state: GuardState, inputs: GuardInputs, now: datetime) -> tuple[GuardSt
                         last_counted_at=inputs.reading.reported_at if new_report
                         else state.last_counted_at, over_count=count,
                         dormant_reason=None)
-        if count >= 2 and requested > 0:
-            cut = min(requested, available, state.cut_kw if state.cut_kw is not None else requested)
+        if count >= 2 and (requested > 0 or observe):
+            ceiling = available if observe else requested
+            cut = min(ceiling, available, state.cut_kw if state.cut_kw is not None else ceiling)
             if state.cut_kw is None or cut < state.cut_kw:
                 state = replace(state, cut_kw=cut, epoch=epoch, restored=False)
                 changed = True
-        if state.cut_kw is not None and requested > 0 and available_w >= requested * 1000 + 200:
+        if observe:
+            # The readings-based all-clear: 5 minutes of >= 200 W site headroom.
+            if state.cut_kw is not None and limit_w - import_w >= 200:
+                start = state.headroom_since or now
+                state = replace(state, headroom_since=start)
+                if (now - start).total_seconds() >= 300:
+                    state = replace(state, cut_kw=None, latched=False, headroom_since=None,
+                                    restored=False)
+                    changed = True
+            else:
+                state = replace(state, headroom_since=None)
+        elif (state.cut_kw is not None and requested > 0
+              and available_w >= requested * 1000 + 200):
             start = state.headroom_since or now
             state = replace(state, headroom_since=start)
             if ((now - start).total_seconds() >= 300 and state.restores_left > 0
@@ -196,7 +213,10 @@ def step(state: GuardState, inputs: GuardInputs, now: datetime) -> tuple[GuardSt
     rewrite = state.restored and permitted and replay() and fresh and requested > 0
     if rewrite:
         state = replace(state, restored=False)
-    allowance = min(requested, state.cut_kw) if state.cut_kw is not None else requested
+    if observe:
+        allowance = state.cut_kw if state.cut_kw is not None else 0
+    else:
+        allowance = min(requested, state.cut_kw) if state.cut_kw is not None else requested
     return state, GuardDecision(allowance if state.cut_kw is not None or changed else None,
                                (changed or rewrite) and permitted and replay() and requested > 0,
                                None if permitted and replay() else "authority_unavailable")

@@ -888,7 +888,12 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
     async def async_step_save(
         self, user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Apply the whole document at once, or show why it is refused."""
+        """Apply the whole document at once, or show why it is refused.
+
+        Submitting the refusal form returns to the topology menu with the draft.
+        """
+        if user_input is not None:
+            return await self.async_step_topology()
         draft = self._topology_draft
         document = {key: list(items) for key, items in draft.items()}
         errors: dict[str, str] = {}

@@ -83,6 +83,8 @@ from ha_spark.energy.export_store import ExportEventStore
 from ha_spark.energy.models import ChargeIntent, ExportIntent, window_hours
 from ha_spark.energy.soc_integrity import MAX_UNCHANGED, SocMeasurement, SocStatus
 from ha_spark.energy.topology import (
+    FIXED_EXPORT_CEILING_REFUSAL,
+    BatteryBank,
     EffectiveLimits,
     LegacyTopology,
     Topology,
@@ -153,7 +155,7 @@ _GRID_CHARGE_BIT = 1 << 5
 _EXPORT_CURRENT_A = 62.5
 _EXPORT_CURRENT_RAW = 625
 # Shared verbatim with the planner's export selection (#536/#537).
-FIXED_EXPORT_REFUSAL = "fixed export command exceeds the effective discharge ceiling"
+FIXED_EXPORT_REFUSAL = FIXED_EXPORT_CEILING_REFUSAL
 # A sync is confirmed only when the read-back is this close to the household
 # clock: the write truncates to whole seconds and a poll adds a little latency.
 _CLOCK_SYNC_READ_BACK = timedelta(seconds=10)
@@ -234,16 +236,42 @@ def active_limits(
     return selection.actuation, effective_limits(selection.actuation)
 
 
+def _bank(topology: Topology, effective: EffectiveLimits) -> BatteryBank:
+    """The bank holding this writer's single inverter."""
+    return next(b for b in topology.banks if b.id == effective.inverters[0].bank_id)
+
+
+def _charge_limit_a(topology: Topology, effective: EffectiveLimits) -> float:
+    """The effective per-inverter charge limit capped by its bank's DC charge limit."""
+    return min(effective.inverters[0].charge_a, _bank(topology, effective).charge_limit_a)
+
+
+def charge_voltage_v(settings: Settings, execution: ExecutionContext | None = None) -> float:
+    """DC volts for this writer's W<->A conversions: the active bank's nominal voltage.
+
+    Equal to ``battery_voltage_v`` for the legacy topology; unusable limits keep
+    the setting (every command then narrows to zero anyway).
+    """
+    limits = active_limits(settings, execution)
+    if isinstance(limits, str):
+        return settings.battery_voltage_v
+    return _bank(*limits).nominal_voltage_v
+
+
 def _commanded_current_a(
     settings: Settings, requested_a: float, execution: ExecutionContext | None = None,
 ) -> int:
-    """Whole amps at or below the effective per-inverter charge limit, rounded down."""
+    """Whole amps at or below the effective inverter and bank charge limits, rounded down."""
     limits = active_limits(settings, execution)
     if isinstance(limits, str):
         return 0
     topology, effective = limits
     try:
-        amps = charge_setpoint_a(requested_a, topology.inverters[0], effective.inverters[0])
+        amps = charge_setpoint_a(
+            min(requested_a, _bank(topology, effective).charge_limit_a),
+            topology.inverters[0],
+            effective.inverters[0],
+        )
     except ValueError:
         return 0
     return 0 if amps is None else math.floor(amps)
@@ -367,8 +395,8 @@ def validate_fallback_schedule(
     # Native limits replace the legacy fields (#542): the effective inverter
     # and bank charge limits and the bank's nominal voltage. For the legacy
     # topology these equal the checks above, so their reasons come first.
-    bank = topology.banks[0]
-    limit_a = min(effective.inverters[0].charge_a, bank.charge_limit_a)
+    bank = _bank(topology, effective)
+    limit_a = _charge_limit_a(topology, effective)
     if configured > limit_a:
         return (
             f"solis_fallback_current_a ({configured:g} A) is above the effective "
@@ -553,9 +581,8 @@ class SolisDevice:
     # --- planning ---
 
     def planned_rate_w(self, intent: ChargeIntent) -> float:
-        return (
-            solis_current_a(intent, self._settings, self._execution)
-            * self._settings.battery_voltage_v
+        return solis_current_a(intent, self._settings, self._execution) * charge_voltage_v(
+            self._settings, self._execution
         )
 
     # --- apply: the forced-charge sequence ---
@@ -841,11 +868,10 @@ class SolisDevice:
         return _ApplyResult(lines, current_ok, window_verified, cleanup_ok)
 
     async def set_charge_rate(self, watts: float) -> ActionLine:
+        voltage_v = charge_voltage_v(self._settings, self._execution)
         amps = (
-            _commanded_current_a(
-                self._settings, watts / self._settings.battery_voltage_v, self._execution,
-            )
-            if self._settings.battery_voltage_v > 0
+            _commanded_current_a(self._settings, watts / voltage_v, self._execution)
+            if voltage_v > 0
             else 0
         )
         return await self._set_current(amps, f"set charge current to {amps} A ({watts:.0f} W)")
@@ -856,7 +882,7 @@ class SolisDevice:
         Does not catch: callers isolate read failures (the supply guard skips
         the tick)."""
         state = await self._rest.get_state(self._sensor("timed_charge_current"))
-        return float(state.state) * self._settings.battery_voltage_v
+        return float(state.state) * charge_voltage_v(self._settings, self._execution)
 
     # --- internal writes (mode-gated, failure-isolated, read-back verified) ---
 
@@ -2637,8 +2663,9 @@ def solis_current_a(
 
     A target at or below the sizing SoC (decision B can set one below the
     expected window-start SoC) sizes 0 A: the window then adds nothing. Capped
-    at the effective per-inverter limit, min(owner, 62.5 A driver ceiling);
-    writes round it down to whole amps.
+    at the effective per-inverter limit, min(owner, 62.5 A driver ceiling), and
+    the bank's DC charge limit; writes round it down to whole amps. Amps convert
+    at the active bank's nominal voltage.
     """
     needed_kwh = max(
         0.0,
@@ -2648,9 +2675,9 @@ def solis_current_a(
     )
     eff = settings.charge_efficiency if settings.charge_efficiency > 0 else 1.0
     purchase = needed_kwh / eff
-    kwh_per_amp = charge_hours(intent, settings) * settings.battery_voltage_v / 1000.0
+    kwh_per_amp = charge_hours(intent, settings) * charge_voltage_v(settings, execution) / 1000.0
     if kwh_per_amp <= 0:
         return 0.0
     limits = active_limits(settings, execution)
-    limit_a = 0.0 if isinstance(limits, str) else limits[1].inverters[0].charge_a
+    limit_a = 0.0 if isinstance(limits, str) else _charge_limit_a(*limits)
     return min(limit_a, purchase / kwh_per_amp)
