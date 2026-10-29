@@ -1,0 +1,398 @@
+{
+  "topology": {
+    "connections": [
+      {
+        "id": "grid0",
+        "supply_voltage_v": 240,
+        "import_limit_a": 75,
+        "export_limit_a": 16,
+        "dno_export_limit_kw": 5
+      },
+      {
+        "id": "grid1",
+        "supply_voltage_v": 240,
+        "import_limit_a": 75,
+        "export_limit_a": 16,
+        "dno_export_limit_kw": 5
+      },
+      {
+        "id": "grid2",
+        "supply_voltage_v": 240,
+        "import_limit_a": 75,
+        "export_limit_a": 16,
+        "dno_export_limit_kw": 5
+      },
+      {
+        "id": "grid3",
+        "supply_voltage_v": 240,
+        "import_limit_a": 75,
+        "export_limit_a": 16,
+        "dno_export_limit_kw": 5
+      }
+    ],
+    "banks": [
+      {
+        "id": "bank0",
+        "connection_id": "grid0",
+        "usable_capacity_kwh": 14,
+        "nominal_voltage_v": 50,
+        "min_soc": 10,
+        "target_cap": 100,
+        "charge_limit_a": 125,
+        "discharge_limit_a": 125,
+        "served_load_share_pct": 50
+      },
+      {
+        "id": "bank1",
+        "connection_id": "grid0",
+        "usable_capacity_kwh": 14,
+        "nominal_voltage_v": 50,
+        "min_soc": 10,
+        "target_cap": 100,
+        "charge_limit_a": 125,
+        "discharge_limit_a": 125,
+        "served_load_share_pct": 50
+      },
+      {
+        "id": "bank2",
+        "connection_id": "grid1",
+        "usable_capacity_kwh": 14,
+        "nominal_voltage_v": 50,
+        "min_soc": 10,
+        "target_cap": 100,
+        "charge_limit_a": 125,
+        "discharge_limit_a": 125,
+        "served_load_share_pct": 50
+      },
+      {
+        "id": "bank3",
+        "connection_id": "grid1",
+        "usable_capacity_kwh": 14,
+        "nominal_voltage_v": 50,
+        "min_soc": 10,
+        "target_cap": 100,
+        "charge_limit_a": 125,
+        "discharge_limit_a": 125,
+        "served_load_share_pct": 50
+      },
+      {
+        "id": "bank4",
+        "connection_id": "grid2",
+        "usable_capacity_kwh": 14,
+        "nominal_voltage_v": 50,
+        "min_soc": 10,
+        "target_cap": 100,
+        "charge_limit_a": 125,
+        "discharge_limit_a": 125,
+        "served_load_share_pct": 100
+      },
+      {
+        "id": "bank5",
+        "connection_id": "grid3",
+        "usable_capacity_kwh": 14,
+        "nominal_voltage_v": 50,
+        "min_soc": 10,
+        "target_cap": 100,
+        "charge_limit_a": 125,
+        "discharge_limit_a": 125,
+        "served_load_share_pct": 100
+      }
+    ],
+    "inverters": [
+      {
+        "id": "inverter0",
+        "bank_id": "bank0",
+        "driver_kind": "solis",
+        "charge_limit_a": 100,
+        "discharge_limit_a": 100,
+        "confirmed": true
+      },
+      {
+        "id": "inverter1",
+        "bank_id": "bank1",
+        "driver_kind": "solis",
+        "charge_limit_a": 100,
+        "discharge_limit_a": 100,
+        "confirmed": true
+      },
+      {
+        "id": "inverter2",
+        "bank_id": "bank2",
+        "driver_kind": "solis",
+        "charge_limit_a": 100,
+        "discharge_limit_a": 100,
+        "confirmed": true
+      },
+      {
+        "id": "inverter3",
+        "bank_id": "bank3",
+        "driver_kind": "solis",
+        "charge_limit_a": 100,
+        "discharge_limit_a": 100,
+        "confirmed": true
+      },
+      {
+        "id": "inverter4",
+        "bank_id": "bank4",
+        "driver_kind": "solis",
+        "charge_limit_a": 100,
+        "discharge_limit_a": 100,
+        "confirmed": true
+      },
+      {
+        "id": "inverter5",
+        "bank_id": "bank5",
+        "driver_kind": "solis",
+        "charge_limit_a": 100,
+        "discharge_limit_a": 100,
+        "confirmed": true
+      },
+      {
+        "id": "inverter6",
+        "bank_id": "bank0",
+        "driver_kind": "solis",
+        "charge_limit_a": 100,
+        "discharge_limit_a": 100,
+        "confirmed": true
+      },
+      {
+        "id": "inverter7",
+        "bank_id": "bank1",
+        "driver_kind": "solis",
+        "charge_limit_a": 100,
+        "discharge_limit_a": 100,
+        "confirmed": true
+      }
+    ],
+    "v2l_chargers": [
+      {
+        "id": "v2l0",
+        "bank_id": "bank0",
+        "max_current_a": 60
+      },
+      {
+        "id": "v2l1",
+        "bank_id": "bank1",
+        "max_current_a": 60
+      },
+      {
+        "id": "v2l2",
+        "bank_id": "bank2",
+        "max_current_a": 60
+      },
+      {
+        "id": "v2l3",
+        "bank_id": "bank3",
+        "max_current_a": 60
+      },
+      {
+        "id": "v2l4",
+        "bank_id": "bank4",
+        "max_current_a": 60
+      },
+      {
+        "id": "v2l5",
+        "bank_id": "bank5",
+        "max_current_a": 60
+      }
+    ],
+    "major_loads": [
+      {
+        "id": "ev0",
+        "connection_id": "grid0",
+        "kind": "ev_charger",
+        "demand_kw": 7.4
+      },
+      {
+        "id": "ev1",
+        "connection_id": "grid1",
+        "kind": "ev_charger",
+        "demand_kw": 7.4
+      },
+      {
+        "id": "ev2",
+        "connection_id": "grid2",
+        "kind": "ev_charger",
+        "demand_kw": 7.4
+      },
+      {
+        "id": "ev3",
+        "connection_id": "grid3",
+        "kind": "ev_charger",
+        "demand_kw": 7.4
+      },
+      {
+        "id": "ev4",
+        "connection_id": "grid0",
+        "kind": "ev_charger",
+        "demand_kw": 7.4
+      },
+      {
+        "id": "ev5",
+        "connection_id": "grid1",
+        "kind": "ev_charger",
+        "demand_kw": 7.4
+      },
+      {
+        "id": "ev6",
+        "connection_id": "grid2",
+        "kind": "ev_charger",
+        "demand_kw": 7.4
+      },
+      {
+        "id": "ev7",
+        "connection_id": "grid3",
+        "kind": "ev_charger",
+        "demand_kw": 7.4
+      },
+      {
+        "id": "ev8",
+        "connection_id": "grid0",
+        "kind": "ev_charger",
+        "demand_kw": 7.4
+      },
+      {
+        "id": "ev9",
+        "connection_id": "grid1",
+        "kind": "ev_charger",
+        "demand_kw": 7.4
+      },
+      {
+        "id": "ev10",
+        "connection_id": "grid2",
+        "kind": "ev_charger",
+        "demand_kw": 7.4
+      },
+      {
+        "id": "ev11",
+        "connection_id": "grid3",
+        "kind": "ev_charger",
+        "demand_kw": 7.4
+      }
+    ]
+  },
+  "limits": {
+    "inverters": [
+      {
+        "id": "inverter0",
+        "bank_id": "bank0",
+        "charge_a": 62.5,
+        "discharge_a": 62.5
+      },
+      {
+        "id": "inverter1",
+        "bank_id": "bank1",
+        "charge_a": 62.5,
+        "discharge_a": 62.5
+      },
+      {
+        "id": "inverter2",
+        "bank_id": "bank2",
+        "charge_a": 62.5,
+        "discharge_a": 62.5
+      },
+      {
+        "id": "inverter3",
+        "bank_id": "bank3",
+        "charge_a": 62.5,
+        "discharge_a": 62.5
+      },
+      {
+        "id": "inverter4",
+        "bank_id": "bank4",
+        "charge_a": 62.5,
+        "discharge_a": 62.5
+      },
+      {
+        "id": "inverter5",
+        "bank_id": "bank5",
+        "charge_a": 62.5,
+        "discharge_a": 62.5
+      },
+      {
+        "id": "inverter6",
+        "bank_id": "bank0",
+        "charge_a": 62.5,
+        "discharge_a": 62.5
+      },
+      {
+        "id": "inverter7",
+        "bank_id": "bank1",
+        "charge_a": 62.5,
+        "discharge_a": 62.5
+      }
+    ],
+    "banks": [
+      {
+        "id": "bank0",
+        "connection_id": "grid0",
+        "charge_a": 125,
+        "charge_kw": 6.25,
+        "bank_charge_kw": 6.25,
+        "discharge_kw": 6.25
+      },
+      {
+        "id": "bank1",
+        "connection_id": "grid0",
+        "charge_a": 125,
+        "charge_kw": 6.25,
+        "bank_charge_kw": 6.25,
+        "discharge_kw": 6.25
+      },
+      {
+        "id": "bank2",
+        "connection_id": "grid1",
+        "charge_a": 62.5,
+        "charge_kw": 3.125,
+        "bank_charge_kw": 6.25,
+        "discharge_kw": 3.125
+      },
+      {
+        "id": "bank3",
+        "connection_id": "grid1",
+        "charge_a": 62.5,
+        "charge_kw": 3.125,
+        "bank_charge_kw": 6.25,
+        "discharge_kw": 3.125
+      },
+      {
+        "id": "bank4",
+        "connection_id": "grid2",
+        "charge_a": 62.5,
+        "charge_kw": 3.125,
+        "bank_charge_kw": 6.25,
+        "discharge_kw": 3.125
+      },
+      {
+        "id": "bank5",
+        "connection_id": "grid3",
+        "charge_a": 62.5,
+        "charge_kw": 3.125,
+        "bank_charge_kw": 6.25,
+        "discharge_kw": 3.125
+      }
+    ],
+    "connections": [
+      {
+        "id": "grid0",
+        "import_kw": 18,
+        "site_export_kw": 3.84
+      },
+      {
+        "id": "grid1",
+        "import_kw": 18,
+        "site_export_kw": 3.84
+      },
+      {
+        "id": "grid2",
+        "import_kw": 18,
+        "site_export_kw": 3.84
+      },
+      {
+        "id": "grid3",
+        "import_kw": 18,
+        "site_export_kw": 3.84
+      }
+    ]
+  }
+}
