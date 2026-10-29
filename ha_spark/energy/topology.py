@@ -26,6 +26,9 @@ Demand = Annotated[float, Field(strict=True, gt=0, le=50, allow_inf_nan=False)]
 Percent = Annotated[float, Field(strict=True, ge=0, le=100, allow_inf_nan=False)]
 DriverKind = Literal["solis", "alphaess"]
 
+FIXED_EXPORT_CEILING_REFUSAL = "fixed export command exceeds the effective discharge ceiling"
+FIXED_EXPORT_COMMAND_A: dict[DriverKind, float | None] = {"solis": 62.5, "alphaess": None}
+
 
 class FrozenModel(BaseModel):
     """Reject unknown fields, non-finite numbers and coercion of control flags."""

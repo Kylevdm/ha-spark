@@ -12,7 +12,7 @@ v1 model (daily energy balance, used when no per-slot forecast is available):
                             min(room_to_cap, window_charge_limit))
     purchase        = required / charge_efficiency   (AC kWh bought)
 
-``window_charge_limit`` is what the charge window can add at ``max_current_a``
+``window_charge_limit`` is what the charge window can add within effective limits
 (only the rest of the window once it has started).
 
 ``compute_plan`` turns ``required``/``purchase`` into a ``target_soc`` and emits
@@ -60,6 +60,8 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
+from pydantic import ValidationError
+
 from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.models import (
     ChargeIntent,
@@ -74,6 +76,56 @@ from ha_spark.energy.models import (
 )
 from ha_spark.energy.plan_view import SocPoint, build_plan_view, v2l_refill_reason
 from ha_spark.energy.tariff import TariffSchedule, _controlled_windows
+from ha_spark.energy.topology import (
+    FIXED_EXPORT_CEILING_REFUSAL,
+    FIXED_EXPORT_COMMAND_A,
+    BankLimits,
+    ConnectionLimits,
+    EffectiveLimits,
+    LegacyTopology,
+    Topology,
+    charge_capacity_kw,
+    effective_limits,
+    legacy_topology,
+)
+
+LIMITS_UNAVAILABLE_REASON = (
+    "Planning limits are unavailable: the limit settings are outside the supported range."
+)
+
+
+class _PlanningLimits(NamedTuple):
+    """The single bank and connection used by every sizing and export check."""
+
+    bank: BankLimits
+    connection: ConnectionLimits
+    fixed_export_refused: bool
+    hardware_id: str
+
+
+def _planning_limits(topology: Topology, limits: EffectiveLimits) -> _PlanningLimits:
+    if len(topology.banks) != 1 or len(topology.connections) != 1:
+        raise ValueError("unsupported_planning_topology")
+    if limits != effective_limits(topology):
+        raise ValueError("inconsistent_planning_limits")
+    bank = topology.banks[0]
+    bank_limits = limits.banks[0]
+    commands = [FIXED_EXPORT_COMMAND_A[i.driver_kind] for i in topology.inverters]
+    refused = any(
+        command is not None and command > limit.discharge_a
+        for command, limit in zip(commands, limits.inverters, strict=True)
+    )
+    # Legacy exact-kW discharge is a planning ceiling, not an owner-entered
+    # DC amp ceiling. Never round-trip it through the live battery voltage.
+    if not isinstance(topology, LegacyTopology):
+        refused |= sum(command or 0 for command in commands) > min(
+            bank.discharge_limit_a, sum(i.discharge_a for i in limits.inverters)
+        )
+    hardware_id = (
+        bank.id if bank.charge_limit_a < sum(i.charge_a for i in limits.inverters)
+        else limits.inverters[0].id
+    )
+    return _PlanningLimits(bank_limits, limits.connections[0], refused, hardware_id)
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -214,29 +266,48 @@ def _slot_reservation(
     )
 
 
-def _window_charge_limit(inputs: PlannerInputs, cfg: PlannerConfig) -> float:
-    """Battery kWh the charge window can add at ``max_current_a`` (#208).
-
-    Once the window has started only the rest of it counts.
-    """
+def _window_charge_limit(
+    inputs: PlannerInputs, cfg: PlannerConfig, limits: _PlanningLimits, efficiency: float,
+) -> tuple[float, str]:
+    """Stored DC kWh within effective limits, counting only the remaining window."""
     geometry = inputs.geometry_for(cfg)
-    if inputs.load_slots is not None and inputs.geometry is not None and geometry is not None:
-        start = geometry.window_start
-        if inputs.now is not None:
-            now = inputs.now
-            if now.tzinfo is None:
-                now = now.replace(
-                    tzinfo=inputs.horizon_start.tzinfo if inputs.horizon_start else UTC
+    binding_id = limits.hardware_id
+    charge_capacity_kw(limits.bank, limits.connection, charge_efficiency=efficiency)
+    if inputs.load_slots is not None:
+        energy = 0.0
+        for i, load in enumerate(inputs.load_slots):
+            if geometry is not None:
+                start = max(geometry.slot_starts[i], geometry.window_start)
+                if inputs.now is not None:
+                    now = inputs.now
+                    if now.tzinfo is None:
+                        now = now.replace(
+                            tzinfo=inputs.horizon_start.tzinfo if inputs.horizon_start else UTC
+                        )
+                    start = max(start, now.astimezone(UTC))
+                end = min(
+                    geometry.slot_starts[i] + timedelta(minutes=30), geometry.window_end
                 )
-            start = max(start, now.astimezone(UTC))
-        hours = max(0.0, (geometry.window_end - start).total_seconds() / 3600.0)
-        return cfg.max_current_a * cfg.voltage_v * hours / 1000.0
+                hours = max(0.0, (end - start).total_seconds() / 3600.0)
+            else:
+                hours = max(0.0, min(0.5, cfg.window_hours - i * 0.5))
+            if hours <= 0:
+                continue
+            capacity = charge_capacity_kw(
+                limits.bank, limits.connection, charge_efficiency=efficiency,
+                base_load_kw=load * 2,
+            )
+            if capacity < limits.bank.charge_kw - 1e-9:
+                binding_id = limits.connection.id
+            energy += capacity * hours
+        return energy, binding_id
+    # No per-slot load: retain the daily model's DC power × remaining hours.
     hours = cfg.window_hours
     if inputs.now is not None and inputs.horizon_start is not None:
         elapsed = (inputs.now - inputs.horizon_start).total_seconds() / 3600.0
         if 0.0 <= elapsed <= hours:
             hours -= elapsed
-    return max(0.0, cfg.max_current_a * cfg.voltage_v * hours / 1000.0)
+    return max(0.0, limits.bank.charge_kw * hours), binding_id
 
 
 def _overlaps(
@@ -289,12 +360,11 @@ _EXPORT_LATER_UNAVAILABLE_SKIP_REASON = (
 )
 
 
-def _slot_export_kw(slot: _EventSlot, cfg: PlannerConfig) -> float:
-    supply_ceiling_kw = max(0.0, cfg.supply_max_current_a * cfg.supply_voltage_v / 1000.0)
+def _slot_export_kw(slot: _EventSlot, limits: _PlanningLimits) -> float:
     unconstrained_export_kw = max(
-        0.0, cfg.battery_discharge_ceiling_kw + slot.solar_kw - slot.load_kw
+        0.0, limits.bank.discharge_kw + slot.solar_kw - slot.load_kw
     )
-    return min(cfg.dno_export_limit_kw, supply_ceiling_kw, unconstrained_export_kw)
+    return min(limits.connection.site_export_kw, unconstrained_export_kw)
 
 
 def _export_soc_needed(
@@ -304,6 +374,7 @@ def _export_soc_needed(
     house_energy_by_start: dict[datetime, float],
     buffered_post_energy: float,
     cfg: PlannerConfig,
+    limits: _PlanningLimits,
 ) -> tuple[float | None, datetime | None]:
     """Return the SoC needed at the counted suffix start, when funding was skipped."""
     if not any(skip.reason == _EXPORT_FUNDING_SKIP_REASON for skip in skips):
@@ -331,7 +402,8 @@ def _export_soc_needed(
         return None, None
     counted_slots = list(reversed(counted_reverse))
     counted_export_energy = sum(
-        (selected_power[slot.start] if slot.start in selected_power else _slot_export_kw(slot, cfg))
+        (selected_power[slot.start] if slot.start in selected_power
+         else _slot_export_kw(slot, limits))
         * slot.hours
         for slot in counted_slots
     )
@@ -351,8 +423,8 @@ _EXPORT_LIMIT_REFUSAL = (
 def _select_export_suffix(
     slots: list[_EventSlot],
     available: float,
-    cfg: PlannerConfig,
     schedule: TariffSchedule,
+    limits: _PlanningLimits,
     reserve: _Reserve | None = None,
 ) -> tuple[list[tuple[_EventSlot, float]], tuple[ExportSkip, ...], float]:
     """Walk an event's complete slots backwards and keep one fundable suffix.
@@ -367,14 +439,13 @@ def _select_export_suffix(
     skips: list[ExportSkip] = []
     contiguous = True
     spent = 0.0
-    supply_ceiling_kw = max(0.0, cfg.supply_max_current_a * cfg.supply_voltage_v / 1000.0)
     for slot in reversed(slots):
         start = slot.start
         end = start + timedelta(minutes=30)
         unconstrained_export_kw = max(
-            0.0, cfg.battery_discharge_ceiling_kw + slot.solar_kw - slot.load_kw
+            0.0, limits.bank.discharge_kw + slot.solar_kw - slot.load_kw
         )
-        export_kw = _slot_export_kw(slot, cfg)
+        export_kw = _slot_export_kw(slot, limits)
         held = any(_overlaps(start, end, window) for window in schedule.controlled_windows)
         # House load is already reserved across the entire event, even for a
         # skipped slot. Selecting this slot only consumes export energy.
@@ -387,7 +458,7 @@ def _select_export_suffix(
             skips.append(
                 ExportSkip(start, "Skipped paid slot: it overlaps an Octopus dispatch hold.")
             )
-        elif unconstrained_export_kw > min(cfg.dno_export_limit_kw, supply_ceiling_kw) + 1e-9:
+        elif unconstrained_export_kw > limits.connection.site_export_kw + 1e-9:
             contiguous = False
             skips.append(
                 ExportSkip(
@@ -395,6 +466,9 @@ def _select_export_suffix(
                     _EXPORT_LIMIT_REFUSAL,
                 )
             )
+        elif limits.fixed_export_refused:
+            contiguous = False
+            skips.append(ExportSkip(start, f"Skipped paid slot: {FIXED_EXPORT_CEILING_REFUSAL}."))
         elif export_kw <= 1e-9:
             contiguous = False
             skips.append(
@@ -428,7 +502,7 @@ def _select_export_suffix(
 
 def _export_intent(
     event: FlexibilityEvent,
-    cfg: PlannerConfig,
+    limits: _PlanningLimits,
     window_start: datetime,
     selected: list[tuple[_EventSlot, float]],
 ) -> ExportIntent:
@@ -439,7 +513,7 @@ def _export_intent(
         window_start=window_start,
         window_end=starts[-1] + timedelta(minutes=30),
         planned_export_kw=min(powers),
-        dno_export_limit_kw=cfg.dno_export_limit_kw,
+        dno_export_limit_kw=limits.connection.site_export_kw,
         selected_slots=starts,
         slot_export_kw=powers,
     )
@@ -458,6 +532,7 @@ def _event_export_plan(
     net: list[float],
     charge_limit: float,
     pre_window_outflow: float,
+    limits: _PlanningLimits,
 ) -> tuple[
     ExportIntent | None,
     tuple[Reservation, ...],
@@ -614,14 +689,11 @@ def _event_export_plan(
     # It never enters solar_kw, funding, or selected export power.
     refusals = {i: _DAYLIGHT_REFUSAL for i in daylight_slots}
     if inputs.export_p90_kw is not None:
-        supply_ceiling_kw = max(0.0, cfg.supply_max_current_a * cfg.supply_voltage_v / 1000.0)
         for i in today_slots:
             # A horizon the evidence doesn't align with gives no evidence.
             p90 = inputs.export_p90_kw[i] if i < len(inputs.export_p90_kw) else None
             if p90 is not None:
-                if cfg.battery_discharge_ceiling_kw + p90 > min(
-                    cfg.dno_export_limit_kw, supply_ceiling_kw,
-                ) + 1e-9:
+                if limits.bank.discharge_kw + p90 > limits.connection.site_export_kw + 1e-9:
                     refusals[i] = _EXPORT_LIMIT_REFUSAL
                 else:
                     refusals.pop(i, None)
@@ -635,12 +707,12 @@ def _event_export_plan(
         )
         for i in event_slots
     ]
-    selected, skips, spent = _select_export_suffix(slots, available, cfg, schedule, reserve)
+    selected, skips, spent = _select_export_suffix(slots, available, schedule, limits, reserve)
     house_energy_by_start = {
         slot.start: net[i] for slot, i in zip(slots, event_slots, strict=True)
     }
     needed_pct, needed_at = _export_soc_needed(
-        slots, selected, skips, house_energy_by_start, buffered_post_energy, cfg
+        slots, selected, skips, house_energy_by_start, buffered_post_energy, cfg, limits
     )
     if not selected:
         return None, (), skips, None, needed_pct, needed_at, charge_capped
@@ -675,7 +747,7 @@ def _event_export_plan(
         # resident window. Align to the first complete event slot in real time.
         half_hour = timedelta(minutes=30)
         window_start -= ((window_start - event.start.astimezone(UTC)) // half_hour) * half_hour
-    export = _export_intent(event, cfg, window_start, selected)
+    export = _export_intent(event, limits, window_start, selected)
     event_energy = house_through_event_energy + sum(power * slot.hours for slot, power in selected)
     event_reservation = Reservation(
         name="axle-export-event",
@@ -921,7 +993,9 @@ def _v2l_refills(
 
 
 def compute_plan(
-    inputs: PlannerInputs, cfg: PlannerConfig, schedule: TariffSchedule
+    inputs: PlannerInputs, cfg: PlannerConfig, schedule: TariffSchedule,
+    *, topology: Topology | None = None, limits: EffectiveLimits | None = None,
+    major_loads: tuple[()] = (),
 ) -> ChargePlan:
     """Compute the charge plan from live inputs, config, and a tariff schedule.
 
@@ -930,6 +1004,8 @@ def compute_plan(
     required — a missing schedule was a silent revert to the ``fixed`` provider
     that let callers describe a different plan than the daemon applied (#91).
     For the legacy fixed-window two-rate behaviour, pass ``fixed_schedule``.
+    Omitted topology and limits use the legacy adapter; unsupported shapes or
+    invalid limits fail closed. Major-load observations are empty in this phase.
     """
     effective_solar = inputs.served_day_solar_kwh * cfg.solar_haircut_k
 
@@ -952,7 +1028,23 @@ def compute_plan(
     export_soc_needed_at: datetime | None = None
     overnight_charge_capped = False
     geometry = inputs.geometry_for(cfg)
-    charge_limit = _window_charge_limit(inputs, cfg)
+    efficiency = cfg.charge_efficiency if cfg.charge_efficiency > 0 else 1.0
+    limits_reason = None
+    binding_id = ""
+    try:
+        topology = topology if topology is not None else legacy_topology(cfg, cfg.driver_kind)
+        limits = limits if limits is not None else effective_limits(topology)
+        planning_limits = _planning_limits(topology, limits)
+        charge_limit, binding_id = _window_charge_limit(inputs, cfg, planning_limits, efficiency)
+    except (ValidationError, ValueError):
+        topology, limits = None, None
+        limits_reason = LIMITS_UNAVAILABLE_REASON
+        charge_limit = 0.0
+        planning_limits = _PlanningLimits(
+            BankLimits(id="", connection_id="", charge_a=0, charge_kw=0,
+                       bank_charge_kw=0, discharge_kw=0),
+            ConnectionLimits(id="", import_kw=0, site_export_kw=0), True, "",
+        )
     pre_window_outflow = inputs.pre_window_drain_kwh
     window_first = geometry.window_slot_range[0] if geometry is not None else 0
     if inputs.load_slots is not None:
@@ -1011,7 +1103,9 @@ def compute_plan(
             export_soc_needed_pct,
             export_soc_needed_at,
             overnight_charge_capped,
-        ) = _event_export_plan(inputs, cfg, schedule, net, charge_limit, pre_window_outflow)
+        ) = _event_export_plan(
+            inputs, cfg, schedule, net, charge_limit, pre_window_outflow, planning_limits
+        )
         slot_reservation = _slot_reservation(inputs, cfg, schedule, net)
         reservations = event_reservations or (slot_reservation,)
         if event_reservations and all(
@@ -1101,7 +1195,6 @@ def compute_plan(
         uncovered += max(0.0, pre_window_outflow - usable_now)
     # The grid supplies required/efficiency AC kWh to store `required` kWh
     # (round-trip: AC->DC charging now, DC->AC discharge to the load later).
-    efficiency = cfg.charge_efficiency if cfg.charge_efficiency > 0 else 1.0
     purchase = required / efficiency
     planned_cost = (cheap_net + purchase) * schedule.cheap_rate + uncovered * schedule.standard_rate
 
@@ -1161,6 +1254,13 @@ def compute_plan(
             target_soc = min(
                 cfg.target_cap, cfg.min_soc + target_energy / cfg.capacity_kwh * 100.0
             )
+
+    if limits_reason is not None or charge_limit <= 0:
+        # Zero capacity must not leave a positive charge target through the
+        # reservation-only target branch above.
+        target_soc = (
+            expected_window_start_soc if expected_window_start_soc is not None else inputs.soc_now
+        )
 
     refills, v2l_unavailable, v2l_saving = _v2l_refills(
         inputs, cfg, schedule, reservations, usable_at_window + required, export
@@ -1280,6 +1380,17 @@ def compute_plan(
         export_soc_needed_at=export_soc_needed_at,
         overnight_charge_capped=overnight_charge_capped,
         soc_path=soc_path,
+        topology=topology,
+        effective_limits=limits,
+        limits_reason=limits_reason,
+        hardware_limit_reason=(
+            f"Charging limited by hardware: {binding_id}."
+            if limits_reason is None and not export_overlaps_charge
+            and charge_limit < min(
+                battery_room,
+                battery_room if cfg.strategy == "fill" else max(0.0, obligation - usable_at_window),
+            ) - 1e-9 else None
+        ),
     )
     series = _soc_series(plan, inputs, cfg, schedule, net) if model == "slots" else ()
     return replace(plan, view=build_plan_view(plan, cfg, inputs, schedule, series))

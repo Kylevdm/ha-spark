@@ -49,8 +49,8 @@ def _plan(inp: PlannerInputs, cfg: PlannerConfig) -> Any:
     return compute_plan(inp, cfg, fixed_schedule(inp, cfg))
 
 
-# A charge current the window can fill any test battery with, for tests about
-# event funding rather than the 62.5 A ceiling (#208).
+# An owner request above the driver ceiling; event funding must now respect
+# the effective 62.5 A limit even when the owner asks for more.
 _FILLS_THE_BATTERY_A = 200.0
 
 
@@ -268,8 +268,9 @@ def test_axle_export_reserves_a_full_event_and_the_post_event_cheap_slot() -> No
     # selected export must survive until the event end.
     assert event_reservation.energy_kwh == pytest.approx(14.7)
     assert post_event_reservation.name == "reach-next-cheap-slot"
-    # The 18:00--23:30 post-event run is entirely protected separately.
-    assert post_event_reservation.energy_kwh == pytest.approx(5.5)
+    # The 62.5 A window adds only 19.125 kWh: 1.075 kWh of the
+    # post-event reserve funds export and is bought back profitably.
+    assert post_event_reservation.energy_kwh == pytest.approx(4.425)
     assert plan.export_revenue == pytest.approx(3.2)
 
 
@@ -304,10 +305,12 @@ def test_axle_export_after_midnight_uses_the_in_progress_window_horizon() -> Non
         ),
     )
 
-    export = plan.charge_intent.export
-    assert export is not None, [skip.reason for skip in plan.export_skips]
-    assert (export.window_start, export.window_end) == (event.start, event.end)
-    assert export.planned_export_kw == pytest.approx(2.2)
+    # Only five hours at 62.5 A remain: 15.9375 kWh cannot fund the
+    # house through this late event, even spending the post-event reserve.
+    assert plan.charge_intent.export is None
+    assert plan.required_kwh == pytest.approx(15.9375)
+    assert plan.export_revenue is None
+    assert "reserved house or post-event energy" in plan.export_skips[-1].reason
     assert plan.target_soc > plan.soc_now
 
 
@@ -871,8 +874,9 @@ def test_axle_export_spends_the_post_event_reserve_when_buying_it_back_costs_les
     )
     assert plan.export_skips == ()
     _, post_event_reservation = plan.reservations
-    # 0.6 kWh of the 5.5 kWh reserve now goes to export.
-    assert post_event_reservation.energy_kwh == pytest.approx(4.9)
+    # With the 62.5 A ceiling, 1.075 kWh of the 5.5 kWh reserve
+    # now goes to export instead of 0.6 kWh.
+    assert post_event_reservation.energy_kwh == pytest.approx(4.425)
     assert plan.export_funding is not None
     assert "post-event reserve: £1.00 event vs £0.33 buy-back" in plan.export_funding
 

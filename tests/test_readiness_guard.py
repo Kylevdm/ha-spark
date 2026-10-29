@@ -1,4 +1,5 @@
 """Observe guard evidence uses GETs only and retains invalid samples."""
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -6,6 +7,7 @@ import respx
 
 from ha_spark.config import Settings
 from ha_spark.energy.models import PlannerInputs
+from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.readiness_ledger import ReadinessLedger, record_guard
 from tests.test_readiness_ledger import START, revision
 
@@ -34,6 +36,29 @@ async def test_guard_samples_are_read_only(tmp_path, supply, valid, throttle, br
     assert rows[0].target_w == 1000
     assert rows[0].throttle_w == throttle
     assert rows[0].breach is breach
+    assert all(call.request.method == "GET" for call in respx.calls)
+
+
+@respx.mock
+async def test_guard_evidence_uses_revision_connection_not_current_settings(tmp_path):
+    settings = Settings(ha_url="http://ha.test", ha_token="t",
+                        db_path=str(tmp_path / "ledger.db"), grid_power_entity="sensor.grid",
+                        battery_voltage_v=50, charge_window_start="00:00",
+                        charge_window_end="06:00", supply_max_current_a=75)
+    a = revision()
+    cfg = replace(a.run.cfg, supply_max_current_a=6)
+    plan = compute_plan(a.run.inputs, cfg, a.run.schedule)
+    a = replace(a, run=replace(a.run, plan=plan))
+    respx.get("http://ha.test/api/states/sensor.grid").respond(
+        200, json={"entity_id": "sensor.grid", "state": "2000", "attributes": {}})
+    respx.get("http://ha.test/api/states/sensor.solis_control_timed_charge_current").respond(
+        200, json={"entity_id": "sensor.solis_control_timed_charge_current",
+                   "state": "20", "attributes": {}})
+    await record_guard(settings, START, a, "observe")
+    (row,) = await ReadinessLedger(settings.db_path).guards()
+    assert row.sample_valid
+    assert row.throttle_w == 440  # 6 A * 240 V minus 1000 W other load
+    assert row.breach is False
     assert all(call.request.method == "GET" for call in respx.calls)
 
 

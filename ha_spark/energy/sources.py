@@ -380,6 +380,7 @@ def build_config(
         min_soc=settings.min_soc,
         target_cap=settings.target_soc_cap,
         max_current_a=settings.max_charge_current_a,
+        driver_kind=settings.inverter,
         battery_discharge_ceiling_kw=settings.battery_discharge_ceiling_kw,
         dno_export_limit_kw=settings.dno_export_limit_kw,
         supply_max_current_a=settings.supply_max_current_a,
