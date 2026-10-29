@@ -66,7 +66,7 @@ def state_value(hass: HomeAssistant, entity_id: str = ENTITY) -> str:
 
 def test_summary_fixture() -> None:
     parsed = parse_summary(fixture("plan_summary"))
-    assert parsed.api_version == 2
+    assert parsed.api_version == 3
     assert parsed.loop_tick is not None
 
 
@@ -82,12 +82,19 @@ def test_bad_summary(updates: dict[str, Any]) -> None:
 
 
 @pytest.mark.parametrize("key", [key for key in fixture("plan_summary")
-                                 if key != "charge_window_start"])
+                                 if key not in ("charge_window_start", "household_timezone")])
 def test_missing_summary_key(key: str) -> None:
     body = fixture("plan_summary")
     del body[key]
     with pytest.raises(MalformedSummary):
         parse_summary(body)
+
+
+def test_summary_without_household_timezone() -> None:
+    # Optional: until the add-on sends one, the integration uses HA's configured zone.
+    body = fixture("plan_summary")
+    del body["household_timezone"]
+    assert parse_summary(body).household_timezone is None
 
 
 async def test_setup_down(hass: HomeAssistant, aioclient_mock: AiohttpClientMocker) -> None:
@@ -154,7 +161,7 @@ async def test_liveness_outcomes(
         elif outcome == "session":
             body["session_id"] = "another-session"
         elif outcome == "incompatible":
-            body["api_version"] = 3
+            body["api_version"] = 4
         aioclient_mock.post(URL, json=body)
     await coordinator.async_refresh()
     expected = {

@@ -6,7 +6,8 @@ or hardware write path. Unloading fences off replies from the previous discovery
 
 import logging
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from math import isfinite
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -20,6 +21,7 @@ from homeassistant.util import dt as dt_util
 from . import wire
 from .channel import Outcome, PollResult, async_poll
 from .const import DOMAIN
+from .topology import Topology, validate_topology
 from .wire import Summary, build_snapshot
 
 if TYPE_CHECKING:
@@ -85,17 +87,45 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             return {"status": "stale", "fetched_at": None, "calls_used": 0,
                     "calls_limit": self.solcast.calls_limit, "slots": []}
 
+    def _topology_snapshot(self) -> tuple[dict[str, object], list[dict[str, object]]]:
+        """Read stored configuration and source timestamps; never echo invalid state."""
+        options = self.entry.options
+        if "topology_revision" not in options:
+            return {"configured": False}, []
+        raw = options.get("topology")
+        block = {"configured": True, "revision": options["topology_revision"], "topology": raw}
+        topology = validate_topology(raw)
+        readings: list[dict[str, object]] = []
+        if isinstance(topology, Topology):
+            for load in topology.major_loads:
+                state = self.hass.states.get(load.power_entity) if load.power_entity else None
+                draw = None
+                reported = None
+                if state is not None:
+                    reported = state.last_reported.astimezone(UTC).isoformat()
+                    try:
+                        value = float(state.state)
+                        unit = state.attributes.get("unit_of_measurement")
+                        if isfinite(value) and value >= 0 and unit in ("W", "kW"):
+                            draw = value / 1000 if unit == "W" else value
+                    except (ValueError, TypeError, OverflowError):
+                        pass
+                readings.append({"id": load.id, "draw_kw": draw, "reported_at": reported})
+        return block, readings
+
     async def _async_update_data(self) -> bool:
         if not self._running or self._ended:
             return self.connected
         data = self.entry.data
         api_version = self.api_version
         envelope = None
+        topology, major_loads = self._topology_snapshot()
         try:
             snapshot = build_snapshot(site_id=data["site_id"],
                                       release_version=self.release_version,
                                       sent_at=dt_util.utcnow(), api_version=api_version,
-                                      solar_forecast=self._solar_forecast(api_version))
+                                      solar_forecast=self._solar_forecast(api_version),
+                                      topology=topology, major_loads=major_loads)
         except (KeyError, ValueError):
             # Raised text would carry the stored value; HA logs an update's exceptions.
             result = PollResult(Outcome.MALFORMED)
@@ -115,7 +145,8 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                         snapshot = build_snapshot(site_id=data["site_id"],
                                                   release_version=self.release_version,
                                                   sent_at=dt_util.utcnow(), api_version=api_version,
-                                                  solar_forecast=self._solar_forecast(api_version))
+                                                  solar_forecast=self._solar_forecast(api_version),
+                                                  topology=topology, major_loads=major_loads)
                     except (KeyError, ValueError):
                         result = PollResult(Outcome.MALFORMED)
                     else:

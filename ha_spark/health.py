@@ -53,6 +53,7 @@ from ha_spark.energy.topology import (
     legacy_topology,
     reserve_advisory,
 )
+from ha_spark.energy.topology_record import load_topology_record
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.statistics import statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
@@ -465,6 +466,16 @@ async def check_integration_link(settings: Settings) -> CheckResult:
     age = view.get("snapshot_age_s")
     if state == "connected" and type(age) is int and age >= 0:
         detail += f"; snapshot age {age}s"
+    topology_reason = view.get("topology_reason")
+    if topology_reason in (
+        "invalid_topology", "topology_not_configured", "topology_save_failed",
+        "topology_record_unavailable",
+    ):
+        detail += f"; {topology_reason}"
+    for field, code in (("major_loads_reason", "invalid_major_loads"),
+                        ("supply_guard_reason", "invalid_supply_guard")):
+        if view.get(field) == code:
+            detail += f"; {code}"
     source = view.get("solar_source")
     if source in ("native", "entities"):
         detail += f"; solar: {source}"
@@ -577,6 +588,18 @@ async def check_effective_limits(
     )
 
 
+async def check_topology_record(settings: Settings) -> CheckResult:
+    """Read the same durable acceptance record as daemon, CLI and agent previews."""
+    loaded = load_topology_record(settings)
+    detail: str = loaded.kind
+    if loaded.revision is not None:
+        detail += f"; revision {loaded.revision}"
+    if loaded.reason is not None:
+        detail += f"; {loaded.reason}"
+    return CheckResult("Topology", Status.WARN if loaded.kind == "unavailable" else Status.OK,
+                       detail)
+
+
 async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
     results = await asyncio.gather(
@@ -590,6 +613,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_load_history(settings),
         check_supply_guard(settings),
         check_effective_limits(settings),
+        check_topology_record(settings),
         check_tariff_provider(settings),
         check_export_event_provider(settings),
         check_ha_timezone(settings),

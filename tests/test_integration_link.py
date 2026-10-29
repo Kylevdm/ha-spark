@@ -18,7 +18,8 @@ from tests.api_helpers import owner_client
 
 NOW = datetime(2026, 10, 24, 12, tzinfo=UTC)
 KEYS = {"state", "site_id", "integration_release_version", "api_version", "sent_at",
-        "snapshot_age_s", "solar_source"}
+        "snapshot_age_s", "solar_source", "topology_source", "topology_revision",
+        "topology_reason", "major_loads_reason", "supply_guard_reason"}
 TOKEN = "TOKEN-CANARY-480"
 SESSION = "SESSION-CANARY-480"
 
@@ -42,6 +43,11 @@ def test_link_view(age: int | None, skew: bool, expected: str) -> None:
     view = link_view(link, NOW)
     assert view == {
         "solar_source": "entities",
+        "topology_source": "legacy",
+        "topology_revision": None,
+        "topology_reason": None,
+        "major_loads_reason": None,
+        "supply_guard_reason": None,
         "state": expected,
         "site_id": snapshot().site_id if age is not None else None,
         "integration_release_version": "0.25.0" if age is not None else None,
@@ -75,6 +81,11 @@ async def test_link_http_socket_and_health(
     assert response.status_code == 200
     view = response.json()["integration_link"]
     assert view["state"] == expected and set(view) == KEYS
+    assert view["topology_source"] == "legacy"
+    assert view["topology_revision"] is None
+    assert view["topology_reason"] is None
+    assert view["major_loads_reason"] is None
+    assert view["supply_guard_reason"] is None
     if repair:
         assert response.json()["configuration"]["status"] == "configuration_repair"
     async with DaemonChannel(settings) as channel:
@@ -139,7 +150,7 @@ def test_heartbeat_health_and_skew_recovery(tmp_path: Path) -> None:
         initial = client.get("/api/health").json()
         assert initial["integration_link"]["state"] == "never_connected"
         body = snapshot().model_dump(mode="json")
-        for version, status, expected in [(1, 200, "connected"), (3, 409, "version_skew"),
+        for version, status, expected in [(1, 200, "connected"), (4, 409, "version_skew"),
                                            (1, 200, "connected")]:
             body["api_version"] = version
             assert client.post("/integration/heartbeat", json=body, headers={
