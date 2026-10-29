@@ -391,6 +391,11 @@ def is_running(
     return 0 <= age <= 60 and reading_kw >= load.effective_demand_kw / 10
 
 
+# Legacy settings carry no discharge amps. The fixed Solis export command is
+# the legacy discharge limit, so a legacy topology never refuses that command.
+_LEGACY_DISCHARGE_A = 62.5
+
+
 class LegacyV2L(FrozenModel):
     """Existing V2L coefficients, not a new native bank constraint."""
 
@@ -418,7 +423,10 @@ def legacy_topology(cfg: "PlannerConfig", driver_kind: DriverKind) -> LegacyTopo
 
     The exact legacy discharge ceiling is intentionally separate from the native
     DC-current calculation. The charge ceiling still respects driver capability.
+    The discharge limit is the driver ceiling (the fixed export command where
+    the driver declares none), never ``max_current_a``.
     """
+    discharge_a = driver_capabilities(driver_kind).discharge_ceiling_a or _LEGACY_DISCHARGE_A
     return LegacyTopology(
         connections=(
             GridConnection(
@@ -438,7 +446,7 @@ def legacy_topology(cfg: "PlannerConfig", driver_kind: DriverKind) -> LegacyTopo
                 min_soc=cfg.min_soc,
                 target_cap=cfg.target_cap,
                 charge_limit_a=cfg.max_current_a,
-                discharge_limit_a=cfg.max_current_a,
+                discharge_limit_a=discharge_a,
                 served_load_share_pct=100,
             ),
         ),
@@ -448,7 +456,7 @@ def legacy_topology(cfg: "PlannerConfig", driver_kind: DriverKind) -> LegacyTopo
                 bank_id="legacy_bank",
                 driver_kind=driver_kind,
                 charge_limit_a=cfg.max_current_a,
-                discharge_limit_a=cfg.max_current_a,
+                discharge_limit_a=discharge_a,
                 confirmed=True,
             ),
         ),

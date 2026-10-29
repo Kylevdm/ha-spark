@@ -184,6 +184,31 @@ def test_legacy_adapter_preserves_exact_discharge_and_v2l() -> None:
     assert topology.legacy_v2l.offpeak_rate_gbp == cfg.v2l_offpeak_rate_gbp
 
 
+@pytest.mark.parametrize("kind", ["solis", "alphaess"])
+def test_legacy_discharge_limit_is_the_fixed_command_not_the_charge_limit(kind: str) -> None:
+    """Legacy settings have no discharge amps: a 40 A charge owner keeps 62.5 A discharge."""
+    from ha_spark.energy.models import PlannerConfig
+    from ha_spark.energy.topology import legacy_topology
+
+    cfg = PlannerConfig(
+        capacity_kwh=14,
+        voltage_v=51,
+        min_soc=10,
+        target_cap=100,
+        max_current_a=40,
+        solar_haircut_k=0.8,
+        window_start=time(23, 30),
+        window_end=time(5, 30),
+    )
+    topology = legacy_topology(cfg, kind)  # type: ignore[arg-type]
+    limits = effective_limits(topology)
+    assert topology.inverters[0].discharge_limit_a == 62.5
+    assert topology.banks[0].discharge_limit_a == 62.5
+    assert limits.inverters[0].discharge_a == 62.5
+    assert limits.inverters[0].charge_a == 40
+    assert limits.banks[0].discharge_kw == cfg.battery_discharge_ceiling_kw
+
+
 @pytest.mark.parametrize(
     "group,field,value",
     [

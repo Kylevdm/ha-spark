@@ -152,10 +152,22 @@ def test_fallback_outside_the_topology_envelope_is_refused() -> None:
 
 @pytest.mark.asyncio
 async def test_export_command_above_the_effective_discharge_ceiling_is_refused(
-    tmp_path,
+    tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Legacy settings never refuse, so a lower inverter discharge limit is
+    # injected the way native limits (#542) will supply one.
+    from ha_spark.devices.inverters import solis
+
+    real = solis.legacy_limits
+
+    def narrowed(settings):  # type: ignore[no-untyped-def]
+        topology, limits = real(settings)
+        inverter = limits.inverters[0].model_copy(update={"discharge_a": 50.0})
+        return topology, limits.model_copy(update={"inverters": (inverter,)})
+
+    monkeypatch.setattr(solis, "legacy_limits", narrowed)
     rest = FakeRest()
-    device = _device(rest, tmp_path, max_charge_current_a=50.0)
+    device = _device(rest, tmp_path)
 
     lines = await device.apply(_export_intent(_export()))
 
@@ -167,9 +179,13 @@ async def test_export_command_above_the_effective_discharge_ceiling_is_refused(
 
 
 @pytest.mark.asyncio
-async def test_export_command_with_default_limits_is_programmed(tmp_path) -> None:
+@pytest.mark.parametrize("owner_max_a", [62.5, 40.0])
+async def test_legacy_export_command_is_programmed_as_today(
+    tmp_path, owner_max_a: float
+) -> None:
+    """Legacy settings never refuse the fixed command, whatever the charge limit."""
     rest = FakeRest()
-    device = _device(rest, tmp_path)
+    device = _device(rest, tmp_path, max_charge_current_a=owner_max_a)
     export = _export()
 
     lines = await device.apply(_export_intent(export))
