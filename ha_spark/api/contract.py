@@ -21,6 +21,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validato
 
 from ha_spark import __version__
 from ha_spark.api.plan_status import PlanStatus, resolve
+from ha_spark.api.topology_intake import MajorLoadReading, SupplyGuardBlock
 from ha_spark.authority import AuthorityState, HoldRecord
 from ha_spark.config import Settings
 from ha_spark.energy.forecast import load_timezone
@@ -28,10 +29,11 @@ from ha_spark.energy.horizon import compute_horizon_geometry
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.soc_integrity import SocStatus
 from ha_spark.energy.solar_source import ParsedSolarForecast
+from ha_spark.energy.topology_record import LoadedTopology
 from ha_spark.energy.v2l import V2LSession, delivered_fraction, savings
 
-API_VERSION: Final = 2
-SUPPORTED_API_VERSIONS: Final = frozenset({1, 2})
+API_VERSION: Final = 3
+SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3})
 
 
 class SiteSnapshot(BaseModel):
@@ -79,6 +81,11 @@ class IntegrationLink:
     received_at: datetime | None
     skew: bool
     solar_forecast: ParsedSolarForecast = ParsedSolarForecast("entities")
+    topology: LoadedTopology = LoadedTopology()
+    major_loads: tuple[MajorLoadReading, ...] = ()
+    supply_guard: SupplyGuardBlock | None = None
+    major_loads_reason: str | None = None
+    supply_guard_reason: str | None = None
 
 
 def link_view(link: IntegrationLink, now: datetime) -> dict[str, object]:
@@ -103,6 +110,11 @@ def link_view(link: IntegrationLink, now: datetime) -> dict[str, object]:
         )
     return {
         **solar,
+        "topology_source": link.topology.kind,
+        "topology_revision": link.topology.revision,
+        "topology_reason": link.topology.reason,
+        "major_loads_reason": link.major_loads_reason,
+        "supply_guard_reason": link.supply_guard_reason,
         "state": state,
         "site_id": snapshot.site_id if snapshot is not None else None,
         "integration_release_version": snapshot.release_version if snapshot is not None else None,
@@ -163,6 +175,9 @@ def plan_summary(
             start = (geometry.window_start if geometry.window_start > built_at
                      else geometry.horizon_end).isoformat()
         result["charge_window_start"] = start
+    if api_version >= 3 and settings is not None:
+        # Omitted rather than guessed: the integration then keeps HA's configured zone.
+        result["household_timezone"] = settings.timezone
     return result
 
 

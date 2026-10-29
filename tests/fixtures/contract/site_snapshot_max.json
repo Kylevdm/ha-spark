@@ -1,1 +1,1177 @@
-{"api_version":2,"release_version":"0.29.1","site_id":"6f1c2b3a-9d84-4e57-a1c0-2f3e4d5c6b7a","sent_at":"2026-10-24T11:59:58+00:00","solar_forecast":{"status":"ok","fetched_at":"2026-10-24T12:00:00+00:00","calls_used":2,"calls_limit":10,"slots":[["2026-10-24T12:00:00+00:00",99.111,99.222,99.333],["2026-10-24T12:30:00+00:00",99.111,99.222,99.333],["2026-10-24T13:00:00+00:00",99.111,99.222,99.333],["2026-10-24T13:30:00+00:00",99.111,99.222,99.333],["2026-10-24T14:00:00+00:00",99.111,99.222,99.333],["2026-10-24T14:30:00+00:00",99.111,99.222,99.333],["2026-10-24T15:00:00+00:00",99.111,99.222,99.333],["2026-10-24T15:30:00+00:00",99.111,99.222,99.333],["2026-10-24T16:00:00+00:00",99.111,99.222,99.333],["2026-10-24T16:30:00+00:00",99.111,99.222,99.333],["2026-10-24T17:00:00+00:00",99.111,99.222,99.333],["2026-10-24T17:30:00+00:00",99.111,99.222,99.333],["2026-10-24T18:00:00+00:00",99.111,99.222,99.333],["2026-10-24T18:30:00+00:00",99.111,99.222,99.333],["2026-10-24T19:00:00+00:00",99.111,99.222,99.333],["2026-10-24T19:30:00+00:00",99.111,99.222,99.333],["2026-10-24T20:00:00+00:00",99.111,99.222,99.333],["2026-10-24T20:30:00+00:00",99.111,99.222,99.333],["2026-10-24T21:00:00+00:00",99.111,99.222,99.333],["2026-10-24T21:30:00+00:00",99.111,99.222,99.333],["2026-10-24T22:00:00+00:00",99.111,99.222,99.333],["2026-10-24T22:30:00+00:00",99.111,99.222,99.333],["2026-10-24T23:00:00+00:00",99.111,99.222,99.333],["2026-10-24T23:30:00+00:00",99.111,99.222,99.333],["2026-10-25T00:00:00+00:00",99.111,99.222,99.333],["2026-10-25T00:30:00+00:00",99.111,99.222,99.333],["2026-10-25T01:00:00+00:00",99.111,99.222,99.333],["2026-10-25T01:30:00+00:00",99.111,99.222,99.333],["2026-10-25T02:00:00+00:00",99.111,99.222,99.333],["2026-10-25T02:30:00+00:00",99.111,99.222,99.333],["2026-10-25T03:00:00+00:00",99.111,99.222,99.333],["2026-10-25T03:30:00+00:00",99.111,99.222,99.333],["2026-10-25T04:00:00+00:00",99.111,99.222,99.333],["2026-10-25T04:30:00+00:00",99.111,99.222,99.333],["2026-10-25T05:00:00+00:00",99.111,99.222,99.333],["2026-10-25T05:30:00+00:00",99.111,99.222,99.333],["2026-10-25T06:00:00+00:00",99.111,99.222,99.333],["2026-10-25T06:30:00+00:00",99.111,99.222,99.333],["2026-10-25T07:00:00+00:00",99.111,99.222,99.333],["2026-10-25T07:30:00+00:00",99.111,99.222,99.333],["2026-10-25T08:00:00+00:00",99.111,99.222,99.333],["2026-10-25T08:30:00+00:00",99.111,99.222,99.333],["2026-10-25T09:00:00+00:00",99.111,99.222,99.333],["2026-10-25T09:30:00+00:00",99.111,99.222,99.333],["2026-10-25T10:00:00+00:00",99.111,99.222,99.333],["2026-10-25T10:30:00+00:00",99.111,99.222,99.333],["2026-10-25T11:00:00+00:00",99.111,99.222,99.333],["2026-10-25T11:30:00+00:00",99.111,99.222,99.333],["2026-10-25T12:00:00+00:00",99.111,99.222,99.333],["2026-10-25T12:30:00+00:00",99.111,99.222,99.333],["2026-10-25T13:00:00+00:00",99.111,99.222,99.333],["2026-10-25T13:30:00+00:00",99.111,99.222,99.333],["2026-10-25T14:00:00+00:00",99.111,99.222,99.333],["2026-10-25T14:30:00+00:00",99.111,99.222,99.333],["2026-10-25T15:00:00+00:00",99.111,99.222,99.333],["2026-10-25T15:30:00+00:00",99.111,99.222,99.333],["2026-10-25T16:00:00+00:00",99.111,99.222,99.333],["2026-10-25T16:30:00+00:00",99.111,99.222,99.333],["2026-10-25T17:00:00+00:00",99.111,99.222,99.333],["2026-10-25T17:30:00+00:00",99.111,99.222,99.333],["2026-10-25T18:00:00+00:00",99.111,99.222,99.333],["2026-10-25T18:30:00+00:00",99.111,99.222,99.333],["2026-10-25T19:00:00+00:00",99.111,99.222,99.333],["2026-10-25T19:30:00+00:00",99.111,99.222,99.333],["2026-10-25T20:00:00+00:00",99.111,99.222,99.333],["2026-10-25T20:30:00+00:00",99.111,99.222,99.333],["2026-10-25T21:00:00+00:00",99.111,99.222,99.333],["2026-10-25T21:30:00+00:00",99.111,99.222,99.333],["2026-10-25T22:00:00+00:00",99.111,99.222,99.333],["2026-10-25T22:30:00+00:00",99.111,99.222,99.333],["2026-10-25T23:00:00+00:00",99.111,99.222,99.333],["2026-10-25T23:30:00+00:00",99.111,99.222,99.333],["2026-10-26T00:00:00+00:00",99.111,99.222,99.333],["2026-10-26T00:30:00+00:00",99.111,99.222,99.333],["2026-10-26T01:00:00+00:00",99.111,99.222,99.333],["2026-10-26T01:30:00+00:00",99.111,99.222,99.333],["2026-10-26T02:00:00+00:00",99.111,99.222,99.333],["2026-10-26T02:30:00+00:00",99.111,99.222,99.333],["2026-10-26T03:00:00+00:00",99.111,99.222,99.333],["2026-10-26T03:30:00+00:00",99.111,99.222,99.333],["2026-10-26T04:00:00+00:00",99.111,99.222,99.333],["2026-10-26T04:30:00+00:00",99.111,99.222,99.333],["2026-10-26T05:00:00+00:00",99.111,99.222,99.333],["2026-10-26T05:30:00+00:00",99.111,99.222,99.333],["2026-10-26T06:00:00+00:00",99.111,99.222,99.333],["2026-10-26T06:30:00+00:00",99.111,99.222,99.333],["2026-10-26T07:00:00+00:00",99.111,99.222,99.333],["2026-10-26T07:30:00+00:00",99.111,99.222,99.333],["2026-10-26T08:00:00+00:00",99.111,99.222,99.333],["2026-10-26T08:30:00+00:00",99.111,99.222,99.333],["2026-10-26T09:00:00+00:00",99.111,99.222,99.333],["2026-10-26T09:30:00+00:00",99.111,99.222,99.333],["2026-10-26T10:00:00+00:00",99.111,99.222,99.333],["2026-10-26T10:30:00+00:00",99.111,99.222,99.333],["2026-10-26T11:00:00+00:00",99.111,99.222,99.333],["2026-10-26T11:30:00+00:00",99.111,99.222,99.333],["2026-10-26T12:00:00+00:00",99.111,99.222,99.333],["2026-10-26T12:30:00+00:00",99.111,99.222,99.333],["2026-10-26T13:00:00+00:00",99.111,99.222,99.333],["2026-10-26T13:30:00+00:00",99.111,99.222,99.333],["2026-10-26T14:00:00+00:00",99.111,99.222,99.333],["2026-10-26T14:30:00+00:00",99.111,99.222,99.333],["2026-10-26T15:00:00+00:00",99.111,99.222,99.333],["2026-10-26T15:30:00+00:00",99.111,99.222,99.333],["2026-10-26T16:00:00+00:00",99.111,99.222,99.333],["2026-10-26T16:30:00+00:00",99.111,99.222,99.333],["2026-10-26T17:00:00+00:00",99.111,99.222,99.333],["2026-10-26T17:30:00+00:00",99.111,99.222,99.333],["2026-10-26T18:00:00+00:00",99.111,99.222,99.333],["2026-10-26T18:30:00+00:00",99.111,99.222,99.333],["2026-10-26T19:00:00+00:00",99.111,99.222,99.333],["2026-10-26T19:30:00+00:00",99.111,99.222,99.333],["2026-10-26T20:00:00+00:00",99.111,99.222,99.333],["2026-10-26T20:30:00+00:00",99.111,99.222,99.333],["2026-10-26T21:00:00+00:00",99.111,99.222,99.333],["2026-10-26T21:30:00+00:00",99.111,99.222,99.333],["2026-10-26T22:00:00+00:00",99.111,99.222,99.333],["2026-10-26T22:30:00+00:00",99.111,99.222,99.333],["2026-10-26T23:00:00+00:00",99.111,99.222,99.333],["2026-10-26T23:30:00+00:00",99.111,99.222,99.333]]}}
+{
+  "api_version": 3,
+  "release_version": "0.29.1",
+  "site_id": "6f1c2b3a-9d84-4e57-a1c0-2f3e4d5c6b7a",
+  "sent_at": "2026-10-24T11:59:58+00:00",
+  "solar_forecast": {
+    "status": "ok",
+    "fetched_at": "2026-10-24T12:00:00+00:00",
+    "calls_used": 2,
+    "calls_limit": 10,
+    "slots": [
+      [
+        "2026-10-24T12:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T12:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T13:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T13:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T14:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T14:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T15:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T15:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T16:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T16:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T17:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T17:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T18:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T18:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T19:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T19:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T20:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T20:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T21:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T21:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T22:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T22:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T23:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-24T23:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T00:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T00:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T01:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T01:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T02:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T02:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T03:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T03:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T04:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T04:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T05:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T05:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T06:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T06:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T07:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T07:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T08:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T08:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T09:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T09:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T10:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T10:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T11:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T11:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T12:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T12:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T13:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T13:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T14:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T14:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T15:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T15:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T16:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T16:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T17:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T17:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T18:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T18:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T19:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T19:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T20:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T20:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T21:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T21:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T22:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T22:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T23:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-25T23:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T00:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T00:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T01:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T01:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T02:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T02:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T03:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T03:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T04:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T04:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T05:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T05:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T06:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T06:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T07:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T07:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T08:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T08:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T09:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T09:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T10:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T10:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T11:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T11:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T12:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T12:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T13:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T13:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T14:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T14:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T15:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T15:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T16:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T16:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T17:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T17:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T18:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T18:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T19:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T19:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T20:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T20:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T21:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T21:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T22:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T22:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T23:00:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ],
+      [
+        "2026-10-26T23:30:00+00:00",
+        99.111,
+        99.222,
+        99.333
+      ]
+    ]
+  },
+  "topology": {
+    "configured": true,
+    "revision": 2147483647,
+    "topology": {
+      "connections": [
+        {
+          "id": "c0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "supply_voltage_v": 229.99999999999997,
+          "import_limit_a": 99.99999999999999,
+          "export_limit_a": 99.99999999999999,
+          "dno_export_limit_kw": 22.999999999999996,
+          "grid_power_entity": "sensor.grid0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "id": "c1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "supply_voltage_v": 229.99999999999997,
+          "import_limit_a": 99.99999999999999,
+          "export_limit_a": 99.99999999999999,
+          "dno_export_limit_kw": 22.999999999999996,
+          "grid_power_entity": "sensor.grid1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "id": "c2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "supply_voltage_v": 229.99999999999997,
+          "import_limit_a": 99.99999999999999,
+          "export_limit_a": 99.99999999999999,
+          "dno_export_limit_kw": 22.999999999999996,
+          "grid_power_entity": "sensor.grid2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "id": "c3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "supply_voltage_v": 229.99999999999997,
+          "import_limit_a": 99.99999999999999,
+          "export_limit_a": 99.99999999999999,
+          "dno_export_limit_kw": 22.999999999999996,
+          "grid_power_entity": "sensor.grid3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      ],
+      "banks": [
+        {
+          "id": "b0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "usable_capacity_kwh": 19.999999999999996,
+          "nominal_voltage_v": 49.99999999999999,
+          "min_soc": 9.999999999999998,
+          "target_cap": 99.99999999999999,
+          "charge_limit_a": 124.99999999999999,
+          "discharge_limit_a": 124.99999999999999,
+          "served_load_share_pct": null,
+          "load_source_entity": "sensor.load0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "id": "b1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "usable_capacity_kwh": 19.999999999999996,
+          "nominal_voltage_v": 49.99999999999999,
+          "min_soc": 9.999999999999998,
+          "target_cap": 99.99999999999999,
+          "charge_limit_a": 124.99999999999999,
+          "discharge_limit_a": 124.99999999999999,
+          "served_load_share_pct": null,
+          "load_source_entity": "sensor.load1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "id": "b2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "usable_capacity_kwh": 19.999999999999996,
+          "nominal_voltage_v": 49.99999999999999,
+          "min_soc": 9.999999999999998,
+          "target_cap": 99.99999999999999,
+          "charge_limit_a": 124.99999999999999,
+          "discharge_limit_a": 124.99999999999999,
+          "served_load_share_pct": null,
+          "load_source_entity": "sensor.load2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "id": "b3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "usable_capacity_kwh": 19.999999999999996,
+          "nominal_voltage_v": 49.99999999999999,
+          "min_soc": 9.999999999999998,
+          "target_cap": 99.99999999999999,
+          "charge_limit_a": 124.99999999999999,
+          "discharge_limit_a": 124.99999999999999,
+          "served_load_share_pct": null,
+          "load_source_entity": "sensor.load3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "id": "b4_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "usable_capacity_kwh": 19.999999999999996,
+          "nominal_voltage_v": 49.99999999999999,
+          "min_soc": 9.999999999999998,
+          "target_cap": 99.99999999999999,
+          "charge_limit_a": 124.99999999999999,
+          "discharge_limit_a": 124.99999999999999,
+          "served_load_share_pct": null,
+          "load_source_entity": "sensor.load4_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "id": "b5_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "usable_capacity_kwh": 19.999999999999996,
+          "nominal_voltage_v": 49.99999999999999,
+          "min_soc": 9.999999999999998,
+          "target_cap": 99.99999999999999,
+          "charge_limit_a": 124.99999999999999,
+          "discharge_limit_a": 124.99999999999999,
+          "served_load_share_pct": null,
+          "load_source_entity": "sensor.load5_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      ],
+      "inverters": [
+        {
+          "id": "i0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "bank_id": "b0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "driver_kind": "solis",
+          "charge_limit_a": 61.99999999999999,
+          "discharge_limit_a": 61.99999999999999,
+          "confirmed": true,
+          "grid_port_power_entity": "sensor.port0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "battery_power_entity": "sensor.battery0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "power_sign": "positive_import"
+        },
+        {
+          "id": "i1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "bank_id": "b1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "driver_kind": "solis",
+          "charge_limit_a": 61.99999999999999,
+          "discharge_limit_a": 61.99999999999999,
+          "confirmed": true,
+          "grid_port_power_entity": "sensor.port1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "battery_power_entity": "sensor.battery1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "power_sign": "positive_import"
+        },
+        {
+          "id": "i2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "bank_id": "b2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "driver_kind": "solis",
+          "charge_limit_a": 61.99999999999999,
+          "discharge_limit_a": 61.99999999999999,
+          "confirmed": true,
+          "grid_port_power_entity": "sensor.port2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "battery_power_entity": "sensor.battery2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "power_sign": "positive_import"
+        },
+        {
+          "id": "i3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "bank_id": "b3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "driver_kind": "solis",
+          "charge_limit_a": 61.99999999999999,
+          "discharge_limit_a": 61.99999999999999,
+          "confirmed": true,
+          "grid_port_power_entity": "sensor.port3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "battery_power_entity": "sensor.battery3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "power_sign": "positive_import"
+        },
+        {
+          "id": "i4_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "bank_id": "b4_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "driver_kind": "solis",
+          "charge_limit_a": 61.99999999999999,
+          "discharge_limit_a": 61.99999999999999,
+          "confirmed": true,
+          "grid_port_power_entity": "sensor.port4_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "battery_power_entity": "sensor.battery4_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "power_sign": "positive_import"
+        },
+        {
+          "id": "i5_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "bank_id": "b5_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "driver_kind": "solis",
+          "charge_limit_a": 61.99999999999999,
+          "discharge_limit_a": 61.99999999999999,
+          "confirmed": true,
+          "grid_port_power_entity": "sensor.port5_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "battery_power_entity": "sensor.battery5_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "power_sign": "positive_import"
+        },
+        {
+          "id": "i6_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "bank_id": "b0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "driver_kind": "solis",
+          "charge_limit_a": 61.99999999999999,
+          "discharge_limit_a": 61.99999999999999,
+          "confirmed": true,
+          "grid_port_power_entity": "sensor.port6_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "battery_power_entity": "sensor.battery6_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "power_sign": "positive_import"
+        },
+        {
+          "id": "i7_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "bank_id": "b1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "driver_kind": "solis",
+          "charge_limit_a": 61.99999999999999,
+          "discharge_limit_a": 61.99999999999999,
+          "confirmed": true,
+          "grid_port_power_entity": "sensor.port7_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "battery_power_entity": "sensor.battery7_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "power_sign": "positive_import"
+        }
+      ],
+      "v2l_chargers": [
+        {
+          "id": "v0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "bank_id": "b0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "max_current_a": 29.999999999999996
+        },
+        {
+          "id": "v1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "bank_id": "b1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "max_current_a": 29.999999999999996
+        },
+        {
+          "id": "v2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "bank_id": "b2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "max_current_a": 29.999999999999996
+        },
+        {
+          "id": "v3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "bank_id": "b3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "max_current_a": 29.999999999999996
+        },
+        {
+          "id": "v4_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "bank_id": "b4_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "max_current_a": 29.999999999999996
+        },
+        {
+          "id": "v5_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "bank_id": "b5_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "max_current_a": 29.999999999999996
+        }
+      ],
+      "major_loads": [
+        {
+          "id": "l0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "kind": "heat_pump",
+          "demand_kw": null,
+          "heating_demand_kw": 3.9999999999999996,
+          "cooling_demand_kw": 2.9999999999999996,
+          "power_entity": "sensor.power0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "dispatch_driven": false
+        },
+        {
+          "id": "l1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "kind": "heat_pump",
+          "demand_kw": null,
+          "heating_demand_kw": 3.9999999999999996,
+          "cooling_demand_kw": 2.9999999999999996,
+          "power_entity": "sensor.power1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "dispatch_driven": false
+        },
+        {
+          "id": "l2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "kind": "heat_pump",
+          "demand_kw": null,
+          "heating_demand_kw": 3.9999999999999996,
+          "cooling_demand_kw": 2.9999999999999996,
+          "power_entity": "sensor.power2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "dispatch_driven": false
+        },
+        {
+          "id": "l3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "kind": "heat_pump",
+          "demand_kw": null,
+          "heating_demand_kw": 3.9999999999999996,
+          "cooling_demand_kw": 2.9999999999999996,
+          "power_entity": "sensor.power3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "dispatch_driven": false
+        },
+        {
+          "id": "l4_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "kind": "heat_pump",
+          "demand_kw": null,
+          "heating_demand_kw": 3.9999999999999996,
+          "cooling_demand_kw": 2.9999999999999996,
+          "power_entity": "sensor.power4_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "dispatch_driven": false
+        },
+        {
+          "id": "l5_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "kind": "heat_pump",
+          "demand_kw": null,
+          "heating_demand_kw": 3.9999999999999996,
+          "cooling_demand_kw": 2.9999999999999996,
+          "power_entity": "sensor.power5_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "dispatch_driven": false
+        },
+        {
+          "id": "l6_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "kind": "heat_pump",
+          "demand_kw": null,
+          "heating_demand_kw": 3.9999999999999996,
+          "cooling_demand_kw": 2.9999999999999996,
+          "power_entity": "sensor.power6_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "dispatch_driven": false
+        },
+        {
+          "id": "l7_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "kind": "heat_pump",
+          "demand_kw": null,
+          "heating_demand_kw": 3.9999999999999996,
+          "cooling_demand_kw": 2.9999999999999996,
+          "power_entity": "sensor.power7_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "dispatch_driven": false
+        },
+        {
+          "id": "l8_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "kind": "heat_pump",
+          "demand_kw": null,
+          "heating_demand_kw": 3.9999999999999996,
+          "cooling_demand_kw": 2.9999999999999996,
+          "power_entity": "sensor.power8_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "dispatch_driven": false
+        },
+        {
+          "id": "l9_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "kind": "heat_pump",
+          "demand_kw": null,
+          "heating_demand_kw": 3.9999999999999996,
+          "cooling_demand_kw": 2.9999999999999996,
+          "power_entity": "sensor.power9_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "dispatch_driven": false
+        },
+        {
+          "id": "l10_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "kind": "heat_pump",
+          "demand_kw": null,
+          "heating_demand_kw": 3.9999999999999996,
+          "cooling_demand_kw": 2.9999999999999996,
+          "power_entity": "sensor.power10_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "dispatch_driven": false
+        },
+        {
+          "id": "l11_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "connection_id": "c3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "kind": "heat_pump",
+          "demand_kw": null,
+          "heating_demand_kw": 3.9999999999999996,
+          "cooling_demand_kw": 2.9999999999999996,
+          "power_entity": "sensor.power11_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "dispatch_driven": false
+        }
+      ]
+    }
+  },
+  "major_loads": [
+    {
+      "id": "l0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "draw_kw": 12.345678901234567,
+      "reported_at": "2026-10-24T11:59:58.123456+00:00"
+    },
+    {
+      "id": "l1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "draw_kw": 12.345678901234567,
+      "reported_at": "2026-10-24T11:59:58.123456+00:00"
+    },
+    {
+      "id": "l2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "draw_kw": 12.345678901234567,
+      "reported_at": "2026-10-24T11:59:58.123456+00:00"
+    },
+    {
+      "id": "l3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "draw_kw": 12.345678901234567,
+      "reported_at": "2026-10-24T11:59:58.123456+00:00"
+    },
+    {
+      "id": "l4_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "draw_kw": 12.345678901234567,
+      "reported_at": "2026-10-24T11:59:58.123456+00:00"
+    },
+    {
+      "id": "l5_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "draw_kw": 12.345678901234567,
+      "reported_at": "2026-10-24T11:59:58.123456+00:00"
+    },
+    {
+      "id": "l6_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "draw_kw": 12.345678901234567,
+      "reported_at": "2026-10-24T11:59:58.123456+00:00"
+    },
+    {
+      "id": "l7_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "draw_kw": 12.345678901234567,
+      "reported_at": "2026-10-24T11:59:58.123456+00:00"
+    },
+    {
+      "id": "l8_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "draw_kw": 12.345678901234567,
+      "reported_at": "2026-10-24T11:59:58.123456+00:00"
+    },
+    {
+      "id": "l9_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "draw_kw": 12.345678901234567,
+      "reported_at": "2026-10-24T11:59:58.123456+00:00"
+    },
+    {
+      "id": "l10_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "draw_kw": 12.345678901234567,
+      "reported_at": "2026-10-24T11:59:58.123456+00:00"
+    },
+    {
+      "id": "l11_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "draw_kw": 12.345678901234567,
+      "reported_at": "2026-10-24T11:59:58.123456+00:00"
+    }
+  ],
+  "supply_guard": {
+    "limiting": true,
+    "connections": [
+      {
+        "id": "c0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "allowance_kw": 12.345678901234567
+      },
+      {
+        "id": "c1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "allowance_kw": 12.345678901234567
+      },
+      {
+        "id": "c2_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "allowance_kw": 12.345678901234567
+      },
+      {
+        "id": "c3_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "allowance_kw": 12.345678901234567
+      }
+    ],
+    "restores_left": 48,
+    "revision": 2147483647
+  }
+}
