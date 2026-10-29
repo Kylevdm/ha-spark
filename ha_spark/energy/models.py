@@ -476,13 +476,16 @@ class ChargePlan:
     # was wrong (#208).
     soc_path: tuple[tuple[datetime, float], ...] = ()
     view: PlanView | None = None
-    limits_source: Literal["legacy"] = "legacy"
+    limits_source: Literal["legacy", "native", "native (preview only)", "unavailable"] = "legacy"
     topology: Topology | None = None
     effective_limits: EffectiveLimits | None = None
     limits_reason: str | None = None
     hardware_limit_reason: str | None = None
     reserve_limit_reason: str | None = None
     reserve_advisory: str | None = None
+    # Display only (#542): the plan on the legacy device's bank of a topology
+    # the writer cannot follow yet. This plan, not the preview, is applied.
+    limits_preview: ChargePlan | None = None
     # Per-inverter commanded currents for a native topology's planned bank
     # (see :func:`ha_spark.energy.topology.split_bank_allocation`). Legacy and
     # fail-closed plans keep ``()``.

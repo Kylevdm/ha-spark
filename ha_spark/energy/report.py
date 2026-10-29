@@ -78,6 +78,21 @@ def format_plan(
                    plan.reserve_limit_reason, plan.reserve_advisory):
         if reason is not None:
             lines.append(f"  Limits             {reason}")
+    preview = plan.limits_preview
+    if preview is not None:
+        if preview.effective_limits is not None:
+            bank = preview.effective_limits.banks[0]
+            connection = preview.effective_limits.connections[0]
+            lines.append(
+                f"  Preview limits     {preview.limits_source}: charge {bank.charge_kw:.2f} kW "
+                f"DC; discharge {bank.discharge_kw:.2f} kW; import {connection.import_kw:.2f} kW; "
+                f"site export {connection.site_export_kw:.2f} kW"
+            )
+        lines.append(
+            f"  Preview target     {preview.target_soc:.0f}% (display only, not applied)"
+        )
+        if preview.limits_reason is not None:
+            lines.append(f"  Limits             {preview.limits_reason}")
     if plan.cheap_covered_kwh > 0:
         lines.append(f"  Cheap-covered load {plan.cheap_covered_kwh:.2f} kWh (daytime dispatch)")
     if plan.expensive_load_kwh is not None:

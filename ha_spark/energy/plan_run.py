@@ -11,16 +11,24 @@ the schedule here, once, removes that whole class of drift.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import tzinfo
 
 from ha_spark.config import Settings
+from ha_spark.devices.execution import execution_context
 from ha_spark.energy.models import ChargePlan, LoadForecast, PlannerConfig, PlannerInputs
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.energy.solar_source import SolarSource
 from ha_spark.energy.sources import build_schedule, gather_inputs
 from ha_spark.energy.tariff import TariffSchedule
+from ha_spark.energy.topology import MajorLoadObservation, effective_limits
+from ha_spark.energy.topology_record import (
+    LimitsSelection,
+    LoadedTopology,
+    load_topology_record,
+    select_limits,
+)
 from ha_spark.ha.rest import HomeAssistantRest
 
 
@@ -41,6 +49,8 @@ class PlanRun:
     # The household zone the inputs were read in, for formatting plan times
     # (horizon instants are UTC).
     tz: tzinfo | None = None
+    # Which accepted limits the plan was sized under (#542).
+    limits: LimitsSelection = LimitsSelection("legacy")
 
 
 @dataclass(frozen=True)
@@ -63,6 +73,8 @@ async def current_plan(
     *,
     soc: SocMeasurement | None = None,
     source: SolarSource,
+    limits: LoadedTopology | None = None,
+    major_loads: tuple[MajorLoadObservation, ...] | None = None,
 ) -> PlanRun:
     """Compute tonight's plan under the configured tariff provider.
 
@@ -73,12 +85,49 @@ async def current_plan(
     daemon tick's checked measurement, reused as-is so the plan carries the
     exact observation the loop made (no independent reread). ``source`` is
     the solar source context every plan must state explicitly (#519).
+
+    ``limits`` is the accepted limits record; omitted, the daemon's in-process
+    record (agent previews), else the durable record (CLI). The applied plan
+    is sized under the limits that drive the writer; a topology it cannot
+    follow adds a display-only preview (#542). ``major_loads`` are the
+    accepted snapshot's observations, by default the daemon's; without them
+    every load stays in the reserve.
     """
+    context = execution_context()
+    if limits is None:
+        limits = context.limits_record or load_topology_record(settings)
+    if major_loads is None:
+        major_loads = context.major_loads
+    selection = select_limits(limits, settings)
     inputs, cfg, forecast = await gather_inputs(settings, rest, soc=soc, source=source)
     schedule = build_schedule(settings, inputs, cfg)
-    plan = compute_plan(inputs, cfg, schedule)
+    if selection.source == "unavailable":
+        plan = compute_plan(inputs, cfg, schedule, limits_unavailable=selection.reason)
+    elif selection.actuation is not None:
+        plan = compute_plan(
+            inputs, cfg, schedule, topology=selection.actuation,
+            limits=effective_limits(selection.actuation), major_loads=major_loads,
+        )
+    else:
+        plan = compute_plan(inputs, cfg, schedule)
+    plan = replace(plan, limits_source=(
+        "unavailable" if selection.source == "unavailable"
+        else "native" if selection.actuation is not None else "legacy"
+    ))
+    if selection.source == "native (preview only)":
+        preview = (
+            compute_plan(
+                inputs, cfg, schedule, topology=selection.preview,
+                limits=effective_limits(selection.preview), major_loads=major_loads,
+            ) if selection.preview is not None
+            else compute_plan(inputs, cfg, schedule, limits_unavailable=selection.reason)
+        )
+        plan = replace(plan, limits_preview=replace(
+            preview, limits_source="native (preview only)", limits_reason=selection.reason,
+        ))
     return PlanRun(
         plan=plan, inputs=inputs, cfg=cfg, schedule=schedule,
         load_source=forecast.source, forecast=forecast,
         tz=inputs.now.tzinfo if inputs.now is not None else None,
+        limits=selection,
     )

@@ -1,8 +1,9 @@
 """Process-shared permission seam and indivisible, reentrant inverter bus actions.
 
 The daemon binds the sole authority store. Unbound callers fail closed. Planned
-epochs and config generations are checked under the bus lock and again at each
-actuating call. Remapped held identities never grant authority to a replacement.
+epochs, config generations and accepted limits revisions are checked under the
+bus lock and again at each actuating call. Remapped held identities never grant
+authority to a replacement.
 During a transition only the running handover step actuates, for its own class.
 Factories and direct driver construction use the same default context. Coordinators
 keep loop-local locks (CLI/tests may run successive event loops); the daemon uses
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
 
     from ha_spark.authority import AuthorityStore
     from ha_spark.config import DeviceConfig, Settings
+    from ha_spark.energy.topology import MajorLoadObservation
+    from ha_spark.energy.topology_record import LoadedTopology
 
 
 def held_identity_remapped(device: HoldDevice, settings: Settings) -> bool:
@@ -83,6 +86,8 @@ class WriteGate:
             return "refuse:stale authority"
         if self.context.planned_generation.get() != self.context.config_generation:
             return "refuse:stale config"
+        if self.context.planned_limits.get() != self.context.limits_key():
+            return "refuse:stale limits"
         if state.committed_mode == "observe":
             return "simulate"
         if any(held_identity_remapped(h.device, settings) for h in state.holds):
@@ -209,6 +214,15 @@ class ExecutionContext:
             "planned_generation", default=None
         )
         self.handover_step: ContextVar[str | None] = ContextVar("handover_step", default=None)
+        # The accepted limits record (#542): the daemon sets it at startup and on
+        # every accepted snapshot change. None is the legacy settings. A write is
+        # refused when the limits it was planned under have been superseded.
+        self.limits_record: LoadedTopology | None = None
+        # The accepted snapshot's major-load observations, for planning only.
+        self.major_loads: tuple[MajorLoadObservation, ...] = ()
+        self.planned_limits: ContextVar[tuple[str, int | None]] = ContextVar(
+            "planned_limits", default=("legacy", None)
+        )
         self.gate = WriteGate(self)
         self.release_backoff: dict[HoldDevice, ReleaseBackoff] = {}
         self._buses: dict[tuple[str, str, str], BusCoordinator] = {}
@@ -219,11 +233,18 @@ class ExecutionContext:
         state = self.authority.state if self.authority is not None else None
         token = self.planned_epoch.set(state.epoch if state is not None else None)
         generation_token = self.planned_generation.set(self.config_generation)
+        limits_token = self.planned_limits.set(self.limits_key())
         try:
             yield
         finally:
             self.planned_epoch.reset(token)
             self.planned_generation.reset(generation_token)
+            self.planned_limits.reset(limits_token)
+
+    def limits_key(self) -> tuple[str, int | None]:
+        """The current accepted limits identity (kind, revision)."""
+        record = self.limits_record
+        return ("legacy", None) if record is None else (record.kind, record.revision)
 
     @contextmanager
     def after_authority_save(self) -> Iterator[None]:

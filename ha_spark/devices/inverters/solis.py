@@ -85,6 +85,7 @@ from ha_spark.energy.soc_integrity import MAX_UNCHANGED, SocMeasurement, SocStat
 from ha_spark.energy.topology import (
     EffectiveLimits,
     LegacyTopology,
+    Topology,
     charge_setpoint_a,
     driver_capabilities,
     effective_limits,
@@ -209,10 +210,36 @@ def legacy_limits(settings: Settings) -> tuple[LegacyTopology, EffectiveLimits] 
     return topology, effective_limits(topology)
 
 
-def _commanded_current_a(settings: Settings, requested_a: float) -> int:
+# After native acceptance an unusable durable record narrows every limit to zero.
+_LIMITS_UNAVAILABLE = "the accepted topology record is unavailable"
+
+
+def active_limits(
+    settings: Settings, execution: ExecutionContext | None = None,
+) -> tuple[Topology, EffectiveLimits] | str:
+    """The limits driving this writer under the context's accepted record (#542).
+
+    A native topology drives it only on an exact single-inverter match; otherwise
+    the last accepted supported topology, else the legacy settings. A reason
+    string narrows every limit to zero (no current, no export, no fallback).
+    """
+    from ha_spark.energy.topology_record import select_limits  # import cycle, see apply
+
+    selection = select_limits((execution or execution_context()).limits_record, settings)
+    if selection.source == "unavailable":
+        return _LIMITS_UNAVAILABLE
+    if selection.actuation is None:
+        limits = legacy_limits(settings)
+        return _LIMITS_INVALID if limits is None else limits
+    return selection.actuation, effective_limits(selection.actuation)
+
+
+def _commanded_current_a(
+    settings: Settings, requested_a: float, execution: ExecutionContext | None = None,
+) -> int:
     """Whole amps at or below the effective per-inverter charge limit, rounded down."""
-    limits = legacy_limits(settings)
-    if limits is None:
+    limits = active_limits(settings, execution)
+    if isinstance(limits, str):
         return 0
     topology, effective = limits
     try:
@@ -222,15 +249,17 @@ def _commanded_current_a(settings: Settings, requested_a: float) -> int:
     return 0 if amps is None else math.floor(amps)
 
 
-def _fixed_export_refusal(settings: Settings) -> str | None:
+def _fixed_export_refusal(
+    settings: Settings, execution: ExecutionContext | None = None,
+) -> str | None:
     """Refuse the fixed export command above the inverter's or bank's discharge ceiling.
 
     Compared in amps, so the legacy bank's exact kW export ceiling never takes a
     current round trip. In addition to every other export gate.
     """
-    limits = legacy_limits(settings)
-    if limits is None:
-        return _LIMITS_INVALID
+    limits = active_limits(settings, execution)
+    if isinstance(limits, str):
+        return limits
     topology, effective = limits
     inverter = effective.inverters[0]
     bank = next(b for b in topology.banks if b.id == inverter.bank_id)
@@ -268,6 +297,7 @@ def validate_fallback_schedule(
     *,
     export: ExportIntent | None = None,
     controls: frozenset[Capability] = _FALLBACK_CONTROLS,
+    execution: ExecutionContext | None = None,
 ) -> FallbackSchedule | str:
     """Validate the fallback charge schedule; one named reason per invalid case.
 
@@ -330,11 +360,21 @@ def validate_fallback_schedule(
         return "the fallback charge window is zero-length"
     # After the window checks: the effective limits are derived from settings
     # that include the window, so a bad window keeps its own named reason.
-    limits = legacy_limits(settings)
-    if limits is None:
-        return _LIMITS_INVALID
-    _topology, effective = limits
-    charge_w = configured * settings.battery_voltage_v
+    limits = active_limits(settings, execution)
+    if isinstance(limits, str):
+        return limits
+    topology, effective = limits
+    # Native limits replace the legacy fields (#542): the effective inverter
+    # and bank charge limits and the bank's nominal voltage. For the legacy
+    # topology these equal the checks above, so their reasons come first.
+    bank = topology.banks[0]
+    limit_a = min(effective.inverters[0].charge_a, bank.charge_limit_a)
+    if configured > limit_a:
+        return (
+            f"solis_fallback_current_a ({configured:g} A) is above the effective "
+            f"charge limit ({limit_a:g} A)"
+        )
+    charge_w = configured * bank.nominal_voltage_v
     supply_w = effective.connections[0].import_kw * 1000
     if charge_w > supply_w:
         return (
@@ -348,9 +388,11 @@ def validate_fallback_schedule(
     )
 
 
-def validated_fallback_current_a(settings: Settings) -> int | None:
+def validated_fallback_current_a(
+    settings: Settings, execution: ExecutionContext | None = None,
+) -> int | None:
     """The validated fallback current, or ``None`` while the schedule is invalid."""
-    result = validate_fallback_schedule(settings)
+    result = validate_fallback_schedule(settings, execution=execution)
     return result.current_a if isinstance(result, FallbackSchedule) else None
 
 
@@ -511,7 +553,10 @@ class SolisDevice:
     # --- planning ---
 
     def planned_rate_w(self, intent: ChargeIntent) -> float:
-        return solis_current_a(intent, self._settings) * self._settings.battery_voltage_v
+        return (
+            solis_current_a(intent, self._settings, self._execution)
+            * self._settings.battery_voltage_v
+        )
 
     # --- apply: the forced-charge sequence ---
 
@@ -525,7 +570,7 @@ class SolisDevice:
         against the settings in force now (#422): an above-limit current is
         blocked with the case named, never clamped.
         """
-        validated = validate_fallback_schedule(self._settings)
+        validated = validate_fallback_schedule(self._settings, execution=self._execution)
         if isinstance(validated, str):
             return [
                 ActionLine(
@@ -614,9 +659,10 @@ class SolisDevice:
             return _ApplyResult(lines, False, False, False)
         current_a = _commanded_current_a(
             self._settings,
-            solis_current_a(intent, self._settings)
+            solis_current_a(intent, self._settings, self._execution)
             if fallback_current_a is None
             else fallback_current_a,
+            self._execution,
         )
         raw_export = getattr(intent, "export", None)
         export_store = ExportEventStore(self._settings.db_path)
@@ -672,7 +718,7 @@ class SolisDevice:
             assert export is not None
             export_error = _validate_export(intent, export)
             if export_error is None:
-                export_error = _fixed_export_refusal(self._settings)
+                export_error = _fixed_export_refusal(self._settings, self._execution)
             if export_error is None:
                 export_error = _export_not_yet_armed(export, now)
                 if export_error is not None and mode in ("on", "simulate"):
@@ -796,7 +842,9 @@ class SolisDevice:
 
     async def set_charge_rate(self, watts: float) -> ActionLine:
         amps = (
-            _commanded_current_a(self._settings, watts / self._settings.battery_voltage_v)
+            _commanded_current_a(
+                self._settings, watts / self._settings.battery_voltage_v, self._execution,
+            )
             if self._settings.battery_voltage_v > 0
             else 0
         )
@@ -843,7 +891,7 @@ class SolisDevice:
             return _refused(mode)
         keeps_discharge = export_window is not None or kept_discharge is not None
         current_a = (
-            solis_current_a(intent, self._settings)
+            solis_current_a(intent, self._settings, self._execution)
             if charge_current_a is None
             else charge_current_a
         )
@@ -986,7 +1034,9 @@ class SolisDevice:
         # Whole amps at or below the effective limit, min(owner, 62.5 A driver ceiling).
         amps = _commanded_current_a(
             self._settings,
-            solis_current_a(intent, self._settings) if current_a is None else current_a,
+            solis_current_a(intent, self._settings, self._execution)
+            if current_a is None else current_a,
+            self._execution,
         )
         desc = _charge_current_description(
             intent, self._settings, amps, fallback=fallback
@@ -1018,7 +1068,9 @@ class SolisDevice:
         ``planned_discharge`` is the discharge half this apply will program."""
         amps = _commanded_current_a(
             self._settings,
-            solis_current_a(intent, self._settings) if current_a is None else current_a,
+            solis_current_a(intent, self._settings, self._execution)
+            if current_a is None else current_a,
+            self._execution,
         )
         current_desc = _charge_current_description(
             intent, self._settings, amps, fallback=fallback
@@ -1354,7 +1406,7 @@ class SolisDevice:
         if state.committed_mode == "protect":
             return [], await self._resident_schedule_problem()
         if state.fallback.active:
-            validated = validate_fallback_schedule(self._settings)
+            validated = validate_fallback_schedule(self._settings, execution=self._execution)
             if isinstance(validated, str):
                 return [], f"fallback schedule invalid: {validated}"
             result = await self._apply(
@@ -1518,7 +1570,7 @@ class SolisDevice:
         the step instead of preserving the export the way ``apply_fallback`` does.
         The schedule is re-validated now, and every ``_apply`` guard still runs.
         """
-        validated = validate_fallback_schedule(self._settings)
+        validated = validate_fallback_schedule(self._settings, execution=self._execution)
         if isinstance(validated, str):
             return [ActionLine(
                 f"[BLOCKED] Solis fallback invalid: {validated}", ActionOutcome.BLOCKED
@@ -2578,7 +2630,9 @@ def _sizing_soc(intent: ChargeIntent, settings: Settings) -> float:
     return intent.soc_now
 
 
-def solis_current_a(intent: ChargeIntent, settings: Settings) -> float:
+def solis_current_a(
+    intent: ChargeIntent, settings: Settings, execution: ExecutionContext | None = None,
+) -> float:
     """DC charge current (A) for the intent — the legacy planner sizing, inverted.
 
     A target at or below the sizing SoC (decision B can set one below the
@@ -2597,6 +2651,6 @@ def solis_current_a(intent: ChargeIntent, settings: Settings) -> float:
     kwh_per_amp = charge_hours(intent, settings) * settings.battery_voltage_v / 1000.0
     if kwh_per_amp <= 0:
         return 0.0
-    limits = legacy_limits(settings)
-    limit_a = limits[1].inverters[0].charge_a if limits is not None else 0.0
+    limits = active_limits(settings, execution)
+    limit_a = 0.0 if isinstance(limits, str) else limits[1].inverters[0].charge_a
     return min(limit_a, purchase / kwh_per_amp)

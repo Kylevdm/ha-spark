@@ -29,6 +29,7 @@ from ha_spark.energy.horizon import compute_horizon_geometry
 from ha_spark.energy.models import ChargePlan
 from ha_spark.energy.soc_integrity import SocStatus
 from ha_spark.energy.solar_source import ParsedSolarForecast
+from ha_spark.energy.topology import MajorLoadObservation
 from ha_spark.energy.topology_record import LoadedTopology
 from ha_spark.energy.v2l import V2LSession, delivered_fraction, savings
 
@@ -86,6 +87,13 @@ class IntegrationLink:
     supply_guard: SupplyGuardBlock | None = None
     major_loads_reason: str | None = None
     supply_guard_reason: str | None = None
+
+
+def major_load_observations(link: IntegrationLink) -> tuple[MajorLoadObservation, ...]:
+    """The accepted snapshot's major-load readings as planner observations (#542)."""
+    return tuple(
+        MajorLoadObservation(r.id, r.draw_kw, r.reported_at) for r in link.major_loads
+    )
 
 
 def link_view(link: IntegrationLink, now: datetime) -> dict[str, object]:

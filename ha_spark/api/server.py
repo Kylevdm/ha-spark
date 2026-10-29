@@ -45,6 +45,7 @@ from ha_spark.api.contract import (
     IntegrationLink,
     SiteSnapshot,
     link_view,
+    major_load_observations,
     plan_summary,
     version_refusal,
 )
@@ -55,6 +56,7 @@ from ha_spark.api.topology_intake import accept_topology, parse_major_loads, par
 from ha_spark.authority import OperatingMode, authority_view, load_authority
 from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import CONFIGURATION_REPAIR, DaemonChannel
+from ha_spark.devices.execution import execution_context
 from ha_spark.energy import v2l
 from ha_spark.energy.carbon import carbon_payload
 from ha_spark.energy.forecast import load_timezone
@@ -796,6 +798,12 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
         state.integration_link = IntegrationLink(
             snapshot, now, False, parsed, topology, readings, guard, readings_reason, guard_reason,
         )
+        # Planning inputs for the daemon and in-process agent previews (#542). A
+        # changed record supersedes the limits any in-flight write was planned
+        # under; never an authority change.
+        execution_context().major_loads = major_load_observations(state.integration_link)
+        if changed:
+            execution_context().limits_record = topology
         if changed and state.executor is not None:
             state.executor.request_replan()
         if load_solar_source_kind(state.settings) != parsed.kind:

@@ -12,7 +12,11 @@ from pydantic import AwareDatetime, Field, TypeAdapter, ValidationError, field_v
 
 from ha_spark.config import Settings
 from ha_spark.energy.topology import FrozenModel, SafeId, Topology, effective_limits
-from ha_spark.energy.topology_record import LoadedTopology, save_topology_record
+from ha_spark.energy.topology_record import (
+    LoadedTopology,
+    save_topology_record,
+    single_inverter,
+)
 
 
 class TopologyBlock(FrozenModel):
@@ -87,11 +91,23 @@ def accept_topology(
         return replace(previous, reason=reason), False
     if previous.revision is not None and block.revision < previous.revision:
         return replace(previous, reason="invalid_topology"), False
+    supported: tuple[int, Topology] | None = None
+    if single_inverter(block.topology):
+        supported = (block.revision, block.topology)
+    elif previous.supported_revision is not None and previous.supported_topology is not None:
+        supported = (previous.supported_revision, previous.supported_topology)
+    elif (previous.kind == "native" and previous.revision is not None
+          and previous.topology is not None and single_inverter(previous.topology)):
+        supported = (previous.revision, previous.topology)
     try:
-        save_topology_record(settings, block.revision, block.topology)
+        save_topology_record(settings, block.revision, block.topology, supported)
     except OSError:
         return replace(previous, reason="topology_save_failed"), False
-    return LoadedTopology("native", block.revision, block.topology), True
+    return LoadedTopology(
+        "native", block.revision, block.topology,
+        supported_revision=supported[0] if supported is not None else None,
+        supported_topology=supported[1] if supported is not None else None,
+    ), True
 
 
 def parse_major_loads(

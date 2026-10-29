@@ -10,9 +10,10 @@ which the deterministic offline parser is a valid fallback).
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from enum import Enum
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from ha_spark.devices.inverters.solis_clock import (
 )
 from ha_spark.energy.axle import AxleApiError, read_axle_event
 from ha_spark.energy.forecast import intervals_from_hourly_stats, load_timezone
+from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.octopus import (
     OctopusApiError,
     fetch_planned_dispatches,
@@ -42,10 +44,12 @@ from ha_spark.energy.profile import history_coverage
 from ha_spark.energy.solar_source import load_solar_source_kind
 from ha_spark.energy.sources import (
     build_config,
+    parse_time,
     read_dispatch_evidence,
     read_dispatches_and_live,
     read_ev_hold_status,
 )
+from ha_spark.energy.tariff import _in_overnight_window as in_window
 from ha_spark.energy.topology import (
     Topology,
     charge_capacity_kw,
@@ -53,7 +57,12 @@ from ha_spark.energy.topology import (
     legacy_topology,
     reserve_advisory,
 )
-from ha_spark.energy.topology_record import load_topology_record
+from ha_spark.energy.topology_record import (
+    PREVIEW_REASON,
+    UNAVAILABLE_REASON,
+    load_topology_record,
+    select_limits,
+)
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.statistics import statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
@@ -561,8 +570,9 @@ async def check_evidence_freshness(settings: Settings) -> list[CheckResult]:
 async def check_effective_limits(
     settings: Settings, *, topology: Topology | None = None,
     overnight_base_load_kw: float | None = None,
+    source: str = "legacy", note: str | None = None,
 ) -> CheckResult:
-    """Show effective budgets; optional forecast evidence adds a reserve advisory.
+    """Show effective budgets and their source; forecast evidence adds a reserve advisory.
 
     Missing or unusable forecast evidence skips the advisory, never blocks health.
     """
@@ -581,10 +591,55 @@ async def check_effective_limits(
         advisory = reserve_advisory(topology, connection, overnight_base_load_kw)
         if advisory is not None:
             return CheckResult("Effective limits", Status.WARN, advisory)
-    return CheckResult(
-        "Effective limits", Status.OK,
-        f"legacy: charge {bank.charge_kw:.2f} kW DC; discharge {bank.discharge_kw:.2f} kW; "
-        f"import {connection.import_kw:.2f} kW; site export {connection.site_export_kw:.2f} kW",
+    detail = (
+        f"{source}: charge {bank.charge_kw:.2f} kW DC; discharge {bank.discharge_kw:.2f} kW; "
+        f"import {connection.import_kw:.2f} kW; site export {connection.site_export_kw:.2f} kW"
+    )
+    return CheckResult("Effective limits", Status.OK,
+                       detail if note is None else f"{detail}; {note}")
+
+
+async def _overnight_base_load_kw(settings: Settings) -> float | None:
+    """The latest recorded load forecast's peak kW over the charge window, or None."""
+    try:
+        tz = load_timezone(settings.timezone)
+        async with ForecastLedger(settings.db_path) as ledger:
+            records = await ledger.forecasts_since(datetime.now(tz).date() - timedelta(days=1))
+        slots = max(
+            (r for r in records if r.slots is not None and len(r.slots) == 48),
+            key=lambda r: r.made_at, default=None,
+        )
+        if slots is None or slots.slots is None:
+            return None
+        start, end = parse_time(settings.charge_window_start), parse_time(
+            settings.charge_window_end)
+        window = [
+            float(kwh) * 2 for i, kwh in enumerate(slots.slots)
+            if in_window(time(i // 2, 30 * (i % 2)), start, end)
+        ]
+        return max(window) if window and all(math.isfinite(v) for v in window) else None
+    except Exception:  # noqa: BLE001 - advisory evidence only; never blocks health
+        return None
+
+
+async def check_limits(settings: Settings) -> CheckResult:
+    """The limits source (#542): legacy, native or native (preview only), with advisory."""
+    selection = select_limits(load_topology_record(settings), settings)
+    if selection.source == "unavailable":
+        return CheckResult("Effective limits", Status.WARN, UNAVAILABLE_REASON)
+    overnight = await _overnight_base_load_kw(settings)
+    if selection.source == "native (preview only)":
+        if selection.preview is None:
+            return CheckResult("Effective limits", Status.WARN, PREVIEW_REASON)
+        writer = "native" if selection.actuation is not None else "legacy"
+        return await check_effective_limits(
+            settings, topology=selection.preview, overnight_base_load_kw=overnight,
+            source=selection.source,
+            note=f"{PREVIEW_REASON}; the writer keeps the {writer} limits",
+        )
+    return await check_effective_limits(
+        settings, topology=selection.actuation, overnight_base_load_kw=overnight,
+        source=selection.source,
     )
 
 
@@ -612,7 +667,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_sqlite(settings),
         check_load_history(settings),
         check_supply_guard(settings),
-        check_effective_limits(settings),
+        check_limits(settings),
         check_topology_record(settings),
         check_tariff_provider(settings),
         check_export_event_provider(settings),

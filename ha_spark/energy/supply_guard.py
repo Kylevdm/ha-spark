@@ -5,7 +5,8 @@ total supply draw past what the main fuse should carry. Each daemon tick the
 guard reads the whole-house draw (``grid_power_entity``, W) and the battery's
 charge-rate setpoint (W), then resizes the setpoint to fit the remaining
 headroom — shedding when over the effective connection import limit (the legacy
-``supply_max_current_a`` at ``supply_voltage_v``), restoring toward the
+``supply_max_current_a`` at ``supply_voltage_v``, or the accepted native
+connection's), restoring toward the
 plan's target as headroom returns. Writes go through the active ``Charger``, so
 the operating-mode write gate, failure isolation, and read-back verification apply.
 
@@ -34,7 +35,7 @@ from ha_spark.devices.execution import (
     device_action,
     execution_context,
 )
-from ha_spark.devices.inverters.solis import legacy_limits, validated_fallback_current_a
+from ha_spark.devices.inverters.solis import active_limits, validated_fallback_current_a
 from ha_spark.devices.outcomes import ActionLine
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.ha.rest import HomeAssistantRest
@@ -108,7 +109,7 @@ class SupplyGuard:
             return None
 
         if fallback_active:
-            fallback_a = validated_fallback_current_a(s)
+            fallback_a = validated_fallback_current_a(s, self._execution)
             if not fallback_confirmed or fallback_a is None:
                 # A persisted/requested/failed fallback is not evidence of the
                 # resident current. Reductions remain valid; increases wait for
@@ -122,11 +123,11 @@ class SupplyGuard:
         elif soc is not None and not soc.ok:
             target_w = min(target_w, setpoint_w)
 
-        # The effective connection import, as amps at its validated supply
-        # voltage; unusable settings narrow it to zero.
-        limits = legacy_limits(s)
-        import_w = limits[1].connections[0].import_kw * 1000 if limits is not None else 0.0
-        voltage_v = limits[0].connections[0].supply_voltage_v if limits is not None else 1.0
+        # The effective connection import of the accepted limits (#542), as amps
+        # at its validated supply voltage; unusable limits narrow it to zero.
+        limits = active_limits(s, self._execution)
+        import_w = 0.0 if isinstance(limits, str) else limits[1].connections[0].import_kw * 1000
+        voltage_v = 1.0 if isinstance(limits, str) else limits[0].connections[0].supply_voltage_v
         wanted_w = throttled_rate_w(
             supply_w,
             setpoint_w,
