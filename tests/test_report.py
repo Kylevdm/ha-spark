@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime, time
 from ha_spark.energy.models import ChargeIntent, ChargePlan, ExportIntent, ExportSkip, Reservation
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+from ha_spark.energy.topology import InverterAllocation
 
 
 def _soc(value: float) -> SocMeasurement:
@@ -53,6 +54,23 @@ def test_hardware_limit_id_is_visible_but_never_in_log_rendering() -> None:
     logged = format_plan(plan, "test", for_logging=True)
     assert "owner_bank" not in logged
     assert "Charging limited by hardware." in logged
+
+
+def test_inverter_allocation_line_visible_but_ids_masked_in_log_rendering() -> None:
+    plan = _plan(inverter_allocations=(
+        InverterAllocation(inverter_id="owner_inverter", charge_a=44),
+        InverterAllocation(inverter_id="annex_inverter", charge_a=None),
+    ))
+    out = format_plan(plan, "test")
+    assert "Charge allocation  owner_inverter 44 A, annex_inverter no charge command" in out
+    logged = format_plan(plan, "test", for_logging=True)
+    assert "owner_inverter" not in logged
+    assert "annex_inverter" not in logged
+    assert "Charge allocation  2 inverters: 44 A, no charge command" in logged
+
+
+def test_no_charge_allocation_line_without_allocations() -> None:
+    assert "Charge allocation" not in format_plan(_plan(), "test")
 
 
 def test_fill_strategy_annotates_required_line() -> None:
