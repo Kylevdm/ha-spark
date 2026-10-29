@@ -82,6 +82,7 @@ from ha_spark.energy.topology import (
     BankLimits,
     ConnectionLimits,
     EffectiveLimits,
+    InverterAllocation,
     LegacyTopology,
     MajorLoad,
     MajorLoadObservation,
@@ -92,6 +93,7 @@ from ha_spark.energy.topology import (
     legacy_topology,
     major_load_reserve_kw,
     reserve_advisory,
+    split_bank_allocation,
 )
 
 LIMITS_UNAVAILABLE_REASON = (
@@ -275,9 +277,15 @@ def _window_charge_limit(
     inputs: PlannerInputs, cfg: PlannerConfig, limits: _PlanningLimits, efficiency: float,
     loads: tuple[MajorLoad, ...] = (),
     observations: tuple[MajorLoadObservation, ...] = (),
-    *, without_reserve: bool = False,
+    *,
+    without_reserve: bool = False,
+    planned_v2l_dc_kw: float = 0.0,
 ) -> tuple[float, str]:
-    """Stored DC kWh within effective limits, counting only the remaining window."""
+    """Stored DC kWh within effective limits, counting only the remaining window.
+
+    ``planned_v2l_dc_kw`` is the in-window V2L set-aside: it narrows the bank's
+    charge room, never the connection's import budget.
+    """
     geometry = inputs.geometry_for(cfg)
     binding_id = limits.hardware_id
     evidence = {observation.load_id: observation for observation in observations}
@@ -331,8 +339,13 @@ def _window_charge_limit(
             capacity = charge_capacity_kw(
                 limits.bank, limits.connection, charge_efficiency=efficiency,
                 base_load_kw=load * 2, active_major_loads_kw=active_kw, reserve_kw=reserve_kw,
+                planned_v2l_dc_kw=planned_v2l_dc_kw,
             )
-            if capacity < limits.bank.charge_kw - 1e-9:
+            # The connection binds only when the import term, not the bank room
+            # shared with a V2L charger, is what lowered the capacity.
+            if capacity < min(
+                limits.bank.charge_kw, limits.bank.bank_charge_kw - planned_v2l_dc_kw
+            ) - 1e-9:
                 binding_id = limits.connection.id
             energy += capacity * hours
         return energy, binding_id
@@ -343,6 +356,20 @@ def _window_charge_limit(
         if 0.0 <= elapsed <= hours:
             hours -= elapsed
     return max(0.0, limits.bank.charge_kw * hours), binding_id
+
+
+def _remaining_window_hours(inputs: PlannerInputs, cfg: PlannerConfig) -> float:
+    """Hours the commanded current is sized over: the driver's ``solis_current_a``
+    relation. The full window before it opens, what is left of it once the plan
+    is made inside it (see ``_window_charge_limit``'s remaining-hours rule)."""
+    geometry = inputs.geometry_for(cfg)
+    if geometry is not None and inputs.now is not None:
+        now = inputs.now
+        if now.tzinfo is None:  # read a naive clock on the horizon's zone
+            now = now.replace(tzinfo=geometry.horizon_start.tzinfo)
+        if geometry.window_start < now < geometry.window_end:
+            return max(0.0, (geometry.window_end - now).total_seconds() / 3600.0)
+    return cfg.window_hours
 
 
 def _overlaps(
@@ -1042,6 +1069,8 @@ def compute_plan(
     Omitted topology and limits use the legacy adapter; unsupported shapes or
     invalid limits fail closed. Major-load observations are evaluated once at
     ``inputs.now``; expected EV demand comes only from planned dispatch slots.
+    Native single-bank plans also carry per-inverter charge allocations, split
+    from the bank's commanded current; legacy and fail-closed plans carry none.
     """
     effective_solar = inputs.served_day_solar_kwh * cfg.solar_haircut_k
 
@@ -1066,6 +1095,7 @@ def compute_plan(
     geometry = inputs.geometry_for(cfg)
     efficiency = cfg.charge_efficiency if cfg.charge_efficiency > 0 else 1.0
     limits_reason = None
+    planned_v2l_dc_kw = 0.0
     binding_id = ""
     no_reserve_limit = 0.0
     advisory = None
@@ -1075,13 +1105,31 @@ def compute_plan(
         planning_limits = _planning_limits(topology, limits)
         loads = tuple(load for load in topology.major_loads
                       if load.connection_id == planning_limits.connection.id)
+        # In-window V2L set-aside (native topologies only): while the car is
+        # plugged in with a budget, every window slot reserves the charger's
+        # rate from the bank's charge room, never from connection import. The
+        # legacy adapter models V2L exactly as today's planner does, so legacy
+        # window capacity is untouched.
+        if (not isinstance(topology, LegacyTopology) and inputs.car_plugged_in
+                and cfg.v2l_budget_kwh > 0):
+            bank = topology.banks[0]  # _planning_limits accepted exactly one bank
+            charger = next(
+                (c for c in topology.v2l_chargers if c.bank_id == bank.id), None
+            )
+            if charger is not None:
+                planned_v2l_dc_kw = max(0.0, min(
+                    cfg.v2l_preferred_rate_kw, cfg.v2l_max_rate_kw,
+                    charger.max_current_a * bank.nominal_voltage_v / 1000,
+                ))
         charge_limit, _ = _window_charge_limit(
             inputs, cfg, planning_limits, efficiency, loads, major_loads,
+            planned_v2l_dc_kw=planned_v2l_dc_kw,
         )
         # The hardware reason names what binds without the reserve; the reserve
         # has its own reason, so it must not relabel a bank limit as the connection.
         no_reserve_limit, binding_id = _window_charge_limit(
             inputs, cfg, planning_limits, efficiency, loads, major_loads, without_reserve=True,
+            planned_v2l_dc_kw=planned_v2l_dc_kw,
         )
         if inputs.load_slots is not None:
             window_loads = [
@@ -1400,6 +1448,25 @@ def compute_plan(
     limited = (limits_reason is None and not export_overlaps_charge
                and charge_limit < charge_need - 1e-9)
     reserve_limited = limited and no_reserve_limit >= charge_need - 1e-9
+    inverter_allocations: tuple[InverterAllocation, ...] = ()
+    if topology is not None and limits is not None and not isinstance(topology, LegacyTopology):
+        # The bank's commanded current uses the driver's sizing relation, then
+        # is split across the bank's inverters within their own limits. Legacy
+        # plans keep no allocations and so do fail-closed ones.
+        # V2L comes out of the bank limit first, so the inverters share only
+        # what the set-aside leaves of it.
+        bank = topology.banks[0]
+        bank_room_a = max(
+            0.0, bank.charge_limit_a - planned_v2l_dc_kw * 1000 / bank.nominal_voltage_v
+        )
+        kwh_per_amp = _remaining_window_hours(inputs, cfg) * bank.nominal_voltage_v / 1000
+        bank_a = (
+            min(planning_limits.bank.charge_a, bank_room_a, required / efficiency / kwh_per_amp)
+            if kwh_per_amp > 0 else 0.0
+        )
+        inverter_allocations = split_bank_allocation(
+            bank_a, topology, limits, planning_limits.bank.id
+        )
     plan = ChargePlan(
         soc=inputs.soc,
         capacity_kwh=cfg.capacity_kwh,
@@ -1454,6 +1521,7 @@ def compute_plan(
             f"Charging limited by hardware: {binding_id}."
             if limited and not reserve_limited else None
         ),
+        inverter_allocations=inverter_allocations,
     )
     series = _soc_series(plan, inputs, cfg, schedule, net) if model == "slots" else ()
     return replace(plan, view=build_plan_view(plan, cfg, inputs, schedule, series))

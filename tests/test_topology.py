@@ -15,6 +15,7 @@ from ha_spark.energy.topology import (
     is_running,
     major_load_reserve_kw,
     setpoint_a,
+    split_bank_allocation,
     validate_topology,
 )
 
@@ -152,6 +153,60 @@ def test_reserve_planner_and_guard_predicates() -> None:
 def test_invalid_setpoint_input_refused(requested: float, limit: float, step: float) -> None:
     with pytest.raises(ValueError, match="^invalid_setpoint_input$"):
         setpoint_a(requested, limit, step)
+
+
+def _two_inverter_topology() -> Topology:
+    case = json.loads((FIXTURES / "two_inverters.json").read_text())
+    topology = validate_topology(case["topology"])
+    assert isinstance(topology, Topology)
+    return topology
+
+
+def test_split_is_proportional_within_each_inverters_own_limit() -> None:
+    topology = _two_inverter_topology()
+    limits = effective_limits(topology)
+    allocations = split_bank_allocation(100, topology, limits, "bank")
+    assert [allocation.inverter_id for allocation in allocations] == ["one", "two"]
+    assert [allocation.charge_a for allocation in allocations] == [50, 50]
+    # Above the bank's per-inverter room each share caps at its own limit.
+    allocations = split_bank_allocation(130, topology, limits, "bank")
+    assert [allocation.charge_a for allocation in allocations] == [62, 62]
+    assert sum(allocation.charge_a or 0 for allocation in allocations) <= 130
+
+
+def test_split_gives_alphaess_no_charge_command() -> None:
+    case = json.loads((FIXTURES / "alphaess_no_charge_command.json").read_text())
+    topology = validate_topology(case["topology"])
+    assert isinstance(topology, Topology)
+    limits = effective_limits(topology)
+    allocations = split_bank_allocation(100, topology, limits, "bank")
+    assert [allocation.charge_a for allocation in allocations] == [None, 38]
+    assert sum(allocation.charge_a or 0 for allocation in allocations) <= 100
+
+
+def test_split_of_zero_effective_limits_is_zero() -> None:
+    case = json.loads((FIXTURES / "unconfirmed_and_missing.json").read_text())
+    topology = validate_topology(case["topology"])
+    assert isinstance(topology, Topology)
+    limits = effective_limits(topology)
+    allocations = split_bank_allocation(100, topology, limits, "bank")
+    assert [allocation.charge_a for allocation in allocations] == [0, 0]
+
+
+@pytest.mark.parametrize("bank_a", [-1, float("nan"), float("inf")])
+def test_split_refuses_invalid_bank_allocation(bank_a: float) -> None:
+    topology = _two_inverter_topology()
+    limits = effective_limits(topology)
+    with pytest.raises(ValueError, match="^invalid_allocation_input$"):
+        split_bank_allocation(bank_a, topology, limits, "bank")
+
+
+def test_split_refuses_limits_missing_a_bank_inverter() -> None:
+    topology = _two_inverter_topology()
+    limits = effective_limits(topology)
+    trimmed = limits.model_copy(update={"inverters": limits.inverters[:1]})
+    with pytest.raises(ValueError, match="^invalid_inverter_limits$"):
+        split_bank_allocation(100, topology, trimmed, "bank")
 
 
 def test_legacy_adapter_preserves_exact_discharge_and_v2l() -> None:
