@@ -120,6 +120,11 @@ async def test_reauth_replaces_key_and_rediscovery_keeps_it(
 async def test_options_limit(hass: HomeAssistant, limit: int) -> None:
     entry = entry_for(hass)
     result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.MENU
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "solcast"},
+    )
+    assert result["step_id"] == "solcast"
     with patch.object(hass.config_entries, "async_reload", return_value=True):
         result = await hass.config_entries.options.async_configure(
             result["flow_id"], {"calls_limit": limit},
@@ -139,7 +144,7 @@ async def test_solcast_translations(hass: HomeAssistant) -> None:
     ):
         assert translations[f"component.{DOMAIN}.config.error.{error}"]
     options = await async_get_translations(hass, "en", "options", [DOMAIN])
-    assert options[f"component.{DOMAIN}.options.step.init.data.calls_limit"]
+    assert options[f"component.{DOMAIN}.options.step.solcast.data.calls_limit"]
 
 
 async def test_loaded_entry_and_flow_share_gate_at_limit(
