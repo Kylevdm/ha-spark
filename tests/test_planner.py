@@ -141,7 +141,7 @@ def test_soc_validity_passes_through_to_plan() -> None:
     assert _plan(valid, cfg()).soc.ok is True
 
 
-def test_buffer_inflates_required_within_headroom() -> None:
+def test_buffer_inflates_required_within_battery_room() -> None:
     inp = PlannerInputs(soc=_soc(20), solar_tomorrow_kwh=3, predicted_home_load_kwh=10)
     plan = _plan(inp, cfg(buffer_pct=20.0))
     # deficit = 10 - 3 = 7; usable_now = 0 (soc at min); buffered = 7 * 1.2 = 8.4.
@@ -150,11 +150,11 @@ def test_buffer_inflates_required_within_headroom() -> None:
     assert plan.required_kwh == pytest.approx(8.4)
 
 
-def test_headroom_caps_required() -> None:
+def test_battery_room_caps_required() -> None:
     inp = PlannerInputs(soc=_soc(85), solar_tomorrow_kwh=0, predicted_home_load_kwh=50)
     plan = _plan(inp, cfg())
-    headroom = 26.88 * (90 - 85) / 100  # 1.344
-    assert round(plan.required_kwh, 3) == round(headroom, 3)
+    battery_room = 26.88 * (90 - 85) / 100  # 1.344
+    assert round(plan.required_kwh, 3) == round(battery_room, 3)
     assert plan.target_soc <= 90 + 1e-9
 
 
@@ -576,7 +576,7 @@ def test_same_day_export_refuses_a_slot_with_forecast_daylight() -> None:
     assert any("daylight" in skip.reason for skip in plan.export_skips)
 
 
-def test_same_day_export_frees_headroom_for_tonights_charge() -> None:
+def test_same_day_export_frees_battery_room_for_tonights_charge() -> None:
     """At the cap, a fill-to-cap night still refills what the event exports."""
     now = datetime(2026, 6, 8, 16, 0, tzinfo=UTC)
     fill = replace(_same_day_cfg(), strategy="fill")
@@ -1162,7 +1162,7 @@ def test_slot_model_charges_for_expensive_slots_only() -> None:
     plan = _plan(_slot_inputs(load=0.5, soc_now=20.0), cfg())
     assert plan.model == "slots"
     assert plan.expensive_load_kwh == pytest.approx(18.0)
-    # SoC at min -> usable 0; required = 18 kWh within headroom (18.816).
+    # SoC at min -> usable 0; required = 18 kWh within battery room (18.816).
     assert plan.required_kwh == pytest.approx(18.0)
 
 
@@ -1255,18 +1255,18 @@ def test_daily_model_also_reports_costs() -> None:
     assert plan.planned_cost <= plan.baseline_cost + 1e-9
 
 
-def test_slot_model_respects_headroom_and_max_current() -> None:
+def test_slot_model_respects_battery_room_and_max_current() -> None:
     plan = _plan(_slot_inputs(load=2.0, soc_now=85.0), cfg())
-    headroom = 26.88 * (90 - 85) / 100
-    assert plan.required_kwh == pytest.approx(headroom)
+    battery_room = 26.88 * (90 - 85) / 100
+    assert plan.required_kwh == pytest.approx(battery_room)
     assert plan.charge_intent.target_soc_pct <= 90.0 + 1e-9
 
 
 def test_fill_strategy_charges_to_cap() -> None:
     inp = PlannerInputs(soc=_soc(69), solar_tomorrow_kwh=3.4, predicted_home_load_kwh=17.7)
     plan = _plan(inp, cfg(strategy="fill"))
-    headroom = 26.88 * (90 - 69) / 100
-    assert plan.required_kwh == pytest.approx(headroom)
+    battery_room = 26.88 * (90 - 69) / 100
+    assert plan.required_kwh == pytest.approx(battery_room)
     assert plan.target_soc == pytest.approx(90.0)
     assert plan.strategy == "fill"
     # Fill ignores need entirely: it buys more than the deficit strategy would.
@@ -1392,7 +1392,7 @@ def test_overnight_charge_is_capped_at_what_the_window_can_add() -> None:
 
     plan = _plan(inp, cfg(capacity_kwh=40.0))
 
-    # 40 kWh deficit, 28 kWh of headroom, but 6 h x 62.5 A x 51 V = 19.125 kWh.
+    # 40 kWh deficit, 28 kWh of battery room, but 6 h x 62.5 A x 51 V = 19.125 kWh.
     assert plan.required_kwh == pytest.approx(19.125)
 
 
@@ -1548,7 +1548,7 @@ def test_v2l_cannot_be_retroactively_stored_for_an_earlier_shortfall() -> None:
         load_slots=(0.0,) * 12 + (30.0,) + (0.0,) * 35, car_plugged_in=True,
     )
     plan = _plan(inp, cfg(v2l_budget_kwh=15))
-    # Overnight already fills the battery: no headroom before the one heavy slot.
+    # Overnight already fills the battery: no battery room before the one heavy slot.
     assert plan.v2l_refills == ()
 
 
@@ -2029,7 +2029,7 @@ def test_pre_window_ledger_target_is_exactly_stable(
 
     # P = 1, E_ws = 3 (or 11), O = 36 * 0.25 * 1.2 = 10.8.
     assert first.required_kwh == pytest.approx(required)
-    assert first.required_kwh < 14 - (soc - 25) / 5  # headroom at window start
+    assert first.required_kwh < 14 - (soc - 25) / 5  # battery room at window start
     assert first.required_kwh < config.max_current_a * config.voltage_v / 1000 * 6
     assert first.target_soc == pytest.approx(74)
     assert not (first.target_soc != second.target_soc)

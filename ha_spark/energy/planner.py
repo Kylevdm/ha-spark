@@ -9,7 +9,7 @@ v1 model (daily energy balance, used when no per-slot forecast is available):
     usable_at_window= usable_now - pre_window_drain   (load before the window opens)
     buffered        = deficit * (1 + buffer_pct / 100)
     required        = clamp(buffered - usable_at_window, 0,
-                            min(headroom_to_cap, window_charge_limit))
+                            min(room_to_cap, window_charge_limit))
     purchase        = required / charge_efficiency   (AC kWh bought)
 
 ``window_charge_limit`` is what the charge window can add at ``max_current_a``
@@ -20,7 +20,7 @@ a ``ChargeIntent``; per-inverter charge mechanics (e.g. amps sizing for Solis)
 are the adapter's job, not the planner's.
 
 With ``strategy="fill"`` the sizing instead charges to the target cap every
-night (``required = headroom``) — optimal once the export rate exceeds
+night (``required = battery_room``) — optimal once the export rate exceeds
 off-peak; the carried-over surplus is an asset the cost projection does not
 model.
 
@@ -541,7 +541,7 @@ def _event_export_plan(
         )
     else:
         # The window can't always fill to the cap: 62.5 A for six hours adds
-        # less than a deep battery's headroom.
+        # less than a deep battery's room below the cap.
         reachable = (
             max(
                 0.0,
@@ -839,7 +839,7 @@ def _v2l_refills(
     """Backfill forecast grid shortfalls with stored car energy, latest slot first.
 
     Each refill finishes before the load it funds. A forward battery ledger
-    includes solar, exports and earlier refills; headroom across the intervening
+    includes solar, exports and earlier refills; battery room across the intervening
     slots prevents counting energy that would spill before its obligation.
     """
     if (inputs.load_slots is None or not reservations or cfg.v2l_budget_kwh <= 0
@@ -941,7 +941,7 @@ def compute_plan(
     controlled = schedule.controlled_windows
 
     usable_now = cfg.capacity_kwh * (inputs.soc_now - cfg.min_soc) / 100.0
-    headroom = max(0.0, cfg.capacity_kwh * (cfg.target_cap - inputs.soc_now) / 100.0)
+    battery_room = max(0.0, cfg.capacity_kwh * (cfg.target_cap - inputs.soc_now) / 100.0)
 
     expensive_load_kwh: float | None = None
     reservations: tuple[Reservation, ...] = ()
@@ -1056,11 +1056,11 @@ def compute_plan(
     # inputs and the daily fallback retain their original numbers.
     if inputs.load_slots is not None and inputs.geometry is not None:
         usable_at_window = max(0.0, usable_at_window)
-        headroom = max(
+        battery_room = max(
             0.0, cfg.capacity_kwh * (cfg.target_cap - cfg.min_soc) / 100.0 - usable_at_window
         )
     else:
-        headroom += pre_window_export_kwh
+        battery_room += pre_window_export_kwh
     # Tonight's charge funds only the reservations targeted after the window
     # start; earlier ones are carried from now (#394).
     charge_funded = tuple(
@@ -1083,7 +1083,7 @@ def compute_plan(
     elif cfg.strategy == "fill":
         # Fill to the cap regardless of need: optimal once export pays more
         # than off-peak; surplus carries over to later days (not costed here).
-        required = min(headroom, charge_limit)
+        required = min(battery_room, charge_limit)
     else:
         # The reservation only reaches the next cheap slot, which assumes that
         # slot can refill the battery. A short daytime dispatch cannot, so it
@@ -1092,7 +1092,7 @@ def compute_plan(
         required = _clamp(
             obligation - usable_at_window,
             0.0,
-            min(headroom, charge_limit),
+            min(battery_room, charge_limit),
         )
     uncovered = max(0.0, buffered_deficit - usable_at_window - required)
     if inputs.load_slots is not None and inputs.geometry is not None:
