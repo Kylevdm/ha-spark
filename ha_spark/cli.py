@@ -1244,7 +1244,8 @@ async def _cmd_mode_set(
         epoch = status.authority.get("epoch")
     reply = await submit_socket(settings, "mode", target=target, expected_epoch=epoch)
     if reply is None or reply.error:
-        print(REFUSED if reply is None else f"[REFUSED] {reply.error}: {reply.text}")
+        detail = f": {reply.text}" if reply and reply.text else ""
+        print(REFUSED if reply is None else f"[REFUSED] {reply.error}{detail}")
         return 1
     print(json.dumps(reply.authority, indent=2))
     return 0
