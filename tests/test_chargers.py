@@ -303,7 +303,8 @@ async def test_solis_current_line_names_the_hours_sized_over() -> None:
         lines = await _solis_device(s, rest, authority_mode="observe").apply(
             _intent(target_soc=70.0, soc=_soc(56.0, at))
         )
-    assert any("timed charge current to 41 A over 2.0 h" in line for line in lines), lines
+    # 40.99 A rounds down to 40 A (#537; was 41 A, nearest-amp rounding).
+    assert any("timed charge current to 40 A over 2.0 h" in line for line in lines), lines
 
 
 def test_solis_capabilities_include_rate() -> None:

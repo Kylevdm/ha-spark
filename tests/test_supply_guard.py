@@ -115,11 +115,12 @@ async def test_tick_on_writes_and_verifies_read_back() -> None:
     _mock_state("sensor.solis_control_timed_charge_current", "40")  # also serves the read-back
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         line = await SupplyGuard(s, rest).tick(target_w=2040.0)
-    # 20 kW incl. 2040 W battery -> other load ~17960, headroom ~40 W -> ~1 A.
+    # 20 kW incl. 2040 W battery -> other load ~17960, headroom ~40 W -> 0.78 A,
+    # rounded down to 0 A (#537; nearest-amp rounding gave 1 A, above the headroom).
     # A real write, then the read-back against the (still 40 A) mock warns.
     assert set_value.called
     assert line is not None and line.startswith("[WARNING]")
-    assert "set charge current to 1 A" in line
+    assert "set charge current to 0 A" in line
 
 
 @respx.mock
@@ -227,9 +228,10 @@ async def test_tick_failed_soc_still_allows_reduction() -> None:
     _mock_state("sensor.solis_control_timed_charge_current", "40")  # setpoint 2040 W
     async with HomeAssistantRest(s.ha_rest_url, s.auth_token) as rest:
         line = await SupplyGuard(s, rest).tick(target_w=4080.0, soc=_soc_measurement(False))
-    # Target capped at 2040 W, then shed to the ~40 W of remaining headroom.
+    # Target capped at 2040 W, then shed to the ~40 W of remaining headroom:
+    # 0.78 A rounds down to 0 A (#537; was 1 A).
     assert set_value.called
-    assert line is not None and "set charge current to 1 A" in line
+    assert line is not None and "set charge current to 0 A" in line
 
 
 @respx.mock
@@ -265,7 +267,8 @@ async def test_unconfirmed_fallback_blocks_increases_but_keeps_valid_reductions(
         reduction = await SupplyGuard(settings, rest).tick(
             target_w=4080.0, fallback_active=True, fallback_confirmed=False
         )
-    assert reduction is not None and "set charge current to 1 A" in reduction
+    # ~40 W of headroom: 0.78 A rounds down to 0 A (#537; was 1 A).
+    assert reduction is not None and "set charge current to 0 A" in reduction
     assert posts.call_count == 0
 
 
