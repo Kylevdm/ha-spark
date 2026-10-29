@@ -83,10 +83,15 @@ from ha_spark.energy.topology import (
     ConnectionLimits,
     EffectiveLimits,
     LegacyTopology,
+    MajorLoad,
+    MajorLoadObservation,
     Topology,
     charge_capacity_kw,
     effective_limits,
+    is_running,
     legacy_topology,
+    major_load_reserve_kw,
+    reserve_advisory,
 )
 
 LIMITS_UNAVAILABLE_REASON = (
@@ -268,10 +273,21 @@ def _slot_reservation(
 
 def _window_charge_limit(
     inputs: PlannerInputs, cfg: PlannerConfig, limits: _PlanningLimits, efficiency: float,
+    loads: tuple[MajorLoad, ...] = (),
+    observations: tuple[MajorLoadObservation, ...] = (),
+    *, without_reserve: bool = False,
 ) -> tuple[float, str]:
     """Stored DC kWh within effective limits, counting only the remaining window."""
     geometry = inputs.geometry_for(cfg)
     binding_id = limits.hardware_id
+    evidence = {observation.load_id: observation for observation in observations}
+    running: dict[str, float] = {}
+    for major in loads:
+        observation = evidence.get(major.id)
+        if (major.power_entity is not None and observation is not None and inputs.now is not None
+                and is_running(major, observation.reading_kw, observation.reported_at, inputs.now)):
+            assert observation.reading_kw is not None
+            running[major.id] = observation.reading_kw
     charge_capacity_kw(limits.bank, limits.connection, charge_efficiency=efficiency)
     if inputs.load_slots is not None:
         energy = 0.0
@@ -293,9 +309,28 @@ def _window_charge_limit(
                 hours = max(0.0, min(0.5, cfg.window_hours - i * 0.5))
             if hours <= 0:
                 continue
+            slot_start = (
+                geometry.slot_starts[i] if geometry is not None
+                else inputs.horizon_start + timedelta(minutes=30 * i)
+                if inputs.horizon_start is not None else None
+            )
+            expected = {
+                major.id for major in loads if major.dispatch_driven
+                and slot_start is not None
+                and any(_overlaps(slot_start, slot_start + timedelta(minutes=30),
+                                  (dispatch.start, dispatch.end)) for dispatch in inputs.dispatches)
+            }
+            active_kw = sum(
+                running[major.id] if major.id in running else major.effective_demand_kw
+                for major in loads if major.id in running or major.id in expected
+            )
+            def excluded(major: MajorLoad, expected: set[str] = expected) -> bool:
+                return major.id in running or major.id in expected
+
+            reserve_kw = 0.0 if without_reserve else major_load_reserve_kw(loads, exclude=excluded)
             capacity = charge_capacity_kw(
                 limits.bank, limits.connection, charge_efficiency=efficiency,
-                base_load_kw=load * 2,
+                base_load_kw=load * 2, active_major_loads_kw=active_kw, reserve_kw=reserve_kw,
             )
             if capacity < limits.bank.charge_kw - 1e-9:
                 binding_id = limits.connection.id
@@ -995,7 +1030,7 @@ def _v2l_refills(
 def compute_plan(
     inputs: PlannerInputs, cfg: PlannerConfig, schedule: TariffSchedule,
     *, topology: Topology | None = None, limits: EffectiveLimits | None = None,
-    major_loads: tuple[()] = (),
+    major_loads: tuple[MajorLoadObservation, ...] = (),
 ) -> ChargePlan:
     """Compute the charge plan from live inputs, config, and a tariff schedule.
 
@@ -1005,7 +1040,8 @@ def compute_plan(
     that let callers describe a different plan than the daemon applied (#91).
     For the legacy fixed-window two-rate behaviour, pass ``fixed_schedule``.
     Omitted topology and limits use the legacy adapter; unsupported shapes or
-    invalid limits fail closed. Major-load observations are empty in this phase.
+    invalid limits fail closed. Major-load observations are evaluated once at
+    ``inputs.now``; expected EV demand comes only from planned dispatch slots.
     """
     effective_solar = inputs.served_day_solar_kwh * cfg.solar_haircut_k
 
@@ -1031,11 +1067,30 @@ def compute_plan(
     efficiency = cfg.charge_efficiency if cfg.charge_efficiency > 0 else 1.0
     limits_reason = None
     binding_id = ""
+    no_reserve_limit = 0.0
+    advisory = None
     try:
         topology = topology if topology is not None else legacy_topology(cfg, cfg.driver_kind)
         limits = limits if limits is not None else effective_limits(topology)
         planning_limits = _planning_limits(topology, limits)
-        charge_limit, binding_id = _window_charge_limit(inputs, cfg, planning_limits, efficiency)
+        loads = tuple(load for load in topology.major_loads
+                      if load.connection_id == planning_limits.connection.id)
+        charge_limit, _ = _window_charge_limit(
+            inputs, cfg, planning_limits, efficiency, loads, major_loads,
+        )
+        # The hardware reason names what binds without the reserve; the reserve
+        # has its own reason, so it must not relabel a bank limit as the connection.
+        no_reserve_limit, binding_id = _window_charge_limit(
+            inputs, cfg, planning_limits, efficiency, loads, major_loads, without_reserve=True,
+        )
+        if inputs.load_slots is not None:
+            window_loads = [
+                load * 2 for i, load in enumerate(inputs.load_slots)
+                if (geometry.window_fracs[i] > 0 if geometry is not None
+                    else i * 0.5 < cfg.window_hours)
+            ]
+            if window_loads:
+                advisory = reserve_advisory(topology, planning_limits.connection, max(window_loads))
     except (ValidationError, ValueError):
         topology, limits = None, None
         limits_reason = LIMITS_UNAVAILABLE_REASON
@@ -1338,6 +1393,13 @@ def compute_plan(
         ),
     )
 
+    charge_need = min(
+        battery_room,
+        battery_room if cfg.strategy == "fill" else max(0.0, obligation - usable_at_window),
+    )
+    limited = (limits_reason is None and not export_overlaps_charge
+               and charge_limit < charge_need - 1e-9)
+    reserve_limited = limited and no_reserve_limit >= charge_need - 1e-9
     plan = ChargePlan(
         soc=inputs.soc,
         capacity_kwh=cfg.capacity_kwh,
@@ -1383,13 +1445,14 @@ def compute_plan(
         topology=topology,
         effective_limits=limits,
         limits_reason=limits_reason,
+        reserve_advisory=advisory,
+        reserve_limit_reason=(
+            "Charging limited by the major-load reserve."
+            if reserve_limited else None
+        ),
         hardware_limit_reason=(
             f"Charging limited by hardware: {binding_id}."
-            if limits_reason is None and not export_overlaps_charge
-            and charge_limit < min(
-                battery_room,
-                battery_room if cfg.strategy == "fill" else max(0.0, obligation - usable_at_window),
-            ) - 1e-9 else None
+            if limited and not reserve_limited else None
         ),
     )
     series = _soc_series(plan, inputs, cfg, schedule, net) if model == "slots" else ()

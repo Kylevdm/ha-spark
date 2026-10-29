@@ -56,7 +56,8 @@ def format_plan(
     hardware_reason = plan.hardware_limit_reason
     if for_logging and hardware_reason is not None:
         hardware_reason = "Charging limited by hardware."
-    for reason in (plan.limits_reason, hardware_reason):
+    for reason in (plan.limits_reason, hardware_reason,
+                   plan.reserve_limit_reason, plan.reserve_advisory):
         if reason is not None:
             lines.append(f"  Limits             {reason}")
     if plan.cheap_covered_kwh > 0:

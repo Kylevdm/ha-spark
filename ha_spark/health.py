@@ -46,7 +46,13 @@ from ha_spark.energy.sources import (
     read_dispatches_and_live,
     read_ev_hold_status,
 )
-from ha_spark.energy.topology import charge_capacity_kw, effective_limits, legacy_topology
+from ha_spark.energy.topology import (
+    Topology,
+    charge_capacity_kw,
+    effective_limits,
+    legacy_topology,
+    reserve_advisory,
+)
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.statistics import statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
@@ -541,11 +547,18 @@ async def check_evidence_freshness(settings: Settings) -> list[CheckResult]:
     return results
 
 
-async def check_effective_limits(settings: Settings) -> CheckResult:
-    """Show the same legacy adapter and effective budgets as the planner."""
+async def check_effective_limits(
+    settings: Settings, *, topology: Topology | None = None,
+    overnight_base_load_kw: float | None = None,
+) -> CheckResult:
+    """Show effective budgets; optional forecast evidence adds a reserve advisory.
+
+    Missing or unusable forecast evidence skips the advisory, never blocks health.
+    """
     try:
         cfg = build_config(settings, settings.battery_voltage_v)
-        limits = effective_limits(legacy_topology(cfg, cfg.driver_kind))
+        topology = topology if topology is not None else legacy_topology(cfg, cfg.driver_kind)
+        limits = effective_limits(topology)
         bank, connection = limits.banks[0], limits.connections[0]
         charge_capacity_kw(
             bank, connection,
@@ -553,6 +566,10 @@ async def check_effective_limits(settings: Settings) -> CheckResult:
         )
     except (ValidationError, ValueError):
         return CheckResult("Effective limits", Status.WARN, LIMITS_UNAVAILABLE_REASON)
+    if overnight_base_load_kw is not None:
+        advisory = reserve_advisory(topology, connection, overnight_base_load_kw)
+        if advisory is not None:
+            return CheckResult("Effective limits", Status.WARN, advisory)
     return CheckResult(
         "Effective limits", Status.OK,
         f"legacy: charge {bank.charge_kw:.2f} kW DC; discharge {bank.discharge_kw:.2f} kW; "

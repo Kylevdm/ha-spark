@@ -37,6 +37,16 @@ def _plan(**kw: object) -> ChargePlan:
     return ChargePlan(**base)  # type: ignore[arg-type]
 
 
+def test_reserve_reason_and_advisory_in_report() -> None:
+    reason = "Charging limited by the major-load reserve."
+    advisory = "Major-load reserve exceeds supply room after forecast overnight base load."
+    plan = _plan(reserve_limit_reason=reason, reserve_advisory=advisory)
+    for logging in (False, True):
+        report = format_plan(plan, "test", for_logging=logging)
+        assert reason in report
+        assert advisory in report
+
+
 def test_hardware_limit_id_is_visible_but_never_in_log_rendering() -> None:
     plan = _plan(hardware_limit_reason="Charging limited by hardware: owner_bank.")
     assert "owner_bank" in format_plan(plan, "test")

@@ -62,6 +62,21 @@ def test_store_hold_without_plan_window(cause, end, next_at):
         assert status.next_action == "idle"
 
 
+def test_reserve_reason_in_charge_status_and_summary():
+    from ha_spark.api.contract import plan_summary
+
+    reason = "Charging limited by the major-load reserve."
+    plan = replace(_plan(), reserve_limit_reason=reason)
+    status = resolve(plan, (), at(23), TZ)
+    assert status.action == "charge"
+    assert status.reason.endswith(reason)
+    summary = plan_summary(api_version=2, session_id="test", built_at=at(0),
+                           loop_tick=at(0), plan=plan, plan_at=at(0),
+                           soc_observation_ok=True)
+    assert summary["plan"]["status"]["reason"].endswith(reason)
+    assert reason not in resolve(plan, (), at(12), TZ).reason
+
+
 def test_zero_charge_need_and_midnight_wrap():
     assert resolve(_plan(required_kwh=0), (), at(23), TZ).action == "idle"
     assert resolve(_plan(), (), at(23), TZ).action == "charge"

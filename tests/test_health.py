@@ -33,6 +33,20 @@ from ha_spark.health import (
     exit_code,
     format_report,
 )
+from tests.test_planner_reserve import site
+
+
+@pytest.mark.parametrize("base, warned", [(3, True), (1, False), (None, False),
+                                         (float("nan"), False)])
+async def test_reserve_advisory_for_tight_supply(base, warned) -> None:
+    result = await health.check_effective_limits(
+        Settings(ha_url="http://ha.test", ha_token="t"),
+        topology=site(), overnight_base_load_kw=base,
+    )
+    assert (result.status == health.Status.WARN) == warned
+    if warned:
+        assert "Major-load reserve exceeds supply room" in result.detail
+
 
 HA = "http://ha.test"
 OLLAMA = "http://ollama.test"

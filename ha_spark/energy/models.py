@@ -476,6 +476,8 @@ class ChargePlan:
     effective_limits: EffectiveLimits | None = None
     limits_reason: str | None = None
     hardware_limit_reason: str | None = None
+    reserve_limit_reason: str | None = None
+    reserve_advisory: str | None = None
 
     @property
     def served_day_solar_kwh(self) -> float:
