@@ -37,6 +37,14 @@ def _plan(**kw: object) -> ChargePlan:
     return ChargePlan(**base)  # type: ignore[arg-type]
 
 
+def test_hardware_limit_id_is_visible_but_never_in_log_rendering() -> None:
+    plan = _plan(hardware_limit_reason="Charging limited by hardware: owner_bank.")
+    assert "owner_bank" in format_plan(plan, "test")
+    logged = format_plan(plan, "test", for_logging=True)
+    assert "owner_bank" not in logged
+    assert "Charging limited by hardware." in logged
+
+
 def test_fill_strategy_annotates_required_line() -> None:
     out = format_plan(_plan(strategy="fill", required_kwh=5.64, target_soc=90), "test")
     assert "5.64 kWh  (fill to 90%)" in out

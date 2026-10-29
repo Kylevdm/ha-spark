@@ -16,13 +16,14 @@ def format_plan(
     load_source: str,
     forecast_date: date | None = None,
     tz: tzinfo | None = None,
+    *, for_logging: bool = False,
 ) -> str:
     """Render the plan as an aligned, scannable block.
 
     ``forecast_date`` is the served day the load forecast targets (#397):
     naming it keeps a plan made at 01:00 from being read as "tomorrow's".
     ``tz`` is the household zone: horizon instants are UTC, so their clock
-    times are shown in it.
+    times are shown in it. ``for_logging`` removes owner-entered limit ids.
     """
 
     def clock(t: datetime) -> time:
@@ -44,6 +45,20 @@ def format_plan(
         f"  {solar_label}     {solar}{served}",
         f"  Home load forecast {plan.load_kwh:.2f} kWh{served}  ({load_source})",
     ]
+    if plan.effective_limits is not None:
+        bank = plan.effective_limits.banks[0]
+        connection = plan.effective_limits.connections[0]
+        lines.append(
+            f"  Effective limits   {plan.limits_source}: charge {bank.charge_kw:.2f} kW DC; "
+            f"discharge {bank.discharge_kw:.2f} kW; import {connection.import_kw:.2f} kW; "
+            f"site export {connection.site_export_kw:.2f} kW"
+        )
+    hardware_reason = plan.hardware_limit_reason
+    if for_logging and hardware_reason is not None:
+        hardware_reason = "Charging limited by hardware."
+    for reason in (plan.limits_reason, hardware_reason):
+        if reason is not None:
+            lines.append(f"  Limits             {reason}")
     if plan.cheap_covered_kwh > 0:
         lines.append(f"  Cheap-covered load {plan.cheap_covered_kwh:.2f} kWh (daytime dispatch)")
     if plan.expensive_load_kwh is not None:

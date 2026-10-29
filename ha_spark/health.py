@@ -17,6 +17,7 @@ from enum import Enum
 from pathlib import Path
 
 import aiosqlite
+from pydantic import ValidationError
 
 from ha_spark.authority import load_authority
 from ha_spark.config import Settings
@@ -36,13 +37,16 @@ from ha_spark.energy.octopus import (
     fetch_planned_dispatches,
     fetch_standard_unit_rates,
 )
+from ha_spark.energy.planner import LIMITS_UNAVAILABLE_REASON
 from ha_spark.energy.profile import history_coverage
 from ha_spark.energy.solar_source import load_solar_source_kind
 from ha_spark.energy.sources import (
+    build_config,
     read_dispatch_evidence,
     read_dispatches_and_live,
     read_ev_hold_status,
 )
+from ha_spark.energy.topology import charge_capacity_kw, effective_limits, legacy_topology
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.statistics import statistics_during_period
 from ha_spark.ha.websocket import HomeAssistantWebSocket
@@ -537,6 +541,25 @@ async def check_evidence_freshness(settings: Settings) -> list[CheckResult]:
     return results
 
 
+async def check_effective_limits(settings: Settings) -> CheckResult:
+    """Show the same legacy adapter and effective budgets as the planner."""
+    try:
+        cfg = build_config(settings, settings.battery_voltage_v)
+        limits = effective_limits(legacy_topology(cfg, cfg.driver_kind))
+        bank, connection = limits.banks[0], limits.connections[0]
+        charge_capacity_kw(
+            bank, connection,
+            charge_efficiency=cfg.charge_efficiency if cfg.charge_efficiency > 0 else 1.0,
+        )
+    except (ValidationError, ValueError):
+        return CheckResult("Effective limits", Status.WARN, LIMITS_UNAVAILABLE_REASON)
+    return CheckResult(
+        "Effective limits", Status.OK,
+        f"legacy: charge {bank.charge_kw:.2f} kW DC; discharge {bank.discharge_kw:.2f} kW; "
+        f"import {connection.import_kw:.2f} kW; site export {connection.site_export_kw:.2f} kW",
+    )
+
+
 async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
     results = await asyncio.gather(
@@ -549,6 +572,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_sqlite(settings),
         check_load_history(settings),
         check_supply_guard(settings),
+        check_effective_limits(settings),
         check_tariff_provider(settings),
         check_export_event_provider(settings),
         check_ha_timezone(settings),

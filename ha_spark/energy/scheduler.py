@@ -424,7 +424,10 @@ async def run_once(
         plan, inputs, load_source = run.plan, run.inputs, run.load_source
         log.info(
             "Charge plan:\n%s",
-            format_plan(plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz),
+            format_plan(
+                plan, load_source, forecast_date=run.forecast.target_date, tz=run.tz,
+                for_logging=True,
+            ),
         )
         intent = plan.charge_intent
         assert intent is not None  # planner always sets it
