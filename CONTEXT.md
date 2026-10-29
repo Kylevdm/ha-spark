@@ -159,6 +159,22 @@ supply current limit, and every consumer (planner, device bound, live checks)
 uses this one value.
 (Decision: #283, 2026-10-12.)
 
+**Effective limit**:
+The limit a device actually gets after every narrowing: each inverter's
+owner-entered DC charge or discharge current capped by its driver's known
+ceiling, and zero until its limits are confirmed; each bank's DC limits capped
+by its inverters; and each grid connection's supply current and site export
+limits. The add-on computes it from the validated site topology and never
+trusts a computed limit from the integration.
+(Decision: #533, 2026-10-29.)
+
+**Limits source**:
+Which limits a plan and its write path use: `legacy` (the flat settings read as
+one inverter, one bank and one connection with no major loads), `native` (a
+saved topology the live writer can follow), or `native (preview only)` (a saved
+topology that is displayed but does not drive hardware in this phase).
+(Decision: #533, 2026-10-29.)
+
 **Device export bound**:
 An export ceiling held and enforced by the inverter itself, covering its solar
 and battery output together. It is either an export limit the owner or
@@ -175,12 +191,21 @@ The charging power assigned to a bank and divided across its connected
 inverters within device, bank and shared site limits. A V2L charger's current
 comes out of the same bank allowance.
 
+**Charging allowance**:
+The supply guard's current AC ceiling for controlled charging at one grid
+connection, after subtracting measured other load from the supply limit. It can
+only lower the requested charge and never starts one.
+(Decision: #533, 2026-10-29.)
+
 **Supply guard**:
 The safeguard that cuts controlled grid charging quickly when measured site
 import exceeds the supply current limit, and restores it slowly once headroom
 has held. It never raises charging above the requested target, and it applies
-whenever charging is controlled, including temporary manual control.
-(Decision: #165, 2026-10-11.)
+whenever charging is controlled, including temporary manual control. It runs
+per grid connection in the companion integration on its own report-driven loop,
+taking the operating mode from the add-on's authority mirror; the add-on's
+daemon guard remains until the native writer arrives.
+(Decision: #165, 2026-10-11; integration guard #533, 2026-10-29.)
 _Avoid_: fuse guard, throttle
 
 **Major load**:
