@@ -96,3 +96,16 @@ async def test_mode_ingress_reply_is_bounded(tmp_path: Path, monkeypatch) -> Non
                                      headers={"X-Remote-User-Id": "owner_1",
                                               "X-HA-Spark-Request": "mode"})
     assert response.status_code == 504
+
+
+async def test_mode_set_refusal_without_reasons_has_no_dangling_colon(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    async def submit(settings, op, **kwargs):
+        if op == "authority_status":
+            return Reply(authority={"epoch": 7})
+        return Reply(error="no_change")
+
+    monkeypatch.setattr(cli, "submit_socket", submit)
+    assert await cli._cmd_mode_set(settings_at(tmp_path), "observe") == 1
+    assert capsys.readouterr().out == "[REFUSED] no_change\n"

@@ -7,8 +7,10 @@ import pytest
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.components.energy.websocket_api import async_get_energy_platforms
 from homeassistant.core import HomeAssistant
+from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker
+from pytest_homeassistant_custom_component.typing import WebSocketGenerator
 
 from custom_components.ha_spark.const import DOMAIN
 from custom_components.ha_spark.energy import async_get_solar_forecast
@@ -105,3 +107,16 @@ async def test_energy_platform_discovery(
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done(wait_background_tasks=True)
     assert (await async_get_energy_platforms(hass))[DOMAIN] is async_get_solar_forecast
+
+
+async def test_energy_forecast_picker_lists_the_entry(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator,
+) -> None:
+    """The Energy dialog offers only config entries of service-type integrations."""
+    assert await async_setup_component(hass, "config", {})
+    entry = entry_for(hass, solcast_api_key=KEY, solcast_resource_ids=[SITE])
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id({"type": "config_entries/get", "type_filter": ["service"],
+                                    "domain": DOMAIN})
+    reply = await client.receive_json()
+    assert [e["entry_id"] for e in reply["result"]] == [entry.entry_id]

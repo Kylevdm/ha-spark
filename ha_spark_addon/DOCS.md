@@ -59,10 +59,14 @@ below is off and the legacy entity path is unchanged.
   across restarts.
 - **What you see.** The **Solcast** device has *Forecast today* and *Forecast
   tomorrow* in kWh at P50, with the P10 and P90 day totals as attributes, plus
-  diagnostic *Last fetch* and *API calls used* sensors. Select ha-spark's
-  forecast in the Energy dashboard's solar forecast setting. The diagnostics
-  download shows Solcast status, quota and fetch age with the key and resource
-  ids redacted.
+  diagnostic *Last fetch* and *API calls used* sensors
+  (`sensor.ha_spark_forecast_today`, `sensor.ha_spark_forecast_tomorrow`,
+  `sensor.ha_spark_last_fetch`, `sensor.ha_spark_api_calls_used`). The P50 is
+  the state; there is no `estimate` attribute. *API calls used* counts only
+  ha-spark's own calls, not another Solcast client on the same account. Select
+  ha-spark's forecast in the Energy dashboard's solar forecast setting. The
+  diagnostics download shows Solcast status, quota and fetch age with the key
+  and resource ids redacted.
 - **What the add-on does.** Once the integration reports Solcast as configured,
   the add-on plans from the snapshot's forecast and never reads
   `solar_today_entity` or `solar_tomorrow_entity`. `solar_percentile` picks P10,

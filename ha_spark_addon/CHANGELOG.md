@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.29.1
+
+- **The native forecast can now be picked in the Energy dashboard (#529).** The
+  dashboard's solar forecast list only offers service integrations, so it
+  skipped ha-spark's forecast. The integration now declares itself a service.
+  The Solcast device also links to the site device by its device id, ahead of
+  Home Assistant 2027.8 removing the old way.
+- **`ha-spark mode set` no longer prints a stray colon (#529).** A refusal
+  without reasons, such as asking for the mode the site is already in, now
+  reads `[REFUSED] no_change`.
+- **Cutover runbook corrections (#529).** It now names the Solcast sensors'
+  entity ids (`sensor.ha_spark_forecast_today`, `…_forecast_tomorrow`,
+  `…_last_fetch`, `…_api_calls_used`), includes YAML-mode dashboards in the
+  inventory, clears the legacy forecast settings with `ha-spark config set`
+  (the Supervisor Configuration tab no longer edits them), notes that native sensors have no `estimate` attribute,
+  and warns that *API calls used* counts only ha-spark's own calls.
+
 ## 0.29.0
 
 - **Native Solcast in the companion integration (#519).** Add your Solcast API
