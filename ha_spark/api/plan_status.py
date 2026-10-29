@@ -88,6 +88,7 @@ def resolve(
                 f"Exporting for the flexibility event until {clock(export.window_end)}."
             )
         if needs_charge and any(s <= t < e for s, e in charge):
+            reserve_reason = f" {plan.reserve_limit_reason}" if plan.reserve_limit_reason else ""
             if plan.charge_funded_reservations:
                 reservation = plan.charge_funded_reservations[0]
                 phrase = {
@@ -96,11 +97,13 @@ def resolve(
                     "reach-charge-window": "the run to the charge window",
                 }.get(reservation.obligation_kind, "planned demand")
                 kwh = _amount(required, " kWh", 1)
-                return "charge", f"Charging {kwh or 'the battery'} to cover {phrase}."
+                return "charge", (
+                    f"Charging {kwh or 'the battery'} to cover {phrase}.{reserve_reason}"
+                )
             end = next(e for s, e in charge if s <= t < e)
             kwh, soc = _amount(required, " kWh", 1), _amount(plan.target_soc, "%", 0)
             return "charge", (f"Charging {kwh or 'the battery'} to reach "
-                              f"{soc or 'the target'} by {clock(end)}.")
+                              f"{soc or 'the target'} by {clock(end)}.{reserve_reason}")
         return "idle", "Nothing to charge, export or hold right now."
 
     action, reason = action_at(now)

@@ -8,6 +8,7 @@ hardware capability.
 """
 
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_FLOOR, Decimal
 from math import isclose, isfinite
@@ -131,6 +132,15 @@ class MajorLoad(FrozenModel):
             return self.demand_kw
         assert self.heating_demand_kw is not None and self.cooling_demand_kw is not None
         return max(self.heating_demand_kw, self.cooling_demand_kw)
+
+
+@dataclass(frozen=True)
+class MajorLoadObservation:
+    """Planner-only evidence; invalid or stale readings remain in the reserve."""
+
+    load_id: str
+    reading_kw: float | None = None
+    reported_at: datetime | None = None
 
 
 class Topology(FrozenModel):
@@ -377,6 +387,19 @@ def major_load_reserve_kw(
     """Same primitive for planner (running or expected) and guard (running)."""
     demands = [load.effective_demand_kw for load in loads if not exclude(load)]
     return max(max(demands, default=0), sum(demands) * 0.5)
+
+
+def reserve_advisory(
+    topology: Topology, connection: ConnectionLimits, overnight_base_load_kw: float,
+) -> str | None:
+    """Advisory only, from forecast base load rather than an owner-entered figure."""
+    if not isfinite(overnight_base_load_kw) or overnight_base_load_kw < 0:
+        return None
+    loads = (load for load in topology.major_loads if load.connection_id == connection.id)
+    reserve = major_load_reserve_kw(loads, exclude=lambda _: False)
+    if reserve > 0 and reserve > connection.import_kw - overnight_base_load_kw:
+        return "Major-load reserve exceeds supply room after forecast overnight base load."
+    return None
 
 
 def is_running(
