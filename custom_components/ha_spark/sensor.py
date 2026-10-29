@@ -1,4 +1,4 @@
-"""Read-only plan sensors and independent cached forecasts on the Solcast device."""
+"""Read-only plan sensors, guard diagnostics and cached forecasts on the Solcast device."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,7 +12,7 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfEnergy
+from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfEnergy, UnitOfPower
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -23,6 +23,7 @@ from . import SparkConfigEntry
 from .const import DOMAIN
 from .coordinator import SparkCoordinator
 from .entity import SparkEntity, async_clear_unregistered_state
+from .guard_loop import SupplyGuardLoop
 from .solcast_coordinator import SolcastCoordinator
 from .wire import Summary
 
@@ -144,6 +145,20 @@ DESCRIPTIONS = (
 )
 
 
+GUARD_DESCRIPTIONS = (
+    SensorEntityDescription(
+        key="charging_allowance", translation_key="charging_allowance",
+        entity_category=EntityCategory.DIAGNOSTIC, device_class=SensorDeviceClass.POWER,
+        native_unit_of_measurement=UnitOfPower.KILO_WATT,
+    ),
+    SensorEntityDescription(
+        key="guard_restores_left_today", translation_key="guard_restores_left_today",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+)
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: SparkConfigEntry, async_add_entities: AddEntitiesCallback,
 ) -> None:
@@ -155,6 +170,11 @@ async def async_setup_entry(
         cls = LastRun if description.key == "last_run" else SparkSensor
         entities.append(cls(entry.runtime_data, description))
     async_add_entities(entities)
+    if entry.runtime_data.guard is not None:
+        async_add_entities(
+            SupplyGuardSensor(entry.runtime_data, entry.runtime_data.guard, description)
+            for description in GUARD_DESCRIPTIONS
+        )
     if entry.runtime_data.solcast is not None:
         async_add_entities(SolcastSensor(entry.runtime_data.solcast, description)
                            for description in SOLCAST_DESCRIPTIONS)
@@ -191,6 +211,38 @@ class SparkSensor(SparkEntity, SensorEntity):
         summary = self.coordinator.summary
         attributes_fn = self.entity_description.attributes_fn
         return attributes_fn(summary) if attributes_fn and summary else None
+
+
+class SupplyGuardSensor(SparkEntity, SensorEntity):
+    """A live guard value on the site device, available whenever the loop runs."""
+
+    entity_description: SensorEntityDescription
+
+    def __init__(
+        self, coordinator: SparkCoordinator, guard: SupplyGuardLoop,
+        description: SensorEntityDescription,
+    ) -> None:
+        super().__init__(coordinator, description.key)
+        self.entity_description = description
+        self._guard = guard
+
+    @property
+    def available(self) -> bool:
+        return self._guard.started
+
+    @property
+    def native_value(self) -> float | None:
+        guard = self._guard
+        if not guard.started:
+            return None
+        if self.entity_description.key == "charging_allowance":
+            # The site total of the guards in force; unknown when none is limiting.
+            if not guard.limiting:
+                return None
+            return sum(allowance for allowance in guard.allowance_kw.values()
+                       if allowance is not None)
+        restores = guard.restores_left.values()
+        return min(restores) if restores else None
 
 
 class LastRun(SparkSensor, RestoreSensor):

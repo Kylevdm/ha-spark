@@ -77,6 +77,37 @@ def test_reserve_reason_in_charge_status_and_summary():
     assert reason not in resolve(plan, (), at(12), TZ).reason
 
 
+def test_guard_reason_after_the_reserve_reason_and_charge_only():
+    guard_text = " Charging limited by the supply guard."
+    reserve = "Charging limited by the major-load reserve."
+    plan = replace(_plan(), reserve_limit_reason=reserve)
+    status = resolve(plan, (), at(23), TZ, guard_limited=True)
+    assert status.action == "charge"
+    assert status.reason.endswith(f" {reserve}{guard_text}")
+    assert guard_text not in resolve(plan, (), at(23), TZ).reason
+    # Never on idle or hold, and never a planning input: display only.
+    idle = resolve(_plan(required_kwh=0), (), at(23), TZ, guard_limited=True)
+    assert idle.action == "idle" and guard_text not in idle.reason
+    hold = resolve(_plan(), (record("ev"),), at(23), TZ, guard_limited=True)
+    assert hold.action == "hold" and guard_text not in hold.reason
+
+
+def test_guard_reason_in_summary_carries_over_the_wire():
+    from ha_spark.api.contract import plan_summary
+
+    plan = replace(_plan(), reserve_limit_reason="Charging limited by the major-load reserve.")
+    summary = plan_summary(api_version=3, session_id="test", built_at=at(0),
+                           loop_tick=at(0), plan=plan, plan_at=at(0),
+                           soc_observation_ok=True, guard_limited=True)
+    reason = summary["plan"]["status"]["reason"]
+    assert "Charging limited by the major-load reserve." in reason
+    assert reason.endswith(" Charging limited by the supply guard.")
+    without = plan_summary(api_version=3, session_id="test", built_at=at(0),
+                           loop_tick=at(0), plan=plan, plan_at=at(0),
+                           soc_observation_ok=True)
+    assert "supply guard" not in without["plan"]["status"]["reason"]
+
+
 def test_zero_charge_need_and_midnight_wrap():
     assert resolve(_plan(required_kwh=0), (), at(23), TZ).action == "idle"
     assert resolve(_plan(), (), at(23), TZ).action == "charge"

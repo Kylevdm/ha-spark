@@ -1,7 +1,8 @@
 """Redacted entry diagnostics with validated display data and fixed link outcomes.
 
-Only the last counted summary, version metadata and Solcast health are exposed,
-never HTTP objects, headers, raw payloads, site identifiers or exception text.
+Only the last counted summary, version metadata, Solcast health and the supply
+guard's bounded state, history and raw readings are exposed, never HTTP objects,
+headers, raw payloads, site identifiers or exception text.
 """
 
 import json
@@ -47,6 +48,12 @@ def _solcast_health(
     }
 
 
+def _guard_health(coordinator: SparkCoordinator | None) -> dict[str, Any] | None:
+    """The guard's own bounded view: state, history and raw readings."""
+    guard = coordinator.guard if coordinator is not None else None
+    return guard.diagnostics() if guard is not None else None
+
+
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: SparkConfigEntry,
 ) -> dict[str, Any]:
@@ -62,6 +69,7 @@ async def async_get_config_entry_diagnostics(
             "supported_api_versions": sorted(wire.SUPPORTED_API_VERSIONS),
             "addon_api_version": None,
             "solcast": _solcast_health(entry, None),
+            "supply_guard": None,
         }
     return {
         "entry": redacted,
@@ -79,4 +87,5 @@ async def async_get_config_entry_diagnostics(
         "supported_api_versions": sorted(wire.SUPPORTED_API_VERSIONS),
         "addon_api_version": coordinator.addon_api_version,
         "solcast": _solcast_health(entry, coordinator),
+        "supply_guard": _guard_health(coordinator),
     }

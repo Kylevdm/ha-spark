@@ -12,6 +12,7 @@ unknown epoch. Phase 8 must provide authority and a native writer, not HA servic
 """
 
 import asyncio
+from collections import deque
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import date, datetime, timedelta
@@ -102,6 +103,8 @@ class SupplyGuardLoop:
         self.writer = ClampedWriter(writer, self) if writer is not None else None
         self._unsubs: list[Callable[[], None]] = []
         self._readings: dict[str, tuple[float | None, datetime | None]] = {}
+        # Bounded in-memory event trail for the diagnostics download only.
+        self._history: deque[dict[str, object]] = deque(maxlen=48)
         self._active = False
         self._stopped = False
         self._save_failed = False
@@ -118,6 +121,36 @@ class SupplyGuardLoop:
         """Warn-only unless a connected, permitting mirror and a working store."""
         return self._active and not self._save_failed and mirror_permits(
             mirror_from(self.coordinator))
+
+    def diagnostics(self) -> dict[str, object]:
+        """Bounded state, event history and raw readings for the diagnostics download.
+
+        No secret, token or site identifier is held here; entity ids are consumed
+        HA state references, as everywhere else in this integration.
+        """
+        connections: list[dict[str, object]] = []
+        for key, guard_state in self.states.items():
+            decision = self.decisions.get(key)
+            connections.append({
+                "id": key,
+                "cut_kw": guard_state.cut_kw,
+                "latched": guard_state.latched,
+                "restores_left": guard_state.restores_left,
+                "dormant_reason": guard_state.dormant_reason,
+                "warn_reason": decision.warn_reason if decision is not None else None,
+            })
+        readings = {
+            entity: {"power_w": power,
+                     "reported_at": reported.isoformat() if reported is not None else None}
+            for entity, (power, reported) in self._readings.items()
+        }
+        return {"connections": connections, "history": list(self._history),
+                "readings": readings}
+
+    @property
+    def started(self) -> bool:
+        """Entity availability: the loop runs without the add-on, but not before start."""
+        return self._active
 
     @property
     def limiting(self) -> bool:
@@ -205,6 +238,9 @@ class SupplyGuardLoop:
             ]
             self.entry.async_on_unload(self._cancel_subscriptions)
         await self.async_evaluate()
+        if self._active:
+            # Entities become available the moment the loop runs, before any change.
+            self.coordinator.async_update_listeners()
 
     @callback
     def _changed(self, event: Event[EventStateChangedData]) -> None:
@@ -347,6 +383,38 @@ class SupplyGuardLoop:
                             self.decisions[bank.connection_id] = replace(
                                 decision, write=False, warn_reason="guard_write_failed",
                             )
+            for key, guard_state in self.states.items():
+                prior = before.get(key)
+                if prior is None:
+                    continue
+                if guard_state.restores_used > prior.restores_used:
+                    self._history.append({"at": now.isoformat(), "connection_id": key,
+                                          "event": "restore",
+                                          "allowance_kw": guard_state.allowance_kw})
+                if (guard_state.cut_kw is not None
+                        and (prior.cut_kw is None or guard_state.cut_kw < prior.cut_kw)):
+                    self._history.append({"at": now.isoformat(), "connection_id": key,
+                                          "event": "cut", "allowance_kw": guard_state.cut_kw})
+                if guard_state.latched and not prior.latched:
+                    self._history.append({"at": now.isoformat(), "connection_id": key,
+                                          "event": "latch",
+                                          "allowance_kw": guard_state.allowance_kw})
+            if any(
+                (prior.limiting, prior.allowance_kw, prior.restores_left)
+                != (guard_state.limiting, guard_state.allowance_kw, guard_state.restores_left)
+                for key, guard_state in self.states.items()
+                if (prior := before.get(key)) is not None
+            ):
+                # Entities and the snapshot follow the guard, never the 30 s poll
+                # clock. The heartbeat task is never awaited inside this lock.
+                # async_refresh rather than async_request_refresh: the debouncer
+                # would only batch a second change, and its cooldown timer must
+                # not outlive the loop's own change notifications.
+                self.coordinator.async_update_listeners()
+                self.entry.async_create_background_task(
+                    self.hass, self.coordinator.async_refresh(),
+                    "Supply guard heartbeat",
+                )
 
     @callback
     def _cancel_subscriptions(self) -> None:
