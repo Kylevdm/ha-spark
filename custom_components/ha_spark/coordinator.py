@@ -25,6 +25,7 @@ from .topology import Topology, validate_topology
 from .wire import Summary, build_snapshot
 
 if TYPE_CHECKING:
+    from .guard_loop import SupplyGuardLoop
     from .solcast_coordinator import SolcastCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                          update_interval=timedelta(seconds=30))
         self.entry = entry
         self.solcast: SolcastCoordinator | None = None
+        self.guard: SupplyGuardLoop | None = None
         self.release_version = release_version
         self.api_version = max(wire.SUPPORTED_API_VERSIONS)
         self.addon_api_version: int | None = None
