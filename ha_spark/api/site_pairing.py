@@ -42,6 +42,7 @@ def save_pairing(settings: Settings, site_id: str) -> bool:
     """Atomic 0600 replacement and independent reload before accepting a snapshot."""
     path = Path(settings.db_path).parent / PAIRING_FILE
     name: str | None = None
+    replaced = False
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(prefix=f".{PAIRING_FILE}.", dir=path.parent)
@@ -50,17 +51,26 @@ def save_pairing(settings: Settings, site_id: str) -> bool:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, path)
+        name, replaced = None, True
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory)
         finally:
             os.close(directory)
-        return load_pairing(settings) == (site_id, True)
+        if load_pairing(settings) == (site_id, True):
+            return True
     except OSError:
-        return False
+        pass
     finally:
         if name is not None:
             try:
                 Path(name).unlink(missing_ok=True)
             except OSError:
                 pass
+    if replaced:
+        # A rejected snapshot must not leave its site paired.
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return False

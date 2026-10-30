@@ -787,8 +787,8 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
         now = _heartbeat_now()
         previous = state.integration_link
         paired_site, pairing_ok = load_pairing(state.settings)
-        # An unreadable pairing record can't prove the site: closed for every version.
-        if not pairing_ok or not snapshot_acceptable(
+        # Unreadable pairing closes v4 only: v1-v3 must keep 0.30.0's unusable-data-dir behaviour.
+        if (not pairing_ok and version >= 4) or not snapshot_acceptable(
             previous, snapshot, now, paired_site=paired_site,
         ):
             return invalid

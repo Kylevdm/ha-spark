@@ -137,6 +137,8 @@ def test_pairing_failure_is_closed(client, state, monkeypatch, failure):
     assert response.status_code == 400
     assert response.json() == {"error": "invalid heartbeat"}
     assert state.integration_link.snapshot is None
+    if failure != "read":
+        assert not (Path(state.settings.db_path).parent / site_pairing.PAIRING_FILE).exists()
 
 
 @pytest.mark.parametrize("key,value", [
@@ -273,13 +275,6 @@ def test_addon_owner_invalid_devices_drop_only_the_block(client, state, devices)
     assert post(client, fixture() | {"devices": devices}).status_code == 200
     v4 = state.integration_link.v4
     assert v4.devices == () and v4.devices_reason == "invalid_devices"
-
-
-@pytest.mark.parametrize("version", [1, 2, 3])
-def test_corrupt_pairing_rejects_legacy_snapshots(client, state, version):
-    (Path(state.settings.db_path).parent / site_pairing.PAIRING_FILE).write_bytes(b"broken")
-    assert post(client, fixture() | {"api_version": version}).status_code == 400
-    assert state.integration_link.snapshot is None
 
 
 def test_integration_owned_snapshot_grants_nothing(client, state):
