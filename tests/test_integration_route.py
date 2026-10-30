@@ -89,11 +89,11 @@ async def test_authenticated_peer(state, discovery, peer):
     assert response.status_code == 200
 
 
-@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
 def test_summary_uses_request_version(state, discovery, monkeypatch, version):
-    monkeypatch.setattr(server, "SUPPORTED_API_VERSIONS", frozenset({1, 2, 3}))
+    monkeypatch.setattr(server, "SUPPORTED_API_VERSIONS", frozenset({1, 2, 3, 4}))
     monkeypatch.setattr(server, "_heartbeat_now", lambda: datetime(2026, 10, 24, 12, tzinfo=UTC))
-    snapshot = {**json.loads(SNAPSHOT_BODY), "api_version": version}
+    snapshot = {**json.loads(SNAPSHOT_BODY), "api_version": version, "authority_owner": "addon"}
     with TestClient(build_app(state, ingress_peer="proxy", integration=discovery)) as client:
         response = client.post(
             "/integration/heartbeat", json=snapshot,
@@ -133,7 +133,7 @@ def test_agent_and_standalone_separation(state, standalone, discovery):
 
 @pytest.mark.parametrize("body", [b"not-json-CANARY-HEARTBEAT-SECRET", b"[]",
     b'"CANARY-HEARTBEAT-SECRET"', b"[" * 3000 + b"]" * 3000,
-    CANARY.encode() + b"x" * 32769, b'{"x": NaN}', b'{"x": -Infinity}'],
+    CANARY.encode() + b"x" * 65537, b'{"x": NaN}', b'{"x": -Infinity}'],
     ids=["invalid-json", "array", "string", "deep-nesting", "content-length-cap", "nan",
          "infinity"])
 async def test_invalid_body(state, discovery, body, caplog):
@@ -150,7 +150,7 @@ async def test_chunked_body_cap(state, discovery, caplog):
     caplog.set_level(logging.DEBUG)
 
     async def chunks() -> AsyncIterator[bytes]:
-        yield CANARY.encode() + b"x" * 32768
+        yield CANARY.encode() + b"x" * 65536
         raise AssertionError("must stop reading at the cap")
 
     response = await request(state, discovery, content=chunks(),
@@ -201,7 +201,7 @@ async def test_agent_token_cannot_open_integration(tmp_path, discovery, caplog):
     assert CANARY not in response.text + caplog.text
 
 
-@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
 async def test_golden_envelope_and_no_mutation(state, discovery, monkeypatch, version):
     monkeypatch.setattr(server, "_heartbeat_now", lambda: datetime(2026, 10, 24, 12, tzinfo=UTC))
     state.loop_tick = datetime(2026, 10, 24, 11, 59, 30, tzinfo=UTC)
@@ -225,19 +225,20 @@ async def test_golden_envelope_and_no_mutation(state, discovery, monkeypatch, ve
     authority_before = load_authority(state.settings)
     # Planning-input-like fields ride along; they must be dropped, never applied.
     injected = json.loads(SNAPSHOT_BODY) | {"api_version": version,
+                                            "authority_owner": "addon",
                                             "mode": "optimise", "operating_mode": "optimise",
                                             "fallback": {"active": True}, "holds": [CANARY]}
     response = await request(state, discovery, content=json.dumps(injected).encode(),
                              headers={"Authorization": f"Bearer {discovery.auth_token}"})
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
-    name = f"plan_summary_v{version}.json" if version < 3 else "plan_summary.json"
+    name = f"plan_summary_v{version}.json" if version != 3 else "plan_summary.json"
     golden = json.loads((FIXTURES / name).read_text())
     assert response.json() == golden
     assert CANARY not in response.text
     contract = json.loads((FIXTURES / "contract.json").read_text())
     assert golden["api_version"] == version
-    assert contract["api_version"] == 3
+    assert contract["api_version"] == 4
     assert (state.current_options(), state.settings_service.revision,
             state.settings.model_dump(), state.plan, state.plan_at) == before
     assert load_authority(state.settings) == authority_before
@@ -260,8 +261,8 @@ def test_snapshot_accepted_and_unknown_fields_dropped(state, discovery, extra):
     assert state.integration_link.received_at is not None
     assert state.integration_link.received_at.utcoffset().total_seconds() == 0
     assert not state.integration_link.skew
-    assert snapshot["api_version"] == json.loads((FIXTURES / "contract.json").read_text())[
-        "api_version"]
+    assert snapshot["api_version"] in json.loads((FIXTURES / "contract.json").read_text())[
+        "supported_api_versions"]
 
 
 @pytest.mark.parametrize("tick", [None, datetime(2026, 10, 24, 11, 50, tzinfo=UTC)])
@@ -278,7 +279,7 @@ def test_http_reports_loop_tick_without_refreshing(state, discovery, monkeypatch
     assert state.loop_tick == tick
 
 
-@pytest.mark.parametrize("version", [4, 99])
+@pytest.mark.parametrize("version", [5, 99])
 def test_version_skew_keeps_snapshot_and_returns_refusal(state, discovery, version):
     snapshot = json.loads((FIXTURES / "site_snapshot.json").read_text())
     with TestClient(build_app(state, ingress_peer="testclient", integration=discovery)) as client:
@@ -291,7 +292,7 @@ def test_version_skew_keeps_snapshot_and_returns_refusal(state, discovery, versi
             "api_version": version, "release_version": "1.0.0", "site_id": [],
             "sent_at": False, "v2": {"new": True}})
     assert response.status_code == 409
-    refusal = json.loads((FIXTURES / "version_refusal_v3.json").read_text())
+    refusal = json.loads((FIXTURES / "version_refusal_v4.json").read_text())
     assert response.json() == refusal
     assert refusal["api_version"] == json.loads((FIXTURES / "contract.json").read_text())[
         "api_version"]
@@ -680,7 +681,8 @@ async def test_action_and_next_change_through_the_heartbeat(
     state.settings = state.settings.model_copy(update={"timezone": "Europe/London"})
     state.plan = scenario()
     state.plan_at = at(9)
-    response = await request(state, discovery,
+    body = json.loads(SNAPSHOT_BODY) | {"sent_at": at(hour).isoformat()}
+    response = await request(state, discovery, content=json.dumps(body).encode(),
                              headers={"Authorization": f"Bearer {discovery.auth_token}"})
     plan = response.json()["plan"]
     assert plan["status"]["action"] == action

@@ -141,7 +141,11 @@ async def test_socket_link_without_provider(tmp_path: Path) -> None:
     assert reply.integration_link == link_view(IntegrationLink(None, None, False), NOW)
 
 
-def test_heartbeat_health_and_skew_recovery(tmp_path: Path) -> None:
+def test_heartbeat_health_and_skew_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(AppState, "integration_link_view",
+                        lambda self: link_view(self.integration_link, NOW))
     settings = Settings(supervisor_token="unused", db_path=str(tmp_path / "ha_spark.db"))
     state = AppState(settings, tmp_path / "options.json")
     discovery = IntegrationDiscovery(supervisor_token="unused", host="addon",
@@ -150,7 +154,7 @@ def test_heartbeat_health_and_skew_recovery(tmp_path: Path) -> None:
         initial = client.get("/api/health").json()
         assert initial["integration_link"]["state"] == "never_connected"
         body = snapshot().model_dump(mode="json")
-        for version, status, expected in [(1, 200, "connected"), (4, 409, "version_skew"),
+        for version, status, expected in [(1, 200, "connected"), (5, 409, "version_skew"),
                                            (1, 200, "connected")]:
             body["api_version"] = version
             assert client.post("/integration/heartbeat", json=body, headers={
