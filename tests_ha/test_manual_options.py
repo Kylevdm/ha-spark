@@ -26,6 +26,7 @@ async def test_manual_deadline_options_validate_and_preserve_options(hass: HomeA
     result = await hass.config_entries.options.async_configure(result["flow_id"], {
         "manual_until_time": "06:30", "household_time_zone": "Europe/London",
     })
+    await hass.async_block_till_done()
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert entry.options["manual_until_time"] == "06:30"
     assert entry.options["household_time_zone"] == "Europe/London"
