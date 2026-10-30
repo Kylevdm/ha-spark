@@ -45,7 +45,7 @@ jobs:
           python-version: "3.14"
 
       - name: Install
-        run: pip install pytest-homeassistant-custom-component==0.13.374 mypy==2.4.0
+        run: pip install pytest-homeassistant-custom-component==0.13.374 mypy==2.4.0 pymodbus==3.13.1
 
       - name: Mypy
         run: mypy --config-file tests_ha/mypy.ini custom_components tests_ha
