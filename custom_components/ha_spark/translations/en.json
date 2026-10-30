@@ -19,6 +19,38 @@
     "resume_control": {"name": "Resume control", "description": "End manual control using current conditions."}
   },
   "issues": {
+    "ownership_peer_version": {
+      "title": "Authority switch refused",
+      "description": "Switching authority requires a v4 add-on with known authority. Restore a compatible peer and retry, or revert the topology."
+    },
+    "ownership_store_unknown": {
+      "title": "Authority switch refused",
+      "description": "The authority or ownership store must be known before switching. Recover the store and retry, or revert the topology."
+    },
+    "ownership_observe_required": {
+      "title": "Authority switch refused",
+      "description": "Both authorities must be in Observe before switching. Set Observe and retry, or revert the topology."
+    },
+    "ownership_holds_present": {
+      "title": "Authority switch refused",
+      "description": "Clear every hold before switching authority. Holds are never migrated. Retry when clear, or revert the topology."
+    },
+    "ownership_transition_present": {
+      "title": "Authority switch refused",
+      "description": "Finish the authority transition before switching. Retry when complete, or revert the topology."
+    },
+    "ownership_manual_present": {
+      "title": "Authority switch refused",
+      "description": "End manual control before switching authority. Retry when complete, or revert the topology."
+    },
+    "ownership_switch_pending": {
+      "title": "Authority switch refused",
+      "description": "An authority switch is already pending. Wait for the v4 handshake before retrying."
+    },
+    "ownership_save_failed": {
+      "title": "Authority switch refused",
+      "description": "Ownership could not be saved and verified. All native writes remain blocked. Recover the store before retrying."
+    },
     "authority_unknown": {
       "title": "ha-spark authority is unknown",
       "description": "The integration cannot verify its authority store. No native writes are permitted. Confirm Observe to recover, then re-escalate through readiness.",
@@ -131,6 +163,15 @@
       "incomplete_topology": "The site needs at least one connection, bank and inverter.",
       "invalid_topology": "The topology is not valid. Check the entries and try again.",
       "invalid_item": "This entry is not valid.",
+      "invalid_native_gateway": "Native transport requires a Solis inverter and a gateway host.",
+      "ownership_peer_version": "Switching authority requires a connected v4 add-on with known authority.",
+      "ownership_store_unknown": "The authority or ownership store must be known before switching.",
+      "ownership_observe_required": "Set the current authority to Observe before switching.",
+      "ownership_holds_present": "Clear every hold before switching authority. Holds are never migrated.",
+      "ownership_transition_present": "Finish the authority transition before switching.",
+      "ownership_manual_present": "End manual control before switching authority.",
+      "ownership_switch_pending": "An authority switch is already pending. Wait for the v4 handshake.",
+      "ownership_save_failed": "Ownership could not be saved and verified. All native writes remain blocked.",
       "remove_last": "The site needs at least one of these; it cannot be removed.",
       "connection_in_use": "Banks or major loads still use this connection.",
       "bank_in_use": "Inverters or a V2L charger still use this bank."
@@ -240,11 +281,15 @@
       },
       "inverters_item": {
         "title": "Inverter",
-        "description": "One inverter with its owner-entered DC limits. Unconfirmed limits count as zero.",
+        "description": "One inverter with its owner-entered DC limits. Unconfirmed limits count as zero. Native Solis gateways are saved without connecting and remain read-only until validated.",
         "data": {
           "id": "Identifier",
           "bank_id": "Battery bank",
           "driver_kind": "Driver",
+          "transport": "Transport",
+          "gateway_host": "Native gateway host",
+          "gateway_port": "Native gateway TCP port",
+          "gateway_unit_id": "Native Modbus unit id",
           "charge_limit_a": "DC charge limit (A)",
           "discharge_limit_a": "DC discharge limit (A)",
           "confirmed": "Limits confirmed",

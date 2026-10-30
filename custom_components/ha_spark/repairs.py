@@ -4,14 +4,32 @@ Uses HA's repairs issue_handler.ConfirmRepairFlow confirm-step contract and
 helpers.issue_registry issue data to select the affected config entry.
 """
 
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 import probatio
 from homeassistant.components.repairs import RepairsFlow
 from homeassistant.components.repairs.models import RepairsFlowResult
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 
-from . import SparkConfigEntry
+from .const import DOMAIN
+
+if TYPE_CHECKING:
+    from . import SparkConfigEntry
+
+
+def ownership_switch_refused(hass: HomeAssistant, entry_id: str, reason: str | None) -> None:
+    """Expose fixed handover conditions, never topology or peer-entered values."""
+    issue_id = f"ownership_switch_refused_{entry_id}"
+    if reason is None:
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
+    else:
+        ir.async_create_issue(
+            hass, DOMAIN, issue_id, is_fixable=False, severity=ir.IssueSeverity.ERROR,
+            translation_key=reason,
+        )
 
 
 class AuthorityRepairFlow(RepairsFlow):

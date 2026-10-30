@@ -222,6 +222,15 @@ def plan_summary(
             "holds_present": bool(state.holds) if state else False,
             "store_state": ("save_failed" if inputs.save_failed else "ok" if state else "unknown"),
         }
+        if settings is not None:
+            from ha_spark.authority import retirement_status
+
+            retired = retirement_status(settings)
+            if retired is not None and not inputs.save_failed:
+                result["addon_authority"] = {
+                    "active": retired, "mode": "observe", "holds_present": False,
+                    "store_state": "ok",
+                }
         result["legacy_overlay"] = {
             inverter.id: bool(settings and settings.solis_control_hub
                               and inverter.driver_kind == "solis")

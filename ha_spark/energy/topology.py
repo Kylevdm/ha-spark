@@ -87,6 +87,21 @@ class Inverter(FrozenModel):
     grid_port_power_entity: EntityId | None = None
     battery_power_entity: EntityId | None = None
     power_sign: Literal["positive_import", "negative_import"] = "positive_import"
+    transport: Literal["legacy", "native"] = "legacy"
+    gateway_host: Annotated[
+        str, Field(strict=True, min_length=1, max_length=253, pattern=r"^[A-Za-z0-9.:-]+$")
+    ] | None = None
+    gateway_port: Annotated[int, Field(strict=True, ge=1, le=65535)] = 502
+    gateway_unit_id: Annotated[int, Field(strict=True, ge=1, le=247)] = 1
+
+    @model_validator(mode="after")
+    def valid_transport(self) -> Self:
+        """Only Solis has a native transport; saving never validates a device."""
+        if self.transport == "native" and (
+            self.driver_kind != "solis" or self.gateway_host is None
+        ):
+            raise ValueError("invalid_native_gateway")
+        return self
 
 
 class V2LCharger(FrozenModel):

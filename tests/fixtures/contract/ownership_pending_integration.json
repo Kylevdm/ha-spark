@@ -1,0 +1,60 @@
+{
+  "api_version": 4,
+  "release_version": "0.30.0",
+  "site_id": "6f1c2b3a-9d84-4e57-a1c0-2f3e4d5c6b7a",
+  "sent_at": "2026-10-24T12:00:00+00:00",
+  "solar_forecast": null,
+  "topology": {
+    "configured": true,
+    "revision": 1,
+    "topology": {
+      "connections": [
+        {
+          "id": "grid",
+          "supply_voltage_v": 240,
+          "import_limit_a": 75,
+          "export_limit_a": 16,
+          "dno_export_limit_kw": 3.6
+        }
+      ],
+      "banks": [
+        {
+          "id": "bank",
+          "connection_id": "grid",
+          "usable_capacity_kwh": 14,
+          "nominal_voltage_v": 50,
+          "min_soc": 10,
+          "target_cap": 100,
+          "charge_limit_a": 125,
+          "discharge_limit_a": 125,
+          "served_load_share_pct": 100
+        }
+      ],
+      "inverters": [
+        {
+          "id": "inv1",
+          "bank_id": "bank",
+          "driver_kind": "solis",
+          "charge_limit_a": 62.5,
+          "discharge_limit_a": 62.5,
+          "confirmed": true,
+          "transport": "native",
+          "gateway_host": "gateway.invalid"
+        }
+      ],
+      "v2l_chargers": [],
+      "major_loads": []
+    }
+  },
+  "major_loads": [],
+  "authority_owner": "pending_integration",
+  "devices": [
+    {
+      "id": "inv1",
+      "transport": "native",
+      "validation": "read_only",
+      "reason": "unvalidated_identity",
+      "capabilities": []
+    }
+  ]
+}

@@ -111,6 +111,27 @@ class _Marker(_Record):
     store_id: UUID
 
 
+class RetirementMarker(_Record):
+    """Deliberately invalid to the legacy marker loader; no holds are imported."""
+
+    schema_version: Literal[1] = 1
+    store_id: UUID
+    ownership: Literal["retired", "pending_addon"]
+    candidate: AuthorityState | None = None
+
+    @model_validator(mode="after")
+    def valid_candidate(self) -> Self:
+        state = self.candidate
+        if self.ownership == "retired":
+            if state is not None:
+                raise ValueError("invalid retirement")
+        elif (state is None or state.committed_mode != "observe" or state.epoch != 1
+              or state.holds or state.transition is not None or state.fallback.active
+              or state.store_id == self.store_id):
+            raise ValueError("invalid rollback")
+        return self
+
+
 class AuthorityLoadResult(_Record):
     """Unknown and uninitialised carry no mode, never an Observe default."""
 
@@ -155,6 +176,25 @@ def load_authority(settings: Settings) -> AuthorityLoadResult:
     """Read only, including on a missing directory; no initialisation or repair."""
     directory = resolve_data_dir(settings)
     return _load(directory / "authority.json", directory / "authority.marker.json")
+
+
+def retirement_status(settings: Settings) -> Literal["active", "retired"] | None:
+    """Report only independently verified handshake evidence, never a permission."""
+    directory = resolve_data_dir(settings)
+    try:
+        marker = RetirementMarker.model_validate_json(
+            (directory / "authority.marker.json").read_text(encoding="utf-8"),
+        )
+        state = AuthorityState.model_validate_json(
+            (directory / "authority.json").read_text(encoding="utf-8"),
+        )
+        if marker.ownership == "retired" and marker.store_id == state.store_id:
+            return "retired"
+        if marker.ownership == "pending_addon" and marker.candidate == state:
+            return "active"
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def operating_mode(settings: Settings) -> str:
@@ -281,8 +321,130 @@ class AuthorityStore:
         self._persist_initial(state)
         return AuthorityLoadResult(status="known", state=state)
 
+    def can_handover(self, owner: str) -> bool:
+        """Read-only admission, before accepting or pairing a pending snapshot."""
+        try:
+            state = AuthorityState.model_validate_json(
+                self.store_path.read_text(encoding="utf-8"),
+            )
+            if (state.committed_mode != "observe" or state.holds
+                    or state.transition is not None):
+                return False
+            try:
+                marker = RetirementMarker.model_validate_json(
+                    self.marker_path.read_text(encoding="utf-8"),
+                )
+            except ValueError:
+                return owner == "pending_integration" and self.known and not self.save_failed
+            original = state.store_id == marker.store_id
+            if not original and state != marker.candidate:
+                return False
+            return (owner == "pending_addon" or owner == "pending_integration"
+                    and marker.ownership == "retired" and original)
+        except (OSError, ValueError):
+            return False
+
+    def handover(self, owner: str) -> Literal["active", "retired"] | None:
+        """Advance the v4 handshake synchronously, verifying each independent reload.
+
+        The retirement marker is rejected by the unchanged 0.30.0 loader. During
+        rollback the new Observe state remains fenced by that marker until the
+        integration has durably confirmed add-on ownership.
+        """
+        try:
+            try:
+                marker = RetirementMarker.model_validate_json(
+                    self.marker_path.read_text(encoding="utf-8"),
+                )
+            except ValueError:
+                marker = None
+            if marker is None:
+                if owner != "pending_integration" or not self.known or self.save_failed:
+                    return None
+                state = self.state
+                if (state is None or state.committed_mode != "observe"
+                        or state.holds or state.transition is not None):
+                    return None
+                marker = RetirementMarker(store_id=state.store_id, ownership="retired")
+                _durable_write(self.marker_path, marker.model_dump_json())
+                if RetirementMarker.model_validate_json(
+                    self.marker_path.read_text(encoding="utf-8"),
+                ) != marker:
+                    raise ValueError("unverified ownership")
+                self._pending = None
+                self._state = None
+            resident = AuthorityState.model_validate_json(
+                self.store_path.read_text(encoding="utf-8"),
+            )
+            original = (resident.store_id == marker.store_id
+                        and resident.committed_mode == "observe" and not resident.holds
+                        and resident.transition is None)
+            if not original and resident != marker.candidate:
+                return None
+            if owner in ("pending_integration", "integration"):
+                if marker.ownership != "retired" or not original:
+                    return None
+                if self.save_failed:
+                    _durable_write(self.marker_path, marker.model_dump_json())
+                    if RetirementMarker.model_validate_json(
+                        self.marker_path.read_text(encoding="utf-8"),
+                    ) != marker:
+                        return None
+                self.save_failed = False
+                return "retired"
+            if owner == "pending_addon":
+                if marker.ownership == "retired":
+                    candidate = AuthorityState(
+                        schema_version=1, store_id=uuid4(), committed_mode="observe",
+                        transition=None, epoch=1, holds=(), fallback=FallbackState(),
+                        readiness_notice=ReadinessNoticeState(),
+                        last_changed_at=datetime.now(UTC), requester_kind="system",
+                    )
+                    marker = RetirementMarker(store_id=marker.store_id,
+                                              ownership="pending_addon", candidate=candidate)
+                    _durable_write(self.marker_path, marker.model_dump_json())
+                    if RetirementMarker.model_validate_json(
+                        self.marker_path.read_text(encoding="utf-8"),
+                    ) != marker:
+                        raise ValueError("unverified ownership")
+                if marker.candidate is None:
+                    return None
+                _durable_write(self.store_path, marker.candidate.model_dump_json())
+                if AuthorityState.model_validate_json(
+                    self.store_path.read_text(encoding="utf-8"),
+                ) != marker.candidate:
+                    raise ValueError("unverified ownership")
+                self.save_failed = False
+                return "active"
+            if owner == "addon" and marker.ownership == "pending_addon":
+                restored = marker.candidate
+                if restored is None or AuthorityState.model_validate_json(
+                    self.store_path.read_text(encoding="utf-8"),
+                ) != restored:
+                    return None
+                _durable_write(self.marker_path, _Marker(
+                    schema_version=1, store_id=restored.store_id,
+                ).model_dump_json())
+                if _load(self.store_path, self.marker_path).state != restored:
+                    raise ValueError("unverified ownership")
+                self._state = restored
+                self.save_failed = False
+                return "active"
+        except (OSError, ValueError):
+            self.save_failed = True
+        return None
+
     def confirm_observe(self, requester_kind: RequesterKind) -> None:
         """Explicit unknown-authority recovery: a new identity, never hardware writes."""
+        try:
+            RetirementMarker.model_validate_json(self.marker_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            pass
+        except OSError:
+            self.save_failed = True
+            raise ValueError("authority unknown") from None
+        else:
+            raise ValueError("ownership handover required")
         if self.known:
             raise ValueError("authority known; use mode set observe")
         state = AuthorityState(

@@ -3,6 +3,7 @@
 One config entry per site (ADR-0011), paired through Supervisor discovery. The
 heartbeat coordinator loads even with the add-on down and exposes site connectivity.
 New discovery reloads the entry, fencing off the old session's in-flight replies.
+Authority and ownership storage load read-only; confirmed ownership selects the entity source.
 Authority loads before native startup reconciliation; legacy sites retain their mirror.
 The optional Solcast service device is registered only while its key is configured.
 A configured topology starts an independent supply guard; no native writer is attached.
@@ -43,6 +44,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     entry.runtime_data = coordinator
     hass.data.setdefault(f"{DOMAIN}.unloaded_authority", {}).pop(entry.entry_id, None)
     await coordinator.authority.async_load()
+    await coordinator.ownership.async_load()
     async_register(hass)
 
     async def authority_tick(now: datetime) -> None:

@@ -247,6 +247,11 @@ def _condition_errors(model: type[BaseModel], clean: dict[str, Any]) -> dict[str
         share, source = clean.get("served_load_share_pct"), clean.get("load_source_entity")
         if (share is None) == (source is None):
             return {"base": "invalid_load_attribution"}
+    elif model is Inverter:
+        if clean.get("transport") == "native" and (
+            clean.get("driver_kind", "solis") != "solis" or not clean.get("gateway_host")
+        ):
+            return {"base": "invalid_native_gateway"}
     elif model is MajorLoad:
         if clean.get("kind") == "ev_charger":
             if (
@@ -275,6 +280,9 @@ def _clean_item(model: type[BaseModel], user_input: dict[str, Any]) -> dict[str,
         value = user_input[name]
         if not field.is_required() and (value is None or value == ""):
             continue
+        if name in ("gateway_port", "gateway_unit_id") and type(value) is float:
+            if value.is_integer():
+                value = int(value)
         clean[name] = value
     return clean
 
@@ -445,6 +453,14 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                 "discharge_limit_a", default=defaults.get("discharge_limit_a", 0)
             ): _NUMBER,
             probatio.Required("confirmed", default=defaults.get("confirmed", False)): _BOOLEAN,
+            probatio.Required(
+                "transport", default=defaults.get("transport", "legacy")
+            ): SelectSelector(SelectSelectorConfig(options=["legacy", "native"])),
+            probatio.Optional("gateway_host"): _TEXT,
+            probatio.Required("gateway_port", default=defaults.get("gateway_port", 502)): _NUMBER,
+            probatio.Required(
+                "gateway_unit_id", default=defaults.get("gateway_unit_id", 1)
+            ): _NUMBER,
             probatio.Optional("grid_port_power_entity"): _ENTITY,
             probatio.Optional("battery_power_entity"): _ENTITY,
             probatio.Required(
@@ -950,6 +966,26 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                 step_id="save", errors={"base": "invalid_topology"},
                 data_schema=probatio.Schema({}),
             )
+        from .ownership import derived_owner
+
+        coordinator = getattr(self.config_entry, "runtime_data", None)
+        target = derived_owner(topology.model_dump(mode="json"))
+        if coordinator is None:
+            if target != "addon":
+                return self.async_show_form(
+                    step_id="save", errors={"base": "ownership_peer_version"},
+                    data_schema=probatio.Schema({}),
+                )
+        else:
+            summary = coordinator.summary if coordinator.connected else None
+            reason = await coordinator.ownership.async_request(
+                target, summary,
+                latest=lambda: coordinator.summary if coordinator.connected else None,
+            )
+            if reason is not None:
+                return self.async_show_form(
+                    step_id="save", errors={"base": reason}, data_schema=probatio.Schema({}),
+                )
         revision = self.config_entry.options.get("topology_revision")
         return self.async_create_entry(title="", data={
             **self.config_entry.options,

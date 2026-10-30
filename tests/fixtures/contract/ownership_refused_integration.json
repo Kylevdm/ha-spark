@@ -1,0 +1,41 @@
+{
+  "api_version": 4,
+  "release_version": "0.30.0",
+  "session_id": "b79156f6-2fbe-4c30-ae3a-6b7fb4dd18d1",
+  "loop_tick": "2026-10-24T12:00:00+00:00",
+  "built_at": "2026-10-24T12:00:00+00:00",
+  "commands_pending": false,
+  "plan": null,
+  "v2l": null,
+  "authority": {
+    "mode": "optimise",
+    "transition_target": null,
+    "last_changed_at": "2026-10-24T12:00:00+00:00",
+    "save_failed": false,
+    "fallback": {
+      "active": false,
+      "causes": []
+    },
+    "holds": {
+      "ev": {
+        "active": false
+      },
+      "dispatch": {
+        "active": false,
+        "trusted_end": null
+      }
+    }
+  },
+  "charge_window_start": "2026-10-24T22:30:00+00:00",
+  "household_timezone": "Europe/London",
+  "addon_authority": {
+    "active": "active",
+    "mode": "optimise",
+    "holds_present": false,
+    "store_state": "ok"
+  },
+  "legacy_overlay": {
+    "inv1": false
+  },
+  "export_acks": []
+}

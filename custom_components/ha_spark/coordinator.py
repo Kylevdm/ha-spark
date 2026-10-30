@@ -1,7 +1,9 @@
 """Poll the add-on and enforce a session-local liveness deadline independently.
 
 Native authority is local only on integration-owned sites; the legacy mirror
-never grants local write permission. Unloading fences off replies from the previous discovery.
+never grants local write permission. Ownership changes through the durable
+Observe-only handshake, not a snapshot grant. Unloading fences off replies
+from the previous discovery. No native hardware writer is attached here.
 """
 
 import logging
@@ -23,6 +25,7 @@ from .authority import AuthorityStore
 from .authority_control import AuthorityControl
 from .channel import Outcome, PollResult, async_poll
 from .const import DOMAIN
+from .ownership import OwnershipStore
 from .topology import Topology, validate_topology
 from .wire import Summary, build_snapshot
 
@@ -42,6 +45,9 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self.entry = entry
         self.authority = AuthorityStore(hass, entry.entry_id, self.async_update_listeners)
         self.control = AuthorityControl(entry, self.authority)
+        self.ownership = OwnershipStore(
+            hass, entry.entry_id, self.authority, lambda: entry.options.get("topology"),
+        )
         self.solcast: SolcastCoordinator | None = None
         self.guard: SupplyGuardLoop | None = None
         self.release_version = release_version
@@ -151,9 +157,56 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         except Exception:  # noqa: BLE001 - its text may never reach HA's update logging
             return None
 
+    def _ownership_snapshot(self, snapshot: dict[str, object]) -> None:
+        """No transport connects here: native devices remain unvalidated/read-only."""
+        if snapshot["api_version"] != 4:
+            return
+        owner = self.ownership.owner if self.ownership.verified else "pending_integration"
+        snapshot["authority_owner"] = owner
+        topology = validate_topology(self.entry.options.get("topology"))
+        if isinstance(topology, Topology):
+            snapshot["devices"] = [
+                {"id": inverter.id, "transport": inverter.transport, "validation": "read_only",
+                 "reason": "unvalidated_identity", "capabilities": []}
+                for inverter in topology.inverters
+            ]
+        if owner != "integration":
+            return
+        state = self.authority.state
+        if state is None:
+            # Omit the required authority block: the add-on drops this snapshot
+            # whole. Never invent an identity, epoch or mode for damaged storage.
+            snapshot.pop("authority_owner", None)
+            return
+        transition = state.transition
+        snapshot["authority"] = {
+            "mode": state.committed_mode if state else "observe",
+            "epoch": state.epoch if state else 1,
+            "store_identity": str(state.store_id) if state else self.entry.entry_id,
+            "transition": ({"target": transition.target, "steps": list(transition.steps),
+                            "failing_actions": list(transition.failing_actions)}
+                           if transition else None),
+            "manual_session": (state.manual_session.model_dump(mode="json")
+                               if state and state.manual_session else None),
+            "fallback": {"active": state.fallback.active if state else False,
+                         "causes": list(state.fallback.causes) if state else []},
+            "store_state": ("ok" if state else "save_failed"
+                            if self.authority.status == "save_failed" else "unknown"),
+        }
+        snapshot["holds"] = []
+
     async def _async_update_data(self) -> bool:
         if not self._running or self._ended:
             return self.connected
+        if not self.ownership.loaded:
+            await self.authority.async_load()
+            await self.ownership.async_load()
+        if not self.ownership.verified:
+            # An unverified pending record must not even request a handover.
+            self.connected = False
+            self.last_outcome = Outcome.MALFORMED
+            self.last_outcome_at = dt_util.utcnow()
+            return False
         data = self.entry.data
         api_version = self.api_version
         envelope = None
@@ -171,6 +224,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         else:
             session = async_get_clientsession(self.hass)
             url = f"http://{data['host']}:{data['port']}/integration/heartbeat"
+            self._ownership_snapshot(snapshot)
             result = await async_poll(session, url=url, token=data["auth_token"], snapshot=snapshot)
             envelope = result.envelope
             if result.outcome is Outcome.VERSION_REFUSED:
@@ -180,6 +234,8 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                     if not self._running or self._ended or self.entry.data is not data:
                         return self.connected
                     api_version = max(common)
+                    if api_version < 4:
+                        await self.ownership.async_abort("ownership_peer_version")
                     try:
                         snapshot = build_snapshot(site_id=data["site_id"],
                                                   release_version=self.release_version,
@@ -224,6 +280,8 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             self.connected = True
             self.last_counted = now
             self.summary = summary
+            if summary is not None:
+                await self.ownership.async_advance(summary)
             self._clear_deadline()
             self._cancel_deadline = async_call_later(self.hass, 120, self._expire)
             if (self.solcast is not None and summary is not None
