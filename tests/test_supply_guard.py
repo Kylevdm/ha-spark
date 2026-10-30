@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import httpx
+import pytest
 import respx
 
 from ha_spark.devices import inverter_device
@@ -14,6 +15,8 @@ from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.supply_guard import SupplyGuard, throttled_rate_w
 from ha_spark.ha.rest import HomeAssistantRest
 from tests.authority_helpers import legacy_settings as Settings
+
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
 
 # Shared electrical model for the math tests: 240 V supply, 75 A limit ->
 # 18000 W ceiling. 51 V battery so watts <-> amps for the tick read-backs.

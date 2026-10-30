@@ -16,6 +16,8 @@ from tests.authority_helpers import run_daemon, seed_authority
 from tests.test_authority_gate import daemon_ticks
 from tests.test_readiness_ledger import START, revision
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 @respx.mock
 async def test_blocked_readiness_does_not_delay_next_guard_or_reconcile(tmp_path, monkeypatch):

@@ -21,6 +21,8 @@ from ha_spark.ha.models import EntityState
 from tests.authority_helpers import legacy_settings as Settings
 from tests.test_solis_export import FakeRest
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 _NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
 _GRID = "sensor.grid_power"
 # 20 A x 240 V = 4800 W legacy supply limit.

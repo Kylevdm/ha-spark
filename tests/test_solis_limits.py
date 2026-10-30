@@ -26,6 +26,8 @@ from tests.authority_helpers import legacy_settings as Settings
 from tests.test_solis_export import FakeRest, _export
 from tests.test_solis_export import _intent as _export_intent
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 @pytest.fixture(autouse=True)
 def _skip_read_back_delays(monkeypatch: pytest.MonkeyPatch) -> None:

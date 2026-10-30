@@ -461,13 +461,14 @@ async def _cmd_onboard(
         print("Import replaces non-secret inputs; merge with `ha-spark config export` first")
         print("if you want to keep other settings. Omitted secrets are unchanged.")
         print("```yaml")
-        has_mapping = False
+        # Pin the current transport: a fragment without the hub would import like a
+        # pre-0.31 export and get the legacy `solis_control` hub (#567).
+        print(f"solis_control_hub: {json.dumps(settings.solis_control_hub)}    # current")
         for p in proposals:
             resolved = _resolve_field(p, preset)
             if resolved is None:
                 continue
             entity_id, origin = resolved
-            has_mapping = True
             print(f"{p.config_field}: {entity_id}    # {origin}")
             if (
                 p.config_field == "dispatch_grid_power_entity"
@@ -475,8 +476,6 @@ async def _cmd_onboard(
             ):
                 invert = preset.get("dispatch_grid_power_invert", "false")
                 print(f"dispatch_grid_power_invert: {invert}")
-        if not has_mapping:
-            print("{}")
         print("```")
         print("ha-spark config import onboard.yaml")
 
