@@ -6,6 +6,7 @@ including the marker. No partially saved candidate is exposed to readers.
 """
 
 import asyncio
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
@@ -71,10 +72,22 @@ class AuthorityStore:
             def evidence() -> bool:
                 # HA renames corrupt JSON before returning None. Keep that
                 # evidence across restarts, even if both files were renamed.
-                return any(
-                    path.exists() or any(path.parent.glob(f"{path.name}.corrupt.*"))
-                    for path in (Path(self.store.path), Path(self.marker.path))
-                )
+                # Only "not found" means absent; any other stat or listing
+                # error (permissions, I/O) raises and reads as unknown.
+                paths = (Path(self.store.path), Path(self.marker.path))
+                try:
+                    names = os.listdir(paths[0].parent)
+                except FileNotFoundError:
+                    return False
+                for path in paths:
+                    try:
+                        path.lstat()
+                        return True
+                    except FileNotFoundError:
+                        pass
+                    if any(name.startswith(f"{path.name}.corrupt.") for name in names):
+                        return True
+                return False
 
             existed = await self._hass.async_add_executor_job(evidence)
             if not existed:
@@ -115,12 +128,15 @@ class AuthorityStore:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
                 await task
-                self._publish("save_failed")
                 raise
             status, loaded = await self._read()
             if status != "ok" or loaded != candidate:
                 self._publish("save_failed")
                 return False
+        except asyncio.CancelledError:
+            # Cancelled before verification: disk may hold the candidate.
+            self._publish("save_failed")
+            raise
         except Exception:
             self._publish("save_failed")
             return False

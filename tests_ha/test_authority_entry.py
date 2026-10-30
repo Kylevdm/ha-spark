@@ -1,5 +1,6 @@
 """Authority persistence and recovery through a real, read-only config entry."""
 
+import asyncio
 import json
 from datetime import timedelta
 from pathlib import Path
@@ -256,3 +257,40 @@ async def test_invalid_candidate_and_load_failure_fail_closed(
     with patch("custom_components.ha_spark.authority.Store.async_load", side_effect=OSError):
         await store.async_load()
     assert store.status == "unknown" and store.state is None
+
+
+async def test_unlistable_storage_reads_unknown_not_fresh(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+) -> None:
+    aioclient_mock.post(URL, exc=aiohttp.ClientError())
+    entry = await setup(hass)
+    store = entry.runtime_data.authority
+    with patch("custom_components.ha_spark.authority.os.listdir", side_effect=PermissionError):
+        await store.async_load()
+        assert store.status == "unknown"
+        assert not await store.async_initialise()
+
+
+async def test_cancelled_verification_fences_memory(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+) -> None:
+    aioclient_mock.post(URL, exc=aiohttp.ClientError())
+    entry = await setup(hass)
+    store = entry.runtime_data.authority
+    assert await store.async_initialise()
+    before = store.state
+    assert before is not None
+    reads = 0
+    real_read = store._read
+
+    async def cancel_verification() -> Any:
+        nonlocal reads
+        reads += 1
+        if reads == 2:  # The first read guards the save; the second verifies it.
+            raise asyncio.CancelledError
+        return await real_read()
+
+    with (patch.object(store, "_read", new=cancel_verification),
+          pytest.raises(asyncio.CancelledError)):
+        await store.async_save(before.model_copy(update={"epoch": 2}))
+    assert store.status == "save_failed" and store.state is None
