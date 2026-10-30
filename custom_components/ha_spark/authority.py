@@ -96,7 +96,13 @@ class AuthorityStore:
             marker_raw = await self._store(self.marker.key).async_load()
             # Defaults are for constructing fresh records, not for silently
             # replacing missing durable holds or other authority contents.
-            if not isinstance(raw, dict) or raw.keys() != AuthorityState.model_fields.keys():
+            if not isinstance(raw, dict):
+                return "unknown", None
+            # Older records predate durable add-on session tracking. No authority
+            # or hold field may be defaulted while upgrading them.
+            if "addon_session_id" not in raw:
+                raw = {**raw, "addon_session_id": None}
+            if raw.keys() != AuthorityState.model_fields.keys():
                 return "unknown", None
             state = AuthorityState.model_validate(raw)
             marker = AuthorityMarker.model_validate(marker_raw)

@@ -1,0 +1,22 @@
+set_observe:
+  name: Set Observe
+  description: Make a verified handover to Observe. Requires a non-system administrator.
+start_manual_control:
+  name: Start manual control
+  description: Temporarily hand over controls to a non-system administrator.
+  fields:
+    duration:
+      default: one_hour
+      selector:
+        select:
+          options:
+            - one_hour
+            - until_tomorrow
+            - until_resumed
+    keep_protection:
+      default: true
+      selector:
+        boolean:
+resume_control:
+  name: Resume control
+  description: End manual control using current conditions, never an old plan.
