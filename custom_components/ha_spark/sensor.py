@@ -43,7 +43,8 @@ DESCRIPTIONS = (
     SparkSensorDescription(
         key="operating_mode", translation_key="operating_mode",
         requested_entity_id="sensor.ha_spark_operating_mode", device_class=SensorDeviceClass.ENUM,
-        options=["observe", "protect", "optimise", "authority_unknown"],
+        options=["observe", "protect", "optimise", "activating", "switching_to_observe",
+                 "authority_unknown"],
         value_fn=lambda s: s.authority.mode,
         attributes_fn=lambda s: {
             "transition_target": s.authority.transition_target,
@@ -145,6 +146,20 @@ DESCRIPTIONS = (
 )
 
 
+AUTHORITY_DESCRIPTIONS = (
+    SparkSensorDescription(
+        key="manual_session", translation_key="manual_session",
+        requested_entity_id="sensor.ha_spark_manual_session", device_class=SensorDeviceClass.ENUM,
+        options=["none", "active"], value_fn=lambda s: "none",
+    ),
+    SparkSensorDescription(
+        key="authority_epoch", translation_key="authority_epoch",
+        requested_entity_id="sensor.ha_spark_authority_epoch",
+        entity_category=EntityCategory.DIAGNOSTIC, value_fn=lambda s: None,
+    ),
+)
+
+
 GUARD_DESCRIPTIONS = (
     SensorEntityDescription(
         key="charging_allowance", translation_key="charging_allowance",
@@ -164,7 +179,7 @@ async def async_setup_entry(
 ) -> None:
     """Free legacy pushed states before requesting their existing ids."""
     entities = []
-    for description in DESCRIPTIONS:
+    for description in (*DESCRIPTIONS, *AUTHORITY_DESCRIPTIONS):
         if description.requested_entity_id is not None:
             async_clear_unregistered_state(hass, description.requested_entity_id)
         cls = LastRun if description.key == "last_run" else SparkSensor
@@ -193,6 +208,11 @@ class SparkSensor(SparkEntity, SensorEntity):
 
     @property
     def available(self) -> bool:
+        key = self.entity_description.key
+        if self.local_authority and key in ("operating_mode", "manual_session", "authority_epoch"):
+            return key == "operating_mode" or self.coordinator.authority.state is not None
+        if key == "authority_epoch":
+            return False  # Legacy summaries carry no epoch.
         summary = self.coordinator.summary
         if not self.coordinator.connected or summary is None:
             return False
@@ -203,11 +223,42 @@ class SparkSensor(SparkEntity, SensorEntity):
 
     @property
     def native_value(self) -> float | datetime | str | None:
+        key = self.entity_description.key
+        if self.local_authority and key in ("operating_mode", "manual_session", "authority_epoch"):
+            state = self.coordinator.authority.state
+            if state is None:
+                return "authority_unknown" if key == "operating_mode" else None
+            if key == "manual_session":
+                return "active" if state.manual_session else "none"
+            if key == "authority_epoch":
+                return state.epoch
+            if state.transition is not None:
+                if state.transition.target == "observe":
+                    return "switching_to_observe"
+                if state.transition.target == "optimise":
+                    return "activating"
+            return state.committed_mode
         summary = self.coordinator.summary
         return self.entity_description.value_fn(summary) if summary else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
+        if self.local_authority:
+            state = self.coordinator.authority.state
+            if self.entity_description.key == "operating_mode":
+                return {
+                    "transition_target": (state.transition.target
+                                          if state and state.transition else None),
+                    "last_changed_at": state.last_changed_at.isoformat() if state else None,
+                    "save_failed": self.coordinator.authority.status == "save_failed",
+                }
+            if self.entity_description.key == "manual_session":
+                manual = state.manual_session if state else None
+                return {
+                    "deadline": manual.deadline.isoformat() if manual and manual.deadline else None,
+                    "return_to": manual.return_to if manual else None,
+                    "keep_protection": manual.keep_protection if manual else None,
+                }
         summary = self.coordinator.summary
         attributes_fn = self.entity_description.attributes_fn
         return attributes_fn(summary) if attributes_fn and summary else None
