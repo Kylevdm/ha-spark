@@ -1,4 +1,23 @@
 {
+  "exceptions": {
+    "not_owner": {"message": "Only a non-system administrator on an integration-owned site may do this."},
+    "authority_unknown": {"message": "Authority is unknown. Confirm Observe through the repair before writing."},
+    "transition_in_progress": {"message": "An authority transition is still in progress."},
+    "no_manual_session": {"message": "There is no manual session to resume."},
+    "not_in_active_mode": {"message": "Manual control requires Protect or Optimise and no existing manual session."},
+    "invalid_household_zone": {"message": "Configure a valid household time zone before choosing until tomorrow."}
+  },
+  "services": {
+    "set_observe": {"name": "Set Observe", "description": "Make a verified handover to Observe."},
+    "start_manual_control": {
+      "name": "Start manual control", "description": "Temporarily hand over controls to the owner.",
+      "fields": {
+        "duration": {"name": "Duration", "description": "One hour, next household-clock morning, or until resumed."},
+        "keep_protection": {"name": "Keep protection", "description": "Keep battery-to-car protection during manual control."}
+      }
+    },
+    "resume_control": {"name": "Resume control", "description": "End manual control using current conditions."}
+  },
   "issues": {
     "authority_unknown": {
       "title": "ha-spark authority is unknown",
@@ -95,6 +114,7 @@
   },
   "options": {
     "error": {
+      "invalid_manual_time": "Enter a valid HH:MM deadline and household time zone.",
       "invalid_number": "Enter a finite number.",
       "out_of_range": "Enter a number in the valid range for this field.",
       "invalid_id": "Use 1-64 letters, numbers, underscores or hyphens.",
@@ -120,8 +140,14 @@
         "title": "ha-spark options",
         "menu_options": {
           "solcast": "Solcast daily allowance",
+          "manual": "Manual control deadline",
           "topology": "Site topology and limits"
         }
+      },
+      "manual": {
+        "title": "Manual control deadline",
+        "description": "Until tomorrow resolves to the next occurrence of this household-clock time. Existing deadlines do not change.",
+        "data": {"manual_until_time": "Household-clock time", "household_time_zone": "Household time zone"}
       },
       "solcast": {
         "title": "Solcast daily allowance",

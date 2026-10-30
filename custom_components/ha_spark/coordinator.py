@@ -1,7 +1,7 @@
 """Poll the add-on and enforce a session-local liveness deadline independently.
 
-A lost link changes visibility only. This integration owns no authority, fallback
-or hardware write path. Unloading fences off replies from the previous discovery.
+Native authority is local only on integration-owned sites; the legacy mirror
+never grants local write permission. Unloading fences off replies from the previous discovery.
 """
 
 import logging
@@ -20,6 +20,7 @@ from homeassistant.util import dt as dt_util
 
 from . import wire
 from .authority import AuthorityStore
+from .authority_control import AuthorityControl
 from .channel import Outcome, PollResult, async_poll
 from .const import DOMAIN
 from .topology import Topology, validate_topology
@@ -40,6 +41,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                          update_interval=timedelta(seconds=30))
         self.entry = entry
         self.authority = AuthorityStore(hass, entry.entry_id, self.async_update_listeners)
+        self.control = AuthorityControl(entry, self.authority)
         self.solcast: SolcastCoordinator | None = None
         self.guard: SupplyGuardLoop | None = None
         self.release_version = release_version
@@ -216,6 +218,8 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self.last_outcome = outcome
         self.last_outcome_at = now
         if outcome is Outcome.COUNTED:
+            if self.control.owned() and summary is not None:
+                await self.control.async_new_session(summary.session_id, now=now)
             ir.async_delete_issue(self.hass, DOMAIN, "api_version_skew")
             self.connected = True
             self.last_counted = now

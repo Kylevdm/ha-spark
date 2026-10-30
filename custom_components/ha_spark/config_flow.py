@@ -12,6 +12,7 @@ from collections.abc import Callable
 from math import isclose
 from typing import Any, TypeGuard, cast
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import probatio
 from homeassistant.config_entries import (
@@ -300,7 +301,33 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
         self, user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
         """Choose between the Solcast allowance and the topology editor."""
-        return self.async_show_menu(step_id="init", menu_options=["solcast", "topology"])
+        return self.async_show_menu(step_id="init", menu_options=["solcast", "topology", "manual"])
+
+    async def async_step_manual(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Set the household-clock deadline for future manual handovers only."""
+        schema = probatio.Schema({
+            probatio.Required(
+                "manual_until_time", default=self.config_entry.options.get(
+                    "manual_until_time", "07:00"),
+            ): probatio.Match(r"^(?:[01]\d|2[0-3]):[0-5]\d$"),
+            probatio.Required("household_time_zone", default=self.config_entry.options.get(
+                "household_time_zone", "Europe/London"),
+            ): str,
+        })
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                clean = schema(user_input)
+                ZoneInfo(clean["household_time_zone"])
+            except (probatio.Invalid, ZoneInfoNotFoundError, ValueError):
+                errors = {"base": "invalid_manual_time"}
+            else:
+                return self.async_create_entry(
+                    title="", data={**self.config_entry.options, **clean},
+                )
+        return self.async_show_form(step_id="manual", data_schema=schema, errors=errors)
 
     async def async_step_solcast(
         self, user_input: dict[str, Any] | None = None,

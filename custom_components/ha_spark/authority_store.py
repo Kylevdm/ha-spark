@@ -152,6 +152,7 @@ class AuthorityState(Record):
     schema_version: Literal[1] = 1
     store_id: UUID
     committed_mode: OperatingMode
+    addon_session_id: Text | None = None
     epoch: Epoch
     transition: Transition | None = None
     manual_session: ManualSession | None = None
