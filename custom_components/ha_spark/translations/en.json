@@ -1,5 +1,22 @@
 {
   "issues": {
+    "authority_unknown": {
+      "title": "ha-spark authority is unknown",
+      "description": "The integration cannot verify its authority store. No native writes are permitted. Confirm Observe to recover, then re-escalate through readiness.",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Confirm Observe",
+            "description": "Reset the integration authority to Observe with a new identity. This writes no hardware and does not change the add-on's authority."
+          }
+        },
+        "error": {"save_failed": "The authority save could not be verified. No writes are permitted. Try again."},
+        "abort": {
+          "entry_unavailable": "The config entry is not loaded.",
+          "authority_known": "Authority is already known. This repair cannot change its mode."
+        }
+      }
+    },
     "api_version_skew": {
       "title": "ha-spark API versions are incompatible",
       "description": "The ha-spark add-on release {addon_release} speaks API version {addon_api_version} (supported: {addon_supported}). The integration sent API version {integration_api_version} and supports: {supported}. Update the add-on or integration so they support a common API version, then restart the updated half."
@@ -22,9 +39,16 @@
           "observe": "Observe",
           "protect": "Protect",
           "optimise": "Optimise",
+          "activating": "Activating",
+          "switching_to_observe": "Switching to Observe",
           "authority_unknown": "Authority unknown"
         }
       },
+      "manual_session": {
+        "name": "Manual session",
+        "state": {"none": "None", "active": "Active"}
+      },
+      "authority_epoch": {"name": "Authority epoch"},
       "charge_needed": {
         "name": "Charge needed"
       },

@@ -74,15 +74,38 @@ class SparkBinarySensor(SparkEntity, BinarySensorEntity):
 
     @property
     def available(self) -> bool:
+        if self.local_authority:
+            return self.coordinator.authority.state is not None
         return self.coordinator.connected and self.coordinator.summary is not None
 
     @property
     def is_on(self) -> bool | None:
+        if self.local_authority:
+            state = self.coordinator.authority.state
+            if state is None:
+                return None
+            key = self.entity_description.key
+            if key == "fallback_active":
+                return state.fallback.active
+            cause = "ev" if key == "ev_hold" else "dispatch"
+            return any(hold.cause == cause for hold in state.holds)
         summary = self.coordinator.summary
         return self.entity_description.is_on_fn(summary) if summary else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
+        if self.local_authority:
+            state = self.coordinator.authority.state
+            if state is None:
+                return None
+            key = self.entity_description.key
+            if key == "fallback_active":
+                return {"causes": list(state.fallback.causes)}
+            if key == "ev_hold":
+                return {"cause": "ev"}
+            ends = [hold.trusted_end for hold in state.holds
+                    if hold.cause == "dispatch" and hold.trusted_end is not None]
+            return {"cause": "dispatch", "trusted_end": max(ends).isoformat() if ends else None}
         summary = self.coordinator.summary
         return self.entity_description.attributes_fn(summary) if summary else None
 

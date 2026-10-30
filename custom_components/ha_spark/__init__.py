@@ -3,7 +3,7 @@
 One config entry per site (ADR-0011), paired through Supervisor discovery. The
 heartbeat coordinator loads even with the add-on down and exposes site connectivity.
 New discovery reloads the entry, fencing off the old session's in-flight replies.
-Plan numbers are read-only sensors; mode, fallback and hold mirrors arrive later.
+Authority storage loads read-only; authority entities still use the add-on mirror.
 The optional Solcast service device is registered only while its key is configured.
 A configured topology starts an independent supply guard; no native writer is attached.
 """
@@ -36,6 +36,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     assert integration.version is not None
     coordinator = SparkCoordinator(hass, entry, integration.version)
     entry.runtime_data = coordinator
+    await coordinator.authority.async_load()
     if "topology_revision" in entry.options:
         topology = validate_topology(entry.options.get("topology"))
         if isinstance(topology, Topology):

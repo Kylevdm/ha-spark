@@ -19,6 +19,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from . import wire
+from .authority import AuthorityStore
 from .channel import Outcome, PollResult, async_poll
 from .const import DOMAIN
 from .topology import Topology, validate_topology
@@ -38,6 +39,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         super().__init__(hass, _LOGGER, config_entry=entry, name="ha-spark",
                          update_interval=timedelta(seconds=30))
         self.entry = entry
+        self.authority = AuthorityStore(hass, entry.entry_id, self.async_update_listeners)
         self.solcast: SolcastCoordinator | None = None
         self.guard: SupplyGuardLoop | None = None
         self.release_version = release_version
