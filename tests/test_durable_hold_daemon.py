@@ -24,6 +24,8 @@ from tests.test_scheduler import (
     _restore_schedule_confirmed,
 )
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 NOW = datetime(2026, 6, 10, 21, 0, tzinfo=UTC)
 
 

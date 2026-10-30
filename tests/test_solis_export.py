@@ -19,6 +19,8 @@ from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.ha.models import EntityState
 from tests.authority_helpers import legacy_settings as Settings
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 @pytest.fixture(autouse=True)
 def _skip_read_back_delays(monkeypatch: pytest.MonkeyPatch) -> None:

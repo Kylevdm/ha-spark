@@ -41,6 +41,8 @@ from tests.test_planner_limits import config, inputs
 from tests.test_scheduler import _AmpsDevice, _patch_run_once_io, _plan_at, entities_source
 from tests.test_solis_power_switch import FakeRest, _device
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 def _connection(cid: str = "grid") -> dict[str, object]:
     return {"id": cid, "supply_voltage_v": 240.0, "import_limit_a": 80.0,

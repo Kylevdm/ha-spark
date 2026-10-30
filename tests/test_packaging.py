@@ -143,7 +143,7 @@ def test_manifest_stays_a_bare_custom_integration() -> None:
     assert manifest["name"] == "ha-spark"
     assert manifest["config_flow"] is True
     assert manifest["iot_class"] == "local_polling"
-    assert manifest["requirements"] == []
+    assert manifest["requirements"] == ["pymodbus==3.13.1"]
     assert "single_config_entry" not in manifest
 
 

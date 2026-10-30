@@ -620,6 +620,7 @@ async def test_check_ha_websocket_unreachable_fails() -> None:
 
 # --- household clock and inverter clock (#161) ---
 
+HUB = "solis_control"  # the legacy overlay hub; empty by default from 0.31
 CLOCK = f"{HA}/api/states/sensor.solis_control_inverter_clock"
 
 
@@ -683,7 +684,7 @@ def _clock_face(offset: timedelta) -> str:
 @respx.mock
 async def test_check_inverter_clock_ok_within_tolerance() -> None:
     respx.get(CLOCK).mock(return_value=_clock_state(_clock_face(timedelta(seconds=35))))
-    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok"))
+    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok", solis_control_hub=HUB))
     assert res.status is Status.OK
     assert "35 s ahead" in res.detail
 
@@ -691,7 +692,7 @@ async def test_check_inverter_clock_ok_within_tolerance() -> None:
 @respx.mock
 async def test_check_inverter_clock_warns_above_tolerance() -> None:
     respx.get(CLOCK).mock(return_value=_clock_state(_clock_face(timedelta(minutes=-6))))
-    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok"))
+    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok", solis_control_hub=HUB))
     assert res.status is Status.WARN
     assert "6 min behind" in res.detail
     assert "sync-clock" in res.detail
@@ -700,7 +701,7 @@ async def test_check_inverter_clock_warns_above_tolerance() -> None:
 @respx.mock
 async def test_check_inverter_clock_fails_at_thirty_minutes() -> None:
     respx.get(CLOCK).mock(return_value=_clock_state(_clock_face(timedelta(hours=-1))))
-    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok"))
+    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok", solis_control_hub=HUB))
     assert res.status is Status.FAIL
     assert "60 min behind" in res.detail
 
@@ -710,7 +711,7 @@ async def test_check_inverter_clock_warns_when_stale() -> None:
     respx.get(CLOCK).mock(
         return_value=_clock_state(_clock_face(timedelta(0)), age=timedelta(minutes=5))
     )
-    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok"))
+    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok", solis_control_hub=HUB))
     assert res.status is Status.WARN
     assert "s old" in res.detail
 
@@ -718,7 +719,7 @@ async def test_check_inverter_clock_warns_when_stale() -> None:
 @respx.mock
 async def test_check_inverter_clock_warns_when_unreadable() -> None:
     respx.get(CLOCK).mock(return_value=_clock_state("unavailable"))
-    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok"))
+    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok", solis_control_hub=HUB))
     assert res.status is Status.WARN
     assert "unreadable" in res.detail
 
@@ -726,7 +727,7 @@ async def test_check_inverter_clock_warns_when_unreadable() -> None:
 @respx.mock
 async def test_check_inverter_clock_warns_when_the_entity_is_missing() -> None:
     respx.get(CLOCK).mock(return_value=httpx.Response(404))
-    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok"))
+    res = await check_inverter_clock(Settings(ha_url=HA, ha_token="tok", solis_control_hub=HUB))
     assert res.status is Status.WARN
     assert "overlay" in res.detail
 
@@ -738,7 +739,9 @@ def test_inverter_clock_failure_is_not_critical() -> None:
 @respx.mock
 async def test_check_inverter_clock_fails_at_thirty_minutes_whatever_the_tolerance() -> None:
     respx.get(CLOCK).mock(return_value=_clock_state(_clock_face(timedelta(minutes=30))))
-    settings = Settings(ha_url=HA, ha_token="tok", inverter_clock_tolerance_minutes=29.9)
+    settings = Settings(
+        ha_url=HA, ha_token="tok", solis_control_hub=HUB, inverter_clock_tolerance_minutes=29.9
+    )
     res = await check_inverter_clock(settings)
     assert res.status is Status.FAIL
 

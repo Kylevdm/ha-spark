@@ -462,6 +462,8 @@ fields, even across restarts or an older integration. An unreadable record
 after acceptance fails closed: *Planning limits are unavailable: the accepted
 topology record cannot be read.*, with no limit- or SoC-derived writes, no
 normal programming and no fallback current until the next valid snapshot.
+The daemon supply guard's only write there is a 0 A cut on fresh over-import
+against the legacy supply limit (see *Add-on daemon guard*).
 Out-of-range legacy settings similarly show *Planning limits are unavailable:
 the limit settings are outside the supported range.* (zero charge, no export).
 `health` **Topology** shows `legacy`, `native` or `unavailable`, with the
@@ -603,7 +605,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `inverter_power_switch_entity` | Inverter power switch `select` entity that the per-minute dispatch-hold check writes |
 | `ha_template_charge_needed_entity` | Optional HA template sensor; the plan report shows its value next to ha-spark's for comparison |
 | `inverter` | Which inverter ha-spark controls: `solis` (default) or `alphaess` |
-| `solis_control_hub` | Name of the HA `modbus:` overlay hub that ha-spark uses to write the Solis timed-slot registers (default `solis_control`; see [`docs/solis-control-modbus-overlay.yaml`](../docs/solis-control-modbus-overlay.yaml)) |
+| `solis_control_hub` | Name of the HA `modbus:` overlay hub that ha-spark uses to write the Solis timed-slot registers (empty by default from 0.31, which leaves the legacy Solis with no control path; see [`docs/solis-control-modbus-overlay.yaml`](../docs/solis-control-modbus-overlay.yaml) and [Solis control](#solis-control)) |
 | `solis_model_confirmed` | Boolean, default `false`. Owner confirmation that the inverter is the validated reference (33000 = `0x0026` AND 35000 = `0x2031`) when identity sensors cannot be read. Readable mismatches always override confirmation; V2 TOU (`33289 = 0xAA55`) is not validated. This setting grants no write authority |
 | `solis_modbus_slave` | Modbus slave/unit id on that hub (default `1`) |
 | `inverter_clock_tolerance_minutes` | How far the Solis inverter clock may drift from the household clock (`timezone`) before ha-spark refuses to arm an export window and `health` warns (default `5`). Fix drift with `python -m ha_spark solis sync-clock` |
@@ -641,6 +643,24 @@ them back through that hub's `sensor.solis_control_*` entities. Control does
 not depend on the solax integration. An add-on can't add `modbus:` entries to
 your `configuration.yaml`, so you add the overlay
 (`docs/solis-control-modbus-overlay.yaml`) once by hand.
+
+From 0.31 `solis_control_hub` is empty by default. An install that already
+used the old `solis_control` default keeps it: on the first 0.31 start, a
+configured legacy Solis without a saved hub gets `solis_control` written
+explicitly (one new revision, logged as `actor=migration`), so its control
+path doesn't change. Importing a settings export from before 0.31 that omits
+the hub does the same; 0.31 exports and `onboard --write` fragments always
+include `solis_control_hub`, so an empty hub stays empty. A hub you clear later
+stays clear.
+
+`ha-spark health` shows one **Solis transport** row per legacy Solis inverter.
+It's ok when every read-back sensor of the hub (`sensor.<hub>_timed_*` and
+`sensor.<hub>_work_mode_bitfield`) is readable, with a warning that Home
+Assistant 2027.10 removes YAML `modbus:` hubs. It fails with **overlay hub
+missing** (naming the first unreadable sensor) when the hub is set but a
+sensor is missing or unavailable, and with **no control path** when the hub
+is empty; the inverter clock check is then skipped. A failing row makes
+`health` exit 2 (degraded), not 1.
 
 Within one ha-spark process, actions on the same inverter bus are serialised
 from prerequisite reads through the final read-back. This includes plan and
@@ -841,6 +861,18 @@ it back toward the planned current as supply headroom returns.
 guard's writes follow the site operating mode and safety checks, as the plan's
 do. Leave `grid_power_entity` empty to turn this daemon guard off. For now it
 is the only guard that writes.
+
+While the accepted topology record is unreadable, the daemon guard uses
+`supply_max_current_a` at `supply_voltage_v` as its limit (both must be finite
+and positive, otherwise it writes nothing). It cuts the charge current to 0 A
+only while a fresh reading exceeds that limit: a finite value in W
+(`unit_of_measurement` `W`) whose `last_reported` is no more than 60 s old and
+no more than 5 s in the future. A missing, stale or future-dated reading, or one
+under the limit, writes nothing, and it never raises the current until the
+record is readable again. The cut still follows the operating mode and is read
+back. **Known gap:** an accepted native connection limit lower than
+`supply_max_current_a` isn't enforced while the record is unreadable; 0.30.0
+cut to 0 A whenever the record was unreadable.
 
 ### SoC integrity and fallback
 

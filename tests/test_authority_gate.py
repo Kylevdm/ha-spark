@@ -36,6 +36,8 @@ from tests.authority_helpers import run_daemon, seed_authority
 from tests.test_scheduler import _patch_loop
 from tests.test_solis_power_switch import FakeRest, _intent, _now, _window
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
