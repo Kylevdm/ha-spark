@@ -462,6 +462,8 @@ fields, even across restarts or an older integration. An unreadable record
 after acceptance fails closed: *Planning limits are unavailable: the accepted
 topology record cannot be read.*, with no limit- or SoC-derived writes, no
 normal programming and no fallback current until the next valid snapshot.
+The daemon supply guard's only write there is a 0 A cut on fresh over-import
+against the legacy supply limit (see *Add-on daemon guard*).
 Out-of-range legacy settings similarly show *Planning limits are unavailable:
 the limit settings are outside the supported range.* (zero charge, no export).
 `health` **Topology** shows `legacy`, `native` or `unavailable`, with the
@@ -841,6 +843,18 @@ it back toward the planned current as supply headroom returns.
 guard's writes follow the site operating mode and safety checks, as the plan's
 do. Leave `grid_power_entity` empty to turn this daemon guard off. For now it
 is the only guard that writes.
+
+While the accepted topology record is unreadable, the daemon guard uses
+`supply_max_current_a` at `supply_voltage_v` as its limit (both must be finite
+and positive, otherwise it writes nothing). It cuts the charge current to 0 A
+only while a fresh reading exceeds that limit: a finite value in W
+(`unit_of_measurement` `W`) whose `last_reported` is no more than 60 s old and
+no more than 5 s in the future. A missing, stale or future-dated reading, or one
+under the limit, writes nothing, and it never raises the current until the
+record is readable again. The cut still follows the operating mode and is read
+back. **Known gap:** an accepted native connection limit lower than
+`supply_max_current_a` isn't enforced while the record is unreadable; 0.30.0
+cut to 0 A whenever the record was unreadable.
 
 ### SoC integrity and fallback
 
