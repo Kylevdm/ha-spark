@@ -11,6 +11,8 @@ from ha_spark.config import Settings
 from ha_spark.devices import inverter_device
 from ha_spark.ha.rest import HomeAssistantRest
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 async def inspect(values, *, confirmed=False, driver="solis"):
     settings = Settings(

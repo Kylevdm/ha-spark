@@ -11,6 +11,8 @@ from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.readiness_ledger import ReadinessLedger, record_guard
 from tests.test_readiness_ledger import START, revision
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 @pytest.mark.parametrize("supply,valid,throttle,breach", [
     ("500", True, 1000, False),

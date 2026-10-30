@@ -14,6 +14,8 @@ from tests.test_mode_lifecycle import _hold
 from tests.test_optimise_lifecycle import wait_for
 from tests.test_solis_power_switch import _SWITCH, FakeRest, _options
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 @pytest.mark.parametrize("target", ["protect", "observe"])
 @respx.mock

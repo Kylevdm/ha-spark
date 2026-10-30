@@ -48,7 +48,8 @@ def test_legacy_fixture_seeds_equivalent_effective_settings(tmp_path, edited):
     expected = Settings(**(options | {"ha_url": "http://ha.test", "ha_token": "test"}))
     assert actual.model_dump() == expected.model_dump()
     document = json.loads((tmp_path / "ha_spark_config.json").read_text())
-    assert document["settings"] == (
+    # The 0.24 options carry the hub; with the empty 0.31 default it is now an input.
+    assert document["settings"] == {"solis_control_hub": "solis_control"} | (
         {"min_soc": 25, "inverter_power_switch_entity": "select.owner"} if edited else {}
     )
     assert CANARY not in json.dumps(document)

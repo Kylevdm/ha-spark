@@ -207,6 +207,46 @@ async def check_ha_timezone(settings: Settings) -> CheckResult:
     )
 
 
+_SOLIS_READBACK_FIELDS = (
+    "timed_charge_current",
+    "timed_discharge_current",
+    "work_mode_bitfield",
+    "timed_charge_start_hours",
+    "timed_charge_start_minutes",
+    "timed_charge_end_hours",
+    "timed_charge_end_minutes",
+    "timed_discharge_start_hours",
+    "timed_discharge_start_minutes",
+    "timed_discharge_end_hours",
+    "timed_discharge_end_minutes",
+)
+
+
+async def check_legacy_solis_transport(settings: Settings, device_id: str) -> CheckResult:
+    """The legacy overlay transport of one Solis inverter (#567); reads only.
+
+    Every read-back sensor the driver verifies a write against must be readable.
+    """
+    name = f"Solis transport ({device_id})"
+    if not settings.solis_control_hub:
+        return CheckResult(name, Status.FAIL, "no control path")
+    entity = ""
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            for field in _SOLIS_READBACK_FIELDS:
+                entity = f"sensor.{settings.solis_control_hub}_{field}"
+                if not math.isfinite(float((await rest.get_state(entity)).state)):
+                    raise ValueError
+    except Exception:  # noqa: BLE001 - untrusted states and HTTP failures degrade health
+        return CheckResult(name, Status.FAIL, f"overlay hub missing: {entity}")
+    return CheckResult(
+        name, Status.OK,
+        "overlay hub readable; warning: HA 2027.10 removes YAML modbus: hubs",
+    )
+
+
 async def check_inverter_clock(settings: Settings) -> CheckResult:
     """Compare the Solis inverter clock with the household clock (#161)."""
     entity = clock_entity(settings.solis_control_hub)
@@ -673,7 +713,16 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_export_event_provider(settings),
         check_ha_timezone(settings),
         *([check_ev_status(settings)] if settings.ev_status_entity else []),
-        *([check_inverter_clock(settings)] if settings.inverter == "solis" else []),
+        *(
+            check_legacy_solis_transport(settings, device.id)
+            for device in settings.devices
+            if device.type == "inverter" and device.driver == "solis"
+        ),
+        *(
+            [check_inverter_clock(settings)]
+            if settings.inverter == "solis" and settings.solis_control_hub
+            else []
+        ),
     )
     try:
         evidence = await check_evidence_freshness(settings)

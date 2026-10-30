@@ -605,7 +605,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `inverter_power_switch_entity` | Inverter power switch `select` entity that the per-minute dispatch-hold check writes |
 | `ha_template_charge_needed_entity` | Optional HA template sensor; the plan report shows its value next to ha-spark's for comparison |
 | `inverter` | Which inverter ha-spark controls: `solis` (default) or `alphaess` |
-| `solis_control_hub` | Name of the HA `modbus:` overlay hub that ha-spark uses to write the Solis timed-slot registers (default `solis_control`; see [`docs/solis-control-modbus-overlay.yaml`](../docs/solis-control-modbus-overlay.yaml)) |
+| `solis_control_hub` | Name of the HA `modbus:` overlay hub that ha-spark uses to write the Solis timed-slot registers (empty by default from 0.31, which leaves the legacy Solis with no control path; see [`docs/solis-control-modbus-overlay.yaml`](../docs/solis-control-modbus-overlay.yaml) and [Solis control](#solis-control)) |
 | `solis_model_confirmed` | Boolean, default `false`. Owner confirmation that the inverter is the validated reference (33000 = `0x0026` AND 35000 = `0x2031`) when identity sensors cannot be read. Readable mismatches always override confirmation; V2 TOU (`33289 = 0xAA55`) is not validated. This setting grants no write authority |
 | `solis_modbus_slave` | Modbus slave/unit id on that hub (default `1`) |
 | `inverter_clock_tolerance_minutes` | How far the Solis inverter clock may drift from the household clock (`timezone`) before ha-spark refuses to arm an export window and `health` warns (default `5`). Fix drift with `python -m ha_spark solis sync-clock` |
@@ -643,6 +643,24 @@ them back through that hub's `sensor.solis_control_*` entities. Control does
 not depend on the solax integration. An add-on can't add `modbus:` entries to
 your `configuration.yaml`, so you add the overlay
 (`docs/solis-control-modbus-overlay.yaml`) once by hand.
+
+From 0.31 `solis_control_hub` is empty by default. An install that already
+used the old `solis_control` default keeps it: on the first 0.31 start, a
+configured legacy Solis without a saved hub gets `solis_control` written
+explicitly (one new revision, logged as `actor=migration`), so its control
+path doesn't change. Importing a settings export from before 0.31 that omits
+the hub does the same; 0.31 exports and `onboard --write` fragments always
+include `solis_control_hub`, so an empty hub stays empty. A hub you clear later
+stays clear.
+
+`ha-spark health` shows one **Solis transport** row per legacy Solis inverter.
+It's ok when every read-back sensor of the hub (`sensor.<hub>_timed_*` and
+`sensor.<hub>_work_mode_bitfield`) is readable, with a warning that Home
+Assistant 2027.10 removes YAML `modbus:` hubs. It fails with **overlay hub
+missing** (naming the first unreadable sensor) when the hub is set but a
+sensor is missing or unavailable, and with **no control path** when the hub
+is empty; the inverter clock check is then skipped. A failing row makes
+`health` exit 2 (degraded), not 1.
 
 Within one ha-spark process, actions on the same inverter bus are serialised
 from prerequisite reads through the final read-back. This includes plan and
