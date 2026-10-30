@@ -1,8 +1,6 @@
 """Regression coverage for interrupted ownership commits and stale admissions."""
 
 import asyncio
-import json
-import shutil
 from copy import deepcopy
 from dataclasses import replace
 from typing import Any
@@ -10,9 +8,11 @@ from unittest.mock import patch
 
 import aiohttp
 import pytest
+from freezegun.api import FrozenDateTimeFactory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.storage import Store
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.test_util.aiohttp import (
     AiohttpClientMocker,
     AiohttpClientMockResponse,
@@ -24,7 +24,7 @@ from custom_components.ha_spark.const import DOMAIN
 from custom_components.ha_spark.diagnostics import async_get_config_entry_diagnostics
 from custom_components.ha_spark.ownership import OwnershipStore
 from tests_ha.test_ownership import hass_config_dir, hass_storage, peer  # noqa: F401
-from tests_ha.test_polling import URL, setup
+from tests_ha.test_polling import URL, fixture, setup
 from tests_ha.test_topology_flow import STORED_TOPOLOGY
 
 
@@ -260,13 +260,10 @@ async def test_confirmed_addon_with_restored_native_topology_reconciles(
     assert str(ownership.owner) == "integration" and authority.state is not None
 
 
-@pytest.mark.parametrize("reverse", [False, True])
-async def test_real_heartbeat_with_changed_peer_aborts_and_exposes_repair(
+async def pending_entry(
     hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, reverse: bool,
-) -> None:
-    # The HTTP mock is only a byte bridge between the separately pinned Python
-    # environments. The response is produced by the real FastAPI route, not a
-    # fabricated Summary, and parsed by the real channel and coordinator.
+) -> MockConfigEntry:
+    """Commit the topology change after the durable pending ownership step."""
     aioclient_mock.post(URL, exc=aiohttp.ClientError())
     entry = await setup(hass)
     coordinator = entry.runtime_data
@@ -283,26 +280,34 @@ async def test_real_heartbeat_with_changed_peer_aborts_and_exposes_repair(
         entry, options=entry.options | {"topology": topology, "topology_revision": 1},
     )
 
-    async def respond(_method: str, _url: Any, data: Any) -> AiohttpClientMockResponse:
-        python = shutil.which("python")
-        assert python is not None
-        process = await asyncio.create_subprocess_exec(
-            python, "-m", "tests.ownership_http_peer",
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        output, error = await process.communicate(json.dumps({
-            "snapshot": data, "mode": "optimise", "session_id": entry.data["session_id"],
-        }).encode())
-        assert process.returncode == 0, error.decode()
-        response = json.loads(output)
-        assert response["known"]
-        return AiohttpClientMockResponse(
-            "post", YarlURL(URL), status=response["status"], json=response["body"],
-        )
+    return entry
 
+
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_pending_heartbeat_snapshot_golden(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+    freezer: FrozenDateTimeFactory, reverse: bool,
+) -> None:
+    freezer.move_to("2026-10-24T12:00:00+00:00")
+    entry = await pending_entry(hass, aioclient_mock, reverse)
+    await entry.runtime_data.async_refresh()
+    direction = "addon" if reverse else "integration"
+    body = aioclient_mock.mock_calls[-1][2]
+    assert body == fixture(f"ownership_pending_{direction}")
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_real_heartbeat_with_changed_peer_aborts_and_exposes_repair(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+    freezer: FrozenDateTimeFactory, reverse: bool,
+) -> None:
+    freezer.move_to("2026-10-24T12:00:00+00:00")
+    entry = await pending_entry(hass, aioclient_mock, reverse)
+    coordinator = entry.runtime_data
+    ownership = coordinator.ownership
+    direction = "addon" if reverse else "integration"
     aioclient_mock.clear_requests()
-    aioclient_mock.post(URL, side_effect=respond)
+    aioclient_mock.post(URL, json=fixture(f"ownership_refused_{direction}"))
     await coordinator.async_refresh()
     assert coordinator.connected
     assert ownership.verified and ownership.owner == ("integration" if reverse else "addon")
@@ -312,6 +317,10 @@ async def test_real_heartbeat_with_changed_peer_aborts_and_exposes_repair(
     assert issue.translation_key == "ownership_observe_required"
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
     assert diagnostics["last_refusal"] == "ownership_observe_required"
+    # The abort is durable, not merely an in-memory repair.
+    restarted = OwnershipStore(hass, entry.entry_id, coordinator.authority)
+    await restarted.async_load()
+    assert restarted.verified and restarted.owner == ownership.owner
     # A later successful switch clears both the repair and diagnostic reason.
     assert await ownership.async_request("addon" if reverse else "integration", peer()) is None
     await ownership.async_advance(peer(active="active" if reverse else "retired"))
