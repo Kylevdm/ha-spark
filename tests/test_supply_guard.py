@@ -20,7 +20,7 @@ pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
 
 # Shared electrical model for the math tests: 240 V supply, 75 A limit ->
 # 18000 W ceiling. 51 V battery so watts <-> amps for the tick read-backs.
-_KW = dict(limit_a=75.0, supply_voltage_v=240.0)
+_KW = dict(limit_a=75.0, supply_voltage_v=240.0, one_way_charge_efficiency=1.0)
 
 
 def _guard_settings(**overrides: object) -> Settings:

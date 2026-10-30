@@ -389,6 +389,10 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
             probatio.Required(
                 "nominal_voltage_v", default=defaults.get("nominal_voltage_v")
             ): _NUMBER,
+            probatio.Required(
+                "one_way_charge_efficiency",
+                default=defaults.get("one_way_charge_efficiency", 0.949),
+            ): _NUMBER,
             probatio.Required("min_soc", default=defaults.get("min_soc")): _NUMBER,
             probatio.Required("target_cap", default=defaults.get("target_cap")): _NUMBER,
             probatio.Required("charge_limit_a", default=defaults.get("charge_limit_a", 0)): _NUMBER,

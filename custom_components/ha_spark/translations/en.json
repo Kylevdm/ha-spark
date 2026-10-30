@@ -186,6 +186,7 @@
           "connection_id": "Grid connection",
           "usable_capacity_kwh": "Usable capacity (kWh)",
           "nominal_voltage_v": "Nominal DC voltage (V)",
+          "one_way_charge_efficiency": "One-way charge efficiency (0–1)",
           "min_soc": "Minimum SoC (%)",
           "target_cap": "Target cap (%)",
           "charge_limit_a": "DC charge limit (A)",

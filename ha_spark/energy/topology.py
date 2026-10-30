@@ -55,6 +55,9 @@ class BatteryBank(FrozenModel):
     connection_id: SafeId
     usable_capacity_kwh: Annotated[float, Field(strict=True, gt=0, le=200, allow_inf_nan=False)]
     nominal_voltage_v: Annotated[float, Field(strict=True, ge=12, le=1000, allow_inf_nan=False)]
+    one_way_charge_efficiency: Annotated[
+        float, Field(strict=True, gt=0, le=1, allow_inf_nan=False)
+    ] = 0.949
     min_soc: Percent
     target_cap: Percent
     charge_limit_a: Current = 0
