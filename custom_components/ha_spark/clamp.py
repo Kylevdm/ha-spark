@@ -1,8 +1,8 @@
 """Final charge boundary for fake writers; no native hardware writer exists yet.
 
-Allowance watts / bank nominal volts follows the daemon guard's AC-equivalent
-conversion, without an efficiency term. Requests share the connection budget by
-power, then each bank's budget in proportion to its requested inverter currents.
+AC allowance is converted to DC using each bank's one-way charge efficiency.
+Requests share the connection budget by power, then each bank's budget in
+proportion to its requested inverter currents.
 The same lock must cover guard changes and clamp plus write; a queued apply can
 never undo an already accepted cut. This protocol is not command authentication.
 """
@@ -60,12 +60,17 @@ def clamp_intent(
         allowance = _current(allowance_kw)
         power = {
             b.id: sum(_current(last_requested_a.get(i.id, 0))
-                      for i in topology.inverters if i.bank_id == b.id) * b.nominal_voltage_v
+                      for i in topology.inverters if i.bank_id == b.id)
+            * b.nominal_voltage_v / b.one_way_charge_efficiency
             for b in topology.banks if b.connection_id == bank.connection_id
         }
         total = sum(power.values())
         share_kw = allowance * power[bank.id] / total if total > 0 else 0
-        ceiling = min(ceiling, share_kw * 1000 / bank.nominal_voltage_v * bank_share)
+        dc_a = (share_kw * 1000 * bank.one_way_charge_efficiency
+                / bank.nominal_voltage_v * bank_share)
+        # Tiny, valid efficiencies can overflow AC requests. Never let NaN
+        # discard a connection allowance through min(ceiling, NaN).
+        ceiling = min(ceiling, dc_a) if isfinite(total) and isfinite(dc_a) else 0
     current = charge_setpoint_a(min(requested, own, ceiling), inverter, limit)
     return replace(intent, charge_a=current) if current is not None else None
 

@@ -10,9 +10,10 @@ connection's), restoring toward the
 plan's target as headroom returns. Writes go through the active ``Charger``, so
 the operating-mode write gate, failure isolation, and read-back verification apply.
 
-Reasoning is in watts throughout: power balances directly across the AC<->DC
-inverter, so we never mix the battery's DC charge amps with the AC supply limit.
-The battery's contribution to the measured ``supply_w`` is its charge power, and
+Reasoning is in watts throughout: the AC allowance is converted to DC with the
+bank's one-way charge efficiency, independently of round-trip planner efficiency.
+The battery's contribution to the measured ``supply_w`` is conservatively its DC
+charge setpoint (never inflated to manufacture extra headroom), and
 the fuse ceiling is the connection's effective ``import_kw``; settings outside the
 topology envelope narrow it to zero.
 
@@ -74,17 +75,29 @@ def throttled_rate_w(
     *,
     limit_a: float,
     supply_voltage_v: float,
+    one_way_charge_efficiency: float = 0.949,
 ) -> float:
-    """Charge power (W) that fits the supply limit, capped at the target.
+    """DC charge power fitting the AC allowance, never wider than lossless maths.
 
-    Power balances directly DC<->AC, so we never mix DC amps with AC amps: the
-    measured draw includes the battery's own charging (~= its DC charge power),
-    so subtract it to get the other load, then grant the battery the remaining
-    headroom under ``limit_a * supply_voltage_v``.
+    Do not divide the resident DC setpoint by efficiency when subtracting it
+    from site import: that would widen the legacy allowance. A lossy restore
+    requires the full AC request plus deadband; efficiency 1 retains the legacy
+    behaviour exactly.
     """
+    eta = one_way_charge_efficiency
+    if not all(isfinite(v) for v in (
+        eta, supply_w, setpoint_w, target_w, limit_a, supply_voltage_v,
+    )) or not 0 < eta <= 1:
+        return 0.0
     other_load_w = supply_w - setpoint_w
-    limit_w = limit_a * supply_voltage_v
-    return max(0.0, min(target_w, limit_w - other_load_w))
+    headroom_w = limit_a * supply_voltage_v - other_load_w
+    if not isfinite(headroom_w):
+        return 0.0
+    available_w = max(0.0, headroom_w)
+    wanted_w = max(0.0, min(target_w, available_w * eta))
+    if eta < 1 and wanted_w > setpoint_w and available_w < target_w / eta + _MIN_DELTA_W:
+        return max(0.0, setpoint_w)
+    return wanted_w
 
 
 def _fresh_over_legacy_limit(
@@ -181,13 +194,26 @@ class SupplyGuard:
         limits = active_limits(s, self._execution)
         import_w = 0.0 if isinstance(limits, str) else limits[1].connections[0].import_kw * 1000
         voltage_v = 1.0 if isinstance(limits, str) else limits[0].connections[0].supply_voltage_v
+        selected = select_limits(self._execution.limits_record, s)
+        eta = (
+            selected.actuation.banks[0].one_way_charge_efficiency
+            if selected.actuation is not None else 0.949
+        )
         wanted_w = throttled_rate_w(
             supply_w,
             setpoint_w,
             target_w,
             limit_a=import_w / voltage_v,
             supply_voltage_v=voltage_v,
+            one_way_charge_efficiency=eta,
         )
         if abs(wanted_w - setpoint_w) < _MIN_DELTA_W:
-            return None
+            # Losses can require a real ceiling reduction even inside the old
+            # noise band. Keep eta=1's deadband behaviour exactly unchanged.
+            lossless_w = throttled_rate_w(
+                supply_w, setpoint_w, target_w, limit_a=import_w / voltage_v,
+                supply_voltage_v=voltage_v, one_way_charge_efficiency=1.0,
+            )
+            if not (wanted_w < setpoint_w and wanted_w < lossless_w):
+                return None
         return await self._charger.set_charge_rate(wanted_w)
