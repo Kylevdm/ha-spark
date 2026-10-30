@@ -61,7 +61,7 @@ async def test_power_report_crosses_snapshot(
 
 def test_maximum_v3_contract() -> None:
     body = fixture("site_snapshot_max")
-    assert len(json.dumps(body)) < 32 * 1024
+    assert len(json.dumps(body)) < 64 * 1024
     assert isinstance(validate_topology(body["topology"]["topology"]), Topology)
     parsed = wire.parse_summary(fixture("plan_summary"))
     assert parsed.household_timezone == "Europe/London"

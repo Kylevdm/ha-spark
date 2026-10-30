@@ -47,9 +47,12 @@ from ha_spark.api.contract import (
     link_view,
     major_load_observations,
     plan_summary,
+    snapshot_acceptable,
     version_refusal,
 )
 from ha_spark.api.history import bucket_starts, history_payload
+from ha_spark.api.site_pairing import load_pairing, save_pairing
+from ha_spark.api.snapshot_v4 import parse_snapshot_v4
 from ha_spark.api.static_assets import packaged_assets
 from ha_spark.api.timeline import household_midnight, timeline_payload
 from ha_spark.api.topology_intake import accept_topology, parse_major_loads, parse_supply_guard
@@ -731,7 +734,7 @@ def _has_origin(scope: Any) -> bool:
     return any(name.lower() == b"origin" for name, _ in scope.get("headers", []))
 
 
-_HEARTBEAT_MAX_BODY = 32 * 1024
+_HEARTBEAT_MAX_BODY = 64 * 1024
 # A body that never finishes must not hold the handler: bytes and time are both bounded.
 _HEARTBEAT_BODY_TIMEOUT_S = 5.0
 
@@ -782,6 +785,27 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
         except ValidationError:
             return invalid
         now = _heartbeat_now()
+        previous = state.integration_link
+        paired_site, pairing_ok = load_pairing(state.settings)
+        # An unreadable pairing record can't prove the site: closed for every version.
+        if not pairing_ok or not snapshot_acceptable(
+            previous, snapshot, now, paired_site=paired_site,
+        ):
+            return invalid
+        v4 = None
+        if version >= 4:
+            # Validate against the topology that would be accepted, before any disk save.
+            candidate, _ = accept_topology(
+                state.settings, previous.topology, payload.get("topology"), persist=False,
+            )
+            try:
+                v4 = parse_snapshot_v4(payload, candidate.topology)
+            except (ValidationError, ValueError, TypeError):
+                return invalid
+            if not snapshot_acceptable(previous, snapshot, now, paired_site=paired_site, v4=v4):
+                return invalid
+            if paired_site is None and not save_pairing(state.settings, snapshot.site_id):
+                return invalid
         # Missing v2 is a field-local schema violation, never a legacy fallback.
         raw = payload.get("solar_forecast", {}) if version >= 2 else None
         parsed = parse_native_forecast(raw, received_at=now)
@@ -792,11 +816,22 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
         readings, readings_reason = parse_major_loads(
             payload.get("major_loads") if version >= 3 else None, topology,
         )
-        guard, guard_reason = parse_supply_guard(
-            payload.get("supply_guard") if version >= 3 else None, topology,
-        )
+        guard_raw = payload.get("supply_guard") if version >= 3 else None
+        if version >= 4 and isinstance(guard_raw, dict):
+            connections = guard_raw.get("connections")
+            if isinstance(connections, list):
+                guard_raw = guard_raw | {"connections": [
+                    {key: value for key, value in c.items() if key != "writer"}
+                    if isinstance(c, dict) else c for c in connections
+                ]}
+        guard, guard_reason = parse_supply_guard(guard_raw, topology)
         state.integration_link = IntegrationLink(
             snapshot, now, False, parsed, topology, readings, guard, readings_reason, guard_reason,
+            v4=v4,
+            authority_identity=(v4.authority.store_identity if v4 and v4.authority
+                                else previous.authority_identity),
+            authority_epoch=(v4.authority.epoch if v4 and v4.authority
+                             else previous.authority_epoch),
         )
         # Planning inputs for the daemon and in-process agent previews (#542). A
         # changed record supersedes the limits any in-flight write was planned
@@ -822,7 +857,7 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
                     v2l.load_session(state.settings) if state.settings.v2l_power_entity else None
                 ),
                 settings=state.settings, authority=authority,
-                guard_limited=guard is not None and guard.limiting,
+                guard_limited=guard is not None and guard.limiting, topology=topology,
             ),
             headers={"Cache-Control": "no-store"},
         )
