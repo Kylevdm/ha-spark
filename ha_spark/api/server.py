@@ -56,7 +56,13 @@ from ha_spark.api.snapshot_v4 import parse_snapshot_v4
 from ha_spark.api.static_assets import packaged_assets
 from ha_spark.api.timeline import household_midnight, timeline_payload
 from ha_spark.api.topology_intake import accept_topology, parse_major_loads, parse_supply_guard
-from ha_spark.authority import OperatingMode, authority_view, load_authority
+from ha_spark.authority import (
+    AuthorityStore,
+    OperatingMode,
+    authority_view,
+    load_authority,
+    retirement_status,
+)
 from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import CONFIGURATION_REPAIR, DaemonChannel
 from ha_spark.devices.execution import execution_context
@@ -793,6 +799,7 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
         ):
             return invalid
         v4 = None
+        handshake_failed = False
         if version >= 4:
             # Validate against the topology that would be accepted, before any disk save.
             candidate, _ = accept_topology(
@@ -804,8 +811,25 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
                 return invalid
             if not snapshot_acceptable(previous, snapshot, now, paired_site=paired_site, v4=v4):
                 return invalid
+            store = execution_context().authority or AuthorityStore(state.settings)
+            if v4.owner == "integration" and retirement_status(state.settings) != "retired":
+                return invalid
+            pending = v4.owner in ("pending_integration", "pending_addon")
+            if pending:
+                native = (candidate.topology is not None and bool(candidate.topology.inverters)
+                          and all(i.transport == "native" for i in candidate.topology.inverters))
+                if (v4.owner == "pending_integration" and not native
+                        or v4.owner == "pending_addon" and native):
+                    return invalid
             if paired_site is None and not save_pairing(state.settings, snapshot.site_id):
                 return invalid
+            if pending and store.can_handover(v4.owner):
+                # A lost admission condition is not malformed: report the real
+                # authority so the integration can durably withdraw its request.
+                # Persistence failures never acknowledge the handshake.
+                handshake_failed = store.handover(v4.owner) is None
+            elif v4.owner == "addon":
+                store.handover("addon")
         # Missing v2 is a field-local schema violation, never a legacy fallback.
         raw = payload.get("solar_forecast", {}) if version >= 2 else None
         parsed = parse_native_forecast(raw, received_at=now)
@@ -848,19 +872,20 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
         else:
             loaded = load_authority(state.settings)
             authority = AuthorityInputs(loaded.state, loaded.status == "known", False)
-        return JSONResponse(
-            plan_summary(
-                api_version=version, session_id=integration.session_id,
-                built_at=now, loop_tick=state.loop_tick,
-                plan=state.plan, plan_at=state.plan_at, soc_observation_ok=state.soc_observation_ok,
-                session=(
-                    v2l.load_session(state.settings) if state.settings.v2l_power_entity else None
-                ),
-                settings=state.settings, authority=authority,
-                guard_limited=guard is not None and guard.limiting, topology=topology,
-            ),
-            headers={"Cache-Control": "no-store"},
+        summary = plan_summary(
+            api_version=version, session_id=integration.session_id,
+            built_at=now, loop_tick=state.loop_tick,
+            plan=state.plan, plan_at=state.plan_at, soc_observation_ok=state.soc_observation_ok,
+            session=(v2l.load_session(state.settings) if state.settings.v2l_power_entity else None),
+            settings=state.settings, authority=authority,
+            guard_limited=guard is not None and guard.limiting, topology=topology,
         )
+        if handshake_failed:
+            summary["addon_authority"] = {
+                "active": "active", "mode": "authority_unknown", "holds_present": False,
+                "store_state": "save_failed",
+            }
+        return JSONResponse(summary, headers={"Cache-Control": "no-store"})
 
     return app
 

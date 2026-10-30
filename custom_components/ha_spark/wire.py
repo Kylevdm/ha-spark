@@ -170,6 +170,17 @@ def build_snapshot(
     if api_version >= 2:
         result["solar_forecast"] = solar_forecast
     if api_version >= 3:
+        if api_version == 3 and isinstance(topology, dict):
+            document = topology.get("topology")
+            if isinstance(document, dict) and isinstance(document.get("inverters"), list):
+                # Old receivers reject unknown topology fields. Transport is a
+                # v4 handshake input, never an implicit upgrade of a v3 peer.
+                topology = topology | {"topology": document | {"inverters": [
+                    {key: value for key, value in inverter.items()
+                     if key not in {"transport", "gateway_host", "gateway_port", "gateway_unit_id"}}
+                    if isinstance(inverter, dict) else inverter
+                    for inverter in document["inverters"]
+                ]}}
         result["topology"] = topology
         result["major_loads"] = major_loads
         if supply_guard is not None:

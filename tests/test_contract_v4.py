@@ -49,6 +49,22 @@ def client(state):
         yield client
 
 
+@pytest.fixture
+def retired_addon(state, tmp_path, monkeypatch):
+    """Integration-owned intake requires the completed add-on retirement step."""
+    monkeypatch.setattr("ha_spark.authority.resolve_data_dir", lambda _: tmp_path)
+    store = AuthorityStore(state.settings)
+    store.initialise()
+    assert store.handover("pending_integration") == "retired"
+    context = execution_context()
+    previous = context.authority
+    context.authority = store
+    try:
+        yield store
+    finally:
+        context.authority = previous
+
+
 def post(client, body):
     return client.post("/integration/heartbeat", json=body)
 
@@ -199,6 +215,7 @@ def test_v4_summary_addon_facts(state, monkeypatch, tmp_path, known, save_failed
     assert "addon_authority" not in legacy
 
 
+@pytest.mark.usefixtures("retired_addon")
 def test_epoch_monotonic_within_store_identity(client, state):
     body = fixture("site_snapshot_v4_max")
     assert post(client, body).status_code == 200
@@ -211,6 +228,7 @@ def test_epoch_monotonic_within_store_identity(client, state):
     assert state.integration_link.authority_epoch == 41
 
 
+@pytest.mark.usefixtures("retired_addon")
 def test_field_local_v4_failures(client, state):
     body = fixture("site_snapshot_v4_max")
     body["evidence"] = {"ev_status": "SECRET"}
@@ -234,6 +252,7 @@ def test_addon_owner_ignores_remote_authority_holds_export(client, state):
     assert v4.authority is None and v4.holds == () and v4.export == ()
 
 
+@pytest.mark.usefixtures("retired_addon")
 def test_max_v4_fits_and_is_accepted(client, state):
     body = fixture("site_snapshot_v4_max")
     compact = json.dumps(body, separators=(",", ":")).encode()
@@ -253,6 +272,7 @@ def test_invalid_native_timestamp_rejects(client, bad_time):
     assert post(client, body).status_code == 400
 
 
+@pytest.mark.usefixtures("retired_addon")
 def test_incomplete_trusted_soc_is_untrusted(client, state):
     body = fixture("site_snapshot_v4_max")
     body["banks"][0]["soc"]["value"] = None
@@ -277,6 +297,34 @@ def test_addon_owner_invalid_devices_drop_only_the_block(client, state, devices)
     assert v4.devices == () and v4.devices_reason == "invalid_devices"
 
 
+def test_integration_snapshot_without_retirement_rejects_without_mutation(
+    client, state, tmp_path, monkeypatch,
+):
+    monkeypatch.setattr("ha_spark.authority.resolve_data_dir", lambda _: tmp_path)
+    store = AuthorityStore(state.settings)
+    store.initialise()
+    context = execution_context()
+    previous = context.authority
+    context.authority = store
+    try:
+        before = state.integration_link
+        limits = context.limits_record
+        stored = load_authority(state.settings)
+        files = {path: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()}
+        response = post(client, fixture("site_snapshot_v4_max"))
+        assert response.status_code == 400
+        assert response.json() == {"error": "invalid heartbeat"}
+        assert state.integration_link is before
+        assert context.limits_record is limits
+        assert context.authority is store and store.known
+        assert load_authority(state.settings) == stored
+        assert site_pairing.load_pairing(state.settings) == (None, True)
+        assert {path: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()} == files
+    finally:
+        context.authority = previous
+
+
+@pytest.mark.usefixtures("retired_addon")
 def test_integration_owned_snapshot_grants_nothing(client, state):
     mirror = post(client, fixture()).json()["authority"]
     authority = execution_context().authority

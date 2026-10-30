@@ -21,12 +21,22 @@ from homeassistant.util import dt as dt_util
 from .authority_store import AuthorityMarker, AuthorityState
 from .const import DOMAIN
 
-StoreStatus = Literal["uninitialised", "ok", "unknown", "save_failed"]
+StoreStatus = Literal["uninitialised", "ok", "unknown", "save_failed", "retired"]
 
 
-def authority_owner(entry: ConfigEntry[Any]) -> Literal["addon", "integration"]:
-    """Until the durable handshake lands, the add-on is always the authority."""
-    return "addon"
+def authority_owner(
+    entry: ConfigEntry[Any],
+) -> Literal["addon", "pending_integration", "integration", "pending_addon"]:
+    """Confirmed durable ownership, never merely the topology's requested owner."""
+    ownership = getattr(getattr(entry, "runtime_data", None), "ownership", None)
+    if ownership is None:
+        return "addon"
+    if not ownership.verified or ownership.reconcile:
+        return "pending_integration"
+    if ownership.owner == "integration" and ownership.authority.state is None:
+        return "pending_integration"
+    owner: Literal["addon", "pending_integration", "integration", "pending_addon"] = ownership.owner
+    return owner
 
 
 class AuthorityStore:
@@ -67,6 +77,10 @@ class AuthorityStore:
             ir.async_delete_issue(self._hass, DOMAIN, self.issue_id)
         self._changed()
 
+    def publish_save_failed(self) -> None:
+        """Fence authority when an associated ownership commit is unverified."""
+        self._publish("save_failed")
+
     async def _read(self) -> tuple[StoreStatus, AuthorityState | None]:
         try:
             def evidence() -> bool:
@@ -99,6 +113,9 @@ class AuthorityStore:
             if not isinstance(raw, dict) or raw.keys() != AuthorityState.model_fields.keys():
                 return "unknown", None
             state = AuthorityState.model_validate(raw)
+            if marker_raw == {"schema_version": 1, "store_id": str(state.store_id),
+                              "retired": True}:
+                return "retired", None
             marker = AuthorityMarker.model_validate(marker_raw)
             if marker.store_id == state.store_id:
                 return "ok", state
@@ -164,14 +181,42 @@ class AuthorityStore:
         """Explicit fresh handshake entry point; never repair damaged authority."""
         async with self._lock:
             status, _ = await self._read()
-            if status != "uninitialised" or self.status == "save_failed":
+            if status not in ("uninitialised", "retired") or self.status == "save_failed":
                 return False
             return await self._fresh_observe("system")
+
+    async def async_retire(self) -> bool:
+        """Invalidate the marker after an Observe-only rollback; verify before ack."""
+        async with self._lock:
+            status, state = await self._read()
+            if status == "retired":
+                return True
+            if (status != "ok" or self.status == "save_failed" or state is None
+                    or state.committed_mode != "observe" or state.holds
+                    or state.transition is not None or state.manual_session is not None):
+                return False
+            try:
+                await self.marker.async_save({"schema_version": 1,
+                                              "store_id": str(state.store_id), "retired": True})
+                loaded, _ = await self._read()
+                if loaded != "retired":
+                    self._publish("save_failed")
+                    return False
+            except asyncio.CancelledError:
+                self._publish("save_failed")
+                raise
+            except Exception:
+                self._publish("save_failed")
+                return False
+            self._publish("retired")
+            return True
 
     async def async_confirm_observe(self) -> bool:
         """Recover unknown authority with a new identity and no other effects."""
         async with self._lock:
             status, _ = await self._read()
+            if status == "retired":
+                return False
             if status == "ok" and self.status != "save_failed":
                 return False
             if status == "uninitialised" and self.status != "save_failed":
