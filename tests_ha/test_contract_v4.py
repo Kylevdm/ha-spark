@@ -27,8 +27,9 @@ def test_command_golden(kind: str) -> None:
     assert len(reply.model_dump_json().encode()) < 65536
 
 
-def test_command_result_and_fetch_golden() -> None:
-    result = fixture("command_result")
+@pytest.mark.parametrize("name", ["command_result", "command_result_apply"])
+def test_command_result_and_fetch_golden(name: str) -> None:
+    result = fixture(name)
     assert CommandResult.model_validate(result).model_dump() == result
     request = fixture("command_fetch")
     assert FetchRequest.model_validate(request).model_dump() == request

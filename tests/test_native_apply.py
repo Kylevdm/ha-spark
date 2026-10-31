@@ -55,6 +55,53 @@ async def test_timeout_does_not_stack_apply(monkeypatch):
     assert len(queue.pending) == 1
 
 
+def test_per_intent_results_map_independently():
+    import json
+    from pathlib import Path
+
+    result = CommandResult.model_validate(json.loads((
+        Path(__file__).parent / "fixtures/contract/command_result_apply.json"
+    ).read_text()))
+    lines = result_lines(result, 3)
+    assert [line.outcome for line in lines] == [
+        ActionOutcome.VERIFIED, ActionOutcome.UNCHANGED_VERIFIED, ActionOutcome.REFUSED,
+    ]
+    assert "not_available" in lines[-1]
+
+
+async def test_per_intent_stale_refusal_replans_once(monkeypatch):
+    from ha_spark.api.commands import IntentResult
+
+    queue = CommandQueue("session")
+    apply = NativeApply(queue)
+    result = CommandResult(session_id="session", sequence=1, outcome="refused",
+                           reason="not_available", intents=[
+                               IntentResult(outcome="refused", reason="not_available"),
+                               IntentResult(outcome="refused", reason="stale_epoch"),
+                           ])
+
+    async def wait(sequence):
+        queue.results[sequence] = result
+        return result
+
+    monkeypatch.setattr(queue, "wait", wait)
+    await apply.send([{"kind": "charge_current_limit"}], epoch=1)
+    assert apply.stale_authority
+    assert not apply.consume_stale_refusal(1)
+    assert apply.consume_stale_refusal(2)
+    assert not apply.consume_stale_refusal(2)
+
+
+def test_per_intent_length_mismatch_is_failure():
+    from ha_spark.api.commands import IntentResult
+
+    result = CommandResult(session_id="s", sequence=1, outcome="applied",
+                           intents=[IntentResult(outcome="applied", written_a=10.0)])
+    for count in (2, 0):
+        assert all(line.outcome == ActionOutcome.FAILED for line in result_lines(result, count))
+    assert len(result_lines(result, 2)) == 2
+
+
 def test_no_result_is_failure():
     assert result_lines(None, 1)[0].outcome == ActionOutcome.FAILED
 
