@@ -104,6 +104,10 @@
     },
     "sensor": {
       "native_bank_soc": {"name": "SoC"},
+      "native_bank_soc_trust": {
+        "name": "SoC trust",
+        "state": {"trusted": "Trusted", "untrusted": "Untrusted", "recovering": "Recovering"}
+      },
       "input_33000_identity": {"name": "Identity"},
       "native_register": {"name": "Register {address}"},
       "input_33029": {"name": "PV total energy"},
@@ -225,6 +229,7 @@
   "options": {
     "error": {
       "invalid_manual_time": "Enter a valid HH:MM deadline and household time zone.",
+      "invalid_soc_policy": "Enter a positive finite report age and whole-number failure and recovery settings of at least one.",
       "invalid_number": "Enter a finite number.",
       "out_of_range": "Enter a number in the valid range for this field.",
       "invalid_id": "Use 1-64 letters, numbers, underscores or hyphens.",
@@ -260,7 +265,17 @@
         "menu_options": {
           "solcast": "Solcast daily allowance",
           "manual": "Manual control deadline",
+          "soc": "Native SoC trust policy",
           "topology": "Site topology and limits"
+        }
+      },
+      "soc": {
+        "title": "Native SoC trust policy",
+        "description": "Recovery requires continuous passing native observations. Saving restarts recovery progress.",
+        "data": {
+          "soc_max_report_age_minutes": "Maximum report age (minutes)",
+          "soc_failure_threshold": "Consecutive failures before fallback",
+          "soc_recovery_minutes": "Continuous recovery (minutes)"
         }
       },
       "manual": {
