@@ -174,6 +174,16 @@ class PymodbusTcpTransport:
         self._last_end: float | None = None
         self._connection = 0
 
+    @property
+    def connected(self) -> bool:
+        """Read-only connectivity; never a write permission."""
+        return not self._closed and self._client.connected
+
+    @property
+    def connection_epoch(self) -> int:
+        """Changes after every successful connection, invalidating validation."""
+        return self._connection
+
     async def _start(self) -> None:
         async with self._start_lock:
             if self._worker is not None or self._closed:

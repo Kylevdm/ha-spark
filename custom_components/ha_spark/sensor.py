@@ -24,6 +24,7 @@ from .const import DOMAIN
 from .coordinator import SparkCoordinator
 from .entity import SparkEntity, async_clear_unregistered_state
 from .guard_loop import SupplyGuardLoop
+from .native_gateway import GatewayCaching, gateways
 from .solcast_coordinator import SolcastCoordinator
 from .wire import Summary
 
@@ -185,6 +186,8 @@ async def async_setup_entry(
         cls = LastRun if description.key == "last_run" else SparkSensor
         entities.append(cls(entry.runtime_data, description))
     async_add_entities(entities)
+    async_add_entities(GatewayCaching(entry.runtime_data, i, "gateway_caching")
+                       for i in gateways(entry.runtime_data))
     if entry.runtime_data.guard is not None:
         async_add_entities(
             SupplyGuardSensor(entry.runtime_data, entry.runtime_data.guard, description)

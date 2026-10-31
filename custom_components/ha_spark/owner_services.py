@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from . import SparkConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
-SERVICES = ("set_observe", "start_manual_control", "resume_control")
+SERVICES = ("set_observe", "start_manual_control", "resume_control", "reprobe")
 
 
 def async_register(hass: HomeAssistant) -> None:
@@ -34,6 +34,12 @@ def async_register(hass: HomeAssistant) -> None:
                 translation_domain=DOMAIN, translation_key="authority_unknown",
             )
         entry: SparkConfigEntry = entries[0]
+        if call.service == "reprobe":
+            if not await entry.runtime_data.async_reprobe(call.data["inverter_id"]):
+                raise ServiceValidationError(
+                    translation_domain=DOMAIN, translation_key="native_device_missing",
+                )
+            return {}
         control = entry.runtime_data.control
         target = {"set_observe": "observe", "start_manual_control": "manual",
                   "resume_control": "resume"}[call.service]
@@ -69,6 +75,8 @@ def async_register(hass: HomeAssistant) -> None:
 
     for service in SERVICES:
         schema = vol.Schema({})
+        if service == "reprobe":
+            schema = vol.Schema({vol.Required("inverter_id"): str})
         if service == "start_manual_control":
             schema = vol.Schema({
                 vol.Optional("duration", default="one_hour"): vol.In(
