@@ -219,6 +219,8 @@ require a second independent source.
 
 ## Cutover runbook
 
+Amended by [ADR-0012](0012-native-modbus-replaces-the-overlay-hub.md): native Solis uses the integration connection, not the overlay-install step below.
+
 A human carries this out in Home Assistant. ha-spark never enables or disables
 Home Assistant automations itself; that stays with the operator.
 

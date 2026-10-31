@@ -683,6 +683,40 @@ async def check_limits(settings: Settings) -> CheckResult:
     )
 
 
+async def check_native_solis_transports(
+    settings: Settings, inverter_ids: tuple[str, ...],
+) -> list[CheckResult]:
+    """Read validation for all native inverters in one read-only daemon request."""
+    if not inverter_ids:
+        return []
+    view: dict[str, object] | None = None
+    try:
+        reply = await submit_socket(settings, "integration_link")
+        if reply is not None and reply.error is None:
+            view = reply.integration_link
+    except OSError:
+        pass
+    devices = view.get("devices") if view is not None else None
+    results = []
+    for inverter_id in inverter_ids:
+        status, detail = Status.WARN, "validation unknown"
+        if settings.solis_control_hub:
+            status, detail = Status.FAIL, "inconsistent"
+        elif view is not None and view.get("state") == "connected" and isinstance(devices, list):
+            matches = [d for d in devices if isinstance(d, dict) and d.get("id") == inverter_id]
+            if len(matches) == 1 and matches[0].get("transport") == "native":
+                device = matches[0]
+                if device.get("validation") == "validated" and device.get("reason") is None:
+                    status, detail = Status.OK, "validated"
+                elif device.get("validation") == "read_only" and device.get("reason") in (
+                    "unvalidated_identity", "identity_read_failed", "v2_tou_firmware",
+                    "caching_on", "gateway_not_owned", "unreachable",
+                ):
+                    detail = str(device["reason"])
+        results.append(CheckResult(f"Solis transport ({inverter_id})", status, detail))
+    return results
+
+
 async def check_topology_record(settings: Settings) -> CheckResult:
     """Read the same durable acceptance record as daemon, CLI and agent previews."""
     loaded = load_topology_record(settings)
@@ -697,6 +731,11 @@ async def check_topology_record(settings: Settings) -> CheckResult:
 
 async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
+    loaded = load_topology_record(settings)
+    native_ids = tuple(
+        inv.id for inv in loaded.topology.inverters if inv.transport == "native"
+    ) if loaded.topology is not None else ()
+    native_rows = await check_native_solis_transports(settings, native_ids) if native_ids else []
     results = await asyncio.gather(
         check_operating_mode(settings),
         check_integration_link(settings),
@@ -717,6 +756,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
             check_legacy_solis_transport(settings, device.id)
             for device in settings.devices
             if device.type == "inverter" and device.driver == "solis"
+            and device.id not in native_ids
         ),
         *(
             [check_inverter_clock(settings)]
@@ -730,7 +770,8 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         evidence = [CheckResult(
             "Evidence freshness", Status.WARN, f"could not read ({type(exc).__name__})"
         )]
-    return [*results, check_entity_config(settings), *check_hold_release(settings), *evidence]
+    return [*results, *native_rows, check_entity_config(settings),
+            *check_hold_release(settings), *evidence]
 
 
 async def run_repair_health(bootstrap: Settings, reasons: list[str]) -> list[CheckResult]:

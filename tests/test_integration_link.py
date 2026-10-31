@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from ha_spark import cli, health
 from ha_spark.api.contract import IntegrationLink, SiteSnapshot, link_view
 from ha_spark.api.server import AppState, build_app
+from ha_spark.api.snapshot_v4 import Device, SnapshotV4
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import DaemonChannel, Reply, submit_socket
 from ha_spark.integration_discovery import IntegrationDiscovery
@@ -19,7 +20,7 @@ from tests.api_helpers import owner_client
 NOW = datetime(2026, 10, 24, 12, tzinfo=UTC)
 KEYS = {"state", "site_id", "integration_release_version", "api_version", "sent_at",
         "snapshot_age_s", "solar_source", "topology_source", "topology_revision",
-        "topology_reason", "major_loads_reason", "supply_guard_reason"}
+        "topology_reason", "major_loads_reason", "supply_guard_reason", "devices"}
 TOKEN = "TOKEN-CANARY-480"
 SESSION = "SESSION-CANARY-480"
 
@@ -48,6 +49,7 @@ def test_link_view(age: int | None, skew: bool, expected: str) -> None:
         "topology_reason": None,
         "major_loads_reason": None,
         "supply_guard_reason": None,
+        "devices": None,
         "state": expected,
         "site_id": snapshot().site_id if age is not None else None,
         "integration_release_version": "0.25.0" if age is not None else None,
@@ -57,6 +59,20 @@ def test_link_view(age: int | None, skew: bool, expected: str) -> None:
     }
     assert set(view) == KEYS
     assert TOKEN not in json.dumps(view) and SESSION not in json.dumps(view)
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_link_view_native_devices_allowlist(invalid: bool) -> None:
+    device = Device(id="main", transport="native", validation="validated",
+                    capabilities=("canary",))
+    link = IntegrationLink(snapshot(), NOW, False, v4=SnapshotV4(
+        owner="addon", devices=(device,), devices_reason="invalid_devices" if invalid else None,
+    ))
+    view = link_view(link, NOW)
+    assert view["devices"] == (None if invalid else [{
+        "id": "main", "transport": "native", "validation": "validated", "reason": None,
+    }])
+    assert "canary" not in json.dumps(view)
 
 
 @pytest.mark.parametrize("repair", [False, True])
