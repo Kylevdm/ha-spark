@@ -13,6 +13,7 @@ from math import isfinite
 from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
+from ha_spark.authority import retirement_status
 from ha_spark.config import Settings
 from ha_spark.energy.axle import AxleApiError, read_axle_event
 from ha_spark.energy.dispatch_evidence import (
@@ -39,7 +40,7 @@ from ha_spark.energy.octopus import (
     fetch_planned_dispatches,
     fetch_standard_unit_rates,
 )
-from ha_spark.energy.soc_integrity import SocMeasurement
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import observe_soc
 from ha_spark.energy.solar import distribute_solar
 from ha_spark.energy.solar_source import SolarSource
@@ -679,6 +680,9 @@ async def gather_inputs(
             log.warning("Could not read %s (%s)", entity_id, exc)
             return None
 
+    if soc is None and retirement_status(settings) is not None:
+        # Integration-owned: SoC comes only from the snapshot; never a REST substitute.
+        soc = SocMeasurement(SocStatus.UNAVAILABLE, datetime.now(UTC))
     soc_measurement = soc if soc is not None else await observe_soc(settings, rest)
     if not soc_measurement.ok:
         log.warning("SoC measurement failed integrity check: %s", soc_measurement.reason)

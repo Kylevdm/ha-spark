@@ -20,7 +20,7 @@ from pathlib import Path
 import aiosqlite
 from pydantic import ValidationError
 
-from ha_spark.authority import load_authority
+from ha_spark.authority import load_authority, retirement_status
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import submit_socket
 from ha_spark.devices.inverters.solis_clock import (
@@ -482,6 +482,11 @@ async def check_operating_mode(settings: Settings) -> CheckResult:
             return CheckResult("Operating mode", Status.FAIL, "authority_unknown")
         if reply.authority.get("suspended"):
             return CheckResult("Operating mode", Status.FAIL, "suspended: configuration_repair")
+        if reply.authority.get("authority_owner") == "integration":
+            mode = reply.authority.get("mode")
+            if mode in ("observe", "protect", "optimise"):
+                return CheckResult("Operating mode", Status.OK, f"integration: {mode}")
+            return CheckResult("Operating mode", Status.FAIL, "integration authority unavailable")
     if result.status == "uninitialised":
         # No daemon of this version has started yet; nothing can write either way.
         return CheckResult("Operating mode", Status.WARN, "uninitialised (daemon not yet started)")
@@ -537,6 +542,30 @@ async def check_integration_link(settings: Settings) -> CheckResult:
             detail += f"; fetch age {fetch_age}s"
     return CheckResult(
         "Integration link", Status.OK if state == "connected" else Status.WARN, detail,
+    )
+
+
+async def check_authority_owner(settings: Settings) -> CheckResult:
+    """Allowlisted owner, handshake and freshness diagnostics; never a permission."""
+    try:
+        reply = await submit_socket(settings, "integration_link")
+    except OSError:
+        reply = None
+    view = reply.integration_link if reply is not None and reply.error is None else None
+    owner = view.get("authority_owner") if view is not None else None
+    retired = retirement_status(settings)
+    if retired is not None and owner in (None, "addon"):
+        # The durable marker, not a missing or stale snapshot, says who owns the site.
+        owner = "integration" if retired == "retired" else "pending_addon"
+    if owner not in ("addon", "integration", "pending_integration", "pending_addon"):
+        return CheckResult("Authority owner", Status.WARN, "unknown; snapshot unavailable")
+    state = view.get("state") if view is not None else None
+    fresh = state == "connected"
+    pending = owner in ("pending_integration", "pending_addon")
+    return CheckResult(
+        "Authority owner", Status.OK if fresh and not pending else Status.WARN,
+        f"{owner}; handshake {'pending' if pending else 'settled'}; "
+        f"snapshot {'fresh' if fresh else 'unavailable'}",
     )
 
 
@@ -739,6 +768,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
     results = await asyncio.gather(
         check_operating_mode(settings),
         check_integration_link(settings),
+        check_authority_owner(settings),
         check_ha_rest(settings),
         *([check_notify_service(settings)] if settings.notify_service else []),
         check_ha_websocket(settings),
