@@ -53,6 +53,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
 
     entry.async_on_unload(async_track_time_interval(hass, native_tick, timedelta(seconds=30)))
 
+    async def native_poll(now: datetime) -> None:
+        await coordinator.native.async_poll(now)
+
+    entry.async_on_unload(async_track_time_interval(hass, native_poll, timedelta(seconds=1)))
+
     async def authority_tick(now: datetime) -> None:
         zone = coordinator.control.household_zone() or ZoneInfo("UTC")
         await coordinator.control.async_expire(now=now, zone=zone)

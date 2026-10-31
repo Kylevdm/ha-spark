@@ -103,6 +103,15 @@ class FakeSolisDevice:
         self.set_input(33289, [tou])
         self.set_input(34502, [dispatch])
 
+    def set_read_frames(self) -> None:
+        """Populate all #575 polling frames without touching identity or its serial."""
+        from custom_components.ha_spark.solis_frames import FRAMES
+
+        for frame in FRAMES:
+            setter = self.set_input if frame.bank == "input" else self.set_holding
+            setter(frame.address, [0] * frame.count)
+        self.set_input(33022, [26, 10, 30, 12, 0, 0])
+
     def inject_write_fault(
         self, fault: WriteFault, *, address: int | None = None, times: int = 1
     ) -> None:

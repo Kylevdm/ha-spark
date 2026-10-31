@@ -342,6 +342,83 @@ the test also has to settle the ordering variance (#249 §2b).
   carry over, but entity-id continuity (§2d) must be planned against the
   solax ids.
 
+## Native phase 8 normative read table (#575)
+
+The #563 owner ruling adopts the following tier A table from
+`hybrid_sensors.py` at **98ef3cd** (source B above). This section is normative
+for the native read surface; the historical inventory above is not a polling
+configuration. All pairs are **high word first**. U32 is unsigned; S32/S16
+use two's complement. Energy has device class `energy`, unit kWh and state
+class `total_increasing`, including today/yesterday counters that reset at
+inverter midnight. Power has class `power`, unit W and state class
+`measurement`; voltage/current have class `voltage`/`current`, V/A and
+`measurement`.
+
+| Input register(s) | Entity | Decode / multiplier | Unit |
+|---|---|---|---|
+| 33029–30 | PV lifetime energy | U32 ×1 | kWh |
+| 33031–32 / 33033–34 | PV month / last month energy | U32 ×1 | kWh |
+| 33035 / 33036 | PV today / yesterday energy | U16 ×0.1 | kWh |
+| 33037–38 / 33039–40 | PV year / last year energy | U32 ×1 | kWh |
+| 33049 / 33051 / 33053 / 33055 | PV1–4 voltage | U16 ×0.1 | V |
+| 33050 / 33052 / 33054 / 33056 | PV1–4 current | U16 ×0.1 | A |
+| 33057–58 | Total PV power | S32 ×1 | W |
+| 33126–27 | Meter total active energy | U32 ×0.001 | kWh |
+| 33128 | Meter voltage | U16 ×0.1 | V |
+| 33129 | Meter current | U16 ×0.01 | A |
+| 33130–31 | Meter active power | S32 ×1 | W |
+| 33161–62 / 33163 / 33164 | Battery charge lifetime / today / yesterday | U32 ×1 / U16 ×0.1 / U16 ×0.1 | kWh |
+| 33165–66 / 33167 / 33168 | Battery discharge lifetime / today / yesterday | U32 ×1 / U16 ×0.1 / U16 ×0.1 | kWh |
+| 33169–70 / 33171 / 33172 | Grid import lifetime / today / yesterday | U32 ×1 / U16 ×0.1 / U16 ×0.1 | kWh |
+| 33173–74 / 33175 / 33176 | Grid export lifetime / today / yesterday | U32 ×1 / U16 ×0.1 / U16 ×0.1 | kWh |
+| 33177–78 / 33179 / 33180 | Consumption lifetime / today / yesterday | U32 ×1 / U16 ×0.1 / U16 ×0.1 | kWh |
+| 33186–87 / 33188–89 | AC grid port fed-in / consumption energy | U32 ×1 | kWh |
+
+Native polling reads nine frames: input **33132×21**, **33022×6**,
+**33161×29**, **33029×12**, **33049×10**, **33126×6**; holding
+**43141×30**, **43007×1**, and the additional read-only export-limit frame
+**43073×2**. Input 33132, 33049 and 33126 are due every 10 seconds; the
+rest every 30 seconds. One site-wide round-robin scheduler caps polling at
+one request per second across all units/gateways (about 0.5 requests/s for
+one inverter). Under contention a frame is delayed, never burst-caught-up.
+Polling shares the gateway's one paced transport with Discovery and Re-probe
+and takes the same exclusive probe lock, so a poll frame never interleaves
+with a caching probe; polling never reads the serial block 33000–33019.
+Readings from before a reconnect are not shown until re-read.
+
+| Other native readings | Decode / metadata |
+|---|---|
+| 33132 bit 5 | Grid-charge permission, read-only binary sensor; raw word diagnostic |
+| 33133 / 33134 | Battery voltage U16 ×0.1 V / current S16 ×0.1 A, measurement |
+| 33135 | Battery direction enum: 0 charge, 1 discharge; other values unknown |
+| 33136–38 | U16 ×0.1, diagnostic, no speculative unit |
+| 33139 / 33140 | SoC / SoH U16 %, battery class, measurement |
+| 33141 / 33142 | BMS voltage U16 ×0.01 V / current S16 ×0.1 A, measurement |
+| 33143 / 33144 | BMS charge / discharge current U16 ×0.1 A, measurement |
+| 33145 / 33146 | Raw bitfields, diagnostic |
+| 33147 / 33148 | Household / backup load U16 W, power, measurement |
+| 33149–50 | Battery magnitude U32 W, signed positive charge / negative discharge using 33135, power, measurement |
+| 33151–52 | Grid-port power S32 W, power, measurement |
+| 33022–27 | yy, month, day, hour, minute, second; diagnostic timestamp in configured household zone; invalid/unknown zone → unknown |
+| 43073 bit 4 / 43074 | Export limit enabled binary sensor / U16 ×100 W, power, measurement; read-only |
+| 33000 / 35000 / 33289 | Diagnostic identity from probe only (three hex words); model is 33000/35000; no serial retained |
+| Other words in these frames | Raw U16 diagnostic sensors, no unit or statistics class |
+
+Reserved 43151–52 and 33181–85 have no entities. All other non-primary
+readings are disabled by default. The approved primary set is the ticket's
+named inverter readings, bank SoC, lifetime 33029/33161/33165/33169/33173/33177
+and power 33057/33130. Clock and identity remain diagnostic even though enabled.
+Bank SoC uses only an exactly-one-native-inverter source with a valid SoC;
+zero or multiple native sources are unavailable, never averaged. Shared-bank
+aggregation is a follow-up.
+
+Inverter unique ids are `{gateway_uuid}_{unit}_{input|holding}_{address}`
+with a bit/derived suffix where needed; device identifiers use gateway UUID
+plus unit. Bank device identity uses an opaque entry/bank UUID; the SoC
+unique id includes the sorted source gateway UUIDs, that bank UUID and
+`input_33139`. With no native source it uses the site's native gateway UUIDs
+but remains unavailable. No inverter is silently chosen for a shared bank.
+
 ## Open questions for the decision ticket
 
 1. Does step 1 include tier A (and B), or does the gap run with

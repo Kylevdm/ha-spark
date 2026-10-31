@@ -13,6 +13,7 @@ from . import SparkConfigEntry
 from .coordinator import SparkCoordinator
 from .entity import SparkEntity
 from .guard_loop import SupplyGuardLoop
+from .native_entities import native_bits
 from .native_gateway import GatewayClaim, GatewayConnected, gateways
 from .wire import Summary
 
@@ -64,6 +65,7 @@ async def async_setup_entry(
             GatewayConnected(entry.runtime_data, inverter, "gateway_connected"),
             GatewayClaim(entry.runtime_data, inverter, "gateway_claim"),
         ])
+    entities.extend(native_bits(entry.runtime_data))
     async_add_entities(entities)
 
 
