@@ -1,5 +1,11 @@
 {
   "exceptions": {
+    "not_available": {"message": "This command is not available yet."},
+    "stale_session": {"message": "The command belongs to an earlier add-on session."},
+    "stale_authority": {"message": "Authority changed before this command could run."},
+    "replayed": {"message": "This command sequence was already consumed."},
+    "stale_epoch": {"message": "Authority changed. Refresh its epoch before making a new request."},
+    "preconditions_unmet": {"message": "The native mode preconditions have not all been met."},
     "not_owner": {"message": "Only a non-system administrator on an integration-owned site may do this."},
     "authority_unknown": {"message": "Authority is unknown. Confirm Observe through the repair before writing."},
     "transition_in_progress": {"message": "An authority transition is still in progress."},
@@ -8,6 +14,7 @@
     "invalid_household_zone": {"message": "Configure a valid household time zone before choosing until tomorrow."}
   },
   "services": {
+    "commands_pending": {"name": "Commands pending", "description": "Prompt a fetch from the authenticated add-on channel. Accepts no command data."},
     "set_observe": {"name": "Set Observe", "description": "Make a verified handover to Observe."},
     "start_manual_control": {
       "name": "Start manual control", "description": "Temporarily hand over controls to the owner.",

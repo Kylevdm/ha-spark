@@ -1,3 +1,6 @@
+commands_pending:
+  name: Commands pending
+  description: Prompt a fetch from the authenticated add-on channel. Accepts no command data.
 set_observe:
   name: Set Observe
   description: Make a verified handover to Observe. Requires a non-system administrator.

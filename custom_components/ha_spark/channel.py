@@ -1,4 +1,4 @@
-"""Bounded heartbeat HTTP client; only fixed outcome codes cross the boundary.
+"""Bounded heartbeat and command clients; only fixed outcomes cross the boundary.
 
 No request, response, credential or exception text is logged or retained. Redirects
 are disabled so the discovery endpoint cannot forward the bearer credential.
@@ -13,6 +13,7 @@ from enum import StrEnum
 import aiohttp
 
 from . import wire
+from .commands import CommandResult, FetchReply, FetchRequest
 from .wire import Summary, VersionEnvelope
 
 _LOGGER = logging.getLogger(__name__)
@@ -43,6 +44,52 @@ class PollResult:
     outcome: Outcome
     summary: Summary | None = None
     envelope: VersionEnvelope | None = None
+
+
+async def _async_command_post(
+    session: aiohttp.ClientSession, *, url: str, token: str, body: dict[str, object],
+    reply_cap: int,
+) -> object:
+    """Stream an authenticated response; failures carry no untrusted text."""
+    try:
+        async with asyncio.timeout(10), session.post(
+            url, json=body, headers={"Authorization": f"Bearer {token}"}, allow_redirects=False,
+        ) as response:
+            if response.status != 200:
+                raise ValueError
+            raw = bytearray()
+            stream = response.content
+            while chunk := await stream.read(reply_cap + 1 - len(raw)):
+                raw.extend(chunk)
+                if len(raw) > reply_cap:
+                    raise ValueError
+            return json.loads(raw)
+    except Exception:
+        raise ValueError("command channel unavailable") from None
+
+
+async def async_fetch_commands(
+    session: aiohttp.ClientSession, *, url: str, token: str, request: FetchRequest,
+) -> FetchReply | None:
+    try:
+        raw = await _async_command_post(session, url=url, token=token,
+                                       body=request.model_dump(), reply_cap=65536)
+        return FetchReply.model_validate(raw)
+    except (ValueError, RecursionError):
+        return None
+
+
+async def async_post_result(
+    session: aiohttp.ClientSession, *, url: str, token: str, result: CommandResult,
+) -> bool:
+    if len(result.model_dump_json().encode()) > 16384:
+        return False
+    try:
+        reply = await _async_command_post(session, url=url, token=token,
+                                         body=result.model_dump(), reply_cap=16384)
+        return reply == {"accepted": True}
+    except (ValueError, RecursionError):
+        return False
 
 
 async def async_poll(
