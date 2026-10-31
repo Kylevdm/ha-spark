@@ -53,7 +53,7 @@ async def open_topology(hass: HomeAssistant, entry: MockConfigEntry) -> Any:
     result = await hass.config_entries.options.async_init(entry.entry_id)
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "init"
-    assert result["menu_options"] == ["solcast", "topology", "manual"]
+    assert result["menu_options"] == ["solcast", "topology", "manual", "soc"]
     result = await choose(hass, result["flow_id"], "topology")
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "topology"
@@ -427,7 +427,7 @@ async def test_topology_flow_translations(hass: HomeAssistant) -> None:
     ):
         assert translations[f"{prefix}step.{step}.title"], step
     menu_options = {
-        "init": ("solcast", "topology"),
+        "init": ("solcast", "topology", "soc"),
         "topology": (
             "connections", "banks", "inverters", "v2l_chargers", "major_loads", "save",
         ),
@@ -450,6 +450,7 @@ async def test_topology_flow_translations(hass: HomeAssistant) -> None:
         for option in options:
             assert translations[f"{prefix}step.{step}.menu_options.{option}"], option
     data_fields = {
+        "soc": ("soc_max_report_age_minutes", "soc_failure_threshold", "soc_recovery_minutes"),
         "solcast": ("calls_limit",),
         "connections_item": (
             "id", "supply_voltage_v", "import_limit_a", "export_limit_a",

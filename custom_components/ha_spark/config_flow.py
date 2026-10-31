@@ -9,7 +9,7 @@ site topology (#535's contract) that later phases send on the heartbeat.
 """
 
 from collections.abc import Callable
-from math import isclose
+from math import isclose, isfinite
 from typing import Any, TypeGuard, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -44,6 +44,7 @@ from pydantic import BaseModel, ValidationError
 
 from . import native
 from .const import ADDON_SLUG, DOMAIN
+from .soc_trust import Policy
 from .solcast import Outcome, async_list_sites
 from .solcast_budget import async_get_budget
 from .topology import (
@@ -320,7 +321,35 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
         self, user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
         """Choose between the Solcast allowance and the topology editor."""
-        return self.async_show_menu(step_id="init", menu_options=["solcast", "topology", "manual"])
+        return self.async_show_menu(
+            step_id="init", menu_options=["solcast", "topology", "manual", "soc"],
+        )
+
+    async def async_step_soc(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Validate the native SoC policy before saving; reload drops recovery progress."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            clean = dict(user_input)
+            for key in ("soc_failure_threshold", "soc_recovery_minutes"):
+                value = clean.get(key)
+                if _is_number(value) and isfinite(value) and value % 1 == 0:
+                    clean[key] = int(value)
+            try:
+                policy = Policy.model_validate(clean)
+            except ValidationError:
+                errors = {"base": "invalid_soc_policy"}
+            else:
+                return self.async_create_entry(
+                    title="", data={**self.config_entry.options, **policy.model_dump()},
+                )
+        defaults = Policy().model_dump()
+        schema = probatio.Schema({
+            probatio.Required(key, default=self.config_entry.options.get(key, value)): _NUMBER
+            for key, value in defaults.items()
+        })
+        return self.async_show_form(step_id="soc", data_schema=schema, errors=errors)
 
     async def async_step_manual(
         self, user_input: dict[str, Any] | None = None,

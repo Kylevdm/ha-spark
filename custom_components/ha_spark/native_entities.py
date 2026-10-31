@@ -125,17 +125,15 @@ class NativeIdentity(NativeEntity, SensorEntity):
         return super().available and self.native_value is not None
 
 
-class BankSoC(CoordinatorEntity[SparkCoordinator], SensorEntity):
+class BankEntity(CoordinatorEntity[SparkCoordinator], SensorEntity):
     """No averaging: ambiguous or absent native source means unavailable."""
 
     _attr_has_entity_name = True
     _attr_translation_key = "native_bank_soc"
-    _attr_device_class = SensorDeviceClass.BATTERY
-    _attr_native_unit_of_measurement = "%"
-    _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, coordinator: SparkCoordinator, bank_id: str) -> None:
         super().__init__(coordinator)
+        self.bank_id = bank_id
         self.sources = [i for i in coordinator.native.inverters.values() if i.bank_id == bank_id]
         bank_key = str(uuid5(NAMESPACE_URL, f"{coordinator.entry.entry_id}:bank:{bank_id}"))
         # Include every source gateway, never silently select a shared bank's source.
@@ -151,6 +149,14 @@ class BankSoC(CoordinatorEntity[SparkCoordinator], SensorEntity):
         if site:
             self._attr_device_info["via_device_id"] = site.id
         self.point = next(p for p in POINTS if p.address == 33139)
+
+
+class BankSoC(BankEntity):
+    """No averaging of multiple native sources."""
+
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_native_unit_of_measurement = "%"
+    _attr_state_class = SensorStateClass.MEASUREMENT
 
     @property
     def native_value(self) -> float | None:
@@ -169,6 +175,34 @@ class BankSoC(CoordinatorEntity[SparkCoordinator], SensorEntity):
         return self.native_value is not None
 
 
+class BankSocTrust(BankEntity):
+    """Local diagnostic trust remains visible without an add-on session or live frame."""
+
+    _attr_translation_key = "native_bank_soc_trust"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_native_unit_of_measurement = None
+    _attr_state_class = None
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_options = ["trusted", "untrusted", "recovering"]
+
+    def __init__(self, coordinator: SparkCoordinator, bank_id: str) -> None:
+        super().__init__(coordinator, bank_id)
+        assert self._attr_unique_id is not None
+        self._attr_unique_id = self._attr_unique_id.removesuffix("input_33139") + "soc_trust"
+
+    @property
+    def native_value(self) -> str:
+        return self.coordinator.soc.bank(self.bank_id).trust
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str]:
+        return {"reason": self.coordinator.soc.bank(self.bank_id).reason}
+
+
 def native_sensors(coordinator: SparkCoordinator) -> list[SensorEntity]:
     entities: list[SensorEntity] = []
     for inverter in coordinator.native.inverters.values():
@@ -178,6 +212,7 @@ def native_sensors(coordinator: SparkCoordinator) -> list[SensorEntity]:
     topology = validate_topology(coordinator.entry.options.get("topology"))
     if isinstance(topology, Topology) and coordinator.native.inverters:
         entities.extend(BankSoC(coordinator, bank.id) for bank in topology.banks)
+        entities.extend(BankSocTrust(coordinator, bank.id) for bank in topology.banks)
     return entities
 
 
