@@ -13,6 +13,7 @@ from . import SparkConfigEntry
 from .coordinator import SparkCoordinator
 from .entity import SparkEntity
 from .guard_loop import SupplyGuardLoop
+from .native_gateway import GatewayClaim, GatewayConnected, gateways
 from .wire import Summary
 
 
@@ -58,6 +59,11 @@ async def async_setup_entry(
     ]
     if entry.runtime_data.guard is not None:
         entities.append(SupplyGuardLimiting(entry.runtime_data, entry.runtime_data.guard))
+    for inverter in gateways(entry.runtime_data):
+        entities.extend([
+            GatewayConnected(entry.runtime_data, inverter, "gateway_connected"),
+            GatewayClaim(entry.runtime_data, inverter, "gateway_claim"),
+        ])
     async_add_entities(entities)
 
 

@@ -3,7 +3,7 @@ import asyncio
 import json
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
 import probatio as vol
@@ -212,7 +212,7 @@ async def test_heartbeat_collects_transition_and_waits_for_site_barrier(
         assert state.epoch == epoch + 3
 
 
-@pytest.mark.parametrize("kind", ["apply", "sync_clock", "reprobe", "supervise_export",
+@pytest.mark.parametrize("kind", ["apply", "sync_clock", "supervise_export",
                                   "end_supervision"])
 async def test_unavailable_kinds_are_validated_refused_and_consumed(
     hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, kind: str,
@@ -236,6 +236,36 @@ async def test_unavailable_kinds_are_validated_refused_and_consumed(
     assert len(results) == 2 and results[0] == results[1], aioclient_mock.mock_calls
     assert results[0]["reason"] == "not_available"
     assert results[0]["sequence"] == cmd["sequence"]
+    assert coordinator.authority.state == state
+
+
+@pytest.mark.parametrize("found", [True, False])
+async def test_reprobe_routes_to_the_native_seam_once(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, found: bool,
+) -> None:
+    aioclient_mock.post(URL, exc=aiohttp.ClientError())
+    entry = await setup(hass)
+    coordinator = entry.runtime_data
+    assert await coordinator.authority.async_initialise()
+    state = coordinator.authority.state
+    assert state is not None
+    cmd = fixture("command_reprobe")
+    cmd.update(epoch=state.epoch, session_id=entry.data["session_id"])
+    aioclient_mock.post(FETCH, json={"session_id": entry.data["session_id"], "commands": [cmd]})
+    aioclient_mock.post(RESULT, json={"accepted": True})
+    coordinator.connected = True
+    reprobe = AsyncMock(return_value=found)
+    with (patch("custom_components.ha_spark.authority.authority_owner",
+                return_value="integration"),
+          patch.object(coordinator, "async_reprobe", reprobe)):
+        for _ in range(2):
+            await hass.services.async_call(DOMAIN, "commands_pending", {}, blocking=True)
+            await hass.async_block_till_done(wait_background_tasks=True)
+    reprobe.assert_awaited_once_with("inverter-1")
+    results = [call[2] for call in aioclient_mock.mock_calls if str(call[1]) == RESULT]
+    assert len(results) == 2 and results[0] == results[1]
+    assert results[0]["outcome"] == ("applied" if found else "refused")
+    assert results[0]["reason"] == (None if found else "native_device_missing")
     assert coordinator.authority.state == state
 
 

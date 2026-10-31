@@ -6,6 +6,7 @@
     "replayed": {"message": "This command sequence was already consumed."},
     "stale_epoch": {"message": "Authority changed. Refresh its epoch before making a new request."},
     "preconditions_unmet": {"message": "The native mode preconditions have not all been met."},
+    "native_device_missing": {"message": "No configured native inverter matches this request."},
     "not_owner": {"message": "Only a non-system administrator on an integration-owned site may do this."},
     "authority_unknown": {"message": "Authority is unknown. Confirm Observe through the repair before writing."},
     "transition_in_progress": {"message": "An authority transition is still in progress."},
@@ -15,6 +16,7 @@
   },
   "services": {
     "commands_pending": {"name": "Commands pending", "description": "Prompt a fetch from the authenticated add-on channel. Accepts no command data."},
+    "reprobe": {"name": "Re-probe Solis", "description": "Re-read identity and test gateway caching (administrator only).", "fields": {"inverter_id": {"name": "Inverter", "description": "Configured topology inverter identifier."}}},
     "set_observe": {"name": "Set Observe", "description": "Make a verified handover to Observe."},
     "start_manual_control": {
       "name": "Start manual control", "description": "Temporarily hand over controls to the owner.",
@@ -26,6 +28,12 @@
     "resume_control": {"name": "Resume control", "description": "End manual control using current conditions."}
   },
   "issues": {
+    "native_unreachable": {"title": "Solis gateway unreachable", "description": "Check gateway connectivity, then Re-probe. The device remains read-only."},
+    "native_identity_read_failed": {"title": "Solis identity probe failed", "description": "Identity or caching could not be verified. Check connectivity and Re-probe. The device remains read-only."},
+    "native_unvalidated_identity": {"title": "Solis identity not validated", "description": "This identity is not in the validated allow-list. The device remains read-only."},
+    "native_v2_tou_firmware": {"title": "Unsupported Solis TOU firmware", "description": "V2 TOU firmware is read-only. Do not enable automatic control."},
+    "native_caching_on": {"title": "Gateway caching detected", "description": "Disable gateway storage mode, then Re-probe. Read-back is not trustworthy while caching is on."},
+    "native_gateway_not_owned": {"title": "Solis gateway not owned", "description": "Confirm the gateway claim in native setup, complete the authority handshake and remove the legacy overlay. Reads continue; writes remain blocked."},
     "ownership_peer_version": {
       "title": "Authority switch refused",
       "description": "Switching authority requires a v4 add-on with known authority. Restore a compatible peer and retry, or revert the topology."
@@ -82,6 +90,8 @@
   },
   "entity": {
     "binary_sensor": {
+      "gateway_connected": {"name": "Connectivity"},
+      "gateway_claim": {"name": "Ownership claim"},
       "fallback_active": {"name": "Fallback active"},
       "ev_hold": {"name": "EV hold"},
       "dispatch_hold": {"name": "Dispatch hold"},
@@ -91,6 +101,7 @@
       }
     },
     "sensor": {
+      "gateway_caching": {"name": "Caching probe"},
       "operating_mode": {
         "name": "Operating mode",
         "state": {
@@ -286,9 +297,10 @@
           "inverters_done": "Back to the topology"
         }
       },
+      "native_connect": {"title": "Connect native Solis", "description": "Confirm that all other Modbus clients and the legacy overlay are disconnected. Continuing probes identity and gateway caching and records your gateway ownership claim when you save. An unreachable device can be saved read-only; setup probes again after saving."},
       "inverters_item": {
         "title": "Inverter",
-        "description": "One inverter with its owner-entered DC limits. Unconfirmed limits count as zero. Native Solis gateways are saved without connecting and remain read-only until validated.",
+        "description": "One inverter with its owner-entered DC limits. Unconfirmed limits count as zero. Native Solis inverters go through a connect step and remain read-only until validated.",
         "data": {
           "id": "Identifier",
           "bank_id": "Battery bank",

@@ -40,6 +40,10 @@ class ManualPayload(Requester):
     keep_protection: bool = True
 
 
+class ReprobePayload(Requester):
+    inverter_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
 class ApplyPayload(Record):
     intents: list[dict[str, JsonValue]] = Field(max_length=64)
 
@@ -64,7 +68,7 @@ class Command(Record):
     def validate_payload(self) -> "Command":
         schemas: dict[str, type[BaseModel]] = {
                   "transition": TransitionPayload, "manual": ManualPayload,
-                  "sync_clock": Requester, "reprobe": Requester, "apply": ApplyPayload,
+                  "sync_clock": Requester, "reprobe": ReprobePayload, "apply": ApplyPayload,
                   "supervise_export": SupervisionPayload,
                   "end_supervision": EndSupervisionPayload}
         schemas[self.kind].model_validate(self.payload)
@@ -80,7 +84,7 @@ class CommandResult(Record):
     reason: Literal["not_available", "stale_session", "stale_authority", "replayed",
                     "not_owner", "authority_unknown", "transition_in_progress", "stale_epoch",
                     "no_manual_session", "not_in_active_mode", "preconditions_unmet",
-                    "invalid_household_zone"] | None = None
+                    "invalid_household_zone", "native_device_missing"] | None = None
     epoch: int | None = Field(default=None, ge=1)
     reasons: list[Literal[
         "devices_validated", "evidence_configured", "limits_confirmed", "fallback_valid",
