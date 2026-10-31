@@ -1,8 +1,8 @@
 """Pure per-connection supply guard; positive grid power means import.
 
 Time, household day, measured inverter import and the authority mirror are inputs.
-Power is AC-equivalent, as in the daemon guard; the clamp converts watts to bank
-amps without an efficiency term. No device I/O or authority store lives here.
+Power and requests are AC-equivalent; the clamp converts the allowance to DC
+with each bank's one-way charge efficiency. No device I/O or authority store lives here.
 """
 
 from dataclasses import dataclass, replace
@@ -25,6 +25,8 @@ class InverterMeasurement:
     inverter_id: str
     power_w: float | None
     reported_at: datetime | None
+    # Keep the lossless evidence too: conversion must never create headroom.
+    unadjusted_w: float | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,8 @@ class GuardInputs:
     # No writer exists (this phase): readings alone set and clear the ceiling for
     # display, with no requested allocation, no write and no restore spent.
     observe_only: bool = False
+    # DC request before losses; missing-reading cuts must not grow with losses.
+    lossless_requested_kw: float | None = None
 
 
 @dataclass(frozen=True)
@@ -142,8 +146,15 @@ def step(state: GuardState, inputs: GuardInputs, now: datetime) -> tuple[GuardSt
 
     observe = inputs.observe_only
     requested = 0 if observe else inputs.requested_kw
-    if not isfinite(requested) or requested < 0:
+    if requested != requested or requested < 0:
         requested = 0
+    # Positive overflow remains a request: it must block restores, not suppress
+    # cuts. Only the finite lossless request may set a missing-reading ceiling.
+    lossless = inputs.lossless_requested_kw
+    if lossless is None:
+        lossless = requested
+    if not isfinite(lossless) or lossless < 0:
+        lossless = 0
     fresh = _fresh(inputs.reading.import_w, inputs.reading.reported_at, now) and all(
         _fresh(m.power_w, m.reported_at, now) for m in inputs.measurements
     )
@@ -154,7 +165,7 @@ def step(state: GuardState, inputs: GuardInputs, now: datetime) -> tuple[GuardSt
         if (state.last_good_at is not None and (now - state.last_good_at).total_seconds() >= 120
                 and not state.latched and requested > 0 and state.last_headroom_kw is not None
                 and state.last_headroom_kw < inputs.reserve_kw):
-            cut = min(requested / 2, state.cut_kw if state.cut_kw is not None else requested)
+            cut = min(lossless / 2, state.cut_kw if state.cut_kw is not None else lossless)
             state = replace(state, cut_kw=cut, latched=True, epoch=epoch, restored=False)
             changed = True
     else:
@@ -163,8 +174,16 @@ def step(state: GuardState, inputs: GuardInputs, now: datetime) -> tuple[GuardSt
                        *(m.reported_at for m in inputs.measurements if m.reported_at is not None))
         import_w = inputs.reading.import_w
         limit_w = inputs.limit_kw * 1000
-        other_w = import_w - sum(m.power_w or 0 for m in inputs.measurements)
-        available_w = max(0, limit_w - other_w)
+        # Keep the lossless ceiling and subtract the directional loss term.
+        # Charging needs DC/eta; discharge offsets only DC*eta. Neither may
+        # manufacture headroom compared with the old DC measurement.
+        measured_w = sum(
+            (m.unadjusted_w - abs((m.power_w or 0) - m.unadjusted_w))
+            if m.unadjusted_w is not None else m.power_w or 0
+            for m in inputs.measurements
+        )
+        other_w = import_w - measured_w
+        available_w = max(0, limit_w - other_w) if isfinite(other_w) else 0
         available = available_w / 1000
         new_report = state.last_counted_at is None or inputs.reading.reported_at > (
             state.last_counted_at

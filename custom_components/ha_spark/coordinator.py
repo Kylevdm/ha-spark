@@ -1,7 +1,9 @@
 """Poll the add-on and enforce a session-local liveness deadline independently.
 
-A lost link changes visibility only. This integration owns no authority, fallback
-or hardware write path. Unloading fences off replies from the previous discovery.
+Native authority is local only on integration-owned sites; the legacy mirror
+never grants local write permission. Ownership changes through the durable
+Observe-only handshake, not a snapshot grant. Unloading fences off replies
+from the previous discovery. No native hardware writer is attached here.
 """
 
 import logging
@@ -9,6 +11,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -19,9 +23,23 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from . import wire
-from .channel import Outcome, PollResult, async_poll
+from .authority import AuthorityStore
+from .authority_control import AuthorityControl
+from .channel import Outcome, PollResult, async_fetch_commands, async_poll, async_post_result
+from .command_dispatch import CommandConsumer
+from .commands import (
+    Command,
+    CommandResult,
+    FetchRequest,
+    ManualPayload,
+    ReprobePayload,
+    TransitionPayload,
+)
 from .const import DOMAIN
+from .native import NativeDevices
+from .ownership import OwnershipStore
 from .topology import Topology, validate_topology
+from .transitions import Preconditions, TransitionRequest
 from .wire import Summary, build_snapshot
 
 if TYPE_CHECKING:
@@ -38,6 +56,21 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         super().__init__(hass, _LOGGER, config_entry=entry, name="ha-spark",
                          update_interval=timedelta(seconds=30))
         self.entry = entry
+        self.authority = AuthorityStore(hass, entry.entry_id, self.async_update_listeners)
+        self.control = AuthorityControl(entry, self.authority)
+        self.ownership = OwnershipStore(
+            hass, entry.entry_id, self.authority, lambda: entry.options.get("topology"),
+        )
+        self.native = NativeDevices(
+            hass, entry,
+            owned=lambda: self.ownership.verified and self.ownership.owner == "integration",
+            overlay=lambda: (self.summary.legacy_overlay
+                             if self.connected and self.summary else None),
+            changed=self.async_update_listeners,
+        )
+        self.control.preconditions = lambda: Preconditions(
+            devices_validated=self._devices_validated(),
+        )
         self.solcast: SolcastCoordinator | None = None
         self.guard: SupplyGuardLoop | None = None
         self.release_version = release_version
@@ -52,6 +85,123 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self._running = True
         self._ended = False
         self._cancel_deadline: Callable[[], None] | None = None
+        # Receiver incarnation is distinct from the add-on's per-boot bearer session.
+        # A fresh incarnation makes the add-on drop commands from before HA restarted.
+        self.integration_session_id = str(uuid4())
+        self.command_consumer: CommandConsumer | None = None
+        self._command_fetching = False
+        self._command_queued = False
+
+    @callback
+    def async_commands_pending(self) -> None:
+        """A data-free nudge only; never accepts a command from a service caller."""
+        if (not self._running or self._ended or not self.connected or self.api_version < 4
+                or not self.control.owned()):
+            return
+        if self._command_fetching:
+            self._command_queued = True
+            return
+        self._command_fetching = True
+        self.entry.async_create_background_task(
+            self.hass, self._async_commands(), "ha-spark command fetch",
+        )
+
+    async def _async_dispatch_command(self, command: Command) -> CommandResult:
+        base = CommandResult(session_id=command.session_id, sequence=command.sequence,
+                             outcome="refused", reason="not_available")
+        if not self.control.owned():
+            return base.model_copy(update={"reason": "not_owner"})
+        if command.kind == "reprobe":
+            # #574's admin seam: identity and caching reads only, no register writes.
+            reprobe = ReprobePayload.model_validate(command.payload)
+            if not await self.async_reprobe(reprobe.inverter_id):
+                return base.model_copy(update={"reason": "native_device_missing"})
+            return base.model_copy(update={"outcome": "applied", "reason": None})
+        if command.kind not in ("transition", "manual"):
+            return base
+        payload = (TransitionPayload.model_validate(command.payload)
+                   if command.kind == "transition"
+                   else ManualPayload.model_validate(command.payload))
+        if payload.expected_epoch != command.epoch:
+            # The locked controller checks only expected_epoch; the two must agree.
+            return base.model_copy(update={"reason": "stale_authority"})
+        request = TransitionRequest.model_validate(payload.model_dump())
+        zone = self.control.household_zone()
+        if zone is None and request.target == "manual" and request.duration == "until_tomorrow":
+            return base.model_copy(update={"reason": "invalid_household_zone"})
+        from .owner_services import _manual_time
+
+        decision = await self.control.async_request(
+            request, now=dt_util.utcnow(), zone=zone or ZoneInfo("UTC"),
+            at=_manual_time(self.entry),
+        )
+        if decision.refusal is not None:
+            return CommandResult.model_validate({**base.model_dump(), "reason": decision.refusal,
+                                                  "reasons": list(decision.reasons)})
+        state = decision.state
+        if state is None:
+            return base.model_copy(update={"reason": "authority_unknown"})
+        return base.model_copy(update={"outcome": "applied", "reason": None, "epoch": state.epoch})
+
+    async def _async_commands(self) -> None:
+        """At most one HTTP fetch plus one queued fetch, including forged nudges."""
+        try:
+            while True:
+                self._command_queued = False
+                data = self.entry.data
+                if (not self._running or self._ended or not self.connected
+                        or not self.control.owned()):
+                    return
+                session_id = data["session_id"]
+                consumer = self.command_consumer
+                if consumer is None or consumer.session_id != session_id:
+                    consumer = CommandConsumer(
+                        session_id, lambda: (self.authority.state.epoch
+                                            if self.authority.state is not None else None),
+                        self._async_dispatch_command,
+                    )
+                    self.command_consumer = consumer
+                url = f"http://{data['host']}:{data['port']}/integration/commands"
+                session = async_get_clientsession(self.hass)
+                reply = await async_fetch_commands(
+                    session, url=url + "/fetch", token=data["auth_token"],
+                    request=FetchRequest(session_id=session_id,
+                                         integration_session_id=self.integration_session_id,
+                                         last_result_sequence=consumer.last_sequence),
+                )
+                if not self._running or self._ended or self.entry.data is not data:
+                    return
+                if reply is not None:
+                    for command in reply.commands:
+                        if (not self._running or self._ended or self.entry.data is not data
+                                or not self.control.owned()):
+                            return
+                        if reply.session_id != session_id:
+                            result = CommandResult(session_id=command.session_id,
+                                                   sequence=command.sequence, outcome="refused",
+                                                   reason="stale_session")
+                        else:
+                            result = await consumer.async_consume(command)
+                        if not self._running or self._ended or self.entry.data is not data:
+                            return
+                        await async_post_result(session, url=url + "/result",
+                                                token=data["auth_token"], result=result)
+                if not self._command_queued:
+                    return
+        finally:
+            self._command_fetching = False
+
+    def _devices_validated(self) -> bool:
+        """Every inverter of the current topology, matched against current probe evidence."""
+        topology = validate_topology(self.entry.options.get("topology"))
+        return isinstance(topology, Topology) and bool(topology.inverters) and all(
+            i.transport == "native" and self.native.reason(i) is None
+            for i in topology.inverters
+        )
+
+    async def async_reprobe(self, inverter_id: str) -> bool:
+        """Native admin command seam; authentication belongs to the caller boundary."""
+        return await self.native.async_reprobe(inverter_id)
 
     @callback
     def _clear_deadline(self) -> None:
@@ -71,12 +221,14 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self._running = False
         self.connected = False
         self._clear_deadline()
+        await self.native.async_close()
         await super().async_shutdown()
 
     @callback
     def async_stop(self) -> None:
         """Fence off replies the moment unloading starts, before platforms go."""
         self._running = False
+        self.native.polling = False
 
     def _solar_forecast(self, api_version: int) -> dict[str, object] | None:
         """The snapshot's forecast field; a failure to build it never blocks the heartbeat."""
@@ -147,9 +299,63 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         except Exception:  # noqa: BLE001 - its text may never reach HA's update logging
             return None
 
+    def _ownership_snapshot(self, snapshot: dict[str, object]) -> None:
+        """Project local validation without granting hardware permission."""
+        if snapshot["api_version"] != 4:
+            return
+        owner = self.ownership.owner if self.ownership.verified else "pending_integration"
+        snapshot["authority_owner"] = owner
+        topology = validate_topology(self.entry.options.get("topology"))
+        if isinstance(topology, Topology):
+            devices: list[dict[str, object]] = []
+            for inverter in topology.inverters:
+                reason = (self.native.reason(inverter) if inverter.transport == "native"
+                          else "unvalidated_identity")
+                device: dict[str, object] = {
+                    "id": inverter.id, "transport": inverter.transport,
+                    "validation": "read_only" if reason else "validated", "capabilities": [],
+                }
+                if reason:
+                    device["reason"] = reason
+                devices.append(device)
+            snapshot["devices"] = devices
+        if owner != "integration":
+            return
+        state = self.authority.state
+        if state is None:
+            # Omit the required authority block: the add-on drops this snapshot
+            # whole. Never invent an identity, epoch or mode for damaged storage.
+            snapshot.pop("authority_owner", None)
+            return
+        transition = state.transition
+        snapshot["authority"] = {
+            "mode": state.committed_mode if state else "observe",
+            "epoch": state.epoch if state else 1,
+            "store_identity": str(state.store_id) if state else self.entry.entry_id,
+            "transition": ({"target": transition.target, "steps": list(transition.steps),
+                            "failing_actions": list(transition.failing_actions)}
+                           if transition else None),
+            "manual_session": (state.manual_session.model_dump(mode="json")
+                               if state and state.manual_session else None),
+            "fallback": {"active": state.fallback.active if state else False,
+                         "causes": list(state.fallback.causes) if state else []},
+            "store_state": ("ok" if state else "save_failed"
+                            if self.authority.status == "save_failed" else "unknown"),
+        }
+        snapshot["holds"] = []
+
     async def _async_update_data(self) -> bool:
         if not self._running or self._ended:
             return self.connected
+        if not self.ownership.loaded:
+            await self.authority.async_load()
+            await self.ownership.async_load()
+        if not self.ownership.verified:
+            # An unverified pending record must not even request a handover.
+            self.connected = False
+            self.last_outcome = Outcome.MALFORMED
+            self.last_outcome_at = dt_util.utcnow()
+            return False
         data = self.entry.data
         api_version = self.api_version
         envelope = None
@@ -167,6 +373,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         else:
             session = async_get_clientsession(self.hass)
             url = f"http://{data['host']}:{data['port']}/integration/heartbeat"
+            self._ownership_snapshot(snapshot)
             result = await async_poll(session, url=url, token=data["auth_token"], snapshot=snapshot)
             envelope = result.envelope
             if result.outcome is Outcome.VERSION_REFUSED:
@@ -176,6 +383,8 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                     if not self._running or self._ended or self.entry.data is not data:
                         return self.connected
                     api_version = max(common)
+                    if api_version < 4:
+                        await self.ownership.async_abort("ownership_peer_version")
                     try:
                         snapshot = build_snapshot(site_id=data["site_id"],
                                                   release_version=self.release_version,
@@ -214,10 +423,16 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self.last_outcome = outcome
         self.last_outcome_at = now
         if outcome is Outcome.COUNTED:
+            if self.control.owned() and summary is not None:
+                await self.control.async_new_session(summary.session_id, now=now)
             ir.async_delete_issue(self.hass, DOMAIN, "api_version_skew")
             self.connected = True
             self.last_counted = now
             self.summary = summary
+            if summary is not None:
+                await self.ownership.async_advance(summary)
+            self.native.recheck()
+            self.async_commands_pending()
             self._clear_deadline()
             self._cancel_deadline = async_call_later(self.hass, 120, self._expire)
             if (self.solcast is not None and summary is not None

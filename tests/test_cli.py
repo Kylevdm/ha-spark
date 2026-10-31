@@ -498,7 +498,7 @@ async def test_onboard_write_fragment_imports_without_secrets(
         channel.settings_service = service
         assert await asyncio.to_thread(cli.main, ["config", "import", str(path)]) == 0
     if empty:
-        assert service.export() == {}
+        assert service.export() == {"solis_control_hub": ""}
     else:
         assert service.export()["soc_entity"] == "sensor.solisac_battery_soc"
         assert service.export()["inverter_power_switch_entity"] == "select.solisac_power_switch"

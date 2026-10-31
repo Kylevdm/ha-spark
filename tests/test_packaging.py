@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from ha_spark.api.contract import API_VERSION
+from ha_spark.api.contract import API_VERSION, SUPPORTED_API_VERSIONS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ADDON_DIR = "ha_spark_addon"
@@ -128,6 +128,7 @@ def test_hacs_json_hides_the_default_branch() -> None:
 def test_contract_fixture_declares_the_addon_api_version() -> None:
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
     assert API_VERSION == contract["api_version"]
+    assert sorted(SUPPORTED_API_VERSIONS) == contract["supported_api_versions"]
 
 
 def test_wheel_still_packages_only_the_addon_package() -> None:
@@ -142,7 +143,7 @@ def test_manifest_stays_a_bare_custom_integration() -> None:
     assert manifest["name"] == "ha-spark"
     assert manifest["config_flow"] is True
     assert manifest["iot_class"] == "local_polling"
-    assert manifest["requirements"] == []
+    assert manifest["requirements"] == ["pymodbus==3.13.1"]
     assert "single_config_entry" not in manifest
 
 

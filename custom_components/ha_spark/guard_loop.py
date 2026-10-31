@@ -324,7 +324,14 @@ class SupplyGuardLoop:
                         power, reported = read(entity)
                         if power is not None and inv.power_sign == "negative_import":
                             power = -power
-                        measurements.append(InverterMeasurement(inv.id, power, reported))
+                        unadjusted = power
+                        if power is not None and not inv.grid_port_power_entity:
+                            bank = next(b for b in banks if b.id == inv.bank_id)
+                            eta = bank.one_way_charge_efficiency
+                            power = power / eta if power >= 0 else power * eta
+                        measurements.append(InverterMeasurement(
+                            inv.id, power, reported, unadjusted,
+                        ))
                 loads = [load for load in self.topology.major_loads
                          if load.connection_id == connection.id]
 
@@ -334,14 +341,20 @@ class SupplyGuardLoop:
                                       reported, now)
 
                 reserve = major_load_reserve_kw(loads, running)
-                requested = sum(
+                lossless_requested = sum(
                     max(0, self.last_requested_a.get(i.id, 0)) * b.nominal_voltage_v / 1000
+                    for b in banks for i in inverters if i.bank_id == b.id
+                )
+                requested = sum(
+                    max(0, self.last_requested_a.get(i.id, 0)) * b.nominal_voltage_v
+                    / b.one_way_charge_efficiency / 1000
                     for b in banks for i in inverters if i.bank_id == b.id
                 )
                 power, reported = read(connection.grid_power_entity)
                 limit = next(c for c in self.limits.connections if c.id == connection.id)
                 state, decision = step(self.states[connection.id], GuardInputs(
                     limit_kw=limit.import_kw, requested_kw=requested, reserve_kw=reserve,
+                    lossless_requested_kw=lossless_requested,
                     reading=GuardReading(power, reported), measurements=tuple(measurements),
                     mirror=mirror, grid_configured=connection.grid_power_entity is not None,
                     controllable=any(driver_capabilities(i.driver_kind).setpoint_step_a is not None

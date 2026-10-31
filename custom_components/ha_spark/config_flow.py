@@ -12,11 +12,13 @@ from collections.abc import Callable
 from math import isclose
 from typing import Any, TypeGuard, cast
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import probatio
 from homeassistant.config_entries import (
     SOURCE_REAUTH,
     ConfigEntry,
+    ConfigEntryState,
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlowWithReload,
@@ -40,6 +42,7 @@ from homeassistant.helpers.selector import (
 from homeassistant.helpers.service_info.hassio import HassioServiceInfo
 from pydantic import BaseModel, ValidationError
 
+from . import native
 from .const import ADDON_SLUG, DOMAIN
 from .solcast import Outcome, async_list_sites
 from .solcast_budget import async_get_budget
@@ -246,6 +249,11 @@ def _condition_errors(model: type[BaseModel], clean: dict[str, Any]) -> dict[str
         share, source = clean.get("served_load_share_pct"), clean.get("load_source_entity")
         if (share is None) == (source is None):
             return {"base": "invalid_load_attribution"}
+    elif model is Inverter:
+        if clean.get("transport") == "native" and (
+            clean.get("driver_kind", "solis") != "solis" or not clean.get("gateway_host")
+        ):
+            return {"base": "invalid_native_gateway"}
     elif model is MajorLoad:
         if clean.get("kind") == "ev_charger":
             if (
@@ -274,8 +282,18 @@ def _clean_item(model: type[BaseModel], user_input: dict[str, Any]) -> dict[str,
         value = user_input[name]
         if not field.is_required() and (value is None or value == ""):
             continue
+        if name in ("gateway_port", "gateway_unit_id") and type(value) is float:
+            if value.is_integer():
+                value = int(value)
         clean[name] = value
     return clean
+
+
+def _current_claims(topology: Topology, claims: object) -> list[dict[str, Any]]:
+    """Keep only claims for a native inverter still in the saved topology."""
+    wanted = [{"host": i.gateway_host, "port": i.gateway_port, "unit_id": i.gateway_unit_id}
+              for i in topology.inverters if i.transport == "native"]
+    return [c for c in claims if c in wanted] if isinstance(claims, list) else []
 
 
 def _id_select_schema(ids: list[str]) -> probatio.Schema:
@@ -293,6 +311,8 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
     """Solcast allowance and the site topology; each save reloads the entry."""
 
     _draft: dict[str, list[dict[str, Any]]] | None = None
+    _native_item: Inverter | None = None
+    _claims: list[dict[str, Any]] | None = None
     _edit_index: int | None = None
     _load_kind: str | None = None
 
@@ -300,7 +320,33 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
         self, user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
         """Choose between the Solcast allowance and the topology editor."""
-        return self.async_show_menu(step_id="init", menu_options=["solcast", "topology"])
+        return self.async_show_menu(step_id="init", menu_options=["solcast", "topology", "manual"])
+
+    async def async_step_manual(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Set the household-clock deadline for future manual handovers only."""
+        schema = probatio.Schema({
+            probatio.Required(
+                "manual_until_time", default=self.config_entry.options.get(
+                    "manual_until_time", "07:00"),
+            ): probatio.Match(r"^(?:[01]\d|2[0-3]):[0-5]\d$"),
+            probatio.Required("household_time_zone", default=self.config_entry.options.get(
+                "household_time_zone", "Europe/London"),
+            ): str,
+        })
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                clean = schema(user_input)
+                ZoneInfo(clean["household_time_zone"])
+            except (probatio.Invalid, ZoneInfoNotFoundError, ValueError):
+                errors = {"base": "invalid_manual_time"}
+            else:
+                return self.async_create_entry(
+                    title="", data={**self.config_entry.options, **clean},
+                )
+        return self.async_show_form(step_id="manual", data_schema=schema, errors=errors)
 
     async def async_step_solcast(
         self, user_input: dict[str, Any] | None = None,
@@ -389,6 +435,10 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
             probatio.Required(
                 "nominal_voltage_v", default=defaults.get("nominal_voltage_v")
             ): _NUMBER,
+            probatio.Required(
+                "one_way_charge_efficiency",
+                default=defaults.get("one_way_charge_efficiency", 0.949),
+            ): _NUMBER,
             probatio.Required("min_soc", default=defaults.get("min_soc")): _NUMBER,
             probatio.Required("target_cap", default=defaults.get("target_cap")): _NUMBER,
             probatio.Required("charge_limit_a", default=defaults.get("charge_limit_a", 0)): _NUMBER,
@@ -414,6 +464,14 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                 "discharge_limit_a", default=defaults.get("discharge_limit_a", 0)
             ): _NUMBER,
             probatio.Required("confirmed", default=defaults.get("confirmed", False)): _BOOLEAN,
+            probatio.Required(
+                "transport", default=defaults.get("transport", "legacy")
+            ): SelectSelector(SelectSelectorConfig(options=["legacy", "native"])),
+            probatio.Optional("gateway_host"): _TEXT,
+            probatio.Required("gateway_port", default=defaults.get("gateway_port", 502)): _NUMBER,
+            probatio.Required(
+                "gateway_unit_id", default=defaults.get("gateway_unit_id", 1)
+            ): _NUMBER,
             probatio.Optional("grid_port_power_entity"): _ENTITY,
             probatio.Optional("battery_power_entity"): _ENTITY,
             probatio.Required(
@@ -746,9 +804,61 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
         self, user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
         """Validate and store one inverter."""
-        return await self._async_item_step(
+        result = await self._async_item_step(
             "inverters_item", "inverters", Inverter, user_input, self._inverter_schema
         )
+        if result["type"] == "menu" and user_input and user_input.get("transport") == "native":
+            item = next(i for i in self._topology_draft["inverters"]
+                        if i["id"] == user_input["id"])
+            self._native_item = Inverter.model_validate(item)
+            return await self.async_step_native_connect()
+        return result
+
+    async def async_step_native_connect(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Explicitly confirm sole-client ownership; a failed probe remains savable."""
+        inverter = self._native_item
+        if inverter is None:
+            return await self.async_step_inverters()
+        if user_input is None:
+            return self.async_show_form(step_id="native_connect", data_schema=probatio.Schema({}))
+        coordinator = (getattr(self.config_entry, "runtime_data", None)
+                       if self.config_entry.state is ConfigEntryState.LOADED else None)
+        key = (inverter.gateway_host, inverter.gateway_port)
+        transport = coordinator.native.transports.get(key) if coordinator else None
+        temporary = transport is None
+        if transport is None:
+            assert inverter.gateway_host is not None
+            transport = native.transport_factory(inverter.gateway_host, inverter.gateway_port)
+        try:
+            # Validation is never persisted; setup probes again after the reload.
+            if coordinator and not temporary:
+                resident = coordinator.native.inverters.get(inverter.id)
+                if (resident is not None and resident.gateway_host == inverter.gateway_host
+                        and resident.gateway_port == inverter.gateway_port
+                        and resident.gateway_unit_id == inverter.gateway_unit_id):
+                    await coordinator.async_reprobe(inverter.id)
+                else:
+                    async with coordinator.native.lock:
+                        probe = await native.async_probe(transport, inverter.gateway_unit_id)
+                    # Gateway caching seen here fences the resident devices at once.
+                    coordinator.native.record_caching(inverter, probe)
+                    coordinator.native.recheck()
+            else:
+                await native.async_probe(transport, inverter.gateway_unit_id)
+        finally:
+            if temporary:
+                await transport.close()
+        if self._claims is None:
+            raw = self.config_entry.options.get("gateway_claims", [])
+            self._claims = list(raw) if isinstance(raw, list) else []
+        claim = {"host": inverter.gateway_host, "port": inverter.gateway_port,
+                 "unit_id": inverter.gateway_unit_id}
+        if claim not in self._claims:
+            self._claims.append(claim)
+        self._native_item = None
+        return await self.async_step_inverters()
 
     async def async_step_inverters_remove(
         self, user_input: dict[str, Any] | None = None,
@@ -919,10 +1029,34 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                 step_id="save", errors={"base": "invalid_topology"},
                 data_schema=probatio.Schema({}),
             )
+        from .ownership import derived_owner
+
+        coordinator = getattr(self.config_entry, "runtime_data", None)
+        target = derived_owner(topology.model_dump(mode="json"))
+        if coordinator is None:
+            if target != "addon":
+                return self.async_show_form(
+                    step_id="save", errors={"base": "ownership_peer_version"},
+                    data_schema=probatio.Schema({}),
+                )
+        else:
+            summary = coordinator.summary if coordinator.connected else None
+            reason = await coordinator.ownership.async_request(
+                target, summary,
+                latest=lambda: coordinator.summary if coordinator.connected else None,
+            )
+            if reason is not None:
+                return self.async_show_form(
+                    step_id="save", errors={"base": reason}, data_schema=probatio.Schema({}),
+                )
         revision = self.config_entry.options.get("topology_revision")
         return self.async_create_entry(title="", data={
             **self.config_entry.options,
             "topology": topology.model_dump(mode="json"),
+            "gateway_claims": _current_claims(
+                topology, self._claims if self._claims is not None
+                else self.config_entry.options.get("gateway_claims", []),
+            ),
             "topology_revision": revision + 1 if type(revision) is int else 1,
         })
 

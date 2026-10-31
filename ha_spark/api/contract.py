@@ -21,6 +21,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validato
 
 from ha_spark import __version__
 from ha_spark.api.plan_status import PlanStatus, resolve
+from ha_spark.api.snapshot_v4 import SnapshotV4
 from ha_spark.api.topology_intake import MajorLoadReading, SupplyGuardBlock
 from ha_spark.authority import AuthorityState, HoldRecord
 from ha_spark.config import Settings
@@ -33,8 +34,8 @@ from ha_spark.energy.topology import MajorLoadObservation
 from ha_spark.energy.topology_record import LoadedTopology
 from ha_spark.energy.v2l import V2LSession, delivered_fraction, savings
 
-API_VERSION: Final = 3
-SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3})
+API_VERSION: Final = 4
+SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3, 4})
 
 
 class SiteSnapshot(BaseModel):
@@ -87,6 +88,30 @@ class IntegrationLink:
     supply_guard: SupplyGuardBlock | None = None
     major_loads_reason: str | None = None
     supply_guard_reason: str | None = None
+    v4: SnapshotV4 | None = None
+    authority_identity: str | None = None
+    authority_epoch: int | None = None
+
+
+def snapshot_acceptable(
+    previous: IntegrationLink, snapshot: SiteSnapshot, now: datetime,
+    *, paired_site: str | None = None, v4: SnapshotV4 | None = None,
+) -> bool:
+    """Check pairing, clock, ordering and authority monotonicity without mutation."""
+    if abs((snapshot.sent_at - now).total_seconds()) > 300:
+        return False
+    if paired_site is not None and snapshot.site_id != paired_site:
+        return False
+    if previous.snapshot is not None and (
+        snapshot.site_id != previous.snapshot.site_id
+        or snapshot.sent_at < previous.snapshot.sent_at
+    ):
+        return False
+    authority = v4.authority if v4 else None
+    return not (
+        authority is not None and authority.store_identity == previous.authority_identity
+        and previous.authority_epoch is not None and authority.epoch < previous.authority_epoch
+    )
 
 
 def major_load_observations(link: IntegrationLink) -> tuple[MajorLoadObservation, ...]:
@@ -118,6 +143,12 @@ def link_view(link: IntegrationLink, now: datetime) -> dict[str, object]:
         )
     return {
         **solar,
+        "devices": [
+            {"id": device.id, "transport": device.transport,
+             "validation": device.validation, "reason": device.reason}
+            for device in link.v4.devices
+        ] if link.v4 is not None and link.v4.devices_reason is None else None,
+        "authority_owner": link.v4.owner if link.v4 is not None else "addon",
         "topology_source": link.topology.kind,
         "topology_revision": link.topology.revision,
         "topology_reason": link.topology.reason,
@@ -155,7 +186,7 @@ def plan_summary(
     plan: ChargePlan | None = None, plan_at: datetime | None = None,
     soc_observation_ok: bool = False, session: V2LSession | None = None,
     settings: Settings | None = None, authority: AuthorityInputs | None = None,
-    guard_limited: bool = False,
+    guard_limited: bool = False, topology: LoadedTopology | None = None,
 ) -> dict[str, object]:
     """Project the envelope and allowlisted display numbers for the request's api_version."""
     result: dict[str, object] = {
@@ -188,6 +219,31 @@ def plan_summary(
     if api_version >= 3 and settings is not None:
         # Omitted rather than guessed: the integration then keeps HA's configured zone.
         result["household_timezone"] = settings.timezone
+    if api_version >= 4:
+        inputs = authority or AuthorityInputs(None, False, False)
+        state = inputs.state if inputs.known else None
+        result["addon_authority"] = {
+            "active": "active",
+            "mode": state.committed_mode if state else "authority_unknown",
+            "holds_present": bool(state.holds) if state else False,
+            "store_state": ("save_failed" if inputs.save_failed else "ok" if state else "unknown"),
+        }
+        if settings is not None:
+            from ha_spark.authority import retirement_status
+
+            retired = retirement_status(settings)
+            if retired is not None and not inputs.save_failed:
+                result["addon_authority"] = {
+                    "active": retired, "mode": "observe", "holds_present": False,
+                    "store_state": "ok",
+                }
+        result["legacy_overlay"] = {
+            inverter.id: bool(settings and settings.solis_control_hub
+                              and inverter.driver_kind == "solis")
+            for inverter in (topology.topology.inverters
+                             if topology is not None and topology.topology is not None else ())
+        }
+        result["export_acks"] = []
     return result
 
 

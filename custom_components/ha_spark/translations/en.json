@@ -1,5 +1,88 @@
 {
+  "exceptions": {
+    "not_available": {"message": "This command is not available yet."},
+    "stale_session": {"message": "The command belongs to an earlier add-on session."},
+    "stale_authority": {"message": "Authority changed before this command could run."},
+    "replayed": {"message": "This command sequence was already consumed."},
+    "stale_epoch": {"message": "Authority changed. Refresh its epoch before making a new request."},
+    "preconditions_unmet": {"message": "The native mode preconditions have not all been met."},
+    "native_device_missing": {"message": "No configured native inverter matches this request."},
+    "not_owner": {"message": "Only a non-system administrator on an integration-owned site may do this."},
+    "authority_unknown": {"message": "Authority is unknown. Confirm Observe through the repair before writing."},
+    "transition_in_progress": {"message": "An authority transition is still in progress."},
+    "no_manual_session": {"message": "There is no manual session to resume."},
+    "not_in_active_mode": {"message": "Manual control requires Protect or Optimise and no existing manual session."},
+    "invalid_household_zone": {"message": "Configure a valid household time zone before choosing until tomorrow."}
+  },
+  "services": {
+    "commands_pending": {"name": "Commands pending", "description": "Prompt a fetch from the authenticated add-on channel. Accepts no command data."},
+    "reprobe": {"name": "Re-probe Solis", "description": "Re-read identity and test gateway caching (administrator only).", "fields": {"inverter_id": {"name": "Inverter", "description": "Configured topology inverter identifier."}}},
+    "set_observe": {"name": "Set Observe", "description": "Make a verified handover to Observe."},
+    "start_manual_control": {
+      "name": "Start manual control", "description": "Temporarily hand over controls to the owner.",
+      "fields": {
+        "duration": {"name": "Duration", "description": "One hour, next household-clock morning, or until resumed."},
+        "keep_protection": {"name": "Keep protection", "description": "Keep battery-to-car protection during manual control."}
+      }
+    },
+    "resume_control": {"name": "Resume control", "description": "End manual control using current conditions."}
+  },
   "issues": {
+    "native_unreachable": {"title": "Solis gateway unreachable", "description": "Check gateway connectivity, then Re-probe. The device remains read-only."},
+    "native_identity_read_failed": {"title": "Solis identity probe failed", "description": "Identity or caching could not be verified. Check connectivity and Re-probe. The device remains read-only."},
+    "native_unvalidated_identity": {"title": "Solis identity not validated", "description": "This identity is not in the validated allow-list. The device remains read-only."},
+    "native_v2_tou_firmware": {"title": "Unsupported Solis TOU firmware", "description": "V2 TOU firmware is read-only. Do not enable automatic control."},
+    "native_caching_on": {"title": "Gateway caching detected", "description": "Disable gateway storage mode, then Re-probe. Read-back is not trustworthy while caching is on."},
+    "native_gateway_not_owned": {"title": "Solis gateway not owned", "description": "Confirm the gateway claim in native setup, complete the authority handshake and remove the legacy overlay. Reads continue; writes remain blocked."},
+    "ownership_peer_version": {
+      "title": "Authority switch refused",
+      "description": "Switching authority requires a v4 add-on with known authority. Restore a compatible peer and retry, or revert the topology."
+    },
+    "ownership_store_unknown": {
+      "title": "Authority switch refused",
+      "description": "The authority or ownership store must be known before switching. Recover the store and retry, or revert the topology."
+    },
+    "ownership_observe_required": {
+      "title": "Authority switch refused",
+      "description": "Both authorities must be in Observe before switching. Set Observe and retry, or revert the topology."
+    },
+    "ownership_holds_present": {
+      "title": "Authority switch refused",
+      "description": "Clear every hold before switching authority. Holds are never migrated. Retry when clear, or revert the topology."
+    },
+    "ownership_transition_present": {
+      "title": "Authority switch refused",
+      "description": "Finish the authority transition before switching. Retry when complete, or revert the topology."
+    },
+    "ownership_manual_present": {
+      "title": "Authority switch refused",
+      "description": "End manual control before switching authority. Retry when complete, or revert the topology."
+    },
+    "ownership_switch_pending": {
+      "title": "Authority switch refused",
+      "description": "An authority switch is already pending. Wait for the v4 handshake before retrying."
+    },
+    "ownership_save_failed": {
+      "title": "Authority switch refused",
+      "description": "Ownership could not be saved and verified. All native writes remain blocked. Recover the store before retrying."
+    },
+    "authority_unknown": {
+      "title": "ha-spark authority is unknown",
+      "description": "The integration cannot verify its authority store. No native writes are permitted. Confirm Observe to recover, then re-escalate through readiness.",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Confirm Observe",
+            "description": "Reset the integration authority to Observe with a new identity. This writes no hardware and does not change the add-on's authority."
+          }
+        },
+        "error": {"save_failed": "The authority save could not be verified. No writes are permitted. Try again."},
+        "abort": {
+          "entry_unavailable": "The config entry is not loaded.",
+          "authority_known": "Authority is already known. This repair cannot change its mode."
+        }
+      }
+    },
     "api_version_skew": {
       "title": "ha-spark API versions are incompatible",
       "description": "The ha-spark add-on release {addon_release} speaks API version {addon_api_version} (supported: {addon_supported}). The integration sent API version {integration_api_version} and supports: {supported}. Update the add-on or integration so they support a common API version, then restart the updated half."
@@ -7,6 +90,10 @@
   },
   "entity": {
     "binary_sensor": {
+      "input_33132_b5": {"name": "Grid charge permitted"},
+      "holding_43073_b4": {"name": "Export limit enabled"},
+      "gateway_connected": {"name": "Connectivity"},
+      "gateway_claim": {"name": "Ownership claim"},
       "fallback_active": {"name": "Fallback active"},
       "ev_hold": {"name": "EV hold"},
       "dispatch_hold": {"name": "Dispatch hold"},
@@ -16,15 +103,81 @@
       }
     },
     "sensor": {
+      "native_bank_soc": {"name": "SoC"},
+      "input_33000_identity": {"name": "Identity"},
+      "native_register": {"name": "Register {address}"},
+      "input_33029": {"name": "PV total energy"},
+      "input_33031": {"name": "PV month energy"},
+      "input_33033": {"name": "PV last month energy"},
+      "input_33037": {"name": "PV year energy"},
+      "input_33039": {"name": "PV last year energy"},
+      "input_33035": {"name": "PV today energy"},
+      "input_33036": {"name": "PV yesterday energy"},
+      "input_33049": {"name": "PV1 voltage"},
+      "input_33050": {"name": "PV1 current"},
+      "input_33051": {"name": "PV2 voltage"},
+      "input_33052": {"name": "PV2 current"},
+      "input_33053": {"name": "PV3 voltage"},
+      "input_33054": {"name": "PV3 current"},
+      "input_33055": {"name": "PV4 voltage"},
+      "input_33056": {"name": "PV4 current"},
+      "input_33057": {"name": "PV power"},
+      "input_33126": {"name": "Meter total active energy"},
+      "input_33128": {"name": "Meter voltage"},
+      "input_33129": {"name": "Meter current"},
+      "input_33130": {"name": "Meter active power"},
+      "input_33161": {"name": "Battery charge total energy"},
+      "input_33163": {"name": "Battery charge today energy"},
+      "input_33164": {"name": "Battery charge yesterday energy"},
+      "input_33165": {"name": "Battery discharge total energy"},
+      "input_33167": {"name": "Battery discharge today energy"},
+      "input_33168": {"name": "Battery discharge yesterday energy"},
+      "input_33169": {"name": "Grid import total energy"},
+      "input_33171": {"name": "Grid import today energy"},
+      "input_33172": {"name": "Grid import yesterday energy"},
+      "input_33173": {"name": "Grid export total energy"},
+      "input_33175": {"name": "Grid export today energy"},
+      "input_33176": {"name": "Grid export yesterday energy"},
+      "input_33177": {"name": "Consumption total energy"},
+      "input_33179": {"name": "Consumption today energy"},
+      "input_33180": {"name": "Consumption yesterday energy"},
+      "input_33186": {"name": "AC grid port fed-in energy"},
+      "input_33188": {"name": "AC grid port consumption energy"},
+      "input_33133": {"name": "Battery voltage"},
+      "input_33134": {"name": "Battery current"},
+      "input_33135": {"name": "Battery direction", "state": {"charge": "Charge", "discharge": "Discharge"}},
+      "input_33136": {"name": "Battery register 33136"},
+      "input_33137": {"name": "Battery register 33137"},
+      "input_33138": {"name": "Battery register 33138"},
+      "input_33139": {"name": "Battery SoC"},
+      "input_33140": {"name": "Battery SoH"},
+      "input_33141": {"name": "BMS voltage"},
+      "input_33142": {"name": "BMS current"},
+      "input_33143": {"name": "BMS charge current"},
+      "input_33144": {"name": "BMS discharge current"},
+      "input_33147": {"name": "Household load power"},
+      "input_33148": {"name": "Backup load power"},
+      "input_33149_signed": {"name": "Battery power"},
+      "input_33151": {"name": "Grid-port power"},
+      "input_33022": {"name": "Inverter clock"},
+      "holding_43074": {"name": "Export limit"},
+      "gateway_caching": {"name": "Caching probe"},
       "operating_mode": {
         "name": "Operating mode",
         "state": {
           "observe": "Observe",
           "protect": "Protect",
           "optimise": "Optimise",
+          "activating": "Activating",
+          "switching_to_observe": "Switching to Observe",
           "authority_unknown": "Authority unknown"
         }
       },
+      "manual_session": {
+        "name": "Manual session",
+        "state": {"none": "None", "active": "Active"}
+      },
+      "authority_epoch": {"name": "Authority epoch"},
       "charge_needed": {
         "name": "Charge needed"
       },
@@ -71,6 +224,7 @@
   },
   "options": {
     "error": {
+      "invalid_manual_time": "Enter a valid HH:MM deadline and household time zone.",
       "invalid_number": "Enter a finite number.",
       "out_of_range": "Enter a number in the valid range for this field.",
       "invalid_id": "Use 1-64 letters, numbers, underscores or hyphens.",
@@ -87,6 +241,15 @@
       "incomplete_topology": "The site needs at least one connection, bank and inverter.",
       "invalid_topology": "The topology is not valid. Check the entries and try again.",
       "invalid_item": "This entry is not valid.",
+      "invalid_native_gateway": "Native transport requires a Solis inverter and a gateway host.",
+      "ownership_peer_version": "Switching authority requires a connected v4 add-on with known authority.",
+      "ownership_store_unknown": "The authority or ownership store must be known before switching.",
+      "ownership_observe_required": "Set the current authority to Observe before switching.",
+      "ownership_holds_present": "Clear every hold before switching authority. Holds are never migrated.",
+      "ownership_transition_present": "Finish the authority transition before switching.",
+      "ownership_manual_present": "End manual control before switching authority.",
+      "ownership_switch_pending": "An authority switch is already pending. Wait for the v4 handshake.",
+      "ownership_save_failed": "Ownership could not be saved and verified. All native writes remain blocked.",
       "remove_last": "The site needs at least one of these; it cannot be removed.",
       "connection_in_use": "Banks or major loads still use this connection.",
       "bank_in_use": "Inverters or a V2L charger still use this bank."
@@ -96,8 +259,14 @@
         "title": "ha-spark options",
         "menu_options": {
           "solcast": "Solcast daily allowance",
+          "manual": "Manual control deadline",
           "topology": "Site topology and limits"
         }
+      },
+      "manual": {
+        "title": "Manual control deadline",
+        "description": "Until tomorrow resolves to the next occurrence of this household-clock time. Existing deadlines do not change.",
+        "data": {"manual_until_time": "Household-clock time", "household_time_zone": "Household time zone"}
       },
       "solcast": {
         "title": "Solcast daily allowance",
@@ -162,6 +331,7 @@
           "connection_id": "Grid connection",
           "usable_capacity_kwh": "Usable capacity (kWh)",
           "nominal_voltage_v": "Nominal DC voltage (V)",
+          "one_way_charge_efficiency": "One-way charge efficiency (0–1)",
           "min_soc": "Minimum SoC (%)",
           "target_cap": "Target cap (%)",
           "charge_limit_a": "DC charge limit (A)",
@@ -187,13 +357,18 @@
           "inverters_done": "Back to the topology"
         }
       },
+      "native_connect": {"title": "Connect native Solis", "description": "Confirm that all other Modbus clients and the legacy overlay are disconnected. Continuing probes identity and gateway caching and records your gateway ownership claim when you save. An unreachable device can be saved read-only; setup probes again after saving."},
       "inverters_item": {
         "title": "Inverter",
-        "description": "One inverter with its owner-entered DC limits. Unconfirmed limits count as zero.",
+        "description": "One inverter with its owner-entered DC limits. Unconfirmed limits count as zero. Native Solis inverters go through a connect step and remain read-only until validated.",
         "data": {
           "id": "Identifier",
           "bank_id": "Battery bank",
           "driver_kind": "Driver",
+          "transport": "Transport",
+          "gateway_host": "Native gateway host",
+          "gateway_port": "Native gateway TCP port",
+          "gateway_unit_id": "Native Modbus unit id",
           "charge_limit_a": "DC charge limit (A)",
           "discharge_limit_a": "DC discharge limit (A)",
           "confirmed": "Limits confirmed",

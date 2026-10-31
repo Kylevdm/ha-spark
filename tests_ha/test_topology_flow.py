@@ -53,7 +53,7 @@ async def open_topology(hass: HomeAssistant, entry: MockConfigEntry) -> Any:
     result = await hass.config_entries.options.async_init(entry.entry_id)
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "init"
-    assert result["menu_options"] == ["solcast", "topology"]
+    assert result["menu_options"] == ["solcast", "topology", "manual"]
     result = await choose(hass, result["flow_id"], "topology")
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "topology"

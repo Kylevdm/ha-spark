@@ -219,6 +219,9 @@ async def test_missing_timer_uses_reserve_excluding_running_loads(
 ) -> None:
     freezer.move_to("2026-10-29T12:00:00+00:00")
     site = topology()
+    site = site.model_copy(update={"banks": tuple(
+        b.model_copy(update={"one_way_charge_efficiency": 1.0}) for b in site.banks
+    )})
     grid = site.connections[0].model_copy(update={"grid_power_entity": "sensor.grid"})
     inv = site.inverters[0].model_copy(update={"grid_port_power_entity": "sensor.inverter"})
     load = MajorLoad(id="ev", connection_id=grid.id, kind="ev_charger", demand_kw=2,
