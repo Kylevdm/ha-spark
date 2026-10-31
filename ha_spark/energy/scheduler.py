@@ -55,7 +55,7 @@ after the recovered plan applied and read back. Observe and Protect still
 count and persist pending failure and threshold crossings but never
 request a fallback write.
 
-Owner mode requests are accepted only here, persisted under the inverter bus
+Add-on-owned mode requests are accepted here, persisted under the inverter bus
 lock before handover work. Stored steps resume after restart; partial failures
 remain visible and retry on the next tick. Optimise activation always applies a
 fresh plan without a preview baseline, and completes only on typed verification.
@@ -1648,7 +1648,7 @@ async def _accept_mode(
     store = channel.authority
     assert store is not None
     request = pending.request
-    if request.target is None:
+    if request.target is None or request.target in ("manual", "resume"):
         return Reply(error="invalid mode request")
     known = store.known and not store.save_failed
     if known and request.expected_epoch is None:

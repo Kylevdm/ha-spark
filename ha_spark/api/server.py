@@ -35,10 +35,11 @@ import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictInt, StrictStr, ValidationError
 
 from ha_spark.agent import auth, tools
 from ha_spark.agent.exposure import OPERATION_TIERS, allowed, surface_on
+from ha_spark.api.commands import CommandQueue, CommandResult, FetchRequest, Kind
 from ha_spark.api.contract import (
     SUPPORTED_API_VERSIONS,
     AuthorityInputs,
@@ -58,13 +59,19 @@ from ha_spark.api.timeline import household_midnight, timeline_payload
 from ha_spark.api.topology_intake import accept_topology, parse_major_loads, parse_supply_guard
 from ha_spark.authority import (
     AuthorityStore,
-    OperatingMode,
     authority_view,
     load_authority,
     retirement_status,
 )
 from ha_spark.config import ConfigError, Settings
-from ha_spark.daemon_channel import CONFIGURATION_REPAIR, DaemonChannel
+from ha_spark.daemon_channel import (
+    CONFIGURATION_REPAIR,
+    DaemonChannel,
+    Duration,
+    ModeTarget,
+    Reply,
+)
+from ha_spark.daemon_channel import Request as DaemonRequest
 from ha_spark.devices.execution import execution_context
 from ha_spark.energy import v2l
 from ha_spark.energy.carbon import carbon_payload
@@ -81,6 +88,7 @@ from ha_spark.energy.solar_source import (
     save_solar_source_kind,
 )
 from ha_spark.energy.topology_record import load_topology_record
+from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.integration_discovery import IntegrationDiscovery
 from ha_spark.logging import get_logger
 from ha_spark.mode_preconditions import entry_preconditions
@@ -123,8 +131,10 @@ _PAGE_HEADERS = {
 
 class ModeBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    target: OperatingMode
+    target: ModeTarget
     expected_epoch: int | None = Field(ge=1, strict=True)
+    duration: Duration = "one_hour"
+    keep_protection: bool = Field(default=True, strict=True)
 
 
 class ConfigBody(BaseModel):
@@ -168,8 +178,82 @@ class AppState:
             None, None, False, ParsedSolarForecast(load_solar_source_kind(settings)),
             topology=load_topology_record(settings),
         )
+        self.commands = CommandQueue("")
         self.loop_tick: datetime | None = None
         self.soc_observation_ok: bool = False
+        if executor is not None:
+            executor.native_request = self.native_request
+            executor.native_status = self.native_status
+
+    def native_status(self) -> dict[str, Any] | None:
+        link = self.integration_link
+        if link.v4 is None or link.v4.owner != "integration":
+            return None
+        # The mode page and health read the add-on view's keys; the integration
+        # checks entry preconditions itself when it runs the request.
+        unchecked = {"passed": False, "reasons": ["checked by the integration when requested"]}
+        base: dict[str, Any] = {
+            "authority_owner": "integration", "save_failed": False, "transition": None,
+            "failing_actions": [], "holds": [], "last_changed_at": None, "requester_kind": None,
+            "preconditions": {target: dict(unchecked)
+                              for target in ("observe", "protect", "optimise")},
+        }
+        authority = link.v4.authority
+        if (authority is None or link.received_at is None or link.skew
+                or (_heartbeat_now() - link.received_at).total_seconds() > 90):
+            return {**base, "mode": "authority_unknown", "epoch": None}
+        view = {**base, **authority.model_dump(mode="json")}
+        view["save_failed"] = authority.store_state == "save_failed"
+        view["holds"] = [hold.model_dump(mode="json") for hold in link.v4.holds]
+        if authority.transition is not None:
+            view["failing_actions"] = list(authority.transition.failing_actions)
+        if authority.store_state != "ok":
+            view["mode"] = "authority_unknown"
+        view["command_results"] = [r.model_dump(mode="json")
+                                   for r in self.commands.results.values()]
+        return view
+
+    async def native_request(self, request: DaemonRequest, user: str | None) -> Reply | None:
+        view = self.native_status()
+        if view is None:
+            return None
+        if view["mode"] == "authority_unknown":
+            return Reply(error="authority_unknown")
+        payload: dict[str, JsonValue] = {
+            "requester_kind": "ingress" if user is not None else "cli", "user_id": user,
+        }
+        kind: Kind = "sync_clock"
+        if request.op == "mode":
+            if request.expected_epoch is None:
+                return Reply(error="stale_epoch")
+            kind = "manual" if request.target in ("manual", "resume") else "transition"
+            payload.update(target=request.target, expected_epoch=request.expected_epoch)
+            if kind == "manual":
+                payload.update(duration=request.duration, keep_protection=request.keep_protection)
+        try:
+            command = self.commands.enqueue(
+                epoch=view["epoch"], kind=kind, payload=payload,
+            )
+        except ValueError:
+            return Reply(error="not_available")
+        try:
+            async with asyncio.timeout(10):
+                # The nudge has no command data and grants no permission.
+                async with HomeAssistantRest(self.settings.ha_rest_url, self.settings.auth_token,
+                                             timeout=1) as rest:
+                    try:
+                        await rest.call_service("ha_spark", "commands_pending")
+                    except Exception:
+                        pass
+                result = await self.commands.wait(command.sequence)
+        except TimeoutError:
+            result = None
+        if result is None:
+            return Reply(error="pending", text="request queued; reload the mode status")
+        if result.outcome not in ("applied", "unchanged"):
+            return Reply(error=result.reason or result.outcome, reasons=list(result.reasons))
+        return Reply(authority={**(self.native_status() or view),
+                                "command_result": result.model_dump(mode="json")})
 
     def integration_link_view(self) -> dict[str, object]:
         """Read the current link without affecting authority or planning."""
@@ -419,6 +503,8 @@ def build_app(
     if ingress_peer is not None:
         app.add_middleware(_PeerGate, peer=ingress_peer)
     if integration is not None:
+        if state.commands.session_id != integration.session_id:
+            state.commands = CommandQueue(integration.session_id)
         app.add_middleware(_IntegrationGate, state=state, integration=integration)
 
     if require_token:
@@ -461,6 +547,9 @@ def build_app(
                 return JSONResponse(
                     st.executor.authority_status(), headers={"Cache-Control": "no-store"},
                 )
+            if st.native_status() is not None:
+                return JSONResponse(st.executor.authority_status(),
+                                    headers={"Cache-Control": "no-store"})
             preconditions = await entry_preconditions(st.settings)
             # Snapshot after the diagnostic reads; preconditions never grant authority.
             view = dict(st.executor.authority_status())
@@ -476,21 +565,32 @@ def build_app(
                 body = ModeBody.model_validate(await request.json())
             except (ValueError, ValidationError):
                 return JSONResponse({"error": "invalid mode request"}, status_code=400)
-            executor = _state_of(request).executor
+            st = _state_of(request)
+            if body.target in ("manual", "resume") and st.native_status() is None:
+                return JSONResponse({"error": "invalid mode request"}, status_code=400)
+            executor = st.executor
             if executor is None:
                 return JSONResponse({"error": "no daemon executor"}, status_code=503)
             try:
-                # Accepted within one daemon tick; a later verdict still lands in the store.
-                reply = await asyncio.wait_for(executor.submit_mode(
-                    body.target, body.expected_epoch, ingress_user=user,
-                ), timeout=_MODE_REPLY_TIMEOUT_S)
+                # Keep the legacy request signature and tick-sized timeout unchanged.
+                if body.target in ("manual", "resume"):
+                    submitted = executor.submit_mode(
+                        body.target, body.expected_epoch, ingress_user=user,
+                        duration=body.duration, keep_protection=body.keep_protection,
+                    )
+                else:
+                    submitted = executor.submit_mode(
+                        body.target, body.expected_epoch, ingress_user=user,
+                    )
+                reply = await asyncio.wait_for(submitted, timeout=_MODE_REPLY_TIMEOUT_S)
             except TimeoutError:
                 return JSONResponse(
                     {"error": "pending", "detail": "request queued; reload the mode status"},
                     status_code=504,
                 )
             if reply.error:
-                status = 409 if reply.error in ("stale_epoch", "transition_in_progress") else 400
+                status = (504 if reply.error == "pending" else 409 if reply.error in (
+                    "stale_epoch", "stale_authority", "transition_in_progress") else 400)
                 return JSONResponse(
                     {"error": reply.error, "detail": reply.text, "reasons": reply.reasons},
                     status_code=status,
@@ -758,6 +858,36 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
     # No slash redirect: its Location would echo the request's query string.
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
 
+    async def command_body(request: Request, cap: int) -> object:
+        length = request.headers.get("content-length")
+        if length is not None and int(length) > cap:
+            raise ValueError
+        body = bytearray()
+        async with asyncio.timeout(_HEARTBEAT_BODY_TIMEOUT_S):
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > cap:
+                    raise ValueError
+                body.extend(chunk)
+        return json.loads(body, parse_constant=_reject_constant)
+
+    @app.post("/integration/commands/fetch")
+    async def fetch_commands(request: Request) -> JSONResponse:
+        try:
+            body = FetchRequest.model_validate(await command_body(request, 65536))
+            reply = state.commands.fetch(body)
+        except Exception:  # fixed response, including disconnected or malformed streams
+            return JSONResponse({"error": "invalid command request"}, status_code=400)
+        return JSONResponse(reply.model_dump(), headers={"Cache-Control": "no-store"})
+
+    @app.post("/integration/commands/result")
+    async def command_result(request: Request) -> JSONResponse:
+        try:
+            result = CommandResult.model_validate(await command_body(request, 16384))
+            state.commands.accept(result)
+        except Exception:  # never expose a stream, validation or handler exception
+            return JSONResponse({"error": "invalid command request"}, status_code=400)
+        return JSONResponse({"accepted": True}, headers={"Cache-Control": "no-store"})
+
     @app.post("/integration/heartbeat")
     async def heartbeat(request: Request) -> JSONResponse:
         invalid = JSONResponse({"error": "invalid heartbeat"}, status_code=400)
@@ -880,6 +1010,8 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
             settings=state.settings, authority=authority,
             guard_limited=guard is not None and guard.limiting, topology=topology,
         )
+        if v4 is not None and v4.owner == "integration":
+            summary["commands_pending"] = bool(state.commands.pending)
         if handshake_failed:
             summary["addon_authority"] = {
                 "active": "active", "mode": "authority_unknown", "holds_present": False,

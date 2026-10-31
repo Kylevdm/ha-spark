@@ -13,7 +13,25 @@ from pytest_homeassistant_custom_component.test_util.aiohttp import (
 from yarl import URL as YarlURL
 
 from custom_components.ha_spark import wire
+from custom_components.ha_spark.commands import Command, CommandResult, FetchReply, FetchRequest
 from tests_ha.test_polling import URL, fixture, setup, state_value
+
+
+@pytest.mark.parametrize("kind", ["transition", "manual", "sync_clock", "reprobe", "apply",
+                                  "supervise_export", "end_supervision"])
+def test_command_golden(kind: str) -> None:
+    body = fixture(f"command_{kind}")
+    command = Command.model_validate(body)
+    assert command.model_dump() == body
+    reply = FetchReply(session_id=command.session_id, commands=[command])
+    assert len(reply.model_dump_json().encode()) < 65536
+
+
+def test_command_result_and_fetch_golden() -> None:
+    result = fixture("command_result")
+    assert CommandResult.model_validate(result).model_dump() == result
+    request = fixture("command_fetch")
+    assert FetchRequest.model_validate(request).model_dump() == request
 
 
 def test_v4_snapshot_golden() -> None:

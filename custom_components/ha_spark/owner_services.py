@@ -18,12 +18,17 @@ if TYPE_CHECKING:
     from . import SparkConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
-SERVICES = ("set_observe", "start_manual_control", "resume_control", "reprobe")
+SERVICES = ("set_observe", "start_manual_control", "resume_control", "reprobe",
+            "commands_pending")
 
 
 def async_register(hass: HomeAssistant) -> None:
     """Register once for the site; no escalation or expected-epoch service field."""
     async def handle(call: ServiceCall) -> ServiceResponse:
+        if call.service == "commands_pending":
+            for loaded_entry in hass.config_entries.async_loaded_entries(DOMAIN):
+                loaded_entry.runtime_data.async_commands_pending()
+            return {}
         user = (await hass.auth.async_get_user(call.context.user_id)
                 if call.context.user_id else None)
         if user is None or not user.is_admin or user.system_generated:

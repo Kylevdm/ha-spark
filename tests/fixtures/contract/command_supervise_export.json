@@ -1,0 +1,1 @@
+{"session_id":"addon-session","epoch":4,"sequence":6,"kind":"supervise_export","payload":{"requester_kind":"cli","event":{"direction":"export","start":"2026-10-31T17:00:00Z","end":"2026-10-31T18:00:00Z"},"ratings_w":{"inverter-1":3000.0}}}

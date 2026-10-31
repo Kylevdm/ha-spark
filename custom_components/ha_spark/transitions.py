@@ -38,6 +38,7 @@ class TransitionRequest(Record):
     target: Literal["observe", "protect", "optimise", "manual", "resume"]
     expected_epoch: int | None = Field(default=None, strict=True, ge=1)
     requester_kind: Literal["cli", "ingress", "service", "system"] = "system"
+    user_id: str | None = Field(default=None, strict=True, pattern=r"^[A-Za-z0-9_-]{1,64}$")
     duration: Duration = "one_hour"
     keep_protection: bool = Field(default=True, strict=True)
 

@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ha_spark.api import server, site_pairing
+from ha_spark.api.commands import Command, CommandResult, FetchReply, FetchRequest
 from ha_spark.api.contract import (
     API_VERSION,
     SUPPORTED_API_VERSIONS,
@@ -67,6 +68,23 @@ def retired_addon(state, tmp_path, monkeypatch):
 
 def post(client, body):
     return client.post("/integration/heartbeat", json=body)
+
+
+@pytest.mark.parametrize("kind", ["transition", "manual", "sync_clock", "reprobe", "apply",
+                                  "supervise_export", "end_supervision"])
+def test_command_golden(kind):
+    body = fixture(f"command_{kind}")
+    command = Command.model_validate(body)
+    assert command.model_dump() == body
+    reply = FetchReply(session_id=command.session_id, commands=[command])
+    assert len(reply.model_dump_json().encode()) < 65536
+
+
+def test_command_result_and_fetch_golden():
+    result = fixture("command_result")
+    assert CommandResult.model_validate(result).model_dump() == result
+    request = fixture("command_fetch")
+    assert FetchRequest.model_validate(request).model_dump() == request
 
 
 def test_shared_versions():

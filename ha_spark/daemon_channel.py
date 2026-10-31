@@ -1,8 +1,9 @@
 """Private fixed-operation transport; only the scheduler consumes the work queue.
 
 The owner-only socket authenticates CLI mode requests by kernel peer uid and
-0600 permissions. Socket callers cannot claim an ingress identity. Only the daemon
-loop persists grants or runs device work; ordinary work requests add no permission.
+0600 permissions. Socket callers cannot claim an ingress identity. On add-on-owned
+sites only the daemon loop persists grants or runs device work. Native owner requests
+use the authenticated command queue; ordinary work requests add no permission.
 Config requests call the shared settings service inline and never enter the work queue.
 Replan requests that arrive while one is queued and not yet started join it: every
 caller shares one run and one reply (CONTEXT.md "Replan request").
@@ -18,7 +19,7 @@ import fcntl
 import os
 import socket
 import struct
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -28,7 +29,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from ha_spark.api.contract import AuthorityInputs, IntegrationLink, link_view
 from ha_spark.authority import (
     AuthorityStore,
-    OperatingMode,
     authority_view,
     load_authority,
     resolve_data_dir,
@@ -47,6 +47,8 @@ Op = Literal[
 ]
 REFUSED = "[REFUSED] no ha-spark daemon running; hardware writes happen only inside the daemon"
 CONFIGURATION_REPAIR = "configuration_repair"
+ModeTarget = Literal["observe", "protect", "optimise", "manual", "resume"]
+Duration = Literal["one_hour", "until_tomorrow", "until_resumed"]
 
 
 class DaemonAlreadyRunning(RuntimeError):
@@ -56,8 +58,10 @@ class DaemonAlreadyRunning(RuntimeError):
 class Request(BaseModel):
     model_config = ConfigDict(extra="forbid")
     op: Op
-    target: OperatingMode | None = None
+    target: ModeTarget | None = None
     expected_epoch: int | None = Field(default=None, ge=1, strict=True)
+    duration: Duration = "one_hour"
+    keep_protection: bool = Field(default=True, strict=True)
 
     expected_revision: int | None = Field(default=None, ge=0, strict=True)
     repair_token: str | None = Field(default=None, max_length=128)
@@ -135,6 +139,8 @@ class DaemonChannel:
         self.path = resolve_data_dir(settings) / "ha_spark.sock"
         self.authority: AuthorityStore | None = None
         self.link_view: Callable[[], dict[str, object]] | None = None
+        self.native_request: Callable[[Request, str | None], Awaitable[Reply | None]] | None = None
+        self.native_status: Callable[[], dict[str, Any] | None] | None = None
         self.settings_service: SettingsService | None = None
         self.queue: asyncio.Queue[Pending] = asyncio.Queue(maxsize=64)
         # Owner mode requests skip queued work so a reply reaches the owner in one tick.
@@ -173,6 +179,8 @@ class DaemonChannel:
     async def __aexit__(self, *args: object) -> None:
         # A startup cancelled before its finally ran must not leave a departed AppState bound.
         self.link_view = None
+        self.native_request = None
+        self.native_status = None
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -209,6 +217,10 @@ class DaemonChannel:
 
     def authority_status(self) -> dict[str, Any]:
         repairing = self._repairing()
+        if not repairing and self.native_status is not None:
+            native = self.native_status()
+            if native is not None:
+                return native
         inputs = self.authority_inputs()
         view = authority_view(inputs.state, known=inputs.known, save_failed=inputs.save_failed)
         if repairing:
@@ -216,10 +228,12 @@ class DaemonChannel:
         return view
 
     async def submit_mode(
-        self, target: OperatingMode, expected_epoch: int | None, *, ingress_user: str | None = None,
+        self, target: ModeTarget, expected_epoch: int | None, *, ingress_user: str | None = None,
+        duration: Duration = "one_hour", keep_protection: bool = True,
     ) -> Reply:
         return await self._submit(
-            Request(op="mode", target=target, expected_epoch=expected_epoch), ingress_user,
+            Request(op="mode", target=target, expected_epoch=expected_epoch,
+                    duration=duration, keep_protection=keep_protection), ingress_user,
         )
 
     def next_request(self) -> Pending | None:
@@ -303,6 +317,12 @@ class DaemonChannel:
                 return Reply(error="conflict", config={"repair_token": exc.token})
             except ConfigError as exc:
                 return Reply(error="invalid configuration", reasons=[str(exc)])
+        if request.op in ("mode", "sync_clock") and self.native_request is not None:
+            native_reply = await self.native_request(request, ingress_user)
+            if native_reply is not None:
+                return native_reply
+        if request.target in ("manual", "resume"):
+            return Reply(error="not_available")
         future = asyncio.get_running_loop().create_future()
         if request.op == "replan" and self._pending_replan is not None:
             # Close-together replans join the queued one: one run, one shared reply.
@@ -354,8 +374,9 @@ class DaemonChannel:
 
 
 async def submit_socket(
-    settings: Settings, op: Op, *, target: OperatingMode | None = None,
-    expected_epoch: int | None = None,
+    settings: Settings, op: Op, *, target: ModeTarget | None = None,
+    expected_epoch: int | None = None, duration: Duration = "one_hour",
+    keep_protection: bool = True,
     expected_revision: int | None = None, changes: dict[str, Any] | None = None,
     document: dict[str, Any] | None = None, field: str | None = None,
     value: str | dict[str, bool] | None = None, repair_token: str | None = None,
@@ -371,6 +392,7 @@ async def submit_socket(
     try:
         payload = Request(
             op=op, target=target, expected_epoch=expected_epoch,
+            duration=duration, keep_protection=keep_protection,
             expected_revision=expected_revision, changes=changes, document=document,
             field=field, value=value, repair_token=repair_token,
         ).model_dump_json(exclude_none=True).encode() + b"\n"
