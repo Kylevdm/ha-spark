@@ -38,6 +38,7 @@ from .commands import (
 )
 from .const import DOMAIN
 from .native import NativeDevices
+from .native_soc import NativeSoc
 from .native_write import NativeChargeBoundary
 from .ownership import OwnershipStore
 from .topology import Topology, validate_topology
@@ -70,8 +71,10 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                              if self.connected and self.summary else None),
             changed=self.async_update_listeners,
         )
+        self.soc = NativeSoc(self)
         self.control.preconditions = lambda: Preconditions(
             devices_validated=self._devices_validated(),
+            soc_trusted=self.soc.all_trusted, soc_recovered=self.soc.recovered,
         )
         self.solcast: SolcastCoordinator | None = None
         self.guard: SupplyGuardLoop | None = None
@@ -348,6 +351,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                             if self.authority.status == "save_failed" else "unknown"),
         }
         snapshot["holds"] = []
+        snapshot["banks"] = self.soc.snapshot()
 
     async def _async_update_data(self) -> bool:
         if not self._running or self._ended:
@@ -361,6 +365,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             self.last_outcome = Outcome.MALFORMED
             self.last_outcome_at = dt_util.utcnow()
             return False
+        self.soc.observe(dt_util.utcnow())
         data = self.entry.data
         api_version = self.api_version
         envelope = None

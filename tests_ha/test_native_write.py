@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from freezegun.api import FrozenDateTimeFactory
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker
 
@@ -413,3 +414,47 @@ async def test_increase_judged_against_resident_read_last(
     result = await writer._async_dispatch_command(command(writer, 20))
     assert (result.outcome, result.reason) == ("refused", "untrusted_soc")
     assert not [t for t in native_transport.traffic if t.op == "write"]
+
+
+async def test_increase_gate_uses_real_native_soc_trust(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+    native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """#579's NativeSoc decides increases: untrusted refuses, trusted writes."""
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+
+    from custom_components.ha_spark.native_soc import NativeSoc
+
+    async def sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(native_write, "verify_sleep", sleep)
+    native_transport.set_read_frames()
+    native_transport.set_input(33139, [73])
+    native_transport.set_input(33132, [32])
+    native_transport.set_holding(43141, [100])
+    entry = await native_entry(hass, aioclient_mock)
+    c: SparkCoordinator = entry.runtime_data
+    assert isinstance(c.soc, NativeSoc)
+    state = c.authority.state
+    assert state is not None and c.guard is not None
+    assert await c.authority.async_save(state.model_copy(update={"committed_mode": "optimise"}))
+    monkeypatch.setattr(c.guard, "allowance_for", lambda bank: None)
+    bank_id = c.soc.topology.banks[0].id  # type: ignore[union-attr]
+    assert not c.soc.increases_allowed(bank_id)
+    native_transport.traffic.clear()
+    refused = await c._async_dispatch_command(command(c, 20))
+    assert (refused.outcome, refused.reason) == ("refused", "untrusted_soc")
+    assert not [t for t in native_transport.traffic if t.op == "write"]
+    reduced = await c._async_dispatch_command(command(c, 5))  # decreases never need SoC
+    assert reduced.outcome == "applied"
+    await c.native.async_poll(dt_util.utcnow())
+    freezer.tick(timedelta(minutes=1))
+    c.soc.observe(dt_util.utcnow())
+    assert c.soc.increases_allowed(bank_id)
+    applied = await c._async_dispatch_command(command(c, 20))
+    assert applied.outcome == "applied"
+    assert native_transport.holding[43141] == 200
