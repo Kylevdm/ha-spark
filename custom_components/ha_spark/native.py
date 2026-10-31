@@ -7,15 +7,19 @@ leave this module. There is deliberately no hardware write path here.
 
 import asyncio
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
+from .solis_frames import Reading, Schedule
 from .solis_identity import caching_on, identity_reason
 from .solis_transport import PymodbusTcpTransport, Transport, TransportError, valid_words
 from .topology import Inverter, Topology, validate_topology
@@ -27,6 +31,7 @@ transport_factory: Callable[[str, int], Transport] = PymodbusTcpTransport
 class Probe:
     reason: str | None = "unvalidated_identity"
     caching: bool | None = None
+    identity: tuple[int, ...] = ()
 
 
 async def async_probe(transport: Transport, unit: int) -> Probe:
@@ -58,7 +63,7 @@ async def async_probe(transport: Transport, unit: int) -> Probe:
             times.append(result.elapsed_s)
     cached = caching_on(times)
     return Probe(reason or ("identity_read_failed" if cached is None else
-                            "caching_on" if cached else None), cached)
+                            "caching_on" if cached else None), cached, tuple(words[:3]))
 
 
 class NativeDevices:
@@ -74,6 +79,8 @@ class NativeDevices:
         topology = validate_topology(entry.options.get("topology"))
         self.inverters = {i.id: i for i in topology.inverters if i.transport == "native"} if (
             isinstance(topology, Topology)) else {}
+        self.schedule = Schedule(tuple(self.inverters))
+        self.readings: dict[str, dict[str, Reading]] = {key: {} for key in self.inverters}
         self.transports: dict[tuple[str, int], Transport] = {}
         self.probes: dict[str, Probe] = {}
         self.epochs: dict[str, int] = {}
@@ -81,6 +88,9 @@ class NativeDevices:
         # only by a completed probe that establishes it off (never by a failure).
         self.gateway_caching: dict[str, bool] = {}
         self.closed = False
+        self.poll_task: asyncio.Task[None] | None = None
+        # Cleared when unloading starts, before platforms go and well before close.
+        self.polling = True
         self.lock = asyncio.Lock()
         for inverter in self.inverters.values():
             self.transport(inverter)
@@ -197,7 +207,50 @@ class NativeDevices:
                 )
         self.changed()
 
+    async def async_poll(self, now: datetime) -> None:
+        """One due read, never interleaved with a probe and never after close."""
+        if self.closed or not self.polling or self.lock.locked():
+            return
+        async with self.lock:
+            if self.closed or not self.polling:
+                return
+            item = self.schedule.next(now.timestamp())
+            if item is None:
+                return
+            inverter_id, frame = item
+            inverter = self.inverters[inverter_id]
+            transport = self.transport(inverter)
+            read = transport.read_input if frame.bank == "input" else transport.read_holding
+            registers = None
+            self.poll_task = asyncio.current_task()
+            try:
+                result = await read(frame.address, frame.count, device_id=inverter.gateway_unit_id)
+                if (result.error is None and len(result.registers) == frame.count
+                        and valid_words(result.registers)):
+                    registers = result.registers
+            except Exception:
+                # Fixed unknown result, with no untrusted transport exception text.
+                pass
+            finally:
+                self.poll_task = None
+            self.readings[inverter_id][frame.key] = Reading(
+                dt_util.utcnow(), registers, getattr(transport, "connection_epoch", 0))
+        self.changed()
+
+    def reading(self, inverter: Inverter, frame_key: str) -> Reading | None:
+        """A frame read on the current connection; nothing from before a reconnect."""
+        reading = self.readings.get(inverter.id, {}).get(frame_key)
+        if (self.closed or reading is None or reading.registers is None
+                or not self.connected(inverter)
+                or reading.epoch != getattr(self.transport(inverter), "connection_epoch", 0)):
+            return None
+        return reading
+
     async def async_close(self) -> None:
         self.closed = True
+        if self.poll_task is not None:
+            self.poll_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.poll_task
         for transport in self.transports.values():
             await transport.close()

@@ -228,6 +228,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
     def async_stop(self) -> None:
         """Fence off replies the moment unloading starts, before platforms go."""
         self._running = False
+        self.native.polling = False
 
     def _solar_forecast(self, api_version: int) -> dict[str, object] | None:
         """The snapshot's forecast field; a failure to build it never blocks the heartbeat."""
