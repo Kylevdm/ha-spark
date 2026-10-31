@@ -1,3 +1,11 @@
+reprobe:
+  name: Re-probe Solis
+  description: Re-read identity and test gateway caching. Requires a non-system administrator.
+  fields:
+    inverter_id:
+      required: true
+      selector:
+        text:
 set_observe:
   name: Set Observe
   description: Make a verified handover to Observe. Requires a non-system administrator.

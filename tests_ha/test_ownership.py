@@ -152,6 +152,9 @@ async def test_native_flow_collects_gateway_without_connecting(
         "gateway_host": "gateway.invalid", "gateway_port": 502, "gateway_unit_id": 2,
         "charge_limit_a": 50, "confirmed": True,
     })
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "native_connect"
+    result = await hass.config_entries.options.async_configure(flow_id, {})
     assert result["type"] is FlowResultType.MENU
     await choose(hass, flow_id, "inverters_done")
     result = await choose(hass, flow_id, "save")
@@ -161,11 +164,14 @@ async def test_native_flow_collects_gateway_without_connecting(
     inverter = entry.options["topology"]["inverters"][0]
     assert inverter["transport"] == "native"
     assert inverter["gateway_host"] == "gateway.invalid" and inverter["gateway_unit_id"] == 2
-    # Only the mocked bearer heartbeat is used; no native transport is created.
+    assert entry.options["gateway_claims"] == [
+        {"host": "gateway.invalid", "port": 502, "unit_id": 2},
+    ]
+    # Native identity is probed, but pending ownership cannot validate it.
     sent = aioclient_mock.mock_calls[-1][2]
     assert sent["authority_owner"] == "pending_integration"
     assert sent["devices"][0]["validation"] == "read_only"
-    assert sent["devices"][0]["reason"] == "unvalidated_identity"
+    assert sent["devices"][0]["reason"] == "gateway_not_owned"
     aioclient_mock.clear_requests()
     aioclient_mock.post(URL, json=peer_body(active="retired"))
     await entry.runtime_data.async_refresh()

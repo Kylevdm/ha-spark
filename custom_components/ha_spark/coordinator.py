@@ -25,8 +25,10 @@ from .authority import AuthorityStore
 from .authority_control import AuthorityControl
 from .channel import Outcome, PollResult, async_poll
 from .const import DOMAIN
+from .native import NativeDevices
 from .ownership import OwnershipStore
 from .topology import Topology, validate_topology
+from .transitions import Preconditions
 from .wire import Summary, build_snapshot
 
 if TYPE_CHECKING:
@@ -48,6 +50,16 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self.ownership = OwnershipStore(
             hass, entry.entry_id, self.authority, lambda: entry.options.get("topology"),
         )
+        self.native = NativeDevices(
+            hass, entry,
+            owned=lambda: self.ownership.verified and self.ownership.owner == "integration",
+            overlay=lambda: (self.summary.legacy_overlay
+                             if self.connected and self.summary else None),
+            changed=self.async_update_listeners,
+        )
+        self.control.preconditions = lambda: Preconditions(
+            devices_validated=self._devices_validated(),
+        )
         self.solcast: SolcastCoordinator | None = None
         self.guard: SupplyGuardLoop | None = None
         self.release_version = release_version
@@ -62,6 +74,18 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self._running = True
         self._ended = False
         self._cancel_deadline: Callable[[], None] | None = None
+
+    def _devices_validated(self) -> bool:
+        """Every inverter of the current topology, matched against current probe evidence."""
+        topology = validate_topology(self.entry.options.get("topology"))
+        return isinstance(topology, Topology) and bool(topology.inverters) and all(
+            i.transport == "native" and self.native.reason(i) is None
+            for i in topology.inverters
+        )
+
+    async def async_reprobe(self, inverter_id: str) -> bool:
+        """Native admin command seam; authentication belongs to the caller boundary."""
+        return await self.native.async_reprobe(inverter_id)
 
     @callback
     def _clear_deadline(self) -> None:
@@ -81,6 +105,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self._running = False
         self.connected = False
         self._clear_deadline()
+        await self.native.async_close()
         await super().async_shutdown()
 
     @callback
@@ -158,18 +183,25 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             return None
 
     def _ownership_snapshot(self, snapshot: dict[str, object]) -> None:
-        """No transport connects here: native devices remain unvalidated/read-only."""
+        """Project local validation without granting hardware permission."""
         if snapshot["api_version"] != 4:
             return
         owner = self.ownership.owner if self.ownership.verified else "pending_integration"
         snapshot["authority_owner"] = owner
         topology = validate_topology(self.entry.options.get("topology"))
         if isinstance(topology, Topology):
-            snapshot["devices"] = [
-                {"id": inverter.id, "transport": inverter.transport, "validation": "read_only",
-                 "reason": "unvalidated_identity", "capabilities": []}
-                for inverter in topology.inverters
-            ]
+            devices: list[dict[str, object]] = []
+            for inverter in topology.inverters:
+                reason = (self.native.reason(inverter) if inverter.transport == "native"
+                          else "unvalidated_identity")
+                device: dict[str, object] = {
+                    "id": inverter.id, "transport": inverter.transport,
+                    "validation": "read_only" if reason else "validated", "capabilities": [],
+                }
+                if reason:
+                    device["reason"] = reason
+                devices.append(device)
+            snapshot["devices"] = devices
         if owner != "integration":
             return
         state = self.authority.state
@@ -282,6 +314,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             self.summary = summary
             if summary is not None:
                 await self.ownership.async_advance(summary)
+            self.native.recheck()
             self._clear_deadline()
             self._cancel_deadline = async_call_later(self.hass, 120, self._expire)
             if (self.solcast is not None and summary is not None
