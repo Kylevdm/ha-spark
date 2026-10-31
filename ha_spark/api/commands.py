@@ -75,6 +75,20 @@ class Command(Record):
         return self
 
 
+IntentOutcome = Literal["applied", "unchanged", "deferred", "refused", "unverified", "failed"]
+WriteReason = Literal["not_available", "invalid_intent", "limits", "mode", "stale_epoch",
+                      "authority_unknown", "gateway_not_owned", "read_only", "untrusted_soc",
+                      "grid_charge_not_permitted"]
+
+
+class IntentResult(Record):
+    """Positionally matched to the request; no rejected values are echoed."""
+
+    outcome: IntentOutcome
+    reason: WriteReason | None = None
+    written_a: float | None = Field(default=None, ge=0, le=62.5)
+
+
 class CommandResult(Record):
     session_id: str = Field(min_length=1, max_length=128)
     sequence: int = Field(ge=1)
@@ -84,7 +98,10 @@ class CommandResult(Record):
     reason: Literal["not_available", "stale_session", "stale_authority", "replayed",
                     "not_owner", "authority_unknown", "transition_in_progress", "stale_epoch",
                     "no_manual_session", "not_in_active_mode", "preconditions_unmet",
-                    "invalid_household_zone", "native_device_missing"] | None = None
+                    "invalid_household_zone", "native_device_missing", "invalid_intent", "limits",
+                    "mode", "gateway_not_owned", "read_only", "untrusted_soc",
+                    "grid_charge_not_permitted"] | None = None
+    intents: list[IntentResult] = Field(default_factory=list, max_length=64)
     epoch: int | None = Field(default=None, ge=1)
     reasons: list[Literal[
         "devices_validated", "evidence_configured", "limits_confirmed", "fallback_valid",

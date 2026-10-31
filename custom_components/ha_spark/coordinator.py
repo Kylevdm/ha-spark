@@ -3,7 +3,8 @@
 Native authority is local only on integration-owned sites; the legacy mirror
 never grants local write permission. Ownership changes through the durable
 Observe-only handshake, not a snapshot grant. Unloading fences off replies
-from the previous discovery. No native hardware writer is attached here.
+from the previous discovery. Apply commands use the verified charge boundary;
+production guard and transition writers remain unattached.
 """
 
 import logging
@@ -38,6 +39,7 @@ from .commands import (
 from .const import DOMAIN
 from .native import NativeDevices
 from .native_soc import NativeSoc
+from .native_write import NativeChargeBoundary
 from .ownership import OwnershipStore
 from .topology import Topology, validate_topology
 from .transitions import Preconditions, TransitionRequest
@@ -76,6 +78,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         )
         self.solcast: SolcastCoordinator | None = None
         self.guard: SupplyGuardLoop | None = None
+        self.writes = NativeChargeBoundary(self)
         self.release_version = release_version
         self.api_version = max(wire.SUPPORTED_API_VERSIONS)
         self.addon_api_version: int | None = None
@@ -112,6 +115,8 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
     async def _async_dispatch_command(self, command: Command) -> CommandResult:
         base = CommandResult(session_id=command.session_id, sequence=command.sequence,
                              outcome="refused", reason="not_available")
+        if command.kind == "apply":
+            return await self.writes.async_apply(command)
         if not self.control.owned():
             return base.model_copy(update={"reason": "not_owner"})
         if command.kind == "reprobe":

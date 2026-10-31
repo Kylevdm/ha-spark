@@ -117,6 +117,11 @@ class SupplyGuardLoop:
         state = self.states.get(bank.connection_id)
         return state.allowance_kw if state else 0
 
+    @property
+    def boundary_open(self) -> bool:
+        """Started, not stopping, store working; else native applies are fenced."""
+        return self._active and not self._stopped and not self._save_failed
+
     def permits_writes(self) -> bool:
         """Warn-only unless a connected, permitting mirror and a working store."""
         return self._active and not self._save_failed and mirror_permits(

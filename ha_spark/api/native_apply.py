@@ -70,7 +70,13 @@ def build_intents(intent: ChargeIntent, settings: Settings, execution: Execution
 
 
 def result_lines(result: CommandResult | None, count: int) -> list[ActionLine]:
-    """Until per-intent results exist, the sequence verdict applies to each action."""
+    """Map positional intent results, retaining the legacy sequence-only fallback."""
+    if result is not None and result.intents:
+        if len(result.intents) != count:
+            return result_lines(None, count)
+        return [line for intent in result.intents for line in result_lines(
+            CommandResult(session_id=result.session_id, sequence=result.sequence,
+                          outcome=intent.outcome, reason=intent.reason), 1)]
     outcome = ActionOutcome.FAILED if result is None else {
         "applied": ActionOutcome.VERIFIED,
         "unchanged": ActionOutcome.UNCHANGED_VERIFIED,
@@ -111,8 +117,11 @@ class NativeApply:
     def consume_stale_refusal(self, current_epoch: int | None) -> bool:
         """One fresh plan per stale refusal, only once a new epoch is known; never a replay."""
         result = self.queue.results.get(self.sequence) if self.sequence is not None else None
-        if (result is None or result.reason not in ("stale_authority", "stale_epoch")
-                or self.sequence == self._replanned_sequence
+        stale = result is not None and (
+            result.reason in ("stale_authority", "stale_epoch")
+            or any(intent.reason == "stale_epoch" for intent in result.intents)
+        )
+        if (not stale or self.sequence == self._replanned_sequence
                 or current_epoch is None or current_epoch == self.epoch):
             return False
         self._replanned_sequence = self.sequence
@@ -133,8 +142,9 @@ class NativeApply:
             return [ActionLine("[FAILED] native apply unavailable", ActionOutcome.FAILED)]
         self.sequence, self.epoch = command.sequence, epoch
         result = await self.queue.wait(command.sequence)
-        self.stale_authority = result is not None and result.reason in (
-            "stale_authority", "stale_epoch",
+        self.stale_authority = result is not None and (
+            result.reason in ("stale_authority", "stale_epoch")
+            or any(intent.reason == "stale_epoch" for intent in result.intents)
         )
         return result_lines(result, len(intents))
 
