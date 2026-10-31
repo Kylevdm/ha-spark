@@ -68,6 +68,11 @@ UTC offset changes also syncs the inverter clock (`DstClockSync`, #161).
 A separate carbon refresh task caches display-only NESO regional estimates. Each
 control-loop tick reads the live region; network I/O never delays planning.
 
+On integration-owned sites the durable retirement fences every direct write.
+Planning uses native snapshot SoC and sends typed device intents over the command
+queue, with at most one unresolved apply. The integration alone runs protection,
+fallback, clock sync and the supply guard; the daemon never replays those writes.
+
 Readiness captures the revision and rates in force on each boundary tick, in
 all modes, and separate read-only guard evidence in Observe. Missed boundaries
 stay gaps; mid-slot requests never rewrite a slot. Recording failures are isolated.
@@ -90,6 +95,7 @@ import uvicorn
 
 from ha_spark.agent.auth import resolve_token
 from ha_spark.api.contract import IntegrationLink
+from ha_spark.api.native_apply import NativeApply, NativeApplyArgs, build_intents, snapshot_soc
 from ha_spark.api.server import (
     AGENT_PORT,
     INGRESS_PORT,
@@ -106,6 +112,7 @@ from ha_spark.authority import (
     AuthorityStore,
     FallbackState,
     RequesterKind,
+    retirement_status,
 )
 from ha_spark.config import Settings, actuation_settings_changed
 from ha_spark.daemon_channel import DaemonChannel, Pending, Reply, action_lines
@@ -394,6 +401,9 @@ async def run_once(
     fallback_active: bool = False,
     execution: ExecutionContext | None = None,
     source: SolarSource,
+    native_apply: NativeApply | None = None,
+    native_link: IntegrationLink | None = None,
+    native_epoch: int | None = None,
 ) -> RunResult:
     """Compute the charge plan, log it, and apply it under site authority.
 
@@ -420,6 +430,12 @@ async def run_once(
     programming, as the fallback branch does.
     """
     context = execution or execution_context()
+    # Ownership comes from the durable retirement marker only, never a snapshot.
+    native = retirement_status(settings) is not None
+    if native:
+        soc = (snapshot_soc(native_link, datetime.now(UTC), settings)
+               if native_link is not None else SocMeasurement(SocStatus.UNAVAILABLE,
+                                                              datetime.now(UTC)))
     generation = context.planned_generation.get()
     if generation is None:
         generation = context.config_generation
@@ -457,7 +473,7 @@ async def run_once(
             log.exception("Readiness plan provenance unavailable")
         ev_hold_state = ev_hold_state or EvHoldState()
         evidence_freshness = getattr(inputs, "evidence_freshness", None) or {}
-        ev_hold_active = await _observe_ev_hold(
+        ev_hold_active = False if native else await _observe_ev_hold(
             ev_hold_state,
             inputs.ev_hold_charging,
             evidence_freshness.get("ev_status"),
@@ -476,14 +492,29 @@ async def run_once(
         reconcile_intent = hold_reconcile_intent(intent, trusted_holds)
         lines: list[str] = (
             list(await device.reconcile_holds(reconcile_intent, now))
-            if reconcile_intent is not None
-            else [UNTRUSTED_HOLDS_LINE]
+            if reconcile_intent is not None and not native
+            else ([] if native else [UNTRUSTED_HOLDS_LINE])
         )
         # Lazy: the rate is only consulted when the setpoint itself is unchanged.
         rate_w = lambda i: device.planned_rate_w(i)  # noqa: E731
         applied_plan = previous_plan
         apply_lines: list[str] = []
-        if fallback_active:
+        if native:
+            topology = native_link.topology.topology if native_link is not None else None
+            if native_apply is not None and native_apply.pending:
+                apply_lines = [ActionLine("[SKIP] apply pending", ActionOutcome.BLOCKED)]
+            elif (native_apply is None or native_epoch is None or topology is None
+                    or not intent.soc.ok):
+                apply_lines = [ActionLine(
+                    "[REFUSED] native apply unavailable", ActionOutcome.REFUSED,
+                )]
+            else:
+                apply_lines = list(await native_apply.send(
+                    build_intents(intent, settings, context, topology), epoch=native_epoch,
+                ))
+            lines.extend(apply_lines)
+            applied_plan = plan if not _apply_failed(apply_lines) else None
+        elif fallback_active:
             reason = (
                 "Solis fallback is active"
                 if any(d.type == "inverter" and d.driver == "solis" for d in settings.devices)
@@ -512,7 +543,7 @@ async def run_once(
             lines.append("[SKIP] charge setpoint unchanged")
         for line in lines:
             log.info(line)
-        if settings.v2l_power_entity:
+        if settings.v2l_power_entity and not native:
             try:
                 await run_v2l_topup(settings, rest, plan, inputs.flexibility_event, now)
             except Exception:  # noqa: BLE001 - a request never breaks a plan run
@@ -630,6 +661,8 @@ async def guard_tick(
     only reduce. An unconfirmed fallback also blocks increases; a verified one
     caps restoration at its configured current.
     """
+    if retirement_status(settings) is not None:
+        return target_w or 0.0
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
@@ -2029,6 +2062,7 @@ async def _run_paired(
     clock_sync = DstClockSync()
     pending = None
     startup_reconciled = False
+    native_apply = NativeApply(state.commands)
     try:
         while True:
             settings = state.settings  # hot-reloaded by POST /api/config
@@ -2037,8 +2071,10 @@ async def _run_paired(
             # The accepted limits this tick plans under, captured with their key so
             # a write planned under a superseded revision is refused (#542).
             context.planned_limits.set(context.limits_key())
+            # Ownership comes from the durable retirement marker only, never a snapshot.
+            retired = native = retirement_status(settings) is not None
             current_faults = set()
-            if not authority.known:
+            if not authority.known and not retired:
                 current_faults.add("authority unknown")
             if authority.save_failed:
                 current_faults.add("authority save failure")
@@ -2121,7 +2157,10 @@ async def _run_paired(
             def _observed(observed: SocMeasurement) -> None:
                 state.soc_observation_ok = observed.ok
 
-            measurement = await soc_monitor_tick(settings, monitor, _observed)
+            measurement = (
+                snapshot_soc(state.integration_link, now, settings) if native
+                else await soc_monitor_tick(settings, monitor, _observed)
+            )
             state.soc_observation_ok = measurement is not None and measurement.ok
             solis_fallback_active = monitor.fallback_active and any(
                 device.type == "inverter" and device.driver == "solis"
@@ -2182,6 +2221,10 @@ async def _run_paired(
                 context.planned_epoch.set(authority.state.epoch if authority.state else None)
                 if mode_request is not None:
                     pending = None
+            if native and pending is not None and pending.request.op == "sync_clock":
+                # Integration-owned: the integration alone syncs the clock (no driver here).
+                pending.future.set_result(Reply(error="sync-clock is handled by the integration"))
+                pending = None
             if pending is not None and pending.request.op == "sync_clock":
                 try:
                     async with HomeAssistantRest(
@@ -2205,7 +2248,11 @@ async def _run_paired(
             if activating:
                 # A preview-accepted Observe/Protect plan is not resident hardware.
                 last_applied_plan = None
-            if pending is not None or recovering or activating or should_run(now, last_run_slot):
+            native_stale = native and native_apply.consume_stale_refusal(
+                state.integration_link.authority_epoch,
+            )
+            if (pending is not None or recovering or activating or native_stale
+                    or should_run(now, last_run_slot)):
                 try:
                     # Recovery never compares against a baseline: the resident
                     # program is the fallback, not any earlier plan.
@@ -2223,6 +2270,13 @@ async def _run_paired(
                             )
                             activation.enter_context(context.after_authority_save())
                             activation.enter_context(context.handover("verify_fresh_plan"))
+                        native_args: NativeApplyArgs = {}
+                        if native:
+                            native_args = {
+                                "native_apply": native_apply,
+                                "native_link": state.integration_link,
+                                "native_epoch": state.integration_link.authority_epoch,
+                            }
                         result = await run_once(
                             settings,
                             soc=measurement,
@@ -2230,6 +2284,7 @@ async def _run_paired(
                             trusted_holds=last_trusted_holds,
                             ev_hold_state=ev_hold_state,
                             source=solar_source,
+                            **native_args,
                             # A failed first tick after restart cannot delegate the
                             # observation to run_once and lift a restored block.
                             fallback_active=(
@@ -2345,7 +2400,7 @@ async def _run_paired(
             # failures last, and a hold ending meanwhile would leave the switch
             # `Off` — the house on grid import — though `last_plan` still holds
             # its known end time (#147).
-            if not replanned:
+            if not replanned and not native:
                 with context.handover("verify_fresh_plan" if activating else ""):
                     reconciled = await reconcile_tick(
                         settings,
@@ -2366,7 +2421,7 @@ async def _run_paired(
                     measurement,
                     ev_hold_active=ev_hold_state.active,
                 )
-            if guard_enabled and in_window(now.time(), window_start, window_end):
+            if not native and guard_enabled and in_window(now.time(), window_start, window_end):
                 try:
                     # While activating, a fresh plan may already be charging: the
                     # guard's reductions run under the activation's charging grant.
@@ -2396,7 +2451,7 @@ async def _run_paired(
                     last_signal_at = now
                 except Exception:
                     log.exception("Signal sampling failed; will retry next tick")
-            if settings.inverter_clock_dst_sync and clock_sync.due(now) is not None:
+            if not native and settings.inverter_clock_dst_sync and clock_sync.due(now) is not None:
                 try:
                     async with HomeAssistantRest(
                         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
@@ -2404,7 +2459,7 @@ async def _run_paired(
                         await clock_sync.run(settings, rest, now)
                 except Exception:
                     log.exception("Clock-change sync failed; will retry next tick")
-            if settings.v2l_power_entity:
+            if not native and settings.v2l_power_entity:
                 try:
                     await run_v2l_tick(settings, now)
                 except Exception:

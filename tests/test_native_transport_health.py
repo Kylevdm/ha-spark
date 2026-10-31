@@ -66,7 +66,7 @@ async def test_native_transport_overlay_inconsistent(monkeypatch):
 
 async def test_run_health_native_replaces_legacy_row(monkeypatch):
     for name in (
-        "check_operating_mode", "check_integration_link", "check_ha_rest",
+        "check_operating_mode", "check_integration_link", "check_authority_owner", "check_ha_rest",
         "check_ha_websocket", "check_ollama", "check_sqlite", "check_load_history",
         "check_supply_guard", "check_limits", "check_topology_record",
         "check_tariff_provider", "check_export_event_provider", "check_ha_timezone",

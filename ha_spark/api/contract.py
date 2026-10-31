@@ -148,6 +148,7 @@ def link_view(link: IntegrationLink, now: datetime) -> dict[str, object]:
              "validation": device.validation, "reason": device.reason}
             for device in link.v4.devices
         ] if link.v4 is not None and link.v4.devices_reason is None else None,
+        "authority_owner": link.v4.owner if link.v4 is not None else "addon",
         "topology_source": link.topology.kind,
         "topology_revision": link.topology.revision,
         "topology_reason": link.topology.reason,

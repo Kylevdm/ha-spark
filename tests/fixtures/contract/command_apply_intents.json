@@ -1,0 +1,13 @@
+{
+  "session_id": "addon-session",
+  "epoch": 7,
+  "sequence": 1,
+  "kind": "apply",
+  "payload": {
+    "intents": [
+      {"kind": "charge_window", "inverter_id": "inverter", "current_a": 20.0, "start": "23:30", "end": "05:30"},
+      {"kind": "charge_current_limit", "inverter_id": "inverter", "current_a": 20.0},
+      {"kind": "export", "inverter_id": "inverter", "request": "none"}
+    ]
+  }
+}
