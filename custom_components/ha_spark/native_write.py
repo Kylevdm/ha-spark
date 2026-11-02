@@ -98,9 +98,14 @@ class NativeChargeBoundary:
         elif fallback:
             # A fallback-schedule write is also the owner's starting schedule on
             # the way out of Optimise; manual control never programs one.
+            # In Optimise it needs a live fallback; leaving Optimise it is the
+            # write_fallback step of a transition to Protect or Observe.
+            leaving = (state.transition is not None
+                       and state.transition.target in ("protect", "observe"))
             if (state.committed_mode != "optimise" or state.manual_session is not None
-                    or state.transition is not None
-                    and state.transition.target not in ("optimise", "protect", "observe")):
+                    or not leaving and not state.fallback.active
+                    or state.transition is not None and not leaving
+                    and state.transition.target != "optimise"):
                 return "mode"
         elif transition:
             # Transition-owned discharge cleanup, including manual start/fallback entry.
@@ -109,7 +114,8 @@ class NativeChargeBoundary:
                 return "mode"
         elif state.fallback.active:
             # A plan writes during fallback only while every cause has cleared.
-            if (state.fallback.causes or state.committed_mode != "optimise"
+            if (state.fallback.causes or coordinator.fallback.retrying(dt_util.utcnow())
+                    or state.committed_mode != "optimise"
                     or state.manual_session is not None
                     or state.transition is not None and state.transition.target != "optimise"):
                 return "mode"
@@ -168,7 +174,8 @@ class NativeChargeBoundary:
             if state.fallback.active:
                 # Fallback restoration is read-only: the resident charge-only
                 # schedule must equal the last fully verified fallback apply.
-                if self.verified_fallback.get(inverter.id) != (epoch, tuple(words[2:10])):
+                if self.verified_fallback.get(inverter.id) != (
+                        epoch, (words[0], *words[2:10])):
                     return False
             elif self.verified_windows.get(inverter.id) != (epoch, tuple(words[2:10])):
                 return False
@@ -181,6 +188,8 @@ class NativeChargeBoundary:
 
     async def async_apply(self, command: Command) -> CommandResult:
         """Isolate intents and aggregate the worst positional result."""
+        # Freshness is judged from acceptance, not completion.
+        accepted_at = dt_util.utcnow()
         results: list[IntentResult] = []
         kinds: list[str | None] = []
         for raw in ApplyPayload.model_validate(command.payload).intents:
@@ -207,7 +216,7 @@ class NativeChargeBoundary:
         charge = [result for kind, result in zip(kinds, results, strict=False)
                   if kind in ("charge_current_limit", "charge_window")]
         if charge:
-            self.last_apply = (command.epoch, dt_util.utcnow(), all(
+            self.last_apply = (command.epoch, accepted_at, all(
                 result.outcome in ("applied", "unchanged") for result in charge))
         worst = max(results, key=lambda r: _SEVERITY.index(r.outcome)) if results else (
             IntentResult(outcome="refused", reason="invalid_intent"))

@@ -38,6 +38,7 @@ class NativeFallback:
         self.attempts: dict[str, int] = {}
         self.backoff: dict[str, datetime] = {}
         self.retry_at: datetime | None = None
+        self.reapply_at: datetime | None = None
         self.exit_since: datetime | None = None
         self.liveness_since: datetime | None = None
         self.notices: dict[str, tuple[datetime, bool]] = {}
@@ -51,6 +52,10 @@ class NativeFallback:
                 self.liveness_since = now
         else:
             self.liveness_since = None
+
+    def retrying(self, now: datetime) -> bool:
+        """After a failed exit plan, plans wait out the five-minute retry."""
+        return self.retry_at is not None and now < self.retry_at
 
     def liveness_lost(self) -> None:
         self.liveness_since = None
@@ -168,6 +173,9 @@ class NativeFallback:
         elif c.soc.fallback_requested:
             causes.add("soc_integrity")
         desired = tuple(cause for cause in CAUSES if cause in causes)
+        if active and desired and not state.fallback.causes:
+            # An exit plan may have overwritten the schedule: re-verify it.
+            self.verified.clear()
         if desired != state.fallback.causes or desired and not active:
             if active:
                 fallback = state.fallback.model_copy(update={"causes": desired})
@@ -187,6 +195,7 @@ class NativeFallback:
         if state.fallback.causes:
             self.exit_since = None
             self.retry_at = None
+            self.reapply_at = None
             await self._apply_causes(state, now)
             c.async_update_listeners()
             return
@@ -228,20 +237,25 @@ class NativeFallback:
             self._unverified(failures[0] if failures else "unverified", now)
 
     async def _exit_pending(self, state: AuthorityState, now: datetime) -> None:
+        if self.retrying(now):
+            return
+        # Only plans accepted after the exit began, or after the last retry, count.
         since = self.exit_since or now
+        if self.retry_at is not None:
+            since = max(since, self.retry_at)
         last = self.coordinator.writes.last_apply
         failed = (last is not None and last[0] == state.epoch and last[1] >= since
                   and not last[2])
         if failed:
-            if self.retry_at is None or now >= self.retry_at:
-                self.verified.clear()
-                await self._apply_all(state.epoch)
-                self.retry_at = now + _RETRY
+            self.verified.clear()
+            await self._apply_all(state.epoch)
+            self.retry_at = now + _RETRY
             return
         if self.coordinator.writes.plan_verified(state.epoch, since=since):
             if await self.coordinator.control.async_fallback_held(FallbackState(), now=now):
                 self.exit_since = None
                 self.retry_at = None
+                self.reapply_at = None
                 self.verified.clear()
                 self.attempts.clear()
                 self.backoff.clear()
@@ -250,9 +264,9 @@ class NativeFallback:
         native = self._native()
         if all(self._verified(i.id, state.epoch) for i in native):
             return
-        if self.retry_at is None or now >= self.retry_at:
+        if self.reapply_at is None or now >= self.reapply_at:
             await self._apply_all(state.epoch)
-            self.retry_at = now + _RETRY
+            self.reapply_at = now + _RETRY
 
     async def _apply_all(self, epoch: int) -> None:
         schedule = self._schedule()
@@ -303,5 +317,5 @@ class NativeFallback:
         if all(result.outcome in ("applied", "unchanged") for result in results):
             return True
         return target == "observe" and all(
-            result.outcome == "refused" for result in results)
+            result.outcome in ("applied", "unchanged", "refused") for result in results)
 

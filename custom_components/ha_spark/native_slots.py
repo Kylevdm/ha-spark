@@ -173,7 +173,11 @@ class NativeSlots:
         if all(r.outcome in ("applied", "unchanged") for r in results):
             block = tuple(charge + self.planned_discharge)
             if self.fallback:
-                self.boundary.verified_fallback[self.inverter.id] = (self.epoch, block)
+                # The verified fallback current is part of the schedule restored to.
+                written = current_result.written_a
+                if written is not None:
+                    self.boundary.verified_fallback[self.inverter.id] = (
+                        self.epoch, (round(written * 10), *block))
             else:
                 self.boundary.verified_windows[self.inverter.id] = (self.epoch, block)
         # Whether the current stays counted is judged on the current alone.

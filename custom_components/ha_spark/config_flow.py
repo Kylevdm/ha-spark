@@ -360,8 +360,8 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
             if not start and not end and not currents:
                 runtime = getattr(self.config_entry, "runtime_data", None)
                 state = runtime.authority.state if runtime is not None else None
-                if state is not None and (state.committed_mode == "optimise"
-                                          or state.fallback.active):
+                if (state is None or state.committed_mode not in ("observe", "protect")
+                        or state.fallback.active or state.transition is not None):
                     errors = {"base": "fallback_in_use"}
                 else:
                     return self.async_create_entry(

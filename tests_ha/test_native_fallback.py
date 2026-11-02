@@ -339,3 +339,118 @@ def native_topology() -> dict[str, Any]:
     raw = deepcopy(STORED_TOPOLOGY)
     raw["inverters"][0].update(transport="native", gateway_host="gateway.invalid")
     return raw
+
+
+async def test_fallback_write_needs_an_active_fallback(
+    fallback_site: SparkCoordinator, native_transport: FakeSolisDevice,
+) -> None:
+    c = fallback_site
+    await optimise(c)
+    state = c.authority.state
+    assert state is not None and not state.fallback.active
+    native_transport.traffic.clear()
+    result = await c.writes.async_fallback(
+        "inv1", current_a=20, start="23:30", end="05:30", epoch=state.epoch)
+    assert result.outcome == "refused"
+    assert not [t for t in native_transport.traffic if t.op == "write"]
+
+
+async def test_returning_cause_reapplies_fallback_over_an_exit_plan(
+    fallback_site: SparkCoordinator, native_transport: FakeSolisDevice,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    c = fallback_site
+    await optimise(c)
+    now = datetime.now(UTC)
+    c._clear_deadline()
+    c._expire(now)
+    await c.fallback.async_evaluate(now)
+    await clear_liveness(c, now)
+    freezer.tick(timedelta(minutes=5))
+    await c.fallback.async_evaluate(datetime.now(UTC))
+    assert (await c._async_dispatch_command(plan(c))).outcome == "applied"
+    assert native_transport.holding[43141] == 120
+    # The add-on is lost again before the exit is judged.
+    c._expire(datetime.now(UTC))
+    await c.fallback.async_evaluate(datetime.now(UTC))
+    state = c.authority.state
+    assert state is not None and state.fallback.causes == ("addon_liveness",)
+    assert native_transport.holding[43141] == 200
+    assert c.fallback.in_force()
+
+
+async def test_exit_retry_refuses_plans_for_five_minutes(
+    fallback_site: SparkCoordinator, native_transport: FakeSolisDevice,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    c = fallback_site
+    await optimise(c)
+    now = datetime.now(UTC)
+    c._clear_deadline()
+    c._expire(now)
+    await c.fallback.async_evaluate(now)
+    await clear_liveness(c, now)
+    freezer.tick(timedelta(minutes=5))
+    await c.fallback.async_evaluate(datetime.now(UTC))
+    native_transport.inject_write_fault(WriteFault("silent_noop"), address=43141)
+    assert (await c._async_dispatch_command(plan(c))).outcome == "unverified"
+    await c.fallback.async_evaluate(datetime.now(UTC))
+    assert native_transport.holding[43141] == 200
+    freezer.tick(timedelta(minutes=2))
+    assert (await c._async_dispatch_command(plan(c))).outcome == "refused"
+    assert native_transport.holding[43141] == 200
+    await c.fallback.async_evaluate(datetime.now(UTC))
+    assert c.authority.state is not None and c.authority.state.fallback.active
+    freezer.tick(timedelta(minutes=4))
+    assert (await c._async_dispatch_command(plan(c))).outcome == "applied"
+    await c.fallback.async_evaluate(datetime.now(UTC))
+    assert c.authority.state is not None and not c.authority.state.fallback.active
+
+
+
+async def test_restoration_during_fallback_needs_the_verified_fallback_current(
+    fallback_site: SparkCoordinator, native_transport: FakeSolisDevice,
+) -> None:
+    c = fallback_site
+    await optimise(c)
+    now = datetime.now(UTC)
+    c._clear_deadline()
+    c._expire(now)
+    await c.fallback.async_evaluate(now)
+    state = c.authority.state
+    assert state is not None and c.fallback.in_force()
+    inverter = next(iter(c.native.inverters.values()))
+    # An exit plan moved the current while the fallback window stayed resident.
+    c.writes.written_a[inverter.id] = 12
+    native_transport.set_holding(43141, [120, 0, 23, 30, 5, 30] + [0] * 24)
+    assert c.guard is not None
+    async with c.guard.lock:
+        async with c.native.lock:
+            assert not await c.writes.async_restoration_held(inverter, epoch=state.epoch)
+
+
+@pytest.mark.parametrize(("target", "done"), [("observe", True), ("protect", False)])
+async def test_write_fallback_step_accepts_refusals_only_into_observe(
+    fallback_site: SparkCoordinator, monkeypatch: pytest.MonkeyPatch, target: str,
+    done: bool,
+) -> None:
+    from custom_components.ha_spark.authority_store import Transition
+    from custom_components.ha_spark.commands import IntentResult
+    from custom_components.ha_spark.topology import Inverter
+
+    c = fallback_site
+    await optimise(c)
+    outcomes = iter(["applied", "refused"])
+    native = c.fallback._native()
+    monkeypatch.setattr(c.fallback, "_native", lambda: native * 2)
+
+    async def apply_one(inverter: Inverter, schedule: object, epoch: int) -> IntentResult:
+        return IntentResult(outcome=next(outcomes))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(c.fallback, "_apply_one", apply_one)
+    state = c.authority.state
+    assert state is not None
+    now = datetime.now(UTC)
+    state = state.model_copy(update={"transition": Transition(
+        target=target, started_at=now, steps=("write_fallback",))})  # type: ignore[arg-type]
+    assert await c.fallback.async_step("write_fallback", state, now=now) is done
