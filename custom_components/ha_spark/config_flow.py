@@ -44,6 +44,7 @@ from pydantic import BaseModel, ValidationError
 
 from . import native
 from .const import ADDON_SLUG, DOMAIN
+from .native_hold import SOURCES, EvidenceOptions
 from .soc_trust import Policy
 from .solcast import Outcome, async_list_sites
 from .solcast_budget import async_get_budget
@@ -316,14 +317,68 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
     _claims: list[dict[str, Any]] | None = None
     _edit_index: int | None = None
     _load_kind: str | None = None
+    _evidence: EvidenceOptions | None = None
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
         """Choose between the Solcast allowance and the topology editor."""
-        return self.async_show_menu(
-            step_id="init", menu_options=["solcast", "topology", "manual", "soc"],
-        )
+        menu = ["solcast", "topology", "manual", "soc"]
+        topology = validate_topology(self.config_entry.options.get("topology"))
+        if (isinstance(topology, Topology)
+                and any(i.transport == "native" for i in topology.inverters)):
+            menu.append("evidence")
+        return self.async_show_menu(step_id="init", menu_options=menu)
+
+    async def async_step_evidence(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Stage native protection sources; only whole-document Save persists them."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            raw: dict[str, Any] = {}
+            for key in SOURCES:
+                entity = user_input.get(f"{key}_entity")
+                if (key == "battery_direction"
+                        and user_input.get("battery_direction_source") == "native"):
+                    raw[key] = {"source": "native", "max_age_s": user_input.get(f"{key}_max_age_s")}
+                elif entity:
+                    raw[key] = {"entity_id": entity,
+                                "max_age_s": user_input.get(f"{key}_max_age_s")}
+            raw["battery_discharge_sign"] = user_input.get("battery_discharge_sign", "positive")
+            raw["dispatch_grid_invert"] = user_input.get("dispatch_grid_invert", False)
+            try:
+                evidence = EvidenceOptions.model_validate(raw)
+                if not evidence.configured or "battery_direction" not in raw:
+                    raise ValueError("incomplete evidence")
+            except (ValidationError, ValueError):
+                errors = {"base": "invalid_evidence"}
+            else:
+                self._evidence = evidence
+                return await self.async_step_topology()
+        try:
+            current = self._evidence or EvidenceOptions.model_validate(
+                self.config_entry.options.get("evidence", {}))
+        except ValidationError:
+            current = EvidenceOptions()
+        fields: dict[Any, Any] = {
+            probatio.Required("battery_direction_source", default=current.battery_direction.source):
+                SelectSelector(SelectSelectorConfig(options=["native", "entity"])),
+            probatio.Required("battery_discharge_sign", default=current.battery_discharge_sign):
+                SelectSelector(SelectSelectorConfig(options=["positive", "negative"])),
+            probatio.Required("dispatch_grid_invert", default=current.dispatch_grid_invert):
+                BooleanSelector(),
+        }
+        suggested: dict[str, Any] = {}
+        for key in SOURCES:
+            source = getattr(current, key)
+            if source is not None and source.entity_id is not None:
+                suggested[f"{key}_entity"] = source.entity_id
+            fields[probatio.Optional(f"{key}_entity")] = EntitySelector()
+            fields[probatio.Required(f"{key}_max_age_s", default=(
+                source.max_age_s if source else 300))] = _NUMBER
+        return self.async_show_form(step_id="evidence", data_schema=(
+            self.add_suggested_values_to_schema(probatio.Schema(fields), suggested)), errors=errors)
 
     async def async_step_soc(
         self, user_input: dict[str, Any] | None = None,
@@ -1081,6 +1136,7 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
         revision = self.config_entry.options.get("topology_revision")
         return self.async_create_entry(title="", data={
             **self.config_entry.options,
+            **({"evidence": self._evidence.model_dump(mode="json")} if self._evidence else {}),
             "topology": topology.model_dump(mode="json"),
             "gateway_claims": _current_claims(
                 topology, self._claims if self._claims is not None

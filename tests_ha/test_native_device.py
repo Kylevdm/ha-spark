@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker
 
@@ -15,6 +16,7 @@ from custom_components.ha_spark.authority import AuthorityStore
 from custom_components.ha_spark.const import DOMAIN
 from custom_components.ha_spark.native import async_probe
 from custom_components.ha_spark.ownership import OwnershipStore
+from custom_components.ha_spark.solis_frames import Reading
 from custom_components.ha_spark.solis_transport import ReadResult, TransportError
 from custom_components.ha_spark.transitions import TransitionRequest
 from tests_ha.fake_solis import FakeSolisDevice
@@ -92,6 +94,9 @@ async def test_native_identity_snapshot_and_precondition(
     assert device["validation"] == ("validated" if reason is None else "read_only")
     assert device.get("reason") == reason
     assert device["capabilities"] == []
+    native_transport.set_holding(43007, [190])
+    entry.runtime_data.native.readings["inv1"]["holding_43007"] = Reading(
+        dt_util.utcnow(), (190,), 0)
     preconditions = entry.runtime_data.control.preconditions()
     assert preconditions.devices_validated is (reason is None)
     assert not preconditions.evidence_configured
@@ -356,8 +361,12 @@ async def test_connect_probe_of_new_unit_fences_resident_devices(
 
 async def test_precondition_uses_current_topology(
     hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+    native_transport: FakeSolisDevice,
 ) -> None:
     entry = await native_entry(hass, aioclient_mock)
+    native_transport.set_holding(43007, [190])
+    entry.runtime_data.native.readings["inv1"]["holding_43007"] = Reading(
+        dt_util.utcnow(), (190,), 0)
     assert entry.runtime_data.control.preconditions().devices_validated
     topology = deepcopy(entry.options["topology"])
     topology["inverters"].append({**topology["inverters"][0], "id": "inv2", "gateway_unit_id": 2})

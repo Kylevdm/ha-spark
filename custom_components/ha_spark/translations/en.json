@@ -53,6 +53,7 @@
         }
       }
     },
+    "native_held_identity_remapped": {"title": "Held control mapping changed", "description": "The original hold is retained. Move to Observe before using a replacement mapping. Native writes remain blocked."},
     "native_unreachable": {"title": "Solis gateway unreachable", "description": "Check gateway connectivity, then Re-probe. The device remains read-only."},
     "native_identity_read_failed": {"title": "Solis identity probe failed", "description": "Identity or caching could not be verified. Check connectivity and Re-probe. The device remains read-only."},
     "native_unvalidated_identity": {"title": "Solis identity not validated", "description": "This identity is not in the validated allow-list. The device remains read-only."},
@@ -254,6 +255,7 @@
   "options": {
     "error": {
       "invalid_manual_time": "Enter a valid HH:MM deadline and household time zone.",
+      "invalid_evidence": "Configure EV status, battery direction and a positive finite maximum age for every configured source.",
       "invalid_soc_policy": "Enter a positive finite report age and whole-number failure and recovery settings of at least one.",
       "invalid_number": "Enter a finite number.",
       "out_of_range": "Enter a number in the valid range for this field.",
@@ -291,7 +293,31 @@
           "solcast": "Solcast daily allowance",
           "manual": "Manual control deadline",
           "soc": "Native SoC trust policy",
+          "evidence": "Native protection evidence",
           "topology": "Site topology and limits"
+        }
+      },
+      "evidence": {
+        "title": "Native protection evidence",
+        "description": "Only fresh reports may start or clear protection. Native battery direction uses successful bus reads. Protection requires Home Assistant to remain running; no switch persistence through a whole-HA outage is assumed. Kraken-only dispatches are not available natively. Continue to Site topology and Save to apply.",
+        "data": {
+          "ev_status_entity": "EV status",
+          "ev_status_max_age_s": "EV status maximum age (seconds)",
+          "battery_direction_source": "Battery direction source",
+          "battery_direction_entity": "Battery direction power entity (entity source only)",
+          "battery_direction_max_age_s": "Battery direction maximum age (seconds)",
+          "battery_discharge_sign": "Entity battery discharge sign",
+          "ev_plug_entity": "EV plug (optional)",
+          "ev_plug_max_age_s": "EV plug maximum age (seconds)",
+          "ev_power_entity": "EV power (optional)",
+          "ev_power_max_age_s": "EV power maximum age (seconds)",
+          "live_dispatch_entity": "Live dispatch and planned dispatches (optional)",
+          "live_dispatch_max_age_s": "Live dispatch maximum age (seconds)",
+          "adjusted_rate_entity": "Adjusted rate (optional)",
+          "adjusted_rate_max_age_s": "Adjusted rate maximum age (seconds)",
+          "dispatch_grid_power_entity": "Dispatch grid power (optional)",
+          "dispatch_grid_power_max_age_s": "Dispatch grid power maximum age (seconds)",
+          "dispatch_grid_invert": "Invert dispatch grid power"
         }
       },
       "soc": {

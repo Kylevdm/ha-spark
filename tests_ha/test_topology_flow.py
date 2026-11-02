@@ -53,7 +53,10 @@ async def open_topology(hass: HomeAssistant, entry: MockConfigEntry) -> Any:
     result = await hass.config_entries.options.async_init(entry.entry_id)
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "init"
-    assert result["menu_options"] == ["solcast", "topology", "manual", "soc"]
+    native = any(i.get("transport") == "native"
+                 for i in entry.options.get("topology", {}).get("inverters", []))
+    assert result["menu_options"] == ["solcast", "topology", "manual", "soc"] + (
+        ["evidence"] if native else [])
     result = await choose(hass, result["flow_id"], "topology")
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "topology"

@@ -2,7 +2,7 @@
 
 The integration store starts empty, never imports add-on authority, and becomes
 an authority source only after the ownership handshake. HoldDevice deliberately
-retains the legacy identity fields until the native hold port adds its identity.
+retains the legacy identity fields; native holds bind them to the gateway/unit.
 """
 
 from datetime import time
@@ -60,6 +60,12 @@ class HoldRecord(Record):
     release_refused_since: AwareDatetime | None = None
     release_refused_reason: Literal["switch_unreadable", "schedule_unverified"] | None = None
     release_refused_notified: bool = Field(default=False, strict=True)
+    apply_notice_at: AwareDatetime | None = None
+    apply_notice_repeated: bool = Field(default=False, strict=True)
+    degraded_notice_at: AwareDatetime | None = None
+    degraded_notice_repeated: bool = Field(default=False, strict=True)
+    release_notice_at: AwareDatetime | None = None
+    release_notice_repeated: bool = Field(default=False, strict=True)
 
     @model_validator(mode="after")
     def validate_cause_fields(self) -> Self:

@@ -1,7 +1,8 @@
 """Verified native transition execution, with fail-closed device/evidence seams.
 
-No native writer is installed yet. Later device tickets supply the step executor
-and startup reads. A step returns True only after its device read-back verifies;
+Native protection supplies startup reads and the protection step executor.
+Other device tickets extend the executor's fail-closed step set.
+A step returns True only after its device read-back verifies;
 verify_fresh_plan must consume a fresh plan from the current epoch, never a cache.
 The writer must use the shared charge-write boundary and recheck ownership there.
 """
@@ -41,6 +42,7 @@ class AuthorityControl:
         self.manual_started: Callable[[], Awaitable[None]] | None = None
         self.write_barrier: Callable[[], Awaitable[None]] | None = None
         self.preconditions: Callable[[], Preconditions] = Preconditions
+        self.owner_source: Callable[[], bool] | None = None
         self.lock = asyncio.Lock()
         self.grace_until: datetime | None = None
         self.ready = False
@@ -56,7 +58,12 @@ class AuthorityControl:
             return None
 
     def owned(self) -> bool:
-        return authority.authority_owner(self.entry) == "integration"
+        # A retained removal controller outlives entry.runtime_data. Its durable
+        # ownership source remains readable, while the I/O unload fences stay shut.
+        if authority.authority_owner(self.entry) == "integration":
+            return True
+        return (getattr(self.entry, "runtime_data", None) is None
+                and self.owner_source is not None and self.owner_source())
 
     async def async_request(
         self, request: TransitionRequest, *, now: datetime, zone: ZoneInfo,
@@ -106,8 +113,14 @@ class AuthorityControl:
                 verified = await self.writer.async_step(step, state, removal=removal)
             except Exception:
                 verified = False
-            if not self.owned() or self.store.state != state:
+            current = self.store.state
+            if (not self.owned() or current is None or current.store_id != state.store_id
+                    or current.epoch != state.epoch or current.transition != state.transition):
                 return
+            # The protection step persists hold progress; retain it while advancing
+            # this same transition, never overwrite it with the pre-step records.
+            state = current
+            assert state.transition is not None
             transition = state.transition.model_copy(update={
                 "steps": state.transition.steps[1:] if verified else state.transition.steps,
                 "failing_actions": () if verified else (step,),
@@ -127,8 +140,10 @@ class AuthorityControl:
             }))
 
     async def async_retry(self) -> None:
+        # Whether a persisted release began as a removal is not durable, so a
+        # retried release step always needs fresh clear evidence or a trusted end.
         async with self.lock:
-            await self._advance()
+            await self._advance(removal=True)
 
     async def async_expire(self, *, now: datetime, zone: ZoneInfo) -> None:
         if not self.startup_complete:

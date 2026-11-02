@@ -123,16 +123,23 @@ class Device(FrozenModel):
     validation: Literal["validated", "read_only"]
     reason: Literal[
         "unvalidated_identity", "identity_read_failed", "v2_tou_firmware", "caching_on",
-        "gateway_not_owned", "unreachable",
+        "gateway_not_owned", "unreachable", "held_identity_remapped",
     ] | None = None
     capabilities: Annotated[tuple[Code, ...], Field(max_length=32)]
 
 
 class EvidenceSource(FrozenModel):
-    """An entity source always carries its explicit maximum age."""
+    """A successful native read or entity report, with an explicit maximum age."""
 
-    entity_id: EntityId
+    source: Literal["entity", "native"] = "entity"
+    entity_id: EntityId | None = None
     max_age_s: float = Field(strict=True, gt=0, le=86400, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_source(self) -> Self:
+        if (self.source == "entity") != (self.entity_id is not None):
+            raise ValueError("invalid evidence source")
+        return self
 
 
 class Evidence(FrozenModel):
@@ -145,6 +152,15 @@ class Evidence(FrozenModel):
     live_dispatch: EvidenceSource | None = None
     adjusted_rate: EvidenceSource | None = None
     dispatch_grid_power: EvidenceSource | None = None
+
+    @model_validator(mode="after")
+    def validate_entity_sources(self) -> Self:
+        if any(source is not None and source.source != "entity" for source in (
+            self.ev_status, self.ev_plug, self.ev_power, self.live_dispatch,
+            self.adjusted_rate, self.dispatch_grid_power,
+        )):
+            raise ValueError("invalid evidence source")
+        return self
 
 
 class Writer(FrozenModel):
