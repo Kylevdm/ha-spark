@@ -40,6 +40,7 @@ class AuthorityControl:
         self.store = store
         self.writer: TransitionWriter | None = None
         self.manual_started: Callable[[], Awaitable[None]] | None = None
+        self.manual_resumed: Callable[[int], Awaitable[None]] | None = None
         self.write_barrier: Callable[[], Awaitable[None]] | None = None
         self.preconditions: Callable[[], Preconditions] = Preconditions
         self.owner_source: Callable[[], bool] | None = None
@@ -87,6 +88,14 @@ class AuthorityControl:
                 return TransitionDecision(refusal="authority_unknown")
             if not await self.store.async_save(decision.state):
                 return TransitionDecision(refusal="authority_unknown")
+            if (before is not None and before.manual_session is not None
+                    and decision.state.manual_session is None
+                    and decision.state.committed_mode == "optimise"
+                    and self.manual_resumed is not None):
+                try:
+                    await self.manual_resumed(decision.state.epoch)
+                except Exception:
+                    pass
             if (decision.state.manual_session is not None
                     and (before is None or before.manual_session is None)
                     and self.manual_started is not None):

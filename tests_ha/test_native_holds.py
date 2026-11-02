@@ -2,15 +2,17 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker
 
 from custom_components.ha_spark import native_power
-from custom_components.ha_spark.authority_store import HoldRecord, Transition
+from custom_components.ha_spark.authority_store import HoldRecord, ManualSession, Transition
 from custom_components.ha_spark.coordinator import SparkCoordinator
 from custom_components.ha_spark.native_hold import hold_device
+from custom_components.ha_spark.transitions import TransitionRequest
 from tests_ha.fake_solis import FakeSolisDevice, WriteFault
 from tests_ha.test_native_device import native_entry
 
@@ -485,3 +487,116 @@ async def test_retried_release_step_still_needs_fresh_clear_evidence(
     c.hass.states.async_set("sensor.ev", "stopped")
     await c.control.async_retry()
     assert native_transport.holding[43007] == 190
+
+
+def _slot_one(window: list[int]) -> list[int]:
+    """A 30-word 43141 frame with charge current 12 A and this Slot 1 window."""
+    return [120, 0, *window] + [0] * 20
+
+
+async def _manual_optimise(c: SparkCoordinator) -> None:
+    state = c.authority.state
+    assert state is not None
+    await c.authority.async_save(state.model_copy(update={
+        "committed_mode": "optimise",
+        "manual_session": ManualSession(return_to="optimise"),
+    }))
+
+
+async def _restoration(c: SparkCoordinator, inverter_id: str, epoch: int) -> bool:
+    c_guard = c.guard
+    assert c_guard is not None
+    inverter = c.native.inverters[inverter_id]
+    async with c_guard.lock:
+        async with c.native.lock:
+            return await c.writes.async_restoration_held(inverter, epoch=epoch)
+
+
+@pytest.mark.parametrize("trigger", ["resume", "expiry"])
+async def test_manual_end_reverifies_the_owner_edited_slot_one_window(
+    held_site: SparkCoordinator, native_transport: FakeSolisDevice, trigger: str,
+) -> None:
+    c = held_site
+    inverter = next(iter(c.native.inverters.values()))
+    await _manual_optimise(c)
+    state = c.authority.state
+    assert state is not None
+    old, edited = [23, 30, 5, 30, 0, 0, 0, 0], [22, 15, 6, 45, 0, 0, 0, 0]
+    c.writes.verified_windows[inverter.id] = (state.epoch, tuple(old))
+    c.writes.written_a[inverter.id] = 12.0
+    native_transport.set_holding(43141, _slot_one(edited))
+    native_transport.traffic.clear()
+    now = datetime.now(UTC)
+    if trigger == "expiry":
+        assert await c.authority.async_save(state.model_copy(update={
+            "manual_session": ManualSession(
+                return_to="optimise", deadline=now - timedelta(seconds=1)),
+        }))
+        await c.control.async_expire(now=now, zone=ZoneInfo("UTC"))
+        resumed = c.authority.state
+    else:
+        decision = await c.control.async_request(
+            TransitionRequest(target="resume"), now=now, zone=ZoneInfo("UTC"))
+        assert decision.refusal is None
+        resumed = decision.state
+    assert resumed is not None and resumed.manual_session is None
+    assert resumed.committed_mode == "optimise"
+    assert c.writes.last_apply is None  # no plan has been applied in this epoch
+    assert c.writes.verified_windows[inverter.id] == (resumed.epoch, tuple(edited))
+    assert await _restoration(c, inverter.id, resumed.epoch)
+
+
+async def test_manual_end_leaves_a_discharge_half_unverified(
+    held_site: SparkCoordinator, native_transport: FakeSolisDevice,
+) -> None:
+    c = held_site
+    inverter = next(iter(c.native.inverters.values()))
+    await _manual_optimise(c)
+    state = c.authority.state
+    assert state is not None
+    old = [23, 30, 5, 30, 0, 0, 0, 0]
+    edited = [22, 15, 6, 45, 10, 0, 12, 0]
+    c.writes.verified_windows[inverter.id] = (state.epoch, tuple(old))
+    c.writes.written_a[inverter.id] = 12.0
+    native_transport.set_holding(43141, _slot_one(edited))
+    decision = await c.control.async_request(
+        TransitionRequest(target="resume"), now=datetime.now(UTC), zone=ZoneInfo("UTC"))
+    assert decision.state is not None
+    assert c.writes.verified_windows.get(inverter.id) == (state.epoch, tuple(old))
+    assert not await _restoration(c, inverter.id, decision.state.epoch)
+
+
+async def test_manual_end_reverify_is_read_only(
+    held_site: SparkCoordinator, native_transport: FakeSolisDevice,
+) -> None:
+    c = held_site
+    inverter = next(iter(c.native.inverters.values()))
+    await _manual_optimise(c)
+    window = [22, 15, 6, 45, 0, 0, 0, 0]
+    native_transport.set_holding(43141, _slot_one(window))
+    native_transport.traffic.clear()
+    decision = await c.control.async_request(
+        TransitionRequest(target="resume"), now=datetime.now(UTC), zone=ZoneInfo("UTC"))
+    assert decision.state is not None
+    assert not [t for t in native_transport.traffic if t.op == "write"]
+    assert any(t.op == "read" and t.address == 43141 for t in native_transport.traffic)
+    assert c.writes.verified_windows[inverter.id] == (decision.state.epoch, tuple(window))
+
+
+async def test_resume_into_protect_records_no_window(
+    held_site: SparkCoordinator, native_transport: FakeSolisDevice,
+) -> None:
+    c = held_site
+    inverter = next(iter(c.native.inverters.values()))
+    state = c.authority.state
+    assert state is not None
+    assert await c.authority.async_save(state.model_copy(update={
+        "committed_mode": "protect",
+        "manual_session": ManualSession(return_to="protect"),
+    }))
+    native_transport.set_holding(43141, _slot_one([22, 15, 6, 45, 0, 0, 0, 0]))
+    c.writes.verified_windows.pop(inverter.id, None)
+    decision = await c.control.async_request(
+        TransitionRequest(target="resume"), now=datetime.now(UTC), zone=ZoneInfo("UTC"))
+    assert decision.state is not None and decision.state.committed_mode == "protect"
+    assert inverter.id not in c.writes.verified_windows
