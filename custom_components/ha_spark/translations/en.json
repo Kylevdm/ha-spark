@@ -28,6 +28,31 @@
     "resume_control": {"name": "Resume control", "description": "End manual control using current conditions."}
   },
   "issues": {
+    "clock_drift": {
+      "title": "Inverter clock differs from the household clock",
+      "description": "The native inverter clock differs by more than five minutes. Resident windows follow this clock. An administrator can synchronise it with the household clock.",
+      "fix_flow": {
+        "step": {"confirm": {
+          "title": "Synchronise inverter clock",
+          "description": "Write the household clock to this inverter and verify it by read-back. This is an explicit clock write, including in Observe or manual control."
+        }},
+        "error": {
+          "authority_unknown": "Recover authority through the Observe repair before writing.",
+          "not_owner": "Complete integration ownership before writing.",
+          "stale_authority": "Authority changed. Try again under the current authority.",
+          "transition_in_progress": "Wait for the authority transition to finish.",
+          "not_available": "The integration is stopping or unavailable.",
+          "invalid_household_zone": "Configure a valid household time zone first.",
+          "read_only": "The inverter is read-only. Resolve its native device repair first.",
+          "unverified": "The clock write could not be verified. Check connectivity and try again.",
+          "failed": "The clock write failed. Check connectivity and try again."
+        },
+        "abort": {
+          "entry_unavailable": "The config entry is not loaded.",
+          "native_device_missing": "The native inverter is no longer configured."
+        }
+      }
+    },
     "native_unreachable": {"title": "Solis gateway unreachable", "description": "Check gateway connectivity, then Re-probe. The device remains read-only."},
     "native_identity_read_failed": {"title": "Solis identity probe failed", "description": "Identity or caching could not be verified. Check connectivity and Re-probe. The device remains read-only."},
     "native_unvalidated_identity": {"title": "Solis identity not validated", "description": "This identity is not in the validated allow-list. The device remains read-only."},

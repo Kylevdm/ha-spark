@@ -51,6 +51,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     async def native_tick(now: datetime) -> None:
         await coordinator.native.async_check_connections()
         coordinator.soc.observe(now)
+        await coordinator.clock.async_tick(now)
         coordinator.async_update_listeners()
 
     entry.async_on_unload(async_track_time_interval(hass, native_tick, timedelta(seconds=30)))
