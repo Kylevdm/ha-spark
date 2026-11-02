@@ -212,7 +212,7 @@ async def test_heartbeat_collects_transition_and_waits_for_site_barrier(
         assert state.epoch == epoch + 3
 
 
-@pytest.mark.parametrize("kind", ["sync_clock", "supervise_export",
+@pytest.mark.parametrize("kind", ["supervise_export",
                                   "end_supervision"])
 async def test_unavailable_kinds_are_validated_refused_and_consumed(
     hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, kind: str,

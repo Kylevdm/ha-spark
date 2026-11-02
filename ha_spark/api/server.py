@@ -70,9 +70,11 @@ from ha_spark.daemon_channel import (
     Duration,
     ModeTarget,
     Reply,
+    action_lines,
 )
 from ha_spark.daemon_channel import Request as DaemonRequest
 from ha_spark.devices.execution import execution_context
+from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 from ha_spark.energy import v2l
 from ha_spark.energy.carbon import carbon_payload
 from ha_spark.energy.forecast import load_timezone
@@ -252,8 +254,14 @@ class AppState:
             return Reply(error="pending", text="request queued; reload the mode status")
         if result.outcome not in ("applied", "unchanged"):
             return Reply(error=result.reason or result.outcome, reasons=list(result.reasons))
-        return Reply(authority={**(self.native_status() or view),
-                                "command_result": result.model_dump(mode="json")})
+        reply = Reply(authority={**(self.native_status() or view),
+                                 "command_result": result.model_dump(mode="json")})
+        if kind == "sync_clock" and result.outcome == "applied":
+            reply.synced = True
+            reply.lines = action_lines([
+                ActionLine("Native inverter clocks synced and verified", ActionOutcome.VERIFIED),
+            ])
+        return reply
 
     def integration_link_view(self) -> dict[str, object]:
         """Read the current link without affecting authority or planning."""
