@@ -50,6 +50,7 @@ from .native_export import (
     latest_latch,
     latest_record,
     ratings_refusal,
+    record_is_live,
     site_export_limit_w,
     snapshot_event,
 )
@@ -310,16 +311,28 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             supervision_id = UUID(payload.supervision_id)
         except ValueError:
             return base.model_copy(update={"reason": "invalid_intent"})
+        dropped = tuple(row for row in state.export_supervisions
+                        if row.id == supervision_id)
         kept = tuple(row for row in state.export_supervisions
                      if row.id != supervision_id)
-        if len(kept) == len(state.export_supervisions):
+        if not dropped:
             return base.model_copy(update={"reason": "invalid_intent"})
+        now = dt_util.utcnow()
         if not await self.authority.async_save(state.model_copy(update={
-            "export_supervisions": kept, "last_changed_at": dt_util.utcnow(),
+            "export_supervisions": kept, "last_changed_at": now,
         })):
             return base.model_copy(update={"reason": "authority_unknown"})
-        return base.model_copy(update={"outcome": "applied", "reason": None,
-                                       "epoch": state.epoch})
+        # Authority to export ended with that save; the clear is a separate
+        # cleanup obligation whose failure keeps its records for the tick.
+        cleared = True
+        for inverter_id in dict.fromkeys(row.inverter_id for row in dropped):
+            result = await self.writes.async_clear_export(
+                inverter_id, epoch=state.epoch)
+            cleared = cleared and result.outcome in ("applied", "unchanged")
+        return base.model_copy(update={
+            "outcome": "applied" if cleared else "unverified",
+            "reason": None if cleared else None, "epoch": state.epoch,
+        })
 
     async def async_expire_supervisions(self, now: datetime) -> None:
         """End event-scoped supervisions; the cleanup obligation is separate."""
@@ -333,6 +346,31 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             await self.authority.async_save(state.model_copy(update={
                 "export_supervisions": kept, "last_changed_at": now,
             }))
+
+    async def async_retry_export_records(self, now: datetime) -> None:
+        """Retry every non-live, non-cleared record while committed Optimise."""
+        async with self.control.lock:
+            state = self.authority.state
+            if (state is None or state.committed_mode != "optimise"
+                    or not self.control.owned() or state.manual_session is not None
+                    or state.fallback.active
+                    or state.transition is not None
+                    and "cancel_export" in state.transition.steps):
+                return
+            for inverter in self.native.inverters.values():
+                state = self.authority.state
+                if state is None:
+                    return
+                record = latest_record(state.export_records, inverter.id)
+                if record is None or record.state == "cleared":
+                    continue
+                if record_is_live(
+                        record, now=now, epoch=state.epoch, store_id=state.store_id,
+                        supervisions=state.export_supervisions,
+                        stop_latches=state.stop_latches,
+                        fallback_active=state.fallback.active):
+                    continue
+                await self.writes.async_clear_export(inverter.id, epoch=state.epoch)
 
     async def _async_commands(self) -> None:
         """At most one HTTP fetch plus one queued fetch, including forged nudges."""

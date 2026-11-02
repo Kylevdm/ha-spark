@@ -3,6 +3,7 @@
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from custom_components.ha_spark.authority_store import (
     EventIdentity,
@@ -15,6 +16,8 @@ from custom_components.ha_spark.authority_store import (
 from custom_components.ha_spark.native_export import (
     DeviceExportFact,
     bound_refusal,
+    clock_face,
+    export_not_yet_armed,
     fixed_export_refusal,
     ratings_refusal,
     record_is_live,
@@ -158,3 +161,57 @@ def test_a_live_record_needs_its_epoch_store_supervision_end_and_no_latch() -> N
     assert not record_is_live(record, now=NOW, epoch=3, store_id=store_id,
                               supervisions=(supervision,), stop_latches=(),
                               fallback_active=True)
+
+
+# --- arming (#144), ported from the legacy clock-face tests -------------------
+
+LONDON = ZoneInfo("Europe/London")
+
+
+def at(year: int, month: int, day: int, hour: int, minute: int = 0, *, fold: int = 0) -> datetime:
+    return datetime(year, month, day, hour, minute, tzinfo=LONDON, fold=fold)
+
+
+def test_a_day_early_window_is_deferred_until_the_previous_clock_window_closes() -> None:
+    start, end = at(2026, 9, 15, 18, 30), at(2026, 9, 15, 19, 30)
+    for hour in range(20):
+        assert export_not_yet_armed(start, end, at(2026, 9, 14, hour)), hour
+    for hour in range(20, 24):
+        assert not export_not_yet_armed(start, end, at(2026, 9, 14, hour)), hour
+
+
+def test_the_window_arms_once_the_day_before_has_left_its_clock_window() -> None:
+    start, end = at(2026, 9, 15, 18, 30), at(2026, 9, 15, 19, 30)
+    assert export_not_yet_armed(start, end, at(2026, 9, 14, 18, 29))
+    assert export_not_yet_armed(start, end, at(2026, 9, 14, 18, 31))
+    assert export_not_yet_armed(start, end, at(2026, 9, 14, 19, 29))
+    assert not export_not_yet_armed(start, end, at(2026, 9, 14, 19, 30))
+    assert not export_not_yet_armed(start, end, at(2026, 9, 15, 12, 0))
+
+
+def test_a_midnight_wrapping_window_is_judged_on_its_start() -> None:
+    start, end = at(2026, 9, 15, 23, 30), at(2026, 9, 16, 0, 30)
+    assert export_not_yet_armed(start, end, at(2026, 9, 15, 0, 15))
+    assert not export_not_yet_armed(start, end, at(2026, 9, 15, 0, 30))
+    assert not export_not_yet_armed(start, end, at(2026, 9, 15, 20, 0))
+    assert export_not_yet_armed(start, end, at(2026, 9, 14, 20, 0))
+
+
+def test_a_window_already_under_way_stays_armed() -> None:
+    start, end = at(2026, 9, 15, 18, 30), at(2026, 9, 15, 19, 30)
+    assert not export_not_yet_armed(start, end, at(2026, 9, 15, 18, 45))
+
+
+def test_an_event_in_the_fall_back_repeated_hour_is_refused_not_armed() -> None:
+    start = at(2026, 10, 25, 1, 30, fold=1)
+    end = at(2026, 10, 25, 2, 30, fold=1)
+    now = at(2026, 10, 25, 1, 0, fold=0)
+    assert now.astimezone(UTC) < start.astimezone(UTC)
+    assert export_not_yet_armed(start, end, now)
+
+
+def test_the_discharge_half_follows_the_household_clock_face() -> None:
+    start = datetime(2026, 7, 15, 17, 0, tzinfo=UTC)  # 18:00 BST
+    end = datetime(2026, 7, 15, 18, 0, tzinfo=UTC)
+    assert clock_face(start, end, LONDON) == [18, 0, 19, 0]
+    assert clock_face(start, end, ZoneInfo("Asia/Kolkata")) == [22, 30, 23, 30]

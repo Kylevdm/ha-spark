@@ -7,7 +7,7 @@ window is armed.
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta, tzinfo
 from math import isfinite
 from typing import Any
 from uuid import UUID
@@ -191,3 +191,49 @@ def snapshot_event(event: EventIdentity) -> dict[str, Any]:
     return {"direction": event.direction,
             "start": event.start.astimezone(UTC).isoformat(),
             "end": event.end.astimezone(UTC).isoformat()}
+
+
+def clock_window_open(moment: time, start: time, end: time) -> bool:
+    """True when clock time ``moment`` is inside ``[start, end)``, wrapping midnight."""
+    if start < end:
+        return start <= moment < end
+    if start > end:
+        return moment >= start or moment < end
+    return False
+
+
+def next_wall_clock_occurrence(wall: datetime, now: datetime) -> datetime:
+    """First instant at or after ``now`` showing ``wall``'s clock face.
+
+    Recombines a date with the time of day so a DST boundary moves the offset
+    but not the face the Slot 1 registers hold. The first fold is chosen
+    deliberately: the register fires on the first occurrence.
+    """
+    face = wall.time().replace(fold=0)
+    today = datetime.combine(now.date(), face, tzinfo=now.tzinfo)
+    if today.astimezone(UTC) >= now.astimezone(UTC):
+        return today
+    return datetime.combine(now.date() + timedelta(days=1), face, tzinfo=now.tzinfo)
+
+
+def export_not_yet_armed(start: datetime, end: datetime, now: datetime) -> bool:
+    """A window whose clock face would come round before its own event is deferred.
+
+    Slot 1 carries a time of day and no date, so programming tomorrow's window
+    today would discharge at the same clock time today. An earlier day's still
+    open window is deferred too, and an event inside a repeated fall-back hour
+    is refused outright (its face comes round twice).
+    """
+    if now.astimezone(UTC) >= start.astimezone(UTC):
+        return False
+    if clock_window_open(now.time(), start.time(), end.time()):
+        return True
+    occurrence = next_wall_clock_occurrence(start, now)
+    return occurrence.astimezone(UTC) != start.astimezone(UTC)
+
+
+def clock_face(window_start: datetime, window_end: datetime, zone: tzinfo) -> list[int]:
+    """Slot 1's discharge half: the selected window on the household clock."""
+    start = window_start.astimezone(zone)
+    end = window_end.astimezone(zone)
+    return [start.hour, start.minute, end.hour, end.minute]

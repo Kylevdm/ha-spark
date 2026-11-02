@@ -36,6 +36,7 @@ class NativeSlots:
         self.planned_discharge = planned_discharge or [0] * 4
         self.fallback = fallback
         self.transition = transition
+        self.block_result: IntentResult | None = None
         # A charge window needs trusted SoC for every write, whatever its direction.
         self.soc_required = False
 
@@ -101,6 +102,23 @@ class NativeSlots:
                 return IntentResult(outcome="failed")
         return await self.block(43143, resident[:4] + [0] * 4)
 
+    async def arm(self, discharge: list[int], *, zero_charge: bool = False) -> IntentResult:
+        """Replace Slot 1's discharge half, keeping the resident charge half."""
+        resident = await self.read(43143)
+        if resident is None:
+            return IntentResult(outcome="failed")
+        if zero_charge:
+            return await self.block(43143, [0] * 4 + discharge)
+        if not any(resident):
+            async def read() -> list[int] | None:
+                return await self.read(43143)
+            if not await confirm([0] * 8, read, native_write.verify_sleep,
+                                 changed=False, mismatch=self.mismatch):
+                resident = await self.read(43143)
+                if resident is None:
+                    return IntentResult(outcome="failed")
+        return await self.block(43143, resident[:4] + discharge)
+
     async def prepare(self, current: float) -> IntentResult:
         resident = await self.read(43143)
         if resident is None:
@@ -164,9 +182,18 @@ class NativeSlots:
         if current_result.outcome in ("applied", "unchanged"):
             charge = [int(part) for time in (request.start, request.end)
                       for part in time.split(":")]
-            results.append(await self.block(43143, charge + self.planned_discharge))
-        elif not any(self.planned_discharge):
-            results.append(await self.clear_discharge())
+            self.block_result = await self.block(43143, charge + self.planned_discharge)
+            results.append(self.block_result)
+        elif any(self.planned_discharge):
+            # Permission gates charging only: a ready export still replaces the
+            # discharge half, keeping the resident charge half (or zeroing it
+            # when the requested charge is zero).
+            self.block_result = await self.arm(
+                self.planned_discharge, zero_charge=request.current_a <= 0)
+            results.append(self.block_result)
+        else:
+            self.block_result = await self.clear_discharge()
+            results.append(self.block_result)
         for address in (43153, 43163):
             results.append(await self.block(address, [0] * 8))
         if all(r.outcome in ("applied", "unchanged") for r in results):
