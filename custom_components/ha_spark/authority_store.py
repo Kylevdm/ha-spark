@@ -5,11 +5,17 @@ an authority source only after the ownership handshake. HoldDevice deliberately
 retains the legacy identity fields; native holds bind them to the gateway/unit.
 """
 
-from datetime import time
 from typing import Annotated, Literal, Self
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 OperatingMode = Literal["observe", "protect", "optimise"]
 Text = Annotated[str, Field(strict=True, min_length=1, max_length=128)]
@@ -111,8 +117,22 @@ class EventIdentity(Record):
 
 
 class ExportWindow(Record):
-    start: time
-    end: time
+    """Dated instants; the register clock face is derived when arming."""
+
+    start: AwareDatetime
+    end: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_window(self) -> Self:
+        if self.end <= self.start:
+            raise ValueError("invalid export window")
+        return self
+
+
+class GatewayClaim(Record):
+    host: Text
+    port: Annotated[int, Field(strict=True, ge=1, le=65535)]
+    unit_id: Annotated[int, Field(strict=True, ge=0, le=247)]
 
 
 class ExportSupervision(Record):
@@ -122,6 +142,9 @@ class ExportSupervision(Record):
     confirming_user_id: Text
     epoch: Epoch
     ends_at: AwareDatetime
+    rating_w: Annotated[float, Field(gt=0, le=100000, allow_inf_nan=False)]
+    identity: tuple[int, int, int]
+    claim: GatewayClaim
 
 
 class ExportRecord(Record):

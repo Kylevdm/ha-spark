@@ -239,8 +239,8 @@ async def test_registered_config_entities_and_service_state(
         "entity_id": entity.entity_id, "value": 17.9,
     }, blocking=True, context=Context(user_id=hass_admin_user.id))
     state = hass.states.get(entity.entity_id)
-    assert state is not None and state.state == "17.0"
-    assert native_transport.holding[43141] == 170
+    assert state is not None and state.state == "17.9"
+    assert native_transport.holding[43141] == 179
     assert hass_admin_user.id in caplog.text
     # Read-only validation does not hide readable device state.
     monkeypatch.setattr(writer.native, "reason", lambda inverter: "caching_on")
@@ -415,12 +415,12 @@ async def test_prewrite_recheck_blocks_discharge_and_slot_writes(
 
 
 @pytest.mark.parametrize(("control", "address", "value", "limit", "expected"), [
-    ("discharge", 43142, 70.0, 100.0, 620),
+    ("discharge", 43142, 70.0, 100.0, 625),
     ("discharge", 43142, 45.0, 30.0, 300),
-    ("discharge", 43142, 10.9, 62.5, 100),
-    ("charge", 43141, 70.0, 100.0, 620),
+    ("discharge", 43142, 10.9, 62.5, 109),
+    ("charge", 43141, 70.0, 100.0, 625),
     ("charge", 43141, 45.0, 30.0, 300),
-    ("charge", 43141, 10.9, 62.5, 100),
+    ("charge", 43141, 10.9, 62.5, 109),
 ])
 async def test_current_numbers_pin_exact_clamp_and_cap(
     writer: SparkCoordinator, native_transport: FakeSolisDevice,

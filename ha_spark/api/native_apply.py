@@ -6,9 +6,9 @@ its local authority and reports verification; a timeout never resubmits work.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal, TypedDict
+from typing import Annotated, Literal, TypedDict
 
-from pydantic import Field, JsonValue
+from pydantic import BeforeValidator, Field, JsonValue, model_validator
 
 from ha_spark.api.commands import CommandQueue, CommandResult, Record
 from ha_spark.api.contract import IntegrationLink
@@ -19,6 +19,18 @@ from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 from ha_spark.energy.models import ChargeIntent
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.topology import Topology, effective_limits, split_bank_allocation
+
+
+def _instant(value: object) -> object:
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+    return value
+
+
+Instant = Annotated[datetime, BeforeValidator(_instant)]
 
 
 class CurrentIntent(Record):
@@ -36,10 +48,89 @@ class ChargeWindow(CurrentIntent):
     end: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
+class ExportEvent(Record):
+    direction: Literal["export"]
+    start: Instant
+    end: Instant
+
+    @model_validator(mode="after")
+    def validate_window(self) -> ExportEvent:
+        if self.start.utcoffset() is None or self.end.utcoffset() is None:
+            raise ValueError("invalid event window")
+        if self.end <= self.start:
+            raise ValueError("invalid event window")
+        return self
+
+
+class ExportInterval(Record):
+    start: Instant
+    end: Instant
+
+    @model_validator(mode="after")
+    def validate_window(self) -> ExportInterval:
+        if self.start.utcoffset() is None or self.end.utcoffset() is None:
+            raise ValueError("invalid export window")
+        if self.end <= self.start:
+            raise ValueError("invalid export window")
+        return self
+
+
+class ExportSoc(Record):
+    ok: bool = Field(strict=True)
+    soc_pct: float = Field(ge=0, le=100, allow_inf_nan=False)
+    observed_at: Instant
+
+    @model_validator(mode="after")
+    def validate_aware(self) -> ExportSoc:
+        if self.observed_at.utcoffset() is None:
+            raise ValueError("invalid SoC time")
+        return self
+
+
 class ExportNone(Record):
     kind: Literal["export"] = "export"
     inverter_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
     request: Literal["none"] = "none"
+
+
+class ExportUntrusted(Record):
+    kind: Literal["export"] = "export"
+    inverter_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    request: Literal["untrusted"] = "untrusted"
+
+
+class ExportWindow(Record):
+    kind: Literal["export"] = "export"
+    inverter_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    request: Literal["window"] = "window"
+    event: ExportEvent
+    window: ExportInterval
+    planned_export_kw: float = Field(gt=0, allow_inf_nan=False)
+    dno_export_limit_kw: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    soc: ExportSoc
+
+
+def _export_intent(
+    intent: ChargeIntent, inverter_id: str,
+) -> ExportNone | ExportUntrusted | ExportWindow:
+    export = intent.export
+    if export is None:
+        if not intent.export_trusted:
+            return ExportUntrusted(inverter_id=inverter_id)
+        return ExportNone(inverter_id=inverter_id)
+    direction, start, end = export.event_identity
+    if direction != "export":
+        raise ValueError("invalid export direction")
+    dno = export.dno_export_limit_kw
+    return ExportWindow(
+        inverter_id=inverter_id,
+        event=ExportEvent(direction="export", start=start, end=end),
+        window=ExportInterval(start=export.window_start, end=export.window_end),
+        planned_export_kw=export.planned_export_kw,
+        dno_export_limit_kw=dno if dno > 0 else None,
+        soc=ExportSoc(ok=intent.soc.ok, soc_pct=intent.soc.soc_now,
+                      observed_at=intent.soc.observed_at),
+    )
 
 
 def build_intents(intent: ChargeIntent, settings: Settings, execution: ExecutionContext,
@@ -63,7 +154,7 @@ def build_intents(intent: ChargeIntent, settings: Settings, execution: Execution
                          start=intent.window_start.strftime("%H:%M"),
                          end=intent.window_end.strftime("%H:%M")),
             ChargeCurrentLimit(inverter_id=inverter.id, current_a=current),
-            ExportNone(inverter_id=inverter.id),
+            _export_intent(intent, inverter.id),
         ):
             intents.append(action.model_dump(mode="json"))
     return intents

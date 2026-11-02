@@ -3,9 +3,29 @@
 This pure module mirrors the add-on schema, pinned by shared golden fixtures.
 Only the authority controller or a gated device handler may execute a command.
 """
-from typing import Literal
+from datetime import datetime
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    JsonValue,
+    model_validator,
+)
+
+
+def _instant(value: object) -> object:
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+    return value
+
+
+Instant = Annotated[datetime, BeforeValidator(_instant)]
 
 Kind = Literal["transition", "manual", "sync_clock", "reprobe", "apply",
                "supervise_export", "end_supervision"]
@@ -76,7 +96,10 @@ class Command(Record):
 IntentOutcome = Literal["applied", "unchanged", "deferred", "refused", "unverified", "failed"]
 WriteReason = Literal["not_available", "invalid_intent", "limits", "mode", "stale_epoch",
                       "authority_unknown", "gateway_not_owned", "read_only", "untrusted_soc",
-                      "grid_charge_not_permitted"]
+                      "grid_charge_not_permitted", "not_supervised", "export_bound_unverified",
+                      "export_bounds_exceed_site_limit", "clock_not_trusted",
+                      "hold_overlaps_export", "hold_data_untrusted", "power_switch_not_on",
+                      "tripped", "export_not_available"]
 
 
 class IntentResult(Record):
@@ -101,10 +124,66 @@ class ChargeWindow(Record):
     end: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
+class ExportEvent(Record):
+    direction: Literal["export"]
+    start: Instant
+    end: Instant
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "ExportEvent":
+        if self.start.utcoffset() is None or self.end.utcoffset() is None:
+            raise ValueError("invalid event window")
+        if self.end <= self.start:
+            raise ValueError("invalid event window")
+        return self
+
+
+class ExportInterval(Record):
+    start: Instant
+    end: Instant
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "ExportInterval":
+        if self.start.utcoffset() is None or self.end.utcoffset() is None:
+            raise ValueError("invalid export window")
+        if self.end <= self.start:
+            raise ValueError("invalid export window")
+        return self
+
+
+class ExportSoc(Record):
+    ok: bool = Field(strict=True)
+    soc_pct: float = Field(ge=0, le=100, allow_inf_nan=False)
+    observed_at: Instant
+
+    @model_validator(mode="after")
+    def validate_aware(self) -> "ExportSoc":
+        if self.observed_at.utcoffset() is None:
+            raise ValueError("invalid SoC time")
+        return self
+
+
 class ExportNone(Record):
     kind: Literal["export"]
     inverter_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
     request: Literal["none"]
+
+
+class ExportUntrusted(Record):
+    kind: Literal["export"]
+    inverter_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    request: Literal["untrusted"]
+
+
+class ExportWindow(Record):
+    kind: Literal["export"]
+    inverter_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    request: Literal["window"]
+    event: ExportEvent
+    window: ExportInterval
+    planned_export_kw: float = Field(gt=0, allow_inf_nan=False)
+    dno_export_limit_kw: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    soc: ExportSoc
 
 
 class CommandResult(Record):
@@ -118,7 +197,10 @@ class CommandResult(Record):
                     "no_manual_session", "not_in_active_mode", "preconditions_unmet",
                     "invalid_household_zone", "native_device_missing", "invalid_intent", "limits",
                     "mode", "gateway_not_owned", "read_only", "untrusted_soc",
-                    "grid_charge_not_permitted"] | None = None
+                    "grid_charge_not_permitted", "not_supervised", "export_bound_unverified",
+                    "export_bounds_exceed_site_limit", "clock_not_trusted",
+                    "hold_overlaps_export", "hold_data_untrusted", "power_switch_not_on",
+                    "tripped", "export_not_available", "not_admin"] | None = None
     intents: list[IntentResult] = Field(default_factory=list, max_length=64)
     epoch: int | None = Field(default=None, ge=1)
     reasons: list[Literal[

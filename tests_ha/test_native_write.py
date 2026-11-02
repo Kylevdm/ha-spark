@@ -79,7 +79,7 @@ async def test_current_result(
     result = await writer._async_dispatch_command(command(writer))
     assert result.outcome == expected
     assert result.intents[0].outcome == expected
-    assert result.intents[0].written_a == (20 if expected in ("applied", "unverified") else None)
+    assert result.intents[0].written_a == (20.9 if expected in ("applied", "unverified") else None)
     assert all(t.address == 43141 for t in native_transport.traffic if t.op == "write")
     if expected == "applied":
         result = await writer._async_dispatch_command(command(writer))
@@ -159,7 +159,7 @@ async def test_soc_not_required_for_reductions_or_unchanged(
     monkeypatch.delattr(writer, "soc")
     result = await writer._async_dispatch_command(command(writer, current))
     assert result.outcome == ("unchanged" if current == 10 else "applied")
-    assert result.intents[0].written_a == int(current)
+    assert result.intents[0].written_a == current
     reads = [t for t in native_transport.traffic if t.op == "read" and t.address == 43141]
     assert len(reads) == (7 if current == 0 else 2)
 
@@ -220,7 +220,7 @@ async def test_clamp_and_intent_isolation(
     result = await writer._async_dispatch_command(request)
     assert result.outcome == "refused"
     assert [i.outcome for i in result.intents] == ["refused", "refused", "applied"]
-    assert result.intents[-1].written_a == 62  # 62.5 A driver ceiling, whole amps
+    assert result.intents[-1].written_a == 62.5  # 62.5 A driver ceiling
     assert (await writer._async_dispatch_command(request.model_copy(
         update={"payload": {"intents": []}}))).outcome == "refused"
 
@@ -303,7 +303,7 @@ async def test_peers_reclamped_reductions_before_increases(
         result = await writer._async_dispatch_command(command(writer, 10))
         assert result.intents[0].written_a == 8  # requested device, not its increasing peer
         writes = [t for t in native_transport.traffic if t.op == "write"]
-        assert [(t.device_id, t.payload) for t in writes] == [(1, (80,)), (2, (320,))]
+        assert [(t.device_id, t.payload) for t in writes] == [(1, (80,)), (2, (321,))]
 
 
 @pytest.mark.parametrize("confirmed", [True, False])
@@ -325,7 +325,7 @@ async def test_effective_limit_narrows_and_unconfirmed_is_zero(
     writer.native.inverters[inv.id] = inv
     result = await writer._async_dispatch_command(command(writer, 62.5))
     assert result.outcome == "applied"
-    assert result.intents[0].written_a == (15 if confirmed else 0)
+    assert result.intents[0].written_a == (15.5 if confirmed else 0)
     await writer.hass.async_block_till_done()
 
 

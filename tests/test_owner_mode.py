@@ -109,3 +109,41 @@ async def test_mode_set_refusal_without_reasons_has_no_dangling_colon(
     monkeypatch.setattr(cli, "submit_socket", submit)
     assert await cli._cmd_mode_set(settings_at(tmp_path), "observe") == 1
     assert capsys.readouterr().out == "[REFUSED] no_change\n"
+
+
+async def test_export_ingress_routes_queue_the_owner_and_ratings(tmp_path: Path) -> None:
+    class Executor:
+        async def submit_export(self, event, ratings_w, *, ingress_user=None):
+            assert (event, ratings_w, ingress_user) == (
+                "event-id", {"inv1": 3000.0}, "owner_1")
+            return Reply(authority={"mode": "optimise"})
+
+        async def submit_end_supervision(self, supervision_id, *, ingress_user=None):
+            assert (supervision_id, ingress_user) == ("supervision-id", "owner_1")
+            return Reply(authority={"mode": "optimise"})
+
+    state = AppState(settings_at(tmp_path), tmp_path / "options.json", executor=Executor())
+    app = build_app(state, ingress_peer="proxy")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=("proxy", 1)),
+                                base_url="http://local") as client:
+        response = await client.post(
+            "/api/export/supervise", json={"event": "event-id",
+                                           "ratings_w": {"inv1": 3000.0}},
+            headers={"X-Remote-User-Id": "owner_1", "X-HA-Spark-Request": "export"},
+        )
+        assert response.status_code == 200
+        ended = await client.post(
+            "/api/export/end", json={"supervision_id": "supervision-id"},
+            headers={"X-Remote-User-Id": "owner_1", "X-HA-Spark-Request": "export"},
+        )
+        assert ended.status_code == 200
+
+
+def test_export_cli_parser() -> None:
+    args = cli.build_parser().parse_args([
+        "export", "supervise", "--event", "event-id", "--rating", "inv1=3000",
+    ])
+    assert (args.export_command, args.event, args.rating) == (
+        "supervise", "event-id", ["inv1=3000"])
+    assert cli.build_parser().parse_args(
+        ["export", "end", "supervision-id"]).supervision_id == "supervision-id"

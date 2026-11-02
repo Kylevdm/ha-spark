@@ -8,6 +8,7 @@ Resident state is evidence only after exact read-back, never a requested value.
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import datetime, time
+from math import floor
 from typing import TYPE_CHECKING
 
 from homeassistant.util import dt as dt_util
@@ -35,6 +36,11 @@ if TYPE_CHECKING:
 
 verify_sleep = asyncio.sleep
 _SEVERITY = ("applied", "unchanged", "deferred", "refused", "unverified", "failed")
+
+
+def current_word(current: float) -> int:
+    """Tenths of an amp, floored so a write is never above the clamped request."""
+    return floor(round(max(current, 0.0) * 10, 6))
 
 
 class NativeChargeBoundary:
@@ -568,7 +574,7 @@ class NativeChargeBoundary:
             return IntentResult(outcome="failed")
         if lower_only:
             current = min(current, resident / 10)
-        target = int(current) * 10
+        target = current_word(current)
         def untrusted() -> bool:
             soc = getattr(self.coordinator, "soc", None)
             return (not soc_exempt and (target > resident or soc_required)

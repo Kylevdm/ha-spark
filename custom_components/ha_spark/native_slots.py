@@ -114,7 +114,7 @@ class NativeSlots:
         if active:
             transport = self.boundary.coordinator.native.transport(self.inverter)
             amps = await self.boundary._read(transport, self.inverter)
-            if amps is None or abs(amps / 10 - int(current)) > 0.5:
+            if amps is None or abs(amps / 10 - current) > 0.05:
                 keep = (self.planned_discharge if any(self.planned_discharge)
                         and resident[4:] == self.planned_discharge else [0] * 4)
                 return await self.block(43143, [0] * 4 + keep)
@@ -141,8 +141,7 @@ class NativeSlots:
                     # Slot 1 schedule is never zeroed by another inverter's window.
                     return await self.boundary._async_commit(
                         device, current, self.epoch, self.mismatches,
-                        fallback=self.fallback, transition=self.transition,
-                        soc_exempt=self.fallback)
+                        fallback=self.fallback, transition=self.transition)
                 device_transport = self.boundary.coordinator.native.transport(device)
                 allowed = await self.boundary._read(device_transport, device, input_=True)
                 if allowed is None or not allowed & 32:

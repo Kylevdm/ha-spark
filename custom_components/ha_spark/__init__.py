@@ -70,6 +70,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     async def authority_tick(now: datetime) -> None:
         zone = coordinator.control.household_zone() or ZoneInfo("UTC")
         await coordinator.control.async_expire(now=now, zone=zone)
+        await coordinator.async_expire_supervisions(now)
         await coordinator.control.async_retry()
 
     entry.async_on_unload(async_track_time_interval(hass, authority_tick, timedelta(seconds=30)))

@@ -41,7 +41,8 @@ async def async_entity(boundary: "NativeChargeBoundary", inverter_id: str, contr
                         limit = next(i.discharge_a for i in guard.limits.inverters
                                      if i.id == inverter.id)
                         return await words(boundary, inverter, epoch, control, 43142,
-                                           [int(min(value, limit, 62.5)) * 10], mismatches)
+                                           [native_write.current_word(
+                                               min(value, limit, 62.5))], mismatches)
                     current = min(value, 62.5)
                 elif (offset in (0, 2, 4, 6) and isinstance(value, list)
                       and len(value) == 2 and valid_words(value)
@@ -74,7 +75,7 @@ async def async_entity(boundary: "NativeChargeBoundary", inverter_id: str, contr
                         result = await boundary._async_commit(device, amps, epoch, mismatches,
                                                              entity_control="charge")
                         if result.outcome in ("applied", "unchanged"):
-                            publish(boundary, device, 43141, [int(amps) * 10])
+                            publish(boundary, device, 43141, [native_write.current_word(amps)])
                         return result
                     try:
                         result, attempted = await boundary._async_transaction(

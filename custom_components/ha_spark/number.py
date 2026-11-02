@@ -21,7 +21,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry,
 
 class NativeCurrent(WriteEntity, NumberEntity):
     _attr_native_min_value = 0
-    _attr_native_step = 1
+    _attr_native_step = 0.1
     _attr_native_unit_of_measurement = UnitOfElectricCurrent.AMPERE
     _attr_mode = NumberMode.BOX
 

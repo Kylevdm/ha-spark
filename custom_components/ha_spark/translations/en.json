@@ -21,7 +21,8 @@
     "transition_in_progress": {"message": "An authority transition is still in progress."},
     "no_manual_session": {"message": "There is no manual session to resume."},
     "not_in_active_mode": {"message": "Manual control requires Protect or Optimise and no existing manual session."},
-    "invalid_household_zone": {"message": "Configure a valid household time zone before choosing until tomorrow."}
+    "invalid_household_zone": {"message": "Configure a valid household time zone before choosing until tomorrow."},
+    "not_admin": {"message": "Only a non-system Home Assistant administrator may do that."}
   },
   "services": {
     "commands_pending": {"name": "Commands pending", "description": "Prompt a fetch from the authenticated add-on channel. Accepts no command data."},
@@ -152,6 +153,19 @@
     },
     "sensor": {
       "native_bank_soc": {"name": "SoC"},
+      "native_export_bound": {"name": "Export bound"},
+      "native_export_supervision": {"name": "Export supervision"},
+      "native_export_record": {
+        "name": "Export record",
+        "state": {
+          "armed": "armed",
+          "active": "active",
+          "preserved": "preserved",
+          "stop_pending": "stop pending",
+          "cleared": "cleared",
+          "unknown": "unknown"
+        }
+      },
       "native_bank_soc_trust": {
         "name": "SoC trust",
         "state": {"trusted": "Trusted", "untrusted": "Untrusted", "recovering": "Recovering"}

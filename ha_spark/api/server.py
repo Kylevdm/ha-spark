@@ -29,7 +29,7 @@ import re
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
@@ -78,7 +78,7 @@ from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 from ha_spark.energy import v2l
 from ha_spark.energy.carbon import carbon_payload
 from ha_spark.energy.forecast import load_timezone
-from ha_spark.energy.models import ChargePlan
+from ha_spark.energy.models import ChargePlan, ExportIntent
 from ha_spark.energy.plan_run import StoredPlanRun
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.energy.solar_forecasts import recorded_solar
@@ -137,6 +137,17 @@ class ModeBody(BaseModel):
     expected_epoch: int | None = Field(ge=1, strict=True)
     duration: Duration = "one_hour"
     keep_protection: bool = Field(default=True, strict=True)
+
+
+class ExportSuperviseBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    event: str | None = Field(default=None, max_length=256)
+    ratings_w: dict[str, float]
+
+
+class ExportEndBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    supervision_id: str = Field(min_length=1, max_length=128)
 
 
 class ConfigBody(BaseModel):
@@ -199,6 +210,7 @@ class AppState:
             "failing_actions": [], "holds": [], "last_changed_at": None, "requester_kind": None,
             "preconditions": {target: dict(unchecked)
                               for target in ("observe", "protect", "optimise")},
+            "planned_export": self._planned_export_view(),
         }
         authority = link.v4.authority
         if (authority is None or link.received_at is None or link.skew
@@ -214,6 +226,29 @@ class AppState:
         view["command_results"] = [r.model_dump(mode="json")
                                    for r in self.commands.results.values()]
         return view
+
+    def _planned_export(self) -> tuple[ExportIntent, str] | None:
+        """The current plan's export intent, or None when there is none."""
+        plan = self.plan
+        intent = plan.charge_intent if plan is not None else None
+        export = intent.export if intent is not None else None
+        if export is None:
+            return None
+        direction, start, end = export.event_identity
+        identity = (f"{direction}|{start.astimezone(UTC).isoformat()}|"
+                    f"{end.astimezone(UTC).isoformat()}")
+        return export, identity
+
+    def _planned_export_view(self) -> dict[str, Any] | None:
+        planned = self._planned_export()
+        if planned is None:
+            return None
+        export, identity = planned
+        _direction, start, end = export.event_identity
+        devices = self.integration_link.v4.devices if self.integration_link.v4 else ()
+        return {"id": identity, "start": start.astimezone(UTC).isoformat(),
+                "end": end.astimezone(UTC).isoformat(),
+                "inverters": [d.id for d in devices if d.transport == "native"]}
 
     async def native_request(self, request: DaemonRequest, user: str | None) -> Reply | None:
         view = self.native_status()
@@ -232,6 +267,24 @@ class AppState:
             payload.update(target=request.target, expected_epoch=request.expected_epoch)
             if kind == "manual":
                 payload.update(duration=request.duration, keep_protection=request.keep_protection)
+        elif request.op == "supervise_export":
+            planned = self._planned_export()
+            if planned is None or not request.ratings_w:
+                return Reply(error="invalid_intent")
+            export, identity = planned
+            if request.event is not None and request.event != identity:
+                return Reply(error="invalid_intent")
+            direction, start, end = export.event_identity
+            kind = "supervise_export"
+            payload["event"] = {"direction": direction,
+                                "start": start.astimezone(UTC).isoformat(),
+                                "end": end.astimezone(UTC).isoformat()}
+            payload["ratings_w"] = cast(JsonValue, request.ratings_w)
+        elif request.op == "end_supervision":
+            if request.supervision_id is None:
+                return Reply(error="invalid_intent")
+            kind = "end_supervision"
+            payload.update(supervision_id=request.supervision_id)
         try:
             command = self.commands.enqueue(
                 epoch=view["epoch"], kind=kind, payload=payload,
@@ -604,6 +657,59 @@ def build_app(
                     status_code=status,
                 )
             return JSONResponse(reply.authority or {})
+
+        async def _submit_export(request: Request, body: object) -> JSONResponse:
+            user = _owner_request(request, "export")
+            if isinstance(user, JSONResponse):
+                return user
+            st = _state_of(request)
+            executor = st.executor
+            if executor is None:
+                return JSONResponse({"error": "no daemon executor"}, status_code=503)
+            try:
+                if isinstance(body, ExportSuperviseBody):
+                    submitted = executor.submit_export(
+                        body.event, body.ratings_w, ingress_user=user)
+                else:
+                    assert isinstance(body, ExportEndBody)
+                    submitted = executor.submit_end_supervision(
+                        body.supervision_id, ingress_user=user)
+                reply = await asyncio.wait_for(submitted, timeout=_MODE_REPLY_TIMEOUT_S)
+            except TimeoutError:
+                return JSONResponse(
+                    {"error": "pending", "detail": "request queued; reload the mode status"},
+                    status_code=504,
+                )
+            if reply.error:
+                status = (504 if reply.error == "pending" else 409 if reply.error in (
+                    "stale_epoch", "stale_authority", "transition_in_progress") else 400)
+                return JSONResponse(
+                    {"error": reply.error, "detail": reply.text, "reasons": reply.reasons},
+                    status_code=status,
+                )
+            return JSONResponse(reply.authority or {})
+
+        @app.post("/api/export/supervise")
+        async def post_export_supervise(request: Request) -> JSONResponse:
+            user = _owner_request(request, "export")
+            if isinstance(user, JSONResponse):
+                return user
+            try:
+                body = ExportSuperviseBody.model_validate(await request.json())
+            except (ValueError, ValidationError):
+                return JSONResponse({"error": "invalid export request"}, status_code=400)
+            return await _submit_export(request, body)
+
+        @app.post("/api/export/end")
+        async def post_export_end(request: Request) -> JSONResponse:
+            user = _owner_request(request, "export")
+            if isinstance(user, JSONResponse):
+                return user
+            try:
+                body = ExportEndBody.model_validate(await request.json())
+            except (ValueError, ValidationError):
+                return JSONResponse({"error": "invalid export request"}, status_code=400)
+            return await _submit_export(request, body)
 
         @app.post("/api/replan")
         async def post_replan(request: Request) -> JSONResponse:

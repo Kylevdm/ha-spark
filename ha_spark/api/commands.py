@@ -78,7 +78,10 @@ class Command(Record):
 IntentOutcome = Literal["applied", "unchanged", "deferred", "refused", "unverified", "failed"]
 WriteReason = Literal["not_available", "invalid_intent", "limits", "mode", "stale_epoch",
                       "authority_unknown", "gateway_not_owned", "read_only", "untrusted_soc",
-                      "grid_charge_not_permitted"]
+                      "grid_charge_not_permitted", "not_supervised", "export_bound_unverified",
+                      "export_bounds_exceed_site_limit", "clock_not_trusted",
+                      "hold_overlaps_export", "hold_data_untrusted", "power_switch_not_on",
+                      "tripped", "export_not_available"]
 
 
 class IntentResult(Record):
@@ -100,7 +103,10 @@ class CommandResult(Record):
                     "no_manual_session", "not_in_active_mode", "preconditions_unmet",
                     "invalid_household_zone", "native_device_missing", "invalid_intent", "limits",
                     "mode", "gateway_not_owned", "read_only", "untrusted_soc",
-                    "grid_charge_not_permitted"] | None = None
+                    "grid_charge_not_permitted", "not_supervised", "export_bound_unverified",
+                    "export_bounds_exceed_site_limit", "clock_not_trusted",
+                    "hold_overlaps_export", "hold_data_untrusted", "power_switch_not_on",
+                    "tripped", "export_not_available", "not_admin"] | None = None
     intents: list[IntentResult] = Field(default_factory=list, max_length=64)
     epoch: int | None = Field(default=None, ge=1)
     reasons: list[Literal[

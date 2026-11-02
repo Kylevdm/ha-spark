@@ -57,7 +57,43 @@ export function mountMode(root, health, refreshHealth) {
         detail("Fallback and causes", view.fallback);
         detail("Last change", view.last_changed_at);
         detail("Requester kind", view.requester_kind);
+        if (view.planned_export) detail("Planned export event", view.planned_export);
         if (view.save_failed) detail("Authority fault", "Authority store save failed; writes are blocked.");
+        if (view.planned_export && view.mode === "optimise") {
+            element("h2", "Supervise this export", statusNode);
+            element("p", "Export is supervised only. Be present for preparation and verified "
+                + "cleanup; keep an abort path (End supervision) ready and check the battery "
+                + "stops exporting afterwards. Confirm each inverter's rated AC output.", statusNode);
+            const form = document.createElement("form");
+            statusNode.appendChild(form);
+            const inputs = {};
+            for (const inverter of view.planned_export.inverters || []) {
+                const label = element("label", inverter + " rated output (W) ", form);
+                const input = document.createElement("input");
+                input.type = "number";
+                input.min = "1";
+                input.step = "1";
+                label.appendChild(input);
+                inputs[inverter] = input;
+            }
+            const arm = element("button", "Arm supervised export", form);
+            arm.type = "button";
+            arm.disabled = busy || !daemonRunning;
+            arm.addEventListener("click", () => {
+                const ratings = {};
+                for (const [inverter, input] of Object.entries(inputs)) {
+                    ratings[inverter] = Number(input.value);
+                }
+                void submitExport({event: view.planned_export.id, ratings_w: ratings});
+            });
+            const end = element("button", "End supervision", form);
+            end.type = "button";
+            end.disabled = busy || !daemonRunning;
+            end.addEventListener("click", () => {
+                const id = window.prompt("Supervision id to end");
+                if (id) void submitExport({supervision_id: id}, true);
+            });
+        }
         if (readOnly || view.suspended === "configuration_repair") {
             detail("Suspended", "Configuration needs repair: protection and optimisation are "
                 + "suspended until a valid configuration is imported.");
@@ -119,6 +155,31 @@ export function mountMode(root, health, refreshHealth) {
             : "Enable Protect? ha-spark will apply and release battery-to-car holds. Your charging "
               + "schedule remains yours; leaving Optimise first hands over the fallback charging schedule.";
         dialog.showModal();
+    }
+
+    async function submitExport(body, end = false) {
+        busy = true;
+        message.textContent = "Waiting for the daemon\u2026";
+        try {
+            const response = await fetch(end ? "api/export/end" : "api/export/supervise", {
+                method: "POST",
+                headers: {"Content-Type": "application/json", "X-HA-Spark-Request": "export"},
+                body: JSON.stringify(body)
+            });
+            const reply = await response.json();
+            message.textContent = response.ok
+                ? "Supervision request accepted. Verify the record and device state below."
+                : "Refused: " + reply.error;
+        } catch {
+            message.textContent = "Request outcome unknown. Reload status before trying again.";
+        } finally {
+            busy = false;
+            if (active) {
+                refreshButton.disabled = false;
+                await reload();
+                void refreshHealth();
+            }
+        }
     }
 
     async function submit(request) {
