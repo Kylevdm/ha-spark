@@ -32,7 +32,9 @@ from .solcast_coordinator import SolcastCoordinator
 from .topology import Topology, validate_topology
 
 SparkConfigEntry: TypeAlias = ConfigEntry[SparkCoordinator]
-PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
+PLATFORMS = [
+    Platform.BINARY_SENSOR, Platform.SENSOR, Platform.NUMBER, Platform.TIME, Platform.SELECT,
+]
 _LOGGER = logging.getLogger(__name__)
 
 

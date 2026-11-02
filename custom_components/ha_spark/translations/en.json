@@ -1,5 +1,14 @@
 {
   "exceptions": {
+    "entity_write_mode": {"message": "ha-spark owns this control in {mode}. Start manual control before editing it. Discharge controls require a manual session."},
+    "protection_owned": {"message": "Protection owns the power switch. Start manual control without kept protection to edit it."},
+    "read_only": {"message": "This device is read-only. Resolve its native device repair before writing."},
+    "limits": {"message": "The request cannot be made within the confirmed device, bank and site limits."},
+    "untrusted_soc": {"message": "Battery SoC is not trusted. Check the bank SoC trust entity before increasing charging or editing a charge window."},
+    "grid_charge_not_permitted": {"message": "The inverter does not permit grid charging. ha-spark never changes that permission."},
+    "invalid_intent": {"message": "The requested value or window is invalid. Use whole minutes and different start and end times, or midnight at both ends to disable a half."},
+    "entity_write_failed": {"message": "The device write failed. Check connectivity before trying again."},
+    "entity_write_unverified": {"message": "The device write could not be verified by read-back. Check connectivity and the native device repair."},
     "not_available": {"message": "This command is not available yet."},
     "stale_session": {"message": "The command belongs to an earlier add-on session."},
     "stale_authority": {"message": "Authority changed before this command could run."},
@@ -114,6 +123,19 @@
     }
   },
   "entity": {
+    "number": {
+      "holding_43141_set": {"name": "Charge current"},
+      "holding_43142_set": {"name": "Discharge current"}
+    },
+    "time": {
+      "holding_43143_charge_start": {"name": "Slot 1 charge start"},
+      "holding_43143_charge_end": {"name": "Slot 1 charge end"},
+      "holding_43143_discharge_start": {"name": "Slot 1 discharge start"},
+      "holding_43143_discharge_end": {"name": "Slot 1 discharge end"}
+    },
+    "select": {
+      "holding_43007_set": {"name": "Power switch", "state": {"on": "On", "off": "Off"}}
+    },
     "binary_sensor": {
       "input_33132_b5": {"name": "Grid charge permitted"},
       "holding_43073_b4": {"name": "Export limit enabled"},
