@@ -271,15 +271,19 @@ async def test_entity_rechecks_after_last_read(
     assert writer.guard is not None and inverter.id not in writer.guard.last_requested_a
 
 
-async def test_invalid_resident_current_refuses_time_without_writes(
+async def test_charge_time_edit_writes_only_the_slot_block(
     writer: SparkCoordinator, native_transport: FakeSolisDevice,
 ) -> None:
+    """Ruling Q9(a): a time edit never writes 43141, even with an odd resident current."""
     await mode(writer, "observe")
-    native_transport.set_holding(43141, [65535])
+    native_transport.set_holding(43141, [105])
     inverter = next(iter(writer.native.inverters.values()))
-    with pytest.raises(HomeAssistantError):
-        await NativeTime(writer, inverter, 0).async_set_value(time(22))
-    assert not [t for t in native_transport.traffic if t.op == "write"]
+    assert writer.guard is not None
+    before = dict(writer.guard.last_requested_a)
+    await NativeTime(writer, inverter, 0).async_set_value(time(22))
+    writes = [t for t in native_transport.traffic if t.op == "write"]
+    assert writes and {t.address for t in writes} == {43143}
+    assert writer.guard.last_requested_a == before
 
 
 @pytest.mark.parametrize("offset", [None, 0])

@@ -1,7 +1,7 @@
 """Owner operations inside NativeChargeBoundary, never a second charge writer.
 
-Both locks and the entity policy cover the whole transaction. Charge-time edits
-first re-clamp the resident current; discharge edits are manual-only. The power
+Both locks and the entity policy cover the whole transaction. Time edits write
+only the whole Slot 1 block (ruling Q9a); discharge edits are manual-only. The power
 switch deliberately belongs to the separate #580 adapter, not this module.
 """
 from dataclasses import replace
@@ -48,12 +48,6 @@ async def async_entity(boundary: "NativeChargeBoundary", inverter_id: str, contr
                       and value[0] < 24 and value[1] < 60
                       and (offset < 4) == (control == "charge")):
                     current = 0.0
-                    if control == "charge":
-                        current_word = await boundary._read(
-                            coordinator.native.transport(inverter), inverter)
-                        if current_word is None or current_word > 625:
-                            return IntentResult(outcome="failed")
-                        current = current_word / 10
                 else:
                     return IntentResult(outcome="refused", reason="invalid_intent")
 
@@ -73,7 +67,8 @@ async def async_entity(boundary: "NativeChargeBoundary", inverter_id: str, contr
                     if control == "charge" and slots.soc_untrusted():
                         return IntentResult(outcome="refused", reason="untrusted_soc")
 
-                if control == "charge":
+                if control == "charge" and offset is None:
+                    # Q9(a): a time edit writes only the Slot 1 block, never 43141.
                     previous = guard.request_current(inverter.id, current)
                     async def commit(device: Inverter, amps: float) -> IntentResult:
                         result = await boundary._async_commit(device, amps, epoch, mismatches,
