@@ -145,10 +145,13 @@ def propose_transition(
         else:
             mode = "protect"
             steps = ("evaluate_protection",)
+    # Authority to export ends with the transition save, before any cleanup runs.
+    leaves_optimise = "cancel_export" in steps or mode != "optimise"
     return TransitionDecision(state=state.model_copy(update={
         "committed_mode": mode, "manual_session": manual,
         "transition": (Transition(target=transition_target, started_at=now, steps=steps)
                        if steps else None),
         "epoch": state.epoch + 1, "last_changed_at": now,
         "requester_kind": request.requester_kind,
+        "export_supervisions": () if leaves_optimise else state.export_supervisions,
     }))

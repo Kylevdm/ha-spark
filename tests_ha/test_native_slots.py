@@ -39,9 +39,9 @@ async def test_window_block_current_and_steady_state(
 ) -> None:
     result = await writer._async_dispatch_command(window(writer))
     assert result.outcome == "unchanged"  # worst successful stage (unused slots already zero)
-    assert result.intents[0].written_a == 20
+    assert result.intents[0].written_a == 20.9
     assert native_transport.traffic[0].address == 33132
-    assert writes(native_transport) == [(43141, (200,)), (43143, (23, 30, 5, 30, 0, 0, 0, 0))]
+    assert writes(native_transport) == [(43141, (209,)), (43143, (23, 30, 5, 30, 0, 0, 0, 0))]
     native_transport.traffic.clear()
     assert (await writer._async_dispatch_command(window(writer))).outcome == "unchanged"
     assert writes(native_transport) == []
@@ -55,7 +55,7 @@ async def test_live_window_deactivated_before_current(
     if fault:
         native_transport.inject_write_fault(WriteFault(fault), address=43141)
     result = await writer._async_dispatch_command(window(writer))
-    expected = [(43143, (0,) * 8), (43141, (200,))]
+    expected = [(43143, (0,) * 8), (43141, (209,))]
     if fault is None:
         expected.append((43143, (23, 30, 5, 30, 0, 0, 0, 0)))
     assert writes(native_transport) == expected
@@ -183,7 +183,7 @@ async def test_transient_slot_one_zero_still_deactivates_before_current(
     native_transport.spurious_zeros.add(("holding", 43143, 8))
     result = await writer._async_dispatch_command(window(writer))
     assert result.outcome == "unchanged"
-    assert writes(native_transport)[:2] == [(43143, (0,) * 8), (43141, (200,))]
+    assert writes(native_transport)[:2] == [(43143, (0,) * 8), (43141, (209,))]
 
 
 async def test_transient_current_zero_preread_does_not_skip_write(
@@ -214,6 +214,8 @@ async def test_current_change_keeps_only_exact_planned_discharge(
     request = ChargeWindow.model_validate(window(writer).payload["intents"][0])  # type: ignore[index]
     slots = NativeSlots(writer.writes, guard.topology.inverters[0], state.epoch, set(),
                         planned_discharge=discharge if matches else [11, 0, 12, 0])
+    # A discharge half is written only with export permission (#584): grant it here.
+    slots.discharge_check = lambda: None
     async with guard.lock:
         async with writer.native.lock:
             guard.last_requested_a[request.inverter_id] = request.current_a
@@ -236,7 +238,7 @@ async def test_current_failure_never_activates_new_window(
     native_transport.inject_write_fault(WriteFault(fault), address=43141)
     result = await writer._async_dispatch_command(window(writer))
     assert result.outcome == ("unverified" if fault == "silent_noop" else "failed")
-    assert writes(native_transport) == [(43141, (200,))]
+    assert writes(native_transport) == [(43141, (209,))]
 
 
 @pytest.mark.parametrize("fault", ["exception", "silent_noop"])
@@ -249,7 +251,7 @@ async def test_slot_failure_isolated_and_unused_slots_still_cleared(
     result = await writer._async_dispatch_command(window(writer))
     assert result.outcome == ("failed" if fault == "exception" else "unverified")
     assert writes(native_transport) == [
-        (43141, (200,)), (43143, (23, 30, 5, 30, 0, 0, 0, 0)),
+        (43141, (209,)), (43143, (23, 30, 5, 30, 0, 0, 0, 0)),
         (43153, (0,) * 8), (43163, (0,) * 8)]
 
 
@@ -334,7 +336,7 @@ async def test_invalid_window_never_writes(
 async def test_stale_nondriven_slot_is_the_only_write_when_window_is_set(
     writer: SparkCoordinator, native_transport: FakeSolisDevice,
 ) -> None:
-    native_transport.set_holding(43141, [200])
+    native_transport.set_holding(43141, [209])
     native_transport.set_holding(43143, [23, 30, 5, 30, 0, 0, 0, 0])
     native_transport.set_holding(43153, [1] * 8)
     result = await writer._async_dispatch_command(window(writer))
@@ -424,7 +426,7 @@ async def test_verified_current_stays_counted_when_a_later_slot_write_is_refused
     monkeypatch.setattr(native_transport, "write", write)
     result = await writer._async_dispatch_command(window(writer))
     assert (result.outcome, result.reason) == ("refused", "authority_unknown")
-    assert writes(native_transport) == [(43141, (200,))]
+    assert writes(native_transport) == [(43141, (209,))]
     assert writer.guard is not None
     # 20 A is resident on the bus: peers must still be clamped against it.
     assert writer.guard.last_requested_a["inv1"] == 20.9
@@ -508,3 +510,36 @@ async def test_peer_rebalance_keeps_the_peer_schedule(
             if t.op == "write" and t.device_id == 2]
     assert peer == [(43141, (200,))]
     assert [second.holding[r] for r in range(43143, 43151)] == [23, 30, 5, 30, 0, 0, 0, 0]
+
+
+@pytest.mark.parametrize("writer", [True], indirect=True)
+async def test_peer_increase_is_never_soc_exempt_in_fallback(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = writer.guard
+    state = writer.authority.state
+    assert guard is not None and state is not None
+    second = FakeSolisDevice()
+    second.set_identity()
+    second.set_input(33132, [32])
+    second.set_holding(43141, [0])
+    for address in (43143, 43153, 43163):
+        second.set_holding(address, [0] * 8)
+    second.traffic = native_transport.traffic
+    monkeypatch.setattr(writer.native, "transport", lambda inv: (
+        native_transport if inv.gateway_unit_id == 1 else second))
+    await writer.async_reprobe("inv2")
+    await writer.authority.async_save(state.model_copy(update={
+        "fallback": state.fallback.model_copy(update={"active": True}),
+    }))
+    guard.request_current("inv1", 10.0)  # bind the request epoch before seeding the peer
+    guard.last_requested_a["inv2"] = 20.9  # a latent peer increase
+    monkeypatch.setattr(writer.soc, "increases_allowed", lambda bank: False)
+    native_transport.set_holding(43141, [100])
+    result = await writer.writes.async_fallback(
+        "inv1", current_a=20.0, start="23:30", end="05:30",
+        epoch=writer.authority.state.epoch if writer.authority.state else state.epoch)
+    assert (result.outcome, result.reason) == ("refused", "untrusted_soc")
+    assert second.holding[43141] == 0
+    assert native_transport.holding[43141] == 100

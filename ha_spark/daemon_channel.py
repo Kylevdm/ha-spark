@@ -43,6 +43,7 @@ log = get_logger(__name__)
 MAX_CONFIG_BYTES = 256 * 1024
 Op = Literal[
     "replan", "apply", "sync_clock", "authority_status", "integration_link", "mode",
+    "supervise_export", "end_supervision",
     "config_show", "config_export", "config_save", "config_import", "config_set_secret",
 ]
 REFUSED = "[REFUSED] no ha-spark daemon running; hardware writes happen only inside the daemon"
@@ -69,6 +70,9 @@ class Request(BaseModel):
     document: dict[str, Any] | None = None
     field: str | None = None
     value: str | dict[str, bool] | None = None
+    event: str | None = Field(default=None, max_length=256)
+    ratings_w: dict[str, float] | None = None
+    supervision_id: str | None = Field(default=None, max_length=128)
 
     @model_validator(mode="after")
     def validate_mode(self) -> Request:
@@ -80,11 +84,16 @@ class Request(BaseModel):
             "config_save": {"expected_revision", "changes"},
             "config_import": {"expected_revision", "document"},
             "config_set_secret": {"expected_revision", "field", "value"},
+            "supervise_export": {"event", "ratings_w"},
+            "end_supervision": {"supervision_id"},
         }.get(self.op, set())
-        fields = {"expected_revision", "repair_token", "changes", "document", "field", "value"}
+        fields = {"expected_revision", "repair_token", "changes", "document", "field", "value",
+                  "event", "ratings_w", "supervision_id"}
         present = {key for key in fields if getattr(self, key) is not None}
         if self.op == "config_import" and present == {"repair_token", "document"}:
             pass
+        elif self.op == "supervise_export" and "event" not in present:
+            present.add("event")  # optional: the current plan's only export event
         elif present != allowed:
             raise ValueError("invalid config operation fields")
         if self.op == "config_set_secret" and self.field not in _SECRET_OPTION_KEYS:
@@ -236,6 +245,21 @@ class DaemonChannel:
                     duration=duration, keep_protection=keep_protection), ingress_user,
         )
 
+    async def submit_export(
+        self, event: str | None, ratings_w: dict[str, float], *,
+        ingress_user: str | None = None,
+    ) -> Reply:
+        return await self._submit(
+            Request(op="supervise_export", event=event, ratings_w=ratings_w), ingress_user,
+        )
+
+    async def submit_end_supervision(
+        self, supervision_id: str, *, ingress_user: str | None = None,
+    ) -> Reply:
+        return await self._submit(
+            Request(op="end_supervision", supervision_id=supervision_id), ingress_user,
+        )
+
     def next_request(self) -> Pending | None:
         """The next request for this tick: an owner mode request before any work."""
         for queue in (self.mode_queue, self.queue):
@@ -317,10 +341,14 @@ class DaemonChannel:
                 return Reply(error="conflict", config={"repair_token": exc.token})
             except ConfigError as exc:
                 return Reply(error="invalid configuration", reasons=[str(exc)])
-        if request.op in ("mode", "sync_clock") and self.native_request is not None:
+        if request.op in ("mode", "sync_clock", "supervise_export",
+                          "end_supervision") and self.native_request is not None:
             native_reply = await self.native_request(request, ingress_user)
             if native_reply is not None:
                 return native_reply
+        if request.op in ("supervise_export", "end_supervision"):
+            # Integration-owned sites only; never a legacy planning or apply cycle.
+            return Reply(error="not_available")
         if request.target in ("manual", "resume"):
             return Reply(error="not_available")
         future = asyncio.get_running_loop().create_future()
@@ -380,6 +408,8 @@ async def submit_socket(
     expected_revision: int | None = None, changes: dict[str, Any] | None = None,
     document: dict[str, Any] | None = None, field: str | None = None,
     value: str | dict[str, bool] | None = None, repair_token: str | None = None,
+    event: str | None = None, ratings_w: dict[str, float] | None = None,
+    supervision_id: str | None = None,
 ) -> Reply | None:
     """None means unreachable. Never retry an accepted request after a lost reply."""
     path = resolve_data_dir(settings) / "ha_spark.sock"
@@ -395,6 +425,7 @@ async def submit_socket(
             duration=duration, keep_protection=keep_protection,
             expected_revision=expected_revision, changes=changes, document=document,
             field=field, value=value, repair_token=repair_token,
+            event=event, ratings_w=ratings_w, supervision_id=supervision_id,
         ).model_dump_json(exclude_none=True).encode() + b"\n"
         if len(payload) > MAX_CONFIG_BYTES:
             return Reply(error="daemon request too large")

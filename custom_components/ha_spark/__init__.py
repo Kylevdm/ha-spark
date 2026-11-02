@@ -57,6 +57,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
         if coordinator.control.startup_complete:
             await coordinator.holds.async_reconcile(now)
             await coordinator.fallback.async_evaluate(now)
+            await coordinator.async_retry_export_records(now)
         await coordinator.clock.async_tick(now)
         coordinator.async_update_listeners()
 
@@ -70,6 +71,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     async def authority_tick(now: datetime) -> None:
         zone = coordinator.control.household_zone() or ZoneInfo("UTC")
         await coordinator.control.async_expire(now=now, zone=zone)
+        await coordinator.async_expire_supervisions(now)
         await coordinator.control.async_retry()
 
     entry.async_on_unload(async_track_time_interval(hass, authority_tick, timedelta(seconds=30)))

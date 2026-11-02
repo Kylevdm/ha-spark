@@ -321,6 +321,38 @@ def _print_reply(reply: Reply) -> None:
         print(f"[REFUSED] {reply.error}")
 
 
+async def _cmd_export_supervise(settings: Settings, *, ratings: list[str],
+                                event: str | None) -> int:
+    """Arm one planned Axle event with the owner's confirmed inverter ratings."""
+    values: dict[str, float] = {}
+    for item in ratings:
+        inverter, separator, raw = item.partition("=")
+        try:
+            rating = float(raw)
+        except ValueError:
+            rating = 0.0
+        if not separator or not inverter or rating <= 0 or rating != rating:
+            print("--rating must be <inverter>=<positive watts>", file=sys.stderr)
+            return 2
+        values[inverter] = rating
+    reply = await submit_socket(settings, "supervise_export", event=event, ratings_w=values)
+    if reply is None or reply.error:
+        print(REFUSED if reply is None else f"[REFUSED] {reply.error}")
+        return 1
+    print(json.dumps(reply.authority, indent=2))
+    return 0
+
+
+async def _cmd_export_end(settings: Settings, supervision_id: str) -> int:
+    """End one supervision early; the export cleanup follows the same gate."""
+    reply = await submit_socket(settings, "end_supervision", supervision_id=supervision_id)
+    if reply is None or reply.error:
+        print(REFUSED if reply is None else f"[REFUSED] {reply.error}")
+        return 1
+    print(json.dumps(reply.authority, indent=2))
+    return 0
+
+
 async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
     """Print a plan; only the running daemon may apply it."""
     if apply:
@@ -866,6 +898,22 @@ def build_parser() -> argparse.ArgumentParser:
     manual.add_argument("--no-keep-protection", action="store_true")
     mode_sub.add_parser("resume")
     mode_sub.add_parser("confirm-observe")
+
+    p_export = sub.add_parser("export", help="Supervise a planned Axle export event")
+    export_sub = p_export.add_subparsers(dest="export_command", required=True, metavar="ACTION")
+    p_supervise = export_sub.add_parser(
+        "supervise",
+        help="Arm the current planned export event with owner-confirmed ratings",
+        description="Send the admin-only supervise_export command for the current planned "
+        "event. Every connection inverter needs its confirmed rated AC output.",
+    )
+    p_supervise.add_argument("--event", default=None,
+                             help="Planned event identity (default: the current plan's event)")
+    p_supervise.add_argument("--rating", action="append", default=[], required=True,
+                             metavar="INVERTER=W",
+                             help="Confirmed rated AC output in watts (repeat per inverter)")
+    export_sub.add_parser("end", help="End a supervision early").add_argument(
+        "supervision_id", help="Supervision id from the mode status")
 
     p_states = sub.add_parser(
         "states",
@@ -1498,6 +1546,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "solis":
         return asyncio.run(_cmd_solis_sync_clock(settings))
+
+    if args.command == "export":
+        if args.export_command == "supervise":
+            return asyncio.run(_cmd_export_supervise(
+                settings, ratings=args.rating, event=args.event))
+        return asyncio.run(_cmd_export_end(settings, args.supervision_id))
 
     parser.error(f"unknown command: {args.command}")
     return 2  # pragma: no cover - argparse exits first

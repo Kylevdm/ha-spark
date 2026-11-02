@@ -205,6 +205,7 @@ class AuthorityControl:
             "fallback": fallback,
             "epoch": state.epoch + int(fallback.active != state.fallback.active),
             "last_changed_at": now,
+            "export_supervisions": () if fallback.active else state.export_supervisions,
         }))
 
     async def async_new_session(self, session_id: str, *, now: datetime) -> bool:

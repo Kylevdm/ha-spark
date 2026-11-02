@@ -1,6 +1,6 @@
 """Pure authority records reject malformed persisted authority without HA I/O."""
 
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -14,6 +14,7 @@ from custom_components.ha_spark.authority_store import (
     ExportTransition,
     ExportWindow,
     FallbackState,
+    GatewayClaim,
     HoldDevice,
     HoldRecord,
     ManualSession,
@@ -40,8 +41,12 @@ def test_authority_round_trip() -> None:
 def test_full_authority_contents_round_trip() -> None:
     state = fresh()
     event = EventIdentity(direction="export", start=NOW, end=NOW + timedelta(hours=1))
-    supervision = ExportSupervision(inverter_id="inverter", id=uuid4(), event=event,
-                                    confirming_user_id="user-id", epoch=1, ends_at=event.end)
+    supervision = ExportSupervision(
+        inverter_id="inverter", id=uuid4(), event=event,
+        confirming_user_id="user-id", epoch=1, ends_at=event.end,
+        rating_w=3000.0, identity=(0x0026, 0x2031, 0x0000),
+        claim=GatewayClaim(host="gateway.invalid", port=502, unit_id=1),
+    )
     complete = AuthorityState.model_validate({
         **state.model_dump(),
         "transition": Transition(target="optimise", started_at=NOW,
@@ -51,7 +56,8 @@ def test_full_authority_contents_round_trip() -> None:
                                   entered_at=NOW),
         "export_supervisions": (supervision,),
         "export_records": (ExportRecord(
-            inverter_id="inverter", event=event, window=ExportWindow(start=time(12), end=time(13)),
+            inverter_id="inverter", event=event,
+            window=ExportWindow(start=event.start, end=event.end),
             store_id=state.store_id, epoch=1, supervision_id=supervision.id,
             state="stop_pending", last_reconcile_at=NOW, stop_reason="tripped",
         ),),

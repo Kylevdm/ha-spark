@@ -354,3 +354,57 @@ async def test_snapshot_owner_alone_never_selects_native_path(tmp_path, monkeypa
         )
     assert seen == [sentinel]  # the caller's (REST-path) measurement, not snapshot SoC
     assert not queue.pending
+
+
+def test_export_intent_golden():
+    import json
+    from pathlib import Path
+
+    from ha_spark.api.commands import Command
+    from ha_spark.api.native_apply import ExportNone, ExportUntrusted, ExportWindow
+
+    body = json.loads((Path(__file__).parent / "fixtures/contract/"
+                       "command_apply_export_intents.json").read_text())
+    command = Command.model_validate(body)
+    assert command.model_dump(mode="json") == body
+    intents = body["payload"]["intents"]
+    for model, raw in zip((ExportNone, ExportUntrusted, ExportWindow), intents, strict=True):
+        assert model.model_validate(raw).model_dump(mode="json") == raw
+
+
+def test_build_intents_selects_the_typed_export_request():
+    from datetime import time
+
+    from ha_spark.api.native_apply import build_intents
+    from ha_spark.config import Settings
+    from ha_spark.devices.execution import ExecutionContext
+    from ha_spark.energy.models import ChargeIntent, ExportIntent
+    from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+    from tests.native_helpers import NOW, native_link
+
+    settings = Settings(battery_capacity_kwh=10, battery_voltage_v=50, charge_efficiency=1)
+    link = native_link(settings)
+    context = ExecutionContext()
+    context.limits_record = link.topology
+    event_start = NOW.replace(hour=17, minute=0, second=0, microsecond=0)
+    event_end = event_start.replace(hour=18)
+    export = ExportIntent(
+        event_identity=("export", event_start, event_end),
+        window_start=event_start, window_end=event_end, planned_export_kw=3.0,
+        dno_export_limit_kw=3.68, selected_slots=(event_start,), slot_export_kw=(3.0,),
+    )
+    soc = SocMeasurement(SocStatus.OK, NOW, value=42)
+    window = build_intents(ChargeIntent(60, soc, time(23, 30), time(5, 30), export=export),
+                           settings, context, link.topology.topology)
+    assert window[-1]["request"] == "window"
+    assert window[-1]["event"]["start"].startswith(event_start.isoformat()[:19])
+    assert window[-1]["soc"] == {"ok": True, "soc_pct": 42.0,
+                                   "observed_at": NOW.isoformat().replace("+00:00", "Z")}
+    untrusted = build_intents(ChargeIntent(60, soc, time(23, 30), time(5, 30),
+                                          export_trusted=False),
+                              settings, context, link.topology.topology)
+    assert untrusted[-1] == {"kind": "export", "inverter_id": "inverter",
+                             "request": "untrusted"}
+    empty = build_intents(ChargeIntent(60, soc, time(23, 30), time(5, 30)),
+                          settings, context, link.topology.topology)
+    assert empty[-1]["request"] == "none"

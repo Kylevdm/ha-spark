@@ -666,3 +666,20 @@ async def test_unreadable_daemon_status_fails_health(settings, monkeypatch):
     ))
     result = await check_operating_mode(settings)
     assert result.status is Status.FAIL
+
+
+@pytest.mark.parametrize("native", [False, True])
+async def test_export_ops_never_reach_the_legacy_queue(settings, ha, native):
+    """#584: supervise/end on an add-on-owned site are refused, never queued as a plan run."""
+    import asyncio
+
+    async with DaemonChannel(settings) as channel:
+        if native:
+            async def not_integration_owned(request, user):
+                return None
+            channel.native_request = not_integration_owned
+        reply = await asyncio.wait_for(channel.submit_export(None, {"inv1": 3000.0}), 3)
+        assert reply.error == "not_available"
+        reply = await asyncio.wait_for(channel.submit_end_supervision("x"), 3)
+        assert reply.error == "not_available"
+        assert channel.queue.empty() and channel.mode_queue.empty()

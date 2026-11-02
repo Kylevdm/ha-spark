@@ -341,10 +341,12 @@ def charge_setpoint_a(
     caps = driver_capabilities(inverter.driver_kind)
     if caps.setpoint_step_a is None:
         return None
+    # The native bus carries tenths (62.5 A is word 625); the legacy overlay does not.
+    step = 0.1 if inverter.transport == "native" else caps.setpoint_step_a
     ceiling = min(limits.charge_a, inverter.charge_limit_a) if inverter.confirmed else 0
     if caps.charge_ceiling_a is not None:
         ceiling = min(ceiling, caps.charge_ceiling_a)
-    return setpoint_a(requested_a, ceiling, caps.setpoint_step_a)
+    return setpoint_a(requested_a, ceiling, step)
 
 
 def charge_capacity_kw(

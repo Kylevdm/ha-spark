@@ -4,10 +4,11 @@ The caller holds guard.lock then native.lock throughout. Slot blocks are always
 fresh-read and written whole. Export arming is not enabled here; planned_discharge
 is the parity seam for keeping an exact resident export during a current change.
 """
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from . import native_write
-from .commands import ChargeCurrentLimit, ChargeWindow, IntentResult
+from .commands import ChargeCurrentLimit, ChargeWindow, IntentResult, WriteReason
 from .native_verify import confirm
 from .solis_transport import valid_words
 from .topology import Inverter
@@ -36,6 +37,10 @@ class NativeSlots:
         self.planned_discharge = planned_discharge or [0] * 4
         self.fallback = fallback
         self.transition = transition
+        self.block_result: IntentResult | None = None
+        # Export permission, rechecked before any write carrying a discharge half;
+        # without one such a write is refused.
+        self.discharge_check: Callable[[], WriteReason | None] | None = None
         # A charge window needs trusted SoC for every write, whatever its direction.
         self.soc_required = False
 
@@ -74,6 +79,8 @@ class NativeSlots:
         reason = self.boundary._refusal(self.inverter, self.epoch,
                                         fallback=self.fallback,
                                         transition=self.transition)
+        if reason is None and address == 43143 and any(target[4:]):
+            reason = self.discharge_check() if self.discharge_check is not None else "mode"
         if reason is not None:
             return IntentResult(outcome="refused", reason=reason)
         result = await self.boundary.coordinator.native.transport(self.inverter).write(
@@ -101,6 +108,23 @@ class NativeSlots:
                 return IntentResult(outcome="failed")
         return await self.block(43143, resident[:4] + [0] * 4)
 
+    async def arm(self, discharge: list[int], *, zero_charge: bool = False) -> IntentResult:
+        """Replace Slot 1's discharge half, keeping the resident charge half."""
+        resident = await self.read(43143)
+        if resident is None:
+            return IntentResult(outcome="failed")
+        if zero_charge:
+            return await self.block(43143, [0] * 4 + discharge)
+        if not any(resident):
+            async def read() -> list[int] | None:
+                return await self.read(43143)
+            if not await confirm([0] * 8, read, native_write.verify_sleep,
+                                 changed=False, mismatch=self.mismatch):
+                resident = await self.read(43143)
+                if resident is None:
+                    return IntentResult(outcome="failed")
+        return await self.block(43143, resident[:4] + discharge)
+
     async def prepare(self, current: float) -> IntentResult:
         resident = await self.read(43143)
         if resident is None:
@@ -114,7 +138,7 @@ class NativeSlots:
         if active:
             transport = self.boundary.coordinator.native.transport(self.inverter)
             amps = await self.boundary._read(transport, self.inverter)
-            if amps is None or abs(amps / 10 - int(current)) > 0.5:
+            if amps is None or abs(amps / 10 - current) > 0.05:
                 keep = (self.planned_discharge if any(self.planned_discharge)
                         and resident[4:] == self.planned_discharge else [0] * 4)
                 return await self.block(43143, [0] * 4 + keep)
@@ -141,8 +165,7 @@ class NativeSlots:
                     # Slot 1 schedule is never zeroed by another inverter's window.
                     return await self.boundary._async_commit(
                         device, current, self.epoch, self.mismatches,
-                        fallback=self.fallback, transition=self.transition,
-                        soc_exempt=self.fallback)
+                        fallback=self.fallback, transition=self.transition)
                 device_transport = self.boundary.coordinator.native.transport(device)
                 allowed = await self.boundary._read(device_transport, device, input_=True)
                 if allowed is None or not allowed & 32:
@@ -165,9 +188,18 @@ class NativeSlots:
         if current_result.outcome in ("applied", "unchanged"):
             charge = [int(part) for time in (request.start, request.end)
                       for part in time.split(":")]
-            results.append(await self.block(43143, charge + self.planned_discharge))
-        elif not any(self.planned_discharge):
-            results.append(await self.clear_discharge())
+            self.block_result = await self.block(43143, charge + self.planned_discharge)
+            results.append(self.block_result)
+        elif any(self.planned_discharge):
+            # Permission gates charging only: a ready export still replaces the
+            # discharge half, keeping the resident charge half (or zeroing it
+            # when the requested charge is zero).
+            self.block_result = await self.arm(
+                self.planned_discharge, zero_charge=request.current_a <= 0)
+            results.append(self.block_result)
+        else:
+            self.block_result = await self.clear_discharge()
+            results.append(self.block_result)
         for address in (43153, 43163):
             results.append(await self.block(address, [0] * 8))
         if all(r.outcome in ("applied", "unchanged") for r in results):

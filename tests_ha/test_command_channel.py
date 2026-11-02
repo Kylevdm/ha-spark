@@ -212,10 +212,10 @@ async def test_heartbeat_collects_transition_and_waits_for_site_barrier(
         assert state.epoch == epoch + 3
 
 
-@pytest.mark.parametrize("kind", ["supervise_export",
-                                  "end_supervision"])
-async def test_unavailable_kinds_are_validated_refused_and_consumed(
-    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, kind: str,
+@pytest.mark.parametrize("kind,reason", [("supervise_export", "mode"),
+                                          ("end_supervision", "invalid_intent")])
+async def test_export_commands_are_handled_and_consumed(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, kind: str, reason: str,
 ) -> None:
     aioclient_mock.post(URL, exc=aiohttp.ClientError())
     entry = await setup(hass)
@@ -234,7 +234,7 @@ async def test_unavailable_kinds_are_validated_refused_and_consumed(
             await hass.async_block_till_done(wait_background_tasks=True)
     results = [call[2] for call in aioclient_mock.mock_calls if str(call[1]) == RESULT]
     assert len(results) == 2 and results[0] == results[1], aioclient_mock.mock_calls
-    assert results[0]["reason"] == "not_available"
+    assert results[0]["reason"] == reason
     assert results[0]["sequence"] == cmd["sequence"]
     assert coordinator.authority.state == state
 
