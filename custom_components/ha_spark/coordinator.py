@@ -98,6 +98,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self.fallback = NativeFallback(self)
         self.native.held_remapped = self.holds.remapped
         self.control.writer = NativeTransitionWriter(self)
+        self.control.manual_resumed = self.writes.async_reverify_windows
         self.control.write_barrier = self.writes.async_barrier
         self.release_version = release_version
         self.api_version = max(wire.SUPPORTED_API_VERSIONS)

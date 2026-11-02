@@ -357,3 +357,86 @@ async def test_permission_and_soc_rules(
             else:
                 await NativeTime(writer, inverter, 0).async_set_value(time(22))
         assert not [t for t in native_transport.traffic if t.op == "write"]
+
+
+def _set_current_limit(c: SparkCoordinator, control: str, limit: float) -> None:
+    from custom_components.ha_spark.topology import effective_limits
+
+    assert c.guard is not None
+    site = c.guard.topology
+    field = "charge_limit_a" if control == "charge" else "discharge_limit_a"
+    inverter = site.inverters[0].model_copy(update={field: limit, "confirmed": True})
+    site = site.model_copy(update={"inverters": (inverter,)})
+    c.hass.config_entries.async_update_entry(c.entry, options={
+        **c.entry.options, "topology": site.model_dump(mode="json"),
+    })
+    c.guard.topology = site
+    c.guard.limits = effective_limits(site)
+    c.native.inverters[inverter.id] = inverter
+
+
+@pytest.mark.parametrize(("control", "address", "value", "offset", "revocation"), [
+    ("discharge", 43142, 20.0, None, "manual"),
+    ("discharge", 43142, 20.0, None, "pending"),
+    ("charge", 43143, [22, 15], 0, "manual"),
+    ("charge", 43143, [22, 15], 0, "pending"),
+])
+async def test_prewrite_recheck_blocks_discharge_and_slot_writes(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, control: str, address: int,
+    value: float | list[int], offset: int | None, revocation: str,
+) -> None:
+    await mode(writer, "manual", False)
+    native_transport.set_holding(43142, [50])
+    native_transport.set_holding(43143, [23, 30, 5, 30, 0, 0, 0, 0])
+    inverter = next(iter(writer.native.inverters.values()))
+    state = writer.authority.state
+    assert state is not None
+    original = native_transport.read_holding
+    async def read(start: int, count: int, *, device_id: int = 1) -> ReadResult:
+        result = await original(start, count, device_id=device_id)
+        if start == address:
+            if revocation == "manual":
+                current = writer.authority.state
+                assert current is not None
+                await writer.authority.async_save(current.model_copy(update={
+                    "manual_session": None,
+                }))
+            else:
+                monkeypatch.setattr(writer.control, "owned", lambda: False)
+        return result
+    monkeypatch.setattr(native_transport, "read_holding", read)
+    result = await writer.writes.async_entity(
+        inverter.id, control, value, epoch=state.epoch, offset=offset)
+    assert result.outcome == "refused"
+    assert result.reason == ("mode" if revocation == "manual" else "gateway_not_owned")
+    assert not [t for t in native_transport.traffic
+                if t.op == "write" and t.address in (43142, 43143)]
+
+
+@pytest.mark.parametrize(("control", "address", "value", "limit", "expected"), [
+    ("discharge", 43142, 70.0, 100.0, 620),
+    ("discharge", 43142, 45.0, 30.0, 300),
+    ("discharge", 43142, 10.9, 62.5, 100),
+    ("charge", 43141, 70.0, 100.0, 620),
+    ("charge", 43141, 45.0, 30.0, 300),
+    ("charge", 43141, 10.9, 62.5, 100),
+])
+async def test_current_numbers_pin_exact_clamp_and_cap(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    control: str, address: int, value: float, limit: float, expected: int,
+) -> None:
+    await mode(writer, "manual", False)
+    _set_current_limit(writer, control, limit)
+    native_transport.set_holding(43141, [0])
+    native_transport.set_holding(43142, [0])
+    inverter = next(iter(writer.native.inverters.values()))
+    state = writer.authority.state
+    assert state is not None
+    native_transport.traffic.clear()
+    result = await writer.writes.async_entity(
+        inverter.id, control, value, epoch=state.epoch)
+    assert result.outcome == "applied"
+    assert [(t.address, t.payload) for t in native_transport.traffic
+            if t.op == "write"] == [(address, (expected,))]
+    assert native_transport.holding[address] == expected

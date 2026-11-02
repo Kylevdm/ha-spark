@@ -186,6 +186,54 @@ class NativeChargeBoundary:
             dt_util.utcnow(), words, connection_epoch)
         return True
 
+    async def async_reverify_windows(self, epoch: int) -> None:
+        """Adopt the resident Slot 1 windows when a manual session ends.
+
+        Read-only: a valid zero-discharge resident block becomes this epoch's
+        verified window, so an ordinary Optimise release is not delayed.
+        """
+        c = self.coordinator
+        state = c.authority.state
+        guard = c.guard
+        if (guard is None or state is None or state.epoch != epoch
+                or state.committed_mode != "optimise" or state.manual_session is not None
+                or state.fallback.active
+                or state.transition is not None and state.transition.target != "optimise"
+                or not c.control.owned() or not c._running or not c.native.polling
+                or c.native.closed):
+            return
+        async with guard.lock:
+            async with c.native.lock:
+                state = c.authority.state
+                if (state is None or state.epoch != epoch
+                        or state.committed_mode != "optimise"
+                        or state.manual_session is not None or state.fallback.active
+                        or state.transition is not None and state.transition.target != "optimise"
+                        or not c.control.owned() or not c._running or not c.native.polling
+                        or c.native.closed):
+                    return
+                for inverter in c.native.inverters.values():
+                    if c.native.reason(inverter) is not None:
+                        continue
+                    transport = c.native.transport(inverter)
+                    connection_epoch = getattr(transport, "connection_epoch", 0)
+                    read = await transport.read_holding(
+                        43141, 30, device_id=inverter.gateway_unit_id)
+                    words = read.registers
+                    if (read.error is not None or len(words) != 30
+                            or not valid_words(words) or words[0] > 625
+                            or connection_epoch != getattr(
+                                transport, "connection_epoch", 0)):
+                        continue
+                    try:
+                        time(words[2], words[3])
+                        time(words[4], words[5])
+                    except ValueError:
+                        continue
+                    if any(words[6:10] + words[12:20] + words[22:30]):
+                        continue
+                    self.verified_windows[inverter.id] = (epoch, tuple(words[2:10]))
+
     async def async_apply(self, command: Command) -> CommandResult:
         """Isolate intents and aggregate the worst positional result."""
         # Freshness is judged from acceptance, not completion.
