@@ -58,7 +58,8 @@ class NativeChargeBoundary:
                 pass
 
     def _refusal(self, inverter: Inverter, epoch: int, *,
-                 guard_write: bool = False) -> WriteReason | None:
+                 guard_write: bool = False,
+                 entity_control: str | None = None) -> WriteReason | None:
         coordinator = self.coordinator
         state = coordinator.authority.state
         if state is None:
@@ -67,7 +68,21 @@ class NativeChargeBoundary:
             return "gateway_not_owned"
         if state.epoch != epoch:
             return "stale_epoch"
-        if guard_write:
+        if entity_control is not None:
+            if not coordinator.control.ready or state.transition is not None:
+                return "not_available"
+            manual = state.manual_session
+            if entity_control == "power":
+                if (manual is not None and manual.keep_protection or manual is None
+                        and (state.committed_mode != "observe" or state.fallback.active)):
+                    return "mode"
+            elif entity_control == "discharge":
+                if manual is None:
+                    return "mode"
+            elif manual is None and (state.committed_mode == "optimise"
+                                      or state.fallback.active):
+                return "mode"
+        elif guard_write:
             if (state.committed_mode not in ("protect", "optimise")
                     or state.transition is not None and state.transition.target == "observe"):
                 return "mode"
@@ -85,6 +100,13 @@ class NativeChargeBoundary:
                 != guard.topology or guard.limits != effective_limits(guard.topology)):
             return "limits"
         return None
+
+    async def async_entity(self, inverter_id: str, control: str, value: float | list[int],
+                           *, epoch: int, offset: int | None = None) -> IntentResult:
+        """Owner writes share the guard lock, clamp and verified commit path."""
+        from .native_entity_write import async_entity
+
+        return await async_entity(self, inverter_id, control, value, epoch=epoch, offset=offset)
 
     async def async_restoration_held(self, inverter: Inverter, *, epoch: int,
                                       handover: bool = False) -> bool:
@@ -363,9 +385,11 @@ class NativeChargeBoundary:
 
     async def _async_commit(self, inverter: Inverter, current: float, epoch: int,
                             mismatches: set[str], *, soc_required: bool = False,
-                            guard_write: bool = False, lower_only: bool = False) -> IntentResult:
+                            guard_write: bool = False, lower_only: bool = False,
+                            entity_control: str | None = None) -> IntentResult:
         transport = self.coordinator.native.transport(inverter)
-        reason = self._refusal(inverter, epoch, guard_write=guard_write)
+        reason = self._refusal(inverter, epoch, guard_write=guard_write,
+                               entity_control=entity_control)
         if reason is not None:
             return IntentResult(outcome="refused", reason=reason)
         permission = await self._read(transport, inverter, input_=True)
@@ -407,7 +431,8 @@ class NativeChargeBoundary:
         if changed:
             # Every await above may have revoked authority or changed limits.
             # No await sits between this recheck and the write.
-            reason = self._refusal(inverter, epoch, guard_write=guard_write)
+            reason = self._refusal(inverter, epoch, guard_write=guard_write,
+                                   entity_control=entity_control)
             if reason is not None:
                 return IntentResult(outcome="refused", reason=reason)
             if untrusted():
