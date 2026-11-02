@@ -1,14 +1,16 @@
 """One serialised, clamped and verified native charge-current boundary.
 
 Lock order is guard then native bus. No caller-supplied SoC exemption exists.
-Plan current limits and charge windows are enabled here; fallback, protection and entity
-callers must acquire their own authority policy before being enabled later.
+Plan current limits, charge windows and guard ceilings share this boundary.
+The guard policy permits only current changes, never window activation.
 Resident state is evidence only after exact read-back, never a requested value.
 """
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import TYPE_CHECKING
 
+from homeassistant.util import dt as dt_util
 from pydantic import ValidationError
 
 from .clamp import DeviceIntent, clamp_intent
@@ -35,11 +37,12 @@ _SEVERITY = ("applied", "unchanged", "deferred", "refused", "unverified", "faile
 
 
 class NativeChargeBoundary:
-    """Shared guard/bus transaction, deliberately not installed as a guard writer."""
+    """Shared guard/bus transactions with caller-specific authority policies."""
 
     def __init__(self, coordinator: "SparkCoordinator") -> None:
         self.coordinator = coordinator
         self.written_a: dict[str, float] = {}
+        self.written_at: dict[str, datetime] = {}
 
     async def async_barrier(self) -> None:
         """Wait for complete read-back transactions, without aborting any write."""
@@ -52,7 +55,8 @@ class NativeChargeBoundary:
             async with self.coordinator.native.lock:
                 pass
 
-    def _refusal(self, inverter: Inverter, epoch: int) -> WriteReason | None:
+    def _refusal(self, inverter: Inverter, epoch: int, *,
+                 guard_write: bool = False) -> WriteReason | None:
         coordinator = self.coordinator
         state = coordinator.authority.state
         if state is None:
@@ -61,9 +65,13 @@ class NativeChargeBoundary:
             return "gateway_not_owned"
         if state.epoch != epoch:
             return "stale_epoch"
-        if (state.committed_mode != "optimise" or state.manual_session is not None
-                or state.fallback.active
-                or state.transition is not None and state.transition.target != "optimise"):
+        if guard_write:
+            if (state.committed_mode not in ("protect", "optimise")
+                    or state.transition is not None and state.transition.target == "observe"):
+                return "mode"
+        elif (state.committed_mode != "optimise" or state.manual_session is not None
+              or state.fallback.active
+              or state.transition is not None and state.transition.target != "optimise"):
             return "mode"
         # Unloading fences new writes the moment it starts, before native closes.
         if (not coordinator._running or not coordinator.native.polling
@@ -105,12 +113,79 @@ class NativeChargeBoundary:
                              outcome=worst.outcome, reason=worst.reason, intents=results)
 
     async def async_write(self, intent: DeviceIntent) -> None:
-        """ChargeWriter seam; no mode expansion or production writer attachment."""
+        """Plan-only ChargeWriter seam; guard callers use the locked entry."""
         state = self.coordinator.authority.state
         if state is not None:
             await self.async_current(ChargeCurrentLimit(
                 kind="charge_current_limit", inverter_id=intent.inverter_id,
                 current_a=intent.charge_a), epoch=state.epoch)
+
+    async def async_residents_locked(self) -> dict[str, float]:
+        """Fresh current evidence, not restore targets; caller holds guard.lock."""
+        residents: dict[str, float] = {}
+        async with self.coordinator.native.lock:
+            for inverter in self.coordinator.native.inverters.values():
+                value = await self._read(self.coordinator.native.transport(inverter), inverter)
+                if value is not None:
+                    residents[inverter.id] = value / 10
+        return residents
+
+    async def async_guard_locked(self, requests: dict[str, float], *, epoch: int,
+                                 lower_only: bool = False,
+                                 cut_only: set[str] | None = None) -> IntentResult:
+        """Clamp all connection peers, reductions first; caller holds guard.lock.
+
+        Replay and request-less protection can only lower the fresh resident.
+        Requests here are ephemeral and never become future restore targets.
+        """
+        guard = self.coordinator.guard
+        if guard is None:
+            return IntentResult(outcome="refused", reason="limits")
+        mismatches: set[str] = set()
+        results: list[IntentResult] = []
+        try:
+            async with self.coordinator.native.lock:
+                planned: list[tuple[Inverter, float, float]] = []
+                banks = {b.id: b for b in guard.topology.banks}
+                connections = {banks[i.bank_id].connection_id for i in guard.topology.inverters
+                               if i.id in requests}
+                if any(i.id not in requests for i in guard.topology.inverters
+                       if banks[i.bank_id].connection_id in connections):
+                    # A failed resident read must not make a peer disappear
+                    # from the allocation and thereby fund an increase.
+                    return IntentResult(outcome="failed")
+                for inverter in guard.topology.inverters:
+                    if inverter.id not in requests:
+                        continue
+                    reason = self._refusal(inverter, epoch, guard_write=True)
+                    if reason is not None:
+                        return IntentResult(outcome="refused", reason=reason)
+                    resident = await self._read(self.coordinator.native.transport(inverter),
+                                                inverter)
+                    if resident is None:
+                        return IntentResult(outcome="failed")
+                    intent = clamp_intent(
+                        DeviceIntent(inverter.id, inverter.bank_id, requests[inverter.id]),
+                        allowance_kw=guard.allowance_for(inverter.bank_id),
+                        last_requested_a=requests, topology=guard.topology, limits=guard.limits)
+                    if intent is None:
+                        return IntentResult(outcome="refused", reason="limits")
+                    only_lower = lower_only or inverter.id in (cut_only or set())
+                    target = min(intent.charge_a, resident / 10) if only_lower else intent.charge_a
+                    planned.append((inverter, target, resident / 10))
+                planned.sort(key=lambda item: item[1] >= item[2])
+                for inverter, target, _ in planned:
+                    result = await self._async_commit(inverter, target, epoch, mismatches,
+                        guard_write=True,
+                        lower_only=lower_only or inverter.id in (cut_only or set()))
+                    results.append(result)
+                    if result.outcome not in ("applied", "unchanged"):
+                        break
+        finally:
+            for inverter_id in mismatches:
+                await self.coordinator.native.async_readback_mismatch(inverter_id)
+        return max(results, key=lambda r: _SEVERITY.index(r.outcome)) if results else (
+            IntentResult(outcome="unchanged"))
 
     async def async_current(self, request: ChargeCurrentLimit | ChargeWindow | ExportNone,
                             *, epoch: int) -> IntentResult:
@@ -129,7 +204,7 @@ class NativeChargeBoundary:
     async def _async_locked(self, guard: "SupplyGuardLoop",
                             request: ChargeCurrentLimit | ChargeWindow | ExportNone,
                             epoch: int, mismatches: set[str]) -> IntentResult:
-        # The only place the boundary takes its locks, guard then native bus.
+        # Plan entry takes both locks; the guard entry already holds guard.lock.
         async with guard.lock:
             async with self.coordinator.native.lock:
                 return await self._async_held(guard, request, epoch, mismatches)
@@ -150,8 +225,7 @@ class NativeChargeBoundary:
         slots = NativeSlots(self, inverter, epoch, mismatches)
         if isinstance(request, ExportNone):
             return await slots.clear_discharge()
-        previous = guard.last_requested_a.get(inverter.id)
-        guard.last_requested_a[inverter.id] = request.current_a
+        previous = guard.request_current(inverter.id, request.current_a)
         try:
             if isinstance(request, ChargeWindow):
                 # Judged on the current alone: a later slot refusal must not
@@ -245,9 +319,10 @@ class NativeChargeBoundary:
         return result.registers[0]
 
     async def _async_commit(self, inverter: Inverter, current: float, epoch: int,
-                            mismatches: set[str], *, soc_required: bool = False) -> IntentResult:
+                            mismatches: set[str], *, soc_required: bool = False,
+                            guard_write: bool = False, lower_only: bool = False) -> IntentResult:
         transport = self.coordinator.native.transport(inverter)
-        reason = self._refusal(inverter, epoch)
+        reason = self._refusal(inverter, epoch, guard_write=guard_write)
         if reason is not None:
             return IntentResult(outcome="refused", reason=reason)
         permission = await self._read(transport, inverter, input_=True)
@@ -259,6 +334,8 @@ class NativeChargeBoundary:
         if resident is None:
             self.written_a.pop(inverter.id, None)
             return IntentResult(outcome="failed")
+        if lower_only:
+            current = min(current, resident / 10)
         target = int(current) * 10
         def untrusted() -> bool:
             soc = getattr(self.coordinator, "soc", None)
@@ -282,11 +359,12 @@ class NativeChargeBoundary:
                                         mismatch=mismatch)
             if not changed:
                 self.written_a[inverter.id] = current
+                self.written_at[inverter.id] = dt_util.utcnow()
                 return IntentResult(outcome="unchanged", written_a=current)
         if changed:
             # Every await above may have revoked authority or changed limits.
             # No await sits between this recheck and the write.
-            reason = self._refusal(inverter, epoch)
+            reason = self._refusal(inverter, epoch, guard_write=guard_write)
             if reason is not None:
                 return IntentResult(outcome="refused", reason=reason)
             if untrusted():
@@ -301,4 +379,5 @@ class NativeChargeBoundary:
             mismatches.add(inverter.id)
             return IntentResult(outcome="unverified", written_a=current if changed else None)
         self.written_a[inverter.id] = current
+        self.written_at[inverter.id] = dt_util.utcnow()
         return IntentResult(outcome="applied" if changed else "unchanged", written_a=current)

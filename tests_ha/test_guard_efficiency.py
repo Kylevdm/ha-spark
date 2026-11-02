@@ -23,7 +23,9 @@ from custom_components.ha_spark.supply_guard import (
 )
 from custom_components.ha_spark.topology import Topology, effective_limits
 from custom_components.ha_spark.wire import parse_summary
+from tests_ha.guard_authority import local_authority
 from tests_ha.test_guard_clamp import FakeWriter
+from tests_ha.test_native_write import hass_config_dir, hass_storage  # noqa: F401
 from tests_ha.test_polling import summary
 
 
@@ -93,6 +95,7 @@ def test_command_shares_never_widen(
 @pytest.mark.parametrize("battery_w", [2000.0, -2000.0])
 async def test_battery_fallback_direction_only_narrows(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, eta: float, battery_w: float,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from tests_ha.test_guard_clamp import topology
 
@@ -112,6 +115,7 @@ async def test_battery_fallback_direction_only_narrows(
         coordinator.summary.authority, mode="optimise", save_failed=False,
         transition_target=None,
     ))
+    await local_authority(coordinator, monkeypatch)
     fake = FakeWriter()
     loop = SupplyGuardLoop(hass, entry, coordinator, site, writer=fake)
     loop.last_requested_a[inv.id] = 60
@@ -123,7 +127,7 @@ async def test_battery_fallback_direction_only_narrows(
             freezer.tick(timedelta(seconds=1))
             hass.states.async_set("sensor.grid", str(limit_w + 1000),
                                   {"unit_of_measurement": "W"})
-            await hass.async_block_till_done()
+            await hass.async_block_till_done(wait_background_tasks=True)
         # Charging: converting DC to AC must not grant extra measured headroom.
         # Discharging: only eta of the DC output offsets AC site load.
         adjusted = battery_w / eta if battery_w >= 0 else battery_w * eta
@@ -202,6 +206,7 @@ def test_discharge_fallback_losses_block_restore_with_nonzero_headroom(eta: floa
 @pytest.mark.parametrize("eta,restored", [(1.0, True), (0.8, False)])
 async def test_discharge_measurement_losses_reach_restore_boundary(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, eta: float, restored: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from tests_ha.test_guard_clamp import topology
 
@@ -221,12 +226,13 @@ async def test_discharge_measurement_losses_reach_restore_boundary(
         coordinator.summary.authority, mode="optimise", save_failed=False,
         transition_target=None,
     ))
+    await local_authority(coordinator, monkeypatch)
     loop = SupplyGuardLoop(hass, entry, coordinator, site, writer=FakeWriter())
     loop.last_requested_a[inv.id] = 36  # 1.8 kW DC
     await loop.async_start()
     try:
         now = datetime.now(UTC)
-        loop.states[grid.id] = replace(loop.states[grid.id], cut_kw=1,
+        loop.states[grid.id] = replace(loop.states[grid.id], cut_kw=1, epoch=1,
                                       headroom_since=now - timedelta(seconds=300))
         limit_w = loop.limits.connections[0].import_kw * 1000
         await loop.async_evaluate({"sensor.grid": (limit_w - 4600, now),
@@ -239,6 +245,7 @@ async def test_discharge_measurement_losses_reach_restore_boundary(
 @pytest.mark.parametrize("eta,restored", [(1.0, True), (0.949, False), (0.8, False)])
 async def test_restore_uses_ac_request_and_deadband(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, eta: float, restored: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from tests_ha.test_guard_clamp import topology
 
@@ -258,11 +265,12 @@ async def test_restore_uses_ac_request_and_deadband(
         coordinator.summary.authority, mode="optimise", save_failed=False,
         transition_target=None,
     ))
+    await local_authority(coordinator, monkeypatch)
     fake = FakeWriter()
     loop = SupplyGuardLoop(hass, entry, coordinator, site, writer=fake)
     loop.last_requested_a[inv.id] = 40  # 2 kW DC, needs 2/eta kW AC.
     await loop.async_start()
-    loop.states[grid.id] = replace(loop.states[grid.id], cut_kw=1)
+    loop.states[grid.id] = replace(loop.states[grid.id], cut_kw=1, epoch=1)
     try:
         limit_w = loop.limits.connections[0].import_kw * 1000
         # 2.25 kW AC available: lossless request + deadband fits, lossy doesn't.
@@ -271,7 +279,7 @@ async def test_restore_uses_ac_request_and_deadband(
             hass.states.async_set("sensor.inverter", "1000", {"unit_of_measurement": "W"})
             hass.states.async_set("sensor.grid", str(limit_w - 1250),
                                   {"unit_of_measurement": "W"})
-            await hass.async_block_till_done()
+            await hass.async_block_till_done(wait_background_tasks=True)
         assert (not loop.limiting) == restored
         assert loop.states[grid.id].restores_used == int(restored)
     finally:

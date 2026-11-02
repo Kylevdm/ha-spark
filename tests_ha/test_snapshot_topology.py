@@ -53,7 +53,8 @@ async def test_power_report_crosses_snapshot(
     body = aioclient_mock.mock_calls[-1][2]
     assert body["supply_guard"] == {
         "limiting": False,
-        "connections": [{"id": c["id"], "allowance_kw": None} for c in raw["connections"]],
+        "connections": [{"id": c["id"], "allowance_kw": None, "writer": False}
+                        for c in raw["connections"]],
         "restores_left": 48,
         "revision": 7,
     }

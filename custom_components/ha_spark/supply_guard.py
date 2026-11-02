@@ -95,11 +95,13 @@ class GuardInputs:
     grid_configured: bool = True
     controllable: bool = True
     household_day: date | None = None
-    # No writer exists (this phase): readings alone set and clear the ceiling for
+    # On warn-only sites, readings alone set and clear the ceiling for
     # display, with no requested allocation, no write and no restore spent.
     observe_only: bool = False
     # DC request before losses; missing-reading cuts must not grow with losses.
     lossless_requested_kw: float | None = None
+    # Resident-only evidence permits cuts and replay, never restoration.
+    restore_allowed: bool = True
 
 
 @dataclass(frozen=True)
@@ -218,7 +220,7 @@ def step(state: GuardState, inputs: GuardInputs, now: datetime) -> tuple[GuardSt
                     changed = True
             else:
                 state = replace(state, headroom_since=None)
-        elif (state.cut_kw is not None and requested > 0
+        elif (inputs.restore_allowed and state.cut_kw is not None and requested > 0
               and available_w >= requested * 1000 + 200):
             start = state.headroom_since or now
             state = replace(state, headroom_since=start)
@@ -237,5 +239,6 @@ def step(state: GuardState, inputs: GuardInputs, now: datetime) -> tuple[GuardSt
     else:
         allowance = min(requested, state.cut_kw) if state.cut_kw is not None else requested
     return state, GuardDecision(allowance if state.cut_kw is not None or changed else None,
-                               (changed or rewrite) and permitted and replay() and requested > 0,
+                               (changed or rewrite) and not observe and permitted
+                               and replay() and requested > 0,
                                None if permitted and replay() else "authority_unavailable")

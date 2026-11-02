@@ -15,7 +15,9 @@ from custom_components.ha_spark.coordinator import SparkCoordinator
 from custom_components.ha_spark.guard_loop import SupplyGuardLoop
 from custom_components.ha_spark.topology import MajorLoad, effective_limits
 from custom_components.ha_spark.wire import parse_summary
+from tests_ha.guard_authority import local_authority
 from tests_ha.test_guard_clamp import FakeWriter, topology
+from tests_ha.test_native_write import hass_config_dir, hass_storage  # noqa: F401
 from tests_ha.test_polling import URL, setup, summary
 
 
@@ -36,11 +38,11 @@ async def test_report_events_cut_and_stop(
     limit = effective_limits(site).connections[0].import_kw * 1000
     hass.states.async_set("sensor.inverter", "2000", {"unit_of_measurement": "W"})
     hass.states.async_set("sensor.grid", str(limit + 1000), {"unit_of_measurement": "W"})
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     # Same state/attributes: HA emits state_reported, not state_changed.
     freezer.tick(timedelta(seconds=1))
     hass.states.async_set("sensor.grid", str(limit + 1000), {"unit_of_measurement": "W"})
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert loop.states[grid.id].last_good_at is not None
     assert loop.states[grid.id].over_count == 2
     assert not fake.intents  # No collected allocation or authority mirror.
@@ -79,7 +81,7 @@ async def test_restart_keeps_cut_budget_and_unknown_epoch(
 ])
 async def test_fake_writer_and_mirror(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, mode: str,
-    connected: bool, expected: bool,
+    connected: bool, expected: bool, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     freezer.move_to("2026-10-29T12:00:00+00:00")
     site = topology()
@@ -95,6 +97,12 @@ async def test_fake_writer_and_mirror(
                                   authority=replace(coordinator.summary.authority, mode=mode,
                                                     save_failed=False, transition_target=None))
     coordinator.connected = connected
+    await coordinator.authority.async_load()
+    assert await coordinator.authority.async_initialise()
+    local = coordinator.authority.state
+    assert local is not None
+    assert await coordinator.authority.async_save(local.model_copy(update={"committed_mode": mode}))
+    monkeypatch.setattr(coordinator.control, "owned", lambda: connected)
     fake = FakeWriter()
     loop = SupplyGuardLoop(hass, entry, coordinator, site, writer=fake)
     loop.last_requested_a[inv.id] = 40
@@ -104,7 +112,7 @@ async def test_fake_writer_and_mirror(
     for _ in range(2):
         freezer.tick(timedelta(seconds=1))
         hass.states.async_set("sensor.grid", str(limit + 1000), {"unit_of_measurement": "W"})
-        await hass.async_block_till_done()
+        await hass.async_block_till_done(wait_background_tasks=True)
     assert loop.limiting
     assert bool(fake.intents) == expected
     assert loop.decisions[grid.id].warn_reason == (None if expected else "authority_unavailable")
@@ -117,7 +125,7 @@ async def test_fake_writer_and_mirror(
             hass.states.async_set("sensor.grid", "5000", {"unit_of_measurement": "W"})
             hass.states.async_set("sensor.inverter", "-2000", {"unit_of_measurement": "W"})
             async_fire_time_changed(hass)
-            await hass.async_block_till_done()
+            await hass.async_block_till_done(wait_background_tasks=True)
         assert not loop.limiting
         assert fake.intents[-1].charge_a == 40
         assert loop.states[grid.id].restores_used == 1
@@ -216,6 +224,7 @@ async def test_entry_without_topology_then_reload_cancels_old_loop(
 @pytest.mark.parametrize("running", [False, True])
 async def test_missing_timer_uses_reserve_excluding_running_loads(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, running: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     freezer.move_to("2026-10-29T12:00:00+00:00")
     site = topology()
@@ -231,22 +240,23 @@ async def test_missing_timer_uses_reserve_excluding_running_loads(
     entry = MockConfigEntry(domain="ha_spark", data={})
     entry.add_to_hass(hass)
     # The 50% missing-reading cut needs a controlled allocation, so a (fake) writer.
-    loop = SupplyGuardLoop(hass, entry, SparkCoordinator(hass, entry, "0.0.0"), site,
-                           writer=FakeWriter())
+    coordinator = SparkCoordinator(hass, entry, "0.0.0")
+    await local_authority(coordinator, monkeypatch)
+    loop = SupplyGuardLoop(hass, entry, coordinator, site, writer=FakeWriter())
     loop.last_requested_a[inv.id] = 40
     await loop.async_start()
     hass.states.async_set("sensor.inverter", "2000", {"unit_of_measurement": "W"})
     hass.states.async_set("sensor.grid", "17000", {"unit_of_measurement": "W"})
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     freezer.tick(timedelta(seconds=61))
     async_fire_time_changed(hass)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert not loop.limiting  # stale, but still within grace from last report
     freezer.tick(timedelta(seconds=59))
     hass.states.async_set("sensor.ev", "200" if running else "0",
                           {"unit_of_measurement": "W"})
     async_fire_time_changed(hass)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert loop.limiting == (not running)
     if not running:
         assert loop.allowance_kw[grid.id] == 1
@@ -297,6 +307,7 @@ async def test_failed_restore_save_keeps_ceiling(
 ])
 async def test_apply_through_clamp_needs_permitting_mirror(
     hass: HomeAssistant, mode: str, connected: bool, save_failed: bool, expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     site = topology()
     inv = site.inverters[0]
@@ -309,6 +320,14 @@ async def test_apply_through_clamp_needs_permitting_mirror(
         transition_target=None,
     ))
     coordinator.connected = connected
+    await coordinator.authority.async_load()
+    assert await coordinator.authority.async_initialise()
+    local = coordinator.authority.state
+    assert local is not None
+    assert await coordinator.authority.async_save(local.model_copy(update={"committed_mode": mode}))
+    if save_failed:
+        monkeypatch.setattr(coordinator.authority, "status", "save_failed")
+    monkeypatch.setattr(coordinator.control, "owned", lambda: connected)
     fake = FakeWriter()
     loop = SupplyGuardLoop(hass, entry, coordinator, site, writer=fake)
     await loop.async_start()
