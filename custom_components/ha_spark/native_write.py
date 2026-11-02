@@ -6,6 +6,7 @@ The guard policy permits only current changes, never window activation.
 Resident state is evidence only after exact read-back, never a requested value.
 """
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, time, timedelta
 from math import floor
@@ -280,6 +281,7 @@ class NativeChargeBoundary:
             "export": ExportNone}
         results: list[IntentResult | None] = [None] * len(raw_intents)
         kinds: list[str | None] = []
+        malformed: set[str] = set()
         parsed: list[tuple[str, ChargeCurrentLimit | ChargeWindow | ExportNone
                            | ExportUntrusted | ExportWindow, int]] = []
         for index, raw in enumerate(raw_intents):
@@ -296,6 +298,13 @@ class NativeChargeBoundary:
                 intent = model.model_validate(raw)
             except ValidationError:
                 results[index] = IntentResult(outcome="refused", reason="invalid_intent")
+                inverter_id = raw.get("inverter_id")
+                if (kind == "export" and isinstance(inverter_id, str)
+                        and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", inverter_id)):
+                    # A malformed export still clears its inverter's discharge half.
+                    malformed.add(inverter_id)
+                    parsed.append((kind, ExportNone(kind="export", inverter_id=inverter_id,
+                                                    request="none"), index))
                 continue
             parsed.append((kind, intent, index))
         guard = self.coordinator.guard
@@ -326,7 +335,8 @@ class NativeChargeBoundary:
                 mismatches: set[str] = set()
                 try:
                     group = await self._async_export_group(
-                        entries, epoch=command.epoch, mismatches=mismatches, fixed=reason)
+                        entries, epoch=command.epoch, mismatches=mismatches, fixed=reason,
+                        malformed=inverter_id in malformed)
                 except Exception:
                     self.written_a.pop(inverter_id, None)
                     group = {index: IntentResult(outcome="failed")
@@ -522,6 +532,14 @@ class NativeChargeBoundary:
         connection_id = banks[inverter.bank_id].connection_id
         state = c.authority.state
         same_event = (state.export_supervisions if state is not None else ())
+        # Every inverter on the connection still has a bound for this event and
+        # is still validated: an unrated or invalid peer's output is unknown.
+        for member in topology.inverters:
+            if banks[member.bank_id].connection_id != connection_id:
+                continue
+            if (supervision_for(same_event, member.id, supervision.event) is None
+                    or member.transport != "native" or c.native.reason(member) is not None):
+                return "export_bound_unverified"
         total = sum(row.rating_w for row in same_event
                     if row.event == supervision.event
                     and banks[next(i.bank_id for i in topology.inverters
@@ -547,7 +565,7 @@ class NativeChargeBoundary:
         return list(result.registers)
 
     async def _async_export_current(self, inverter: Inverter, epoch: int,
-                                   mismatches: set[str]) -> IntentResult:
+                                   mismatches: set[str], event: EventIdentity) -> IntentResult:
         """Write and confirm the fixed 62.5 A export command."""
         target = [current_word(EXPORT_CURRENT_A)]
         resident = await self._read_export_current(inverter)
@@ -558,7 +576,7 @@ class NativeChargeBoundary:
                              verify_sleep, changed=False, mismatch=lambda: mismatches.add(
                                  inverter.id)):
                 return IntentResult(outcome="unchanged", written_a=EXPORT_CURRENT_A)
-        reason = self._export_policy_reason(inverter, epoch)
+        reason = self._export_write_reason(inverter, epoch, event)
         if reason is not None:
             return IntentResult(outcome="refused", reason=reason)
         result = await self.coordinator.native.transport(inverter).write(
@@ -576,14 +594,63 @@ class NativeChargeBoundary:
         """Clear and zero-confirm the discharge half, retiring the record on success."""
         result = await slots.clear_discharge()
         if result.outcome in ("applied", "unchanged"):
-            if not await self._mark_cleared(inverter.id, now):
-                return IntentResult(outcome="unverified")
+            return await self._retire_after_zero(inverter, slots, now, result)
         return result
+
+    async def _retire_after_zero(self, inverter: Inverter, slots: "NativeSlots",
+                                 now: datetime, result: IntentResult | None = None
+                                 ) -> IntentResult:
+        """The discharge half alone must read zero first time and on 5 further reads."""
+        async def half() -> list[int] | None:
+            block = await slots.read(43143)
+            return None if block is None else block[4:]
+        if not await confirm([0] * 4, half, verify_sleep, changed=True,
+                             mismatch=slots.mismatch):
+            return IntentResult(outcome="unverified")
+        if not await self._mark_cleared(inverter.id, now):
+            return IntentResult(outcome="unverified")
+        return result or IntentResult(outcome="unchanged")
+
+    async def _drop_supervisions(self, inverter_id: str, now: datetime) -> bool:
+        state = self.coordinator.authority.state
+        if state is None:
+            return False
+        kept = tuple(row for row in state.export_supervisions if row.inverter_id != inverter_id)
+        if len(kept) == len(state.export_supervisions):
+            return True
+        return await self.coordinator.authority.async_save(state.model_copy(update={
+            "export_supervisions": kept, "last_changed_at": now}))
 
     async def _async_export_group(
         self, entries: list[tuple[str, ChargeCurrentLimit | ChargeWindow | ExportNone
                                  | ExportUntrusted | ExportWindow, int]],
-        *, epoch: int, mismatches: set[str], fixed: str | None,
+        *, epoch: int, mismatches: set[str], fixed: str | None, malformed: bool = False,
+    ) -> dict[int, IntentResult]:
+        """Export state changes serialise with every other authority save (control.lock)."""
+        async with self.coordinator.control.lock:
+            return await self._async_export_group_controlled(
+                entries, epoch=epoch, mismatches=mismatches, fixed=fixed, malformed=malformed)
+
+    def _export_write_reason(self, inverter: Inverter, epoch: int,
+                             event: EventIdentity) -> WriteReason | None:
+        """Write-time export permission: mode, device, a live supervision and no latch."""
+        reason = self._export_policy_reason(inverter, epoch)
+        if reason is not None:
+            return reason
+        state = self.coordinator.authority.state
+        if state is None:
+            return "authority_unknown"
+        supervision = supervision_for(state.export_supervisions, inverter.id, event)
+        if supervision is None or supervision.ends_at <= dt_util.utcnow():
+            return "not_supervised"
+        if any(latch.event == event for latch in state.stop_latches):
+            return "tripped"
+        return None
+
+    async def _async_export_group_controlled(
+        self, entries: list[tuple[str, ChargeCurrentLimit | ChargeWindow | ExportNone
+                                 | ExportUntrusted | ExportWindow, int]],
+        *, epoch: int, mismatches: set[str], fixed: str | None, malformed: bool,
     ) -> dict[int, IntentResult]:
         """One guard-lock transaction per inverter, in the oracle's export order."""
         from .native_slots import NativeSlots
@@ -636,11 +703,19 @@ class NativeChargeBoundary:
                                 supervision.event, event):
                             refusal = "not_supervised"
                         elif (request.window.end <= now.astimezone(UTC)
-                              or request.event.end <= now.astimezone(UTC)):
+                              or request.event.end <= now.astimezone(UTC)
+                              or request.window.start < request.event.start
+                              or request.window.end > request.event.end):
+                            # The selected window must lie inside the supervised event.
                             refusal = "invalid_intent"
+                        elif any(latch.event == event for latch in state.stop_latches):
+                            refusal = "tripped"
                         elif (not request.soc.ok or not hasattr(c, "soc")
                               or not c.soc.trusted(inverter.bank_id)):
-                            refusal = "untrusted_soc"
+                            # The SoC gate never writes (oracle's early BLOCKED).
+                            return {index: IntentResult(outcome="refused",
+                                                        reason="untrusted_soc")
+                                    for _, _, index in entries}
                         elif fixed is not None:
                             refusal = "limits"
                         elif zone is None:
@@ -649,7 +724,8 @@ class NativeChargeBoundary:
                         assert zone is not None
                         half = clock_face(request.window.start, request.window.end, zone)
                         if export_not_yet_armed(
-                                request.window.start, request.window.end, now):
+                                request.window.start.astimezone(zone),
+                                request.window.end.astimezone(zone), now.astimezone(zone)):
                             deferred = True
                             if live is not None and self._same_event(live.event, event):
                                 resident = await NativeSlots(
@@ -683,6 +759,19 @@ class NativeChargeBoundary:
                                 if refusal is None:
                                     ready = True
                 slots = NativeSlots(self, inverter, epoch, mismatches)
+                # Every write carrying a discharge half re-checks export permission
+                # with no await before the write (the slots' own recheck point).
+                check_event = live.event if keep and live is not None else event
+                if check_event is not None:
+                    def check(checked: EventIdentity = check_event) -> WriteReason | None:
+                        return self._export_write_reason(inverter, epoch, checked)
+                    slots.discharge_check = check
+                if isinstance(request, ExportNone) and not malformed:
+                    # A trusted "none" ends authority to export before the clear.
+                    if not await self._drop_supervisions(inverter.id, now):
+                        return {index: IntentResult(outcome="refused",
+                                                    reason="authority_unknown")
+                                for _, _, index in entries}
                 written: list[IntentResult] = []
                 if ready:
                     assert (isinstance(request, ExportWindow) and event is not None
@@ -700,7 +789,9 @@ class NativeChargeBoundary:
                         return {
                             index: IntentResult(outcome="refused", reason="authority_unknown")
                             for _, _, index in entries}
-                    current = await self._async_export_current(inverter, epoch, mismatches)
+                    assert event is not None
+                    current = await self._async_export_current(
+                        inverter, epoch, mismatches, event)
                     written.append(current)
                     if current.outcome not in ("applied", "unchanged"):
                         ready = False
@@ -715,7 +806,8 @@ class NativeChargeBoundary:
                     if isinstance(intent, ChargeWindow):
                         charge_window = True
                         slots.planned_discharge = planned
-                        result, _ = await slots.window(guard, intent)
+                        result = await self._async_held(guard, intent, epoch, mismatches,
+                                                        slots=slots)
                     else:
                         assert isinstance(intent, ChargeCurrentLimit)
                         result = await self._async_held(guard, intent, epoch, mismatches)
@@ -728,11 +820,9 @@ class NativeChargeBoundary:
                         or slot_result.outcome == "refused"):
                     slot_result = await self._cleanup_locked(inverter, slots, now)
                 elif not ready and not keep and slot_result is not None:
-                    if slot_result.outcome in ("unverified", "failed"):
-                        # The charge window cleared the half but could not verify it.
-                        pass
-                    else:
-                        await self._mark_cleared(inverter.id, now)
+                    if slot_result.outcome in ("applied", "unchanged"):
+                        # The charge window wrote a zero half: confirm it as a zero.
+                        slot_result = await self._retire_after_zero(inverter, slots, now)
                 if ready and (slot_result is None or slot_result.outcome in (
                         "unverified", "failed", "refused")):
                     refusal = slot_result.reason if slot_result is not None else None
@@ -762,7 +852,10 @@ class NativeChargeBoundary:
                     if cleanup.outcome in ("unverified", "failed"):
                         results[export_index] = IntentResult(outcome="unverified")
                         return results
-                if failure is not None:
+                if malformed:
+                    results[export_index] = IntentResult(outcome="refused",
+                                                         reason="invalid_intent")
+                elif failure is not None:
                     results[export_index] = IntentResult(outcome=failure)
                 elif deferred:
                     results[export_index] = IntentResult(outcome="deferred")
@@ -939,7 +1032,8 @@ class NativeChargeBoundary:
 
     async def _async_held(self, guard: "SupplyGuardLoop",
                           request: ChargeCurrentLimit | ChargeWindow | ExportNone,
-                          epoch: int, mismatches: set[str]) -> IntentResult:
+                          epoch: int, mismatches: set[str], *,
+                          slots: "NativeSlots | None" = None) -> IntentResult:
         """The whole intent; the caller holds guard.lock then native.lock."""
         inverter = next((i for i in guard.topology.inverters
                          if i.id == request.inverter_id), None)
@@ -950,7 +1044,8 @@ class NativeChargeBoundary:
             return IntentResult(outcome="refused", reason=reason)
         from .native_slots import NativeSlots
 
-        slots = NativeSlots(self, inverter, epoch, mismatches)
+        if slots is None:
+            slots = NativeSlots(self, inverter, epoch, mismatches)
         if isinstance(request, ExportNone):
             return await slots.clear_discharge()
         previous = guard.request_current(inverter.id, request.current_a)

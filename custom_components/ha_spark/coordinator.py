@@ -238,6 +238,10 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         return topology, effective_limits(topology)
 
     async def _async_supervise_export(self, command: Command) -> CommandResult:
+        async with self.control.lock:
+            return await self._async_supervise_export_locked(command)
+
+    async def _async_supervise_export_locked(self, command: Command) -> CommandResult:
         base = CommandResult(session_id=command.session_id, sequence=command.sequence,
                              outcome="refused")
         payload = SupervisionPayload.model_validate(command.payload)
@@ -295,6 +299,10 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                                        "epoch": state.epoch})
 
     async def _async_end_supervision(self, command: Command) -> CommandResult:
+        async with self.control.lock:
+            return await self._async_end_supervision_locked(command)
+
+    async def _async_end_supervision_locked(self, command: Command) -> CommandResult:
         base = CommandResult(session_id=command.session_id, sequence=command.sequence,
                              outcome="refused")
         payload = EndSupervisionPayload.model_validate(command.payload)
@@ -435,7 +443,20 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
 
     async def async_reprobe(self, inverter_id: str) -> bool:
         """Native admin command seam; authentication belongs to the caller boundary."""
-        return await self.native.async_reprobe(inverter_id)
+        found = await self.native.async_reprobe(inverter_id)
+        # A Re-probe that changes the identity invalidates that inverter's bound
+        # until a new supervise_export (Q22a): its supervision rows are dropped.
+        async with self.control.lock:
+            state = self.authority.state
+            if state is not None:
+                probe = self.native.probes.get(inverter_id)
+                identity = tuple(probe.identity) if probe is not None else None
+                kept = tuple(row for row in state.export_supervisions
+                             if row.inverter_id != inverter_id or row.identity == identity)
+                if len(kept) != len(state.export_supervisions):
+                    await self.authority.async_save(state.model_copy(update={
+                        "export_supervisions": kept, "last_changed_at": dt_util.utcnow()}))
+        return found
 
     @callback
     def _clear_deadline(self) -> None:

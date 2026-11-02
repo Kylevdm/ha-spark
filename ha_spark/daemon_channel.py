@@ -346,6 +346,9 @@ class DaemonChannel:
             native_reply = await self.native_request(request, ingress_user)
             if native_reply is not None:
                 return native_reply
+        if request.op in ("supervise_export", "end_supervision"):
+            # Integration-owned sites only; never a legacy planning or apply cycle.
+            return Reply(error="not_available")
         if request.target in ("manual", "resume"):
             return Reply(error="not_available")
         future = asyncio.get_running_loop().create_future()

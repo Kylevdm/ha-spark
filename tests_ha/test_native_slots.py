@@ -214,6 +214,8 @@ async def test_current_change_keeps_only_exact_planned_discharge(
     request = ChargeWindow.model_validate(window(writer).payload["intents"][0])  # type: ignore[index]
     slots = NativeSlots(writer.writes, guard.topology.inverters[0], state.epoch, set(),
                         planned_discharge=discharge if matches else [11, 0, 12, 0])
+    # A discharge half is written only with export permission (#584): grant it here.
+    slots.discharge_check = lambda: None
     async with guard.lock:
         async with writer.native.lock:
             guard.last_requested_a[request.inverter_id] = request.current_a

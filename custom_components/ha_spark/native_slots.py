@@ -4,10 +4,11 @@ The caller holds guard.lock then native.lock throughout. Slot blocks are always
 fresh-read and written whole. Export arming is not enabled here; planned_discharge
 is the parity seam for keeping an exact resident export during a current change.
 """
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from . import native_write
-from .commands import ChargeCurrentLimit, ChargeWindow, IntentResult
+from .commands import ChargeCurrentLimit, ChargeWindow, IntentResult, WriteReason
 from .native_verify import confirm
 from .solis_transport import valid_words
 from .topology import Inverter
@@ -37,6 +38,9 @@ class NativeSlots:
         self.fallback = fallback
         self.transition = transition
         self.block_result: IntentResult | None = None
+        # Export permission, rechecked before any write carrying a discharge half;
+        # without one such a write is refused.
+        self.discharge_check: Callable[[], WriteReason | None] | None = None
         # A charge window needs trusted SoC for every write, whatever its direction.
         self.soc_required = False
 
@@ -75,6 +79,8 @@ class NativeSlots:
         reason = self.boundary._refusal(self.inverter, self.epoch,
                                         fallback=self.fallback,
                                         transition=self.transition)
+        if reason is None and address == 43143 and any(target[4:]):
+            reason = self.discharge_check() if self.discharge_check is not None else "mode"
         if reason is not None:
             return IntentResult(outcome="refused", reason=reason)
         result = await self.boundary.coordinator.native.transport(self.inverter).write(

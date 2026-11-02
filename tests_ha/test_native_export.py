@@ -296,10 +296,13 @@ async def test_a_supervised_window_writes_the_fixed_current_and_one_atomic_block
     intents = [*charge_intents(), window_intent()]
     result = await writer._async_dispatch_command(apply_command(writer, intents))
     assert result.outcome in ("applied", "unchanged")
+    # The grouped window registers and writes its own current before the block
+    # (review fix): the later current intent then has nothing left to raise.
     assert [intent.outcome for intent in result.intents] == [
-        "unchanged", "applied", "applied"]
+        "unchanged", "unchanged", "applied"]
     assert result.intents[2].written_a == 62.5
     writes = [(t.address, t.payload) for t in native_transport.traffic if t.op == "write"]
+    assert writes.index((43141, (200,))) < writes.index((43143, (23, 30, 5, 30, 14, 0, 15, 0)))
     assert (43142, (625,)) in writes
     assert (43143, (23, 30, 5, 30, 14, 0, 15, 0)) in writes
     assert not [t for t in native_transport.traffic if t.op == "write" and t.address != 43141
@@ -658,3 +661,183 @@ async def test_none_clears_the_discharge_half_under_the_plan_policy(
     reads = [t for t in native_transport.traffic
              if t.op == "read" and t.address == 43143]
     assert len(reads) >= 7  # first match plus five further matching zero reads
+
+
+# --- review fixes (#584 astra/Opus review): each fails on the delegate's code ----
+from custom_components.ha_spark.authority_store import StopLatch  # noqa: E402
+
+
+def export_writes(transport: FakeSolisDevice) -> list[tuple[int, tuple[int, ...]]]:
+    return [(t.address, cast(tuple[int, ...], t.payload)) for t in transport.traffic
+            if t.op == "write" and (t.address == 43142 or (
+                t.address == 43143 and any(cast(tuple[int, ...], t.payload)[4:])))]
+
+
+async def test_supervision_lost_mid_arm_writes_no_export(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    original = writer.writes._bound_reason
+
+    async def revoked(*args: Any, **kwargs: Any) -> Any:
+        reason = await original(*args, **kwargs)
+        state = writer.authority.state
+        assert state is not None
+        assert await writer.authority.async_save(state.model_copy(update={
+            "export_supervisions": ()}))
+        return reason
+
+    monkeypatch.setattr(writer.writes, "_bound_reason", revoked)
+    native_transport.traffic.clear()
+    result = await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
+    assert result.intents[0].outcome != "applied"
+    assert export_writes(native_transport) == []
+
+
+async def test_a_stop_latch_refuses_arming(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    state = writer.authority.state
+    assert state is not None
+    event = EventIdentity(direction="export", start=NOW + timedelta(hours=2),
+                          end=NOW + timedelta(hours=3))
+    assert await writer.authority.async_save(state.model_copy(update={"stop_latches": (
+        StopLatch(inverter_id="inv1", event=event, window_end=event.end, epoch=state.epoch),)}))
+    native_transport.traffic.clear()
+    result = await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
+    assert (result.intents[0].outcome, result.intents[0].reason) == ("refused", "tripped")
+    assert export_writes(native_transport) == []
+
+
+async def test_arming_is_judged_on_the_household_clock(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, freezer: FrozenDateTimeFactory,
+) -> None:
+    # Fall-back night: 00:50Z is 01:50 BST, inside the local 01:30-02:00 face of a
+    # 01:30Z-02:00Z (GMT) window, so programming it now would export at once.
+    now = datetime(2026, 10, 25, 0, 50, tzinfo=UTC)
+    freezer.move_to(now)
+    zone = ZoneInfo("Europe/London")
+    monkeypatch.setattr(writer.control, "household_zone", lambda: zone)
+    event = {"direction": "export", "start": datetime(2026, 10, 25, 1, 30, tzinfo=UTC).isoformat(),
+             "end": datetime(2026, 10, 25, 2, 0, tzinfo=UTC).isoformat()}
+    allow_export(writer, monkeypatch, native_transport)
+    local = now.astimezone(zone)
+    registers = (local.year % 100, local.month, local.day, local.hour, local.minute, 0)
+    native_transport.set_input(33022, list(registers))
+    writer.native.readings["inv1"]["input_33022"] = Reading(now, registers, 0)
+    await arm(writer, event=event)
+    native_transport.traffic.clear()
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [window_intent(event=event)]))
+    assert result.intents[0].outcome != "applied"
+    assert export_writes(native_transport) == []
+
+
+async def test_a_clear_beside_a_charge_half_is_zero_confirmed_on_the_half(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    native_transport.set_holding(43143, [23, 30, 5, 30, 14, 0, 15, 0])
+    native_transport.traffic.clear()
+    result = await writer.writes.async_clear_export("inv1", epoch=writer.authority.state.epoch)  # type: ignore[union-attr]
+    assert result.outcome == "applied"
+    write_at = next(i for i, t in enumerate(native_transport.traffic)
+                    if t.op == "write" and t.address == 43143)
+    reads = [t for t in native_transport.traffic[write_at:]
+             if t.op == "read" and t.address == 43143]
+    assert len(reads) >= 6  # first match plus five further reads of the zero half
+
+
+async def test_a_malformed_export_still_clears_the_discharge_half(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    native_transport.set_holding(43143, [0, 0, 0, 0, 14, 0, 15, 0])
+    native_transport.traffic.clear()
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [window_intent(planned_export_kw=-1.0)]))
+    assert (result.intents[0].outcome, result.intents[0].reason) == ("refused", "invalid_intent")
+    assert block_writes(native_transport)[-1] == (0,) * 8
+    state = writer.authority.state
+    assert state is not None and state.export_supervisions  # malformed is not a cancel
+
+
+async def test_untrusted_soc_writes_nothing(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    native_transport.set_holding(43143, [0, 0, 0, 0, 14, 0, 15, 0])
+    monkeypatch.setattr(writer.soc, "trusted", lambda bank: False)
+    native_transport.traffic.clear()
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [*charge_intents(), window_intent()]))
+    assert {(r.outcome, r.reason) for r in result.intents} == {("refused", "untrusted_soc")}
+    assert not [t for t in native_transport.traffic if t.op == "write"]
+
+
+async def test_a_window_outside_its_event_is_refused(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    native_transport.traffic.clear()
+    result = await writer._async_dispatch_command(apply_command(writer, [window_intent(
+        start=NOW + timedelta(hours=1), end=NOW + timedelta(hours=1, minutes=30))]))
+    assert (result.intents[0].outcome, result.intents[0].reason) == ("refused", "invalid_intent")
+    assert export_writes(native_transport) == []
+
+
+async def test_a_trusted_none_ends_the_supervision(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    await writer._async_dispatch_command(apply_command(
+        writer, [{"kind": "export", "inverter_id": "inv1", "request": "none"}]))
+    state = writer.authority.state
+    assert state is not None and not state.export_supervisions
+    native_transport.traffic.clear()
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [window_intent()], sequence=2))
+    assert (result.intents[0].outcome, result.intents[0].reason) == ("refused", "not_supervised")
+    assert export_writes(native_transport) == []
+
+
+async def test_a_reprobe_with_a_changed_identity_drops_the_bound(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    native_transport.set_input(35000, [0x2032])
+    await writer.async_reprobe("inv1")
+    state = writer.authority.state
+    assert state is not None and not state.export_supervisions
+
+
+async def test_supervision_waits_for_the_authority_lock(writer: SparkCoordinator) -> None:
+    import asyncio
+
+    await optimise(writer)
+    async with writer.control.lock:
+        task = asyncio.ensure_future(writer._async_dispatch_command(command(writer)))
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert not task.done()
+        state = writer.authority.state
+        assert state is not None and not state.export_supervisions
+    assert (await task).outcome == "applied"
