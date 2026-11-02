@@ -160,6 +160,9 @@ class NativeSlots:
             results.append(await self.clear_discharge())
         for address in (43153, 43163):
             results.append(await self.block(address, [0] * 8))
+        if all(r.outcome in ("applied", "unchanged") for r in results):
+            self.boundary.verified_windows[self.inverter.id] = (
+                self.epoch, tuple(charge + self.planned_discharge))
         # Whether the current stays counted is judged on the current alone.
         return (worst(results, written_a=current_result.written_a),
                 attempted and current_result.outcome != "refused")

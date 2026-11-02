@@ -6,7 +6,8 @@ New discovery reloads the entry, fencing off the old session's in-flight replies
 Authority and ownership storage load read-only; confirmed ownership selects the entity source.
 Authority loads before native startup reconciliation; legacy sites retain their mirror.
 The optional Solcast service device is registered only while its key is configured.
-A configured topology starts an independent supply guard; no native writer is attached.
+A configured topology starts an independent supply guard. Native protection
+reconciles durable holds independently of add-on liveness.
 """
 
 import logging
@@ -53,6 +54,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     async def native_tick(now: datetime) -> None:
         await coordinator.native.async_check_connections()
         coordinator.soc.observe(now)
+        if coordinator.control.startup_complete:
+            await coordinator.holds.async_reconcile(now)
         await coordinator.clock.async_tick(now)
         coordinator.async_update_listeners()
 

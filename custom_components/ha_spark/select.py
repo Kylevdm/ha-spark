@@ -1,10 +1,12 @@
-"""Protection-owned power select, gated before the #580 power adapter."""
+"""Protection-owned power select, gated, then written through #580's helper."""
 from homeassistant.components.select import SelectEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from . import SparkConfigEntry, native_power_seam
 from .coordinator import SparkCoordinator
+from .native_power import polled_power
 from .native_write_entities import WriteEntity
 from .topology import Inverter
 
@@ -25,8 +27,7 @@ class NativePower(WriteEntity, SelectEntity):
 
     @property
     def current_option(self) -> str | None:
-        words = self.words()
-        return {190: "on", 222: "off"}.get(words[0]) if words else None
+        return polled_power(self.coordinator.native, self.inverter, dt_util.utcnow())
 
     async def async_select_option(self, option: str) -> None:
         epoch = self.epoch()

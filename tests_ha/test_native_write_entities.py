@@ -188,12 +188,37 @@ async def test_entity_readback_failure(
         await NativeCurrent(writer, inverter, False).async_set_native_value(20)
 
 
-async def test_power_adapter_is_no_write(writer: SparkCoordinator) -> None:
-    from custom_components.ha_spark.native_power_seam import async_set_power_switch
-    state = writer.authority.state
-    assert state is not None
-    result = await async_set_power_switch(writer, "inv", True, epoch=state.epoch)
-    assert result.outcome == "refused" and result.reason == "not_available"
+@pytest.mark.parametrize(("value", "keep", "allowed"), [
+    ("observe", True, True), ("protect", True, False), ("optimise", True, False),
+    ("manual", True, False), ("manual", False, True),
+])
+async def test_power_select_writes_43007_only_when_permitted(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, value: str, keep: bool, allowed: bool,
+) -> None:
+    """The real select drives #580's helper: Off then On, verified, only where Q12 allows."""
+    from custom_components.ha_spark import native_power
+
+    async def sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(native_power, "verify_sleep", sleep)
+    await mode(writer, value, keep)
+    inverter = next(iter(writer.native.inverters.values()))
+    entity = NativePower(writer, inverter)
+    if not allowed:
+        with pytest.raises(ServiceValidationError):
+            await entity.async_select_option("off")
+        assert not [t for t in native_transport.traffic if t.op == "write"]
+        assert native_transport.holding[43007] == 190
+        return
+    await entity.async_select_option("off")
+    assert native_transport.holding[43007] == 222
+    assert entity.current_option == "off"
+    await entity.async_select_option("on")
+    assert native_transport.holding[43007] == 190
+    writes = [t for t in native_transport.traffic if t.op == "write"]
+    assert [t.address for t in writes] == [43007, 43007]
 
 
 async def test_registered_config_entities_and_service_state(
