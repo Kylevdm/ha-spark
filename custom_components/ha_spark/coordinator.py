@@ -4,7 +4,7 @@ Native authority is local only on integration-owned sites; the legacy mirror
 never grants local write permission. Ownership changes through the durable
 Observe-only handshake, not a snapshot grant. Unloading fences off replies
 from the previous discovery. Apply commands use the verified charge boundary;
-production guard and transition writers remain unattached.
+the production guard shares that boundary; transition writers remain unattached.
 """
 
 import logging
@@ -68,8 +68,10 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self.native = NativeDevices(
             hass, entry,
             owned=lambda: self.ownership.verified and self.ownership.owner == "integration",
-            overlay=lambda: (self.summary.legacy_overlay
-                             if self.connected and self.summary else None),
+            # The last accepted overlay report survives add-on liveness loss;
+            # local protection must keep working without the add-on. Every new
+            # accepted report still rechecks this fence, including a missing block.
+            overlay=lambda: self.summary.legacy_overlay if self.summary else None,
             changed=self.async_update_listeners,
         )
         self.clock = NativeClock(self)
@@ -81,6 +83,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self.solcast: SolcastCoordinator | None = None
         self.guard: SupplyGuardLoop | None = None
         self.writes = NativeChargeBoundary(self)
+        self.control.write_barrier = self.writes.async_barrier
         self.release_version = release_version
         self.api_version = max(wire.SUPPORTED_API_VERSIONS)
         self.addon_api_version: int | None = None
@@ -319,6 +322,13 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             return
         owner = self.ownership.owner if self.ownership.verified else "pending_integration"
         snapshot["authority_owner"] = owner
+        guard_block = snapshot.get("supply_guard")
+        if self.guard is not None and isinstance(guard_block, dict):
+            connections = guard_block.get("connections")
+            if isinstance(connections, list):
+                for connection in connections:
+                    if isinstance(connection, dict) and isinstance(connection.get("id"), str):
+                        connection["writer"] = self.guard.owns_connection(connection["id"])
         topology = validate_topology(self.entry.options.get("topology"))
         if isinstance(topology, Topology):
             devices: list[dict[str, object]] = []

@@ -6,7 +6,7 @@ verify_fresh_plan must consume a fresh plan from the current epoch, never a cach
 The writer must use the shared charge-write boundary and recheck ownership there.
 """
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, time, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -38,6 +38,8 @@ class AuthorityControl:
         self.entry = entry
         self.store = store
         self.writer: TransitionWriter | None = None
+        self.manual_started: Callable[[], Awaitable[None]] | None = None
+        self.write_barrier: Callable[[], Awaitable[None]] | None = None
         self.preconditions: Callable[[], Preconditions] = Preconditions
         self.lock = asyncio.Lock()
         self.grace_until: datetime | None = None
@@ -68,15 +70,20 @@ class AuthorityControl:
             if decision.state is None or decision.state == self.store.state:
                 return decision
             before = self.store.state
-            if self.writer is not None:
+            barrier = self.writer.async_barrier if self.writer is not None else self.write_barrier
+            if barrier is not None:
                 try:
-                    await self.writer.async_barrier()
+                    await barrier()
                 except Exception:
                     return TransitionDecision(refusal="transition_in_progress")
             if not self.owned() or self.store.state != before:
                 return TransitionDecision(refusal="authority_unknown")
             if not await self.store.async_save(decision.state):
                 return TransitionDecision(refusal="authority_unknown")
+            if (decision.state.manual_session is not None
+                    and (before is None or before.manual_session is None)
+                    and self.manual_started is not None):
+                await self.manual_started()
             if not (before is not None and before.manual_session is not None
                     and request.target in ("protect", "optimise")):
                 await self._advance(removal=removal)

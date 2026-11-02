@@ -1,4 +1,4 @@
-"""Final charge boundary for fake writers; no native hardware writer exists yet.
+"""Charge clamp shared by fake writers and the verified native boundary.
 
 AC allowance is converted to DC using each bank's one-way charge efficiency.
 Requests share the connection budget by power, then each bank's budget in
