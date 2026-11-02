@@ -121,7 +121,8 @@ async def test_refusals_never_write(
             deadline=None, return_to="optimise", keep_protection=True)}))
     elif fence == "fallback":
         await writer.authority.async_save(state.model_copy(update={
-            "fallback": state.fallback.model_copy(update={"active": True})}))
+            "fallback": state.fallback.model_copy(update={
+                "active": True, "causes": ("addon_liveness",)})}))
     elif fence == "transition":
         from datetime import UTC, datetime
 

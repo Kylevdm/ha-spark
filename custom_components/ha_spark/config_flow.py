@@ -44,6 +44,7 @@ from pydantic import BaseModel, ValidationError
 
 from . import native
 from .const import ADDON_SLUG, DOMAIN
+from .native_fallback import FallbackOptions, validate_fallback
 from .native_hold import SOURCES, EvidenceOptions
 from .soc_trust import Policy
 from .solcast import Outcome, async_list_sites
@@ -55,6 +56,7 @@ from .topology import (
     MajorLoad,
     Topology,
     V2LCharger,
+    effective_limits,
     validate_topology,
 )
 
@@ -328,7 +330,77 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
         if (isinstance(topology, Topology)
                 and any(i.transport == "native" for i in topology.inverters)):
             menu.append("evidence")
+            menu.append("fallback")
         return self.async_show_menu(step_id="init", menu_options=menu)
+
+    async def async_step_fallback(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Validate one cheap-window schedule with an explicit current per inverter."""
+        topology = validate_topology(self.config_entry.options.get("topology"))
+        native = ([i for i in topology.inverters if i.transport == "native"]
+                  if isinstance(topology, Topology) else [])
+        errors: dict[str, str] = {}
+        if not native or not isinstance(topology, Topology):
+            errors = {"base": "invalid_fallback"}
+        stored = self.config_entry.options.get("fallback")
+        try:
+            current = (FallbackOptions.model_validate(stored)
+                       if stored is not None else None)
+        except ValidationError:
+            current = None
+        if user_input is not None and native:
+            start = user_input.get("window_start")
+            end = user_input.get("window_end")
+            currents: dict[str, Any] = {}
+            for inverter in native:
+                value = user_input.get(f"current_{inverter.id}")
+                if value is not None and value != "":
+                    currents[inverter.id] = value
+            if not start and not end and not currents:
+                runtime = getattr(self.config_entry, "runtime_data", None)
+                state = runtime.authority.state if runtime is not None else None
+                if (state is None or state.committed_mode not in ("observe", "protect")
+                        or state.fallback.active or state.transition is not None):
+                    errors = {"base": "fallback_in_use"}
+                else:
+                    return self.async_create_entry(
+                        title="",
+                        data={key: value for key, value in self.config_entry.options.items()
+                              if key != "fallback"},
+                    )
+            if not errors and isinstance(topology, Topology):
+                try:
+                    options = FallbackOptions.model_validate({
+                        "window_start": start, "window_end": end,
+                        "currents": currents,
+                    })
+                except ValidationError:
+                    errors = {"base": "invalid_fallback"}
+                else:
+                    if isinstance(validate_fallback(
+                            options, topology, effective_limits(topology)), str):
+                        errors = {"base": "invalid_fallback"}
+                    else:
+                        return self.async_create_entry(title="", data={
+                            **self.config_entry.options,
+                            "fallback": options.model_dump(mode="json"),
+                        })
+        fields: dict[Any, Any] = {
+            probatio.Optional("window_start", default=(
+                current.window_start if current else "")): probatio.Match(
+                    r"^(?:[01]\d|2[0-3]):[0-5]\d$"),
+            probatio.Optional("window_end", default=(
+                current.window_end if current else "")): probatio.Match(
+                    r"^(?:[01]\d|2[0-3]):[0-5]\d$"),
+        }
+        for inverter in native:
+            fields[probatio.Optional(f"current_{inverter.id}", default=(
+                current.currents.get(inverter.id) if current else None))] = NumberSelector(
+                    NumberSelectorConfig(min=0, max=500, step=0.1,
+                                         mode=NumberSelectorMode.BOX))
+        return self.async_show_form(
+            step_id="fallback", data_schema=probatio.Schema(fields), errors=errors)
 
     async def async_step_evidence(
         self, user_input: dict[str, Any] | None = None,
@@ -1111,6 +1183,13 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
         if not isinstance(topology, Topology):
             return self.async_show_form(
                 step_id="save", errors={"base": "invalid_topology"},
+                data_schema=probatio.Schema({}),
+            )
+        fallback = self.config_entry.options.get("fallback")
+        if fallback is not None and isinstance(validate_fallback(
+                fallback, topology, effective_limits(topology)), str):
+            return self.async_show_form(
+                step_id="save", errors={"base": "fallback_invalidated"},
                 data_schema=probatio.Schema({}),
             )
         from .ownership import derived_owner

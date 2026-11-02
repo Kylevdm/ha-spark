@@ -39,6 +39,7 @@ from .commands import (
 from .const import DOMAIN
 from .native import NativeDevices
 from .native_clock import NativeClock
+from .native_fallback_control import NativeFallback
 from .native_holds import NativeHolds, NativeTransitionWriter
 from .native_power import polled_power
 from .native_soc import NativeSoc
@@ -85,12 +86,16 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             devices_validated=self._devices_validated(),
             evidence_configured=self.holds.evidence.configured,
             limits_confirmed=self._limits_confirmed(),
+            fallback_valid=self.fallback.valid(dt_util.utcnow()),
+            live_session=(self.connected
+                          and self.control.permits_non_protection(dt_util.utcnow())),
             soc_trusted=self.soc.all_trusted, soc_recovered=self.soc.recovered,
         )
         self.solcast: SolcastCoordinator | None = None
         self.guard: SupplyGuardLoop | None = None
         self.writes = NativeChargeBoundary(self)
         self.holds = NativeHolds(self)
+        self.fallback = NativeFallback(self)
         self.native.held_remapped = self.holds.remapped
         self.control.writer = NativeTransitionWriter(self)
         self.control.write_barrier = self.writes.async_barrier
@@ -245,6 +250,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
     def _expire(self, _now: datetime) -> None:
         self._cancel_deadline = None
         self.connected = False
+        self.fallback.liveness_lost()
         self.data = False
         self.async_update_listeners()
 
@@ -469,6 +475,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                 outcome = Outcome.FUTURE_TICK
         self.last_outcome = outcome
         self.last_outcome_at = now
+        self.fallback.observe_outcome(outcome, now)
         if outcome is Outcome.COUNTED:
             if self.control.owned() and summary is not None:
                 await self.control.async_new_session(summary.session_id, now=now)

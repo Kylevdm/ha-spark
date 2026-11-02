@@ -306,7 +306,10 @@
       "ownership_save_failed": "Ownership could not be saved and verified. All native writes remain blocked.",
       "remove_last": "The site needs at least one of these; it cannot be removed.",
       "connection_in_use": "Banks or major loads still use this connection.",
-      "bank_in_use": "Inverters or a V2L charger still use this bank."
+      "bank_in_use": "Inverters or a V2L charger still use this bank.",
+      "invalid_fallback": "Enter a cheap-window start and end on the household clock and a current for every native inverter within its limits.",
+      "fallback_in_use": "Fallback cannot be cleared while Optimise is committed or fallback is active.",
+      "fallback_invalidated": "This edit would invalidate the saved fallback schedule. Update or clear the fallback first."
     },
     "step": {
       "init": {
@@ -316,6 +319,7 @@
           "manual": "Manual control deadline",
           "soc": "Native SoC trust policy",
           "evidence": "Native protection evidence",
+          "fallback": "Native fallback schedule",
           "topology": "Site topology and limits"
         }
       },
@@ -340,6 +344,14 @@
           "dispatch_grid_power_entity": "Dispatch grid power (optional)",
           "dispatch_grid_power_max_age_s": "Dispatch grid power maximum age (seconds)",
           "dispatch_grid_invert": "Invert dispatch grid power"
+        }
+      },
+      "fallback": {
+        "title": "Native fallback schedule",
+        "description": "The fallback charges only in this cheap window, at these per-inverter currents, when a cause is active in Optimise. Leave every field empty to clear it only outside Optimise.",
+        "data": {
+          "window_start": "Window start (HH:MM)",
+          "window_end": "Window end (HH:MM)"
         }
       },
       "soc": {
