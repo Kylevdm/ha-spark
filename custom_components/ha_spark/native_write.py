@@ -7,7 +7,7 @@ Resident state is evidence only after exact read-back, never a requested value.
 """
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import datetime, time
 from typing import TYPE_CHECKING
 
 from homeassistant.util import dt as dt_util
@@ -25,6 +25,7 @@ from .commands import (
     WriteReason,
 )
 from .native_verify import confirm
+from .solis_frames import Reading
 from .solis_transport import Transport, valid_words
 from .topology import Inverter, effective_limits, validate_topology
 
@@ -43,6 +44,7 @@ class NativeChargeBoundary:
         self.coordinator = coordinator
         self.written_a: dict[str, float] = {}
         self.written_at: dict[str, datetime] = {}
+        self.verified_windows: dict[str, tuple[int, tuple[int, ...]]] = {}
 
     async def async_barrier(self) -> None:
         """Wait for complete read-back transactions, without aborting any write."""
@@ -83,6 +85,47 @@ class NativeChargeBoundary:
                 != guard.topology or guard.limits != effective_limits(guard.topology)):
             return "limits"
         return None
+
+    async def async_restoration_held(self, inverter: Inverter, *, epoch: int,
+                                      handover: bool = False) -> bool:
+        """Read-only hold-release seam; caller holds guard.lock then native.lock.
+
+        Protect/manual leave the owner's charging edits untouched. Ordinary
+        Optimise releases require the last fully verified window in this epoch.
+        Fallback restoration remains refused until its validated schedule seam
+        is supplied by the fallback controller.
+        """
+        c = self.coordinator
+        guard = c.guard
+        if (guard is None or not guard.boundary_open
+                or validate_topology(c.entry.options.get("topology")) != guard.topology
+                or guard.limits != effective_limits(guard.topology)):
+            return False
+        transport = c.native.transport(inverter)
+        connection_epoch = getattr(transport, "connection_epoch", 0)
+        read = await transport.read_holding(43141, 30, device_id=inverter.gateway_unit_id)
+        words = read.registers
+        if (read.error is not None or len(words) != 30 or not valid_words(words)
+                or words[0] > 625 or connection_epoch != getattr(transport, "connection_epoch", 0)):
+            return False
+        try:
+            time(words[2], words[3])
+            time(words[4], words[5])
+        except ValueError:
+            return False
+        state = c.authority.state
+        if state is None or state.epoch != epoch:
+            return False
+        if not handover and state.manual_session is None and state.committed_mode == "optimise":
+            if state.fallback.active or self.verified_windows.get(inverter.id) != (
+                    epoch, tuple(words[2:10])):
+                return False
+            if (self.written_a.get(inverter.id) != words[0] / 10
+                    or any(words[12:20] + words[22:30])):
+                return False
+        c.native.readings[inverter.id]["holding_43141"] = Reading(
+            dt_util.utcnow(), words, connection_epoch)
+        return True
 
     async def async_apply(self, command: Command) -> CommandResult:
         """Isolate intents and aggregate the worst positional result."""

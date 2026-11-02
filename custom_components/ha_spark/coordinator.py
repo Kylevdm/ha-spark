@@ -4,7 +4,7 @@ Native authority is local only on integration-owned sites; the legacy mirror
 never grants local write permission. Ownership changes through the durable
 Observe-only handshake, not a snapshot grant. Unloading fences off replies
 from the previous discovery. Apply commands use the verified charge boundary;
-the production guard shares that boundary; transition writers remain unattached.
+the production guard shares that boundary; native holds own protection steps.
 """
 
 import logging
@@ -39,6 +39,8 @@ from .commands import (
 from .const import DOMAIN
 from .native import NativeDevices
 from .native_clock import NativeClock
+from .native_holds import NativeHolds, NativeTransitionWriter
+from .native_power import polled_power
 from .native_soc import NativeSoc
 from .native_write import NativeChargeBoundary
 from .ownership import OwnershipStore
@@ -65,6 +67,9 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self.ownership = OwnershipStore(
             hass, entry.entry_id, self.authority, lambda: entry.options.get("topology"),
         )
+        self.control.owner_source = lambda: (
+            self.ownership.verified and not self.ownership.reconcile
+            and self.ownership.owner == "integration")
         self.native = NativeDevices(
             hass, entry,
             owned=lambda: self.ownership.verified and self.ownership.owner == "integration",
@@ -78,11 +83,16 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self.soc = NativeSoc(self)
         self.control.preconditions = lambda: Preconditions(
             devices_validated=self._devices_validated(),
+            evidence_configured=self.holds.evidence.configured,
+            limits_confirmed=self._limits_confirmed(),
             soc_trusted=self.soc.all_trusted, soc_recovered=self.soc.recovered,
         )
         self.solcast: SolcastCoordinator | None = None
         self.guard: SupplyGuardLoop | None = None
         self.writes = NativeChargeBoundary(self)
+        self.holds = NativeHolds(self)
+        self.native.held_remapped = self.holds.remapped
+        self.control.writer = NativeTransitionWriter(self)
         self.control.write_barrier = self.writes.async_barrier
         self.release_version = release_version
         self.api_version = max(wire.SUPPORTED_API_VERSIONS)
@@ -213,8 +223,13 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         topology = validate_topology(self.entry.options.get("topology"))
         return isinstance(topology, Topology) and bool(topology.inverters) and all(
             i.transport == "native" and self.native.reason(i) is None
+            and polled_power(self.native, i, dt_util.utcnow()) is not None
             for i in topology.inverters
         )
+
+    def _limits_confirmed(self) -> bool:
+        topology = validate_topology(self.entry.options.get("topology"))
+        return isinstance(topology, Topology) and all(i.confirmed for i in topology.inverters)
 
     async def async_reprobe(self, inverter_id: str) -> bool:
         """Native admin command seam; authentication belongs to the caller boundary."""
@@ -366,7 +381,13 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             "store_state": ("ok" if state else "save_failed"
                             if self.authority.status == "save_failed" else "unknown"),
         }
-        snapshot["holds"] = []
+        snapshot["holds"] = [{"cause": h.cause, "device_id": h.device.power_switch,
+                              "confirmed": h.confirmed,
+                              "trusted_end": h.trusted_end.isoformat() if h.trusted_end else None}
+                             for h in state.holds]
+        evidence = self.holds.evidence.options()
+        if evidence is not None and evidence.configured:
+            snapshot["evidence"] = evidence.snapshot()
         snapshot["banks"] = self.soc.snapshot()
 
     async def _async_update_data(self) -> bool:

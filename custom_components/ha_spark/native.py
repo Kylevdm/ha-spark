@@ -19,6 +19,7 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
+from .native_hold import hold_identity_valid
 from .solis_frames import Reading, Schedule
 from .solis_identity import caching_on, identity_reason
 from .solis_transport import PymodbusTcpTransport, Transport, TransportError, valid_words
@@ -76,6 +77,7 @@ class NativeDevices:
     ) -> None:
         self.hass, self.entry = hass, entry
         self.owned, self.overlay, self.changed = owned, overlay, changed
+        self.held_remapped: Callable[[], bool] = lambda: False
         topology = validate_topology(entry.options.get("topology"))
         self.inverters = {i.id: i for i in topology.inverters if i.transport == "native"} if (
             isinstance(topology, Topology)) else {}
@@ -121,6 +123,10 @@ class NativeDevices:
         )
 
     def reason(self, inverter: Inverter) -> str | None:
+        if not hold_identity_valid(inverter):
+            return "unvalidated_identity"
+        if self.held_remapped():
+            return "held_identity_remapped"
         if self.inverters.get(inverter.id) != inverter:
             # Options can change before their reload runs. Old probe evidence
             # never validates a new unit or gateway in that interval.
