@@ -38,6 +38,7 @@ from .commands import (
 )
 from .const import DOMAIN
 from .native import NativeDevices
+from .native_clock import NativeClock
 from .native_soc import NativeSoc
 from .native_write import NativeChargeBoundary
 from .ownership import OwnershipStore
@@ -71,6 +72,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                              if self.connected and self.summary else None),
             changed=self.async_update_listeners,
         )
+        self.clock = NativeClock(self)
         self.soc = NativeSoc(self)
         self.control.preconditions = lambda: Preconditions(
             devices_validated=self._devices_validated(),
@@ -119,6 +121,10 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             return await self.writes.async_apply(command)
         if not self.control.owned():
             return base.model_copy(update={"reason": "not_owner"})
+        if command.kind == "sync_clock":
+            result = await self.clock.async_command(command.epoch)
+            return result.model_copy(update={"session_id": command.session_id,
+                                             "sequence": command.sequence})
         if command.kind == "reprobe":
             # #574's admin seam: identity and caching reads only, no register writes.
             reprobe = ReprobePayload.model_validate(command.payload)

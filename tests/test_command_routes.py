@@ -205,3 +205,23 @@ async def test_native_status_keeps_the_health_and_mode_page_keys(tmp_path, monke
             shown = (await c.get("/api/mode")).json()
             assert set(shown["preconditions"]) == {"observe", "protect", "optimise"}
             assert isinstance(shown["holds"], list) and "failing_actions" in shown
+
+
+@respx.mock
+async def test_native_clock_reply_reports_verified_sync(channel, monkeypatch):
+    from ha_spark.api.commands import CommandResult
+    from ha_spark.daemon_channel import Request
+
+    state, _ = channel
+    monkeypatch.setattr(state, "native_status", lambda: {"mode": "observe", "epoch": 1})
+    respx.post(state.settings.ha_rest_url + "/services/ha_spark/commands_pending").mock(
+        return_value=httpx.Response(200, json=[]))
+
+    async def result(sequence):
+        return CommandResult(session_id="addon", sequence=sequence, outcome="applied")
+
+    monkeypatch.setattr(state.commands, "wait", result)
+    reply = await state.native_request(Request(op="sync_clock"), None)
+    assert reply is not None and reply.synced
+    assert len(reply.lines) == 1 and reply.lines[0].outcome == "verified"
+    assert state.commands.pending[1].kind == "sync_clock"
