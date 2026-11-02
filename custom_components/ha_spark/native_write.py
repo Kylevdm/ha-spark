@@ -204,15 +204,19 @@ class NativeChargeBoundary:
             return
         async with guard.lock:
             async with c.native.lock:
-                state = c.authority.state
-                if (state is None or state.epoch != epoch
+                def eligible() -> bool:
+                    state = c.authority.state
+                    return not (
+                        state is None or state.epoch != epoch
                         or state.committed_mode != "optimise"
                         or state.manual_session is not None or state.fallback.active
                         or state.transition is not None and state.transition.target != "optimise"
                         or not c.control.owned() or not c._running or not c.native.polling
-                        or c.native.closed):
-                    return
+                        or c.native.closed)
+
                 for inverter in c.native.inverters.values():
+                    if not eligible():
+                        return
                     if c.native.reason(inverter) is not None:
                         continue
                     transport = c.native.transport(inverter)
@@ -231,6 +235,11 @@ class NativeChargeBoundary:
                     except ValueError:
                         continue
                     if any(words[6:10] + words[12:20] + words[22:30]):
+                        continue
+                    # The read awaited: unloading or a mode change may have begun.
+                    if not eligible():
+                        return
+                    if c.native.reason(inverter) is not None:
                         continue
                     self.verified_windows[inverter.id] = (epoch, tuple(words[2:10]))
 
