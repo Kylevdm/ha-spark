@@ -56,6 +56,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
         coordinator.soc.observe(now)
         if coordinator.control.startup_complete:
             await coordinator.holds.async_reconcile(now)
+            await coordinator.fallback.async_evaluate(now)
         await coordinator.clock.async_tick(now)
         coordinator.async_update_listeners()
 

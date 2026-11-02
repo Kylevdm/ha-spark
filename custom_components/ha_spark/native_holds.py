@@ -412,6 +412,9 @@ class NativeTransitionWriter:
         if step == "release_holds":
             return await self.coordinator.holds.async_release_held(
                 dt_util.utcnow(), removal=removal)
+        if step in ("verify_fresh_plan", "write_fallback", "cancel_export"):
+            return await self.coordinator.fallback.async_step(
+                step, state, now=dt_util.utcnow())
         return False
 
     async def async_startup(self, stage: str) -> bool:

@@ -108,7 +108,8 @@ class SparkBinarySensor(SparkEntity, BinarySensorEntity):
                 return None
             key = self.entity_description.key
             if key == "fallback_active":
-                return {"causes": list(state.fallback.causes)}
+                return {"causes": list(state.fallback.causes),
+                        "in_force": self.coordinator.fallback.in_force()}
             if key == "ev_hold":
                 return {"cause": "ev"}
             ends = [hold.trusted_end for hold in state.holds

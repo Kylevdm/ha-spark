@@ -45,6 +45,13 @@ class NativeChargeBoundary:
         self.written_a: dict[str, float] = {}
         self.written_at: dict[str, datetime] = {}
         self.verified_windows: dict[str, tuple[int, tuple[int, ...]]] = {}
+        self.verified_fallback: dict[str, tuple[int, tuple[int, ...]]] = {}
+        self.last_apply: tuple[int, datetime, bool] | None = None
+
+    def plan_verified(self, epoch: int, *, since: datetime) -> bool:
+        """A freshly accepted plan in this epoch, judged on charge intents only."""
+        last = self.last_apply
+        return last is not None and last[0] == epoch and last[1] >= since and last[2]
 
     async def async_barrier(self) -> None:
         """Wait for complete read-back transactions, without aborting any write."""
@@ -59,7 +66,9 @@ class NativeChargeBoundary:
 
     def _refusal(self, inverter: Inverter, epoch: int, *,
                  guard_write: bool = False,
-                 entity_control: str | None = None) -> WriteReason | None:
+                 entity_control: str | None = None,
+                 fallback: bool = False,
+                 transition: bool = False) -> WriteReason | None:
         coordinator = self.coordinator
         state = coordinator.authority.state
         if state is None:
@@ -86,8 +95,25 @@ class NativeChargeBoundary:
             if (state.committed_mode not in ("protect", "optimise")
                     or state.transition is not None and state.transition.target == "observe"):
                 return "mode"
+        elif fallback:
+            # A fallback-schedule write is also the owner's starting schedule on
+            # the way out of Optimise; manual control never programs one.
+            if (state.committed_mode != "optimise" or state.manual_session is not None
+                    or state.transition is not None
+                    and state.transition.target not in ("optimise", "protect", "observe")):
+                return "mode"
+        elif transition:
+            # Transition-owned discharge cleanup, including manual start/fallback entry.
+            if (state.committed_mode != "optimise"
+                    or state.transition is None and not state.fallback.active):
+                return "mode"
+        elif state.fallback.active:
+            # A plan writes during fallback only while every cause has cleared.
+            if (state.fallback.causes or state.committed_mode != "optimise"
+                    or state.manual_session is not None
+                    or state.transition is not None and state.transition.target != "optimise"):
+                return "mode"
         elif (state.committed_mode != "optimise" or state.manual_session is not None
-              or state.fallback.active
               or state.transition is not None and state.transition.target != "optimise"):
             return "mode"
         # Unloading fences new writes the moment it starts, before native closes.
@@ -139,8 +165,12 @@ class NativeChargeBoundary:
         if state is None or state.epoch != epoch:
             return False
         if not handover and state.manual_session is None and state.committed_mode == "optimise":
-            if state.fallback.active or self.verified_windows.get(inverter.id) != (
-                    epoch, tuple(words[2:10])):
+            if state.fallback.active:
+                # Fallback restoration is read-only: the resident charge-only
+                # schedule must equal the last fully verified fallback apply.
+                if self.verified_fallback.get(inverter.id) != (epoch, tuple(words[2:10])):
+                    return False
+            elif self.verified_windows.get(inverter.id) != (epoch, tuple(words[2:10])):
                 return False
             if (self.written_a.get(inverter.id) != words[0] / 10
                     or any(words[12:20] + words[22:30])):
@@ -152,11 +182,13 @@ class NativeChargeBoundary:
     async def async_apply(self, command: Command) -> CommandResult:
         """Isolate intents and aggregate the worst positional result."""
         results: list[IntentResult] = []
+        kinds: list[str | None] = []
         for raw in ApplyPayload.model_validate(command.payload).intents:
             schemas: dict[str, type[ChargeCurrentLimit] | type[ChargeWindow] | type[ExportNone]] = {
                 "charge_current_limit": ChargeCurrentLimit, "charge_window": ChargeWindow,
                 "export": ExportNone}
             kind = raw.get("kind")
+            kinds.append(kind if isinstance(kind, str) else None)
             if not isinstance(kind, str) or kind not in schemas or (
                     kind == "export" and raw.get("request") != "none"):
                 results.append(IntentResult(outcome="refused", reason="not_available"))
@@ -172,10 +204,74 @@ class NativeChargeBoundary:
                 # Fixed outcomes only; a broken device cannot skip its peers.
                 self.written_a.pop(intent.inverter_id, None)
                 results.append(IntentResult(outcome="failed"))
+        charge = [result for kind, result in zip(kinds, results, strict=False)
+                  if kind in ("charge_current_limit", "charge_window")]
+        if charge:
+            self.last_apply = (command.epoch, dt_util.utcnow(), all(
+                result.outcome in ("applied", "unchanged") for result in charge))
         worst = max(results, key=lambda r: _SEVERITY.index(r.outcome)) if results else (
             IntentResult(outcome="refused", reason="invalid_intent"))
         return CommandResult(session_id=command.session_id, sequence=command.sequence,
                              outcome=worst.outcome, reason=worst.reason, intents=results)
+
+    async def async_fallback(self, inverter_id: str, *, current_a: float, start: str,
+                             end: str, epoch: int) -> IntentResult:
+        """Apply the validated fallback schedule through the one charge-write path."""
+        guard = self.coordinator.guard
+        if guard is None:
+            return IntentResult(outcome="refused", reason="limits")
+        request = ChargeWindow(kind="charge_window", inverter_id=inverter_id,
+                               current_a=current_a, start=start, end=end)
+        mismatches: set[str] = set()
+        try:
+            async with guard.lock:
+                async with self.coordinator.native.lock:
+                    inverter = next((i for i in guard.topology.inverters
+                                     if i.id == inverter_id), None)
+                    if inverter is None:
+                        return IntentResult(outcome="refused", reason="limits")
+                    reason = self._refusal(inverter, epoch, fallback=True)
+                    if reason is not None:
+                        return IntentResult(outcome="refused", reason=reason)
+                    from .native_slots import NativeSlots
+
+                    slots = NativeSlots(self, inverter, epoch, mismatches, fallback=True)
+                    previous = guard.request_current(inverter.id, request.current_a)
+                    try:
+                        result, keep = await slots.window(guard, request, soc_required=False)
+                    except BaseException:
+                        self._restore(guard, inverter.id, previous)
+                        raise
+                    if not keep:
+                        self._restore(guard, inverter.id, previous)
+                    return result
+        finally:
+            for mismatched in mismatches:
+                await self.coordinator.native.async_readback_mismatch(mismatched)
+
+    async def async_cancel_export(self, inverter_id: str, *, epoch: int) -> IntentResult:
+        """Clear the discharge half under a transition's own write policy."""
+        guard = self.coordinator.guard
+        if guard is None:
+            return IntentResult(outcome="refused", reason="limits")
+        mismatches: set[str] = set()
+        try:
+            async with guard.lock:
+                async with self.coordinator.native.lock:
+                    inverter = next((i for i in guard.topology.inverters
+                                     if i.id == inverter_id), None)
+                    if inverter is None:
+                        return IntentResult(outcome="refused", reason="limits")
+                    reason = self._refusal(inverter, epoch, transition=True)
+                    if reason is not None:
+                        return IntentResult(outcome="refused", reason=reason)
+                    from .native_slots import NativeSlots
+
+                    slots = NativeSlots(self, inverter, epoch, mismatches, transition=True)
+                    return await slots.clear_discharge()
+        finally:
+            for mismatched in mismatches:
+                await self.coordinator.native.async_readback_mismatch(mismatched)
 
     async def async_write(self, intent: DeviceIntent) -> None:
         """Plan-only ChargeWriter seam; guard callers use the locked entry."""
@@ -385,10 +481,13 @@ class NativeChargeBoundary:
 
     async def _async_commit(self, inverter: Inverter, current: float, epoch: int,
                             mismatches: set[str], *, soc_required: bool = False,
+                            soc_exempt: bool = False,
                             guard_write: bool = False, lower_only: bool = False,
+                            fallback: bool = False, transition: bool = False,
                             entity_control: str | None = None) -> IntentResult:
         transport = self.coordinator.native.transport(inverter)
         reason = self._refusal(inverter, epoch, guard_write=guard_write,
+                               fallback=fallback, transition=transition,
                                entity_control=entity_control)
         if reason is not None:
             return IntentResult(outcome="refused", reason=reason)
@@ -406,8 +505,8 @@ class NativeChargeBoundary:
         target = int(current) * 10
         def untrusted() -> bool:
             soc = getattr(self.coordinator, "soc", None)
-            return (target > resident or soc_required) and (
-                soc is None or not soc.increases_allowed(inverter.bank_id))
+            return (not soc_exempt and (target > resident or soc_required)
+                    and (soc is None or not soc.increases_allowed(inverter.bank_id)))
 
         if untrusted():
             return IntentResult(outcome="refused", reason="untrusted_soc")
@@ -432,6 +531,7 @@ class NativeChargeBoundary:
             # Every await above may have revoked authority or changed limits.
             # No await sits between this recheck and the write.
             reason = self._refusal(inverter, epoch, guard_write=guard_write,
+                                   fallback=fallback, transition=transition,
                                    entity_control=entity_control)
             if reason is not None:
                 return IntentResult(outcome="refused", reason=reason)

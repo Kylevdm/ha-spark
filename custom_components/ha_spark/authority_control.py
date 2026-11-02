@@ -185,14 +185,18 @@ class AuthorityControl:
     async def async_fallback(self, fallback: FallbackState, *, now: datetime) -> bool:
         """Called by the fallback evaluator; changes to causes alone do not bump epoch."""
         async with self.lock:
-            state = self.store.state
-            if not self.owned() or state is None:
-                return False
-            return await self.store.async_save(state.model_copy(update={
-                "fallback": fallback,
-                "epoch": state.epoch + int(fallback.active != state.fallback.active),
-                "last_changed_at": now,
-            }))
+            return await self.async_fallback_held(fallback, now=now)
+
+    async def async_fallback_held(self, fallback: FallbackState, *, now: datetime) -> bool:
+        """The same save for a caller already holding the authority lock."""
+        state = self.store.state
+        if not self.owned() or state is None:
+            return False
+        return await self.store.async_save(state.model_copy(update={
+            "fallback": fallback,
+            "epoch": state.epoch + int(fallback.active != state.fallback.active),
+            "last_changed_at": now,
+        }))
 
     async def async_new_session(self, session_id: str, *, now: datetime) -> bool:
         async with self.lock:

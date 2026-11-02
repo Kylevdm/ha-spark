@@ -137,7 +137,7 @@ async def test_activation_clears_unknown_discharge_but_fences_never_write(
         monkeypatch.setattr(writer.native, "reason", lambda inv: "gateway_not_owned")
     elif mode == "fallback":
         state = state.model_copy(update={"fallback": state.fallback.model_copy(
-            update={"active": True})})
+            update={"active": True, "causes": ("addon_liveness",)})})
     if mode != "unknown":
         assert await writer.authority.async_save(state)
     native_transport.set_holding(43143, [0, 0, 0, 0, 10, 0, 12, 0])

@@ -27,12 +27,15 @@ class NativeSlots:
 
     def __init__(self, boundary: "NativeChargeBoundary", inverter: Inverter,
                  epoch: int, mismatches: set[str], *,
-                 planned_discharge: list[int] | None = None) -> None:
+                 planned_discharge: list[int] | None = None,
+                 fallback: bool = False, transition: bool = False) -> None:
         self.boundary = boundary
         self.inverter = inverter
         self.epoch = epoch
         self.mismatches = mismatches
         self.planned_discharge = planned_discharge or [0] * 4
+        self.fallback = fallback
+        self.transition = transition
         # A charge window needs trusted SoC for every write, whatever its direction.
         self.soc_required = False
 
@@ -68,7 +71,9 @@ class NativeSlots:
                 return IntentResult(outcome="unverified")
         if self.soc_required and self.soc_untrusted():
             return IntentResult(outcome="refused", reason="untrusted_soc")
-        reason = self.boundary._refusal(self.inverter, self.epoch)
+        reason = self.boundary._refusal(self.inverter, self.epoch,
+                                        fallback=self.fallback,
+                                        transition=self.transition)
         if reason is not None:
             return IntentResult(outcome="refused", reason=reason)
         result = await self.boundary.coordinator.native.transport(self.inverter).write(
@@ -115,12 +120,13 @@ class NativeSlots:
                 return await self.block(43143, [0] * 4 + keep)
         return IntentResult(outcome="unchanged")
 
-    async def window(self, guard: "SupplyGuardLoop", request: ChargeWindow
+    async def window(self, guard: "SupplyGuardLoop", request: ChargeWindow,
+                     *, soc_required: bool = True
                      ) -> tuple[IntentResult, bool]:
         if request.start == request.end:
             return IntentResult(outcome="refused", reason="invalid_intent"), False
-        self.soc_required = True
-        if self.soc_untrusted():
+        self.soc_required = soc_required
+        if soc_required and self.soc_untrusted():
             return IntentResult(outcome="refused", reason="untrusted_soc"), False
         transport = self.boundary.coordinator.native.transport(self.inverter)
         permission = await self.boundary._read(transport, self.inverter, input_=True)
@@ -133,8 +139,10 @@ class NativeSlots:
                 if device.id != self.inverter.id:
                     # A peer rebalance is a plain current change (#576): its own
                     # Slot 1 schedule is never zeroed by another inverter's window.
-                    return await self.boundary._async_commit(device, current, self.epoch,
-                                                              self.mismatches)
+                    return await self.boundary._async_commit(
+                        device, current, self.epoch, self.mismatches,
+                        fallback=self.fallback, transition=self.transition,
+                        soc_exempt=self.fallback)
                 device_transport = self.boundary.coordinator.native.transport(device)
                 allowed = await self.boundary._read(device_transport, device, input_=True)
                 if allowed is None or not allowed & 32:
@@ -144,8 +152,10 @@ class NativeSlots:
                 if preparation.outcome not in ("applied", "unchanged"):
                     return preparation
                 attempted = True
-                return await self.boundary._async_commit(device, current, self.epoch,
-                                                          self.mismatches, soc_required=True)
+                return await self.boundary._async_commit(
+                    device, current, self.epoch, self.mismatches,
+                    soc_required=self.soc_required, soc_exempt=self.fallback,
+                    fallback=self.fallback, transition=self.transition)
 
             current_result, _ = await self.boundary._async_transaction(
                 guard, self.inverter, ChargeCurrentLimit(kind="charge_current_limit",
@@ -161,8 +171,11 @@ class NativeSlots:
         for address in (43153, 43163):
             results.append(await self.block(address, [0] * 8))
         if all(r.outcome in ("applied", "unchanged") for r in results):
-            self.boundary.verified_windows[self.inverter.id] = (
-                self.epoch, tuple(charge + self.planned_discharge))
+            block = tuple(charge + self.planned_discharge)
+            if self.fallback:
+                self.boundary.verified_fallback[self.inverter.id] = (self.epoch, block)
+            else:
+                self.boundary.verified_windows[self.inverter.id] = (self.epoch, block)
         # Whether the current stays counted is judged on the current alone.
         return (worst(results, written_a=current_result.written_a),
                 attempted and current_result.outcome != "refused")
