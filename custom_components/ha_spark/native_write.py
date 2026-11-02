@@ -1,11 +1,12 @@
 """One serialised, clamped and verified native charge-current boundary.
 
 Lock order is guard then native bus. No caller-supplied SoC exemption exists.
-Only plan current limits are enabled here; fallback, protection and entity
+Plan current limits and charge windows are enabled here; fallback, protection and entity
 callers must acquire their own authority policy before being enabled later.
 Resident state is evidence only after exact read-back, never a requested value.
 """
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
@@ -14,11 +15,14 @@ from .clamp import DeviceIntent, clamp_intent
 from .commands import (
     ApplyPayload,
     ChargeCurrentLimit,
+    ChargeWindow,
     Command,
     CommandResult,
+    ExportNone,
     IntentResult,
     WriteReason,
 )
+from .native_verify import confirm
 from .solis_transport import Transport, valid_words
 from .topology import Inverter, effective_limits, validate_topology
 
@@ -76,11 +80,16 @@ class NativeChargeBoundary:
         """Isolate intents and aggregate the worst positional result."""
         results: list[IntentResult] = []
         for raw in ApplyPayload.model_validate(command.payload).intents:
-            if raw.get("kind") != "charge_current_limit":
+            schemas: dict[str, type[ChargeCurrentLimit] | type[ChargeWindow] | type[ExportNone]] = {
+                "charge_current_limit": ChargeCurrentLimit, "charge_window": ChargeWindow,
+                "export": ExportNone}
+            kind = raw.get("kind")
+            if not isinstance(kind, str) or kind not in schemas or (
+                    kind == "export" and raw.get("request") != "none"):
                 results.append(IntentResult(outcome="refused", reason="not_available"))
                 continue
             try:
-                intent = ChargeCurrentLimit.model_validate(raw)
+                intent = schemas[kind].model_validate(raw)
             except ValidationError:
                 results.append(IntentResult(outcome="refused", reason="invalid_intent"))
                 continue
@@ -103,7 +112,8 @@ class NativeChargeBoundary:
                 kind="charge_current_limit", inverter_id=intent.inverter_id,
                 current_a=intent.charge_a), epoch=state.epoch)
 
-    async def async_current(self, request: ChargeCurrentLimit, *, epoch: int) -> IntentResult:
+    async def async_current(self, request: ChargeCurrentLimit | ChargeWindow | ExportNone,
+                            *, epoch: int) -> IntentResult:
         guard = self.coordinator.guard
         if guard is None:
             return IntentResult(outcome="refused", reason="limits")
@@ -116,31 +126,50 @@ class NativeChargeBoundary:
             for inverter_id in mismatches:
                 await self.coordinator.native.async_readback_mismatch(inverter_id)
 
-    async def _async_locked(self, guard: "SupplyGuardLoop", request: ChargeCurrentLimit,
+    async def _async_locked(self, guard: "SupplyGuardLoop",
+                            request: ChargeCurrentLimit | ChargeWindow | ExportNone,
                             epoch: int, mismatches: set[str]) -> IntentResult:
+        # The only place the boundary takes its locks, guard then native bus.
         async with guard.lock:
             async with self.coordinator.native.lock:
-                inverter = next((i for i in guard.topology.inverters
-                                 if i.id == request.inverter_id), None)
-                if inverter is None:
-                    return IntentResult(outcome="refused", reason="limits")
-                reason = self._refusal(inverter, epoch)
-                if reason is not None:
-                    return IntentResult(outcome="refused", reason=reason)
-                previous = guard.last_requested_a.get(inverter.id)
-                guard.last_requested_a[inverter.id] = request.current_a
-                try:
-                    result, attempted = await self._async_transaction(
-                        guard, inverter, request, epoch, mismatches)
-                except BaseException:
-                    self._restore(guard, inverter.id, previous)
-                    raise
-                if not attempted or result.outcome == "refused":
-                    # A request refused or never attempted must not become a latent
-                    # peer request for a later command. Failed and unverified ones
-                    # stay counted: their resident current is unknown.
-                    self._restore(guard, inverter.id, previous)
-                return result
+                return await self._async_held(guard, request, epoch, mismatches)
+
+    async def _async_held(self, guard: "SupplyGuardLoop",
+                          request: ChargeCurrentLimit | ChargeWindow | ExportNone,
+                          epoch: int, mismatches: set[str]) -> IntentResult:
+        """The whole intent; the caller holds guard.lock then native.lock."""
+        inverter = next((i for i in guard.topology.inverters
+                         if i.id == request.inverter_id), None)
+        if inverter is None:
+            return IntentResult(outcome="refused", reason="limits")
+        reason = self._refusal(inverter, epoch)
+        if reason is not None:
+            return IntentResult(outcome="refused", reason=reason)
+        from .native_slots import NativeSlots
+
+        slots = NativeSlots(self, inverter, epoch, mismatches)
+        if isinstance(request, ExportNone):
+            return await slots.clear_discharge()
+        previous = guard.last_requested_a.get(inverter.id)
+        guard.last_requested_a[inverter.id] = request.current_a
+        try:
+            if isinstance(request, ChargeWindow):
+                # Judged on the current alone: a later slot refusal must not
+                # uncount a current already written.
+                result, keep = await slots.window(guard, request)
+            else:
+                result, attempted = await self._async_transaction(
+                    guard, inverter, request, epoch, mismatches)
+                keep = attempted and result.outcome != "refused"
+        except BaseException:
+            self._restore(guard, inverter.id, previous)
+            raise
+        if not keep:
+            # A request refused or never attempted must not become a latent
+            # peer request for a later command. Failed and unverified ones
+            # stay counted: their resident current is unknown.
+            self._restore(guard, inverter.id, previous)
+        return result
 
     @staticmethod
     def _restore(guard: "SupplyGuardLoop", inverter_id: str, previous: float | None) -> None:
@@ -151,7 +180,9 @@ class NativeChargeBoundary:
 
     async def _async_transaction(self, guard: "SupplyGuardLoop", inverter: Inverter,
                                  request: ChargeCurrentLimit, epoch: int,
-                                 mismatches: set[str]) -> tuple[IntentResult, bool]:
+                                 mismatches: set[str], *,
+                                 commit: Callable[[Inverter, float], Awaitable[IntentResult]] | None
+                                 = None) -> tuple[IntentResult, bool]:
         """The requested device's result, and whether its write was attempted."""
         banks = {b.id: b for b in guard.topology.banks}
         connection = banks[inverter.bank_id].connection_id
@@ -185,7 +216,8 @@ class NativeChargeBoundary:
         planned.sort(key=lambda item: item[1] >= residents.get(item[0].id, 0))
         requested_result: IntentResult | None = None
         for device, current in planned:
-            result = await self._async_commit(device, current, epoch, mismatches)
+            result = (await commit(device, current) if commit is not None else
+                      await self._async_commit(device, current, epoch, mismatches))
             if device.id == request.inverter_id:
                 requested_result = result
             # A failed peer reduction must never be followed by an increase.
@@ -213,7 +245,7 @@ class NativeChargeBoundary:
         return result.registers[0]
 
     async def _async_commit(self, inverter: Inverter, current: float, epoch: int,
-                            mismatches: set[str]) -> IntentResult:
+                            mismatches: set[str], *, soc_required: bool = False) -> IntentResult:
         transport = self.coordinator.native.transport(inverter)
         reason = self._refusal(inverter, epoch)
         if reason is not None:
@@ -228,34 +260,42 @@ class NativeChargeBoundary:
             self.written_a.pop(inverter.id, None)
             return IntentResult(outcome="failed")
         target = int(current) * 10
-        soc = getattr(self.coordinator, "soc", None)
-        if target > resident and (soc is None or not soc.increases_allowed(inverter.bank_id)):
+        def untrusted() -> bool:
+            soc = getattr(self.coordinator, "soc", None)
+            return (target > resident or soc_required) and (
+                soc is None or not soc.increases_allowed(inverter.bank_id))
+
+        if untrusted():
             return IntentResult(outcome="refused", reason="untrusted_soc")
+
+        async def read() -> list[int] | None:
+            value = await self._read(transport, inverter)
+            return [value] if value is not None else None
+
+        def mismatch() -> None:
+            mismatches.add(inverter.id)
+
         changed = resident != target
+        if not changed and target == 0:
+            # A transient zero must not skip the correcting write.
+            changed = not await confirm([target], read, verify_sleep, changed=False,
+                                        mismatch=mismatch)
+            if not changed:
+                self.written_a[inverter.id] = current
+                return IntentResult(outcome="unchanged", written_a=current)
         if changed:
             # Every await above may have revoked authority or changed limits.
             # No await sits between this recheck and the write.
             reason = self._refusal(inverter, epoch)
             if reason is not None:
                 return IntentResult(outcome="refused", reason=reason)
+            if untrusted():
+                return IntentResult(outcome="refused", reason="untrusted_soc")
             self.written_a.pop(inverter.id, None)
             result = await transport.write(43141, [target], device_id=inverter.gateway_unit_id)
             if not result.ok:
                 return IntentResult(outcome="failed")
-        verified = False
-        for attempt in range(3):
-            if changed or attempt:
-                await verify_sleep(1)
-            if await self._read(transport, inverter) == target:
-                verified = True
-                break
-            mismatches.add(inverter.id)
-        if verified and target == 0:
-            for _ in range(5):
-                await verify_sleep(1)
-                if await self._read(transport, inverter) != 0:
-                    verified = False
-                    break
+        verified = await confirm([target], read, verify_sleep, changed=changed, mismatch=mismatch)
         if not verified:
             self.written_a.pop(inverter.id, None)
             mismatches.add(inverter.id)

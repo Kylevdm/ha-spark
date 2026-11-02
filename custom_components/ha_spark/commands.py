@@ -93,6 +93,20 @@ class ChargeCurrentLimit(Record):
     current_a: float = Field(ge=0, le=62.5)
 
 
+class ChargeWindow(Record):
+    kind: Literal["charge_window"]
+    inverter_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    current_a: float = Field(ge=0, le=62.5)
+    start: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    end: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+
+
+class ExportNone(Record):
+    kind: Literal["export"]
+    inverter_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    request: Literal["none"]
+
+
 class CommandResult(Record):
     session_id: str = Field(min_length=1, max_length=128)
     sequence: int = Field(ge=1)
