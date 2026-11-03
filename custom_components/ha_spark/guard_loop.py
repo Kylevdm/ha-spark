@@ -9,6 +9,7 @@ Both subscriptions are required. Positive grid watts mean import.
 Legacy sites use the summary for warn-only display. Native sites use durable
 local authority and the one charge-write boundary. Persisted cuts are ceilings,
 never restore targets; only fresh owner or plan requests permit restoration.
+The export tripwire shares each connection's grid reading but never changes a guard rule.
 """
 
 import asyncio
@@ -496,6 +497,11 @@ class SupplyGuardLoop:
                     for b in banks for i in inverters if i.bank_id == b.id
                 )
                 power, reported = read(connection.grid_power_entity)
+                if self.coordinator.tripwire.observe(connection.id, power, reported, now):
+                    # The trip takes control.lock first: never await it under guard.lock.
+                    self.entry.async_create_background_task(
+                        self.hass, self.coordinator.tripwire.async_trip(connection.id, now),
+                        "Export tripwire")
                 limit = next(c for c in self.limits.connections if c.id == connection.id)
                 state, decision = step(self.states[connection.id], GuardInputs(
                     limit_kw=limit.import_kw, requested_kw=requested, reserve_kw=reserve,
