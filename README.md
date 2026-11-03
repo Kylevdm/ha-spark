@@ -78,6 +78,19 @@ them.
 >   the add-on plans from the integration's P10/P50/P90 forecast. Sites without
 >   native Solcast keep the legacy `solar_today_entity` and
 >   `solar_tomorrow_entity` settings.
+> - site topology and shared limits (0.30.0). The integration's **Options**
+>   records grid connections, battery banks, inverters, a V2L charger and
+>   major loads; plans and charge commands use one set of effective limits,
+>   and major loads reserve supply room in every slot.
+>
+> Where the programme stands (2026-11-03): phases 1–7 of v1 have shipped
+> (0.23.0–0.30.0). Phase 8, the integration's own Solis Modbus module with
+> supervised native export, is on its integration branch
+> ([#591](https://github.com/Kylevdm/ha-spark/pull/591)) with 22 of 27
+> tickets merged and ships as 0.31.0. The reference household runs 0.29.1 in
+> Observe on the legacy overlay driver; it moves onto the native module in
+> phase 9. [`docs/human-next-steps.md`](docs/human-next-steps.md) is the
+> owner's ordered list of the hands-on steps.
 >
 > Axle export completed its first paid export on real hardware on 2026-10-05
 > ([#134](https://github.com/Kylevdm/ha-spark/issues/134)). It stays a
@@ -194,8 +207,12 @@ UI ([#247](https://github.com/Kylevdm/ha-spark/issues/247)). It adds:
   override, and settings, giving every owner task a home in the UI
   ([CLI parity](https://github.com/Kylevdm/ha-spark/issues/364#issuecomment-6241994831));
 - a companion HACS integration, now shipping read-only plan sensors,
-  mirrors of the add-on's mode, fallback and holds, and its own Solcast client
-  (0.29.0). In later v1 phases it takes over Solis and AlphaESS control; sites
+  mirrors of the add-on's mode, fallback and holds, its own Solcast client
+  (0.29.0) and the site topology and limits (0.30.0). Phase 8 (0.31.0) gives it
+  its own Solis Modbus module, a durable authority store and a command channel,
+  so a site whose inverters are all native is integration-owned and the add-on
+  writes no hardware there; phase 9 moves the reference household across.
+  AlphaESS control stays in the add-on until its native module (1.0.x). Sites
   without native Solcast keep the legacy forecast entity settings. The add-on
   keeps the planner and the UI; the integration makes no planning decisions
   ([ADR 0005](docs/adr/0005-integration-authority-and-operating-modes.md));
@@ -217,7 +234,12 @@ The morning plan digest is still open. The readiness signal
 and tells you when the evidence supports Optimise; it never changes the mode. `1.0.0`
 ships once every item in the
 [release gate](docs/releasing.md#v100-release-gate) is confirmed on real
-hardware.
+hardware. The build is sequenced into 18 phases
+([#366](https://github.com/Kylevdm/ha-spark/issues/366), one
+[milestone](https://github.com/Kylevdm/ha-spark/milestones) each): after phase
+8 come the household cutover (9), onboarding and settings (10, 11), the
+statistics ledger (12), chat (13), the API for other apps (14), Solis parity
+(16), daytime cheap and free charging (17) and per-bank planning (18).
 
 ## Design rules
 
