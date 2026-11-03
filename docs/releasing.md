@@ -82,10 +82,12 @@ every item below must be confirmed on real hardware or live suppliers.
 
 ### Safety (automatic control; must never regress)
 
-These gates cover add-on automatic control and its UI/CLI actions. In phase 2
-only the daemon actuates, through the site operating mode and write-time gate.
-Integration-owned control and temporary manual handover arrive in later phases;
-no bypass is granted here.
+These gates cover automatic control and its UI/CLI actions under the site's
+authority owner. On an add-on-owned site only the daemon actuates, through the
+site operating mode and write-time gate. On an integration-owned site (phase 8)
+the add-on writes no hardware; the integration's authority store and its one
+charge-write path hold the same gates, and temporary manual control is
+available there. No bypass is granted either way.
 
 - [ ] Observe (the new-install and legacy-upgrade default) computes a plan, logs `[SIMULATE]`
       action lines, and makes **zero** hardware-actuating calls, including on shutdown.
