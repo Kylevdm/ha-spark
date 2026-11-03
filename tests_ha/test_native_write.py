@@ -89,7 +89,7 @@ async def test_current_result(
 @pytest.mark.parametrize("fence", [
     "observe", "protect", "unknown", "save_failed", "pending", "read_only", "epoch",
     "manual", "fallback", "transition", "soc", "permission", "exemption", "no_guard",
-    "guard_save_failed",
+    "guard_save_failed", "grace",
 ])
 async def test_refusals_never_write(
     writer: SparkCoordinator, native_transport: FakeSolisDevice,
@@ -145,6 +145,13 @@ async def test_refusals_never_write(
         assert writer.guard is not None
         monkeypatch.setattr(writer.guard, "_save_failed", True)
         reason = "limits"
+    elif fence == "grace":
+        # Only protection writes run in the startup grace; a plan apply waits it out.
+        from datetime import timedelta
+
+        from homeassistant.util import dt as dt_util
+        writer.control.grace_until = dt_util.utcnow() + timedelta(minutes=2)
+        reason = "not_available"
     result = await writer._async_dispatch_command(request)
     assert result.outcome == "refused"
     assert result.reason == reason
