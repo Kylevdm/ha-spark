@@ -65,8 +65,10 @@ deleted on 2026-10-18, so those names are free for the real release
 candidates. No unchecked item is claimed as validated.
 
 [#366](https://github.com/Kylevdm/ha-spark/issues/366#issuecomment-6253526844)
-sequences the build into 16 phases (#376–#391, one milestone each). Each ships
-as a `0.y.x` minor, and each phase issue lists the gate items it must pass in
+sequences the build into 18 phases, one milestone each: #376–#391, phase 17
+(#592) and phase 18 (#593), added by the #366 amendments of 2026-10-30 and
+2026-11-02; phase 15 is folded into phase 14 as its last ticket. Each ships as
+a `0.y.x` minor, and each phase issue lists the gate items it must pass in
 tests. Then:
 
 - **`1.0.0-rc1`** (tag `v1.0.0-rc1`): every phase shipped, ruff, mypy and
