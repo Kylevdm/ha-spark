@@ -80,7 +80,11 @@ security and prefer the safe default. Hard rules:
     supervision.
 
   Under either authority owner, Observe, unknown authority and a failed
-  authority save write nothing; Protect writes only its holds (and enabled
+  authority save write nothing, with one exception: on an integration-owned
+  site an explicit owner clock sync (the `sync_clock` command or the
+  clock-drift repair's fix flow) may write in Observe or a manual session, but
+  never with unknown authority, a stale epoch or a transition in progress
+  (`native_clock.py`); Protect writes only its holds (and enabled
   clock sync), plus, on an integration-owned site, supply-guard cuts and
   restores and the fallback schedule written as the owner's starting schedule
   when leaving Optimise; Optimise runs the plan. An invalid SoC blocks every SoC-derived write;

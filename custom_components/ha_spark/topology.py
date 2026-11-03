@@ -16,6 +16,9 @@ from typing import Annotated, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 SafeId = Annotated[str, Field(strict=True, pattern=r"^[A-Za-z0-9_-]{1,64}$")]
+
+# One-way battery charge efficiency assumed when a bank doesn't set its own (#566).
+DEFAULT_ONE_WAY_CHARGE_EFFICIENCY = 0.949
 EntityId = Annotated[str, Field(strict=True, pattern=r"^[a-z0-9_]+\.[a-z0-9_]+$", max_length=255)]
 Current = Annotated[float, Field(strict=True, ge=0, le=500, allow_inf_nan=False)]
 SupplyCurrent = Annotated[float, Field(strict=True, ge=0, le=200, allow_inf_nan=False)]
@@ -50,7 +53,7 @@ class BatteryBank(FrozenModel):
     nominal_voltage_v: Annotated[float, Field(strict=True, ge=12, le=1000, allow_inf_nan=False)]
     one_way_charge_efficiency: Annotated[
         float, Field(strict=True, gt=0, le=1, allow_inf_nan=False)
-    ] = 0.949
+    ] = DEFAULT_ONE_WAY_CHARGE_EFFICIENCY
     min_soc: Percent
     target_cap: Percent
     charge_limit_a: Current = 0

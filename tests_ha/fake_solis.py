@@ -62,6 +62,7 @@ class FakeSolisDevice:
         self.elapsed_overrides: deque[float] = deque()
         self.cached_elapsed_s = 0.001
         self.connected = True
+        self.connection_epoch = 0
         self.traffic: list[Traffic] = []
         self.drift: dict[int, int] = {}
         self.spurious_zeros: set[tuple[Bank, int, int]] = set()

@@ -1,6 +1,7 @@
 """Native validation at config-entry, snapshot and fake-register seams."""
 
 from copy import deepcopy
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -64,6 +65,10 @@ async def native_entry(
     assert owner.owner == "integration"
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
+    # Plan writes wait out the startup grace; these tests start past it.
+    control = entry.runtime_data.control
+    if control.grace_until is not None:
+        control.grace_until = dt_util.utcnow() - timedelta(seconds=1)
     return entry
 
 
@@ -182,7 +187,7 @@ async def test_claim_loss_reconnect_and_protect_refusal(
     entry = await native_entry(hass, aioclient_mock)
     assert (await devices(entry, aioclient_mock))[0]["validation"] == "validated"
     # A new connection invalidates identity even before the reconnect check runs.
-    monkeypatch.setattr(native_transport, "connection_epoch", 1, raising=False)
+    monkeypatch.setattr(native_transport, "connection_epoch", 1)
     assert (await devices(entry, aioclient_mock))[0]["reason"] == "unvalidated_identity"
     await entry.runtime_data.native.async_check_connections()
     assert (await devices(entry, aioclient_mock))[0]["validation"] == "validated"
@@ -296,7 +301,7 @@ async def test_identity_cannot_span_connections(
 
     async def read(start: int, count: int, *, device_id: int = 1) -> ReadResult:
         if start == 33289:
-            monkeypatch.setattr(native_transport, "connection_epoch", 1, raising=False)
+            monkeypatch.setattr(native_transport, "connection_epoch", 1)
         return await original(start, count, device_id=device_id)
 
     monkeypatch.setattr(native_transport, "read_input", read)

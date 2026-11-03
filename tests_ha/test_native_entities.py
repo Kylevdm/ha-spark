@@ -218,7 +218,7 @@ async def test_readings_from_before_a_reconnect_are_not_shown(
     await native.async_poll(dt_util.utcnow())
     assert native.reading(inverter, "input_33132") is not None
     assert BankSoC(entry.runtime_data, inverter.bank_id).native_value == 73
-    native_transport.connection_epoch = 1  # type: ignore[attr-defined]
+    native_transport.connection_epoch = 1
     assert native.reading(inverter, "input_33132") is None
     assert BankSoC(entry.runtime_data, inverter.bank_id).native_value is None
 

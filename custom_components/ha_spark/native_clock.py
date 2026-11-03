@@ -143,11 +143,11 @@ class NativeClock:
                         if attempt:
                             await verify_sleep(1)
                         try:
-                            connection_epoch = getattr(transport, "connection_epoch", 0)
+                            connection_epoch = transport.connection_epoch
                             read = await transport.read_input(33022, 6, device_id=unit)
                             at = dt_util.utcnow()
                             if (read.error is not None or connection_epoch !=
-                                    getattr(transport, "connection_epoch", 0)):
+                                    transport.connection_epoch):
                                 continue
                             error = clock_error(read.registers, at, zone)
                             if len(read.registers) == 6 and valid_words(read.registers):
