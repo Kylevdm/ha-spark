@@ -1,5 +1,272 @@
 # Changelog
 
+## 0.31.0
+
+- **Add-on and integration now speak contract `api_version` 4 (#564).** Both
+  accept versions 1–4, so 0.30.x peers keep working, and the heartbeat body may
+  now be up to 64 KiB. Snapshots are checked more strictly: one for another
+  site, one sent more than five minutes off the clock or older than the last
+  accepted one, or one whose authority epoch goes backwards is rejected and
+  never refreshes the connection's freshness. Nothing changes on the
+  hardware.
+
+- **The daemon supply guard no longer cuts charging just because the topology
+  record is unreadable (#555, #565).** While the accepted record can't be read,
+  it uses `supply_max_current_a` as its limit and cuts to 0 A only while a fresh
+  grid reading (in W, reported within the last 60 s) exceeds it; a missing,
+  stale or future-dated reading, or an invalid legacy setting, writes nothing.
+  The cut still follows the operating mode and is read back. **Known gap:** an
+  accepted native connection limit lower than `supply_max_current_a` isn't
+  enforced while the record is unreadable.
+
+- **Battery banks gain a one-way charge efficiency (#566).** The new bank
+  option defaults to 0.949 and must be above 0 and at most 1; it is separate
+  from the round-trip `charge_efficiency`. Both supply guards now count the
+  AC a charge draws as its DC current divided by this efficiency, so a
+  clamped charge never draws more from the grid than the allowance. The term
+  only ever lowers a charge current. The daemon guard uses the accepted
+  native bank's value, or 0.949 otherwise.
+
+- **`solis_control_hub` is empty by default (#567).** An existing install with
+  a legacy Solis and no saved hub gets `solis_control` written explicitly on its
+  first 0.31 start, so its control path is unchanged; importing a pre-0.31
+  settings export without the hub does the same. Exports and `onboard --write`
+  fragments now always include `solis_control_hub`.
+- **`ha-spark health` reports the legacy Solis transport (#567).** One row per
+  legacy Solis inverter: ok while the overlay hub's read-back sensors are
+  readable, with a warning that HA 2027.10 removes YAML `modbus:` hubs; fails
+  with "overlay hub missing" or, for an empty hub, "no control path" (the
+  inverter clock check is then skipped).
+
+- **The integration has its own durable authority store (#568).** It is kept
+  per config entry with a separate initialisation marker, and every save is
+  read back. A missing or corrupt store, a marker mismatch or a failed save
+  makes authority unknown: nothing writes, a repair offers only Observe, and
+  confirming it writes nothing. New read-only entities show the operating mode
+  (including *activating*, *switching to Observe* and *authority unknown*),
+  the manual session, fallback active with its causes, holds and the
+  authority epoch. On an add-on-owned site the add-on's store stays the
+  authority and these entities mirror it.
+
+- **A site's authority owner can move to the integration (#569).** Each
+  topology inverter now has a transport, `legacy` (the default) or `native`.
+  A site with any legacy inverter stays add-on-owned; an all-native site
+  switches to integration ownership through a durable handshake. Saving the
+  switch is refused, with the unmet condition named, unless the add-on is in
+  Observe with no holds, no transition and a known store. The integration then
+  records the switch as pending, the add-on retires its own store, and the
+  integration starts its store in Observe. Nothing writes while the switch is
+  pending, a crash at any step resumes or stays safe, and the reverse switch
+  runs the same steps back. Both peers must be 0.31 or later; an older peer
+  never completes a switch.
+
+- **Operating-mode transitions and temporary manual control on integration-owned
+  sites (#570).** The integration now runs the Observe, Protect and Optimise
+  transitions itself. *Activating* lasts until the first fresh plan verifies,
+  leaving Optimise for Protect writes the fallback schedule as your starting
+  schedule, and going to Observe makes a verified release. Manual control
+  hands the controls to you for one hour, until tomorrow (07:00 on the
+  household clock by default, set under **Manual control deadline**) or until
+  you resume, and keeps protection on unless you say otherwise. Its expiry
+  never replays an old plan. Reloading the integration keeps authority;
+  disabling or removing it in Protect or Optimise first hands over to Observe,
+  with a notification if that fails.
+- **Three owner services leave automatic control (#570).** `ha_spark.set_observe`,
+  `ha_spark.start_manual_control` and `ha_spark.resume_control` are for
+  administrators only and can't enter Protect or Optimise. A refusal names its
+  reason (not owner, authority unknown, transition in progress, no manual
+  session, not in an active mode). Each accepted call is written to the
+  logbook and the log with the user, the change and the new epoch.
+
+- **Owner requests reach an integration-owned site (#571).** On such a site
+  the integration fetches mode changes, manual control requests, clock syncs
+  and re-probes from the add-on over its authenticated channel and posts the
+  results back. The channel isn't reachable through ingress, caps every body
+  and never logs payloads. A command runs at most once: a repeat returns the
+  stored result, a stale or replayed one is refused with its sequence named,
+  and a mode change waits for in-flight writes before it takes effect. In
+  ingress and the CLI a request waits up to 10 s, then shows as pending and
+  reports its outcome from the next snapshot; it is never resent
+  automatically. The new data-free `ha_spark.commands_pending` service prompts
+  a fetch.
+
+- **The add-on writes no hardware on an integration-owned site (#572).** Once
+  its store is retired, every direct write is refused and the daemon's supply
+  guard, hold reconcile, SoC monitor, clock sync and V2L stay idle. Each plan
+  is sent to the integration as per-inverter charge window and charge current
+  intents, stamped with the plan's epoch, and the plan output shows each
+  result: applied or unchanged, refused with its reason, deferred, or failed.
+  A refusal for a stale epoch replans once under the new one. The planner
+  takes a native bank's SoC from the integration only, and untrusted or
+  missing SoC blocks SoC-based output. `ha-spark health` gains an
+  **Authority owner** row with the owner, the handshake state and the
+  snapshot's freshness.
+
+- **The integration now installs `pymodbus` 3.13.1 (#573).** It carries the
+  native Solis Modbus connection: one paced connection per gateway, with
+  writes queued ahead of polling reads and never resent after a disconnect.
+
+- **Connect a native Solis inverter (#574).** Choosing the `native` transport
+  in **Site topology and limits** adds a connect step that reads the
+  inverter's identity, tests the gateway for caching and records a durable
+  ownership claim on the gateway's host, port and unit id. The device is
+  validated only on the supported identity with caching off; anything else,
+  an unreachable gateway or a lost claim leaves it read-only with a repair,
+  and readings continue. Any read-only device blocks Protect and Optimise.
+  The gateway appears as its own device with connectivity, ownership claim and
+  caching probe entities, and the administrator-only `ha_spark.reprobe`
+  service, also sent from the add-on, runs the checks again.
+
+- **Native Solis readings in Home Assistant (#575).** A native Solis inverter
+  now gets read-only entities for SoC, battery voltage, power and direction,
+  grid-port power, the grid-charge permission bit, the inverter clock, its
+  identity, the export limit and the Energy-dashboard counters (PV, battery,
+  grid import/export, consumption), plus a battery-bank SoC when the bank has
+  exactly one native inverter. Frames are read about once every two seconds
+  per inverter, never more than one request per second; other registers in
+  those frames are disabled-by-default diagnostic entities. A frame that fails
+  to read makes only its own entities unavailable. Nothing is written to the
+  inverter.
+
+- **One verified write path for native charge currents (#576).** On an
+  integration-owned site every charge current the integration writes, whether
+  from a plan, the fallback, a hold restoration, the supply guard or your own
+  entity edit, goes through one path. It rechecks the operating mode, epoch,
+  manual session, ownership and limits at write time, applies the supply-guard
+  clamp, writes reductions before increases and reads the value back. A
+  current is in whole amps rounded down and at most 62.5 A, and only changed
+  values are written. Raising a current needs trusted SoC. A value that
+  doesn't read back is reported unverified and triggers one caching probe.
+  For two minutes after the integration starts, plan writes are refused
+  (`not_available`) so that only protection writes run while it settles.
+
+- **Native charge windows follow the legacy Solis rules (#577).** A plan's
+  charge window is written to Slot 1 as one whole block, and is refused with
+  `grid_charge_not_permitted` while the inverter's grid-charge permission is
+  off. A live charge window is switched off and checked before its current
+  changes, and the new window is set only once the current reads back. Slots 2
+  and 3 are kept clear, and until supervised export is in force the discharge
+  half of Slot 1 is cleared and zero-confirmed. Untrusted SoC refuses every
+  window write.
+
+- **Native Solis write entities (#578).** A native inverter gets charge and
+  discharge current numbers, four Slot 1 charge and discharge start and end
+  times and a power switch select, all configuration entities. Every write
+  goes through the verified charge path and its supply-guard clamp; a time
+  edit rewrites the whole Slot 1 block and an invalid window is refused.
+  Charge edits are refused while ha-spark is in Optimise or fallback, discharge
+  edits work only during manual control, and the power switch belongs to
+  protection: you can set it in Observe, or in manual control without kept
+  protection. Nothing is writable while authority is unknown, a save failed, a
+  switch is pending or the device is read-only. Each write is logged with its
+  caller.
+
+- **Native Solis SoC trust (#579).** Each battery bank on a native Solis
+  inverter now has a diagnostic *SoC trust* sensor (trusted, untrusted or
+  recovering, with the reason) and reports its SoC, read time and trust to the
+  add-on. The checks are the add-on's own: the first failed SoC check blocks
+  SoC-based work and charge-rate increases at once, fallback is requested at
+  the failure threshold, and recovery needs an unbroken run of passing minutes.
+  A bank shared by more than one native inverter is never trusted. The maximum
+  report age, failure threshold and recovery minutes are integration options
+  with the add-on's defaults. Trust only narrows what is allowed; nothing is
+  written to the inverter.
+
+- **Holds on native Solis sites (#580).** **Native protection evidence** in
+  the integration options sets the EV status and battery direction sources,
+  which are required (direction defaults to the inverter's own battery power),
+  the optional EV plug, EV power, live dispatch and adjusted-rate sources, and
+  a maximum age for each. Holds then run as they do on the add-on: a hold
+  starts only on fresh evidence and is recorded before the power switch goes
+  Off, an EV hold ends after five advancing clear reports and a dispatch hold
+  at its last trusted end, and a release restores and verifies the schedule
+  while the switch is still Off before writing `On` to a readable switch.
+  Holds survive restarts, a shutdown never releases one, and a hold that can't
+  be applied raises a notification. Reconcile runs in Protect and Optimise and
+  in manual control with kept protection, never in Observe.
+
+- **Fallback charging and reachable Protect and Optimise on native sites
+  (#581).** **Native fallback schedule** sets a cheap window on the household
+  clock and a current for each inverter, with no default. A save is refused if
+  a current is over its inverter's limit, the total is over a bank or supply
+  limit, the window is invalid or a control can't be read back. In Optimise,
+  fallback starts when the add-on has sent no heartbeat for two minutes or SoC
+  integrity fails, is checked against the live limits before each apply, and
+  counts only once it reads back. It clears after five minutes of fresh
+  heartbeats from a new add-on session or the SoC recovery window, followed by
+  a verified fresh plan. Notifications cover fallback entered, cleared and
+  unverified. With every check in place, a fully validated native site can now
+  enter Protect and Optimise.
+
+- **The integration's supply guard now writes on integration-owned sites
+  (#582).** In Protect, Optimise, fallback and manual control it lowers and
+  restores the charge current through the verified charge path; it never
+  starts a charge window. Under manual control it only caps your latest charge
+  current and restores up to it, never above. After a restart a saved cut is
+  replayed only under the same epoch and connection, and only ever lowers the
+  current. On add-on-owned sites it stays display only.
+
+- **Native inverter clock sync (#583).** On an integration-owned site the
+  integration sets the inverter clock automatically at a household clock
+  change, such as the start or end of summer time, in Protect and Optimise
+  including fallback; never in Observe or manual control. A drifted
+  clock raises a repair whose fix, like `ha-spark solis sync-clock`, syncs in
+  Observe, Protect, Optimise or manual control. Every sync is read back, and
+  none runs while authority is unknown, a save failed, a switch is pending or
+  the device is read-only.
+
+- **Supervised native export (#584).** On an integration-owned Solis site in
+  Optimise, a planned Axle export runs only after you arm it with **Arm
+  supervised export** in ingress or `ha-spark export supervise`, confirming
+  each inverter's rated AC output; both are administrator only. The
+  supervision covers that one event and ends at its end, on a cancel, on
+  leaving Optimise, or with **End supervision** or `ha-spark export end`. An
+  unsupervised export is refused as not supervised, and export never runs in
+  fallback, Protect, manual control or Observe. The device export bound is the
+  confirmed rating, no higher than the site export limit, and is checked again
+  just before each window is armed. Export follows the legacy driver's rules
+  step for step; every refusal clears and zero-confirms the discharge half.
+  New diagnostic entities show the export bound, the supervision and the
+  export record.
+
+- **Native export lifecycle notices (#585).** On an integration-owned Solis
+  site the integration now keeps a durable, ordered log of each supervised
+  export's transitions (accepted, armed, started, cleanup verified, aborted,
+  clock hold), and the add-on turns it into the usual Axle export notices. A
+  transition made while the add-on is down is still notified exactly once,
+  after it reconnects. Start and cleanup are only ever notified after the
+  inverter read back the change; an export you did not supervise is reported
+  as aborted (not supervised).
+
+- **Native export next to holds, fallback and restarts (#586).** On an
+  integration-owned Solis site a hold now always beats a supervised export,
+  and every way out of an export (SoC fallback, leaving Optimise, manual
+  control, disabling the integration, ending supervision, a `none` request)
+  clears the inverter's discharge window and confirms it stayed at zero for
+  five seconds before the export counts as cleaned up; a failed clear is
+  retried every tick, including during fallback. After a restart an export
+  window is only kept if the inverter still holds exactly that window, and is
+  never re-armed from memory. A changed inverter identity or gateway claim
+  now ends export supervision for that inverter.
+
+- **Live export tripwire (#587).** While a supervised export is live on an
+  integration-owned Solis site, the integration watches the whole-site grid
+  reading; two consecutive fresh readings more than 200 W over the site export
+  limit stop every export on that connection for the rest of its window (a
+  durable stop latch written before cleanup, honoured across restarts and
+  Re-probes), end every export bound on that connection until the owner
+  confirms a new supervision, and log `tripped` for the add-on's notice. A
+  missing or stale grid reading never cuts: it warns after 60 s and raises a
+  repair after two minutes. PV-only export is never curtailed.
+
+- **`ha-spark health` reports native Solis transports (#588).** Each native
+  inverter gets a **Solis transport** row: ok when validated, a warning with
+  the reason while it is read-only, and a failure, "inconsistent", while an
+  overlay hub is still configured. ADR-0012 makes the integration's own Modbus
+  connection the native Solis control path in place of the overlay hub, and
+  `docs/runbooks/solis-native-migration.md` gives the ordered migration and
+  rollback steps.
+
 ## 0.30.0
 
 - **The companion integration now describes your site's topology and limits (#533).**
