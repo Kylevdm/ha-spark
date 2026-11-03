@@ -151,6 +151,16 @@ The maximum combined DC charge or discharge current a bank can accept or
 supply across its connected inverters and any V2L charger, with a separate
 limit for each direction.
 
+**One-way charge efficiency**:
+The share of the AC power drawn from the grid that reaches a bank as DC
+charge, set per bank by the owner. Supply-guard and charge-command maths use
+it to convert between AC and DC, so a clamped charge never draws more AC than
+the charging allowance. It is distinct from the round-trip `charge_efficiency`
+the planner uses for costs, and is never derived from it.
+(Decision: #563, 2026-10-29.)
+_Avoid_: charge efficiency (unqualified), round-trip efficiency (when meaning
+this)
+
 **Site export limit**:
 The maximum combined grid-export power permitted at the household's grid
 connection, including battery and solar output after house consumption. It is
@@ -182,9 +192,23 @@ installer has enabled, or the inverter's rated AC output when that is already
 within the site export limit. ha-spark verifies it from the device and never
 writes it. Scheduled battery export needs a verified bound on every
 export-capable inverter, and those bounds must together stay within the site
-export limit.
-(Decision: #283, 2026-10-12; rated output added by #316, 2026-10-15.)
+export limit. On a natively connected inverter the bound is the owner-confirmed
+rated output alone: it counts only for a validated device, stays tied to that
+device's identity and gateway ownership claim, and is checked again just before
+each export window is armed. An enabled export limit doesn't count there.
+(Decision: #283, 2026-10-12; rated output added by #316, 2026-10-15; native
+bound #563, 2026-10-29.)
 _Avoid_: EPM (vendor term), export guard
+
+**Export supervision**:
+An owner's arming of one planned flexibility-event export on a natively
+connected inverter, with each inverter's rated output confirmed. It covers that
+event only and ends at the event's end, on a cancel, when the site leaves
+Optimise, or when the owner ends it. Without a live supervision a native
+export is refused, and it never runs outside Optimise. It is not a hold, an
+override or manual control.
+(Decision: #563, 2026-10-29.)
+_Avoid_: export approval, armed export (when meaning the owner's act)
 
 **Charging allocation**:
 The charging power assigned to a bank and divided across its connected
@@ -202,10 +226,17 @@ The safeguard that cuts controlled grid charging quickly when measured site
 import exceeds the supply current limit, and restores it slowly once headroom
 has held. It never raises charging above the requested target, and it applies
 whenever charging is controlled, including temporary manual control. It runs
-per grid connection in the companion integration on its own report-driven loop,
-taking the operating mode from the add-on's authority mirror; the add-on's
-daemon guard remains until the native writer arrives.
-(Decision: #165, 2026-10-11; integration guard #533, 2026-10-29.)
+per grid connection in the companion integration on its own report-driven
+loop. On an integration-owned site it takes the operating mode from the
+integration's own authority store and lowers and restores charging itself,
+capping only the owner's latest charge current during manual control; on an
+add-on-owned
+site it takes the mode from the add-on's authority mirror and only displays,
+while the add-on's daemon guard does the writing. Both count losses with the
+bank's one-way charge efficiency, and the daily budget of restores resets at
+household-clock midnight.
+(Decision: #165, 2026-10-11; integration guard #533, 2026-10-29; native writer
+#563, 2026-10-29.)
 _Avoid_: fuse guard, throttle
 
 **Major load**:
@@ -250,6 +281,31 @@ clock before ha-spark trusts one. It drifts, and it can't be relied on to
 change hour when the clocks change.
 (Decision: #155, 2026-09-28.)
 _Avoid_: RTC (in prose), inverter time
+
+**Transport**:
+How ha-spark reaches an inverter's controls: `legacy`, through the add-on and
+a Home Assistant Modbus hub, or `native`, through the integration's own
+connection to the inverter's gateway, as the only client on that gateway. Each
+inverter has one, and the site's transports decide its authority owner.
+(Decision: #563, 2026-10-29.)
+_Avoid_: overlay (when meaning the transport choice), driver
+
+**Gateway ownership claim**:
+The owner's durable record that ha-spark's integration is the only client of
+one inverter gateway, made when they connect a native inverter. While it isn't
+held, the inverter is read-only: readings continue and writes are refused. It
+is the owner's statement, not proof that no other client is connected.
+(Decision: #563, 2026-10-29.)
+_Avoid_: lock, lease
+
+**Device validation**:
+Whether a natively connected inverter may be written to: *validated* when its
+identity is a supported model and firmware, its gateway doesn't cache, and its
+gateway ownership claim is held; otherwise *read-only*, with the reason. A
+read-only device still reports readings, and any read-only device keeps the
+site out of Protect and Optimise.
+(Decision: #563, 2026-10-29.)
+_Avoid_: verified device (verification is a write's read-back)
 
 **Stale schedule**:
 An inverter-resident window that keeps firing after ha-spark has stopped
@@ -296,8 +352,10 @@ plans without writing to hardware.
 An operating mode that prevents the house battery feeding the car while
 ordinary charging schedules remain under manual control. It owns the controls
 needed to apply and release that protection, with optional clock-change sync.
-It never uses the fallback charging schedule. In phase 2 the add-on daemon
-provides protection; protection independent of the add-on awaits the integration.
+It never uses the fallback charging schedule. The site's authority owner
+provides it: the add-on daemon on an add-on-owned site, the integration on an
+integration-owned site, where protection no longer depends on the add-on
+running.
 
 **Optimise**:
 An operating mode that authorises the full automatic energy plan, subject to
@@ -305,10 +363,26 @@ safety checks. Settings and device definitions cannot grant this authority.
 
 **Authority store**:
 The durable record of the site's operating mode, authority epoch, transition,
-holds and fallback state. In phase 2 it belongs to the add-on, not Settings;
-only the running daemon changes authority on an owner's request. A missing or
-invalid previously initialised store means authority unknown, with no hardware
-writes, until the owner confirms Observe. Every install starts in Observe.
+manual control, holds and fallback state, and on an integration-owned site its
+export supervisions too. It never belongs to Settings. It is kept by the site's
+authority owner: the add-on's on an add-on-owned site, the integration's on an
+integration-owned site, where the add-on's own store is retired. Only that
+owner changes authority, on an owner's request. A missing or invalid
+previously initialised store, or one that failed to save, means authority
+unknown, with no hardware writes, until the owner confirms Observe. Every
+install starts in Observe, and so does a store newly taken over in an
+authority switch.
+
+**Authority owner**:
+The one process that holds a site's authority store and alone may write to
+its hardware: the add-on or the integration. It follows from the site's
+inverter transports. A site with any legacy inverter, or none, is add-on-owned;
+a site whose every inverter is native is integration-owned. The change takes
+effect only once both sides have completed the authority switch from Observe
+with no holds. Until then the switch is pending and nothing writes. The other
+side never writes, whatever it is told.
+(Decision: #563, 2026-10-29.)
+_Avoid_: owner (unqualified; that is the person), controller, master
 
 **Settings document**:
 The versioned record of the owner's non-secret configuration inputs. It belongs
@@ -338,9 +412,14 @@ have been checked. A return to Optimise needs a fresh plan, or uses the
 fallback charging schedule when the planner is unavailable; a return to
 Protect leaves the owner's charging edits in place. The owner may instead
 choose to resume explicitly. Battery-to-car protection may remain enabled,
-retaining ownership of the controls it needs. Learning may continue during the
-handover.
-(Decision: #266, 2026-10-12.)
+retaining ownership of the controls it needs, and does so by default. Learning
+may continue during the handover. The owner chooses its length: an hour, until
+a set time on the household clock tomorrow, or until they resume. Switching
+between Protect and Optimise during it changes only where it returns to, and
+its end never replays an old plan. On an integration-owned site the
+integration runs it, and the owner can also start and end it from Home
+Assistant.
+(Decision: #266, 2026-10-12; integration-owned sites #563, 2026-10-29.)
 
 **Override**:
 An owner instruction that the plan must obey until it ends: **Charge now**
@@ -363,8 +442,11 @@ block it. It does not authorise scheduled battery export and remains
 subordinate to applicable protection. A request is not proof that the inverter
 accepted it; the schedule is in force only once read-back matches. It stays in
 force until every cause has cleared and a fresh plan has been applied and read
-back; recovery being *ready* does not end it.
-(Decision: #266, 2026-10-12.)
+back; recovery being *ready* does not end it. On an integration-owned site its
+causes are lost contact with the add-on and untrusted SoC, its window is on the
+household clock, and the owner sets a current per inverter with no default;
+it charges only through controls that read back.
+(Decision: #266, 2026-10-12; integration-owned sites #563, 2026-10-29.)
 _Avoid_: Solis fallback
 
 **Owner**:
