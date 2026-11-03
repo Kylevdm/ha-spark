@@ -44,20 +44,22 @@ security and prefer the safe default. Hard rules:
   planner is the sole decider.
 - **Actuation invariants:** the site **operating mode** (Observe/Protect/
   Optimise, ADR-0008) is the only write gate, and each site has exactly one
-  **authority owner** that holds it. The owner is derived from the topology's
+  **authority owner** (the add-on or the integration) that holds it. The
+  authority owner is derived from the topology's
   inverter transports (any `legacy` inverter, or none, means the add-on; all
   `native` means the integration) and is confirmed only by the durable
   ownership handshake; while it is pending or unknown nothing writes. The mode
-  lives in the owner's durable authority store, never in Settings, and only an
-  owner transition changes it.
+  lives in the authority owner's durable authority store, never in Settings,
+  and only an owner's transition request changes it.
   - *Add-on-owned sites:* the add-on's store is the authority and only the
     daemon actuates: real writes go through `WriteGate.mode_for` and the
     write-time `WriteGate.recheck` (`devices/execution.py`).
   - *Integration-owned sites:* the add-on's store carries the retirement
     marker, `WriteGate` refuses every direct write, and the daemon's supply
     guard, hold reconcile, SoC monitor, clock sync and V2L do nothing. The
-    add-on only sends typed device intents as `apply` commands stamped with the
-    plan epoch. The integration's authority store (`authority_store.py`) is the
+    add-on writes no hardware itself: a plan reaches devices only as typed
+    device intents sent as `apply` commands stamped with the plan epoch, and
+    owner requests travel the same command channel. The integration's authority store (`authority_store.py`) is the
     gate, and every charge-affecting write (plan intents, owner entity edits,
     fallback, hold restoration, supply-guard cuts and restores) goes through
     the one charge-write path, `NativeChargeBoundary` (`native_write.py`):
@@ -71,9 +73,11 @@ security and prefer the safe default. Hard rules:
     and never in fallback, Protect, manual control or Observe. Every clear is
     zero-confirmed.
 
-  On either owner, Observe, unknown authority and a failed authority save
-  write nothing; Protect writes only its holds (and enabled clock sync);
-  Optimise runs the plan. An invalid SoC blocks every SoC-derived write;
+  Under either authority owner, Observe, unknown authority and a failed
+  authority save write nothing; Protect writes only its holds (and enabled
+  clock sync), plus, on an integration-owned site, supply-guard cuts and
+  restores and the fallback schedule written as the owner's starting schedule
+  when leaving Optimise; Optimise runs the plan. An invalid SoC blocks every SoC-derived write;
   always read back; isolate failures per action. Writes that don't depend on
   SoC keep their own safeguards: holds (discharge prevention), authorised
   clock sync, and the Solis fallback charging schedule in Optimise. On the
@@ -81,8 +85,9 @@ security and prefer the safe default. Hard rules:
   programs the configured cheap-rate window at an explicitly set
   `solis_fallback_current_a`; on a native site it starts on `soc_integrity`
   or `addon_liveness` and uses the owner's per-inverter currents from the
-  integration options. Both go through the same gates and read-back, are
-  charge-only, have no default current, and AlphaESS never gets it. A hold
+  integration options. Both fallbacks go through the same gates and read-back,
+  are charge-only and have no default current, and AlphaESS never gets
+  either. A hold
   starts only on fresh evidence and ends on fresh clear evidence, a
   dispatch's last trusted end, or an explicit owner handover; `On` is written
   only to a readable switch. Don't weaken these (`ha_spark/devices/inverters/`,
