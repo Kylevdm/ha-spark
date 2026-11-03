@@ -372,6 +372,7 @@ previously initialised store, or one that failed to save, means authority
 unknown, with no hardware writes, until the owner confirms Observe. Every
 install starts in Observe, and so does a store newly taken over in an
 authority switch.
+(Decision: #266, 2026-10-12; per-site authority owner #563, 2026-10-29.)
 
 **Authority owner**:
 The one process that holds a site's authority store and alone may write to
@@ -414,9 +415,8 @@ Protect leaves the owner's charging edits in place. The owner may instead
 choose to resume explicitly. Battery-to-car protection may remain enabled,
 retaining ownership of the controls it needs, and does so by default. Learning
 may continue during the handover. The owner chooses its length: an hour, until
-a set time on the household clock tomorrow, or until they resume. Switching
-between Protect and Optimise during it changes only where it returns to, and
-its end never replays an old plan. On an integration-owned site the
+a set time on the household clock tomorrow, or until they resume. Its end never
+replays an old plan. On an integration-owned site the
 integration runs it, and the owner can also start and end it from Home
 Assistant.
 (Decision: #266, 2026-10-12; integration-owned sites #563, 2026-10-29.)
@@ -444,8 +444,7 @@ accepted it; the schedule is in force only once read-back matches. It stays in
 force until every cause has cleared and a fresh plan has been applied and read
 back; recovery being *ready* does not end it. On an integration-owned site its
 causes are lost contact with the add-on and untrusted SoC, its window is on the
-household clock, and the owner sets a current per inverter with no default;
-it charges only through controls that read back.
+household clock, and the owner sets a current per inverter with no default.
 (Decision: #266, 2026-10-12; integration-owned sites #563, 2026-10-29.)
 _Avoid_: Solis fallback
 
