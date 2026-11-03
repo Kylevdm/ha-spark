@@ -253,7 +253,7 @@ def allow_export(c: SparkCoordinator, monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setattr(c, "soc", SimpleNamespace(
         trusted=lambda bank: True, increases_allowed=lambda bank: True,
         bank=lambda bank: SimpleNamespace(trust="trusted", reason=None),
-        snapshot=lambda: []))
+        snapshot=lambda: [], observe=lambda now: None))
     trusted_evidence(c)
     transport.set_holding(43007, [power])
     transport.set_holding(43142, [0])
@@ -841,3 +841,237 @@ async def test_supervision_waits_for_the_authority_lock(writer: SparkCoordinator
         state = writer.authority.state
         assert state is not None and not state.export_supervisions
     assert (await task).outcome == "applied"
+
+
+# --- #585 durable export transition log and live notices ----------------------
+
+def transition_kinds(c: SparkCoordinator) -> list[tuple[str, str | None]]:
+    state = c.authority.state
+    assert state is not None
+    return [(row.kind, row.reason) for row in state.export_transitions]
+
+
+async def test_accepted_then_armed_then_started_are_logged_once(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, freezer: FrozenDateTimeFactory,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    assert (await writer._async_dispatch_command(
+        apply_command(writer, [window_intent()]))).outcome in ("applied", "unchanged")
+    state = writer.authority.state
+    assert state is not None
+    [accepted, armed] = state.export_transitions
+    assert (accepted.kind, accepted.event) == ("accepted", EventIdentity(
+        direction="export", start=NOW + timedelta(hours=2), end=NOW + timedelta(hours=3)))
+    assert (armed.kind, armed.event) == ("armed", accepted.event)
+    # A second verified pass before the window adds nothing.
+    await writer._async_dispatch_command(apply_command(
+        writer, [*charge_intents(), window_intent()], sequence=2))
+    assert [row.kind for row in writer.authority.state.export_transitions] == [  # type: ignore[union-attr]
+        "accepted", "armed"]
+    # The first verified pass after the window begins logs the start.
+    later = NOW + timedelta(hours=2, minutes=1)
+    freezer.move_to(later)
+    registers = (later.year % 100, later.month, later.day, later.hour, later.minute,
+                 later.second)
+    native_transport.set_input(33022, list(registers))
+    writer.native.readings["inv1"]["input_33022"] = Reading(later, registers, 0)
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [window_intent()], sequence=3))
+    assert result.outcome in ("applied", "unchanged")
+    assert [row.kind for row in writer.authority.state.export_transitions] == [  # type: ignore[union-attr]
+        "accepted", "armed", "started"]
+
+
+async def test_a_refusal_logs_a_terminal_abort_with_its_reason(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    native_transport.set_holding(43143, [23, 30, 5, 30, 14, 0, 15, 0])
+    result = await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
+    assert (result.outcome, result.reason) == ("refused", "not_supervised")
+    state = writer.authority.state
+    assert state is not None
+    [aborted] = state.export_transitions
+    assert (aborted.kind, aborted.reason, aborted.cleared) == (
+        "aborted", "not_supervised", True)
+
+
+async def test_the_clock_gate_is_a_retryable_clock_hold_not_an_abort(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await optimise(writer)
+    assert (await writer._async_dispatch_command(command(writer))).outcome == "applied"
+    native_transport.set_input(33022, [26, 11, 2, 11, 0, 0])
+    writer.native.readings["inv1"]["input_33022"] = Reading(NOW, (26, 11, 2, 11, 0, 0), 0)
+    result = await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
+    assert (result.outcome, result.reason) == ("refused", "clock_not_trusted")
+    state = writer.authority.state
+    assert state is not None
+    assert [(row.kind, row.reason) for row in state.export_transitions] == [
+        ("accepted", None), ("clock_hold", "clock_not_trusted")]
+
+
+async def test_untrusted_hold_data_and_deferral_never_abort(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await optimise(writer)
+    assert (await writer._async_dispatch_command(command(writer))).outcome == "applied"
+    writer.hass.config_entries.async_update_entry(writer.entry, options={
+        **writer.entry.options, "evidence": {
+            "ev_status": {"entity_id": "sensor.ev", "max_age_s": 300}}})
+    result = await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
+    assert (result.outcome, result.reason) == ("refused", "hold_data_untrusted")
+    far = {"direction": "export", "start": (NOW + timedelta(hours=26)).isoformat(),
+           "end": (NOW + timedelta(hours=27)).isoformat()}
+    assert (await writer._async_dispatch_command(
+        command(writer, event=far, sequence=2))).outcome == "applied"
+    deferred = await writer._async_dispatch_command(apply_command(
+        writer, [window_intent(event=far)], sequence=3))
+    assert deferred.outcome == "deferred"
+    state = writer.authority.state
+    assert state is not None
+    assert "aborted" not in [row.kind for row in state.export_transitions]
+
+
+async def test_cleanup_verified_is_logged_only_after_a_verified_zero(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests_ha.fake_solis import WriteFault
+
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    assert (await writer._async_dispatch_command(apply_command(
+        writer, [window_intent()], sequence=2))).outcome in ("applied", "unchanged")
+    native_transport.set_holding(43143, [23, 30, 5, 30, 14, 0, 15, 0])
+    native_transport.inject_write_fault(WriteFault("silent_noop"), address=43143)
+    failed = await writer._async_dispatch_command(apply_command(
+        writer, [{"kind": "export", "inverter_id": "inv1", "request": "none"}]))
+    assert failed.outcome == "unverified"
+    kinds = [row.kind for row in writer.authority.state.export_transitions]  # type: ignore[union-attr]
+    assert "cleanup_verified" not in kinds
+    assert ("aborted", "unverified") in transition_kinds(writer)
+    native_transport.advance(1)
+    state = writer.authority.state
+    assert state is not None
+    cleared = await writer.writes.async_clear_export("inv1", epoch=state.epoch)
+    assert cleared.outcome == "applied"
+    assert "cleanup_verified" in [row.kind for row in writer.authority.state.export_transitions]  # type: ignore[union-attr]
+
+
+async def test_untrusted_soc_aborts_without_a_read_or_write(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await optimise(writer)
+    assert (await writer._async_dispatch_command(command(writer))).outcome == "applied"
+    monkeypatch.setattr(writer.soc, "trusted", lambda bank: False)
+    native_transport.traffic.clear()
+    result = await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
+    assert (result.outcome, result.reason) == ("refused", "untrusted_soc")
+    assert native_transport.traffic == []
+    state = writer.authority.state
+    assert state is not None
+    [aborted] = [row for row in state.export_transitions if row.kind == "aborted"]
+    assert (aborted.kind, aborted.reason, aborted.cleared) == (
+        "aborted", "untrusted_soc", False)
+
+
+async def test_acknowledged_rows_leave_the_snapshot_and_prune_after_the_event(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    assert (await writer._async_dispatch_command(
+        apply_command(writer, [window_intent()], sequence=2))).outcome in (
+            "applied", "unchanged")
+    state = writer.authority.state
+    assert state is not None
+    ids = tuple(str(row.id) for row in state.export_transitions)
+    snapshot = writer._export_snapshot(state, writer.guard.topology)  # type: ignore[union-attr]
+    [entry] = snapshot
+    transitions = cast(list[dict[str, object]], entry["transitions"])
+    assert [row["kind"] for row in transitions] == ["accepted", "armed"]
+    await writer._async_ack_export_transitions(ids, NOW)
+    state = writer.authority.state
+    assert state is not None
+    assert all(row.acked for row in state.export_transitions)
+    snapshot = writer._export_snapshot(state, writer.guard.topology)  # type: ignore[union-attr]
+    assert cast(list[dict[str, object]], snapshot[0]["transitions"]) == []
+    await writer.async_expire_supervisions(NOW + timedelta(hours=3))
+    state = writer.authority.state
+    assert state is not None and state.export_transitions == ()
+
+
+async def test_only_emitted_transition_ids_are_acknowledged(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    state = writer.authority.state
+    assert state is not None
+    ids = tuple(str(row.id) for row in state.export_transitions)
+    writer.emitted_transitions = frozenset()
+    await writer._async_ack_export_transitions(ids, NOW)
+    state = writer.authority.state
+    assert state is not None
+    assert not any(row.acked for row in state.export_transitions)
+    writer._export_snapshot(state, writer.guard.topology)  # type: ignore[union-attr]
+    await writer._async_ack_export_transitions(ids, NOW)
+    assert all(row.acked for row in writer.authority.state.export_transitions)  # type: ignore[union-attr]
+
+
+async def test_a_cancel_whose_zero_confirm_fails_logs_an_abort(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    assert (await writer._async_dispatch_command(apply_command(
+        writer, [window_intent()], sequence=2))).outcome in ("applied", "unchanged")
+    from custom_components.ha_spark import native_write
+    from custom_components.ha_spark.native_verify import confirm as real_confirm
+
+    async def zero_never_confirms(target: list[int], *args: object, **kwargs: object) -> bool:
+        if target == [0] * 4:
+            return False  # the clear verified, the 5-read zero confirm did not
+        return await real_confirm(target, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(native_write, "confirm", zero_never_confirms)
+    state = writer.authority.state
+    assert state is not None
+    result = await writer.writes.async_clear_export("inv1", epoch=state.epoch)
+    assert result.outcome == "unverified"
+    assert ("aborted", "unverified") in transition_kinds(writer)
+    assert "cleanup_verified" not in [kind for kind, _ in transition_kinds(writer)]
+
+
+async def test_a_clock_hold_whose_clear_fails_stays_retryable(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.ha_spark import native_write
+
+    allow_export(writer, monkeypatch, native_transport)
+    await optimise(writer)
+    assert (await writer._async_dispatch_command(command(writer))).outcome == "applied"
+    native_transport.set_input(33022, [26, 11, 2, 11, 0, 0])
+    writer.native.readings["inv1"]["input_33022"] = Reading(NOW, (26, 11, 2, 11, 0, 0), 0)
+
+    async def never(*args: object, **kwargs: object) -> bool:
+        return False
+
+    monkeypatch.setattr(native_write, "confirm", never)
+    result = await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
+    assert result.outcome == "unverified"
+    assert [kind for kind, _ in transition_kinds(writer)] == ["accepted", "clock_hold"]
