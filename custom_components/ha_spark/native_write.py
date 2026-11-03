@@ -52,6 +52,22 @@ from .solis_frames import Reading
 from .solis_transport import Transport, valid_words
 from .topology import Inverter, effective_limits, validate_topology
 
+CHARGE_CURRENT_REG = 43141
+EXPORT_CURRENT_REG = 43142
+SLOT1_REG = 43143
+SLOT2_REG = 43153
+SLOT3_REG = 43163
+GRID_CHARGE_PERMITTED_REG = 33132
+CLOCK_REG = 33022
+MODEL_REG = 33000
+INVERTER_TYPE_REG = 35000
+TOU_VERSION_REG = 33289
+MAX_CURRENT_TENTHS = 625
+
+CHARGE_BLOCK_FRAME = f"holding_{CHARGE_CURRENT_REG}"
+CLOCK_FRAME = f"input_{CLOCK_REG}"
+POWER_SWITCH_FRAME = f"holding_{POWER_SWITCH_REG}"
+
 if TYPE_CHECKING:
     from .coordinator import SparkCoordinator
     from .guard_loop import SupplyGuardLoop
@@ -162,6 +178,10 @@ class NativeChargeBoundary:
         elif (state.committed_mode != "optimise" or state.manual_session is not None
               or state.transition is not None and state.transition.target != "optimise"):
             return "mode"
+        if (entity_control is None and not (guard_write or fallback or cleanup or transition)
+                and not coordinator.control.permits_non_protection(dt_util.utcnow())):
+            # Plan writes wait out the startup grace; only protection writes run in it.
+            return "not_available"
         # Unloading fences new writes the moment it starts, before native closes.
         if (not coordinator._running or not coordinator.native.polling
                 or coordinator.native.closed or coordinator.native.reason(inverter) is not None):
@@ -196,11 +216,12 @@ class NativeChargeBoundary:
                 or guard.limits != effective_limits(guard.topology)):
             return False
         transport = c.native.transport(inverter)
-        connection_epoch = getattr(transport, "connection_epoch", 0)
-        read = await transport.read_holding(43141, 30, device_id=inverter.gateway_unit_id)
+        connection_epoch = transport.connection_epoch
+        read = await transport.read_holding(
+            CHARGE_CURRENT_REG, 30, device_id=inverter.gateway_unit_id)
         words = read.registers
         if (read.error is not None or len(words) != 30 or not valid_words(words)
-                or words[0] > 625 or connection_epoch != getattr(transport, "connection_epoch", 0)):
+                or words[0] > MAX_CURRENT_TENTHS or connection_epoch != transport.connection_epoch):
             return False
         try:
             time(words[2], words[3])
@@ -222,7 +243,7 @@ class NativeChargeBoundary:
             if (self.written_a.get(inverter.id) != words[0] / 10
                     or any(words[12:20] + words[22:30])):
                 return False
-        c.native.readings[inverter.id]["holding_43141"] = Reading(
+        c.native.readings[inverter.id][CHARGE_BLOCK_FRAME] = Reading(
             dt_util.utcnow(), words, connection_epoch)
         return True
 
@@ -260,14 +281,13 @@ class NativeChargeBoundary:
                     if c.native.reason(inverter) is not None:
                         continue
                     transport = c.native.transport(inverter)
-                    connection_epoch = getattr(transport, "connection_epoch", 0)
+                    connection_epoch = transport.connection_epoch
                     read = await transport.read_holding(
-                        43141, 30, device_id=inverter.gateway_unit_id)
+                        CHARGE_CURRENT_REG, 30, device_id=inverter.gateway_unit_id)
                     words = read.registers
                     if (read.error is not None or len(words) != 30
-                            or not valid_words(words) or words[0] > 625
-                            or connection_epoch != getattr(
-                                transport, "connection_epoch", 0)):
+                            or not valid_words(words) or words[0] > MAX_CURRENT_TENTHS
+                            or connection_epoch != transport.connection_epoch):
                         continue
                     try:
                         time(words[2], words[3])
@@ -354,7 +374,7 @@ class NativeChargeBoundary:
         from .native_slots import NativeSlots
 
         # A read is safe before the device is validated; only the clear waits.
-        resident = await NativeSlots(self, inverter, state.epoch, mismatches).read(43143)
+        resident = await NativeSlots(self, inverter, state.epoch, mismatches).read(SLOT1_REG)
         if (resident is None
                 or resident[4:] != clock_face(record.window.start, record.window.end, zone)):
             return False
@@ -653,7 +673,7 @@ class NativeChargeBoundary:
             return False, None
         half = clock_face(request.window.start, request.window.end,
                           c.control.household_zone() or UTC)
-        resident = await slots.read(43143)
+        resident = await slots.read(SLOT1_REG)
         if resident is not None and resident[4:] == half:
             return False, None
         if (resident is not None and any(resident[4:]) and live is not None
@@ -667,7 +687,7 @@ class NativeChargeBoundary:
         zone = self.coordinator.control.household_zone()
         if zone is None:
             return True
-        reading = self.coordinator.native.reading(inverter, "input_33022")
+        reading = self.coordinator.native.reading(inverter, CLOCK_FRAME)
         if reading is None or reading.registers is None:
             return True
         age = now - reading.read_at
@@ -679,15 +699,15 @@ class NativeChargeBoundary:
     async def _power_on(self, inverter: Inverter, now: datetime) -> bool:
         """Read the switch, never write it: ordinary export apply never turns it On."""
         transport = self.coordinator.native.transport(inverter)
-        epoch = getattr(transport, "connection_epoch", 0)
+        epoch = transport.connection_epoch
         read = await transport.read_holding(
             POWER_SWITCH_REG, 1, device_id=inverter.gateway_unit_id)
         if (read.error is not None or len(read.registers) != 1
                 or not valid_words(read.registers)
-                or epoch != getattr(transport, "connection_epoch", 0)):
+                or epoch != transport.connection_epoch):
             return False
         self.coordinator.native.readings.setdefault(inverter.id, {})[
-            "holding_43007"] = Reading(dt_util.utcnow(), tuple(read.registers), epoch)
+            POWER_SWITCH_FRAME] = Reading(dt_util.utcnow(), tuple(read.registers), epoch)
         return decode_power(list(read.registers)) == "on"
 
     async def _bound_reason(self, inverter: Inverter, supervision: ExportSupervision,
@@ -699,16 +719,16 @@ class NativeChargeBoundary:
             return "export_bound_unverified"
         limits = effective_limits(topology)
         transport = c.native.transport(inverter)
-        epoch = getattr(transport, "connection_epoch", 0)
+        epoch = transport.connection_epoch
         words: list[int] = []
-        for address in (33000, 35000, 33289):
+        for address in (MODEL_REG, INVERTER_TYPE_REG, TOU_VERSION_REG):
             read = await transport.read_input(
                 address, 1, device_id=inverter.gateway_unit_id)
             if (read.error is not None or len(read.registers) != 1
                     or not valid_words(read.registers)):
                 return "export_bound_unverified"
             words.append(read.registers[0])
-        if epoch != getattr(transport, "connection_epoch", 0):
+        if epoch != transport.connection_epoch:
             return "export_bound_unverified"
         if c.native.reason(inverter) is not None:
             return "export_bound_unverified"
@@ -751,7 +771,7 @@ class NativeChargeBoundary:
 
     async def _read_export_current(self, inverter: Inverter) -> list[int] | None:
         result = await self.coordinator.native.transport(inverter).read_holding(
-            43142, 1, device_id=inverter.gateway_unit_id)
+            EXPORT_CURRENT_REG, 1, device_id=inverter.gateway_unit_id)
         if (result.error is not None or len(result.registers) != 1
                 or not valid_words(result.registers)):
             return None
@@ -773,7 +793,7 @@ class NativeChargeBoundary:
         if reason is not None:
             return IntentResult(outcome="refused", reason=reason)
         result = await self.coordinator.native.transport(inverter).write(
-            43142, target, device_id=inverter.gateway_unit_id)
+            EXPORT_CURRENT_REG, target, device_id=inverter.gateway_unit_id)
         if not result.ok:
             return IntentResult(outcome="failed")
         verified = await confirm(
@@ -793,7 +813,7 @@ class NativeChargeBoundary:
         if result.outcome not in ("applied", "unchanged"):
             return result
         if zero_slots:
-            for address in (43153, 43163):
+            for address in (SLOT2_REG, SLOT3_REG):
                 extra = await slots.block(address, [0] * 8)
                 if extra.outcome not in ("applied", "unchanged"):
                     return IntentResult(
@@ -805,7 +825,7 @@ class NativeChargeBoundary:
                                  ) -> IntentResult:
         """The discharge half alone must read zero first time and on 5 further reads."""
         async def half() -> list[int] | None:
-            block = await slots.read(43143)
+            block = await slots.read(SLOT1_REG)
             return None if block is None else block[4:]
         if not slots.zero_half_confirmed and not await confirm(
                 [0] * 4, half, verify_sleep, changed=True, mismatch=slots.mismatch):
@@ -945,7 +965,7 @@ class NativeChargeBoundary:
                             deferred = True
                             if live is not None and self._same_event(live.event, event):
                                 resident = await NativeSlots(
-                                    self, inverter, epoch, mismatches).read(43143)
+                                    self, inverter, epoch, mismatches).read(SLOT1_REG)
                                 keep = resident is not None and resident[4:] == half
                         else:
                             if self._hold_overlaps(
@@ -1385,8 +1405,9 @@ class NativeChargeBoundary:
     async def _read(transport: Transport, inverter: Inverter, *, input_: bool = False
                     ) -> int | None:
         read = transport.read_input if input_ else transport.read_holding
-        result = await read(33132 if input_ else 43141, 1,
-                            device_id=inverter.gateway_unit_id)
+        result = await read(
+            GRID_CHARGE_PERMITTED_REG if input_ else CHARGE_CURRENT_REG, 1,
+            device_id=inverter.gateway_unit_id)
         if result.error is not None or len(result.registers) != 1 or not valid_words(
                 result.registers):
             return None
@@ -1451,7 +1472,8 @@ class NativeChargeBoundary:
             if untrusted():
                 return IntentResult(outcome="refused", reason="untrusted_soc")
             self.written_a.pop(inverter.id, None)
-            result = await transport.write(43141, [target], device_id=inverter.gateway_unit_id)
+            result = await transport.write(
+                CHARGE_CURRENT_REG, [target], device_id=inverter.gateway_unit_id)
             if not result.ok:
                 return IntentResult(outcome="failed")
         verified = await confirm([target], read, verify_sleep, changed=changed, mismatch=mismatch)

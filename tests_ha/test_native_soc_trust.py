@@ -111,7 +111,7 @@ async def test_failed_frame_ages_last_good_read_but_reconnect_never_reuses_it(
     freezer.tick(timedelta(minutes=10))
     c.soc.observe(dt_util.utcnow())
     assert c.soc.bank(bank_id).reason == "stale"
-    native_transport.connection_epoch = 1  # type: ignore[attr-defined]
+    native_transport.connection_epoch = 1
     assert not c.soc.trusted(bank_id)
     assert all(t.op == "read" for t in native_transport.traffic)
 

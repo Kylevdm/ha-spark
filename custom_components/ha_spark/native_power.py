@@ -55,10 +55,10 @@ async def async_write_power_locked(
 
     async def read() -> PowerState | None:
         try:
-            epoch = getattr(transport, "connection_epoch", 0)
+            epoch = transport.connection_epoch
             result = await transport.read_holding(
                 POWER_SWITCH_REG, 1, device_id=inverter.gateway_unit_id)
-            if result.error is not None or epoch != getattr(transport, "connection_epoch", 0):
+            if result.error is not None or epoch != transport.connection_epoch:
                 return None
             value = decode_power(list(result.registers))
             if value is not None:

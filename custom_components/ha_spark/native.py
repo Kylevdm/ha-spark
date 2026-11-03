@@ -45,7 +45,7 @@ async def async_probe(transport: Transport, unit: int) -> Probe:
             return Probe("unreachable" if result.error in (
                 TransportError.DISCONNECTED, TransportError.TIMEOUT,
             ) else "identity_read_failed")
-        current_epoch = getattr(transport, "connection_epoch", 0)
+        current_epoch = transport.connection_epoch
         if (len(result.registers) != count or not valid_words(result.registers)
                 or epoch is not None and current_epoch != epoch):
             return Probe("identity_read_failed")
@@ -58,7 +58,7 @@ async def async_probe(transport: Transport, unit: int) -> Probe:
         result = await transport.read_input(35000, 1, device_id=unit)
         if (result.error is not None or len(result.registers) != 1
                 or not valid_words(result.registers)
-                or getattr(transport, "connection_epoch", 0) != epoch):
+                or transport.connection_epoch != epoch):
             return Probe(reason or "identity_read_failed")
         if index:
             times.append(result.elapsed_s)
@@ -140,7 +140,7 @@ class NativeDevices:
         probe = self.probes.get(inverter.id, Probe())
         if not self.connected(inverter):
             return "unreachable"
-        epoch = getattr(self.transport(inverter), "connection_epoch", 0)
+        epoch = self.transport(inverter).connection_epoch
         if self.epochs.get(inverter.id) != epoch:
             return "unvalidated_identity"
         if probe.reason is not None:
@@ -178,7 +178,7 @@ class NativeDevices:
                     self.identity_changed.add(inverter_id)
                 self.identities[inverter_id] = probe.identity
             self.record_caching(inverter, probe)
-            self.epochs[inverter_id] = getattr(self.transport(inverter), "connection_epoch", 0)
+            self.epochs[inverter_id] = self.transport(inverter).connection_epoch
         self.recheck()
         return True
 
@@ -203,7 +203,7 @@ class NativeDevices:
     async def async_check_connections(self) -> None:
         for inverter in self.inverters.values():
             if (not self.connected(inverter) or self.epochs.get(inverter.id) !=
-                    getattr(self.transport(inverter), "connection_epoch", 0)):
+                    self.transport(inverter).connection_epoch):
                 await self.async_reprobe(inverter.id)
         self.recheck()
 
@@ -253,7 +253,7 @@ class NativeDevices:
             finally:
                 self.poll_task = None
             self.readings[inverter_id][frame.key] = Reading(
-                dt_util.utcnow(), registers, getattr(transport, "connection_epoch", 0))
+                dt_util.utcnow(), registers, transport.connection_epoch)
         self.changed()
 
     def reading(self, inverter: Inverter, frame_key: str) -> Reading | None:
@@ -261,7 +261,7 @@ class NativeDevices:
         reading = self.readings.get(inverter.id, {}).get(frame_key)
         if (self.closed or reading is None or reading.registers is None
                 or not self.connected(inverter)
-                or reading.epoch != getattr(self.transport(inverter), "connection_epoch", 0)):
+                or reading.epoch != self.transport(inverter).connection_epoch):
             return None
         return reading
 

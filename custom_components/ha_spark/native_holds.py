@@ -427,7 +427,7 @@ class NativeTransitionWriter:
                     for inverter in c.native.inverters.values():
                         transport = c.native.transport(inverter)
                         for address, count in ((43007, 1), (43141, 30), (33132, 21)):
-                            epoch = getattr(transport, "connection_epoch", 0)
+                            epoch = transport.connection_epoch
                             result = await (transport.read_input if address < 40000 else
                                 transport.read_holding)(address, count,
                                                         device_id=inverter.gateway_unit_id)

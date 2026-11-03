@@ -74,6 +74,9 @@ class WriteResult:
 
 
 class Transport(Protocol):
+    @property
+    def connection_epoch(self) -> int: ...
+
     async def read_input(self, address: int, count: int, *, device_id: int = 1) -> ReadResult: ...
 
     async def read_holding(self, address: int, count: int, *, device_id: int = 1) -> ReadResult: ...

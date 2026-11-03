@@ -58,9 +58,7 @@ class NativeSoc:
             valid = native.reason(source) is None
             reading = native.reading(source, "input_33132")
             previous = self._good.get(bank.id)
-            if previous is not None and previous.epoch != getattr(
-                native.transport(source), "connection_epoch", 0,
-            ):
+            if previous is not None and previous.epoch != native.transport(source).connection_epoch:
                 valid = False
             if not valid:
                 self._good.pop(bank.id, None)
@@ -88,9 +86,8 @@ class NativeSoc:
         view = monitor.view
         native = self.coordinator.native
         good = self._good.get(bank_id)
-        if (native.reason(source) is not None or (good is not None and good.epoch != getattr(
-            native.transport(source), "connection_epoch", 0,
-        ))):
+        if native.reason(source) is not None or (
+                good is not None and good.epoch != native.transport(source).connection_epoch):
             return BankTrust(view.value, view.read_at, "untrusted", "read_failed")
         current = native.reading(source, "input_33132")
         if current is not None and current.registers is not None:
