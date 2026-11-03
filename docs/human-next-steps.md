@@ -2,7 +2,7 @@
 
 The owner's ordered list of the hands-on steps, in one place. It points at
 the tickets rather than restating them; the ticket is the source of truth and
-the place to report. Updated 2026-11-03. Agents: keep this current when a
+the place to report. Updated 2026-11-03 (rulings posted). Agents: keep this current when a
 human ticket is created, folded or closed.
 
 **Where things stand.** Phases 1–7 shipped (0.23.0–0.30.0). Phase 8
@@ -13,19 +13,13 @@ either done (#529) or folded into #590 (#511, #241).
 
 ## 1. Now, while phase 8 finishes
 
-Rulings agents are waiting on. Answer on the ticket.
+No rulings outstanding. Settled 2026-11-03: #587 trips per connection
+(every live export on it latches); #532 ships as a 0.30.1 patch from
+`master` now; #562 closes at the phase 9 cutover. The Supervisor schema
+warning is fixed.
 
-- [ ] **#587 trip scope.** With two export-capable inverters on one
-      connection, a site-level over-export latches every live export on that
-      connection (proposed), or only one. Rule before #587 starts.
-- [ ] **#532 timing.** Decided 2026-11-02 as 0.31.1 after 0.31.0. The
-      household plans on the fixed rate until it ships; a 0.30.1 patch now
-      costs one merge from `master` into the integration branch. Confirm or
-      change.
-- [ ] **#562 closing.** PR #591 closes it on merge; the spec says it closes
-      when the household cuts over in phase 9. Pick one.
-- [ ] **Supervisor schema warnings every 5 s.** Paste the warning text on a
-      new issue so it can be triaged.
+- [ ] Install 0.30.1 when it ships and confirm `health` shows live Octopus
+      Intelligent rates again (#532). No other check.
 
 ## 2. When 0.31.0 is released: #590
 
