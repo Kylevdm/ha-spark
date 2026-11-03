@@ -50,6 +50,7 @@ from .soc_trust import Policy
 from .solcast import Outcome, async_list_sites
 from .solcast_budget import async_get_budget
 from .topology import (
+    DEFAULT_ONE_WAY_CHARGE_EFFICIENCY,
     BatteryBank,
     GridConnection,
     Inverter,
@@ -593,7 +594,9 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
             ): _NUMBER,
             probatio.Required(
                 "one_way_charge_efficiency",
-                default=defaults.get("one_way_charge_efficiency", 0.949),
+                default=defaults.get(
+                    "one_way_charge_efficiency", DEFAULT_ONE_WAY_CHARGE_EFFICIENCY
+                ),
             ): _NUMBER,
             probatio.Required("min_soc", default=defaults.get("min_soc")): _NUMBER,
             probatio.Required("target_cap", default=defaults.get("target_cap")): _NUMBER,

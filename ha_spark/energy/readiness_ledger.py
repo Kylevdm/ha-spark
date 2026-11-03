@@ -25,7 +25,7 @@ from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.energy.sources import parse_time
 from ha_spark.energy.supply_guard import throttled_rate_w
 from ha_spark.energy.tariff import _in_overnight_window
-from ha_spark.energy.topology import EffectiveLimits
+from ha_spark.energy.topology import DEFAULT_ONE_WAY_CHARGE_EFFICIENCY, EffectiveLimits
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -288,7 +288,7 @@ async def record_guard(
     limit_a = 0.0
     supply_voltage = 0.0
     import_w = 0.0
-    eta = 0.949
+    eta = DEFAULT_ONE_WAY_CHARGE_EFFICIENCY
     try:
         if revision is not None:
             geometry = revision.run.inputs.geometry_for(revision.run.cfg)

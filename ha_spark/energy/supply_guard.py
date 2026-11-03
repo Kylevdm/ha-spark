@@ -54,6 +54,7 @@ from ha_spark.devices.inverters.solis import (
 )
 from ha_spark.devices.outcomes import ActionLine
 from ha_spark.energy.soc_integrity import SocMeasurement
+from ha_spark.energy.topology import DEFAULT_ONE_WAY_CHARGE_EFFICIENCY
 from ha_spark.energy.topology_record import select_limits
 from ha_spark.ha.models import EntityState
 from ha_spark.ha.rest import HomeAssistantRest
@@ -75,7 +76,7 @@ def throttled_rate_w(
     *,
     limit_a: float,
     supply_voltage_v: float,
-    one_way_charge_efficiency: float = 0.949,
+    one_way_charge_efficiency: float = DEFAULT_ONE_WAY_CHARGE_EFFICIENCY,
 ) -> float:
     """DC charge power fitting the AC allowance, never wider than lossless maths.
 
@@ -197,7 +198,7 @@ class SupplyGuard:
         selected = select_limits(self._execution.limits_record, s)
         eta = (
             selected.actuation.banks[0].one_way_charge_efficiency
-            if selected.actuation is not None else 0.949
+            if selected.actuation is not None else DEFAULT_ONE_WAY_CHARGE_EFFICIENCY
         )
         wanted_w = throttled_rate_w(
             supply_w,
