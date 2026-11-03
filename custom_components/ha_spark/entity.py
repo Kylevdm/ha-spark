@@ -5,6 +5,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from . import authority
 from .const import DOMAIN
 from .coordinator import SparkCoordinator
 
@@ -13,6 +14,11 @@ class SparkEntity(CoordinatorEntity[SparkCoordinator]):
     """A read-only entity on the site's service device."""
 
     _attr_has_entity_name = True
+
+    @property
+    def local_authority(self) -> bool:
+        """The handshake selects the source; never infer ownership from a store."""
+        return authority.authority_owner(self.coordinator.entry) == "integration"
 
     def __init__(self, coordinator: SparkCoordinator, key: str) -> None:
         super().__init__(coordinator)

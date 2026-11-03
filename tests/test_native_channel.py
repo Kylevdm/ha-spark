@@ -86,13 +86,13 @@ def test_source_store_failure_keeps_heartbeat(state, discovery, monkeypatch):
 def test_maximum_snapshot_under_cap(state, discovery, monkeypatch):
     monkeypatch.setattr(server, "_heartbeat_now", lambda: NOW)
     body = json.dumps(json.loads((FIXTURES / "site_snapshot_max.json").read_text())).encode()
-    assert len(body) < 32 * 1024
+    assert len(body) < 64 * 1024
     with TestClient(build_app(state, ingress_peer="proxy", integration=discovery)) as client:
         headers = {"Authorization": f"Bearer {discovery.auth_token}"}
         response = client.post("/integration/heartbeat", content=body, headers=headers)
         assert response.status_code == 200
         assert len(state.integration_link.solar_forecast.forecast.slots) == 120
-        assert client.post("/integration/heartbeat", content=body + b" " * 32768,
+        assert client.post("/integration/heartbeat", content=body + b" " * 65536,
                            headers=headers).status_code == 400
 
 

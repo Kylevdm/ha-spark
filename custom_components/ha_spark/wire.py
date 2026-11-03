@@ -22,7 +22,7 @@ from math import isfinite
 from typing import Final, Literal, cast
 from uuid import UUID
 
-API_VERSION: Final = 3
+API_VERSION: Final = 4
 # Display codes the add-on sends at this api_version (its planner, SoC check and fallback).
 PLAN_MODELS: Final = frozenset({"daily", "slots"})
 PLAN_STRATEGIES: Final = frozenset({"deficit", "fill"})
@@ -33,7 +33,7 @@ SOC_STATUSES: Final = frozenset({
 FALLBACK_CAUSES: Final = frozenset({"soc_integrity"})
 
 # Every `api_version` this integration can send and accept replies to.
-SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3})
+SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3, 4})
 
 
 class MalformedSummary(ValueError):
@@ -124,6 +124,16 @@ class AuthorityBlock:
 
 
 @dataclass(frozen=True)
+class AddonAuthority:
+    """Handshake facts only; malformed or missing means unknown."""
+
+    active: Literal["active", "retired"]
+    mode: str
+    holds_present: bool
+    store_state: Literal["ok", "unknown", "save_failed"]
+
+
+@dataclass(frozen=True)
 class Summary:
     """Validated envelope and allowlisted plan/session display blocks."""
 
@@ -138,6 +148,9 @@ class Summary:
     authority: AuthorityBlock
     charge_window_start: datetime | None = None
     household_timezone: str | None = None
+    addon_authority: AddonAuthority | None = None
+    legacy_overlay: dict[str, bool] | None = None
+    export_acks: tuple[str, ...] | None = None
 
 
 def build_snapshot(
@@ -157,10 +170,23 @@ def build_snapshot(
     if api_version >= 2:
         result["solar_forecast"] = solar_forecast
     if api_version >= 3:
+        if api_version == 3 and isinstance(topology, dict):
+            document = topology.get("topology")
+            if isinstance(document, dict) and isinstance(document.get("inverters"), list):
+                # Old receivers reject unknown topology fields. Transport is a
+                # v4 handshake input, never an implicit upgrade of a v3 peer.
+                topology = topology | {"topology": document | {"inverters": [
+                    {key: value for key, value in inverter.items()
+                     if key not in {"transport", "gateway_host", "gateway_port", "gateway_unit_id"}}
+                    if isinstance(inverter, dict) else inverter
+                    for inverter in document["inverters"]
+                ]}}
         result["topology"] = topology
         result["major_loads"] = major_loads
         if supply_guard is not None:
             result["supply_guard"] = supply_guard
+    if api_version >= 4:
+        result["authority_owner"] = "addon"
     return result
 
 
@@ -261,7 +287,42 @@ def parse_summary(body: object) -> Summary:
         authority=_authority(body.get("authority")),
         charge_window_start=window,
         household_timezone=zone,
+        addon_authority=_addon_authority(body.get("addon_authority")) if version >= 4 else None,
+        legacy_overlay=_legacy_overlay(body.get("legacy_overlay")) if version >= 4 else None,
+        export_acks=_export_acks(body.get("export_acks")) if version >= 4 else None,
     )
+
+
+def _addon_authority(value: object) -> AddonAuthority | None:
+    if not isinstance(value, dict):
+        return None
+    active, mode, state = value.get("active"), value.get("mode"), value.get("store_state")
+    if (type(active) is not str or active not in {"active", "retired"}
+            or type(mode) is not str
+            or mode not in {"observe", "protect", "optimise", "authority_unknown"}
+            or type(value.get("holds_present")) is not bool
+            or type(state) is not str or state not in {"ok", "unknown", "save_failed"}):
+        return None
+    return AddonAuthority(
+        cast(Literal["active", "retired"], active), mode, value["holds_present"],
+        cast(Literal["ok", "unknown", "save_failed"], state),
+    )
+
+
+def _legacy_overlay(value: object) -> dict[str, bool] | None:
+    if (not isinstance(value, dict) or len(value) > 8
+            or any(type(key) is not str or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", key) is None
+                   or type(flag) is not bool for key, flag in value.items())):
+        return None
+    return dict(value)
+
+
+def _export_acks(value: object) -> tuple[str, ...] | None:
+    if (not isinstance(value, list) or len(value) > 512
+            or any(type(key) is not str or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", key) is None
+                   for key in value) or len(set(value)) != len(value)):
+        return None
+    return tuple(value)
 
 
 def _authority(value: object) -> AuthorityBlock:

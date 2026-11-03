@@ -23,12 +23,14 @@ from typing import Any
 
 import yaml
 
-from ha_spark.authority import OperatingMode, authority_view, load_authority
+from ha_spark.authority import authority_view, load_authority
 from ha_spark.config import _SECRET_OPTION_KEYS, ConfigError, Settings, load_settings
 from ha_spark.daemon_channel import (
     MAX_CONFIG_BYTES,
     REFUSED,
     DaemonAlreadyRunning,
+    Duration,
+    ModeTarget,
     Reply,
     submit_socket,
 )
@@ -319,6 +321,38 @@ def _print_reply(reply: Reply) -> None:
         print(f"[REFUSED] {reply.error}")
 
 
+async def _cmd_export_supervise(settings: Settings, *, ratings: list[str],
+                                event: str | None) -> int:
+    """Arm one planned Axle event with the owner's confirmed inverter ratings."""
+    values: dict[str, float] = {}
+    for item in ratings:
+        inverter, separator, raw = item.partition("=")
+        try:
+            rating = float(raw)
+        except ValueError:
+            rating = 0.0
+        if not separator or not inverter or rating <= 0 or rating != rating:
+            print("--rating must be <inverter>=<positive watts>", file=sys.stderr)
+            return 2
+        values[inverter] = rating
+    reply = await submit_socket(settings, "supervise_export", event=event, ratings_w=values)
+    if reply is None or reply.error:
+        print(REFUSED if reply is None else f"[REFUSED] {reply.error}")
+        return 1
+    print(json.dumps(reply.authority, indent=2))
+    return 0
+
+
+async def _cmd_export_end(settings: Settings, supervision_id: str) -> int:
+    """End one supervision early; the export cleanup follows the same gate."""
+    reply = await submit_socket(settings, "end_supervision", supervision_id=supervision_id)
+    if reply is None or reply.error:
+        print(REFUSED if reply is None else f"[REFUSED] {reply.error}")
+        return 1
+    print(json.dumps(reply.authority, indent=2))
+    return 0
+
+
 async def _cmd_plan(settings: Settings, *, apply: bool) -> int:
     """Print a plan; only the running daemon may apply it."""
     if apply:
@@ -461,13 +495,14 @@ async def _cmd_onboard(
         print("Import replaces non-secret inputs; merge with `ha-spark config export` first")
         print("if you want to keep other settings. Omitted secrets are unchanged.")
         print("```yaml")
-        has_mapping = False
+        # Pin the current transport: a fragment without the hub would import like a
+        # pre-0.31 export and get the legacy `solis_control` hub (#567).
+        print(f"solis_control_hub: {json.dumps(settings.solis_control_hub)}    # current")
         for p in proposals:
             resolved = _resolve_field(p, preset)
             if resolved is None:
                 continue
             entity_id, origin = resolved
-            has_mapping = True
             print(f"{p.config_field}: {entity_id}    # {origin}")
             if (
                 p.config_field == "dispatch_grid_power_entity"
@@ -475,8 +510,6 @@ async def _cmd_onboard(
             ):
                 invert = preset.get("dispatch_grid_power_invert", "false")
                 print(f"dispatch_grid_power_invert: {invert}")
-        if not has_mapping:
-            print("{}")
         print("```")
         print("ha-spark config import onboard.yaml")
 
@@ -859,7 +892,28 @@ def build_parser() -> argparse.ArgumentParser:
     mode_sub = p_mode.add_subparsers(dest="mode_command", required=True)
     mode_sub.add_parser("show")
     mode_sub.add_parser("set").add_argument("target", choices=("observe", "protect", "optimise"))
+    manual = mode_sub.add_parser("manual")
+    manual.add_argument("--duration", choices=("one_hour", "until_tomorrow", "until_resumed"),
+                        default="one_hour")
+    manual.add_argument("--no-keep-protection", action="store_true")
+    mode_sub.add_parser("resume")
     mode_sub.add_parser("confirm-observe")
+
+    p_export = sub.add_parser("export", help="Supervise a planned Axle export event")
+    export_sub = p_export.add_subparsers(dest="export_command", required=True, metavar="ACTION")
+    p_supervise = export_sub.add_parser(
+        "supervise",
+        help="Arm the current planned export event with owner-confirmed ratings",
+        description="Send the admin-only supervise_export command for the current planned "
+        "event. Every connection inverter needs its confirmed rated AC output.",
+    )
+    p_supervise.add_argument("--event", default=None,
+                             help="Planned event identity (default: the current plan's event)")
+    p_supervise.add_argument("--rating", action="append", default=[], required=True,
+                             metavar="INVERTER=W",
+                             help="Confirmed rated AC output in watts (repeat per inverter)")
+    export_sub.add_parser("end", help="End a supervision early").add_argument(
+        "supervision_id", help="Supervision id from the mode status")
 
     p_states = sub.add_parser(
         "states",
@@ -1232,7 +1286,8 @@ async def _cmd_config(settings: Settings, args: argparse.Namespace) -> int:
 
 
 async def _cmd_mode_set(
-    settings: Settings, target: OperatingMode, *, confirm: bool = False,
+    settings: Settings, target: ModeTarget, *, confirm: bool = False,
+    duration: Duration = "one_hour", keep_protection: bool = True,
 ) -> int:
     """Submit one owner request with the epoch seen; never retry a conflict."""
     epoch = None
@@ -1242,7 +1297,11 @@ async def _cmd_mode_set(
             print(REFUSED if status is None else f"[REFUSED] {status.error}")
             return 1
         epoch = status.authority.get("epoch")
-    reply = await submit_socket(settings, "mode", target=target, expected_epoch=epoch)
+    if target in ("manual", "resume"):
+        reply = await submit_socket(settings, "mode", target=target, expected_epoch=epoch,
+                                    duration=duration, keep_protection=keep_protection)
+    else:
+        reply = await submit_socket(settings, "mode", target=target, expected_epoch=epoch)
     if reply is None or reply.error:
         detail = f": {reply.text}" if reply and reply.text else ""
         print(REFUSED if reply is None else f"[REFUSED] {reply.error}{detail}")
@@ -1253,6 +1312,11 @@ async def _cmd_mode_set(
 
 async def _cmd_mode_show(settings: Settings) -> int:
     """Read authority and live entry conditions without creating or saving state."""
+    status = await submit_socket(settings, "authority_status")
+    if (status is not None and status.authority is not None
+            and status.authority.get("authority_owner") == "integration"):
+        print(json.dumps(status.authority, indent=2))
+        return 0
     loaded = load_authority(settings)
     view = authority_view(loaded.state, known=loaded.status == "known")
     view["load_status"] = loaded.status
@@ -1380,8 +1444,11 @@ def main(argv: list[str] | None = None) -> int:
                 return _cmd_mode_show_repair(suspended)
             return asyncio.run(_cmd_mode_show(settings))
         return asyncio.run(_cmd_mode_set(
-            settings, args.target if args.mode_command == "set" else "observe",
+            settings, (args.target if args.mode_command == "set" else args.mode_command
+                       if args.mode_command in ("manual", "resume") else "observe"),
             confirm=args.mode_command == "confirm-observe",
+            duration=getattr(args, "duration", "one_hour"),
+            keep_protection=not getattr(args, "no_keep_protection", False),
         ))
 
     if args.command == "health":
@@ -1479,6 +1546,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "solis":
         return asyncio.run(_cmd_solis_sync_clock(settings))
+
+    if args.command == "export":
+        if args.export_command == "supervise":
+            return asyncio.run(_cmd_export_supervise(
+                settings, ratings=args.rating, event=args.event))
+        return asyncio.run(_cmd_export_end(settings, args.supervision_id))
 
     parser.error(f"unknown command: {args.command}")
     return 2  # pragma: no cover - argparse exits first

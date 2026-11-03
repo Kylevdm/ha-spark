@@ -1,0 +1,29 @@
+{
+  "session_id": "addon-session",
+  "epoch": 7,
+  "sequence": 1,
+  "kind": "apply",
+  "payload": {
+    "intents": [
+      {"kind": "export", "inverter_id": "inverter", "request": "none"},
+      {"kind": "export", "inverter_id": "inverter", "request": "untrusted"},
+      {
+        "kind": "export",
+        "inverter_id": "inverter",
+        "request": "window",
+        "event": {
+          "direction": "export",
+          "start": "2026-10-31T17:00:00Z",
+          "end": "2026-10-31T18:00:00Z"
+        },
+        "window": {
+          "start": "2026-10-31T17:00:00Z",
+          "end": "2026-10-31T18:00:00Z"
+        },
+        "planned_export_kw": 3.0,
+        "dno_export_limit_kw": 3.68,
+        "soc": {"ok": true, "soc_pct": 40.0, "observed_at": "2026-10-31T16:59:00Z"}
+      }
+    ]
+  }
+}

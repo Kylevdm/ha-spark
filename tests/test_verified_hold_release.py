@@ -17,6 +17,8 @@ from tests.test_solis_power_switch import (
     _seed_owned_hold,
 )
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 def _without_refusal(holds):
     return tuple(

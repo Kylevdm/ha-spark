@@ -108,7 +108,7 @@ async def test_setup_down(hass: HomeAssistant, aioclient_mock: AiohttpClientMock
 async def test_snapshot_and_device(
     hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, freezer: FrozenDateTimeFactory,
 ) -> None:
-    snapshot = fixture("site_snapshot")
+    snapshot = fixture("site_snapshot_v4")
     freezer.move_to(snapshot["sent_at"])
     aioclient_mock.post(URL, json=summary())
     entry = await setup(hass)
@@ -161,7 +161,7 @@ async def test_liveness_outcomes(
         elif outcome == "session":
             body["session_id"] = "another-session"
         elif outcome == "incompatible":
-            body["api_version"] = 4
+            body["api_version"] = 5
         aioclient_mock.post(URL, json=body)
     await coordinator.async_refresh()
     expected = {

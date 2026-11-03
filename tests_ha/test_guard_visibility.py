@@ -195,7 +195,7 @@ async def test_guard_change_sends_an_immediate_heartbeat(
     block = body["supply_guard"]
     assert block == {
         "limiting": True,
-        "connections": [{"id": "grid", "allowance_kw": 1.0}],
+        "connections": [{"id": "grid", "allowance_kw": 1.0, "writer": False}],
         "restores_left": 48,
         "revision": 1,
     }

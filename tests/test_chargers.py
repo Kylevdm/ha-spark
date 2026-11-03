@@ -24,6 +24,8 @@ from ha_spark.ha.rest import HomeAssistantRest, HomeAssistantRestError
 from tests.authority_helpers import legacy_settings as Settings
 from tests.authority_helpers import seed_authority
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 def _settings(**overrides: object) -> Settings:
     defaults: dict[str, object] = {

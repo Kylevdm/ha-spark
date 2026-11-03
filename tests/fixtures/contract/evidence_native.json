@@ -1,0 +1,9 @@
+{
+  "ev_status": {"source": "entity", "entity_id": "sensor.ev_status", "max_age_s": 300},
+  "battery_direction": {"source": "native", "max_age_s": 300},
+  "ev_plug": {"source": "entity", "entity_id": "sensor.ev_plug", "max_age_s": 300},
+  "ev_power": {"source": "entity", "entity_id": "sensor.ev_power", "max_age_s": 300},
+  "live_dispatch": {"source": "entity", "entity_id": "binary_sensor.dispatch", "max_age_s": 300},
+  "adjusted_rate": {"source": "entity", "entity_id": "sensor.adjusted_rate", "max_age_s": 300},
+  "dispatch_grid_power": {"source": "entity", "entity_id": "sensor.grid_power", "max_age_s": 300}
+}

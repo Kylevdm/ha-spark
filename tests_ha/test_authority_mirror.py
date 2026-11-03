@@ -37,7 +37,8 @@ async def test_authority_fixture_entities(
         assert registered.device_id is not None
     mode = hass.states.get(IDS["operating_mode"])
     assert mode is not None
-    assert mode.attributes["options"] == ["observe", "protect", "optimise", "authority_unknown"]
+    assert mode.attributes["options"] == ["observe", "protect", "optimise", "activating",
+                                          "switching_to_observe", "authority_unknown"]
     assert mode.attributes["transition_target"] is None
     assert mode.attributes["last_changed_at"] is None
     assert mode.attributes["save_failed"] is False

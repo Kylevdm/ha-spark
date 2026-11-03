@@ -28,6 +28,9 @@ class FakeWriter:
 
 def test_proportional_share_rounds_down() -> None:
     site = topology()
+    site = site.model_copy(update={"banks": tuple(
+        b.model_copy(update={"one_way_charge_efficiency": 1.0}) for b in site.banks
+    )})
     a, b = site.inverters
     bank = site.banks[0]
     intent = clamp_intent(DeviceIntent(a.id, bank.id, 40), allowance_kw=3,

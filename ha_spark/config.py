@@ -650,10 +650,10 @@ class Settings(BaseSettings):
     # writes the timed-slot registers through (`modbus.write_register`) and reads
     # back via its `sensor.<hub>_*` entities. The window/current/work-mode
     # registers are fixed in the driver (docs/solis-control-modbus-overlay.yaml).
+    # Empty from 0.31 (no control path); a pre-0.31 store or export that omits it
+    # and configures a legacy Solis keeps `solis_control` (settings_service, #567).
     solis_model_confirmed: Annotated[bool, _metadata("integration")] = False
-    solis_control_hub: Annotated[str, _metadata("integration", "restart")] = Field(
-        default="solis_control"
-    )
+    solis_control_hub: Annotated[str, _metadata("integration", "restart")] = Field(default="")
     solis_modbus_slave: Annotated[int, _metadata("integration", "restart")] = Field(default=1)
     # How far the inverter clock may disagree with the household clock before
     # an export window is refused and `health` warns (#155/#161).

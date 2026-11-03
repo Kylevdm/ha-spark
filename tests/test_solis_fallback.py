@@ -28,6 +28,8 @@ from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from tests.authority_helpers import legacy_settings as Settings
 from tests.test_solis_power_switch import FakeRest, _device, _export, _register_writes, _soc
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 # One invalid case per entry: (id, settings overrides, expected reason substring).
 # Overrides land via model_copy, so cases pydantic itself would refuse (nan,
 # above the register limit) still reach the pure validator.

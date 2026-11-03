@@ -12,6 +12,22 @@ import pytest
 # directory also holds a `custom_components` package, and an import that lands
 # there first would hide the integration from Home Assistant's loader.
 import custom_components  # noqa: F401
+from tests_ha.fake_solis import FakeSolisDevice
+
+
+@pytest.fixture(autouse=True)
+def native_transport(monkeypatch: pytest.MonkeyPatch) -> FakeSolisDevice:
+    """No native setup in this suite may open a socket."""
+    from custom_components.ha_spark import native
+
+    device = FakeSolisDevice()
+    device.set_identity()
+    def factory(host: str, port: int) -> FakeSolisDevice:
+        device.connected = True
+        return device
+
+    monkeypatch.setattr(native, "transport_factory", factory)
+    return device
 
 
 @pytest.fixture(autouse=True)

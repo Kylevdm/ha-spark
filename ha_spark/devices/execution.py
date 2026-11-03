@@ -21,7 +21,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, Protocol, TypeVar
 from weakref import WeakKeyDictionary
 
-from ha_spark.authority import HoldDevice
+from ha_spark.authority import HoldDevice, retirement_status
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -70,6 +70,8 @@ class WriteGate:
         self.context = context
 
     def mode_for(self, ownership: Ownership, config: DeviceConfig, settings: Settings) -> str:
+        if retirement_status(settings) is not None:
+            return "refuse:authority unknown"
         store = self.context.authority
         if store is None or store.save_failed or not store.known:
             return "refuse:authority unknown"

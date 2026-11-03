@@ -70,6 +70,7 @@ async def async_get_config_entry_diagnostics(
             "addon_api_version": None,
             "solcast": _solcast_health(entry, None),
             "supply_guard": None,
+            "last_refusal": None,
         }
     return {
         "entry": redacted,
@@ -79,6 +80,7 @@ async def async_get_config_entry_diagnostics(
             ).items() if key != "session_id"}
             if coordinator.summary is not None else None
         ),
+        "last_refusal": coordinator.ownership.last_refusal,
         "last_outcome": coordinator.last_outcome,
         "last_outcome_at": (
             coordinator.last_outcome_at.isoformat() if coordinator.last_outcome_at else None

@@ -13,18 +13,23 @@ from datetime import UTC, datetime, time
 
 import pytest
 
+from ha_spark.devices.execution import execution_context
 from ha_spark.devices.inverters.solis import (
     FIXED_EXPORT_REFUSAL,
     FallbackSchedule,
     SolisDevice,
+    legacy_limits,
     validate_fallback_schedule,
 )
 from ha_spark.energy.models import ChargeIntent
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.supply_guard import SupplyGuard
+from ha_spark.energy.topology_record import LoadedTopology
 from tests.authority_helpers import legacy_settings as Settings
 from tests.test_solis_export import FakeRest, _export
 from tests.test_solis_export import _intent as _export_intent
+
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
 
 
 @pytest.fixture(autouse=True)
@@ -212,7 +217,9 @@ class _GuardRest(FakeRest):
 
 
 @pytest.mark.asyncio
-async def test_daemon_guard_cuts_to_the_effective_connection_import(tmp_path) -> None:
+async def test_daemon_guard_cuts_to_the_effective_connection_import(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # 20 A x 240 V = 4800 W of import; 4000 W other load + 1020 W charging.
     # The battery gets 800 W: 800 / 51 = 15.7 A, rounded down to 15 A.
     settings = Settings(
@@ -224,7 +231,19 @@ async def test_daemon_guard_cuts_to_the_effective_connection_import(tmp_path) ->
     )
     rest = _GuardRest(supply_w=5020.0, setpoint_a=20.0)
 
-    line = await SupplyGuard(settings, rest).tick(2000.0)  # type: ignore[arg-type]
+    limits = legacy_limits(settings)
+    assert limits is not None
+    site = limits[0]
+    site = site.model_copy(update={"banks": (
+        site.banks[0].model_copy(update={"one_way_charge_efficiency": 1.0}),
+    )})
+    context = execution_context()
+    monkeypatch.setattr(context, "limits_record", LoadedTopology("native", 1, site))
+    token = context.planned_limits.set(context.limits_key())
+    try:
+        line = await SupplyGuard(settings, rest).tick(2000.0)  # type: ignore[arg-type]
+    finally:
+        context.planned_limits.reset(token)
 
     assert line is not None
     assert _current_writes(rest) == [150]
