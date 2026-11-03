@@ -61,6 +61,11 @@ def test_v4_summary_golden() -> None:
     assert parsed.authority == wire.parse_summary(fixture("plan_summary")).authority
 
 
+def test_v4_summary_export_ack_golden() -> None:
+    parsed = wire.parse_summary(fixture("plan_summary_v4_export_acks"))
+    assert parsed.export_acks == ("transition_0", "transition_1", "transition_2")
+
+
 @pytest.mark.parametrize("key", ["addon_authority", "legacy_overlay", "export_acks"])
 @pytest.mark.parametrize("value", [None, "SECRET", [], True])
 def test_malformed_summary_field_is_unknown(key: str, value: object) -> None:

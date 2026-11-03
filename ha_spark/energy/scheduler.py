@@ -142,6 +142,7 @@ from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
+from ha_spark.energy.native_export_notices import notify_export_transitions
 from ha_spark.energy.plan_run import PlanRun, StoredPlanRun, current_plan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.energy.readiness import readiness_tick
@@ -2090,6 +2091,12 @@ async def _run_paired(
                         log.warning("%s; hardware writes refused", fault)
                         await send_notification(settings, rest, "ha-spark authority fault", fault)
                     await notify_remapped_holds(settings, rest)
+                    if retired:
+                        await notify_export_transitions(
+                            settings, rest, state.integration_link,
+                            acknowledged=state.acknowledged_exports,
+                            planned_for=state.export_notice_context,
+                        )
             except Exception:
                 log.warning("Authority notification failed")
             faults = current_faults

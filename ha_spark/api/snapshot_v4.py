@@ -226,14 +226,16 @@ class StopLatch(FrozenModel):
 
 
 class ExportTransition(FrozenModel):
-    """Bounded ordered notice log entry."""
+    """Bounded ordered notice log entry; the event survives an outage."""
 
     id: SafeId
     kind: Literal[
         "accepted", "armed", "started", "cleanup_verified", "aborted", "clock_hold", "tripped"
     ]
+    event: Event
     at: Instant
     reason: Code | None
+    cleared: bool | None = None
 
 
 class Export(FrozenModel):

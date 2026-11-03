@@ -12,6 +12,7 @@ so neither half can move a contract version alone.
 """
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from typing import Final
@@ -187,6 +188,7 @@ def plan_summary(
     soc_observation_ok: bool = False, session: V2LSession | None = None,
     settings: Settings | None = None, authority: AuthorityInputs | None = None,
     guard_limited: bool = False, topology: LoadedTopology | None = None,
+    export_acks: Iterable[str] = (),
 ) -> dict[str, object]:
     """Project the envelope and allowlisted display numbers for the request's api_version."""
     result: dict[str, object] = {
@@ -243,7 +245,7 @@ def plan_summary(
             for inverter in (topology.topology.inverters
                              if topology is not None and topology.topology is not None else ())
         }
-        result["export_acks"] = []
+        result["export_acks"] = list(export_acks)
     return result
 
 

@@ -23,7 +23,7 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from . import wire
+from . import native_export_log, wire
 from .authority import AuthorityStore
 from .authority_control import AuthorityControl
 from .authority_store import ExportSupervision
@@ -78,6 +78,8 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         super().__init__(hass, _LOGGER, config_entry=entry, name="ha-spark",
                          update_interval=timedelta(seconds=30))
         self.entry = entry
+        # Transition ids offered in the last snapshot built; only these may be acked.
+        self.emitted_transitions: frozenset[str] = frozenset()
         self.authority = AuthorityStore(hass, entry.entry_id, self.async_update_listeners)
         self.control = AuthorityControl(entry, self.authority)
         self.ownership = OwnershipStore(
@@ -291,9 +293,15 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             ))
         # Re-supervising the same event replaces its rows; other events stay.
         kept = tuple(row for row in state.export_supervisions if row.event != event)
-        if not await self.authority.async_save(state.model_copy(update={
+        candidate = state.model_copy(update={
             "export_supervisions": kept + tuple(rows), "last_changed_at": now,
-        })):
+        })
+        for row in rows:
+            candidate = native_export_log.with_append(
+                candidate, inverter_id=row.inverter_id, event=event,
+                kind="accepted", at=now,
+            )
+        if not await self.authority.async_save(candidate):
             return base.model_copy(update={"reason": "authority_unknown"})
         return base.model_copy(update={"outcome": "applied", "reason": None,
                                        "epoch": state.epoch})
@@ -346,7 +354,16 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         """End event-scoped supervisions; the cleanup obligation is separate."""
         async with self.control.lock:
             state = self.authority.state
-            if state is None or not state.export_supervisions:
+            if state is None:
+                return
+            pruned = native_export_log.with_pruned(state, now)
+            if pruned is not state:
+                if not await self.authority.async_save(pruned):
+                    return
+                state = self.authority.state
+                if state is None:
+                    return
+            if not state.export_supervisions:
                 return
             kept = tuple(row for row in state.export_supervisions if row.ends_at > now)
             if len(kept) == len(state.export_supervisions):
@@ -354,6 +371,21 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             await self.authority.async_save(state.model_copy(update={
                 "export_supervisions": kept, "last_changed_at": now,
             }))
+
+    async def _async_ack_export_transitions(
+        self, acks: tuple[str, ...] | None, now: datetime,
+    ) -> None:
+        """Acknowledged ids hide/prune rows; they never change control state."""
+        if not acks:
+            return
+        async with self.control.lock:
+            state = self.authority.state
+            if state is None:
+                return
+            emitted = [ack for ack in acks if ack in self.emitted_transitions]
+            candidate = native_export_log.with_acks(state, emitted, now)
+            if candidate is not state:
+                await self.authority.async_save(candidate)
 
     async def async_retry_export_records(self, now: datetime) -> None:
         """Retry every non-live, non-cleared record while committed Optimise."""
@@ -617,6 +649,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             try:
                 snapshot["export"] = self._export_snapshot(state, topology)
             except Exception:  # noqa: BLE001 - a bad export view never blocks the heartbeat
+                self.emitted_transitions = frozenset()
                 snapshot.pop("export", None)
 
     def _export_snapshot(self, state: Any, topology: Topology) -> list[dict[str, object]]:
@@ -627,6 +660,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         banks = {bank.id: bank for bank in topology.banks}
         years = state.export_supervisions
         entries: list[dict[str, object]] = []
+        emitted: set[str] = set()
         for inverter in topology.inverters:
             if inverter.transport != "native":
                 continue
@@ -651,12 +685,13 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                          "validated": reason is None, "reason": reason}
             latch = latest_latch(state.stop_latches, inverter.id)
             transitions = [
-                {"id": str(row.id),
-                 "kind": ("clock_hold" if row.kind == "retryable_clock_hold" else row.kind),
+                {"id": str(row.id), "kind": row.kind,
+                 "event": snapshot_event(row.event),
                  "at": row.at.isoformat(),
-                 "reason": row.reason}
-                for row in state.export_transitions if row.inverter_id == inverter.id
+                 "reason": row.reason, "cleared": row.cleared}
+                for row in native_export_log.visible(state.export_transitions, inverter.id)
             ]
+            emitted.update(str(row["id"]) for row in transitions)
             entries.append({
                 "inverter_id": inverter.id,
                 "bound": bound,
@@ -682,6 +717,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                 } if latch is not None else None),
                 "transitions": transitions,
             })
+        self.emitted_transitions = frozenset(emitted)
         return entries
 
     async def _async_update_data(self) -> bool:
@@ -773,6 +809,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             self.summary = summary
             if summary is not None:
                 await self.ownership.async_advance(summary)
+                await self._async_ack_export_transitions(summary.export_acks, now)
             self.native.recheck()
             self.async_commands_pending()
             self._clear_deadline()

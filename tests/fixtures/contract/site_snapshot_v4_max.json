@@ -1534,46 +1534,100 @@
       },
       "transitions": [
         {
-          "id": "transition_0",
+          "id": "00000000-0000-0000-0000-000000000001",
           "kind": "accepted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_1",
+          "id": "00000000-0000-0000-0000-000000000002",
           "kind": "armed",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_2",
+          "id": "00000000-0000-0000-0000-000000000003",
           "kind": "started",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_3",
+          "id": "00000000-0000-0000-0000-000000000004",
           "kind": "cleanup_verified",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_4",
+          "id": "00000000-0000-0000-0000-000000000005",
           "kind": "aborted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         },
         {
-          "id": "transition_5",
+          "id": "00000000-0000-0000-0000-000000000006",
           "kind": "clock_hold",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "clock_not_trusted",
+          "cleared": null
         },
         {
-          "id": "transition_6",
+          "id": "00000000-0000-0000-0000-000000000007",
           "kind": "tripped",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000008",
+          "kind": "aborted",
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         }
       ]
     },
@@ -1624,46 +1678,100 @@
       },
       "transitions": [
         {
-          "id": "transition_0",
+          "id": "00000000-0000-0000-0000-000000000009",
           "kind": "accepted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_1",
+          "id": "00000000-0000-0000-0000-00000000000a",
           "kind": "armed",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_2",
+          "id": "00000000-0000-0000-0000-00000000000b",
           "kind": "started",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_3",
+          "id": "00000000-0000-0000-0000-00000000000c",
           "kind": "cleanup_verified",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_4",
+          "id": "00000000-0000-0000-0000-00000000000d",
           "kind": "aborted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         },
         {
-          "id": "transition_5",
+          "id": "00000000-0000-0000-0000-00000000000e",
           "kind": "clock_hold",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "clock_not_trusted",
+          "cleared": null
         },
         {
-          "id": "transition_6",
+          "id": "00000000-0000-0000-0000-00000000000f",
           "kind": "tripped",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000010",
+          "kind": "aborted",
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         }
       ]
     },
@@ -1714,46 +1822,100 @@
       },
       "transitions": [
         {
-          "id": "transition_0",
+          "id": "00000000-0000-0000-0000-000000000011",
           "kind": "accepted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_1",
+          "id": "00000000-0000-0000-0000-000000000012",
           "kind": "armed",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_2",
+          "id": "00000000-0000-0000-0000-000000000013",
           "kind": "started",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_3",
+          "id": "00000000-0000-0000-0000-000000000014",
           "kind": "cleanup_verified",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_4",
+          "id": "00000000-0000-0000-0000-000000000015",
           "kind": "aborted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         },
         {
-          "id": "transition_5",
+          "id": "00000000-0000-0000-0000-000000000016",
           "kind": "clock_hold",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "clock_not_trusted",
+          "cleared": null
         },
         {
-          "id": "transition_6",
+          "id": "00000000-0000-0000-0000-000000000017",
           "kind": "tripped",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000018",
+          "kind": "aborted",
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         }
       ]
     },
@@ -1804,46 +1966,100 @@
       },
       "transitions": [
         {
-          "id": "transition_0",
+          "id": "00000000-0000-0000-0000-000000000019",
           "kind": "accepted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_1",
+          "id": "00000000-0000-0000-0000-00000000001a",
           "kind": "armed",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_2",
+          "id": "00000000-0000-0000-0000-00000000001b",
           "kind": "started",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_3",
+          "id": "00000000-0000-0000-0000-00000000001c",
           "kind": "cleanup_verified",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_4",
+          "id": "00000000-0000-0000-0000-00000000001d",
           "kind": "aborted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         },
         {
-          "id": "transition_5",
+          "id": "00000000-0000-0000-0000-00000000001e",
           "kind": "clock_hold",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "clock_not_trusted",
+          "cleared": null
         },
         {
-          "id": "transition_6",
+          "id": "00000000-0000-0000-0000-00000000001f",
           "kind": "tripped",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000020",
+          "kind": "aborted",
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         }
       ]
     },
@@ -1894,46 +2110,100 @@
       },
       "transitions": [
         {
-          "id": "transition_0",
+          "id": "00000000-0000-0000-0000-000000000021",
           "kind": "accepted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_1",
+          "id": "00000000-0000-0000-0000-000000000022",
           "kind": "armed",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_2",
+          "id": "00000000-0000-0000-0000-000000000023",
           "kind": "started",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_3",
+          "id": "00000000-0000-0000-0000-000000000024",
           "kind": "cleanup_verified",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_4",
+          "id": "00000000-0000-0000-0000-000000000025",
           "kind": "aborted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         },
         {
-          "id": "transition_5",
+          "id": "00000000-0000-0000-0000-000000000026",
           "kind": "clock_hold",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "clock_not_trusted",
+          "cleared": null
         },
         {
-          "id": "transition_6",
+          "id": "00000000-0000-0000-0000-000000000027",
           "kind": "tripped",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000028",
+          "kind": "aborted",
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         }
       ]
     },
@@ -1984,46 +2254,100 @@
       },
       "transitions": [
         {
-          "id": "transition_0",
+          "id": "00000000-0000-0000-0000-000000000029",
           "kind": "accepted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_1",
+          "id": "00000000-0000-0000-0000-00000000002a",
           "kind": "armed",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_2",
+          "id": "00000000-0000-0000-0000-00000000002b",
           "kind": "started",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_3",
+          "id": "00000000-0000-0000-0000-00000000002c",
           "kind": "cleanup_verified",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_4",
+          "id": "00000000-0000-0000-0000-00000000002d",
           "kind": "aborted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         },
         {
-          "id": "transition_5",
+          "id": "00000000-0000-0000-0000-00000000002e",
           "kind": "clock_hold",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "clock_not_trusted",
+          "cleared": null
         },
         {
-          "id": "transition_6",
+          "id": "00000000-0000-0000-0000-00000000002f",
           "kind": "tripped",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000030",
+          "kind": "aborted",
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         }
       ]
     },
@@ -2074,46 +2398,100 @@
       },
       "transitions": [
         {
-          "id": "transition_0",
+          "id": "00000000-0000-0000-0000-000000000031",
           "kind": "accepted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_1",
+          "id": "00000000-0000-0000-0000-000000000032",
           "kind": "armed",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_2",
+          "id": "00000000-0000-0000-0000-000000000033",
           "kind": "started",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_3",
+          "id": "00000000-0000-0000-0000-000000000034",
           "kind": "cleanup_verified",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_4",
+          "id": "00000000-0000-0000-0000-000000000035",
           "kind": "aborted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         },
         {
-          "id": "transition_5",
+          "id": "00000000-0000-0000-0000-000000000036",
           "kind": "clock_hold",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "clock_not_trusted",
+          "cleared": null
         },
         {
-          "id": "transition_6",
+          "id": "00000000-0000-0000-0000-000000000037",
           "kind": "tripped",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000038",
+          "kind": "aborted",
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         }
       ]
     },
@@ -2164,46 +2542,100 @@
       },
       "transitions": [
         {
-          "id": "transition_0",
+          "id": "00000000-0000-0000-0000-000000000039",
           "kind": "accepted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_1",
+          "id": "00000000-0000-0000-0000-00000000003a",
           "kind": "armed",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_2",
+          "id": "00000000-0000-0000-0000-00000000003b",
           "kind": "started",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_3",
+          "id": "00000000-0000-0000-0000-00000000003c",
           "kind": "cleanup_verified",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
         },
         {
-          "id": "transition_4",
+          "id": "00000000-0000-0000-0000-00000000003d",
           "kind": "aborted",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         },
         {
-          "id": "transition_5",
+          "id": "00000000-0000-0000-0000-00000000003e",
           "kind": "clock_hold",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "clock_not_trusted",
+          "cleared": null
         },
         {
-          "id": "transition_6",
+          "id": "00000000-0000-0000-0000-00000000003f",
           "kind": "tripped",
-          "at": "2026-10-24T11:59:58+00:00",
-          "reason": null
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": null,
+          "cleared": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000040",
+          "kind": "aborted",
+          "event": {
+            "direction": "export",
+            "start": "2026-10-24T12:00:00+00:00",
+            "end": "2026-10-24T13:00:00+00:00"
+          },
+          "at": "2026-10-24T11:59:58.123456+00:00",
+          "reason": "export_bounds_exceed_site_limit",
+          "cleared": false
         }
       ]
     }

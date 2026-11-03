@@ -194,6 +194,8 @@ class AppState:
         self.commands = CommandQueue("")
         self.loop_tick: datetime | None = None
         self.soc_observation_ok: bool = False
+        # Ids of export transitions already notified (or knowingly left unsent).
+        self.acknowledged_exports: set[str] = set()
         if executor is not None:
             executor.native_request = self.native_request
             executor.native_status = self.native_status
@@ -249,6 +251,24 @@ class AppState:
         return {"id": identity, "start": start.astimezone(UTC).isoformat(),
                 "end": end.astimezone(UTC).isoformat(),
                 "inverters": [d.id for d in devices if d.transport == "native"]}
+
+    def export_notice_context(self, event_id: str) -> tuple[float | None, float | None]:
+        """The add-on's own planned figures for this identity, else unknown."""
+        planned = self._planned_export()
+        if planned is None or planned[1] != event_id:
+            return None, None
+        export, _identity = planned
+        return export.planned_export_kw, export.dno_export_limit_kw
+
+    def export_acks(self) -> list[str]:
+        """Acknowledge only ids still offered by the latest accepted snapshot."""
+        link = self.integration_link
+        if link.v4 is None:
+            return []
+        present = dict.fromkeys(row.id for entry in link.v4.export
+                                for row in entry.transitions)
+        return [row_id for row_id in present
+                if row_id in self.acknowledged_exports][:512]
 
     async def native_request(self, request: DaemonRequest, user: str | None) -> Reply | None:
         view = self.native_status()
@@ -1123,6 +1143,7 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
             session=(v2l.load_session(state.settings) if state.settings.v2l_power_entity else None),
             settings=state.settings, authority=authority,
             guard_limited=guard is not None and guard.limiting, topology=topology,
+            export_acks=state.export_acks(),
         )
         if v4 is not None and v4.owner == "integration":
             summary["commands_pending"] = bool(state.commands.pending)

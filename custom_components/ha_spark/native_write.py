@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from homeassistant.util import dt as dt_util
 from pydantic import ValidationError
 
+from . import native_export_log
 from .authority_store import EventIdentity, ExportRecord, ExportSupervision
 from .authority_store import ExportWindow as StoredWindow
 from .clamp import DeviceIntent, clamp_intent
@@ -37,6 +38,7 @@ from .native_export import (
     bound_refusal,
     claim_from_raw,
     clock_face,
+    event_from_raw,
     export_not_yet_armed,
     fixed_export_refusal,
     latest_record,
@@ -282,6 +284,7 @@ class NativeChargeBoundary:
         results: list[IntentResult | None] = [None] * len(raw_intents)
         kinds: list[str | None] = []
         malformed: set[str] = set()
+        malformed_events: dict[str, EventIdentity | None] = {}
         parsed: list[tuple[str, ChargeCurrentLimit | ChargeWindow | ExportNone
                            | ExportUntrusted | ExportWindow, int]] = []
         for index, raw in enumerate(raw_intents):
@@ -303,6 +306,7 @@ class NativeChargeBoundary:
                         and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", inverter_id)):
                     # A malformed export still clears its inverter's discharge half.
                     malformed.add(inverter_id)
+                    malformed_events[inverter_id] = event_from_raw(raw.get("event"))
                     parsed.append((kind, ExportNone(kind="export", inverter_id=inverter_id,
                                                     request="none"), index))
                 continue
@@ -336,7 +340,8 @@ class NativeChargeBoundary:
                 try:
                     group = await self._async_export_group(
                         entries, epoch=command.epoch, mismatches=mismatches, fixed=reason,
-                        malformed=inverter_id in malformed)
+                        malformed=inverter_id in malformed,
+                        malformed_event=malformed_events.get(inverter_id))
                 except Exception:
                     self.written_a.pop(inverter_id, None)
                     group = {index: IntentResult(outcome="failed")
@@ -392,7 +397,10 @@ class NativeChargeBoundary:
         return record
 
     async def _save_export_record(self, inverter_id: str, record: ExportRecord | None,
-                                  now: datetime) -> bool:
+                                  now: datetime, *, event: EventIdentity | None = None,
+                                  kind: native_export_log.TransitionKind | None = None,
+                                  reason: str | None = None,
+                                  cleared: bool | None = None) -> bool:
         state = self.coordinator.authority.state
         if state is None:
             return False
@@ -400,9 +408,52 @@ class NativeChargeBoundary:
                         if row.inverter_id != inverter_id)
         if record is not None:
             records += (record,)
-        return await self.coordinator.authority.async_save(state.model_copy(update={
+        candidate = state.model_copy(update={
             "export_records": records, "last_changed_at": now,
-        }))
+        })
+        if event is not None and kind is not None:
+            candidate = native_export_log.with_append(
+                candidate, inverter_id=inverter_id, event=event, kind=kind, at=now,
+                reason=reason, cleared=cleared)
+        return await self.coordinator.authority.async_save(candidate)
+
+    async def _save_transition(self, inverter_id: str, event: EventIdentity | None,
+                               kind: native_export_log.TransitionKind, now: datetime, *,
+                               reason: str | None = None,
+                               cleared: bool | None = None) -> None:
+        """Best effort: a log save never changes the result of the write it describes."""
+        if event is None:
+            return
+        state = self.coordinator.authority.state
+        if state is None:
+            return
+        candidate = native_export_log.with_append(
+            state, inverter_id=inverter_id, event=event, kind=kind, at=now,
+            reason=reason, cleared=cleared)
+        if candidate is not state:
+            await self.coordinator.authority.async_save(candidate)
+
+    async def _save_abort(self, inverter_id: str, event: EventIdentity | None,
+                          now: datetime, reason: str, *, cleared: bool) -> None:
+        await self._save_transition(inverter_id, event, "aborted", now,
+                                    reason=reason, cleared=cleared)
+
+    async def _log_refusal(self, inverter_id: str, event: EventIdentity | None,
+                           now: datetime, reason: str | None, *, cleared: bool) -> None:
+        """Deferral and untrusted holds never abort; the clock hold is retryable."""
+        if reason is None or reason == "hold_data_untrusted":
+            return
+        if reason == "clock_not_trusted":
+            await self._save_transition(inverter_id, event, "clock_hold", now, reason=reason)
+            return
+        await self._save_abort(inverter_id, event, now, reason, cleared=cleared)
+
+    def _latest_event(self, inverter_id: str) -> EventIdentity | None:
+        state = self.coordinator.authority.state
+        if state is None:
+            return None
+        record = latest_record(state.export_records, inverter_id)
+        return None if record is None else record.event
 
     async def _mark_cleared(self, inverter_id: str, now: datetime) -> bool:
         """A verified clear is the only thing that retires a record."""
@@ -411,8 +462,11 @@ class NativeChargeBoundary:
             return False
         records = list(state.export_records)
         found = False
+        cleanup_event: EventIdentity | None = None
         for index, row in enumerate(records):
             if row.inverter_id == inverter_id and row.state != "cleared":
+                if row.state in ("armed", "active", "preserved", "stop_pending"):
+                    cleanup_event = row.event
                 records[index] = row.model_copy(update={
                     "state": "cleared", "cleanup_verified": True,
                     "last_reconcile_at": now,
@@ -420,9 +474,14 @@ class NativeChargeBoundary:
                 found = True
         if not found:
             return True
-        return await self.coordinator.authority.async_save(state.model_copy(update={
+        candidate = state.model_copy(update={
             "export_records": tuple(records), "last_changed_at": now,
-        }))
+        })
+        if cleanup_event is not None:
+            candidate = native_export_log.with_append(
+                candidate, inverter_id=inverter_id, event=cleanup_event,
+                kind="cleanup_verified", at=now)
+        return await self.coordinator.authority.async_save(candidate)
 
     @staticmethod
     def _same_event(first: EventIdentity, second: EventIdentity) -> bool:
@@ -625,11 +684,13 @@ class NativeChargeBoundary:
         self, entries: list[tuple[str, ChargeCurrentLimit | ChargeWindow | ExportNone
                                  | ExportUntrusted | ExportWindow, int]],
         *, epoch: int, mismatches: set[str], fixed: str | None, malformed: bool = False,
+        malformed_event: EventIdentity | None = None,
     ) -> dict[int, IntentResult]:
         """Export state changes serialise with every other authority save (control.lock)."""
         async with self.coordinator.control.lock:
             return await self._async_export_group_controlled(
-                entries, epoch=epoch, mismatches=mismatches, fixed=fixed, malformed=malformed)
+                entries, epoch=epoch, mismatches=mismatches, fixed=fixed, malformed=malformed,
+                malformed_event=malformed_event)
 
     def _export_write_reason(self, inverter: Inverter, epoch: int,
                              event: EventIdentity) -> WriteReason | None:
@@ -651,6 +712,7 @@ class NativeChargeBoundary:
         self, entries: list[tuple[str, ChargeCurrentLimit | ChargeWindow | ExportNone
                                  | ExportUntrusted | ExportWindow, int]],
         *, epoch: int, mismatches: set[str], fixed: str | None, malformed: bool,
+        malformed_event: EventIdentity | None = None,
     ) -> dict[int, IntentResult]:
         """One guard-lock transaction per inverter, in the oracle's export order."""
         from .native_slots import NativeSlots
@@ -690,7 +752,7 @@ class NativeChargeBoundary:
                 failure: Literal["unverified", "failed"] | None = None
                 half = [0, 0, 0, 0]
                 refusal: WriteReason | None = None
-                event: EventIdentity | None = None
+                event: EventIdentity | None = malformed_event
                 supervision: ExportSupervision | None = None
                 if isinstance(request, ExportWindow):
                     event = self._resolved_event(request)
@@ -713,6 +775,8 @@ class NativeChargeBoundary:
                         elif (not request.soc.ok or not hasattr(c, "soc")
                               or not c.soc.trusted(inverter.bank_id)):
                             # The SoC gate never writes (oracle's early BLOCKED).
+                            await self._save_abort(inverter.id, event, now, "untrusted_soc",
+                                                   cleared=False)
                             return {index: IntentResult(outcome="refused",
                                                         reason="untrusted_soc")
                                     for _, _, index in entries}
@@ -831,11 +895,13 @@ class NativeChargeBoundary:
                     ready = False
                 if ready:
                     assert isinstance(request, ExportWindow)
+                    assert event is not None
                     active = now.astimezone(UTC) >= request.window.start.astimezone(UTC)
                     saved = await self._save_export_record(inverter.id, record.model_copy(
                         update={"state": "active" if active else "armed",
                                 "cleanup_verified": False,
-                                "last_reconcile_at": now}), now)
+                                "last_reconcile_at": now}), now,
+                        event=event, kind="started" if active else "armed")
                     if not saved:
                         results[export_index] = IntentResult(outcome="unverified")
                     else:
@@ -850,6 +916,11 @@ class NativeChargeBoundary:
                     cleanup = (slot_result if slot_result is not None
                                else await self._cleanup_locked(inverter, slots, now))
                     if cleanup.outcome in ("unverified", "failed"):
+                        await self._log_refusal(
+                            inverter.id, event or self._latest_event(inverter.id), now,
+                            None if deferred else ("invalid_intent" if malformed else
+                                                   failure or refusal or cleanup.outcome),
+                            cleared=False)
                         results[export_index] = IntentResult(outcome="unverified")
                         return results
                 if malformed:
@@ -865,6 +936,11 @@ class NativeChargeBoundary:
                 else:
                     results[export_index] = IntentResult(
                         outcome=cleanup.outcome, reason=cleanup.reason)
+                if not keep and not deferred:
+                    await self._log_refusal(
+                        inverter.id, event or self._latest_event(inverter.id), now,
+                        "invalid_intent" if malformed else failure or refusal,
+                        cleared=cleanup.outcome in ("applied", "unchanged"))
                 return results
 
     async def async_fallback(self, inverter_id: str, *, current_a: float, start: str,
@@ -928,7 +1004,13 @@ class NativeChargeBoundary:
 
                     slots = NativeSlots(self, inverter, epoch, mismatches,
                                         transition=transition)
-                    return await self._cleanup_locked(inverter, slots, now)
+                    event = self._latest_event(inverter.id)
+                    result = await self._cleanup_locked(inverter, slots, now)
+                    if result.outcome in ("unverified", "failed"):
+                        # A cancel whose clear or zero confirm failed is a terminal abort.
+                        await self._save_abort(inverter.id, event, now, result.outcome,
+                                               cleared=False)
+                    return result
         finally:
             for mismatched in mismatches:
                 await self.coordinator.native.async_readback_mismatch(mismatched)

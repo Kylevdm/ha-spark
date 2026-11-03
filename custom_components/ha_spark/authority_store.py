@@ -166,8 +166,10 @@ class ExportTransition(Record):
     event: EventIdentity
     at: AwareDatetime
     kind: Literal["accepted", "armed", "started", "cleanup_verified", "aborted",
-                  "retryable_clock_hold", "tripped"]
+                  "clock_hold", "tripped"]
     reason: Text | None = None
+    acked: bool = Field(default=False, strict=True)
+    cleared: bool | None = Field(default=None, strict=True)
 
 
 class StopLatch(Record):

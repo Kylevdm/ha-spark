@@ -206,6 +206,14 @@ def test_device_identity_set_is_exact(client, mutation):
     assert post(client, body).status_code == 400
 
 
+def test_v4_summary_carries_acknowledged_export_ids():
+    acks = fixture("plan_summary_v4_export_acks")["export_acks"]
+    assert acks == ["transition_0", "transition_1", "transition_2"]
+    summary = plan_summary(api_version=4, session_id="session", built_at=NOW, loop_tick=NOW,
+                           export_acks=acks)
+    assert summary["export_acks"] == acks
+
+
 @pytest.mark.parametrize("known,save_failed,expected", [
     (True, False, "ok"), (True, True, "save_failed"), (False, False, "unknown"),
 ])
@@ -275,7 +283,7 @@ def test_addon_owner_ignores_remote_authority_holds_export(client, state):
 def test_max_v4_fits_and_is_accepted(client, state):
     body = fixture("site_snapshot_v4_max")
     compact = json.dumps(body, separators=(",", ":")).encode()
-    assert len(compact) < 48 * 1024
+    assert len(compact) < 60 * 1024
     assert client.post("/integration/heartbeat", content=compact).status_code == 200
     v4 = state.integration_link.v4
     assert len(v4.devices) == 8 and len(v4.banks) == 6
