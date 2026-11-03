@@ -440,3 +440,18 @@ async def test_current_numbers_pin_exact_clamp_and_cap(
     assert [(t.address, t.payload) for t in native_transport.traffic
             if t.op == "write"] == [(address, (expected,))]
     assert native_transport.holding[address] == expected
+
+
+async def test_a_time_edit_with_a_zero_discharge_half_carries_the_five_read_confirm(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+) -> None:
+    # W9-3 / Q11b: every 43143 write whose target discharge half is zero.
+    await mode(writer, "manual", False)
+    inverter = next(iter(writer.native.inverters.values()))
+    native_transport.set_holding(43143, [23, 30, 5, 30, 0, 0, 0, 0])
+    native_transport.traffic.clear()
+    await NativeTime(writer, inverter, 0).async_set_value(time(22))
+    traffic = native_transport.traffic
+    [write_at] = [i for i, t in enumerate(traffic) if t.op == "write"]
+    after = [t for t in traffic[write_at + 1:] if t.op == "read" and t.address == 43143]
+    assert len(after) >= 6

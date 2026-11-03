@@ -26,7 +26,7 @@ from homeassistant.util import dt as dt_util
 from . import native_export_log, wire
 from .authority import AuthorityStore
 from .authority_control import AuthorityControl
-from .authority_store import ExportSupervision
+from .authority_store import ExportSupervision, GatewayClaim
 from .channel import Outcome, PollResult, async_fetch_commands, async_poll, async_post_result
 from .command_dispatch import CommandConsumer
 from .commands import (
@@ -388,12 +388,26 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                 await self.authority.async_save(candidate)
 
     async def async_retry_export_records(self, now: datetime) -> None:
-        """Retry every non-live, non-cleared record while committed Optimise."""
+        """Retry every non-live, non-cleared record in any owned non-Observe mode.
+
+        The restart re-verification also runs here first, so a record loaded while
+        the device was still unvalidated is never kept from the record alone. A
+        fallback entry's own cancel is retried with the transition policy; every
+        other cleanup only ever writes a discharge-half zero.
+        """
         async with self.control.lock:
             state = self.authority.state
-            if (state is None or state.committed_mode != "optimise"
-                    or not self.control.owned() or state.manual_session is not None
-                    or state.fallback.active
+            if (state is None or state.committed_mode == "observe"
+                    or not self.control.owned()
+                    or state.transition is not None
+                    and "cancel_export" in state.transition.steps):
+                return
+            fallback = state.fallback.active
+        await self.writes.async_reconcile_pending(now)
+        async with self.control.lock:
+            state = self.authority.state
+            if (state is None or state.committed_mode == "observe"
+                    or not self.control.owned() or state.fallback.active != fallback
                     or state.transition is not None
                     and "cancel_export" in state.transition.steps):
                 return
@@ -410,7 +424,53 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                         stop_latches=state.stop_latches,
                         fallback_active=state.fallback.active):
                     continue
-                await self.writes.async_clear_export(inverter.id, epoch=state.epoch)
+                if state.fallback.active:
+                    await self.writes.async_cancel_export(inverter.id, epoch=state.epoch)
+                else:
+                    await self.writes.async_clear_export(
+                        inverter.id, epoch=state.epoch, cleanup=True)
+
+    async def async_drop_stale_bounds(
+        self, *, claims: object = None, now: datetime | None = None,
+    ) -> bool:
+        """Drop supervision rows whose identity or claim can no longer hold (W9-2).
+
+        A re-probe that changed an inverter's identity, or a gateway claim edit,
+        ends that inverter's bound. Rows are dropped under the authority lock and
+        the in-memory identity latch is cleared only once the save verified.
+        """
+        changed = set(self.native.identity_changed)
+        topology = validate_topology(self.entry.options.get("topology"))
+        raw_claims = claims if claims is not None else self.entry.options.get("gateway_claims")
+        current: dict[str, GatewayClaim | None] = {}
+        if isinstance(topology, Topology):
+            for inverter in topology.inverters:
+                claim = next((claim_from_raw(raw) for raw in (
+                    raw_claims if isinstance(raw_claims, list) else [])
+                    if isinstance(raw, dict)
+                    and raw.get("host") == inverter.gateway_host
+                    and raw.get("port") == inverter.gateway_port
+                    and raw.get("unit_id") == inverter.gateway_unit_id), None)
+                current[inverter.id] = claim
+        async with self.control.lock:
+            state = self.authority.state
+            if state is None:
+                return False
+            identities = self.native.identities
+            kept = tuple(row for row in state.export_supervisions
+                         if row.inverter_id not in changed
+                         and identities.get(row.inverter_id, row.identity) == row.identity
+                         and (row.inverter_id not in current
+                              or current[row.inverter_id] == row.claim))
+            if len(kept) == len(state.export_supervisions):
+                self.native.identity_changed -= changed
+                return True
+            saved = await self.authority.async_save(state.model_copy(update={
+                "export_supervisions": kept,
+                "last_changed_at": now or dt_util.utcnow()}))
+            if saved:
+                self.native.identity_changed -= changed
+            return saved
 
     async def _async_commands(self) -> None:
         """At most one HTTP fetch plus one queued fetch, including forged nudges."""
@@ -488,6 +548,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                 if len(kept) != len(state.export_supervisions):
                     await self.authority.async_save(state.model_copy(update={
                         "export_supervisions": kept, "last_changed_at": dt_util.utcnow()}))
+                # The identity latch is cleared only by the tick's verified drop.
         return found
 
     @callback

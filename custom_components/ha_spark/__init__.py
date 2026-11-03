@@ -48,11 +48,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     hass.data.setdefault(f"{DOMAIN}.unloaded_authority", {}).pop(entry.entry_id, None)
     await coordinator.authority.async_load()
     await coordinator.ownership.async_load()
+    # A claim edited while the entry was unloaded still ends the affected bound.
+    await coordinator.async_drop_stale_bounds()
     async_register(hass)
     await coordinator.native.async_start()
 
     async def native_tick(now: datetime) -> None:
         await coordinator.native.async_check_connections()
+        # Any identity change seen by a probe ends that inverter's bound.
+        await coordinator.async_drop_stale_bounds(now=now)
         coordinator.soc.observe(now)
         if coordinator.control.startup_complete:
             await coordinator.holds.async_reconcile(now)

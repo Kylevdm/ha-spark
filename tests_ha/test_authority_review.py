@@ -107,6 +107,7 @@ async def test_return_to_only_and_repeated_observe_preserve_pending_work(
 
 @pytest.mark.parametrize("failed_stage", [
     None, "absent", "connect", "read_device_state", "read_evidence", "reconcile_holds",
+    "reconcile_export",
 ])
 async def test_expiry_waits_for_startup_and_grace_starts_after_slow_reads(
     hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
@@ -141,7 +142,7 @@ async def test_expiry_waits_for_startup_and_grace_starts_after_slow_reads(
             assert not control.ready
         else:
             assert state.manual_session is None and state.epoch == 2
-            assert control.grace_until == NOW + timedelta(minutes=6)
+            assert control.grace_until == NOW + timedelta(minutes=7)
             assert not control.permits_non_protection(NOW + timedelta(minutes=5, seconds=59))
             assert not any(effect in writer.effects for effect in (
                 "verify_fresh_plan", "write_fallback"))

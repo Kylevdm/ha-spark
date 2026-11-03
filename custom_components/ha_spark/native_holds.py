@@ -414,7 +414,7 @@ class NativeTransitionWriter:
                 dt_util.utcnow(), removal=removal)
         if step in ("verify_fresh_plan", "write_fallback", "cancel_export"):
             return await self.coordinator.fallback.async_step(
-                step, state, now=dt_util.utcnow())
+                step, state, now=dt_util.utcnow(), removal=removal)
         return False
 
     async def async_startup(self, stage: str) -> bool:
@@ -444,4 +444,6 @@ class NativeTransitionWriter:
             await c.holds.async_reconcile(dt_util.utcnow())
             # Refused holds remain durable and visible; do not stop their retries.
             return c.authority.state is not None
+        if stage == "reconcile_export":
+            return await c.writes.async_reconcile_export(dt_util.utcnow())
         return False
