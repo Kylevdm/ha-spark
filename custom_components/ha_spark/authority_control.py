@@ -169,11 +169,13 @@ class AuthorityControl:
         self.grace_until = None
         if not self.owned() or self.store.state is None or self.writer is None:
             return
-        for stage in ("connect", "read_device_state", "read_evidence", "reconcile_holds"):
+        for stage in ("connect", "read_device_state", "read_evidence", "reconcile_holds",
+                      "reconcile_export"):
             state = self.store.state
             if not self.owned() or state is None:
                 return
-            if stage == "reconcile_holds" and state.committed_mode == "observe":
+            if stage in ("reconcile_holds", "reconcile_export") \
+                    and state.committed_mode == "observe":
                 continue
             try:
                 if not await self.writer.async_startup(stage):

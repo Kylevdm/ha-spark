@@ -29,7 +29,8 @@ class NativeSlots:
     def __init__(self, boundary: "NativeChargeBoundary", inverter: Inverter,
                  epoch: int, mismatches: set[str], *,
                  planned_discharge: list[int] | None = None,
-                 fallback: bool = False, transition: bool = False) -> None:
+                 fallback: bool = False, transition: bool = False,
+                 cleanup: bool = False) -> None:
         self.boundary = boundary
         self.inverter = inverter
         self.epoch = epoch
@@ -37,7 +38,11 @@ class NativeSlots:
         self.planned_discharge = planned_discharge or [0] * 4
         self.fallback = fallback
         self.transition = transition
+        self.cleanup = cleanup
         self.block_result: IntentResult | None = None
+        # Set once a Slot 1 block whose discharge half is zero carries the five
+        # further matching reads, so a later retire never confirms it twice.
+        self.zero_half_confirmed = False
         # Export permission, rechecked before any write carrying a discharge half;
         # without one such a write is refused.
         self.discharge_check: Callable[[], WriteReason | None] | None = None
@@ -65,12 +70,17 @@ class NativeSlots:
         if resident is None:
             return IntentResult(outcome="failed")
 
+        # Every discharge-half clear carries the shipped sustained-zero rule.
+        sustained = address == 43143 and not any(target[4:])
+
         async def read() -> list[int] | None:
             return await self.read(address)
 
         if resident == target:
             if await confirm(target, read, native_write.verify_sleep,
-                             changed=False, mismatch=self.mismatch):
+                             changed=False, mismatch=self.mismatch, sustained=sustained):
+                if address == 43143:
+                    self.zero_half_confirmed = sustained
                 return IntentResult(outcome="unchanged")
             if any(target):
                 return IntentResult(outcome="unverified")
@@ -78,7 +88,8 @@ class NativeSlots:
             return IntentResult(outcome="refused", reason="untrusted_soc")
         reason = self.boundary._refusal(self.inverter, self.epoch,
                                         fallback=self.fallback,
-                                        transition=self.transition)
+                                        transition=self.transition,
+                                        cleanup=self.cleanup)
         if reason is None and address == 43143 and any(target[4:]):
             reason = self.discharge_check() if self.discharge_check is not None else "mode"
         if reason is not None:
@@ -88,7 +99,9 @@ class NativeSlots:
         if not result.ok:
             return IntentResult(outcome="failed")
         verified = await confirm(target, read, native_write.verify_sleep,
-                                 changed=True, mismatch=self.mismatch)
+                                 changed=True, mismatch=self.mismatch, sustained=sustained)
+        if address == 43143:
+            self.zero_half_confirmed = verified and sustained
         return IntentResult(outcome="applied" if verified else "unverified")
 
     async def clear_discharge(self) -> IntentResult:
@@ -102,6 +115,7 @@ class NativeSlots:
                 return await self.read(43143)
             if await confirm([0] * 8, read, native_write.verify_sleep,
                              changed=False, mismatch=self.mismatch):
+                self.zero_half_confirmed = True
                 return IntentResult(outcome="unchanged")
             resident = await self.read(43143)
             if resident is None:

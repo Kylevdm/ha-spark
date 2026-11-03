@@ -290,21 +290,22 @@ class NativeFallback:
 
     # --- transition steps ----------------------------------------------------
 
-    async def async_step(self, step: str, state: AuthorityState, *, now: datetime) -> bool:
+    async def async_step(self, step: str, state: AuthorityState, *, now: datetime,
+                         removal: bool = False) -> bool:
         """Executed by the transition writer while it holds the authority lock."""
         async with self.lock:
             if step == "verify_fresh_plan":
                 started = state.transition.started_at if state.transition is not None else now
                 return self.coordinator.writes.plan_verified(state.epoch, since=started)
             if step == "cancel_export":
-                return await self._cancel_export(state.epoch)
+                return await self._cancel_export(state.epoch, removal=removal)
             if step == "write_fallback":
                 return await self._write_fallback(state, now)
             return False
 
-    async def _cancel_export(self, epoch: int) -> bool:
-        results = [await self.coordinator.writes.async_cancel_export(i.id, epoch=epoch)
-                   for i in self._native()]
+    async def _cancel_export(self, epoch: int, *, removal: bool = False) -> bool:
+        results = [await self.coordinator.writes.async_cancel_export(
+            i.id, epoch=epoch, removal=removal) for i in self._native()]
         return all(result.outcome in ("applied", "unchanged") for result in results)
 
     async def _write_fallback(self, state: AuthorityState, now: datetime) -> bool:

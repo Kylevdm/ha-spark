@@ -76,6 +76,10 @@ class NativeChargeBoundary:
         self.verified_windows: dict[str, tuple[int, tuple[int, ...]]] = {}
         self.verified_fallback: dict[str, tuple[int, tuple[int, ...]]] = {}
         self.last_apply: tuple[int, datetime, bool] | None = None
+        # Reloaded records are live only after the startup stage re-verified them
+        # against Slot 1; records saved in this session need no such re-read.
+        self.reverified: set[str] = set()
+        self.armed_this_session: set[str] = set()
 
     def plan_verified(self, epoch: int, *, since: datetime) -> bool:
         """A freshly accepted plan in this epoch, judged on charge intents only."""
@@ -97,7 +101,8 @@ class NativeChargeBoundary:
                  guard_write: bool = False,
                  entity_control: str | None = None,
                  fallback: bool = False,
-                 transition: bool = False) -> WriteReason | None:
+                 transition: bool = False,
+                 cleanup: bool = False) -> WriteReason | None:
         coordinator = self.coordinator
         state = coordinator.authority.state
         if state is None:
@@ -135,6 +140,12 @@ class NativeChargeBoundary:
                     or not leaving and not state.fallback.active
                     or state.transition is not None and not leaving
                     and state.transition.target != "optimise"):
+                return "mode"
+        elif cleanup:
+            # A stale record is cleaned up in any owned non-Observe mode; Observe
+            # is the safe exit and never writes. Only a discharge-half zero is
+            # ever written on this path.
+            if state.committed_mode == "observe":
                 return "mode"
         elif transition:
             # Transition-owned discharge cleanup, including manual start/fallback entry.
@@ -272,6 +283,124 @@ class NativeChargeBoundary:
                         continue
                     self.verified_windows[inverter.id] = (epoch, tuple(words[2:10]))
 
+    async def async_reconcile_export(self, now: datetime) -> bool:
+        """Startup stage: re-verify every loaded export record against Slot 1.
+
+        A record with the same epoch and store identity, its end ahead, no stop
+        latch and a matching supervision is ``preserved`` when the resident
+        discharge half exactly matches its clock face; anything else is cleared
+        (or cancelled when the epoch or store changed). Nothing is ever
+        re-armed from the record alone.
+        """
+        return await self._async_reconcile_all(now, strict=True)
+
+    async def async_reconcile_pending(self, now: datetime) -> None:
+        """Retry a re-verification the startup stage could not attempt yet."""
+        await self._async_reconcile_all(now, strict=False)
+
+    async def _async_reconcile_all(self, now: datetime, *, strict: bool) -> bool:
+        """One ordered pass under control.lock then guard.lock then native.lock.
+
+        Setup creates the guard after the startup stages, so a guardless pass can
+        only re-verify read-only: a clear obligation waits for the next tick.
+        """
+        c = self.coordinator
+        if c.authority.state is None or not c.native.inverters:
+            return True
+        mismatches: set[str] = set()
+        try:
+            async with c.control.lock:
+                if c.guard is None:
+                    async with c.native.lock:
+                        for inverter in c.native.inverters.values():
+                            await self._async_reconcile_preserve(inverter, now, mismatches)
+                    return True
+                async with c.guard.lock:
+                    async with c.native.lock:
+                        for inverter in c.native.inverters.values():
+                            if strict:
+                                if not await self._async_reconcile_one(
+                                        inverter, now, mismatches):
+                                    return False
+                            else:
+                                await self._async_reconcile_pending(
+                                    inverter, now, mismatches)
+        finally:
+            for mismatched in mismatches:
+                await c.native.async_readback_mismatch(mismatched)
+        return True
+
+    async def _async_reconcile_preserve(self, inverter: Inverter, now: datetime,
+                                        mismatches: set[str]) -> bool:
+        """Read Slot 1 and preserve an exact match; never write, never re-arm."""
+        c = self.coordinator
+        state = c.authority.state
+        if state is None:
+            return False
+        record = latest_record(state.export_records, inverter.id)
+        if record is None or record.state == "cleared":
+            self.reverified.add(inverter.id)
+            return True
+        zone = c.control.household_zone()
+        # Only a validated, non-caching device's Slot 1 can re-verify a record.
+        if (zone is None or c.native.reason(inverter) is not None
+                or record.epoch != state.epoch
+                or record.store_id != state.store_id
+                or record.event.end <= now.astimezone(UTC)
+                or any(latch.event == record.event for latch in state.stop_latches)
+                or not any(row.id == record.supervision_id and row.event == record.event
+                           for row in state.export_supervisions)):
+            return False
+        from .native_slots import NativeSlots
+
+        # A read is safe before the device is validated; only the clear waits.
+        resident = await NativeSlots(self, inverter, state.epoch, mismatches).read(43143)
+        if (resident is None
+                or resident[4:] != clock_face(record.window.start, record.window.end, zone)):
+            return False
+        saved = await self._save_export_record(inverter.id, record.model_copy(
+            update={"state": "preserved", "last_reconcile_at": now}), now)
+        if not saved:
+            return False
+        self.reverified.add(inverter.id)
+        return True
+
+    async def _async_reconcile_one(self, inverter: Inverter, now: datetime,
+                                   mismatches: set[str]) -> bool:
+        """One inverter's restart re-verification; the caller holds all three locks."""
+        c = self.coordinator
+        state = c.authority.state
+        if state is None:
+            return False
+        record = latest_record(state.export_records, inverter.id)
+        if record is None or record.state == "cleared":
+            self.reverified.add(inverter.id)
+            return True
+        if state.fallback.active:
+            # Fallback entry's cancel (with slots 2/3) is retried by the cancel loop;
+            # a record is never live while fallback is active.
+            return True
+        if await self._async_reconcile_preserve(inverter, now, mismatches):
+            return True
+        if c.native.reason(inverter) is not None:
+            # An unvalidated device is never written: the record stays unverified
+            # and is retried once the device validates.
+            return True
+        result = await self._async_clear_held(
+            inverter.id, epoch=state.epoch, now=now, transition=False, cleanup=True,
+            removal=False, mismatches=mismatches)
+        if result.outcome not in ("applied", "unchanged"):
+            return False
+        self.reverified.add(inverter.id)
+        return True
+
+    async def _async_reconcile_pending(self, inverter: Inverter, now: datetime,
+                                       mismatches: set[str]) -> None:
+        """Re-verification for a record the startup stage could not settle yet."""
+        if inverter.id in self.reverified:
+            return
+        await self._async_reconcile_one(inverter, now, mismatches)
+
     async def async_apply(self, command: Command) -> CommandResult:
         """Isolate intents and aggregate the worst positional result."""
         # Freshness is judged from acceptance, not completion.
@@ -394,6 +523,9 @@ class NativeChargeBoundary:
                 supervisions=state.export_supervisions, stop_latches=state.stop_latches,
                 fallback_active=state.fallback.active):
             return None
+        if inverter_id not in self.armed_this_session and inverter_id not in self.reverified:
+            # A record loaded from disk is never live before its re-verification.
+            return None
         return record
 
     async def _save_export_record(self, inverter_id: str, record: ExportRecord | None,
@@ -408,6 +540,8 @@ class NativeChargeBoundary:
                         if row.inverter_id != inverter_id)
         if record is not None:
             records += (record,)
+            if record.state != "cleared":
+                self.armed_this_session.add(inverter_id)
         candidate = state.model_copy(update={
             "export_records": records, "last_changed_at": now,
         })
@@ -649,12 +783,22 @@ class NativeChargeBoundary:
                             written_a=EXPORT_CURRENT_A if verified else None)
 
     async def _cleanup_locked(self, inverter: Inverter, slots: "NativeSlots",
-                              now: datetime) -> IntentResult:
-        """Clear and zero-confirm the discharge half, retiring the record on success."""
+                              now: datetime, *, zero_slots: bool = False) -> IntentResult:
+        """Clear and zero-confirm the discharge half, retiring the record on success.
+
+        A transition cancel also zeroes and verifies slots 2/3, as the oracle's
+        ``cancel_export`` does; the record is retired only when all of it verifies.
+        """
         result = await slots.clear_discharge()
-        if result.outcome in ("applied", "unchanged"):
-            return await self._retire_after_zero(inverter, slots, now, result)
-        return result
+        if result.outcome not in ("applied", "unchanged"):
+            return result
+        if zero_slots:
+            for address in (43153, 43163):
+                extra = await slots.block(address, [0] * 8)
+                if extra.outcome not in ("applied", "unchanged"):
+                    return IntentResult(
+                        outcome="failed" if extra.outcome == "failed" else "unverified")
+        return await self._retire_after_zero(inverter, slots, now, result)
 
     async def _retire_after_zero(self, inverter: Inverter, slots: "NativeSlots",
                                  now: datetime, result: IntentResult | None = None
@@ -663,8 +807,8 @@ class NativeChargeBoundary:
         async def half() -> list[int] | None:
             block = await slots.read(43143)
             return None if block is None else block[4:]
-        if not await confirm([0] * 4, half, verify_sleep, changed=True,
-                             mismatch=slots.mismatch):
+        if not slots.zero_half_confirmed and not await confirm(
+                [0] * 4, half, verify_sleep, changed=True, mismatch=slots.mismatch):
             return IntentResult(outcome="unverified")
         if not await self._mark_cleared(inverter.id, now):
             return IntentResult(outcome="unverified")
@@ -736,6 +880,12 @@ class NativeChargeBoundary:
         now = dt_util.utcnow()
         async with guard.lock:
             async with c.native.lock:
+                state = c.authority.state
+                if state is None:
+                    return {index: IntentResult(outcome="refused", reason="authority_unknown")
+                            for _, _, index in entries}
+                # A record loaded from disk is re-verified before any apply uses it.
+                await self._async_reconcile_pending(inverter, now, mismatches)
                 state = c.authority.state
                 if state is None:
                     return {index: IntentResult(outcome="refused", reason="authority_unknown")
@@ -978,12 +1128,15 @@ class NativeChargeBoundary:
             for mismatched in mismatches:
                 await self.coordinator.native.async_readback_mismatch(mismatched)
 
-    async def async_cancel_export(self, inverter_id: str, *, epoch: int) -> IntentResult:
+    async def async_cancel_export(self, inverter_id: str, *, epoch: int,
+                                  removal: bool = False) -> IntentResult:
         """Clear the discharge half under a transition's own write policy."""
-        return await self.async_clear_export(inverter_id, epoch=epoch, transition=True)
+        return await self.async_clear_export(inverter_id, epoch=epoch, transition=True,
+                                             removal=removal)
 
     async def async_clear_export(self, inverter_id: str, *, epoch: int,
-                                 transition: bool = False) -> IntentResult:
+                                 transition: bool = False, cleanup: bool = False,
+                                 removal: bool = False) -> IntentResult:
         """Clear and zero-confirm the discharge half, retiring the record on success."""
         guard = self.coordinator.guard
         if guard is None:
@@ -993,27 +1146,41 @@ class NativeChargeBoundary:
         try:
             async with guard.lock:
                 async with self.coordinator.native.lock:
-                    inverter = next((i for i in guard.topology.inverters
-                                     if i.id == inverter_id), None)
-                    if inverter is None:
-                        return IntentResult(outcome="refused", reason="limits")
-                    reason = self._refusal(inverter, epoch, transition=transition)
-                    if reason is not None:
-                        return IntentResult(outcome="refused", reason=reason)
-                    from .native_slots import NativeSlots
-
-                    slots = NativeSlots(self, inverter, epoch, mismatches,
-                                        transition=transition)
-                    event = self._latest_event(inverter.id)
-                    result = await self._cleanup_locked(inverter, slots, now)
-                    if result.outcome in ("unverified", "failed"):
-                        # A cancel whose clear or zero confirm failed is a terminal abort.
-                        await self._save_abort(inverter.id, event, now, result.outcome,
-                                               cleared=False)
-                    return result
+                    return await self._async_clear_held(
+                        inverter_id, epoch=epoch, now=now, transition=transition,
+                        cleanup=cleanup, removal=removal, mismatches=mismatches)
         finally:
             for mismatched in mismatches:
                 await self.coordinator.native.async_readback_mismatch(mismatched)
+
+    async def _async_clear_held(self, inverter_id: str, *, epoch: int, now: datetime,
+                                transition: bool, cleanup: bool, removal: bool,
+                                mismatches: set[str]) -> IntentResult:
+        """The whole clear; the caller holds guard.lock then native.lock."""
+        guard = self.coordinator.guard
+        if guard is None:
+            return IntentResult(outcome="refused", reason="limits")
+        inverter = next((i for i in guard.topology.inverters if i.id == inverter_id), None)
+        if inverter is None:
+            return IntentResult(outcome="refused", reason="limits")
+        reason = self._refusal(inverter, epoch, transition=transition, cleanup=cleanup)
+        if reason is not None:
+            if removal and (not self.coordinator._running or self.coordinator.native.closed):
+                # A removal after unload cannot write: the obligation stays and
+                # its abort is visible once the store has loaded again.
+                await self._save_abort(inverter_id, self._latest_event(inverter_id), now,
+                                       reason, cleared=False)
+            return IntentResult(outcome="refused", reason=reason)
+        from .native_slots import NativeSlots
+
+        slots = NativeSlots(self, inverter, epoch, mismatches,
+                            transition=transition, cleanup=cleanup)
+        event = self._latest_event(inverter_id)
+        result = await self._cleanup_locked(inverter, slots, now, zero_slots=transition)
+        if result.outcome in ("unverified", "failed"):
+            # A cancel whose clear or zero confirm failed is a terminal abort.
+            await self._save_abort(inverter_id, event, now, result.outcome, cleared=False)
+        return result
 
     async def async_write(self, intent: DeviceIntent) -> None:
         """Plan-only ChargeWriter seam; guard callers use the locked entry."""

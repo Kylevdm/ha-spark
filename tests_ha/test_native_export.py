@@ -1039,15 +1039,16 @@ async def test_a_cancel_whose_zero_confirm_fails_logs_an_abort(
     await arm(writer)
     assert (await writer._async_dispatch_command(apply_command(
         writer, [window_intent()], sequence=2))).outcome in ("applied", "unchanged")
-    from custom_components.ha_spark import native_write
+    from custom_components.ha_spark import native_slots
     from custom_components.ha_spark.native_verify import confirm as real_confirm
 
     async def zero_never_confirms(target: list[int], *args: object, **kwargs: object) -> bool:
-        if target == [0] * 4:
+        if len(target) == 8 and not any(target[4:]):
             return False  # the clear verified, the 5-read zero confirm did not
         return await real_confirm(target, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(native_write, "confirm", zero_never_confirms)
+    # W9-3: the sustained zero confirm lives in the Slot 1 block write.
+    monkeypatch.setattr(native_slots, "confirm", zero_never_confirms)
     state = writer.authority.state
     assert state is not None
     result = await writer.writes.async_clear_export("inv1", epoch=state.epoch)
@@ -1060,7 +1061,7 @@ async def test_a_clock_hold_whose_clear_fails_stays_retryable(
     writer: SparkCoordinator, native_transport: FakeSolisDevice,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from custom_components.ha_spark import native_write
+    from custom_components.ha_spark import native_slots
 
     allow_export(writer, monkeypatch, native_transport)
     await optimise(writer)
@@ -1071,7 +1072,8 @@ async def test_a_clock_hold_whose_clear_fails_stays_retryable(
     async def never(*args: object, **kwargs: object) -> bool:
         return False
 
-    monkeypatch.setattr(native_write, "confirm", never)
+    # W9-3: the sustained zero confirm lives in the Slot 1 block write.
+    monkeypatch.setattr(native_slots, "confirm", never)
     result = await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
     assert result.outcome == "unverified"
     assert [kind for kind, _ in transition_kinds(writer)] == ["accepted", "clock_hold"]

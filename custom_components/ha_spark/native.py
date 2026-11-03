@@ -86,6 +86,12 @@ class NativeDevices:
         self.transports: dict[tuple[str, int], Transport] = {}
         self.probes: dict[str, Probe] = {}
         self.epochs: dict[str, int] = {}
+        # Identities observed to change since the last probe: the coordinator drops
+        # that inverter's supervision rows on the next tick (W9-2).
+        self.identity_changed: set[str] = set()
+        # Last readable identity per inverter, so a failed probe in between never
+        # hides a change.
+        self.identities: dict[str, tuple[int, ...]] = {}
         # Gateway-wide caching fence: set on any probe that sees caching, cleared
         # only by a completed probe that establishes it off (never by a failure).
         self.gateway_caching: dict[str, bool] = {}
@@ -164,6 +170,13 @@ class NativeDevices:
             if self.closed:
                 return False
             self.probes[inverter_id] = probe
+            if probe.identity:
+                previous = self.identities.get(inverter_id)
+                if previous is not None and previous != probe.identity:
+                    # Latch the change: a later re-probe that reverts must not make
+                    # an already ended binding look valid again.
+                    self.identity_changed.add(inverter_id)
+                self.identities[inverter_id] = probe.identity
             self.record_caching(inverter, probe)
             self.epochs[inverter_id] = getattr(self.transport(inverter), "connection_epoch", 0)
         self.recheck()

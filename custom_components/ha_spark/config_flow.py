@@ -1213,14 +1213,18 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                     step_id="save", errors={"base": reason}, data_schema=probatio.Schema({}),
                 )
         revision = self.config_entry.options.get("topology_revision")
+        claims = _current_claims(
+            topology, self._claims if self._claims is not None
+            else self.config_entry.options.get("gateway_claims", []),
+        )
+        if coordinator is not None:
+            # A claim edited for a native inverter ends that inverter's bound.
+            await coordinator.async_drop_stale_bounds(claims=claims)
         return self.async_create_entry(title="", data={
             **self.config_entry.options,
             **({"evidence": self._evidence.model_dump(mode="json")} if self._evidence else {}),
             "topology": topology.model_dump(mode="json"),
-            "gateway_claims": _current_claims(
-                topology, self._claims if self._claims is not None
-                else self.config_entry.options.get("gateway_claims", []),
-            ),
+            "gateway_claims": claims,
             "topology_revision": revision + 1 if type(revision) is int else 1,
         })
 

@@ -154,6 +154,7 @@ async def test_manual_expiry_startup_grace_and_durable_session_epoch(
         assert store.state.transition.steps == ("verify_fresh_plan",)
         assert writer.effects == [
             "connect", "read_device_state", "read_evidence", "reconcile_holds",
+            "reconcile_export",
         ]
         assert not control.permits_non_protection(NOW + timedelta(seconds=119))
         assert control.permits_non_protection(NOW + timedelta(seconds=120))

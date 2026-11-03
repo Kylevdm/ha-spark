@@ -119,9 +119,11 @@ async def words(boundary: "NativeChargeBoundary", inverter: Inverter, epoch: int
     if resident is None:
         return IntentResult(outcome="failed")
     changed = resident != target
+    # Every discharge-half zero carries the sustained-zero rule (W9-3).
+    sustained = address == 43143 and not any(target[4:])
     if not changed:
         if await confirm(target, read, native_write.verify_sleep, changed=False,
-                         mismatch=mismatch):
+                         mismatch=mismatch, sustained=sustained):
             publish(boundary, inverter, address, target)
             return IntentResult(outcome="unchanged")
         if any(target):
@@ -135,7 +137,7 @@ async def words(boundary: "NativeChargeBoundary", inverter: Inverter, epoch: int
     if not result.ok:
         return IntentResult(outcome="failed")
     verified = await confirm(target, read, native_write.verify_sleep, changed=True,
-                             mismatch=mismatch)
+                             mismatch=mismatch, sustained=sustained)
     if verified:
         publish(boundary, inverter, address, target)
     return IntentResult(outcome="applied" if verified else "unverified")
