@@ -218,9 +218,15 @@ repair. PV-only export is never curtailed.
 
 **Stop latch**:
 The durable record, saved before any cleanup write, that an export event was
-stopped by the tripwire. It lasts to the event window's end, survives restarts
-and Re-probes, and refuses that event as `tripped` even if the owner confirms a
-new supervision.
+stopped by the tripwire. It lasts to the stopped export window's end, survives
+restarts and Re-probes, and refuses that event as `tripped` even if the owner
+confirms a new supervision. The `tripped` lifecycle transition produces an
+abort notice about the stop, not verified cleanup.
+
+**Stop pending**:
+The export-record state `stop_pending`: the tripwire's stop is recorded, but
+verified cleanup is still owed. It is not a live export permission or proof
+that the inverter's export window is clear.
 
 **Charging allocation**:
 The charging power assigned to a bank and divided across its connected

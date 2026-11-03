@@ -37,6 +37,191 @@ Describe your grid connections, battery banks, inverters, V2L charger and major
 loads under **Options → Site topology and limits** (see below). Installing the
 integration does not change the operating mode or any hardware control.
 
+### Native Solis setup and authority switch
+
+The integration connects directly to a Solis gateway and must be its only
+Modbus client. Native transport supports Solis only; AlphaESS remains legacy.
+Use the [migration and rollback runbook](../docs/runbooks/solis-native-migration.md)
+for an existing installation. Do not connect the native client alongside the
+legacy overlay or another Modbus client.
+
+1. Finish a verified handover to Observe, with no holds or transition. Keep
+   both the add-on and integration running during the authority switch.
+2. Disconnect the other gateway clients, remove the legacy overlay and restart
+   Home Assistant. Explicitly clear `solis_control_hub` in the add-on settings.
+3. In **Options → Site topology and limits → Inverters**, choose
+   `transport: native`, `driver_kind: solis`, and enter `gateway_host`,
+   `gateway_port` and `gateway_unit_id`. Confirm the inverter limits. Complete
+   **Connect native Solis**, then save the topology. Continuing probes identity
+   and gateway caching; saving records your gateway ownership claim. This
+   claim is your statement, not proof that another client is disconnected.
+4. Check device validation and repairs. Unsupported identity or firmware,
+   caching, an unreachable gateway or a missing claim leaves the device
+   read-only: readings continue, but writes are refused. Disable gateway
+   storage caching, not a safety guard, before Re-probing.
+5. Wait for the authority switch to settle in Observe. All inverters native
+   means integration ownership; any legacy inverter, or no inverter, means
+   add-on ownership. Both peers need API v4, Observe, no holds and no
+   transition; the reverse switch also requires no manual session. The
+   integration saves `pending_integration`, the add-on retires its authority
+   store, and the integration initialises fresh authority in Observe. The
+   reverse uses `pending_addon` and fresh add-on authority in Observe. Pending
+   or unknown ownership grants no writes. Do not edit authority files to
+   bypass a failed switch.
+6. Configure **Native protection evidence**, **Native fallback schedule** and
+   **Native SoC trust policy** in Options. Check `ha-spark health`, limits and
+   repairs in Observe before explicitly choosing Protect or Optimise.
+
+On an integration-owned site the integration's authority store is the write
+gate. The add-on sends typed device intents with the authority epoch; it never
+writes hardware directly. Its own supply guard, hold reconcile, SoC monitor,
+clock sync and V2L actuation do not run for that site. Native charge writes,
+including fallback and guard changes, share the same limit checks and exact
+read-back. A read-only device prevents entry to Protect or Optimise. Optimise
+also needs a live add-on session, trusted and recovered SoC, and valid fallback.
+Observe writes nothing; completing Setup or changing topology never escalates
+it.
+
+### Owner services and temporary manual control
+
+For integration-owned sites, Home Assistant exposes these `ha_spark` services:
+
+| Service | Purpose |
+|---|---|
+| `ha_spark.set_observe` | Request a verified handover to Observe |
+| `ha_spark.start_manual_control` | Start temporary manual control from Protect or Optimise |
+| `ha_spark.resume_control` | End manual control using current conditions, never an old plan |
+| `ha_spark.reprobe` | Re-read identity and test caching for `inverter_id` |
+| `ha_spark.commands_pending` | Prompt a fetch from the authenticated add-on channel; accepts no command data and grants no authority |
+
+Except for the fetch prompt, these services require a non-system Home Assistant
+administrator. There is no service to enter Protect or Optimise or to supply a
+plan; use the operating-mode page for escalation. Re-probe is not permission
+to write and does not clear a stop latch.
+
+`start_manual_control` accepts `duration: one_hour` (default),
+`until_tomorrow` or `until_resumed`, and `keep_protection: true` by default.
+**Options → Manual control deadline** sets `manual_until_time` and
+`household_time_zone`; it affects future handovers, not an existing deadline.
+`until_tomorrow` means the next occurrence of that household-clock time.
+Starting manual control cancels native export. Kept protection still owns the
+power switch; the supply guard still limits charging. Resuming Optimise needs
+a fresh verified plan or the fallback charging schedule; resuming Protect
+leaves charging edits in place.
+
+Native charge-current and schedule controls are owner-editable only when their
+mode permits it. Discharge controls require a manual session, and editing the
+power switch requires protection to have handed it over. Entity availability
+is not write permission: the same authority, limits, validation and read-back
+checks apply. Do not use manual control as a way to run a supervised export.
+
+### Native fallback and protection evidence
+
+**Options → Native fallback schedule** saves `window_start`, `window_end`
+and an explicit `current_<inverter_id>` for every native inverter. There is no
+default current. Use a cheap window on the household clock. Validation checks
+each current against the inverter's effective limit and 62.5 A register
+ceiling, the combined bank limit, and site import including one-way charge
+efficiency; accepted currents are rounded down to whole amps. AlphaESS never
+gets this fallback.
+
+In Optimise, `addon_liveness` or `soc_integrity` starts the fallback charging
+schedule. It is charge-only, does not depend on trusted SoC and remains below
+holds and the supply guard. Entry ends export supervision and attempts verified
+export cleanup first; failed cleanup remains an obligation and is retried even
+while fallback charging proceeds. Causes clearing is not recovery by itself:
+a fresh plan must apply and read back before fallback ends. Saving the SoC
+policy restarts recovery progress. To clear the fallback configuration, leave
+all fields empty while in Observe or Protect, with no active fallback or
+transition. Protect does not run fallback automatically; leaving Optimise
+writes it as the starting charging schedule before the handover completes.
+
+**Options → Native protection evidence** requires `ev_status_entity` and
+battery direction. `battery_direction_source` selects `native` successful bus
+reads or an `entity` with `battery_direction_entity` and
+`battery_discharge_sign`. Optional sources are `ev_plug_entity`,
+`ev_power_entity`, `live_dispatch_entity`, `adjusted_rate_entity` and
+`dispatch_grid_power_entity`; `dispatch_grid_invert` reverses the last source's
+sign. Set each configured source's `*_max_age_s`. Continue to Site topology
+and **Save topology** to apply the evidence draft.
+
+Only fresh reports start or clear holds. An unchanged cached state or a sibling
+sensor's timestamp cannot rescue stale native protection evidence. A confirmed
+EV hold needs five distinct advancing fresh not-charging reports to clear;
+a dispatch hold retains its last trusted end through an outage. A verified
+charging window and fresh no-discharge evidence can prevent a new EV hold,
+never clear a confirmed one. Holds beat fallback and exports. Protection can
+continue without the add-on, but requires Home Assistant to remain running;
+do not assume switch persistence through a whole-Home-Assistant outage.
+Kraken-only dispatches are not available natively.
+
+### Native supervised export
+
+Native battery export runs only in Optimise with a live export supervision for
+that event, never in Observe, Protect, fallback or temporary manual control.
+On the operating-mode page, **Supervise this export** shows the planned event.
+Confirm each inverter's rated AC output in watts and choose **Arm supervised
+export**. Every inverter on the connection needs a confirmed device export
+bound; their ratings must together fit the site export limit. Native bounds
+use rated output tied to validated identity and the gateway ownership claim,
+not an enabled inverter export limit. ha-spark never writes that limit.
+
+Be present throughout. Keep **End supervision** and its supervision id ready,
+and check the battery stops exporting afterwards. Supervision ends at the
+event end, on trusted cancellation, leaving Optimise, fallback, manual control
+or an explicit end. Changed identity or gateway claim ends the affected bound;
+recovery needs fresh owner supervision, not replay of an old command. Slot 1
+has a clock face, not a date, so arming is deferred until its next occurrence
+falls inside the event. A live record is re-verified after restart and never
+re-armed from memory. An untrusted event read preserves only a still-live
+verified export, not permission for a new one.
+
+The export tripwire watches fresh whole-site grid readings while export is
+live. Two consecutive advancing fresh readings more than 200 W above the site
+export limit stop every export on that connection. A missing or stale reading
+never cuts or resets the count: it warns after 60 s and raises a repair after
+2 minutes, while export continues on the device export bound. PV-only export
+is never curtailed.
+
+Before cleanup, the integration durably saves the stop latch and records
+`stop_pending` with `stop_reason: tripped`; every bound on the connection is
+invalidated until new supervision. The latch survives restarts and Re-probes,
+and a new supervision does not clear it. It refuses the same event as
+`tripped` until the stopped export window ends. `stop_pending` is not verified
+cleanup. Every discharge-window clear needs exact read-back plus five further
+matching reads a second apart. Only then can the record become `cleared` with
+`cleanup_verified: true`. Failed clears remain visible and retry in non-Observe
+modes; Observe writes nothing, including cleanup.
+
+The inverter diagnostics **Export bound**, **Export supervision** and
+**Export record** show the confirmed bound, supervision id and end, window,
+record state, stop reason and cleanup verification. States are `armed`,
+`active`, `preserved`, `stop_pending`, `cleared` and `unknown`; none is a new
+write permission. Follow the
+[supervised-export runbook](../docs/runbooks/supervised-axle-export.md) for
+preparation, abort and verified cleanup, including lifecycle notices.
+
+### Health checks
+
+Run `ha-spark health` in Observe before escalation and after transport changes.
+**Authority owner** reports `addon`, `integration`, `pending_integration` or
+`pending_addon`, whether the handshake is settled, and snapshot freshness.
+Unknown or pending ownership is a warning, not permission to control hardware.
+**Operating mode** reports integration authority on integration-owned sites;
+an unavailable authority or failed save fails the check.
+
+Each native **Solis transport (<id>)** row reads validation through the daemon,
+without probing Modbus or writing a test schedule. `validated` is OK;
+`unvalidated_identity`, `identity_read_failed`, `v2_tou_firmware`, `caching_on`,
+`gateway_not_owned` or `unreachable` is a warning. A missing fresh validation
+is `validation unknown`, also a warning. A native inverter with a nonempty
+`solis_control_hub` is `inconsistent` and fails that check. Resolve repairs and
+restore the channel rather than treating unknown as validated. Health also
+reports the integration link, topology, effective limits and provider checks.
+Exit codes are `0` for all green, `1` for a failed critical check, and `2`
+for other degraded results. A green report is diagnostic evidence, not an
+authority grant or live export proof.
+
 ### Native Solcast
 
 The integration can fetch Solcast itself, so the add-on no longer has to read
@@ -119,19 +304,22 @@ These are the initial entity ids; you can rename them in Home Assistant.
 Plan status describes the plan's intended action, not device read-back. Its
 attributes give the reason, model, strategy, SoC status and reason, and export
 SoC need with its time when present. Operating mode has transition target,
-last changed time and save-failed attributes. Mode, fallback and holds still
-belong to the add-on's authority store; these entities cannot change them.
+last changed time and save-failed attributes. Mode, fallback and holds belong
+to the site's authority owner's store; these read-only entities cannot change
+them.
 
 The integration polls every 30 seconds. A heartbeat counts only with a
 compatible API version, the accepted add-on session and a recent control-loop
 tick. **Add-on connected** goes off after 120 seconds without a counted
 heartbeat. A rejected token, changed session or incompatible API version ends
-the session at once. Losing the connection changes no authority or fallback
-behaviour in the add-on.
+the session at once. Losing the connection does not transfer authority. On integration-owned
+sites it can trigger the native fallback charging schedule in Optimise.
 
 *Supply guard limiting*, *Charging allowance* and *Guard restores left today* are
 created only after a topology is saved. They become available when the
-integration's guard loop starts, independently of the add-on link; the other
+integration's guard loop starts, independently of the add-on link. On
+integration-owned sites, mode, manual control, authority epoch, fallback and
+holds also use local authority independently of that link. The other
 summary-fed entities show `unavailable` without a counted heartbeat, except
 **Last run**, which keeps its last value even when no plan exists after an
 add-on restart. **Add-on connected** itself is always available. SoC-derived
@@ -167,8 +355,9 @@ also refused while any saved inverter's limits are unconfirmed, with *every
 controllable inverter's limits must be confirmed*. An unusable accepted
 topology record refuses both with its own reason. Leaving a mode is never
 blocked, and editing limits never changes the mode or grants authority.
-Axle export remains supervised: ha-spark will arm configured export windows,
-but a person must be present for preparation and verified cleanup (see the
+Axle export remains supervised. Native export also needs the owner's live
+supervision for that event; a person must be present throughout, including
+preparation and verified cleanup (see the
 [supervised-export runbook](../docs/runbooks/supervised-axle-export.md)).
 A change uses the epoch displayed on the page. A conflict reloads status and
 requires a new click; it never retries the change automatically. With authority
@@ -177,7 +366,8 @@ hardware. A queued request may still finish, so refresh before trying again.
 
 CLI equivalents are `ha-spark mode show`, `ha-spark mode set protect`,
 `ha-spark mode set optimise`, `ha-spark mode set observe`, and
-`ha-spark mode confirm-observe`. Only the running daemon changes authority.
+`ha-spark mode confirm-observe`. The running daemon handles CLI requests; on
+integration-owned sites it forwards them to the integration's authority store rather than changing its retired store.
 
 ## Plan view
 
@@ -374,8 +564,10 @@ remain. Restart loads and checks the committed candidate as a whole.
 
 The companion integration owns the site's topology and limits in its config
 entry (ADR-0006), so they remain available while the add-on is down. Open
-**Settings → Devices & services → ha-spark → Options**. The menu offers
-**Solcast daily allowance** and **Site topology and limits**. The topology menu
+**Settings → Devices & services → ha-spark → Options**. The menu includes
+**Solcast daily allowance**, **Site topology and limits**, **Manual control
+deadline** and **Native SoC trust policy**, plus native evidence and fallback
+options when a native inverter is configured. The topology menu
 edits **Grid connections**, **Battery banks**, **Inverters**, **V2L charger**
 and **Major loads**, then **Save topology**; each collection has Add, Edit,
 Remove and Back.
@@ -383,7 +575,8 @@ Remove and Back.
 Edits stay in a draft and nothing applies until **Save topology**. A save
 validates the whole document and stores it with a revision that goes up by one,
 and reloads the integration; a newly accepted revision triggers one replan. It
-never changes the operating mode or authority. A refused save shows the error
+never grants authority to escalate. A transport change can request the verified
+authority switch described above. A refused save shows the error
 and keeps the previous topology live; the draft is lost if you close the flow.
 Removing a connection still used by a bank or major load, a bank still used by
 an inverter or V2L charger, or the last connection, bank or inverter is refused.
@@ -472,12 +665,12 @@ revision and any reason. The **Integration link** check can add
 `topology_record_unavailable`, `invalid_major_loads` or `invalid_supply_guard`.
 A new accepted revision triggers one replan.
 
-In 0.30.0, several banks or connections are preview-only until per-bank SoC
-arrives; re-adding the integration restarts its topology revision at 1, and the
+Several banks or connections remain preview-only for the add-on planner;
+re-adding the integration restarts its topology revision at 1, and the
 add-on keeps the old accepted topology until a save passes that revision; V2L
 refills and bank capacity, minimum SoC and target cap still come from the
-add-on settings. There is no native integration writer yet (see **Supply
-guard**).
+add-on settings. Native device intents are written by the integration, not by
+the legacy add-on writer (see **Native Solis setup and authority switch**).
 
 ### Major-load reserve
 
@@ -637,10 +830,10 @@ diagnostic does not itself establish fresh protection evidence.
 
 ### Solis control
 
-ha-spark writes the Solis timed-slot charge registers itself, with the
-`modbus.write_register` service on the `solis_control` overlay hub, and reads
-them back through that hub's `sensor.solis_control_*` entities. Control does
-not depend on the solax integration. An add-on can't add `modbus:` entries to
+On a legacy, add-on-owned site ha-spark writes the Solis timed-slot charge
+registers with `modbus.write_register` on the configured `<solis_control_hub>`
+overlay hub, and reads them back through `sensor.<solis_control_hub>_*`.
+Control does not depend on the solax integration. An add-on can't add `modbus:` entries to
 your `configuration.yaml`, so you add the overlay
 (`docs/solis-control-modbus-overlay.yaml`) once by hand.
 
@@ -671,7 +864,8 @@ other processes or external Home Assistant automations.
 
 ### Power-switch holds
 
-On the Solis, ha-spark re-reads the dispatch state and checks
+The following describes the legacy, add-on-owned path; native evidence and
+holds are described above. On the Solis, ha-spark re-reads the dispatch state and checks
 `inverter_power_switch_entity` every minute, separately from the half-hourly
 plan. It turns the switch `Off` during an active dispatch hold and back `On`
 only to release a hold it recorded itself. When `ev_status_entity` is configured, a fresh
@@ -793,13 +987,15 @@ devices:
 - `plan_run_time`: no longer used, and kept so existing configs still load. The
   daemon recomputes the plan every half-hour slot.
 
-### Daemon-only hardware writes
+### Daemon command channel
 
 `plan --apply`, `run --once`, `solis sync-clock`, the agent's `run_plan`
 (including MCP) and `POST /agent/run` submit fixed operations to the running
 ha-spark daemon. Replans use the daemon's live SoC, fallback and hold state;
 a one-shot request cannot overwrite an active fallback charging schedule.
-The daemon's committed site operating mode and safety checks still apply.
+The site's committed operating mode and safety checks still apply. On an
+integration-owned site the daemon forwards typed commands; only the integration
+writes hardware.
 
 The CLI connects only to `ha_spark.sock` in `/data` (standalone/dev: beside the
 configured database). The Unix socket is mode `0600`, not a TCP endpoint or an
@@ -815,8 +1011,9 @@ returns 1 because no sync was verified (2 for a non-Solis install).
 
 ### Supply guard
 
-Two guards exist in 0.30.0. Only the add-on's daemon guard writes, and it only
-lowers controlled charging; neither guard ever starts a charge.
+The site's authority owner determines which supply guard writes. The integration
+writes on integration-owned sites; the daemon writes on add-on-owned sites.
+Neither guard ever starts a charge.
 
 **Companion integration guard.** Saving a topology starts the integration's own
 guard loop for each grid connection. It reacts to grid-power reports rather
@@ -827,16 +1024,19 @@ site import minus the inverters' measured import. A reading counts as missing
 when it is unavailable, non-numeric or older than 60 s. The V2L charger is
 ignored, because car energy is not grid import.
 
-**In 0.30.0 it has no hardware writer** and never changes the inverter; the
-add-on's daemon guard below is still what lowers the charge current. From the
-readings alone it marks a cut after 2 consecutive readings with site import
+On add-on-owned sites this guard only displays; on integration-owned sites it
+cuts and restores charging through the native write boundary, using its own
+authority store. It marks a cut after 2 consecutive readings with site import
 more than 200 W above the supply limit, showing an allowance of the supply limit
-minus measured other load (never below zero), and clears it after 5 continuous
-minutes with at least 200 W of supply headroom. Clearing a displayed cut spends
-no restore. The writer's rules (writes only in Protect or Optimise with the mode
-taken from the add-on's authority mirror, at most 48 restores per household day,
-and one latched 50% cut after 2 minutes of missing readings when supply headroom
-was already short) arrive with it in a later release.
+minus measured other load (never below zero), and, on the display-only path,
+clears it after 5 continuous minutes with at least 200 W of supply headroom. Native restores instead need 5 continuous
+minutes with available charging power at least 200 W above the requested
+charge. Clearing a displayed cut on an add-on-owned site spends no restore.
+Native writes run only in Protect or Optimise, with at most 48 restores per household
+day and one latched 50% cut after 2 minutes of missing readings when supply
+headroom was already short. During manual control, restores are capped at the
+owner's latest requested charge current. These are charging safeguards, not
+the export tripwire: missing export readings never cut export.
 
 The site device gets **Supply guard limiting** (problem), **Charging
 allowance** (diagnostic, kW, `unknown` when not limiting) and **Guard restores
@@ -850,7 +1050,7 @@ never plans from the live allowance. Dormancy reasons shown in diagnostics are
 `awaiting_reading` and `missing_reading`; warn reasons are
 `authority_unavailable`, `guard_save_failed` and `guard_write_failed`.
 
-**Add-on daemon guard.** If an EV dispatch overlaps the battery's timed charge,
+**Add-on daemon guard (add-on-owned sites only).** If an EV dispatch overlaps the battery's timed charge,
 total supply draw can exceed what the main fuse should carry. Set
 `grid_power_entity` to a whole-house supply power sensor (W). On every tick
 inside the charge window, the daemon then lowers the timed-charge current to
@@ -859,8 +1059,7 @@ keep total draw under the effective connection import limit
 it back toward the planned current as supply headroom returns.
 `supply_voltage_v` (default 240) converts the sensor's watts to amps. The
 guard's writes follow the site operating mode and safety checks, as the plan's
-do. Leave `grid_power_entity` empty to turn this daemon guard off. For now it
-is the only guard that writes.
+do. Leave `grid_power_entity` empty to turn this daemon guard off. It does not run on integration-owned sites.
 
 While the accepted topology record is unreadable, the daemon guard uses
 `supply_max_current_a` at `supply_voltage_v` as its limit (both must be finite
@@ -875,6 +1074,10 @@ back. **Known gap:** an accepted native connection limit lower than
 cut to 0 A whenever the record was unreadable.
 
 ### SoC integrity and fallback
+
+This section describes add-on-owned sites. Integration-owned sites use the
+native SoC policy and fallback options described above, not
+`solis_fallback_current_a`.
 
 ha-spark checks `soc_entity` once a minute (see the `soc_*` settings above).
 The companion integration shows fallback state in **Fallback active** and the
@@ -1215,12 +1418,17 @@ only lowercase letters, digits and underscores; anything else is refused when
 it is saved. ha-spark sends one
 notice when it accepts an event, one
 after a verified export start, one after verified cleanup, and one for a
-terminal abort. It deduplicates notices by event and lifecycle step. A notice
-is never proof that a hardware write succeeded. Leave both `notify_service` and
+terminal abort. On native sites these come from the integration's durable
+transition log, including transitions made while the add-on was down. `armed`
+is logged but sends no notice. `clock_hold` is retryable; `not_supervised`
+produces a terminal abort notice. `tripped` becomes **Axle export aborted**
+with reason **site export over limit**; it is not a cleanup notice. Notices are
+deduplicated by event and lifecycle step. A notice is never proof that a hardware write succeeded. Leave both `notify_service` and
 the deprecated `v2l_notify_service` blank to turn the notices off. The
-supervised procedure is in `docs/runbooks/supervised-axle-export.md`.
+supervised procedure is in `docs/runbooks/supervised-axle-export.md`. Native
+export notices use `notify_service` only, not `v2l_notify_service`.
 
-On the Solis, an export window fires on the inverter's own clock. ha-spark
+On a legacy Solis, an export window fires on the inverter's own clock. ha-spark
 refuses to arm one unless `sensor.<solis_control_hub>_inverter_clock` (add it
 from `docs/solis-control-modbus-overlay.yaml`) is under 60 s old and within
 `inverter_clock_tolerance_minutes` of the household clock (`timezone`).
@@ -1411,10 +1619,15 @@ every hardware decision.
 5. `ha-spark plan` prints tonight's plan without applying it.
 6. Leave the add-on running; it recomputes the plan every half-hour. When the
    Observe plan looks right, disable conflicting automations, confirm
-   the Solis overlay and entity reads are healthy before enabling Optimise.
+   the transport and evidence reads are healthy before enabling Optimise.
+   Native Solis uses the setup and authority-switch steps above, not an overlay.
    Follow the handover procedure linked above.
 
 ## Hold evidence freshness and durable ownership
+
+The settings and sibling-liveness rules below describe add-on-owned sites.
+Integration-owned sites use **Native protection evidence** above; no sibling
+report rescues a stale source there.
 
 Only fresh EV/dispatch evidence can start a new hold. A confirmed EV hold
 survives stale evidence and restarts, and clears after five strictly advancing
