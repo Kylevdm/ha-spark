@@ -102,7 +102,8 @@
   **Authority owner** row with the owner, the handshake state and the
   snapshot's freshness.
 
-- **The integration now installs `pymodbus` 3.13.1 (#573).** It carries the
+- **The integration now requires `pymodbus` 3.13.1 or later (#573), the version
+  Home Assistant itself ships.** It carries the
   native Solis Modbus connection: one paced connection per gateway, with
   writes queued ahead of polling reads and never resent after a disconnect.
 

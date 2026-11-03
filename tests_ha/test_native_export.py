@@ -253,7 +253,8 @@ def allow_export(c: SparkCoordinator, monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setattr(c, "soc", SimpleNamespace(
         trusted=lambda bank: True, increases_allowed=lambda bank: True,
         bank=lambda bank: SimpleNamespace(trust="trusted", reason=None),
-        snapshot=lambda: [], observe=lambda now: None))
+        snapshot=lambda: [], observe=lambda now: None,
+        fallback_requested=False, recovery_ready=False))
     trusted_evidence(c)
     transport.set_holding(43007, [power])
     transport.set_holding(43142, [0])

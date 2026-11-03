@@ -44,11 +44,10 @@
     },
     "clock_drift": {
       "title": "Inverter clock differs from the household clock",
-      "description": "The native inverter clock differs by more than five minutes. Resident windows follow this clock. An administrator can synchronise it with the household clock.",
       "fix_flow": {
         "step": {"confirm": {
           "title": "Synchronise inverter clock",
-          "description": "Write the household clock to this inverter and verify it by read-back. This is an explicit clock write, including in Observe or manual control."
+          "description": "The native inverter clock differs by more than five minutes. Resident windows follow this clock. An administrator can synchronise it with the household clock. Write the household clock to this inverter and verify it by read-back. This is an explicit clock write, including in Observe or manual control."
         }},
         "error": {
           "authority_unknown": "Recover authority through the Observe repair before writing.",
@@ -108,12 +107,11 @@
     },
     "authority_unknown": {
       "title": "ha-spark authority is unknown",
-      "description": "The integration cannot verify its authority store. No native writes are permitted. Confirm Observe to recover, then re-escalate through readiness.",
       "fix_flow": {
         "step": {
           "confirm": {
             "title": "Confirm Observe",
-            "description": "Reset the integration authority to Observe with a new identity. This writes no hardware and does not change the add-on's authority."
+            "description": "The integration cannot verify its authority store. No native writes are permitted. Confirm Observe to recover, then re-escalate through readiness. Reset the integration authority to Observe with a new identity. This writes no hardware and does not change the add-on's authority."
           }
         },
         "error": {"save_failed": "The authority save could not be verified. No writes are permitted. Try again."},
