@@ -71,7 +71,13 @@ security and prefer the safe default. Hard rules:
   - *Native export is supervised only:* it runs only in Optimise with a live
     owner `supervise_export` for that event, within the device export bound,
     and never in fallback, Protect, manual control or Observe. Every clear is
-    zero-confirmed.
+    zero-confirmed. The live tripwire stops every export on a connection after
+    two consecutive fresh grid readings more than 200 W over the site export
+    limit; a missing or stale reading only warns and raises a repair, never
+    cuts. Its stop latch is saved before any cleanup write (the record goes
+    `stop_pending`), lasts to that export window's end across restarts and
+    Re-probes, and refuses that event as `tripped` even under a new
+    supervision.
 
   Under either authority owner, Observe, unknown authority and a failed
   authority save write nothing; Protect writes only its holds (and enabled
@@ -94,7 +100,8 @@ security and prefer the safe default. Hard rules:
   `energy/supply_guard.py`, `energy/soc_monitor.py`, `authority.py`,
   `transitions.py`, and in the integration `authority_store.py`,
   `ownership.py`, `native_write.py`, `native_holds.py`,
-  `native_fallback_control.py`, `guard_loop.py`, `native_export.py`).
+  `native_fallback_control.py`, `guard_loop.py`, `native_export.py`,
+  `native_tripwire.py`).
 - **Parameterised SQL only**; no `eval`/`exec`/`shell=True`/shell interpolation
   of external data.
 - **Network:** outbound only to configured endpoints; any inbound network
