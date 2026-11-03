@@ -845,11 +845,12 @@ class NativeChargeBoundary:
         state = self.coordinator.authority.state
         if state is None:
             return "authority_unknown"
+        # A trip drops the bound with its latch, so the latch is judged first.
+        if any(latch.event == event for latch in state.stop_latches):
+            return "tripped"
         supervision = supervision_for(state.export_supervisions, inverter.id, event)
         if supervision is None or supervision.ends_at <= dt_util.utcnow():
             return "not_supervised"
-        if any(latch.event == event for latch in state.stop_latches):
-            return "tripped"
         return None
 
     async def _async_export_group_controlled(
@@ -911,7 +912,10 @@ class NativeChargeBoundary:
                     zone = c.control.household_zone()
                     refusal = self._export_policy_reason(inverter, epoch)
                     if refusal is None:
-                        if supervision is None or not self._same_event(
+                        if any(latch.event == event for latch in state.stop_latches):
+                            # A trip drops the bound, so the latch is judged first.
+                            refusal = "tripped"
+                        elif supervision is None or not self._same_event(
                                 supervision.event, event):
                             refusal = "not_supervised"
                         elif (request.window.end <= now.astimezone(UTC)
@@ -920,8 +924,6 @@ class NativeChargeBoundary:
                               or request.window.end > request.event.end):
                             # The selected window must lie inside the supervised event.
                             refusal = "invalid_intent"
-                        elif any(latch.event == event for latch in state.stop_latches):
-                            refusal = "tripped"
                         elif (not request.soc.ok or not hasattr(c, "soc")
                               or not c.soc.trusted(inverter.bank_id)):
                             # The SoC gate never writes (oracle's early BLOCKED).

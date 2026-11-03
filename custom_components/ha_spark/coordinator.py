@@ -58,6 +58,7 @@ from .native_fallback_control import NativeFallback
 from .native_holds import NativeHolds, NativeTransitionWriter
 from .native_power import polled_power
 from .native_soc import NativeSoc
+from .native_tripwire import ExportTripwire
 from .native_write import NativeChargeBoundary
 from .ownership import OwnershipStore
 from .topology import Topology, validate_topology
@@ -111,6 +112,7 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
         self.solcast: SolcastCoordinator | None = None
         self.guard: SupplyGuardLoop | None = None
         self.writes = NativeChargeBoundary(self)
+        self.tripwire = ExportTripwire(self)
         self.holds = NativeHolds(self)
         self.fallback = NativeFallback(self)
         self.native.held_remapped = self.holds.remapped
@@ -363,13 +365,15 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
                 state = self.authority.state
                 if state is None:
                     return
-            if not state.export_supervisions:
-                return
             kept = tuple(row for row in state.export_supervisions if row.ends_at > now)
-            if len(kept) == len(state.export_supervisions):
+            # A stop latch lasts to its window end and no longer.
+            latches = tuple(row for row in state.stop_latches if row.window_end > now)
+            if (len(kept) == len(state.export_supervisions)
+                    and len(latches) == len(state.stop_latches)):
                 return
             await self.authority.async_save(state.model_copy(update={
-                "export_supervisions": kept, "last_changed_at": now,
+                "export_supervisions": kept, "stop_latches": latches,
+                "last_changed_at": now,
             }))
 
     async def _async_ack_export_transitions(

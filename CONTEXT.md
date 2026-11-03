@@ -186,6 +186,18 @@ export limit.
 (Decision: #283, 2026-10-12; rated output added by #316, 2026-10-15.)
 _Avoid_: EPM (vendor term), export guard
 
+**Export tripwire**:
+The live check on a supervised export: two consecutive fresh whole-site grid
+readings more than 200 W over the site export limit stop every export on that
+connection. A missing or stale reading never cuts; it only warns and raises a
+repair. PV-only export is never curtailed.
+
+**Stop latch**:
+The durable record, saved before any cleanup write, that an export event was
+stopped by the tripwire. It lasts to the event window's end, survives restarts
+and Re-probes, and refuses that event as `tripped` even if the owner confirms a
+new supervision.
+
 **Charging allocation**:
 The charging power assigned to a bank and divided across its connected
 inverters within device, bank and shared site limits. A V2L charger's current

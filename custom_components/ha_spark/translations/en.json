@@ -38,6 +38,10 @@
     "resume_control": {"name": "Resume control", "description": "End manual control using current conditions."}
   },
   "issues": {
+    "export_reading_missing": {
+      "title": "Site grid reading missing during an export",
+      "description": "The whole-site grid power reading has been missing or stale for over two minutes while a supervised export is live. The export continues within the inverter's confirmed bound; the tripwire cannot watch the site export limit until the reading returns."
+    },
     "clock_drift": {
       "title": "Inverter clock differs from the household clock",
       "description": "The native inverter clock differs by more than five minutes. Resident windows follow this clock. An administrator can synchronise it with the household clock.",
