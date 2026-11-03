@@ -7,6 +7,8 @@ from ha_spark.energy.scheduler import _apply_failed, recovery_verified
 from ha_spark.energy.soc_monitor import SocMonitor
 from tests.test_soc_monitor import _measurement
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 @pytest.mark.parametrize(
     "outcome",

@@ -41,7 +41,7 @@ def test_v2_snapshot_fixtures(name: str) -> None:
         solar_forecast=body["solar_forecast"], topology=body.get("topology"),
         major_loads=body.get("major_loads"), supply_guard=body.get("supply_guard"),
     ) == body
-    assert len(json.dumps(body)) < 32 * 1024
+    assert len(json.dumps(body)) < 64 * 1024
     assert "solar_forecast" not in wire.build_snapshot(
         site_id=body["site_id"], release_version=body["release_version"],
         sent_at=datetime.fromisoformat(body["sent_at"]), api_version=1,

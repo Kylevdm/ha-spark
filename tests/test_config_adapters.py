@@ -72,6 +72,7 @@ def test_cli_import_supervisor_yaml(service, monkeypatch, capsys):
     # The store can be isolated while the fixed bootstrap database is /data's default.
     service = seed_settings(service.data_dir, settings=Settings(
         ha_url="http://ha.test", ha_token="test", db_path="/data/ha_spark.db",
+        solis_control_hub="solis_control",
     ))
 
     async def submit(settings, op, **kwargs):

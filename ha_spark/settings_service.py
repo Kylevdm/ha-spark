@@ -12,6 +12,12 @@ mismatched pair with no matching ``*.prev``, invalid values, an unsupported
 nothing is written or reseeded, reasons name fields only, and the one write
 accepted is an import carrying the repair token (a keyed digest of the files
 on disk, or ``none``).
+
+From 0.31 ``solis_control_hub`` defaults to empty. A store committed before
+0.31 (its ``initialised`` marker lacks ``hub_default``) and a pre-0.31 export
+keep the former ``solis_control`` explicitly when they omit the key and
+configure a legacy Solis; 0.31 exports pin the hub so their empty default
+survives an import.
 """
 
 from __future__ import annotations
@@ -56,6 +62,8 @@ _REPAIR_FILES = (
     "ha_spark_secrets.json.prev",
     "ha_spark_config.initialised",
 )
+# Marks a store committed under the empty hub default (0.31+); older markers are `{}`.
+_MARKER = {"hub_default": ""}
 
 
 class _PairRevisionMismatch(ConfigError):
@@ -187,6 +195,13 @@ def _merged(
         else:
             inputs[key] = value
     return inputs, secrets
+
+
+def _hub_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    """An imported empty hub is the 0.31 default, kept as an absent input."""
+    if inputs.get("solis_control_hub") == "":
+        return {key: value for key, value in inputs.items() if key != "solis_control_hub"}
+    return inputs
 
 
 def _read_options_overlay(path: Path = OPTIONS_PATH) -> dict[str, Any]:
@@ -418,6 +433,7 @@ class SettingsService:
         """Read the store; any ``ConfigError`` before a write means repair."""
         assert self._bootstrap is not None
         marker = self._path("ha_spark_config.initialised")
+        migrate_hub = marker.exists() and self._readable(marker.name) != _MARKER
         recover = False
         seed_source = "defaults"
         if marker.exists():
@@ -480,6 +496,30 @@ class SettingsService:
             except OSError:
                 self.save_failed = True
                 raise _RestartRequired("Configuration recovery failed; restart required") from None
+        if migrate_hub:
+            # Not a settings change: no replan, no fence, no pending restart.
+            # A crash after the commit leaves the key set: the next load only marks.
+            migrated = self._legacy_hub(inputs)
+            changed = migrated is not inputs
+            if changed:
+                inputs = migrated
+                candidate = self._candidate(inputs, secrets, validate)
+            if writable:
+                try:
+                    if changed:
+                        self._commit(inputs, secrets, revision + 1, backup=True)
+                    self._write_marker()
+                except OSError:
+                    self.save_failed = True
+                    raise _RestartRequired(
+                        "Configuration migration failed; restart required"
+                    ) from None
+                if changed:
+                    revision += 1
+                    log.info(
+                        "Configuration committed revision=%d fields=solis_control_hub "
+                        "actor=migration", revision,
+                    )
         if not marker.exists():
             # Compare validated values: Supervisor choices can encode numeric
             # defaults as strings (notably solar_percentile).
@@ -603,7 +643,7 @@ class SettingsService:
                 path.unlink(missing_ok=True)
 
     def _write_marker(self, name: str = "ha_spark_config.initialised") -> None:
-        path = self._temporary(name, {})
+        path = self._temporary(name, _MARKER if name == "ha_spark_config.initialised" else {})
         try:
             os.replace(path, self._path(name))
             self._sync_directory()
@@ -648,10 +688,26 @@ class SettingsService:
             mac.update(name.encode() + b"\0" + len(data).to_bytes(8, "big") + data)
         return mac.hexdigest() if present else "none"
 
+    def _legacy_hub(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Pre-0.31 inputs omitting the hub keep the former default for a legacy Solis.
+
+        Returns ``inputs`` itself when nothing changes.
+        """
+        if "solis_control_hub" in inputs:
+            return inputs
+        plain = {key: value for key, value in inputs.items() if key not in _SECRET_OPTION_KEYS}
+        devices = self._candidate(plain, {}, False).devices
+        if any(device.type == "inverter" and device.driver == "solis" for device in devices):
+            return {**inputs, "solis_control_hub": "solis_control"}
+        return inputs
+
     def export(self) -> dict[str, Any]:
-        """Return owner inputs only, never secrets or derived defaults."""
+        """Return owner inputs only, never secrets or derived defaults.
+
+        The hub is pinned so an import can tell a 0.31 export from a pre-0.31 one.
+        """
         with self._lock:
-            return deepcopy(self._inputs)
+            return {"solis_control_hub": "", **deepcopy(self._inputs)}
 
     def import_document(
         self, document: dict[str, Any], expected: int | str, actor: str,
@@ -665,7 +721,9 @@ class SettingsService:
                 return self._repair_import(document, expected)
             raw = normalise_legacy(document, self.settings.db_path, strict=True)
             changes = {key: None for key in self._inputs}
-            changes.update({key: value for key, value in raw.items() if key in _KEYS})
+            changes.update(_hub_inputs(self._legacy_hub(
+                {key: value for key, value in raw.items() if key in _KEYS}
+            )))
             return self.save(changes, expected if isinstance(expected, int) else -1, actor)
 
     def _repair_import(self, document: dict[str, Any], expected: int | str) -> dict[str, Any]:
@@ -689,6 +747,7 @@ class SettingsService:
         inputs, secrets = _merged(
             {key: value for key, value in raw.items() if key in _KEYS}, {}, kept,
         )
+        inputs = _hub_inputs(self._legacy_hub(inputs))
         candidate = _checked(self._candidate(inputs, secrets, False))
         inputs = _validated_devices(inputs, candidate)
         # compare_digest raises on non-ASCII str; compare the fixed token format first.
@@ -712,8 +771,8 @@ class SettingsService:
             for name in ("ha_spark_config.json.prev", "ha_spark_secrets.json.prev"):
                 self._path(name).unlink(missing_ok=True)
             self._commit(inputs, secrets, revision, backup=False)
-            if not self._path("ha_spark_config.initialised").exists():
-                self._write_marker()
+            # The import already decided the hub; mark it so no load migrates it again.
+            self._write_marker()
         except (OSError, ValueError, TypeError):
             self.save_failed = True
             raise ConfigError("Configuration save failed; restart required") from None

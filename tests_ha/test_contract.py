@@ -15,6 +15,7 @@ CONTRACT_DIR = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "
 def test_api_version_matches_the_shared_fixture() -> None:
     contract = json.loads((CONTRACT_DIR / "contract.json").read_text(encoding="utf-8"))
     assert API_VERSION == contract["api_version"]
+    assert sorted(SUPPORTED_API_VERSIONS) == contract["supported_api_versions"]
 
 
 def test_api_version_is_in_an_immutable_supported_set() -> None:

@@ -65,8 +65,10 @@ deleted on 2026-10-18, so those names are free for the real release
 candidates. No unchecked item is claimed as validated.
 
 [#366](https://github.com/Kylevdm/ha-spark/issues/366#issuecomment-6253526844)
-sequences the build into 16 phases (#376–#391, one milestone each). Each ships
-as a `0.y.x` minor, and each phase issue lists the gate items it must pass in
+sequences the build into 18 phases, one milestone each: #376–#391, phase 17
+(#592) and phase 18 (#593), added by the #366 amendments of 2026-10-30 and
+2026-11-02; phase 15 is folded into phase 14 as its last ticket. Each ships as
+a `0.y.x` minor, and each phase issue lists the gate items it must pass in
 tests. Then:
 
 - **`1.0.0-rc1`** (tag `v1.0.0-rc1`): every phase shipped, ruff, mypy and
@@ -80,10 +82,12 @@ every item below must be confirmed on real hardware or live suppliers.
 
 ### Safety (automatic control; must never regress)
 
-These gates cover add-on automatic control and its UI/CLI actions. In phase 2
-only the daemon actuates, through the site operating mode and write-time gate.
-Integration-owned control and temporary manual handover arrive in later phases;
-no bypass is granted here.
+These gates cover automatic control and its UI/CLI actions under the site's
+authority owner. On an add-on-owned site only the daemon actuates, through the
+site operating mode and write-time gate. On an integration-owned site (phase 8)
+the add-on writes no hardware; the integration's authority store and its one
+charge-write path hold the same gates, and temporary manual control is
+available there. No bypass is granted either way.
 
 - [ ] Observe (the new-install and legacy-upgrade default) computes a plan, logs `[SIMULATE]`
       action lines, and makes **zero** hardware-actuating calls, including on shutdown.

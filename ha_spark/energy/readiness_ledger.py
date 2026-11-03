@@ -25,7 +25,7 @@ from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.energy.sources import parse_time
 from ha_spark.energy.supply_guard import throttled_rate_w
 from ha_spark.energy.tariff import _in_overnight_window
-from ha_spark.energy.topology import EffectiveLimits
+from ha_spark.energy.topology import DEFAULT_ONE_WAY_CHARGE_EFFICIENCY, EffectiveLimits
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -288,6 +288,7 @@ async def record_guard(
     limit_a = 0.0
     supply_voltage = 0.0
     import_w = 0.0
+    eta = DEFAULT_ONE_WAY_CHARGE_EFFICIENCY
     try:
         if revision is not None:
             geometry = revision.run.inputs.geometry_for(revision.run.cfg)
@@ -298,6 +299,7 @@ async def record_guard(
             ):
                 target = revision.target_w
                 connection = plan.topology.connections[0]
+                eta = plan.topology.banks[0].one_way_charge_efficiency
                 limit_a = connection.import_limit_a
                 supply_voltage = connection.supply_voltage_v
                 import_w = plan.effective_limits.connections[0].import_kw * 1000
@@ -322,9 +324,9 @@ async def record_guard(
         if supply is not None and setpoint is not None and target is not None:
             throttle = throttled_rate_w(
                 supply, setpoint, target, limit_a=limit_a,
-                supply_voltage_v=supply_voltage,
+                supply_voltage_v=supply_voltage, one_way_charge_efficiency=eta,
             )
-            breach = supply - setpoint + throttle > import_w
+            breach = supply - setpoint + throttle / eta > import_w
         await ReadinessLedger(settings.db_path).record(GuardRecord(
             observed_at=now.astimezone(UTC), slot_start=slot_start(now),
             revision_id=revision.revision_id if revision else None, sample_valid=valid,

@@ -1,0 +1,33 @@
+commands_pending:
+  name: Commands pending
+  description: Prompt a fetch from the authenticated add-on channel. Accepts no command data.
+reprobe:
+  name: Re-probe Solis
+  description: Re-read identity and test gateway caching. Requires a non-system administrator.
+  fields:
+    inverter_id:
+      required: true
+      selector:
+        text:
+set_observe:
+  name: Set Observe
+  description: Make a verified handover to Observe. Requires a non-system administrator.
+start_manual_control:
+  name: Start manual control
+  description: Temporarily hand over controls to a non-system administrator.
+  fields:
+    duration:
+      default: one_hour
+      selector:
+        select:
+          options:
+            - one_hour
+            - until_tomorrow
+            - until_resumed
+    keep_protection:
+      default: true
+      selector:
+        boolean:
+resume_control:
+  name: Resume control
+  description: End manual control using current conditions, never an old plan.

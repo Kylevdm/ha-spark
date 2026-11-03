@@ -29,11 +29,12 @@ def service(tmp_path):
 def test_import_replaces_inputs_preserves_secrets_and_roundtrips(service):
     service.save({"notify_service": "phone"}, service.revision, "cli")
     service.import_document({"log_level": "info", "db_path": service.settings.db_path,
-                             "target_soc_cap": 85}, service.revision, "import")
+                             "target_soc_cap": 85, "solis_control_hub": ""},
+                            service.revision, "import")
     assert service.settings.notify_service == ""
     assert service.settings.octopus_api_key == "CANARY-SECRET-123"
     exported = service.export()
-    assert exported == {"target_soc_cap": 85}
+    assert exported == {"solis_control_hub": "", "target_soc_cap": 85}
     service.import_document(exported, service.revision, "import")
     assert service.export() == exported
 
@@ -68,9 +69,10 @@ async def test_config_socket_operations(service, caplog):
         assert saved.error is None
         assert len(service.settings.notify_service) == 8192
         imported = await submit_socket(service.settings, "config_import",
-                                       expected_revision=service.revision, document={})
+                                       expected_revision=service.revision,
+                                       document={"solis_control_hub": ""})
         assert imported.error is None
-        assert service.export() == {}
+        assert service.export() == {"solis_control_hub": ""}
         assert service.settings.axle_api_key == "CANARY-SECRET-123"
         conflict = await submit_socket(service.settings, "config_save",
                                        expected_revision=service.revision - 1, changes={})
@@ -94,9 +96,11 @@ def test_import_uses_fallback_guard_and_leaves_authority_unchanged(service):
 
 def test_import_secret_clear_is_explicit_and_mask_means_unchanged(service):
     for document in ({}, {"octopus_api_key": ""}, {"octopus_api_key": "***"}):
+        document["solis_control_hub"] = ""
         service.import_document(document, service.revision, "import")
         assert service.read_view()["settings"]["octopus_api_key"]["set"] is True
-    service.import_document({"octopus_api_key": {"clear": True}}, service.revision, "import")
+    service.import_document({"octopus_api_key": {"clear": True}, "solis_control_hub": ""},
+                            service.revision, "import")
     assert service.read_view()["settings"]["octopus_api_key"]["set"] is False
 
 

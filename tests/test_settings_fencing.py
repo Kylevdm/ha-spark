@@ -19,6 +19,8 @@ from ha_spark.settings_service import SettingsService
 from tests.authority_helpers import seed_authority, seed_settings, settings_bytes
 from tests.test_solis_power_switch import FakeRest, _intent, _now, _window
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 def app_state(tmp_path):
     service = seed_settings(tmp_path, {

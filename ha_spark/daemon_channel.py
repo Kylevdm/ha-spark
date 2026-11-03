@@ -1,8 +1,9 @@
 """Private fixed-operation transport; only the scheduler consumes the work queue.
 
 The owner-only socket authenticates CLI mode requests by kernel peer uid and
-0600 permissions. Socket callers cannot claim an ingress identity. Only the daemon
-loop persists grants or runs device work; ordinary work requests add no permission.
+0600 permissions. Socket callers cannot claim an ingress identity. On add-on-owned
+sites only the daemon loop persists grants or runs device work. Native owner requests
+use the authenticated command queue; ordinary work requests add no permission.
 Config requests call the shared settings service inline and never enter the work queue.
 Replan requests that arrive while one is queued and not yet started join it: every
 caller shares one run and one reply (CONTEXT.md "Replan request").
@@ -18,7 +19,7 @@ import fcntl
 import os
 import socket
 import struct
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -28,7 +29,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from ha_spark.api.contract import AuthorityInputs, IntegrationLink, link_view
 from ha_spark.authority import (
     AuthorityStore,
-    OperatingMode,
     authority_view,
     load_authority,
     resolve_data_dir,
@@ -43,10 +43,13 @@ log = get_logger(__name__)
 MAX_CONFIG_BYTES = 256 * 1024
 Op = Literal[
     "replan", "apply", "sync_clock", "authority_status", "integration_link", "mode",
+    "supervise_export", "end_supervision",
     "config_show", "config_export", "config_save", "config_import", "config_set_secret",
 ]
 REFUSED = "[REFUSED] no ha-spark daemon running; hardware writes happen only inside the daemon"
 CONFIGURATION_REPAIR = "configuration_repair"
+ModeTarget = Literal["observe", "protect", "optimise", "manual", "resume"]
+Duration = Literal["one_hour", "until_tomorrow", "until_resumed"]
 
 
 class DaemonAlreadyRunning(RuntimeError):
@@ -56,8 +59,10 @@ class DaemonAlreadyRunning(RuntimeError):
 class Request(BaseModel):
     model_config = ConfigDict(extra="forbid")
     op: Op
-    target: OperatingMode | None = None
+    target: ModeTarget | None = None
     expected_epoch: int | None = Field(default=None, ge=1, strict=True)
+    duration: Duration = "one_hour"
+    keep_protection: bool = Field(default=True, strict=True)
 
     expected_revision: int | None = Field(default=None, ge=0, strict=True)
     repair_token: str | None = Field(default=None, max_length=128)
@@ -65,6 +70,9 @@ class Request(BaseModel):
     document: dict[str, Any] | None = None
     field: str | None = None
     value: str | dict[str, bool] | None = None
+    event: str | None = Field(default=None, max_length=256)
+    ratings_w: dict[str, float] | None = None
+    supervision_id: str | None = Field(default=None, max_length=128)
 
     @model_validator(mode="after")
     def validate_mode(self) -> Request:
@@ -76,11 +84,16 @@ class Request(BaseModel):
             "config_save": {"expected_revision", "changes"},
             "config_import": {"expected_revision", "document"},
             "config_set_secret": {"expected_revision", "field", "value"},
+            "supervise_export": {"event", "ratings_w"},
+            "end_supervision": {"supervision_id"},
         }.get(self.op, set())
-        fields = {"expected_revision", "repair_token", "changes", "document", "field", "value"}
+        fields = {"expected_revision", "repair_token", "changes", "document", "field", "value",
+                  "event", "ratings_w", "supervision_id"}
         present = {key for key in fields if getattr(self, key) is not None}
         if self.op == "config_import" and present == {"repair_token", "document"}:
             pass
+        elif self.op == "supervise_export" and "event" not in present:
+            present.add("event")  # optional: the current plan's only export event
         elif present != allowed:
             raise ValueError("invalid config operation fields")
         if self.op == "config_set_secret" and self.field not in _SECRET_OPTION_KEYS:
@@ -135,6 +148,8 @@ class DaemonChannel:
         self.path = resolve_data_dir(settings) / "ha_spark.sock"
         self.authority: AuthorityStore | None = None
         self.link_view: Callable[[], dict[str, object]] | None = None
+        self.native_request: Callable[[Request, str | None], Awaitable[Reply | None]] | None = None
+        self.native_status: Callable[[], dict[str, Any] | None] | None = None
         self.settings_service: SettingsService | None = None
         self.queue: asyncio.Queue[Pending] = asyncio.Queue(maxsize=64)
         # Owner mode requests skip queued work so a reply reaches the owner in one tick.
@@ -173,6 +188,8 @@ class DaemonChannel:
     async def __aexit__(self, *args: object) -> None:
         # A startup cancelled before its finally ran must not leave a departed AppState bound.
         self.link_view = None
+        self.native_request = None
+        self.native_status = None
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -209,6 +226,10 @@ class DaemonChannel:
 
     def authority_status(self) -> dict[str, Any]:
         repairing = self._repairing()
+        if not repairing and self.native_status is not None:
+            native = self.native_status()
+            if native is not None:
+                return native
         inputs = self.authority_inputs()
         view = authority_view(inputs.state, known=inputs.known, save_failed=inputs.save_failed)
         if repairing:
@@ -216,10 +237,27 @@ class DaemonChannel:
         return view
 
     async def submit_mode(
-        self, target: OperatingMode, expected_epoch: int | None, *, ingress_user: str | None = None,
+        self, target: ModeTarget, expected_epoch: int | None, *, ingress_user: str | None = None,
+        duration: Duration = "one_hour", keep_protection: bool = True,
     ) -> Reply:
         return await self._submit(
-            Request(op="mode", target=target, expected_epoch=expected_epoch), ingress_user,
+            Request(op="mode", target=target, expected_epoch=expected_epoch,
+                    duration=duration, keep_protection=keep_protection), ingress_user,
+        )
+
+    async def submit_export(
+        self, event: str | None, ratings_w: dict[str, float], *,
+        ingress_user: str | None = None,
+    ) -> Reply:
+        return await self._submit(
+            Request(op="supervise_export", event=event, ratings_w=ratings_w), ingress_user,
+        )
+
+    async def submit_end_supervision(
+        self, supervision_id: str, *, ingress_user: str | None = None,
+    ) -> Reply:
+        return await self._submit(
+            Request(op="end_supervision", supervision_id=supervision_id), ingress_user,
         )
 
     def next_request(self) -> Pending | None:
@@ -303,6 +341,16 @@ class DaemonChannel:
                 return Reply(error="conflict", config={"repair_token": exc.token})
             except ConfigError as exc:
                 return Reply(error="invalid configuration", reasons=[str(exc)])
+        if request.op in ("mode", "sync_clock", "supervise_export",
+                          "end_supervision") and self.native_request is not None:
+            native_reply = await self.native_request(request, ingress_user)
+            if native_reply is not None:
+                return native_reply
+        if request.op in ("supervise_export", "end_supervision"):
+            # Integration-owned sites only; never a legacy planning or apply cycle.
+            return Reply(error="not_available")
+        if request.target in ("manual", "resume"):
+            return Reply(error="not_available")
         future = asyncio.get_running_loop().create_future()
         if request.op == "replan" and self._pending_replan is not None:
             # Close-together replans join the queued one: one run, one shared reply.
@@ -354,11 +402,14 @@ class DaemonChannel:
 
 
 async def submit_socket(
-    settings: Settings, op: Op, *, target: OperatingMode | None = None,
-    expected_epoch: int | None = None,
+    settings: Settings, op: Op, *, target: ModeTarget | None = None,
+    expected_epoch: int | None = None, duration: Duration = "one_hour",
+    keep_protection: bool = True,
     expected_revision: int | None = None, changes: dict[str, Any] | None = None,
     document: dict[str, Any] | None = None, field: str | None = None,
     value: str | dict[str, bool] | None = None, repair_token: str | None = None,
+    event: str | None = None, ratings_w: dict[str, float] | None = None,
+    supervision_id: str | None = None,
 ) -> Reply | None:
     """None means unreachable. Never retry an accepted request after a lost reply."""
     path = resolve_data_dir(settings) / "ha_spark.sock"
@@ -371,8 +422,10 @@ async def submit_socket(
     try:
         payload = Request(
             op=op, target=target, expected_epoch=expected_epoch,
+            duration=duration, keep_protection=keep_protection,
             expected_revision=expected_revision, changes=changes, document=document,
             field=field, value=value, repair_token=repair_token,
+            event=event, ratings_w=ratings_w, supervision_id=supervision_id,
         ).model_dump_json(exclude_none=True).encode() + b"\n"
         if len(payload) > MAX_CONFIG_BYTES:
             return Reply(error="daemon request too large")

@@ -53,7 +53,10 @@ async def open_topology(hass: HomeAssistant, entry: MockConfigEntry) -> Any:
     result = await hass.config_entries.options.async_init(entry.entry_id)
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "init"
-    assert result["menu_options"] == ["solcast", "topology"]
+    native = any(i.get("transport") == "native"
+                 for i in entry.options.get("topology", {}).get("inverters", []))
+    assert result["menu_options"] == ["solcast", "topology", "manual", "soc"] + (
+        ["evidence", "fallback"] if native else [])
     result = await choose(hass, result["flow_id"], "topology")
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "topology"
@@ -423,11 +426,11 @@ async def test_topology_flow_translations(hass: HomeAssistant) -> None:
         "inverters_edit", "inverters_remove", "v2l_chargers", "v2l_chargers_item",
         "v2l_chargers_edit", "v2l_chargers_remove", "major_loads",
         "major_load_kind", "major_load_ev", "major_load_heat", "major_loads_edit",
-        "major_loads_remove", "save",
+        "major_loads_remove", "save", "fallback",
     ):
         assert translations[f"{prefix}step.{step}.title"], step
     menu_options = {
-        "init": ("solcast", "topology"),
+        "init": ("solcast", "topology", "soc", "fallback"),
         "topology": (
             "connections", "banks", "inverters", "v2l_chargers", "major_loads", "save",
         ),
@@ -450,6 +453,8 @@ async def test_topology_flow_translations(hass: HomeAssistant) -> None:
         for option in options:
             assert translations[f"{prefix}step.{step}.menu_options.{option}"], option
     data_fields = {
+        "soc": ("soc_max_report_age_minutes", "soc_failure_threshold", "soc_recovery_minutes"),
+        "fallback": ("window_start", "window_end"),
         "solcast": ("calls_limit",),
         "connections_item": (
             "id", "supply_voltage_v", "import_limit_a", "export_limit_a",
@@ -489,7 +494,8 @@ async def test_topology_flow_translations(hass: HomeAssistant) -> None:
         "unknown_bank", "unknown_connection", "duplicate_v2l_bank", "invalid_soc_range",
         "invalid_load_attribution", "invalid_load_demand", "multiple_dispatch_loads",
         "invalid_load_shares", "incomplete_topology", "invalid_topology", "invalid_item",
-        "remove_last", "connection_in_use", "bank_in_use",
+        "remove_last", "connection_in_use", "bank_in_use", "invalid_fallback",
+        "fallback_in_use", "fallback_invalidated",
     ):
         assert translations[f"{prefix}error.{error}"], error
 

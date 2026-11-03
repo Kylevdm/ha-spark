@@ -1,170 +1,208 @@
 # Runbook: supervised Axle export
 
-Human-present procedure for the first production-path Axle export event. This
-runbook covers the prototype in [#128](https://github.com/Kylevdm/ha-spark/issues/128)
-and the implementation in [#133](https://github.com/Kylevdm/ha-spark/issues/133).
+Human-present procedure for a planned Axle export. Prepare in Observe, explicitly
+choose Optimise, supervise the event, then return to Observe only after verified
+cleanup. This is not evidence of unattended readiness. Do not enter an export
+window by hand or use a parallel automation to write the inverter.
 
-This is supervised hardware control. The operator requests Optimise shortly
-before the event, watches the inverter and household telemetry throughout, and
-returns ha-spark to Observe after verified cleanup. Do not use a parallel HA
-automation or enter an event window by hand.
+## Prepare in Observe
 
-## Before the event
+- [ ] Be present throughout and able to stop the run. Keep the operating-mode
+      page and an independent view of battery and whole-site grid power open.
+- [ ] Finish any handover to Observe. Check known authority, settled ownership,
+      no transition and no outstanding cleanup. Observe writes nothing; it
+      does not erase an inverter-resident charging schedule.
+- [ ] Run `ha-spark health`. Resolve authority, transport, topology and provider
+      failures and inspect the integration's repairs. Health is diagnostic,
+      not an authority grant or proof of a live hardware write.
+- [ ] On a native site, each inverter is validated, gateway caching is off,
+      ha-spark is the sole gateway client, and `solis_control_hub` is explicitly
+      empty. Complete the [native migration runbook](solis-native-migration.md)
+      before the event, not during it.
+- [ ] Disable conflicting inverter-writing automations. Confirm effective
+      inverter and bank discharge limits, and the site export limit against
+      the installation's permission and supply limit. Do not enable an
+      inverter export limit to bypass native bound validation.
+- [ ] Confirm protection evidence is configured and fresh, SoC is trusted and
+      recovered, and the fallback charging schedule has explicit currents.
+      No applicable hold may overlap the export; holds beat exports.
+- [ ] Confirm the household clock and inverter clock agree. An unreadable,
+      stale or untrusted clock is an abort condition; do not bypass its guard.
+- [ ] Confirm the current plan names an explicit fresh Axle export event with
+      the expected direction and window. Do not type inferred event times.
+- [ ] Set `notify_service` to the intended bare HA notify service, such as
+      `mobile_app_<device>`, without `notify.`. Blank disables native export
+      notices; the deprecated `v2l_notify_service` is not their target. Check
+      notification delivery before relying on it as a reminder.
+- [ ] Record a baseline: timestamp, event identity and window, plan, SoC,
+      battery power, solar power, house load, whole-site grid power, power
+      switch, resident charging and discharge windows, and ownership/mode.
 
-- [ ] A person is present and can stop the run immediately.
-- [ ] The committed operating mode is Observe while the installation is prepared.
-- [ ] The Solis overlay is healthy, the daemon is running, and `ha-spark mode show`
-      reports all Optimise entry preconditions pass, including a validated model,
-      configured protection evidence, trusted SoC and a configured fallback
-      current.
-- [ ] The incumbent automations that write the Solis power switch or timed
-      discharge window are disabled for this run.
-- [ ] Clock check steps 1 to 3 pass in Observe. The sync (steps 4 and 5)
-      runs right after Optimise is requested, before the window arms (see
-      [Clock check](#clock-check)). The configured `timezone` is the
-      **household clock**, and everything else is checked against it. Slot 1
-      stores a local wall-clock window with no date, which the inverter fires
-      on its own clock, so a clock mismatch can arm it on the wrong day or at
-      the wrong time.
-- [ ] SoC is fresh, finite, and in the configured 0 to 100% range.
-- [ ] `dno_export_limit_kw` matches the export limit in the installation's DNO
-      approval. The default is the G98 limit, 3.68 kW.
-- [ ] No dispatch hold overlaps the planned export window.
-- [ ] The event came from a fresh explicit Axle API/HA source. Never type an
-      inferred start or end time.
-- [ ] `notify_service` names the intended HA `notify.<service>` target. A blank
-      value disables notices. Notifications are reminders, not proof of a write.
-- [ ] Record a baseline timestamp, SoC, battery power, solar power, house load,
-      grid power, inverter power switch, work mode, and the Solis Slot 1 window.
+## Enter Optimise and arm native supervision
 
-### Clock check
+1. Request Optimise on the ingress operating-mode page. Check the reported
+   preconditions and transition; acceptance alone does not prove activation.
+   Optimise needs a fresh verified plan. A refused or deferred export with a
+   safe resident state does not itself prevent plan verification, so an
+   Optimise mode indication is not proof of export.
+2. Under **Supervise this export**, confirm the displayed planned event and
+   every inverter's rated AC output in watts, then choose **Arm supervised
+   export**. This is the owner's event-scoped export supervision, carried by
+   the authenticated add-on command `supervise_export`, not an HA service.
+   Every inverter on the connection needs a bound tied to its validated
+   identity and gateway ownership claim. Their rated outputs must together
+   fit the site export limit. An enabled inverter export limit is not a
+   native device export bound, and ha-spark never writes it.
+3. Keep the supervision id from **Export supervision** ready
+   for **End supervision**. Native export runs only in Optimise with live
+   supervision, never in Protect, Observe, fallback or temporary manual
+   control. A new supervision does not clear a stop latch.
+4. Inspect **Export bound**, **Export supervision** and **Export record**.
+   `armed` means the window was verified before its start; `active` records
+   an export verified inside the window. Slot 1 has no date: programming is
+   deferred when its clock face would fire before the event. Do not work
+   around a deferral by programming the inverter yourself.
+5. At the start, confirm battery discharge and whole-site grid direction from
+   fresh telemetry, not just the plan or notice. Keep grid export below the
+   site export limit and watch SoC, solar, house load and guard state until
+   cleanup completes. Do not wait for the tripwire if anything looks unsafe.
 
-Steps 1 to 3 run while still in Observe. Steps 4 and 5 run shortly before the
-event, after the owner requests Optimise and before the export window arms.
-Clock sync goes through the running daemon and its write gate; it writes only
-when the current operating mode and transition authorise it.
+The fixed native export command is 62.5 A per exporting inverter. It must fit
+each effective inverter limit and the combined bank discharge limit; an owner
+rating does not relax those limits. A hold, untrusted SoC, failed power-switch
+check or failed read-back can still refuse an otherwise supervised export.
 
-1. **First native read only:** in Home Assistant, briefly enable the disabled
-   `sensor.solisac_rtc` entity. Confirm `sensor.solis_control_inverter_clock`
-   (`yy,mm,dd,hh,mi,ss`) shows the same date and time, then disable
-   `sensor.solisac_rtc` again. The register map's only source is solax-modbus
-   `plugin_solis.py`, so this cross-checks it once.
-2. Confirm the add-on container's UTC clock matches a trusted UTC source.
-3. Run `python -m ha_spark health`. `Household clock` must be ✓: HA's
-   `time_zone` equals the configured `timezone`. Record the `Inverter clock`
-   line; this is the error **before** the sync.
-4. Run `python -m ha_spark solis sync-clock`. It must exit 0 and end with
-   `[APPLIED] sync inverter clock to <timezone> (now … )`. Record the error
-   **before** and **after** from its output. Exit 1 means nothing was
-   confirmed: do not continue.
-5. Run `health` again. `Inverter clock` must be ✓.
+The CLI exposes `ha-spark export supervise --rating <inverter_id>=<watts>`
+(repeat `--rating` per inverter), optional `--event`, and
+`ha-spark export end <supervision_id>`. Supervision and ending it require the
+integration to recognise an owner: the owner-only local CLI is accepted as
+`cli`; an ingress identity must resolve to a non-system administrator. Neither
+path bypasses the export guards.
 
-ha-spark itself refuses to arm the export window if the inverter clock is off
-by more than `inverter_clock_tolerance_minutes` (default 5), if its reading is
-over 60 s old, or if it is unreadable. It then sends an "Axle export held:
-inverter clock" notice and retries each pass. Syncing clears the refusal.
+## Watch lifecycle notices
 
-Record the clock check before proceeding. Use UTC for the record timestamp.
+The integration keeps an ordered durable transition log; the add-on delivers
+notices after reconnecting, including transitions made while it was down.
+Notices are deduplicated by event and lifecycle step. Delivery is best-effort
+and does not control hardware. No notice replaces telemetry or cleanup checks.
 
-| Check | Result |
-| --- | --- |
-| Checked at (UTC) | |
-| Configured `timezone` / HA `time_zone` | |
-| Add-on container UTC vs trusted source | |
-| `solisac_rtc` cross-check (first read only) | |
-| Inverter clock error before sync | |
-| Inverter clock error after sync | |
-| Operator / outcome | |
+| Integration transition | Notice and meaning |
+|---|---|
+| `accepted` | **Axle export accepted**: supervision was saved; prepare and stay present |
+| `armed` | No notice; inspect the verified export record |
+| `started` | **Axle export started**: timed-discharge current and window read back inside the window |
+| `cleanup_verified` | **Axle export cleanup verified**: resident export window cleared and read back |
+| `clock_hold` | **Axle export held: inverter clock**: retryable refusal, not a terminal abort |
+| `aborted` | **Axle export aborted**: terminal refusal or failed operation; inspect its reason and safe result |
+| `tripped` | **Axle export aborted**, reason **site export over limit**: the stop latch is saved, not proof cleanup succeeded |
 
-Keep the record with the event evidence for #134. A failed or incomplete clock
-check is an abort condition. Request Observe with `ha-spark mode set observe`
-or the ingress mode page and verify the handover completes.
+`not_supervised` generates a terminal abort notice. A trip shares the abort
+notice's deduplication step; do not expect a second abort message for the same
+event. A failed or unverified cancel can report **the Solis export state was
+not verified; switch to Observe and inspect it**. Follow the verified handover
+and inspect the device; do not read this as confirmation that it is safe.
 
-The accepted-event notice is the preparation prompt. It includes the event
-window, planned export, DNO limit, and the requirement to keep a person present.
-If the event changes, ha-spark sends a new accepted notice for the changed
-event. Repeated polls of the same event do not repeat it.
+## Tripwire and stop latch
 
-## Enable and observe
+While supervised export is live, two consecutive advancing fresh whole-site
+grid readings more than 200 W above the site export limit stop every export
+on that connection. Readings must be finite and no more than 60 s old, with
+up to 5 s of future clock skew allowed. A missing or stale reading never cuts
+and never resets the count: it warns after 60 s of missing evidence and raises
+a repair after 2 minutes. Export continues on the device export bound; PV-only
+export is never curtailed. Missing telemetry is a reason for the person
+supervising to abort, not a reason to weaken this guard.
 
-1. Confirm the accepted notice and the planner output identify the same event.
-2. Request Optimise on the ingress mode page or with `ha-spark mode set optimise`.
-   The daemon must be running; a refused request grants nothing. The mode stays
-   activating until its first fresh plan is fully read-back verified.
-3. Run [Clock check](#clock-check) steps 4 and 5 (sync, then `health`) and fill
-   in the record. If the sync is not confirmed, request Observe and verify handover.
-4. Confirm the committed mode is Optimise, the power switch is `On`,
-   and the fresh SoC guard passes.
-5. Watch the log for the verified Solis timed-discharge current and Slot 1
-   window. The start notice is sent only after those writes have read back.
-6. At the event start, record the timestamp and the first battery/grid response.
-   Confirm the direction is export and that grid export remains below the DNO
-   limit. Capture the command, read-back, battery power, solar power, house
-   load, grid power, SoC, and event identity.
-7. Within 1–2 minutes of any charge or export starting, confirm the sign of
-   `sensor.solisac_battery_power`: negative while charging, positive while
-   discharging or exporting. This is the second confirmation on top of register
-   read-back ([#131](https://github.com/Kylevdm/ha-spark/issues/131)). The
-   sensor does not see V2L current, which enters the battery through the R48
-   rectifier, so while V2L runs confirm with BMS current and SoC instead.
+The integration saves a durable stop latch before any cleanup write, drops all
+supervision bounds on the connection and marks the stopped records
+`stop_pending` with `stop_reason: tripped`. If the save fails it writes
+nothing. The latch survives restarts and Re-probes. Even if a new supervision
+is confirmed, the same event is refused as `tripped` until the stopped export
+window's end. Do not retry that event to bypass the stop.
 
-The start notice means the production driver saw a successful read-back. It
-does not replace confirmation from telemetry.
+`stop_pending` means cleanup is still owed. Only exact zero confirmation makes
+the record `cleared` with `cleanup_verified: true`. A latch can remain after
+successful cleanup; cleared hardware is not permission to resume that event.
 
-## Abort ladder
+## Abort
 
-Stop the run and leave the installation in the safe state if any of these occur:
+Abort if the event changes unexpectedly, evidence becomes untrustworthy, a
+hold applies, telemetry cannot confirm safe direction and limits, a writer
+conflicts, a write fails, or export runs outside the paid window.
 
-- event identity, direction, or window changes unexpectedly;
-- event data is stale, malformed, or no longer explicit;
-- SoC, power switch, operating-mode authority, work mode, or overlay health fails;
-- a current or Slot 1 write is rejected or does not read back;
-- battery, solar, house-load, or grid telemetry cannot confirm the expected
-  direction or the export limit is approached;
-- any incumbent automation or manual writer changes the same controls;
-- export continues outside the paid event window;
-- the export visibly starts more than `inverter_clock_tolerance_minutes` away
-  from the event start (the inverter clock is not where the sync left it).
+1. Choose **End supervision**, using the recorded id, to end export early.
+   Alternatively request Observe on the mode page or use the administrator's
+   `ha_spark.set_observe` service. These are requests for verified cleanup,
+   not evidence that the inverter has already stopped.
+2. Watch **Export record**, the resident discharge window and battery/grid
+   telemetry. If the command is refused or cleanup fails, keep the person
+   present and inspect the device using the installation's safe shutdown
+   procedure. Do not kill or unload the integration as a cleanup shortcut.
+3. Request Observe and wait for the handover to finish. Leaving Optimise
+   cancels export, writes and verifies the fallback charging schedule as the
+   starting schedule, and releases owned holds before committing Observe.
+   A failed handover remains visible; committed Observe itself writes nothing.
 
-An unreadable Axle read is not a cancellation: ha-spark preserves a still-live
-verified export rather than clearing it blindly. Do not override that protection
-with a manual window. Wait for recovery or use the operator's safe shutdown
-procedure.
+An unreadable event source is not a trusted cancellation. Only a still-live,
+verified record with current supervision can be preserved; untrusted reads
+cannot authorise a new window. Use the explicit abort path rather than
+manually replacing the resident window.
 
-The abort notice names the failed guard or operation and the safe result. A
-notice is not evidence that cleanup succeeded; verify the Slot 1 read-back.
+## Verify cleanup and return to Observe
 
-## Cleanup and handoff
+1. At the event end let normal cleanup run, or end supervision early. Check
+   the discharge half is zero, not merely that the paid event ended. The
+   native clear requires exact read-back plus five further matching reads a
+   second apart. Transition cancellation and fallback-entry cancellation also
+   zero and verify the other discharge slots. A fallback charge write alone
+   never retires an export record.
+2. Check **Export record** is `cleared`, `cleanup_verified` is true, the
+   resident discharge window is empty and the battery has stopped the
+   scheduled export. Record the cleanup notice, but do not use it alone as
+   proof. Solar can still export; the tripwire never curtails PV-only export.
+3. If clearing fails, the record remains outstanding and retries in non-Observe
+   modes, including fallback. Keep supervision of the installation until the
+   device is safe. Observe does not perform cleanup writes after commitment.
+4. Request Observe, wait for a completed handover, then record final mode,
+   switch, resident windows, SoC and grid power. Only then end the supervised
+   session. Do not assume a restart or unload cleared a repeating window.
 
-1. After the event ends, let the normal provider transition run cleanup.
-2. Confirm the cleanup notice arrives only after the resident timed-discharge
-   window reads back as `00:00-00:00`.
-3. Record the cleanup timestamp, final Slot 1 values, final SoC, grid power,
-   and any remaining plan or guard warnings.
-4. If cleanup is not verified, keep the person present, request Observe, and
-   inspect the overlay before any retry. A failed handover stays visible as
-   switching to Observe; do not assume a notice was proof of cleanup.
-5. Request Observe on the ingress mode page or with `ha-spark mode set observe`.
-   Verify the handover completes and the committed mode is Observe. Only then
-   confirm `[SIMULATE]` actions with no hardware-actuating service calls.
-   Leaving Optimise cancels export, writes and verifies the fallback charging schedule,
-   then releases owned holds before committing Observe.
+## Restart and fallback recovery
 
-## Restart recovery
+A saved export is not permission to re-arm it. After restart, the integration
+re-verifies a still-live record against the actual resident discharge half.
+Only an exact match with current authority and supervision may be preserved;
+otherwise it is a cleanup obligation. Observe never writes, even for recovery.
+A failed startup reconciliation must be resolved before ordinary control.
 
-- Before restarting during a live event, capture the current event identity and
-  verified end from the operator log.
-- On restart, do not manually recreate the event. The persisted verified export
-  record protects the resident window while the Axle read is unavailable, and
-  the next trusted plan either continues it or performs verified cleanup.
-- If the process is intentionally stopped after the event, keep writes
-  authorised long enough to verify the safe state. A forced process kill may
-  skip cleanup, so a person must check the overlay before requesting Optimise
-  again.
+Fallback entry ends supervision and attempts cancellation before charging;
+failed cancellation is retried while fallback proceeds. Recovery applies a
+fresh plan, never a consumed command, and re-offered export needs fresh owner
+supervision. A changed identity or gateway claim ends the affected bound.
+The stop latch is independent of all of these recovery paths.
+
+## Legacy add-on-owned sites
+
+The legacy overlay path still ships. It uses the daemon's authority store,
+`<solis_control_hub>` read-back sensors and `ha-spark mode set optimise` /
+`ha-spark mode set observe`. The native supervision command, tripwire and stop
+latch above are not guards on that legacy path. Keep the same human-present
+Observe → Optimise → verified cleanup → Observe procedure.
+
+Before enabling Optimise, verify the overlay sensors and household clock with
+`ha-spark health`. Once writes are authorised, `ha-spark solis sync-clock`
+requests verified clock sync through the daemon. Legacy arming refuses an
+unreadable clock, a reading over 60 s old or drift beyond
+`inverter_clock_tolerance_minutes`. Watch the verified current and Slot 1
+window, then battery/grid telemetry. At cleanup confirm Slot 1 discharge reads
+`00:00-00:00` and wait for the verified Observe handover. Do not mistake native
+diagnostics or a notification for legacy device read-back.
 
 ## Evidence record
 
-Keep one row per transition with UTC timestamp, event identity, event window,
-planner output, command/read-back result, SoC, battery power, solar power,
-house load, grid power, notification transition, and operator action. Attach
-the completed record to the event proof ticket [#134](https://github.com/Kylevdm/ha-spark/issues/134).
+Keep a row per transition: timestamp, event identity/window, authority owner,
+mode and epoch, supervision id, plan, command and read-back, record state,
+cleanup verification, stop reason, SoC, battery/solar/house/grid power, notice
+and operator action. Keep gateway addresses and credentials out of shared
+records. Live hardware proof belongs to the live-check ticket; this runbook
+does not claim it has passed.

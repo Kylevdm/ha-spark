@@ -122,7 +122,8 @@ def test_repair_import_commits_and_preserves_readable_secrets(store: Path) -> No
     with pytest.raises(ConfigurationRepair):
         service.load(writable=True)
     result = service.import_document(
-        {"target_soc_cap": 85, "solis_fallback_current_a": 20}, service.repair_token(), "import",
+        {"target_soc_cap": 85, "solis_fallback_current_a": 20, "solis_control_hub": ""},
+        service.repair_token(), "import",
     )
     assert result["status"] == "live"
     assert service.repair is None
@@ -130,7 +131,9 @@ def test_repair_import_commits_and_preserves_readable_secrets(store: Path) -> No
     settings = fresh.load(writable=True)
     assert settings.target_soc_cap == 85
     assert settings.octopus_api_key == CANARY
-    assert fresh.export() == {"target_soc_cap": 85, "solis_fallback_current_a": 20}
+    assert fresh.export() == {
+        "solis_control_hub": "", "target_soc_cap": 85, "solis_fallback_current_a": 20,
+    }
 
 
 def test_newer_schema_document_is_never_overwritten(store: Path) -> None:
@@ -500,7 +503,8 @@ def test_ingress_import_outside_repair_uses_the_revision(store: Path) -> None:
         assert conflict.status_code == 409
         imported = client.post("/api/config/import", json={
             "expected": service.revision,
-            "document": {"solis_fallback_current_a": 20, "target_soc_cap": 85},
+            "document": {"solis_fallback_current_a": 20, "target_soc_cap": 85,
+                         "solis_control_hub": ""},
         })
         assert imported.status_code == 200, imported.text
     assert service.settings.target_soc_cap == 85

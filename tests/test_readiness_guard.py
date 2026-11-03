@@ -11,6 +11,8 @@ from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.readiness_ledger import ReadinessLedger, record_guard
 from tests.test_readiness_ledger import START, revision
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 @pytest.mark.parametrize("supply,valid,throttle,breach", [
     ("500", True, 1000, False),
@@ -48,6 +50,12 @@ async def test_guard_evidence_uses_revision_connection_not_current_settings(tmp_
     a = revision()
     cfg = replace(a.run.cfg, supply_max_current_a=6)
     plan = compute_plan(a.run.inputs, cfg, a.run.schedule)
+    assert plan.topology is not None
+    site = plan.topology
+    site = site.model_copy(update={"banks": (
+        site.banks[0].model_copy(update={"one_way_charge_efficiency": 1.0}),
+    )})
+    plan = replace(plan, topology=site)
     a = replace(a, run=replace(a.run, plan=plan))
     respx.get("http://ha.test/api/states/sensor.grid").respond(
         200, json={"entity_id": "sensor.grid", "state": "2000", "attributes": {}})
@@ -60,6 +68,38 @@ async def test_guard_evidence_uses_revision_connection_not_current_settings(tmp_
     assert row.throttle_w == 440  # 6 A * 240 V minus 1000 W other load
     assert row.breach is False
     assert all(call.request.method == "GET" for call in respx.calls)
+
+
+@respx.mock
+async def test_readiness_projects_dc_throttle_as_ac(tmp_path):
+    settings = Settings(ha_url="http://ha.test", ha_token="t",
+                        db_path=str(tmp_path / "ledger.db"), grid_power_entity="sensor.grid",
+                        battery_voltage_v=50, charge_window_start="00:00",
+                        charge_window_end="06:00")
+    a = revision()
+    plan = a.run.plan
+    assert plan.topology is not None and plan.effective_limits is not None
+    site = plan.topology
+    site = site.model_copy(update={
+        "banks": (site.banks[0].model_copy(update={"one_way_charge_efficiency": 0.949}),),
+        "connections": (site.connections[0].model_copy(update={
+            "import_limit_a": 75, "supply_voltage_v": 240,
+        }),),
+    })
+    limits = plan.effective_limits.model_copy(update={"connections": (
+        plan.effective_limits.connections[0].model_copy(update={"import_kw": 17}),
+    )})
+    a = replace(a, run=replace(a.run, plan=replace(plan, topology=site,
+                                                  effective_limits=limits)))
+    respx.get("http://ha.test/api/states/sensor.grid").respond(
+        200, json={"entity_id": "sensor.grid", "state": "16000", "attributes": {}})
+    respx.get("http://ha.test/api/states/sensor.solis_control_timed_charge_current").respond(
+        200, json={"entity_id": "sensor.solis_control_timed_charge_current",
+                   "state": "0", "attributes": {}})
+    await record_guard(settings, START, a, "observe")
+    (row,) = await ReadinessLedger(settings.db_path).guards()
+    assert row.throttle_w == 1000
+    assert row.breach is True
 
 
 @respx.mock

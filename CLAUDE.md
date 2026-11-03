@@ -43,23 +43,69 @@ security and prefer the safe default. Hard rules:
   validated before storage; it must not reach `call_service`. The deterministic
   planner is the sole decider.
 - **Actuation invariants:** the site **operating mode** (Observe/Protect/
-  Optimise, ADR-0008) is the only write gate. It lives in the daemon's durable
-  authority store, never in Settings, and only an owner transition changes it.
-  Only the daemon actuates: real writes go through `WriteGate.mode_for` and the
-  write-time `WriteGate.recheck` (`devices/execution.py`). Observe, unknown
-  authority and a failed authority save write nothing; Protect writes only its
-  holds (and enabled clock sync); Optimise runs the plan. An invalid SoC
-  blocks every SoC-derived write; always read back; isolate failures per
-  action. Writes that don't depend on SoC keep their own safeguards: holds
-  (discharge prevention) and authorised clock sync, and, after
-  `soc_failure_threshold` failed SoC checks, the Solis fallback in Optimise,
-  which programs the configured cheap-rate window at an explicitly set
-  `solis_fallback_current_a` through the same gates and read-back; no default
-  current, and AlphaESS never gets it. A hold starts only on fresh evidence
-  and ends on fresh clear evidence, a dispatch's last trusted end, or an
-  explicit owner handover; `On` is written only to a readable switch. Don't weaken these
-  (`ha_spark/devices/inverters/`, `energy/supply_guard.py`,
-  `energy/soc_monitor.py`, `authority.py`, `transitions.py`).
+  Optimise, ADR-0008) is the only write gate, and each site has exactly one
+  **authority owner** (the add-on or the integration) that holds it. The
+  authority owner is derived from the topology's
+  inverter transports (any `legacy` inverter, or none, means the add-on; all
+  `native` means the integration) and is confirmed only by the durable
+  ownership handshake; while it is pending or unknown nothing writes. The mode
+  lives in the authority owner's durable authority store, never in Settings,
+  and only an owner's transition request changes it.
+  - *Add-on-owned sites:* the add-on's store is the authority and only the
+    daemon actuates: real writes go through `WriteGate.mode_for` and the
+    write-time `WriteGate.recheck` (`devices/execution.py`).
+  - *Integration-owned sites:* the add-on's store carries the retirement
+    marker, `WriteGate` refuses every direct write, and the daemon's supply
+    guard, hold reconcile, SoC monitor, clock sync and V2L do nothing. The
+    add-on writes no hardware itself: a plan reaches devices only as typed
+    device intents sent as `apply` commands stamped with the plan epoch, and
+    owner requests travel the same command channel. The integration's authority store (`authority_store.py`) is the
+    gate, and every charge-affecting write (plan intents, owner entity edits,
+    fallback, hold restoration, supply-guard cuts and restores) goes through
+    the one charge-write path, `NativeChargeBoundary` (`native_write.py`):
+    guard lock then bus lock, write-time recheck of authority, ownership and
+    limits, the guard clamp, exact read-back. Power-switch and clock writes use
+    their own verified helpers under the same authority checks. A `read_only`
+    device (failed identity, caching on, gateway not owned) and a pending
+    switch write nothing.
+  - *Native export is supervised only:* it runs only in Optimise with a live
+    owner `supervise_export` for that event, within the device export bound,
+    and never in fallback, Protect, manual control or Observe. Every clear is
+    zero-confirmed. The live tripwire stops every export on a connection after
+    two consecutive fresh grid readings more than 200 W over the site export
+    limit; a missing or stale reading only warns and raises a repair, never
+    cuts. Its stop latch is saved before any cleanup write (the record goes
+    `stop_pending`), lasts to that export window's end across restarts and
+    Re-probes, and refuses that event as `tripped` even under a new
+    supervision.
+
+  Under either authority owner, Observe, unknown authority and a failed
+  authority save write nothing, with one exception: on an integration-owned
+  site an explicit owner clock sync (the `sync_clock` command or the
+  clock-drift repair's fix flow) may write in Observe or a manual session, but
+  never with unknown authority, a stale epoch or a transition in progress
+  (`native_clock.py`); Protect writes only its holds (and enabled
+  clock sync), plus, on an integration-owned site, supply-guard cuts and
+  restores and the fallback schedule written as the owner's starting schedule
+  when leaving Optimise; Optimise runs the plan. An invalid SoC blocks every SoC-derived write;
+  always read back; isolate failures per action. Writes that don't depend on
+  SoC keep their own safeguards: holds (discharge prevention), authorised
+  clock sync, and the Solis fallback charging schedule in Optimise. On the
+  add-on it starts after `soc_failure_threshold` failed SoC checks and
+  programs the configured cheap-rate window at an explicitly set
+  `solis_fallback_current_a`; on a native site it starts on `soc_integrity`
+  or `addon_liveness` and uses the owner's per-inverter currents from the
+  integration options. Both fallbacks go through the same gates and read-back,
+  are charge-only and have no default current, and AlphaESS never gets
+  either. A hold
+  starts only on fresh evidence and ends on fresh clear evidence, a
+  dispatch's last trusted end, or an explicit owner handover; `On` is written
+  only to a readable switch. Don't weaken these (`ha_spark/devices/inverters/`,
+  `energy/supply_guard.py`, `energy/soc_monitor.py`, `authority.py`,
+  `transitions.py`, and in the integration `authority_store.py`,
+  `ownership.py`, `native_write.py`, `native_holds.py`,
+  `native_fallback_control.py`, `guard_loop.py`, `native_export.py`,
+  `native_tripwire.py`).
 - **Parameterised SQL only**; no `eval`/`exec`/`shell=True`/shell interpolation
   of external data.
 - **Network:** outbound only to configured endpoints; any inbound network

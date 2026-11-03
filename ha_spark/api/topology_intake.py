@@ -72,7 +72,7 @@ _READINGS = TypeAdapter(Annotated[list[MajorLoadReading], Field(max_length=12)])
 
 
 def accept_topology(
-    settings: Settings, previous: LoadedTopology, raw: object,
+    settings: Settings, previous: LoadedTopology, raw: object, *, persist: bool = True,
 ) -> tuple[LoadedTopology, bool]:
     """An unconfigured or rejected snapshot never replaces an accepted document."""
     if raw is None or raw == {"configured": False}:
@@ -100,7 +100,8 @@ def accept_topology(
           and previous.topology is not None and drives_writer(previous.topology, settings)):
         supported = (previous.revision, previous.topology)
     try:
-        save_topology_record(settings, block.revision, block.topology, supported)
+        if persist:
+            save_topology_record(settings, block.revision, block.topology, supported)
     except OSError:
         return replace(previous, reason="topology_save_failed"), False
     return LoadedTopology(

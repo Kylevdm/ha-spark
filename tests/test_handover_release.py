@@ -20,6 +20,8 @@ from tests.test_solis_power_switch import (
     _window,
 )
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 @pytest.fixture(autouse=True)
 def _skip_read_back_delays(monkeypatch: pytest.MonkeyPatch) -> None:

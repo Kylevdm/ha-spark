@@ -20,7 +20,7 @@ from pathlib import Path
 import aiosqlite
 from pydantic import ValidationError
 
-from ha_spark.authority import load_authority
+from ha_spark.authority import load_authority, retirement_status
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import submit_socket
 from ha_spark.devices.inverters.solis_clock import (
@@ -204,6 +204,46 @@ async def check_ha_timezone(settings: Settings) -> CheckResult:
         Status.WARN,
         f"HA time_zone is {ha_zone!r} but ha-spark timezone is {settings.timezone!r}; "
         "times without an offset and the local day may be misread",
+    )
+
+
+_SOLIS_READBACK_FIELDS = (
+    "timed_charge_current",
+    "timed_discharge_current",
+    "work_mode_bitfield",
+    "timed_charge_start_hours",
+    "timed_charge_start_minutes",
+    "timed_charge_end_hours",
+    "timed_charge_end_minutes",
+    "timed_discharge_start_hours",
+    "timed_discharge_start_minutes",
+    "timed_discharge_end_hours",
+    "timed_discharge_end_minutes",
+)
+
+
+async def check_legacy_solis_transport(settings: Settings, device_id: str) -> CheckResult:
+    """The legacy overlay transport of one Solis inverter (#567); reads only.
+
+    Every read-back sensor the driver verifies a write against must be readable.
+    """
+    name = f"Solis transport ({device_id})"
+    if not settings.solis_control_hub:
+        return CheckResult(name, Status.FAIL, "no control path")
+    entity = ""
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+        ) as rest:
+            for field in _SOLIS_READBACK_FIELDS:
+                entity = f"sensor.{settings.solis_control_hub}_{field}"
+                if not math.isfinite(float((await rest.get_state(entity)).state)):
+                    raise ValueError
+    except Exception:  # noqa: BLE001 - untrusted states and HTTP failures degrade health
+        return CheckResult(name, Status.FAIL, f"overlay hub missing: {entity}")
+    return CheckResult(
+        name, Status.OK,
+        "overlay hub readable; warning: HA 2027.10 removes YAML modbus: hubs",
     )
 
 
@@ -442,6 +482,11 @@ async def check_operating_mode(settings: Settings) -> CheckResult:
             return CheckResult("Operating mode", Status.FAIL, "authority_unknown")
         if reply.authority.get("suspended"):
             return CheckResult("Operating mode", Status.FAIL, "suspended: configuration_repair")
+        if reply.authority.get("authority_owner") == "integration":
+            mode = reply.authority.get("mode")
+            if mode in ("observe", "protect", "optimise"):
+                return CheckResult("Operating mode", Status.OK, f"integration: {mode}")
+            return CheckResult("Operating mode", Status.FAIL, "integration authority unavailable")
     if result.status == "uninitialised":
         # No daemon of this version has started yet; nothing can write either way.
         return CheckResult("Operating mode", Status.WARN, "uninitialised (daemon not yet started)")
@@ -497,6 +542,30 @@ async def check_integration_link(settings: Settings) -> CheckResult:
             detail += f"; fetch age {fetch_age}s"
     return CheckResult(
         "Integration link", Status.OK if state == "connected" else Status.WARN, detail,
+    )
+
+
+async def check_authority_owner(settings: Settings) -> CheckResult:
+    """Allowlisted owner, handshake and freshness diagnostics; never a permission."""
+    try:
+        reply = await submit_socket(settings, "integration_link")
+    except OSError:
+        reply = None
+    view = reply.integration_link if reply is not None and reply.error is None else None
+    owner = view.get("authority_owner") if view is not None else None
+    retired = retirement_status(settings)
+    if retired is not None and owner in (None, "addon"):
+        # The durable marker, not a missing or stale snapshot, says who owns the site.
+        owner = "integration" if retired == "retired" else "pending_addon"
+    if owner not in ("addon", "integration", "pending_integration", "pending_addon"):
+        return CheckResult("Authority owner", Status.WARN, "unknown; snapshot unavailable")
+    state = view.get("state") if view is not None else None
+    fresh = state == "connected"
+    pending = owner in ("pending_integration", "pending_addon")
+    return CheckResult(
+        "Authority owner", Status.OK if fresh and not pending else Status.WARN,
+        f"{owner}; handshake {'pending' if pending else 'settled'}; "
+        f"snapshot {'fresh' if fresh else 'unavailable'}",
     )
 
 
@@ -643,6 +712,40 @@ async def check_limits(settings: Settings) -> CheckResult:
     )
 
 
+async def check_native_solis_transports(
+    settings: Settings, inverter_ids: tuple[str, ...],
+) -> list[CheckResult]:
+    """Read validation for all native inverters in one read-only daemon request."""
+    if not inverter_ids:
+        return []
+    view: dict[str, object] | None = None
+    try:
+        reply = await submit_socket(settings, "integration_link")
+        if reply is not None and reply.error is None:
+            view = reply.integration_link
+    except OSError:
+        pass
+    devices = view.get("devices") if view is not None else None
+    results = []
+    for inverter_id in inverter_ids:
+        status, detail = Status.WARN, "validation unknown"
+        if settings.solis_control_hub:
+            status, detail = Status.FAIL, "inconsistent"
+        elif view is not None and view.get("state") == "connected" and isinstance(devices, list):
+            matches = [d for d in devices if isinstance(d, dict) and d.get("id") == inverter_id]
+            if len(matches) == 1 and matches[0].get("transport") == "native":
+                device = matches[0]
+                if device.get("validation") == "validated" and device.get("reason") is None:
+                    status, detail = Status.OK, "validated"
+                elif device.get("validation") == "read_only" and device.get("reason") in (
+                    "unvalidated_identity", "identity_read_failed", "v2_tou_firmware",
+                    "caching_on", "gateway_not_owned", "unreachable",
+                ):
+                    detail = str(device["reason"])
+        results.append(CheckResult(f"Solis transport ({inverter_id})", status, detail))
+    return results
+
+
 async def check_topology_record(settings: Settings) -> CheckResult:
     """Read the same durable acceptance record as daemon, CLI and agent previews."""
     loaded = load_topology_record(settings)
@@ -657,9 +760,15 @@ async def check_topology_record(settings: Settings) -> CheckResult:
 
 async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
+    loaded = load_topology_record(settings)
+    native_ids = tuple(
+        inv.id for inv in loaded.topology.inverters if inv.transport == "native"
+    ) if loaded.topology is not None else ()
+    native_rows = await check_native_solis_transports(settings, native_ids) if native_ids else []
     results = await asyncio.gather(
         check_operating_mode(settings),
         check_integration_link(settings),
+        check_authority_owner(settings),
         check_ha_rest(settings),
         *([check_notify_service(settings)] if settings.notify_service else []),
         check_ha_websocket(settings),
@@ -673,7 +782,17 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_export_event_provider(settings),
         check_ha_timezone(settings),
         *([check_ev_status(settings)] if settings.ev_status_entity else []),
-        *([check_inverter_clock(settings)] if settings.inverter == "solis" else []),
+        *(
+            check_legacy_solis_transport(settings, device.id)
+            for device in settings.devices
+            if device.type == "inverter" and device.driver == "solis"
+            and device.id not in native_ids
+        ),
+        *(
+            [check_inverter_clock(settings)]
+            if settings.inverter == "solis" and settings.solis_control_hub
+            else []
+        ),
     )
     try:
         evidence = await check_evidence_freshness(settings)
@@ -681,7 +800,8 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         evidence = [CheckResult(
             "Evidence freshness", Status.WARN, f"could not read ({type(exc).__name__})"
         )]
-    return [*results, check_entity_config(settings), *check_hold_release(settings), *evidence]
+    return [*results, *native_rows, check_entity_config(settings),
+            *check_hold_release(settings), *evidence]
 
 
 async def run_repair_health(bootstrap: Settings, reasons: list[str]) -> list[CheckResult]:

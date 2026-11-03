@@ -50,6 +50,8 @@ from tests.authority_helpers import run_daemon as run_forever
 from tests.authority_helpers import seed_authority
 from tests.solar_source_helpers import entities_source
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 @respx.mock
 @pytest.mark.parametrize("initial_soc", [45.0, 80.0])

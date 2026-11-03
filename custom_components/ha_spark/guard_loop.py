@@ -1,4 +1,4 @@
-"""Independent HA report-driven supply guard, with no production device writer.
+"""Independent report-driven supply guard with a local-authority native writer.
 
 HA 2026.10.3 source: helpers/event.py async_track_state_report_event documents
 that unchanged updates fire state_reported, opposite of state_changed. core.py
@@ -6,12 +6,15 @@ State.last_reported documents using event.data['last_reported'] for reports
 (the State object can be mutated again), and last_updated for changed events.
 Both subscriptions are required. Positive grid watts mean import.
 
-The current summary has neither epoch nor manual session: mirror_from deliberately
-supplies None/False. Persisted cuts remain ceilings but cannot be replayed with an
-unknown epoch. Phase 8 must provide authority and a native writer, not HA services.
+Legacy sites use the summary for warn-only display. Native sites use durable
+local authority and the one charge-write boundary. Persisted cuts are ceilings,
+never restore targets; only fresh owner or plan requests permit restoration.
+The export tripwire shares each connection's grid reading but never changes a guard rule.
 """
 
 import asyncio
+import hashlib
+import json
 from collections import deque
 from collections.abc import Callable
 from dataclasses import replace
@@ -40,6 +43,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from .clamp import ChargeWriter, ClampedWriter, DeviceIntent
 from .const import DOMAIN
 from .coordinator import SparkCoordinator
+from .solis_frames import POINTS, decode
 from .supply_guard import (
     AuthorityMirror,
     GuardDecision,
@@ -70,10 +74,17 @@ class StoredGuard(BaseModel):
     restores_used: Annotated[int, Field(strict=True, ge=0, le=48)]
     restore_day: Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")]
     epoch: Annotated[int, Field(strict=True, ge=0)] | None
+    fingerprint: str | None = None
 
 
 def mirror_from(coordinator: SparkCoordinator) -> AuthorityMirror | None:
-    """Only a counted, still-connected summary is authority evidence."""
+    """Local store on native sites; a counted summary is only a legacy mirror."""
+    if coordinator.control.owned():
+        state = coordinator.authority.state
+        return (AuthorityMirror(state.committed_mode, state.epoch,
+                                state.manual_session is not None, False,
+                                state.transition.target if state.transition else None)
+                if state is not None else None)
     if not coordinator.connected or coordinator.summary is None:
         return None
     authority = coordinator.summary.authority
@@ -108,6 +119,13 @@ class SupplyGuardLoop:
         self._active = False
         self._stopped = False
         self._save_failed = False
+        self.native_writer = coordinator.writes
+        coordinator.control.manual_started = self.async_manual_start
+        self._request_epoch: int | None = None
+        self._manual_epoch: int | None = None
+        self._manual_read_at: datetime | None = None
+        self._poll_times: dict[str, datetime] = {}
+        self._manual_baseline: dict[str, float] = {}
 
     def allowance_for(self, bank_id: str) -> float | None:
         """Connection allowance, split by the clamp rather than counted per bank."""
@@ -117,10 +135,113 @@ class SupplyGuardLoop:
         state = self.states.get(bank.connection_id)
         return state.allowance_kw if state else 0
 
+    @property
+    def boundary_open(self) -> bool:
+        """Started, not stopping, store working; else native applies are fenced."""
+        return self._active and not self._stopped and not self._save_failed
+
     def permits_writes(self) -> bool:
-        """Warn-only unless a connected, permitting mirror and a working store."""
-        return self._active and not self._save_failed and mirror_permits(
-            mirror_from(self.coordinator))
+        """Only a verified integration owner can actuate, independent of the add-on."""
+        return (self.boundary_open and self.coordinator.control.owned()
+                and mirror_permits(mirror_from(self.coordinator)))
+
+    def owns_connection(self, connection_id: str) -> bool:
+        banks = {b.id for b in self.topology.banks if b.connection_id == connection_id}
+        return self.coordinator.control.owned() and any(
+            i.transport == "native" and i.bank_id in banks for i in self.topology.inverters)
+
+    def _fingerprint(self, connection_id: str) -> str:
+        """Bind replay to the connection record, effective limit and membership."""
+        connection = next(c for c in self.topology.connections if c.id == connection_id)
+        banks = sorted(b.id for b in self.topology.banks if b.connection_id == connection_id)
+        inverters = sorted(i.id for i in self.topology.inverters if i.bank_id in banks)
+        limit = next(c.import_kw for c in self.limits.connections if c.id == connection_id)
+        data = [connection.model_dump(mode="json"), limit, banks, inverters]
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+    def request_current(self, inverter_id: str, current_a: float) -> float | None:
+        """Record a new owner/plan request under the boundary lock, never a guard cut."""
+        state = self.coordinator.authority.state
+        if state is not None and self._request_epoch != state.epoch:
+            self.last_requested_a.clear()
+            self._request_epoch = state.epoch
+        previous = self.last_requested_a.get(inverter_id)
+        self.last_requested_a[inverter_id] = current_a
+        return previous
+
+    async def async_manual_start(self) -> None:
+        """Seed the manual restore ceiling from fresh hardware, never an old plan."""
+        async with self.lock:
+            await self._manual_start_locked()
+
+    async def _manual_start_locked(self, *, seed: bool = True) -> None:
+        state = self.coordinator.authority.state
+        if not self.coordinator.control.owned() or state is None or state.manual_session is None:
+            return
+        self.last_requested_a.clear()
+        residents = await self.native_writer.async_residents_locked()
+        if self.coordinator.authority.state != state or not self.coordinator.control.owned():
+            return
+        self._manual_baseline = residents
+        if seed:
+            self.last_requested_a.update(residents)
+        self._request_epoch = self._manual_epoch = state.epoch
+        self._manual_read_at = dt_util.utcnow()
+
+    async def _requests_locked(self) -> dict[str, float]:
+        state = self.coordinator.authority.state
+        if not self.permits_writes() or state is None:
+            return dict(self.last_requested_a)
+        if (self._request_epoch is not None and self._request_epoch != state.epoch
+                and not (state.manual_session is not None and self._manual_epoch is not None)):
+            self.last_requested_a.clear()
+        self._request_epoch = state.epoch
+        if state.manual_session is not None:
+            if self._manual_epoch is None:
+                # A restart is not a new owner request. Establish a comparison
+                # baseline, but never turn the saved cut into a restore target.
+                await self._manual_start_locked(seed=False)
+            for inverter in self.topology.inverters:
+                reading = self.coordinator.native.reading(inverter, "holding_43141")
+                if (reading is None or reading.registers is None
+                        or self._manual_read_at is None or reading.read_at <= self._manual_read_at
+                        or reading.read_at <= self.native_writer.written_at.get(
+                            inverter.id, self._manual_read_at)
+                        or reading.read_at <= self._poll_times.get(inverter.id,
+                                                                 self._manual_read_at)):
+                    continue
+                self._poll_times[inverter.id] = reading.read_at
+                current = reading.registers[0] / 10
+                previous = self.native_writer.written_a.get(
+                    inverter.id, self._manual_baseline.get(inverter.id))
+                if current != previous and current != self.last_requested_a.get(inverter.id):
+                    self.last_requested_a[inverter.id] = current
+                    bank = next(b for b in self.topology.banks if b.id == inverter.bank_id)
+                    saved = self.states.get(bank.connection_id)
+                    if saved is not None and saved.cut_kw is not None:
+                        self.states[bank.connection_id] = replace(saved, restored=True)
+        else:
+            self._manual_epoch = None
+        residents = await self.native_writer.async_residents_locked()
+        if state.manual_session is not None and self._manual_epoch is not None:
+            # A poll that landed while this read waited for the bus is not in
+            # the cache above. A fresh resident below the ceiling that differs
+            # from our own last verified write is the owner's latest value, so
+            # it may only lower the ceiling; raising it needs a newer poll.
+            for inverter in self.topology.inverters:
+                resident = residents.get(inverter.id)
+                ceiling = self.last_requested_a.get(inverter.id)
+                previous = self.native_writer.written_a.get(
+                    inverter.id, self._manual_baseline.get(inverter.id))
+                if (resident is None or ceiling is None or resident >= ceiling
+                        or resident == previous):
+                    continue
+                self.last_requested_a[inverter.id] = resident
+                bank = next(b for b in self.topology.banks if b.id == inverter.bank_id)
+                saved = self.states.get(bank.connection_id)
+                if saved is not None and saved.cut_kw is not None:
+                    self.states[bank.connection_id] = replace(saved, restored=True)
+        return {**residents, **self.last_requested_a}
 
     def diagnostics(self) -> dict[str, object]:
         """Bounded state, event history and raw readings for the diagnostics download.
@@ -202,6 +323,9 @@ class SupplyGuardLoop:
             if self._stopped or self._active:
                 return
             now = self._now()
+            local = self.coordinator.authority.state
+            if self.coordinator.control.owned() and local is not None:
+                self._request_epoch = local.epoch
             self.states = {c.id: GuardState(restore_day=now.date(),
                                           dormant_reason="awaiting_reading")
                            for c in self.topology.connections}
@@ -217,6 +341,11 @@ class SupplyGuardLoop:
                         if key not in self.states:
                             continue
                         record = StoredGuard.model_validate(value)
+                        if self.coordinator.control.owned():
+                            state = self.coordinator.authority.state
+                            if (state is None or record.epoch != state.epoch
+                                    or record.fingerprint != self._fingerprint(key)):
+                                continue
                         loaded[key] = GuardState(
                             cut_kw=record.cut_kw, latched=record.latched,
                             missing_since=record.missing_since, restores_used=record.restores_used,
@@ -283,7 +412,7 @@ class SupplyGuardLoop:
             key: {"cut_kw": s.cut_kw, "latched": s.latched,
                   "missing_since": s.missing_since.isoformat() if s.missing_since else None,
                   "restores_used": s.restores_used, "restore_day": s.restore_day.isoformat(),
-                  "epoch": s.epoch}
+                  "epoch": s.epoch, "fingerprint": self._fingerprint(key)}
             for key, s in self.states.items()
         }
         try:
@@ -293,6 +422,9 @@ class SupplyGuardLoop:
             ).async_load()
             if persisted != data:
                 self._save_failed = True
+        except asyncio.CancelledError:
+            self._save_failed = True
+            raise
         except Exception:
             self._save_failed = True
 
@@ -312,19 +444,40 @@ class SupplyGuardLoop:
 
             mirror = mirror_from(self.coordinator) if not self._save_failed else None
             before = self.states.copy()
+            requests = await self._requests_locked()
             writes: set[str] = set()
+            replay: set[str] = set()
             for connection in self.topology.connections:
                 banks = [b for b in self.topology.banks if b.connection_id == connection.id]
                 bank_ids = {b.id for b in banks}
                 inverters = [i for i in self.topology.inverters if i.bank_id in bank_ids]
                 measurements = []
                 for inv in inverters:
+                    if self.coordinator.control.owned() and inv.transport == "native":
+                        reading = self.coordinator.native.reading(inv, "input_33132")
+                        point = next(p for p in POINTS if p.address == 33151)
+                        value = decode(point, reading.registers, None, frame=True) if (
+                            reading is not None and reading.registers is not None) else None
+                        power = float(value) if isinstance(value, (int, float)) else None
+                        # Same owner-set sign rule as the entity path below.
+                        if power is not None and inv.power_sign == "negative_import":
+                            power = -power
+                        measurements.append(InverterMeasurement(
+                            inv.id, power, reading.read_at if reading else None))
+                        continue
                     entity = inv.grid_port_power_entity or inv.battery_power_entity
                     if entity:
                         power, reported = read(entity)
                         if power is not None and inv.power_sign == "negative_import":
                             power = -power
-                        measurements.append(InverterMeasurement(inv.id, power, reported))
+                        unadjusted = power
+                        if power is not None and not inv.grid_port_power_entity:
+                            bank = next(b for b in banks if b.id == inv.bank_id)
+                            eta = bank.one_way_charge_efficiency
+                            power = power / eta if power >= 0 else power * eta
+                        measurements.append(InverterMeasurement(
+                            inv.id, power, reported, unadjusted,
+                        ))
                 loads = [load for load in self.topology.major_loads
                          if load.connection_id == connection.id]
 
@@ -334,24 +487,39 @@ class SupplyGuardLoop:
                                       reported, now)
 
                 reserve = major_load_reserve_kw(loads, running)
+                lossless_requested = sum(
+                    max(0, requests.get(i.id, 0)) * b.nominal_voltage_v / 1000
+                    for b in banks for i in inverters if i.bank_id == b.id
+                )
                 requested = sum(
-                    max(0, self.last_requested_a.get(i.id, 0)) * b.nominal_voltage_v / 1000
+                    max(0, requests.get(i.id, 0)) * b.nominal_voltage_v
+                    / b.one_way_charge_efficiency / 1000
                     for b in banks for i in inverters if i.bank_id == b.id
                 )
                 power, reported = read(connection.grid_power_entity)
+                if self.coordinator.tripwire.observe(connection.id, power, reported, now):
+                    # The trip takes control.lock first: never await it under guard.lock.
+                    self.entry.async_create_background_task(
+                        self.hass, self.coordinator.tripwire.async_trip(connection.id, now),
+                        "Export tripwire")
                 limit = next(c for c in self.limits.connections if c.id == connection.id)
                 state, decision = step(self.states[connection.id], GuardInputs(
                     limit_kw=limit.import_kw, requested_kw=requested, reserve_kw=reserve,
+                    lossless_requested_kw=lossless_requested,
                     reading=GuardReading(power, reported), measurements=tuple(measurements),
                     mirror=mirror, grid_configured=connection.grid_power_entity is not None,
                     controllable=any(driver_capabilities(i.driver_kind).setpoint_step_a is not None
                                      for i in inverters), household_day=now.date(),
-                    observe_only=self.writer is None,
+                    observe_only=not self.coordinator.control.owned() or (
+                        self.writer is None and not self.owns_connection(connection.id)),
+                    restore_allowed=any(i.id in self.last_requested_a for i in inverters),
                 ), now)
                 self.states[connection.id] = state
                 self.decisions[connection.id] = decision
                 if decision.write:
                     writes.update(i.id for i in inverters)
+                    if before[connection.id].restored:
+                        replay.update(i.id for i in inverters)
             durable_fields = ("cut_kw", "latched", "missing_since", "restores_used",
                               "restore_day", "epoch")
             if any(any(getattr(before[key], field) != getattr(state, field)
@@ -372,6 +540,39 @@ class SupplyGuardLoop:
                         key: replace(decision, write=False, warn_reason="guard_save_failed")
                         for key, decision in self.decisions.items()
                     }
+            if (self.writer is None and self.coordinator.control.owned()
+                    and not self._save_failed and mirror is not None):
+                for connection in self.topology.connections:
+                    member_banks = {b.id for b in self.topology.banks
+                                    if b.connection_id == connection.id}
+                    selected = {i.id: requests[i.id] for i in self.topology.inverters
+                                if i.bank_id in member_banks and i.id in writes
+                                and i.id in requests}
+                    if not selected:
+                        continue
+                    try:
+                        result = await self.native_writer.async_guard_locked(
+                            selected, epoch=mirror.epoch or 0,
+                            lower_only=bool(replay.intersection(selected)),
+                            cut_only=set(selected).difference(self.last_requested_a))
+                        failed = result.outcome not in ("applied", "unchanged")
+                    except Exception:
+                        failed = True
+                    if failed:
+                        self.decisions[connection.id] = replace(
+                            self.decisions[connection.id], write=False,
+                            warn_reason="guard_write_failed")
+                        current = self.states[connection.id]
+                        previous = before[connection.id]
+                        # A refused/unverified restore is not an all-clear. Keep
+                        # the old ceiling and require fresh headroom again.
+                        if previous.cut_kw is not None and (
+                            current.cut_kw is None or current.cut_kw > previous.cut_kw
+                        ):
+                            current = replace(current, cut_kw=previous.cut_kw,
+                                              latched=previous.latched, headroom_since=None)
+                        self.states[connection.id] = replace(current, restored=True)
+                        await self._save()
             if self.writer is not None and not self._save_failed:
                 for inv in self.topology.inverters:
                     requested_a = self.last_requested_a.get(inv.id, 0)
@@ -430,7 +631,7 @@ class SupplyGuardLoop:
         self._unsubs.clear()
 
     async def async_stop(self) -> None:
-        """Fence queued callbacks and finish any in-flight fake write before return."""
+        """Fence queued callbacks and finish any in-flight write before return."""
         self._stopped = True
         self._active = False
         self._cancel_subscriptions()

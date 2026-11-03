@@ -15,6 +15,8 @@ from tests.authority_helpers import legacy_settings as Settings
 from tests.authority_helpers import seeded_execution
 from tests.test_solis_power_switch import FakeRest, _intent, _now
 
+pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
+
 
 @pytest.mark.parametrize("control", ["observe", "ha_spark", "supplier"])
 @pytest.mark.parametrize("mode", ["off", "simulate", "on"])

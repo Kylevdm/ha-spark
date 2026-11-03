@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from ha_spark import cli, health
 from ha_spark.api.contract import IntegrationLink, SiteSnapshot, link_view
 from ha_spark.api.server import AppState, build_app
+from ha_spark.api.snapshot_v4 import Device, SnapshotV4
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import DaemonChannel, Reply, submit_socket
 from ha_spark.integration_discovery import IntegrationDiscovery
@@ -19,7 +20,8 @@ from tests.api_helpers import owner_client
 NOW = datetime(2026, 10, 24, 12, tzinfo=UTC)
 KEYS = {"state", "site_id", "integration_release_version", "api_version", "sent_at",
         "snapshot_age_s", "solar_source", "topology_source", "topology_revision",
-        "topology_reason", "major_loads_reason", "supply_guard_reason"}
+        "topology_reason", "major_loads_reason", "supply_guard_reason", "devices",
+        "authority_owner"}
 TOKEN = "TOKEN-CANARY-480"
 SESSION = "SESSION-CANARY-480"
 
@@ -43,11 +45,13 @@ def test_link_view(age: int | None, skew: bool, expected: str) -> None:
     view = link_view(link, NOW)
     assert view == {
         "solar_source": "entities",
+        "authority_owner": "addon",
         "topology_source": "legacy",
         "topology_revision": None,
         "topology_reason": None,
         "major_loads_reason": None,
         "supply_guard_reason": None,
+        "devices": None,
         "state": expected,
         "site_id": snapshot().site_id if age is not None else None,
         "integration_release_version": "0.25.0" if age is not None else None,
@@ -57,6 +61,20 @@ def test_link_view(age: int | None, skew: bool, expected: str) -> None:
     }
     assert set(view) == KEYS
     assert TOKEN not in json.dumps(view) and SESSION not in json.dumps(view)
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_link_view_native_devices_allowlist(invalid: bool) -> None:
+    device = Device(id="main", transport="native", validation="validated",
+                    capabilities=("canary",))
+    link = IntegrationLink(snapshot(), NOW, False, v4=SnapshotV4(
+        owner="addon", devices=(device,), devices_reason="invalid_devices" if invalid else None,
+    ))
+    view = link_view(link, NOW)
+    assert view["devices"] == (None if invalid else [{
+        "id": "main", "transport": "native", "validation": "validated", "reason": None,
+    }])
+    assert "canary" not in json.dumps(view)
 
 
 @pytest.mark.parametrize("repair", [False, True])
@@ -141,7 +159,11 @@ async def test_socket_link_without_provider(tmp_path: Path) -> None:
     assert reply.integration_link == link_view(IntegrationLink(None, None, False), NOW)
 
 
-def test_heartbeat_health_and_skew_recovery(tmp_path: Path) -> None:
+def test_heartbeat_health_and_skew_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(AppState, "integration_link_view",
+                        lambda self: link_view(self.integration_link, NOW))
     settings = Settings(supervisor_token="unused", db_path=str(tmp_path / "ha_spark.db"))
     state = AppState(settings, tmp_path / "options.json")
     discovery = IntegrationDiscovery(supervisor_token="unused", host="addon",
@@ -150,7 +172,7 @@ def test_heartbeat_health_and_skew_recovery(tmp_path: Path) -> None:
         initial = client.get("/api/health").json()
         assert initial["integration_link"]["state"] == "never_connected"
         body = snapshot().model_dump(mode="json")
-        for version, status, expected in [(1, 200, "connected"), (4, 409, "version_skew"),
+        for version, status, expected in [(1, 200, "connected"), (5, 409, "version_skew"),
                                            (1, 200, "connected")]:
             body["api_version"] = version
             assert client.post("/integration/heartbeat", json=body, headers={
