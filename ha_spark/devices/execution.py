@@ -86,6 +86,8 @@ class WriteGate:
                 return "refuse:not owned"
         if self.context.planned_epoch.get() != state.epoch:
             return "refuse:stale authority"
+        # Both fences refuse every ownership, holds and clock sync included: the
+        # change may add, remove or remap devices, and the next tick re-plans.
         if self.context.planned_generation.get() != self.context.config_generation:
             return "refuse:stale config"
         if self.context.planned_limits.get() != self.context.limits_key():

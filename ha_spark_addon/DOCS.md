@@ -82,6 +82,15 @@ also needs a live add-on session, trusted and recovered SoC, and valid fallback.
 Observe writes nothing; completing Setup or changing topology never escalates
 it.
 
+Disabling the integration hands over to Observe and releases any active hold.
+Removing it does not: Home Assistant unloads the integration first, so the
+release is refused and an active hold stays in place, with an **ha-spark
+handover incomplete** notification. To stop protection, call
+`ha_spark.set_observe` and wait for the handover to complete, or disable the
+integration, before you remove it. If a hold was left in place, the inverter's
+power switch stays Off until you turn it back On with the inverter's own
+controls.
+
 ### Owner services and temporary manual control
 
 For integration-owned sites, Home Assistant exposes these `ha_spark` services:

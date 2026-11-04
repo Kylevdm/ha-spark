@@ -1426,6 +1426,8 @@ class NativeChargeBoundary:
         if reason is not None:
             return IntentResult(outcome="refused", reason=reason)
         permission = await self._read(transport, inverter, input_=True)
+        # Guard cuts too: with 33132 bit 5 clear there is no grid charging to cut,
+        # and the guard retries on its next evaluation.
         if permission is None or not permission & 32:
             return IntentResult(outcome="refused", reason="grid_charge_not_permitted")
         # The resident read is the last await before the increase decision and

@@ -95,6 +95,10 @@ class SparkCoordinator(DataUpdateCoordinator[bool]):
             # The last accepted overlay report survives add-on liveness loss;
             # local protection must keep working without the add-on. Every new
             # accepted report still rechecks this fence, including a missing block.
+            # No age limit, by design: one would disable the supply guard and
+            # fallback in the add-on-loss case they exist for. `apply` only
+            # arrives from a live add-on (so its summary is fresh), and owner
+            # clock sync is an explicit owner action.
             overlay=lambda: self.summary.legacy_overlay if self.summary else None,
             changed=self.async_update_listeners,
         )

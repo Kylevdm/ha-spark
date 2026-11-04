@@ -88,8 +88,10 @@ security and prefer the safe default. Hard rules:
   clock sync), plus, on an integration-owned site, supply-guard cuts and
   restores and the fallback schedule written as the owner's starting schedule
   when leaving Optimise; Optimise runs the plan. An invalid SoC blocks every SoC-derived write;
-  always read back; isolate failures per action. Writes that don't depend on
-  SoC keep their own safeguards: holds (discharge prevention), authorised
+  always read back; isolate failures per action. A config or accepted-limits
+  change between planning and the write refuses every write for that tick,
+  holds and clock sync included; the next tick re-plans. Writes that don't
+  depend on SoC keep their own safeguards: holds (discharge prevention), authorised
   clock sync, and the Solis fallback charging schedule in Optimise. On the
   add-on it starts after `soc_failure_threshold` failed SoC checks and
   programs the configured cheap-rate window at an explicitly set
