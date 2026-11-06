@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 _NOTICE_KIND: dict[str, NoticeTransition] = {
     "accepted": "accepted", "started": "started", "cleanup_verified": "cleanup",
     "clock_hold": "clock", "aborted": "aborted", "tripped": "aborted",
+    "unverified": "unverified",
 }
 _TRIPPED_REASON = "site export over limit"
 # The integration's fixed refusal codes (commands.WriteReason) plus the failure
@@ -75,7 +76,7 @@ async def _send(
     planned_kw, limit_kw = planned_for(identity)
     reason = (_TRIPPED_REASON if row.kind == "tripped"
               else row.reason if row.reason in _REASONS else None)
-    safe_state = _safe_state(row.cleared) if row.kind == "aborted" else None
+    safe_state = _safe_state(row.cleared) if row.kind in ("aborted", "unverified") else None
     notice = make_notice(
         transition, identity, start, end, planned_export_kw=planned_kw,
         dno_export_limit_kw=limit_kw, reason=reason, safe_state=safe_state,

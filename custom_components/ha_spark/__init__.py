@@ -49,6 +49,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     hass.data.setdefault(f"{DOMAIN}.unloaded_authority", {}).pop(entry.entry_id, None)
     await coordinator.authority.async_load()
     await coordinator.ownership.async_load()
+    # A hold whose event started while HA was down owes its abort before any prune.
+    await coordinator.async_abort_held_exports(dt_util.utcnow())
     # A claim edited while the entry was unloaded still ends the affected bound.
     await coordinator.async_drop_stale_bounds()
     async_register(hass)
@@ -78,6 +80,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     async def authority_tick(now: datetime) -> None:
         zone = coordinator.control.household_zone() or ZoneInfo("UTC")
         await coordinator.control.async_expire(now=now, zone=zone)
+        await coordinator.async_abort_held_exports(now)
         await coordinator.async_expire_supervisions(now)
         await coordinator.control.async_retry()
 
