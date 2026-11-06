@@ -8,8 +8,10 @@ from pydantic import ValidationError
 
 from custom_components.ha_spark.authority_store import HoldDevice, HoldRecord
 from custom_components.ha_spark.native_hold import (
+    SOURCES,
     DispatchWindow,
     EvidenceOptions,
+    EvidenceSource,
     advance_ev,
     dispatch_kept,
     fresh,
@@ -56,6 +58,18 @@ def test_evidence_required_sources_and_native_default() -> None:
                    {"entity_id": "sensor.ev", "max_age_s": float("nan")}):
         with pytest.raises(ValidationError):
             EvidenceOptions.model_validate({"ev_status": source})
+
+
+def test_entity_evidence_requires_explicit_max_age_but_native_keeps_default() -> None:
+    with pytest.raises(ValidationError):
+        EvidenceSource(entity_id="sensor.ev")
+    assert EvidenceSource(source="native").max_age_s == 300
+
+
+@pytest.mark.parametrize("key", SOURCES)
+def test_any_entity_source_without_max_age_invalidates_evidence_options(key: str) -> None:
+    with pytest.raises(ValidationError):
+        EvidenceOptions.model_validate({key: {"entity_id": "sensor.evidence"}})
 
 
 def test_ev_needs_five_advancing_reports_and_stale_rearms_pending_release() -> None:

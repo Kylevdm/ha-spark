@@ -133,6 +133,7 @@ class NativeHolds:
     async def async_reconcile(self, now: datetime) -> bool:
         """Serialize whole-record saves with transitions and new add-on sessions."""
         async with self.coordinator.control.lock:
+            now = max(now, dt_util.utcnow())
             return await self.async_reconcile_held(now)
 
     async def async_reconcile_held(self, now: datetime) -> bool:
@@ -295,6 +296,7 @@ class NativeHolds:
 
     async def async_release(self, now: datetime, *, removal: bool = False) -> bool:
         async with self.coordinator.control.lock:
+            now = max(now, dt_util.utcnow())
             return await self.async_release_held(now, removal=removal)
 
     async def async_release_held(self, now: datetime, *, removal: bool = False) -> bool:
