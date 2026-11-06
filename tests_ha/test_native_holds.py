@@ -1,4 +1,5 @@
 """Native durable holds through the real config entry and the in-memory inverter."""
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,65 @@ async def test_hold_start_persists_before_off_and_confirms_only_after_readback(
     assert native_transport.holding[43007] == 222
     state = c.authority.state
     assert state is not None and state.holds[0].confirmed
+
+
+async def test_missing_evidence_age_neither_starts_nor_clears_hold(
+    held_site: SparkCoordinator, native_transport: FakeSolisDevice, freezer: Any,
+) -> None:
+    c = held_site
+    valid = dict(c.entry.options)
+    invalid = {**valid, "evidence": {"ev_status": {"entity_id": "sensor.ev"}}}
+    c.hass.config_entries.async_update_entry(c.entry, options=invalid)
+    c.hass.states.async_set("sensor.ev", "charging")
+    await tick(c)
+    assert c.holds.evidence.read(datetime.now(UTC)).charging is None
+    assert not c.control.preconditions().evidence_configured
+    assert c.authority.state is not None and not c.authority.state.holds
+    assert not any(t.op == "write" for t in native_transport.traffic)
+
+    c.hass.config_entries.async_update_entry(c.entry, options=valid)
+    await tick(c)
+    assert c.authority.state is not None and c.authority.state.holds[0].confirmed
+    native_transport.traffic.clear()
+    c.hass.config_entries.async_update_entry(c.entry, options=invalid)
+    for _ in range(6):
+        freezer.tick(timedelta(seconds=1))
+        c.hass.states.async_set("sensor.ev", "stopped", force_update=True)
+        await tick(c)
+    assert not await c.holds.async_release(datetime.now(UTC), removal=True)
+    assert c.authority.state is not None and c.authority.state.holds[0].confirmed
+    assert not c.authority.state.holds[0].pending_release
+    assert native_transport.holding[43007] == 222
+    assert not any(t.op == "write" for t in native_transport.traffic)
+
+
+@pytest.mark.parametrize("release", [False, True])
+async def test_evidence_freshness_is_checked_after_control_lock_wait(
+    held_site: SparkCoordinator, native_transport: FakeSolisDevice, freezer: Any, release: bool,
+) -> None:
+    c = held_site
+    c.hass.states.async_set("sensor.ev", "charging")
+    if release:
+        await tick(c)
+        c.hass.states.async_set("sensor.ev", "stopped")
+    now = datetime.now(UTC)
+    assert c.holds.evidence.read(now).charging is (not release)
+    native_transport.traffic.clear()
+    async with c.control.lock:
+        task = asyncio.create_task(c.holds.async_release(now, removal=True) if release
+                                   else c.holds.async_reconcile(now))
+        await asyncio.sleep(0)
+        assert not task.done()
+        freezer.tick(timedelta(seconds=301))
+    result = await task
+    if release:
+        assert not result
+        assert c.authority.state is not None and c.authority.state.holds[0].confirmed
+        assert native_transport.holding[43007] == 222
+    else:
+        assert c.authority.state is not None and not c.authority.state.holds
+        assert native_transport.holding[43007] == 190
+    assert not any(t.op == "write" for t in native_transport.traffic)
 
 
 async def test_owner_off_is_never_adopted_or_released(

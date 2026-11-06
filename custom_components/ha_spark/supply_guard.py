@@ -238,7 +238,20 @@ def step(state: GuardState, inputs: GuardInputs, now: datetime) -> tuple[GuardSt
         allowance = state.cut_kw if state.cut_kw is not None else 0
     else:
         allowance = min(requested, state.cut_kw) if state.cut_kw is not None else requested
+    reason = None
+    if not (permitted and replay()):
+        # One reason per state: a missing mirror, Observe (committed or a
+        # pending transition to it), any other known no-write state such as a
+        # failed save, or a replay refusal from a loaded cut's epoch.
+        if inputs.mirror is None:
+            reason = "authority_unavailable"
+        elif inputs.mirror.mode == "observe" or inputs.mirror.transition_target == "observe":
+            reason = "mode_observe"
+        elif not permitted:
+            reason = "writes_not_permitted"
+        else:
+            reason = "authority_unavailable"
     return state, GuardDecision(allowance if state.cut_kw is not None or changed else None,
                                (changed or rewrite) and not observe and permitted
                                and replay() and requested > 0,
-                               None if permitted and replay() else "authority_unavailable")
+                               reason)
