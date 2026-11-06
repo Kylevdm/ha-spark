@@ -10,7 +10,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import NAMESPACE_URL, uuid5
 
 from homeassistant.config_entries import ConfigEntry
@@ -19,6 +19,7 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
+from .modbus_fence import hub_conflict
 from .native_hold import hold_identity_valid
 from .solis_frames import Reading, Schedule
 from .solis_identity import caching_on, identity_reason
@@ -137,6 +138,9 @@ class NativeDevices:
             # Options can change before their reload runs. Old probe evidence
             # never validates a new unit or gateway in that interval.
             return "unvalidated_identity"
+        conflict = hub_conflict(self.hass, inverter.gateway_host, inverter.gateway_port)
+        if conflict is not None:
+            return conflict
         probe = self.probes.get(inverter.id, Probe())
         if not self.connected(inverter):
             return "unreachable"
@@ -154,6 +158,17 @@ class NativeDevices:
                 or overlay.get(inverter.id) is not False):
             return "gateway_not_owned"
         return None
+
+    def write_reason(
+        self, inverter: Inverter,
+    ) -> Literal["modbus_hub_conflict", "read_only"] | None:
+        """Keep detailed repair reasons local; expose one fixed Modbus write refusal."""
+        reason = self.reason(inverter)
+        if reason is None:
+            return None
+        if reason in ("modbus_hub_conflict", "modbus_hub_unreadable"):
+            return "modbus_hub_conflict"
+        return "read_only"
 
     async def async_reprobe(self, inverter_id: str) -> bool:
         """Admin command/service seam; also used for startup and reconnect reads."""

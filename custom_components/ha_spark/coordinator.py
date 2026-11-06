@@ -272,7 +272,9 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
                     "validation": "read_only" if reason else "validated", "capabilities": [],
                 }
                 if reason:
-                    device["reason"] = reason
+                    # Preserve the v4 device-reason contract with older add-ons.
+                    device["reason"] = ("gateway_not_owned" if reason in (
+                        "modbus_hub_conflict", "modbus_hub_unreadable") else reason)
                 devices.append(device)
             snapshot["devices"] = devices
         if owner != "integration":

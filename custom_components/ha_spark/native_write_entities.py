@@ -68,7 +68,8 @@ class WriteEntity(NativeEntity):
             self.error("protection_owned" if self.control == "power" else "entity_write_mode")
         self.error(reason if reason in ("authority_unknown", "stale_epoch", "read_only", "limits",
                                        "untrusted_soc", "grid_charge_not_permitted",
-                                       "not_available", "invalid_intent") else "read_only")
+                                       "not_available", "invalid_intent",
+                                       "modbus_hub_conflict") else "read_only")
 
     def result(self, result: IntentResult) -> None:
         if result.outcome == "refused":

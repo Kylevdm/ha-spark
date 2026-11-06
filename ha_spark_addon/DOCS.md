@@ -58,7 +58,14 @@ legacy overlay or another Modbus client.
 4. Check device validation and repairs. Unsupported identity or firmware,
    caching, an unreachable gateway or a missing claim leaves the device
    read-only: readings continue, but writes are refused. Disable gateway
-   storage caching, not a safety guard, before Re-probing.
+   storage caching, not a safety guard, before Re-probing. The refusal reason
+   `modbus_hub_conflict` means Home Assistant's own `modbus` integration has a
+   hub or connection on the claimed gateway host and port, or is loaded but its
+   connections cannot be read. A self-clearing repair explains which condition
+   applies; reads continue and all native writes stay blocked. Matching uses the
+   host as written, case-insensitively: a hostname and its IP address do not
+   match. Third-party Modbus integrations are **not detected**; disconnecting
+   them in step 2 remains mandatory.
 5. Wait for the authority switch to settle in Observe. All inverters native
    means integration ownership; any legacy inverter, or no inverter, means
    add-on ownership. Both peers need API v4, Observe, no holds and no
@@ -261,7 +268,10 @@ warning: it pairs nothing.
 Each native **Solis transport (<id>)** row reads validation through the daemon,
 without probing Modbus or writing a test schedule. `validated` is OK;
 `unvalidated_identity`, `identity_read_failed`, `v2_tou_firmware`, `caching_on`,
-`gateway_not_owned` or `unreachable` is a warning. A missing fresh validation
+`gateway_not_owned` or `unreachable` is a warning. HA Modbus conflicts and
+unreadable HA Modbus connection data appear here as `gateway_not_owned` for
+compatibility; the integration's repair gives the specific cause and writes
+are refused as `modbus_hub_conflict`. A missing fresh validation
 is `validation unknown`, also a warning. A native inverter with a nonempty
 `solis_control_hub` is `inconsistent` and fails that check. Resolve repairs and
 restore the channel rather than treating unknown as validated. Health also

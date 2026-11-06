@@ -1,5 +1,6 @@
 {
   "exceptions": {
+    "modbus_hub_conflict": {"message": "Home Assistant Modbus may be using this gateway. Resolve the native device repair before writing."},
     "entity_write_mode": {"message": "ha-spark owns this control in {mode}. Start manual control before editing it. Discharge controls require a manual session."},
     "protection_owned": {"message": "Protection owns the power switch. Start manual control without kept protection to edit it."},
     "read_only": {"message": "This device is read-only. Resolve its native device repair before writing."},
@@ -61,6 +62,7 @@
           "not_available": "The integration is stopping or unavailable.",
           "invalid_household_zone": "Configure a valid household time zone first.",
           "read_only": "The inverter is read-only. Resolve its native device repair first.",
+          "modbus_hub_conflict": "Home Assistant Modbus may be using this gateway. Resolve the native device repair first.",
           "unverified": "The clock write could not be verified. Check connectivity and try again.",
           "failed": "The clock write failed. Check connectivity and try again."
         },
@@ -76,6 +78,8 @@
     "native_unvalidated_identity": {"title": "Solis identity not validated", "description": "This identity is not in the validated allow-list. The device remains read-only."},
     "native_v2_tou_firmware": {"title": "Unsupported Solis TOU firmware", "description": "V2 TOU firmware is read-only. Do not enable automatic control."},
     "native_caching_on": {"title": "Gateway caching detected", "description": "Disable gateway storage mode, then Re-probe. Read-back is not trustworthy while caching is on."},
+    "native_modbus_hub_conflict": {"title": "Home Assistant Modbus uses the Solis gateway", "description": "Home Assistant's Modbus integration has a hub or connection on this gateway. Remove or disable it. Reads continue; native writes stay blocked until it is gone."},
+    "native_modbus_hub_unreadable": {"title": "Home Assistant Modbus connections unreadable", "description": "Home Assistant's Modbus integration is loaded but its connections could not be read. Native writes stay blocked; reads continue. Check the Modbus integration after a Home Assistant update."},
     "native_gateway_not_owned": {"title": "Solis gateway not owned", "description": "Confirm the gateway claim in native setup, complete the authority handshake and remove the legacy overlay. Reads continue; writes remain blocked."},
     "ownership_peer_version": {
       "title": "Authority switch refused",
