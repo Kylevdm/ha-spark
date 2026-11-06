@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from freezegun.api import FrozenDateTimeFactory
 from pydantic import JsonValue
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.ha_spark.commands import Command
 from custom_components.ha_spark.coordinator import SparkCoordinator
@@ -1124,6 +1125,9 @@ async def test_held_window_retries_verifies_and_matches_notice_fixture(
                          "tests/fixtures/contract/export_transitions_held.json").read_text())
     assert [{k: v for k, v in row.items() if k not in ("id", "at")} for row in rows] == [
         {k: v for k, v in row.items() if k not in ("id", "at")} for row in fixture]
+    # Flush the Store writes the clock jump left pending (#666 lingering timers).
+    async_fire_time_changed(writer.hass, later + timedelta(minutes=1))
+    await writer.hass.async_block_till_done()
 
 
 @pytest.mark.parametrize("cleanup_fails", [False, True])
@@ -1201,22 +1205,21 @@ async def test_terminal_refusals_abort_immediately_not_held(
 @pytest.mark.parametrize("after_start", [False, True])
 async def test_arm_failure_aborts_at_start_or_on_transport_failure(
     writer: SparkCoordinator, native_transport: FakeSolisDevice,
-    monkeypatch: pytest.MonkeyPatch, freezer: FrozenDateTimeFactory, after_start: bool,
+    monkeypatch: pytest.MonkeyPatch, after_start: bool,
 ) -> None:
     from tests_ha.fake_solis import WriteFault
 
+    # An event already under way, rather than moving the clock (#666 timers).
+    event = ({"direction": "export", "start": (NOW - timedelta(minutes=1)).isoformat(),
+              "end": (NOW + timedelta(hours=1)).isoformat()} if after_start else EVENT)
     allow_export(writer, monkeypatch, native_transport)
-    await arm(writer)
     if after_start:
-        later = NOW + timedelta(hours=2)
-        freezer.move_to(later)
         trusted_evidence(writer)
-        registers = (26, 11, 2, 14, 0, 0)
-        native_transport.set_input(33022, list(registers))
-        writer.native.readings["inv1"]["input_33022"] = Reading(later, registers, 0)
+    await arm(writer, event=event)
     native_transport.inject_write_fault(
         WriteFault("silent_noop" if after_start else "exception"), address=43143)
-    await writer._async_dispatch_command(apply_command(writer, [window_intent()], sequence=2))
+    await writer._async_dispatch_command(apply_command(
+        writer, [window_intent(event=event)], sequence=2))
     assert transition_kinds(writer) == [
         ("accepted", None), ("aborted", "unverified" if after_start else "failed")]
 
