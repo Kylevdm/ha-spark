@@ -61,6 +61,46 @@ def command(clock: SparkCoordinator) -> Command:
                    kind="sync_clock", payload={"requester_kind": "cli"})
 
 
+async def test_topology_reload_removes_only_departed_inverter_clock_repair(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+    native_transport: FakeSolisDevice,
+) -> None:
+    from copy import deepcopy
+
+    entry = await native_entry(hass, aioclient_mock, two_units=True)
+    coordinator: SparkCoordinator = entry.runtime_data
+    keys = {}
+    for inverter in coordinator.native.inverters.values():
+        issue_id = coordinator.clock.issue_id(inverter)
+        keys[inverter.id] = ("ha_spark", issue_id)
+        ir.async_create_issue(
+            hass, "ha_spark", issue_id, is_fixable=True, severity=ir.IssueSeverity.WARNING,
+            translation_key="clock_drift",
+            data={"entry_id": entry.entry_id, "inverter_id": inverter.id},
+        )
+    other_issues: dict[str, dict[str, str | int | float | None] | None] = {
+        "clock_drift_other_entry": {"entry_id": "other", "inverter_id": "inv2"},
+        "clock_drift_without_data": None,
+        "clock_drift_without_inverter": {"entry_id": entry.entry_id},
+        "clock_drift_malformed_inverter": {"entry_id": entry.entry_id, "inverter_id": 2},
+        "unrelated_repair": {"entry_id": entry.entry_id, "inverter_id": "inv2"},
+    }
+    for issue_id, data in other_issues.items():
+        ir.async_create_issue(
+            hass, "ha_spark", issue_id, is_fixable=False, severity=ir.IssueSeverity.WARNING,
+            translation_key="clock_drift", data=data,
+        )
+    before = set(ir.async_get(hass).issues)
+    topology = deepcopy(entry.options["topology"])
+    topology["inverters"] = [topology["inverters"][0]]
+    hass.config_entries.async_update_entry(
+        entry, options={**entry.options, "topology": topology, "topology_revision": 2},
+    )
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert set(ir.async_get(hass).issues) == before - {keys["inv2"]}
+
+
 async def test_clock_command_writes_and_reads_back_in_observe(
     clock: SparkCoordinator, native_transport: FakeSolisDevice,
 ) -> None:

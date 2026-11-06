@@ -81,7 +81,8 @@ WriteReason = Literal["not_available", "invalid_intent", "limits", "mode", "stal
                       "grid_charge_not_permitted", "not_supervised", "export_bound_unverified",
                       "export_bounds_exceed_site_limit", "clock_not_trusted",
                       "hold_overlaps_export", "hold_data_untrusted", "power_switch_not_on",
-                      "tripped", "export_not_available", "modbus_hub_conflict"]
+                      "tripped", "export_not_available", "modbus_hub_conflict",
+                      "transition_in_progress"]
 
 
 class IntentResult(Record):

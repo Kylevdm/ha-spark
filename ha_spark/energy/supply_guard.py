@@ -161,8 +161,9 @@ class SupplyGuard:
             supply = await self._rest.get_state(s.grid_power_entity)
             supply_w = float(supply.state)
             setpoint_w = await self._charger.read_charge_rate()
-        except Exception as exc:  # noqa: BLE001 - never throttle on bad data
-            log.warning("Supply guard: read failed (%s); skipping", exc)
+        except Exception:  # noqa: BLE001 - never throttle on bad data
+            # Fixed text only: exception text can carry URLs or entity state.
+            log.warning("Supply guard: read failed; skipping")
             return None
 
         if select_limits(self._execution.limits_record, s).source == "unavailable":
