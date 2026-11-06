@@ -45,6 +45,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     assert integration.version is not None
     coordinator = SparkCoordinator(hass, entry, integration.version)
     entry.runtime_data = coordinator
+    coordinator.holds.evidence.check_options()
     hass.data.setdefault(f"{DOMAIN}.unloaded_authority", {}).pop(entry.entry_id, None)
     await coordinator.authority.async_load()
     await coordinator.ownership.async_load()
@@ -54,6 +55,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     await coordinator.native.async_start()
 
     async def native_tick(now: datetime) -> None:
+        coordinator.holds.evidence.check_options()
         await coordinator.native.async_check_connections()
         # Any identity change seen by a probe ends that inverter's bound.
         await coordinator.async_drop_stale_bounds(now=now)
