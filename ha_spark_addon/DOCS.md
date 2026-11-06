@@ -171,6 +171,23 @@ continue without the add-on, but requires Home Assistant to remain running;
 do not assume switch persistence through a whole-Home-Assistant outage.
 Kraken-only dispatches are not available natively.
 
+### Native notify target
+
+In **Options → Notify target**, enter an existing bare notify service name such
+as `mobile_app_<device>`, without the `notify.` prefix. Use lowercase letters,
+numbers and underscores only. The entity-based `send_message` service is not
+supported. Leave the field empty to clear the target. This option is available
+before switching to native transport.
+
+Hold notices (a hold could not be applied, identity or remap problems, degraded
+protection evidence, or a refused release) and fallback notices (entered,
+cleared, or not verified) use this target. Each notice is sent once, with one
+repeat after 30 minutes while a failure persists. Unset, unknown or failing
+targets fall back to a persistent notification with the same notification id.
+Delivery is best effort and never gates control; a slow phone service cannot
+delay protection or fallback. The removal handover result remains a persistent
+notification, regardless of this setting.
+
 ### Native supervised export
 
 Native battery export runs only in Optimise with a live export supervision for
