@@ -89,6 +89,14 @@ also needs a live add-on session, trusted and recovered SoC, and valid fallback.
 Observe writes nothing; completing Setup or changing topology never escalates
 it.
 
+The native inverter's previous-period energy sensors (yesterday, last month
+and last year) are disabled by default and have no state class, so they keep
+no long-term statistics. The lifetime totals keep `total_increasing`; use them
+for the Energy dashboard. If you enabled a previous-period sensor before this
+change, Home Assistant may show a "no longer has a state class" repair for it.
+Fix it in **Developer tools → Statistics**, which offers to delete the old
+long-term statistics. History and the current value are unaffected.
+
 Disabling the integration hands over to Observe and releases any active hold.
 Removing it does not: Home Assistant unloads the integration first, so the
 release is refused and an active hold stays in place, with an **ha-spark
