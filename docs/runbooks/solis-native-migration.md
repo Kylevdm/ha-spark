@@ -20,7 +20,14 @@ conflicting inverter-writing automations disabled throughout.
    charging schedule.
 2. **Stop the other Modbus client for this gateway.** Disconnect third-party
    Modbus integrations and direct tools, not just their writing automations.
-   The native integration must be the sole client on the bus.
+   The native integration must be the sole client on the bus. It refuses every
+   native write as `modbus_hub_conflict` and raises a self-clearing repair while
+   HA's own `modbus` integration has a hub or connection on the claimed gateway
+   host and port, or is loaded but its connection data cannot be read. Reads
+   continue; health reports `gateway_not_owned`. Matching is case-insensitive
+   on the host as written, not DNS: a hostname and IP address do not match.
+   Third-party Modbus integrations are **not detected**, so disconnecting them
+   remains mandatory.
 3. **Remove the overlay YAML and restart Home Assistant.** Remove the hub
    installed from [`docs/solis-control-modbus-overlay.yaml`](../solis-control-modbus-overlay.yaml)
    and its include if appropriate. Confirm the old hub no longer connects.

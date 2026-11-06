@@ -93,8 +93,8 @@ class NativeClock:
             reason = "not_available"
         elif c.control.household_zone() is None:
             reason = "invalid_household_zone"
-        elif c.native.reason(inverter) is not None:
-            reason = "read_only"
+        elif (device_reason := c.native.write_reason(inverter)) is not None:
+            reason = device_reason
         elif automatic and (state.committed_mode not in ("protect", "optimise")
                             or state.manual_session is not None):
             reason = "mode"

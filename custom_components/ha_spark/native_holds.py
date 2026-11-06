@@ -62,8 +62,9 @@ class NativeHolds:
             return "held_identity_remapped"
         if not c._running or not c.native.polling or c.native.closed:
             return "not_available"
-        if c.native.reason(inverter) is not None:
-            return "read_only"
+        reason = c.native.write_reason(inverter)
+        if reason is not None:
+            return reason
         if current.committed_mode not in ("protect", "optimise"):
             return "mode"
         manual = current.manual_session

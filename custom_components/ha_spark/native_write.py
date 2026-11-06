@@ -164,8 +164,11 @@ class NativeChargeBoundary(NativeExportWrites):
             return "not_available"
         # Unloading fences new writes the moment it starts, before native closes.
         if (not coordinator._running or not coordinator.native.polling
-                or coordinator.native.closed or coordinator.native.reason(inverter) is not None):
+                or coordinator.native.closed):
             return "read_only"
+        reason = coordinator.native.write_reason(inverter)
+        if reason is not None:
+            return reason
         guard = coordinator.guard
         if (guard is None or not guard.boundary_open
                 or validate_topology(coordinator.entry.options.get("topology"))
