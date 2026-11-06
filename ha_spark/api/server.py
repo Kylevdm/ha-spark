@@ -39,6 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictInt, StrictS
 
 from ha_spark.agent import auth, tools
 from ha_spark.agent.exposure import OPERATION_TIERS, allowed, surface_on
+from ha_spark.api import site_pairing
 from ha_spark.api.commands import CommandQueue, CommandResult, FetchRequest, Kind
 from ha_spark.api.contract import (
     SUPPORTED_API_VERSIONS,
@@ -62,6 +63,7 @@ from ha_spark.authority import (
     authority_view,
     load_authority,
     retirement_status,
+    rollback_pending,
 )
 from ha_spark.config import ConfigError, Settings
 from ha_spark.daemon_channel import (
@@ -89,7 +91,7 @@ from ha_spark.energy.solar_source import (
     parse_native_forecast,
     save_solar_source_kind,
 )
-from ha_spark.energy.topology_record import load_topology_record
+from ha_spark.energy.topology_record import for_site, load_topology_record
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.integration_discovery import IntegrationDiscovery
 from ha_spark.logging import get_logger
@@ -171,7 +173,11 @@ _REPAIR_ROUTES = frozenset({
 
 
 class AppState:
-    """Daemon/API state; all settings operations delegate to the settings service."""
+    """Daemon/API state; settings operations delegate to the settings service.
+
+    Intake lock: pairing, topology acceptance and ownership handover never
+    interleave a replace.
+    """
 
     def __init__(
         self,
@@ -187,9 +193,11 @@ class AppState:
         self.plan_run: StoredPlanRun | None = None
         self.plan_at = plan_at
         self.executor = executor
+        self.intake_lock = asyncio.Lock()
+        self.refused_site: str | None = None
         self.integration_link = IntegrationLink(
             None, None, False, ParsedSolarForecast(load_solar_source_kind(settings)),
-            topology=load_topology_record(settings),
+            topology=for_site(load_topology_record(settings), load_pairing(settings)[0]),
         )
         self.commands = CommandQueue("")
         self.loop_tick: datetime | None = None
@@ -199,6 +207,41 @@ class AppState:
         if executor is not None:
             executor.native_request = self.native_request
             executor.native_status = self.native_status
+
+    async def replace_pairing(
+        self, from_site: str, to_site: str,
+    ) -> site_pairing.ReplaceReason | None:
+        """Owner-only daemon operation; pairing never changes authority or limits."""
+        async with self.intake_lock:
+            refusal = site_pairing.replacement_refusal(self.settings, from_site, to_site)
+            if refusal is not None:
+                return refusal
+            link = self.integration_link
+            if (link.v4 is not None and link.v4.owner in ("pending_integration", "pending_addon")
+                    or rollback_pending(self.settings)):
+                return "handshake_pending"
+            view = self.native_status()
+            if view is None:
+                loaded = load_authority(self.settings)
+                view = authority_view(loaded.state, known=loaded.status == "known")
+            if view["transition"] is not None:
+                return "transition_pending"
+            if view["mode"] not in ("observe", "authority_unknown"):
+                return "mode_not_observe"
+            refusal = site_pairing.replace_pairing(self.settings, from_site, to_site)
+            # A failure after the commit point can leave the new pairing trusted on disk:
+            # intake then follows the disk, never the old site's link or revision floor.
+            if refusal is not None and load_pairing(self.settings) != (to_site, True):
+                return refusal
+            # Replacing back to the site the record is bound to restores that site's floor.
+            topology = load_topology_record(self.settings)
+            if topology.site_id != to_site:
+                topology = replace(link.topology, revision=None)
+            self.integration_link = IntegrationLink(
+                None, None, False, ParsedSolarForecast(load_solar_source_kind(self.settings)),
+                topology=topology,
+            )
+            return refusal
 
     def native_status(self) -> dict[str, Any] | None:
         link = self.integration_link
@@ -1055,78 +1098,89 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
         except ValidationError:
             return invalid
         now = _heartbeat_now()
-        previous = state.integration_link
-        paired_site, pairing_ok = load_pairing(state.settings)
-        # Unreadable pairing closes v4 only: v1-v3 must keep 0.30.0's unusable-data-dir behaviour.
-        if (not pairing_ok and version >= 4) or not snapshot_acceptable(
-            previous, snapshot, now, paired_site=paired_site,
-        ):
-            return invalid
-        v4 = None
-        handshake_failed = False
-        if version >= 4:
-            # Validate against the topology that would be accepted, before any disk save.
-            candidate, _ = accept_topology(
-                state.settings, previous.topology, payload.get("topology"), persist=False,
-            )
-            try:
-                v4 = parse_snapshot_v4(payload, candidate.topology)
-            except (ValidationError, ValueError, TypeError):
+        async with state.intake_lock:
+            previous = state.integration_link
+            paired_site, pairing_ok = load_pairing(state.settings)
+            # Unreadable pairing closes v4 only: preserve v1-v3's unusable-data-dir behaviour.
+            if not pairing_ok and version >= 4:
                 return invalid
-            if not snapshot_acceptable(previous, snapshot, now, paired_site=paired_site, v4=v4):
+            if pairing_ok and paired_site is not None and snapshot.site_id != paired_site:
+                state.refused_site = snapshot.site_id
+                return JSONResponse({
+                    "error": site_pairing.SITE_NOT_PAIRED,
+                    "detail": site_pairing.SITE_NOT_PAIRED_TEXT,
+                }, status_code=400)
+            if not snapshot_acceptable(previous, snapshot, now, paired_site=paired_site):
                 return invalid
-            store = execution_context().authority or AuthorityStore(state.settings)
-            if v4.owner == "integration" and retirement_status(state.settings) != "retired":
-                return invalid
-            pending = v4.owner in ("pending_integration", "pending_addon")
-            if pending:
-                native = (candidate.topology is not None and bool(candidate.topology.inverters)
-                          and all(i.transport == "native" for i in candidate.topology.inverters))
-                if (v4.owner == "pending_integration" and not native
-                        or v4.owner == "pending_addon" and native):
+            v4 = None
+            handshake_failed = False
+            if version >= 4:
+                # Validate against the topology that would be accepted, before any disk save.
+                candidate, _ = accept_topology(
+                    state.settings, previous.topology, payload.get("topology"), persist=False,
+                )
+                try:
+                    v4 = parse_snapshot_v4(payload, candidate.topology)
+                except (ValidationError, ValueError, TypeError):
                     return invalid
-            if paired_site is None and not save_pairing(state.settings, snapshot.site_id):
-                return invalid
-            if pending and store.can_handover(v4.owner):
-                # A lost admission condition is not malformed: report the real
-                # authority so the integration can durably withdraw its request.
-                # Persistence failures never acknowledge the handshake.
-                handshake_failed = store.handover(v4.owner) is None
-            elif v4.owner == "addon":
-                store.handover("addon")
-        # Missing v2 is a field-local schema violation, never a legacy fallback.
-        raw = payload.get("solar_forecast", {}) if version >= 2 else None
-        parsed = parse_native_forecast(raw, received_at=now)
-        previous = state.integration_link
-        topology, changed = accept_topology(
-            state.settings, previous.topology, payload.get("topology") if version >= 3 else None,
-        )
-        readings, readings_reason = parse_major_loads(
-            payload.get("major_loads") if version >= 3 else None, topology,
-        )
-        guard_raw = payload.get("supply_guard") if version >= 3 else None
-        if version >= 4 and isinstance(guard_raw, dict):
-            connections = guard_raw.get("connections")
-            if isinstance(connections, list):
-                guard_raw = guard_raw | {"connections": [
-                    {key: value for key, value in c.items() if key != "writer"}
-                    if isinstance(c, dict) else c for c in connections
-                ]}
-        guard, guard_reason = parse_supply_guard(guard_raw, topology)
-        state.integration_link = IntegrationLink(
-            snapshot, now, False, parsed, topology, readings, guard, readings_reason, guard_reason,
-            v4=v4,
-            authority_identity=(v4.authority.store_identity if v4 and v4.authority
-                                else previous.authority_identity),
-            authority_epoch=(v4.authority.epoch if v4 and v4.authority
-                             else previous.authority_epoch),
-        )
-        # Planning inputs for the daemon and in-process agent previews (#542). A
-        # changed record supersedes the limits any in-flight write was planned
-        # under; never an authority change.
-        execution_context().major_loads = major_load_observations(state.integration_link)
-        if changed:
-            execution_context().limits_record = topology
+                if not snapshot_acceptable(previous, snapshot, now, paired_site=paired_site, v4=v4):
+                    return invalid
+                store = execution_context().authority or AuthorityStore(state.settings)
+                if v4.owner == "integration" and retirement_status(state.settings) != "retired":
+                    return invalid
+                pending = v4.owner in ("pending_integration", "pending_addon")
+                if pending:
+                    native = (
+                        candidate.topology is not None and bool(candidate.topology.inverters)
+                        and all(i.transport == "native" for i in candidate.topology.inverters)
+                    )
+                    if (v4.owner == "pending_integration" and not native
+                            or v4.owner == "pending_addon" and native):
+                        return invalid
+                if paired_site is None and not save_pairing(state.settings, snapshot.site_id):
+                    return invalid
+                if pending and store.can_handover(v4.owner):
+                    # A lost admission condition is not malformed: report the real
+                    # authority so the integration can durably withdraw its request.
+                    # Persistence failures never acknowledge the handshake.
+                    handshake_failed = store.handover(v4.owner) is None
+                elif v4.owner == "addon":
+                    store.handover("addon")
+            # Missing v2 is a field-local schema violation, never a legacy fallback.
+            raw = payload.get("solar_forecast", {}) if version >= 2 else None
+            parsed = parse_native_forecast(raw, received_at=now)
+            previous = state.integration_link
+            topology, changed = accept_topology(
+                state.settings, previous.topology,
+                payload.get("topology") if version >= 3 else None,
+            )
+            readings, readings_reason = parse_major_loads(
+                payload.get("major_loads") if version >= 3 else None, topology,
+            )
+            guard_raw = payload.get("supply_guard") if version >= 3 else None
+            if version >= 4 and isinstance(guard_raw, dict):
+                connections = guard_raw.get("connections")
+                if isinstance(connections, list):
+                    guard_raw = guard_raw | {"connections": [
+                        {key: value for key, value in c.items() if key != "writer"}
+                        if isinstance(c, dict) else c for c in connections
+                    ]}
+            guard, guard_reason = parse_supply_guard(guard_raw, topology)
+            state.integration_link = IntegrationLink(
+                snapshot, now, False, parsed, topology, readings, guard,
+                readings_reason, guard_reason,
+                v4=v4,
+                authority_identity=(v4.authority.store_identity if v4 and v4.authority
+                                    else previous.authority_identity),
+                authority_epoch=(v4.authority.epoch if v4 and v4.authority
+                                 else previous.authority_epoch),
+            )
+            # Planning inputs for the daemon and in-process agent previews (#542). A
+            # changed record supersedes the limits any in-flight write was planned
+            # under; never an authority change.
+            execution_context().major_loads = major_load_observations(state.integration_link)
+            if changed:
+                execution_context().limits_record = topology
         if changed and state.executor is not None:
             state.executor.request_replan()
         if load_solar_source_kind(state.settings) != parsed.kind:

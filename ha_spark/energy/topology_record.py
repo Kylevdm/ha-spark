@@ -3,16 +3,21 @@
 The marker is written first so interrupted first acceptance cannot restore legacy
 limits. A marker's presence (even if corrupt) is sufficient to fail closed when
 the bounded, revalidated record cannot be read. No authority lives here.
+
+An optional canonical site_id binds the revision floor during re-pairing; None
+means accepted under the current pairing (including pre-binding records).
+for_site clears a foreign site's revision floor, never its topology or limits.
 """
 
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
+from uuid import UUID
 
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, field_validator
 
 from ha_spark.config import Settings
 from ha_spark.energy.topology import FrozenModel, Topology, effective_limits
@@ -38,6 +43,14 @@ class TopologyRecord(FrozenModel):
     # later topology is preview-only. Absent in records written before #542.
     supported_revision: int | None = Field(default=None, strict=True, ge=1)
     supported_topology: Topology | None = None
+    site_id: str | None = None
+
+    @field_validator("site_id")
+    @classmethod
+    def canonical_site(cls, value: str | None) -> str | None:
+        if value is not None and str(UUID(value)) != value:
+            raise ValueError("invalid_site_id")
+        return value
 
 
 @dataclass(frozen=True)
@@ -50,6 +63,14 @@ class LoadedTopology:
     reason: str | None = None
     supported_revision: int | None = None
     supported_topology: Topology | None = None
+    site_id: str | None = None
+
+
+def for_site(loaded: LoadedTopology, paired_site: str | None) -> LoadedTopology:
+    """Keep accepted limits, but apply the revision floor only to its paired site."""
+    if loaded.site_id is None or loaded.site_id == paired_site:
+        return loaded
+    return replace(loaded, revision=None)
 
 
 def load_topology_record(settings: Settings) -> LoadedTopology:
@@ -70,6 +91,7 @@ def load_topology_record(settings: Settings) -> LoadedTopology:
             "native", record.revision, record.topology,
             supported_revision=record.supported_revision,
             supported_topology=record.supported_topology,
+            site_id=record.site_id,
         )
     except (OSError, ValueError, TypeError, RecursionError):
         if os.path.lexists(parent / _MARKER):
@@ -98,11 +120,12 @@ def _durable_write(path: Path, body: bytes) -> None:
 def save_topology_record(
     settings: Settings, revision: int, topology: Topology,
     supported: tuple[int, Topology] | None = None,
+    *, site_id: str | None = None,
 ) -> None:
     """Daemon-only acceptance; failures propagate as fixed outcome codes at intake."""
     try:
         record = TopologyRecord(
-            schema_version=1, revision=revision, topology=topology,
+            schema_version=1, revision=revision, topology=topology, site_id=site_id,
             supported_revision=supported[0] if supported is not None else None,
             supported_topology=supported[1] if supported is not None else None,
         )
