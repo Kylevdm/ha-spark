@@ -21,13 +21,38 @@ MAX_PER_INVERTER = 64
 # heartbeat inside its 64 KiB cap, and oldest-first means acks always make progress.
 SNAPSHOT_PER_INVERTER = 8
 TransitionKind = Literal[
-    "accepted", "armed", "started", "cleanup_verified", "aborted", "clock_hold", "tripped"
+    "accepted", "armed", "started", "cleanup_verified", "aborted", "clock_hold", "tripped",
+    "unverified",
 ]
 
 
 def same_event(first: EventIdentity, second: EventIdentity) -> bool:
     return (first.direction == second.direction and first.start == second.start
             and first.end == second.end)
+
+
+def held_at_start(
+    rows: Sequence[ExportTransition], now: datetime,
+) -> tuple[tuple[str, EventIdentity], ...]:
+    """Each (inverter, event) held as ``unverified`` whose event has started unsettled.
+
+    A hold is settled by a terminal row (``aborted``/``tripped``), a verified
+    ``started``, or an ``armed`` logged after it (#406). The caller also treats a
+    live record for the event as settled, since ``armed`` is logged once per event.
+    """
+    held: list[tuple[str, EventIdentity]] = []
+    for index, row in enumerate(rows):
+        if (row.kind != "unverified" or row.event.start > now
+                or any(inverter_id == row.inverter_id and same_event(event, row.event)
+                       for inverter_id, event in held)):
+            continue
+        if not any(other.inverter_id == row.inverter_id
+                   and same_event(other.event, row.event)
+                   and (other.kind in ("aborted", "tripped", "started")
+                        or (other.kind == "armed" and position > index))
+                   for position, other in enumerate(rows)):
+            held.append((row.inverter_id, row.event))
+    return tuple(held)
 
 
 def visible(rows: Sequence[ExportTransition], inverter_id: str) -> tuple[ExportTransition, ...]:

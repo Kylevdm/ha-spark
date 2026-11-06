@@ -1,0 +1,34 @@
+[
+  {
+    "id": "accepted",
+    "kind": "accepted",
+    "event": {"direction": "export", "start": "2026-11-02T14:00:00+00:00", "end": "2026-11-02T15:00:00+00:00"},
+    "at": "2026-11-02T12:00:00+00:00",
+    "reason": null,
+    "cleared": null
+  },
+  {
+    "id": "unverified",
+    "kind": "unverified",
+    "event": {"direction": "export", "start": "2026-11-02T14:00:00+00:00", "end": "2026-11-02T15:00:00+00:00"},
+    "at": "2026-11-02T12:00:00+00:00",
+    "reason": "unverified",
+    "cleared": false
+  },
+  {
+    "id": "armed",
+    "kind": "armed",
+    "event": {"direction": "export", "start": "2026-11-02T14:00:00+00:00", "end": "2026-11-02T15:00:00+00:00"},
+    "at": "2026-11-02T12:00:00+00:00",
+    "reason": null,
+    "cleared": null
+  },
+  {
+    "id": "started",
+    "kind": "started",
+    "event": {"direction": "export", "start": "2026-11-02T14:00:00+00:00", "end": "2026-11-02T15:00:00+00:00"},
+    "at": "2026-11-02T14:01:00+00:00",
+    "reason": null,
+    "cleared": null
+  }
+]

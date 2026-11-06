@@ -13,7 +13,7 @@ from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
 
-ExportTransition = Literal["accepted", "started", "cleanup", "clock", "aborted"]
+ExportTransition = Literal["accepted", "started", "cleanup", "clock", "aborted", "unverified"]
 
 
 @dataclass(frozen=True)
@@ -81,6 +81,15 @@ def make_notice(
         message = (
             f"Verified Axle export cleanup for {window}: the resident timed export "
             "window was cleared and read back."
+        )
+    elif transition == "unverified":
+        title = "Axle export held: write not verified"
+        message = f"The Axle export for {window} did not read back."
+        if safe_state:
+            message += f" Safe result: {safe_state}."
+        message += (
+            " ha-spark retries every pass; the export is aborted if it is "
+            "not verified by the event start."
         )
     elif transition == "clock":
         title = "Axle export held: inverter clock"

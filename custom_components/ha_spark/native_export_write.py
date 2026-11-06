@@ -290,12 +290,21 @@ class NativeExportWrites:
                                     reason=reason, cleared=cleared)
 
     async def _log_refusal(self, inverter_id: str, event: EventIdentity | None,
-                           now: datetime, reason: str | None, *, cleared: bool) -> None:
-        """Deferral and untrusted holds never abort; the clock hold is retryable."""
+                           now: datetime, reason: str | None, *, cleared: bool,
+                           held: bool = False) -> None:
+        """Deferral and untrusted holds never abort; the clock hold is retryable.
+
+        ``held`` marks an arm write that did not read back: before the event
+        starts it is the retryable ``unverified`` (#406), at or after it an abort.
+        """
         if reason is None or reason == "hold_data_untrusted":
             return
         if reason == "clock_not_trusted":
             await self._save_transition(inverter_id, event, "clock_hold", now, reason=reason)
+            return
+        if held and event is not None and now < event.start:
+            await self._save_transition(inverter_id, event, "unverified", now,
+                                        reason="unverified", cleared=cleared)
             return
         await self._save_abort(inverter_id, event, now, reason, cleared=cleared)
 
@@ -618,6 +627,9 @@ class NativeExportWrites:
                 deferred = False
                 keep = False
                 failure: Literal["unverified", "failed"] | None = None
+                # The arm itself did not read back (#406): retryable before the start.
+                arm_unverified = False
+                arm_failed_slot = False
                 half = [0, 0, 0, 0]
                 refusal: WriteReason | None = None
                 event: EventIdentity | None = malformed_event
@@ -731,6 +743,7 @@ class NativeExportWrites:
                         refusal = current.reason
                         failure = ("failed" if current.outcome == "failed"
                                    else "unverified")
+                        arm_unverified = current.outcome == "unverified"
                 planned = half if ready or keep else [0, 0, 0, 0]
                 charge_window = False
                 for kind, intent, index in entries:
@@ -761,6 +774,9 @@ class NativeExportWrites:
                     refusal = slot_result.reason if slot_result is not None else None
                     failure = (slot_result.outcome if slot_result is not None
                                and slot_result.outcome in ("unverified", "failed") else None)
+                    # The failed arm write is this pass's slot result: no cleanup ran.
+                    arm_unverified = failure == "unverified"
+                    arm_failed_slot = True
                     ready = False
                 if ready:
                     assert isinstance(request, ExportWindow)
@@ -785,11 +801,13 @@ class NativeExportWrites:
                     cleanup = (slot_result if slot_result is not None
                                else await self._cleanup_locked(inverter, slots, now))
                     if cleanup.outcome in ("unverified", "failed"):
+                        # A failed cleanup is terminal; only the failed arm's own
+                        # unread window stays retryable.
                         await self._log_refusal(
                             inverter.id, event or self._latest_event(inverter.id), now,
                             None if deferred else ("invalid_intent" if malformed else
                                                    failure or refusal or cleanup.outcome),
-                            cleared=False)
+                            cleared=False, held=arm_unverified and arm_failed_slot)
                         results[export_index] = IntentResult(outcome="unverified")
                         return results
                 if malformed:
@@ -809,7 +827,8 @@ class NativeExportWrites:
                     await self._log_refusal(
                         inverter.id, event or self._latest_event(inverter.id), now,
                         "invalid_intent" if malformed else failure or refusal,
-                        cleared=cleanup.outcome in ("applied", "unchanged"))
+                        cleared=cleanup.outcome in ("applied", "unchanged"),
+                        held=arm_unverified and cleanup.outcome in ("applied", "unchanged"))
                 return results
 
     async def async_cancel_export(self, inverter_id: str, *, epoch: int,

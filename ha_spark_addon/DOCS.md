@@ -1499,8 +1499,12 @@ notice when it accepts an event, one
 after a verified export start, one after verified cleanup, and one for a
 terminal abort. On native sites these come from the integration's durable
 transition log, including transitions made while the add-on was down. `armed`
-is logged but sends no notice. `clock_hold` is retryable; `not_supervised`
-produces a terminal abort notice. `tripped` becomes **Axle export aborted**
+is logged but sends no notice. `clock_hold` is retryable, and so is
+`unverified`: an export window or discharge-current write that did not read
+back before the event start sends **Axle export held: write not verified**
+once, with its safe result, and ha-spark retries every pass. It becomes
+**Axle export aborted** only if the event starts without a verified arm or a
+cleanup fails. `not_supervised` produces a terminal abort notice. `tripped` becomes **Axle export aborted**
 with reason **site export over limit**; it is not a cleanup notice. Notices are
 deduplicated by event and lifecycle step. A notice is never proof that a hardware write succeeded. Leave both `notify_service` and
 the deprecated `v2l_notify_service` blank to turn the notices off. The

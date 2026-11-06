@@ -230,7 +230,8 @@ class ExportTransition(FrozenModel):
 
     id: SafeId
     kind: Literal[
-        "accepted", "armed", "started", "cleanup_verified", "aborted", "clock_hold", "tripped"
+        "accepted", "armed", "started", "cleanup_verified", "aborted", "clock_hold", "tripped",
+        "unverified",
     ]
     event: Event
     at: Instant
