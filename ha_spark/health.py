@@ -43,6 +43,7 @@ from ha_spark.energy.octopus import (
 )
 from ha_spark.energy.planner import LIMITS_UNAVAILABLE_REASON
 from ha_spark.energy.profile import history_coverage
+from ha_spark.energy.soc_integrity import SocStatus
 from ha_spark.energy.solar_source import load_solar_source_kind
 from ha_spark.energy.sources import (
     build_config,
@@ -314,9 +315,13 @@ _REQUIRED_ENTITY_FIELDS = (
 
 def check_entity_config(settings: Settings) -> CheckResult:
     """Flag required entity fields left blank (ships unconfigured by default)."""
-    native = load_solar_source_kind(settings) == "native"
+    native_solar = load_solar_source_kind(settings) == "native"
+    native = retirement_status(settings) is not None
+    legacy_fields = {"soc_entity", "battery_voltage_entity", "charge_current_entity",
+                     "inverter_power_switch_entity"}
     unset = [f for f in _REQUIRED_ENTITY_FIELDS if not getattr(settings, f)
-             and not (native and f == "solar_tomorrow_entity")]
+             and not (native_solar and f == "solar_tomorrow_entity")
+             and not (native and f in legacy_fields)]
     if not settings.battery_power_entity:
         unset.append("battery_power_entity (glitch and stuck-SoC protection are off)")
     if not unset:
@@ -595,6 +600,34 @@ async def check_site_pairing(settings: Settings) -> CheckResult:
     return CheckResult("Site pairing", Status.OK, detail)
 
 
+async def check_native_soc(settings: Settings) -> CheckResult:
+    """Report only validated snapshot SoC diagnostics from the local daemon."""
+    try:
+        reply = await submit_socket(settings, "integration_link")
+    except OSError:
+        return CheckResult("Native SoC", Status.WARN, "unknown (daemon connection lost)")
+    if reply is None:
+        return CheckResult("Native SoC", Status.WARN, "unknown (no daemon running)")
+    view = reply.integration_link if reply.error is None else None
+    status = view.get("native_soc_status") if view is not None else None
+    if not isinstance(status, str) or status not in {s.value for s in SocStatus}:
+        return CheckResult("Native SoC", Status.WARN, "unknown")
+    if status != SocStatus.OK.value:
+        return CheckResult(
+            "Native SoC", Status.FAIL,
+            f"snapshot SoC {status}; SoC-derived writes are blocked",
+        )
+    pct = view.get("native_soc_pct") if view is not None else None
+    age = view.get("native_soc_age_s") if view is not None else None
+    if (not isinstance(pct, (int, float)) or isinstance(pct, bool)
+            or not 0 <= pct <= 100 or not math.isfinite(pct)
+            or not isinstance(age, int) or isinstance(age, bool) or age < 0):
+        return CheckResult("Native SoC", Status.WARN, "unknown")
+    return CheckResult(
+        "Native SoC", Status.OK, f"snapshot SoC {pct:g}%; trusted; read {age}s ago",
+    )
+
+
 def check_hold_release(settings: Settings) -> list[CheckResult]:
     """A WARN per owned hold whose release has been refused (#449); nothing otherwise.
 
@@ -796,6 +829,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_integration_link(settings),
         check_authority_owner(settings),
         check_site_pairing(settings),
+        *([check_native_soc(settings)] if retirement_status(settings) is not None else []),
         check_ha_rest(settings),
         *([check_notify_service(settings)] if settings.notify_service else []),
         check_ha_websocket(settings),
