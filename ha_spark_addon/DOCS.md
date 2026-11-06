@@ -272,6 +272,12 @@ an unavailable authority or failed save fails the check.
 last refused site id while snapshots from another site are refused as
 `site_not_paired` (see re-pairing above). An unreadable pairing record is a
 warning: it pairs nothing.
+On an integration-owned site, **Native SoC** shows the integration snapshot's
+SoC, its trust and its age; a missing, stale, future-dated or untrusted SoC
+fails the row (SoC-derived writes are blocked), and **Entity config** no
+longer asks for the SoC, battery voltage, charge current or power switch
+entities. Entry preconditions use the same snapshot SoC, never the configured
+SoC entity.
 
 Each native **Solis transport (<id>)** row reads validation through the daemon,
 without probing Modbus or writing a test schedule. `validated` is OK;
