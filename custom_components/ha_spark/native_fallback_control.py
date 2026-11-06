@@ -9,8 +9,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
-from homeassistant.components import persistent_notification
-
+from . import notify_target
 from .authority_store import AuthorityState, FallbackState
 from .channel import Outcome
 from .clock_sync import STALE_AFTER
@@ -110,14 +109,13 @@ class NativeFallback:
         return f"ha_spark_fallback_{kind}"
 
     def _create(self, kind: str, message: str) -> None:
-        persistent_notification.async_create(
-            self.coordinator.hass, message, title="ha-spark fallback",
-            notification_id=self._identifier(kind),
+        notify_target.async_notice(
+            self.coordinator.hass, self.coordinator.entry,
+            notification_id=self._identifier(kind), title="ha-spark fallback", message=message,
         )
 
     def _dismiss(self, kind: str) -> None:
-        persistent_notification.async_dismiss(
-            self.coordinator.hass, self._identifier(kind))
+        notify_target.async_dismiss(self.coordinator.hass, self._identifier(kind))
 
     def _entered(self, causes: tuple[str, ...]) -> None:
         self.notices.pop("unverified", None)

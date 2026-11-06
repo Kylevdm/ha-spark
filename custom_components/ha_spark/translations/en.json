@@ -300,6 +300,8 @@
   },
   "options": {
     "error": {
+      "invalid_notify_target": "Enter a bare lowercase notify service name using letters, numbers and underscores, not notify. or send_message.",
+      "unknown_notify_target": "This notify service is not available. Choose an existing service or leave the field empty.",
       "invalid_manual_time": "Enter a valid HH:MM deadline and household time zone.",
       "invalid_evidence": "Configure EV status, battery direction and a positive finite maximum age for every configured source.",
       "invalid_soc_policy": "Enter a positive finite report age and whole-number failure and recovery settings of at least one.",
@@ -342,9 +344,20 @@
           "solcast": "Solcast daily allowance",
           "manual": "Manual control deadline",
           "soc": "Native SoC trust policy",
+          "notify": "Notify target",
           "evidence": "Native protection evidence",
           "fallback": "Native fallback schedule",
           "topology": "Site topology and limits"
+        }
+      },
+      "notify": {
+        "title": "Notify target",
+        "description": "Enter a bare notify service name such as mobile_app_<device>, without notify. Leave empty to clear it. Unset or failed sends use a persistent notification. Delivery never gates control.",
+        "data": {
+          "notify_target": "Notify service name"
+        },
+        "data_description": {
+          "notify_target": "Lowercase letters, numbers and underscores only; the service must exist. Entity-based send_message is not supported."
         }
       },
       "evidence": {
