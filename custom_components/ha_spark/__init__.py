@@ -101,7 +101,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     site_id = entry.data["site_id"]
     identifier = (DOMAIN, f"{site_id}_solcast")
     if entry.data.get("solcast_api_key"):
-        site = registry.async_get_device(identifiers={(DOMAIN, site_id)})
+        site = registry.async_get_device_by_identifier((DOMAIN, site_id), entry.entry_id)
         registry.async_get_or_create(
             config_entry_id=entry.entry_id, identifiers={identifier}, name="Solcast",
             entry_type=dr.DeviceEntryType.SERVICE, via_device_id=site.id if site else None,

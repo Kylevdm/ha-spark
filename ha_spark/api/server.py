@@ -53,6 +53,7 @@ from ha_spark.api.contract import (
     version_refusal,
 )
 from ha_spark.api.history import bucket_starts, history_payload
+from ha_spark.api.native_apply import snapshot_soc
 from ha_spark.api.site_pairing import load_pairing, save_pairing
 from ha_spark.api.snapshot_v4 import parse_snapshot_v4
 from ha_spark.api.static_assets import packaged_assets
@@ -83,6 +84,7 @@ from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.models import ChargePlan, ExportIntent
 from ha_spark.energy.plan_run import StoredPlanRun
 from ha_spark.energy.publish import plan_to_payload
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.solar_forecasts import recorded_solar
 from ha_spark.energy.solar_measured import MeasuredSolar
 from ha_spark.energy.solar_source import (
@@ -382,8 +384,19 @@ class AppState:
 
     def integration_link_view(self) -> dict[str, object]:
         """Read the current link without affecting authority or planning."""
-        return {**link_view(self.integration_link, datetime.now(UTC)),
-                "refused_site_id": self.refused_site}
+        now = datetime.now(UTC)
+        measurement = (
+            SocMeasurement(SocStatus.UNAVAILABLE, now)
+            if self.settings_service.repair is not None
+            else snapshot_soc(self.integration_link, now, self.settings)
+        )
+        return {**link_view(self.integration_link, now),
+                "refused_site_id": self.refused_site,
+                "native_soc_status": measurement.status.value,
+                "native_soc_pct": measurement.value,
+                "native_soc_age_s": (
+                    int(measurement.age_s) if measurement.age_s is not None else None
+                )}
 
     @property
     def settings(self) -> Settings:
@@ -676,7 +689,10 @@ def build_app(
             if st.native_status() is not None:
                 return JSONResponse(st.executor.authority_status(),
                                     headers={"Cache-Control": "no-store"})
-            preconditions = await entry_preconditions(st.settings)
+            preconditions = await entry_preconditions(
+                st.settings,
+                native_soc=snapshot_soc(st.integration_link, datetime.now(UTC), st.settings),
+            )
             # Snapshot after the diagnostic reads; preconditions never grant authority.
             view = dict(st.executor.authority_status())
             view["preconditions"] = preconditions

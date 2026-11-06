@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 from freezegun.api import FrozenDateTimeFactory
-from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_RECONFIGURE
+from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_RECONFIGURE, ConfigEntryDisabler
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import device_registry as dr
@@ -72,6 +72,39 @@ async def test_reconfigure_key(
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
     assert KEY not in caplog.text + repr(result) + repr(diagnostics)
     assert SITE not in caplog.text + repr(result) + repr(diagnostics)
+
+
+async def test_solcast_setup_has_no_deprecated_device_lookup(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    entry = entry_for(hass, solcast_api_key=KEY, solcast_resource_ids=[SITE])
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert "async_get_device" not in caplog.text
+    assert "deprecated" not in caplog.text
+
+
+async def test_solcast_parent_is_scoped_to_its_config_entry(hass: HomeAssistant) -> None:
+    other = MockConfigEntry(
+        domain=DOMAIN, unique_id="other", data={}, disabled_by=ConfigEntryDisabler.USER,
+    )
+    other.add_to_hass(hass)
+    registry = dr.async_get(hass)
+    foreign = registry.async_get_or_create(
+        config_entry_id=other.entry_id, identifiers={(DOMAIN, "site")}, name="Other site",
+    )
+    entry = entry_for(hass, solcast_api_key=KEY, solcast_resource_ids=[SITE])
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    site = registry.async_get_device_by_identifier((DOMAIN, "site"), entry.entry_id)
+    device = registry.async_get_device_by_identifier((DOMAIN, "site_solcast"), entry.entry_id)
+    assert site is not None and device is not None
+    assert device.via_device_id == site.id
+    assert device.via_device_id != foreign.id
+    retained = registry.async_get(foreign.id)
+    assert retained is not None
+    assert retained.config_entry_id == other.entry_id
 
 
 async def test_clear_requires_confirmation_and_removes_device(hass: HomeAssistant) -> None:

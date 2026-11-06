@@ -98,7 +98,9 @@ async def test_link_http_socket_and_health(
         response = client.get("/api/health")
     assert response.status_code == 200
     view = response.json()["integration_link"]
-    assert view["state"] == expected and set(view) == KEYS | {"refused_site_id"}
+    assert view["state"] == expected and set(view) == KEYS | {
+        "refused_site_id", "native_soc_status", "native_soc_pct", "native_soc_age_s",
+    }
     assert view["topology_source"] == "legacy"
     assert view["topology_revision"] is None
     assert view["topology_reason"] is None
