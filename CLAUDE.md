@@ -108,7 +108,7 @@ security and prefer the safe default. Hard rules:
   `transitions.py`, and in the integration `authority_store.py`,
   `ownership.py`, `native_write.py`, `native_holds.py`,
   `native_fallback_control.py`, `guard_loop.py`, `native_export.py`,
-  `native_tripwire.py`).
+  `native_export_write.py`, `native_export_supervision.py`, `native_tripwire.py`).
 - **Parameterised SQL only**; no `eval`/`exec`/`shell=True`/shell interpolation
   of external data.
 - **Network:** outbound only to configured endpoints; any inbound network
