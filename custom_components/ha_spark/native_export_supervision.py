@@ -220,6 +220,30 @@ class ExportSupervisor:
                 "last_changed_at": now,
             }))
 
+    async def async_abort_held_exports(self, now: datetime) -> None:
+        """Log ``aborted`` for each held event that started without a verified arm.
+
+        Log only (#406): it never writes a device, grants arming or changes a record.
+        Setup runs it once before any heartbeat can acknowledge and prune the hold.
+        """
+        async with self.control.lock:
+            state = self.authority.state
+            if state is None:
+                return
+            candidate = state
+            for inverter_id, event in native_export_log.held_at_start(
+                    state.export_transitions, now):
+                record = latest_record(candidate.export_records, inverter_id)
+                if (record is not None and record.event == event
+                        and record.state in ("armed", "active", "preserved")):
+                    continue  # re-armed and verified after the hold
+                candidate = native_export_log.with_append(
+                    candidate, inverter_id=inverter_id, event=event, kind="aborted",
+                    at=now, reason="unverified",
+                    cleared=record is None or record.state == "cleared")
+            if candidate is not state:
+                await self.authority.async_save(candidate)
+
     async def _async_ack_export_transitions(
         self, acks: tuple[str, ...] | None, now: datetime,
     ) -> None:
