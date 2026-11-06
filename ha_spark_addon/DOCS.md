@@ -720,6 +720,14 @@ needed, **Limits** lines. The source is one of:
   not match the live writer's exact single-inverter shape is preview-only for
   hardware, including several banks or connections until per-bank SoC arrives.
 
+Moving to a native topology replaces `battery_discharge_ceiling_kw` with the
+inverter's DC discharge limit × the bank's nominal voltage. To keep a lowered
+ceiling, enter the inverter's DC discharge limit as **A = kW × 1000 ÷ nominal V,
+rounded down** (for example, 3.0 kW at 51.2 V → 58 A). `ha-spark health` shows a
+**Discharge ceiling** WARN while a native inverter's effective limit is above an
+explicitly set ceiling, using the durable accepted topology; it never fails or
+blocks control.
+
 The add-on stores the last accepted topology durably in
 `ha_spark_topology.json`, with an initialisation marker, beside the database in
 `/data`. Once a native topology is accepted it never returns to the legacy

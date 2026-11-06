@@ -56,7 +56,9 @@ def only_topology_check(monkeypatch):
 
     for name in dir(health):
         if name.startswith("check_") and name != "check_topology_record":
-            if name in ("check_hold_release", "check_entity_config"):
+            if name == "check_discharge_ceiling":
+                monkeypatch.setattr(health, name, lambda *_: [])
+            elif name in ("check_hold_release", "check_entity_config"):
                 stub = (lambda s: []) if name == "check_hold_release" else (
                     lambda s: health.CheckResult("Stub", health.Status.OK, ""))
                 monkeypatch.setattr(health, name, stub)

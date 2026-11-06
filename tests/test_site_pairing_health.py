@@ -83,6 +83,7 @@ async def test_pairing_row_in_health_reports(settings, monkeypatch, repair):
                 monkeypatch.setattr(health, name, AsyncMock(return_value=stub))
         monkeypatch.setattr(health, "check_entity_config", lambda _: stub)
         monkeypatch.setattr(health, "check_hold_release", lambda _: [])
+        monkeypatch.setattr(health, "check_discharge_ceiling", lambda *_: [])
         monkeypatch.setattr(health, "check_evidence_freshness", AsyncMock(return_value=[]))
         rows = await health.run_health(settings)
     row = next(r for r in rows if r.name == "Site pairing")
