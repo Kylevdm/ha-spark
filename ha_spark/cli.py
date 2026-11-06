@@ -20,14 +20,17 @@ from datetime import UTC, date, datetime, time, timedelta
 from getpass import getpass
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import yaml
 
+from ha_spark.api.site_pairing import REPLACE_TEXT
 from ha_spark.authority import authority_view, load_authority
 from ha_spark.config import _SECRET_OPTION_KEYS, ConfigError, Settings, load_settings
 from ha_spark.daemon_channel import (
     MAX_CONFIG_BYTES,
     REFUSED,
+    RESPONSE_UNAVAILABLE,
     DaemonAlreadyRunning,
     Duration,
     ModeTarget,
@@ -888,6 +891,11 @@ def build_parser() -> argparse.ArgumentParser:
     secret.add_argument("--clear", action="store_true")
     config_sub.add_parser("import").add_argument("file", type=Path)
 
+    pair = sub.add_parser("pair", help="Replace pairing after re-adding the integration")
+    pair.add_argument("--replace", action="store_true", required=True)
+    pair.add_argument("--from", dest="from_site", required=True)
+    pair.add_argument("--to", dest="to_site", required=True)
+
     p_mode = sub.add_parser("mode", help="Show or change operating-mode authority")
     mode_sub = p_mode.add_subparsers(dest="mode_command", required=True)
     mode_sub.add_parser("show")
@@ -1285,6 +1293,44 @@ async def _cmd_config(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _canonical_site(value: str) -> bool:
+    try:
+        return str(UUID(value)) == value
+    except ValueError:
+        return False
+
+
+async def _cmd_pair_replace(settings: Settings, from_site: str, to_site: str) -> int:
+    """Confirm locally, then submit once; only the daemon persists the pairing."""
+    if not (_canonical_site(from_site) and _canonical_site(to_site)):
+        # Sends nothing: an over-long id would otherwise fail locally as an unknown outcome.
+        print(f"[REFUSED] invalid_site_id: {REPLACE_TEXT['invalid_site_id']}")
+        return 2
+    try:
+        confirmation = await asyncio.to_thread(input, "Type the new site id again to confirm: ")
+        confirmed = confirmation.strip() == to_site
+    except EOFError:
+        confirmed = False
+    if not confirmed:
+        print("[REFUSED] confirmation did not match; nothing was sent")
+        return 2
+    reply = await submit_socket(settings, "pair_replace", from_site=from_site, to_site=to_site)
+    if reply is None:
+        print(REFUSED)
+        return 1
+    if reply.error == RESPONSE_UNAVAILABLE:
+        print("[REFUSED] outcome unknown; check ha-spark health before trying again")
+        return 1
+    if reply.error:
+        print(f"[REFUSED] {reply.error}: {reply.text}" if reply.text
+              else f"[REFUSED] {reply.error}")
+        if reply.error == "pairing_save_failed":
+            print("The new pairing may have been saved; check ha-spark health before trying again")
+        return 1
+    print("Pairing replaced; the new entry's next snapshot will be accepted")
+    return 0
+
+
 async def _cmd_mode_set(
     settings: Settings, target: ModeTarget, *, confirm: bool = False,
     duration: Duration = "one_hour", keep_protection: bool = True,
@@ -1427,6 +1473,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.readiness_command == "coverage":
             return asyncio.run(_cmd_readiness_coverage(settings, days=args.days))
         return asyncio.run(_cmd_readiness_slots(settings, days=args.days))
+
+    if args.command == "pair":
+        try:
+            settings = load_settings(validate=False)
+        except ConfigurationRepair as repair:
+            settings = repair.bootstrap
+        except ConfigError as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 2
+        return asyncio.run(_cmd_pair_replace(settings, args.from_site, args.to_site))
 
     if args.command == "mode":
         try:
