@@ -210,6 +210,41 @@ write permission. Follow the
 [supervised-export runbook](../docs/runbooks/supervised-axle-export.md) for
 preparation, abort and verified cleanup, including lifecycle notices.
 
+### Re-pairing after re-adding the integration
+
+The add-on pairs with the first site that sends it a current snapshot and
+keeps that pairing on disk. Each new integration entry has a new site id, so
+after you remove and re-add the integration the add-on refuses the new entry's
+snapshots as `site_not_paired`, and nothing it sends is used. `ha-spark health`
+shows the **Site pairing** row with the paired site id and the last refused
+site id. To move the pairing to the new entry, run inside the add-on container:
+
+```sh
+ha-spark pair --replace --from <paired site id> --to <new site id>
+```
+
+The command asks you to type the new site id again and sends nothing if it
+doesn't match. The daemon then replaces the pairing only when:
+
+- the stored pairing is readable and equals `--from`;
+- `--to` is a different, canonical site id;
+- the site is in Observe, or authority is unknown;
+- no ownership handshake and no mode transition is pending.
+
+Otherwise it refuses with a reason code (`invalid_site_id`, `same_site`,
+`pairing_untrusted`, `pairing_mismatch`, `mode_not_observe`,
+`handshake_pending`, `transition_pending`) and changes nothing. On success
+the old site's topology revisions no longer count, so the new entry's first
+topology save (revision 1) is accepted; until then the last accepted topology
+and limits stay in force, unwidened. Snapshots from the old entry are refused.
+Re-pairing changes neither the authority owner nor the operating mode.
+
+`pairing_save_failed` means the replacement could not be verified; the new
+pairing may still have been saved. If the reply is lost, the outcome is
+unknown. In both cases check `ha-spark health` before running the command
+again. Only the daemon writes the pairing, so the command needs a running
+daemon and is refused in configuration repair.
+
 ### Health checks
 
 Run `ha-spark health` in Observe before escalation and after transport changes.
@@ -218,6 +253,10 @@ Run `ha-spark health` in Observe before escalation and after transport changes.
 Unknown or pending ownership is a warning, not permission to control hardware.
 **Operating mode** reports integration authority on integration-owned sites;
 an unavailable authority or failed save fails the check.
+**Site pairing** shows the paired site id, or `not paired`, and warns with the
+last refused site id while snapshots from another site are refused as
+`site_not_paired` (see re-pairing above). An unreadable pairing record is a
+warning: it pairs nothing.
 
 Each native **Solis transport (<id>)** row reads validation through the daemon,
 without probing Modbus or writing a test schedule. `validated` is OK;

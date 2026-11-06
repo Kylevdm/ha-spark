@@ -205,6 +205,7 @@ class AppState:
         # Ids of export transitions already notified (or knowingly left unsent).
         self.acknowledged_exports: set[str] = set()
         if executor is not None:
+            executor.pair_replace = self.replace_pairing
             executor.native_request = self.native_request
             executor.native_status = self.native_status
 
@@ -381,7 +382,8 @@ class AppState:
 
     def integration_link_view(self) -> dict[str, object]:
         """Read the current link without affecting authority or planning."""
-        return link_view(self.integration_link, datetime.now(UTC))
+        return {**link_view(self.integration_link, datetime.now(UTC)),
+                "refused_site_id": self.refused_site}
 
     @property
     def settings(self) -> Settings:
