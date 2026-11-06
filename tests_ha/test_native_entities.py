@@ -89,6 +89,33 @@ async def test_native_energy_metadata_pacing_and_failure_isolation(
     assert len(native_transport.traffic) == count
 
 
+async def test_enabled_previous_period_sensor_has_no_state_class(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+    native_transport: FakeSolisDevice, freezer: FrozenDateTimeFactory,
+) -> None:
+    native_transport.set_read_frames()
+    entry = await native_entry(hass, aioclient_mock)
+    native = entry.runtime_data.native
+    prefix = f"{native.gateway_id(native.inverters['inv1'])}_1"
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id("sensor", DOMAIN, f"{prefix}_input_33172")
+    assert entity_id is not None
+    registered = registry.async_get(entity_id)
+    assert registered is not None
+    assert registered.disabled_by is er.RegistryEntryDisabler.INTEGRATION
+    assert hass.states.get(entity_id) is None
+    registry.async_update_entity(entity_id, disabled_by=None)
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    await ticks(hass, freezer, 9)
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state not in ("unknown", "unavailable")
+    assert state.attributes["unit_of_measurement"] == "kWh"
+    assert state.attributes["device_class"] == "energy"
+    assert "state_class" not in state.attributes
+
+
 async def test_probe_lock_blocks_poll_reads(
     hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
     native_transport: FakeSolisDevice, freezer: FrozenDateTimeFactory,

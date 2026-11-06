@@ -64,6 +64,8 @@ def _points() -> tuple[Point, ...]:
                    "%": "battery"}
         points.append(Point(frame, address, name, count, scale, kind, unit,
                             "timestamp" if kind == "clock" else classes.get(unit or ""),
+                            None if any(period in name for period in
+                                        ("yesterday", "last month", "last year")) else
                             "total_increasing" if unit == "kWh" else
                             "measurement" if unit else None, primary, suffix))
 
