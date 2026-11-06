@@ -17,6 +17,7 @@
   "power_switch_not_on",
   "read_only",
   "stale_epoch",
+  "transition_in_progress",
   "tripped",
   "untrusted_soc"
 ]

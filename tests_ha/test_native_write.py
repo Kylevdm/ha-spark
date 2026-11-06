@@ -158,6 +158,35 @@ async def test_refusals_never_write(
     assert not [t for t in native_transport.traffic if t.op == "write"]
 
 
+@pytest.mark.parametrize(("ready", "pending", "reason"), [
+    (True, True, "transition_in_progress"),
+    (False, False, "not_available"),
+    (False, True, "not_available"),
+])
+async def test_entity_control_transition_and_startup_refusals(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, ready: bool, pending: bool, reason: str,
+) -> None:
+    from datetime import UTC, datetime
+
+    from custom_components.ha_spark.authority_store import Transition
+
+    state = writer.authority.state
+    assert state is not None
+    if pending:
+        assert await writer.authority.async_save(state.model_copy(update={
+            "transition": Transition(
+                target="observe", started_at=datetime(2026, 10, 31, tzinfo=UTC), steps=()),
+        }))
+    monkeypatch.setattr(writer.control, "ready", ready)
+    result = await writer.writes.async_entity(
+        next(iter(writer.native.inverters)), "charge", 20, epoch=state.epoch,
+    )
+    assert result.outcome == "refused"
+    assert result.reason == reason
+    assert not any(t.op == "write" for t in native_transport.traffic)
+
+
 @pytest.mark.parametrize("current", [0.0, 5.9, 10.0])
 async def test_soc_not_required_for_reductions_or_unchanged(
     writer: SparkCoordinator, native_transport: FakeSolisDevice,

@@ -53,6 +53,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     await coordinator.async_drop_stale_bounds()
     async_register(hass)
     await coordinator.native.async_start()
+    coordinator.clock.cleanup_repairs()
 
     async def native_tick(now: datetime) -> None:
         coordinator.holds.evidence.check_options()

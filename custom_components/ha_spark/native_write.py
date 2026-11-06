@@ -108,8 +108,10 @@ class NativeChargeBoundary(NativeExportWrites):
         if state.epoch != epoch:
             return "stale_epoch"
         if entity_control is not None:
-            if not coordinator.control.ready or state.transition is not None:
+            if not coordinator.control.ready:
                 return "not_available"
+            if state.transition is not None:
+                return "transition_in_progress"
             manual = state.manual_session
             if entity_control == "power":
                 if (manual is not None and manual.keep_protection or manual is None

@@ -69,7 +69,8 @@ class WriteEntity(NativeEntity):
         self.error(reason if reason in ("authority_unknown", "stale_epoch", "read_only", "limits",
                                        "untrusted_soc", "grid_charge_not_permitted",
                                        "not_available", "invalid_intent",
-                                       "modbus_hub_conflict") else "read_only")
+                                       "modbus_hub_conflict", "transition_in_progress")
+                   else "read_only")
 
     def result(self, result: IntentResult) -> None:
         if result.outcome == "refused":
