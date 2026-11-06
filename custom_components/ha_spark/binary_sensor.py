@@ -139,6 +139,11 @@ class SupplyGuardLimiting(SparkEntity, BinarySensorEntity):
     def is_on(self) -> bool | None:
         return self._guard.limiting if self._guard.started else None
 
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        # Only while the guard simulates in Observe on an integration-owned site.
+        return {"simulated": True} if self._guard.simulated else None
+
 
 class AddonConnected(SparkEntity, BinarySensorEntity):
     """Whether a heartbeat has counted within the current deadline."""

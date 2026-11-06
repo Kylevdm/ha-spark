@@ -115,7 +115,8 @@ async def test_fake_writer_and_mirror(
         await hass.async_block_till_done(wait_background_tasks=True)
     assert loop.limiting
     assert bool(fake.intents) == expected
-    assert loop.decisions[grid.id].warn_reason == (None if expected else "authority_unavailable")
+    assert loop.decisions[grid.id].warn_reason == (
+        None if expected else ("mode_observe" if mode == "observe" else "authority_unavailable"))
     if expected:
         assert fake.intents[-1].charge_a * site.banks[0].nominal_voltage_v <= 1000
     if expected:
