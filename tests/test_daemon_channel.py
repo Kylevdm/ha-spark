@@ -5,6 +5,7 @@ import socket
 import stat
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -250,3 +251,48 @@ async def test_owner_mode_request_is_served_before_queued_work(tmp_path: Path) -
         assert channel.next_request().request.op == "apply"  # type: ignore[union-attr]
         for task in (*work, mode):
             task.cancel()
+
+
+@pytest.mark.parametrize("payload", [
+    b'{"op":"pair_replace"}',
+    b'{"op":"pair_replace","from_site":"old"}',
+    b'{"op":"pair_replace","to_site":"new"}',
+    b'{"op":"pair_replace","from_site":"old","to_site":"new","event":"extra"}',
+    b'{"op":"pair_replace","from_site":"old","to_site":"new","unexpected":true}',
+    b'{"op":"pair_replace","from_site":"' + b'x' * 37 + b'","to_site":"new"}',
+    b'{"op":"pair_replace","from_site":"old","to_site":"' + b'x' * 37 + b'"}',
+    b'{"op":"integration_link","from_site":"old"}',
+    b'{"op":"pair_replace","from_site":123,"to_site":"new"}',
+    # Valid fields, over the line cap only through JSON whitespace.
+    b'{"op":"pair_replace","from_site":"old","to_site":"new"'
+    + b' ' * daemon_channel.MAX_CONFIG_BYTES + b'}',
+])
+async def test_pair_request_validation_never_dispatches(tmp_path, payload):
+    callback = AsyncMock()
+    async with DaemonChannel(settings_at(tmp_path)) as channel:
+        channel.pair_replace = callback
+        reader, writer = await asyncio.open_unix_connection(str(channel.path))
+        writer.write(payload + b'\n')
+        await writer.drain()
+        reply = Reply.model_validate_json(await reader.readline())
+        assert reply.error == "invalid daemon request"
+        callback.assert_not_awaited()
+        assert channel.next_request() is None
+        writer.close()
+        await writer.wait_closed()
+
+
+async def test_pair_unbound_and_repair_refusals_and_shutdown(tmp_path):
+    settings = settings_at(tmp_path)
+    channel = DaemonChannel(settings)
+    async with channel:
+        reply = await submit_socket(settings, "pair_replace", from_site="old", to_site="new")
+        assert reply.error == "not_available"
+        callback = AsyncMock()
+        channel.pair_replace = callback
+        channel.settings_service = type("Repairing", (), {"repair": ["broken"]})()
+        reply = await submit_socket(settings, "pair_replace", from_site="old", to_site="new")
+        assert reply.error == "configuration_repair"
+        callback.assert_not_awaited()
+        assert channel.next_request() is None
+    assert channel.pair_replace is None

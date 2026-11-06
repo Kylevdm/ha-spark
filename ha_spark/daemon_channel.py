@@ -27,6 +27,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from ha_spark.api.contract import AuthorityInputs, IntegrationLink, link_view
+from ha_spark.api.site_pairing import REPLACE_TEXT, ReplaceReason
 from ha_spark.authority import (
     AuthorityStore,
     authority_view,
@@ -43,11 +44,12 @@ log = get_logger(__name__)
 MAX_CONFIG_BYTES = 256 * 1024
 Op = Literal[
     "replan", "apply", "sync_clock", "authority_status", "integration_link", "mode",
-    "supervise_export", "end_supervision",
+    "supervise_export", "end_supervision", "pair_replace",
     "config_show", "config_export", "config_save", "config_import", "config_set_secret",
 ]
 REFUSED = "[REFUSED] no ha-spark daemon running; hardware writes happen only inside the daemon"
 CONFIGURATION_REPAIR = "configuration_repair"
+RESPONSE_UNAVAILABLE = "daemon response unavailable; request may have executed"
 ModeTarget = Literal["observe", "protect", "optimise", "manual", "resume"]
 Duration = Literal["one_hour", "until_tomorrow", "until_resumed"]
 
@@ -73,6 +75,8 @@ class Request(BaseModel):
     event: str | None = Field(default=None, max_length=256)
     ratings_w: dict[str, float] | None = None
     supervision_id: str | None = Field(default=None, max_length=128)
+    from_site: str | None = Field(default=None, max_length=36)
+    to_site: str | None = Field(default=None, max_length=36)
 
     @model_validator(mode="after")
     def validate_mode(self) -> Request:
@@ -86,9 +90,10 @@ class Request(BaseModel):
             "config_set_secret": {"expected_revision", "field", "value"},
             "supervise_export": {"event", "ratings_w"},
             "end_supervision": {"supervision_id"},
+            "pair_replace": {"from_site", "to_site"},
         }.get(self.op, set())
         fields = {"expected_revision", "repair_token", "changes", "document", "field", "value",
-                  "event", "ratings_w", "supervision_id"}
+                  "event", "ratings_w", "supervision_id", "from_site", "to_site"}
         present = {key for key in fields if getattr(self, key) is not None}
         if self.op == "config_import" and present == {"repair_token", "document"}:
             pass
@@ -150,6 +155,7 @@ class DaemonChannel:
         self.link_view: Callable[[], dict[str, object]] | None = None
         self.native_request: Callable[[Request, str | None], Awaitable[Reply | None]] | None = None
         self.native_status: Callable[[], dict[str, Any] | None] | None = None
+        self.pair_replace: Callable[[str, str], Awaitable[ReplaceReason | None]] | None = None
         self.settings_service: SettingsService | None = None
         self.queue: asyncio.Queue[Pending] = asyncio.Queue(maxsize=64)
         # Owner mode requests skip queued work so a reply reaches the owner in one tick.
@@ -190,6 +196,7 @@ class DaemonChannel:
         self.link_view = None
         self.native_request = None
         self.native_status = None
+        self.pair_replace = None
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -312,6 +319,14 @@ class DaemonChannel:
         if self._repairing() and request.op not in ("config_show", "config_import"):
             return Reply(error=CONFIGURATION_REPAIR,
                          text="configuration needs repair; import a valid configuration")
+        if request.op == "pair_replace":
+            if self.pair_replace is None:
+                return Reply(error="not_available")
+            assert request.from_site is not None and request.to_site is not None
+            code = await self.pair_replace(request.from_site, request.to_site)
+            if code is not None:
+                return Reply(error=code, text=REPLACE_TEXT[code])
+            return Reply(text="pairing replaced")
         if request.op.startswith("config_"):
             service = self.settings_service
             if service is None:
@@ -410,6 +425,7 @@ async def submit_socket(
     value: str | dict[str, bool] | None = None, repair_token: str | None = None,
     event: str | None = None, ratings_w: dict[str, float] | None = None,
     supervision_id: str | None = None,
+    from_site: str | None = None, to_site: str | None = None,
 ) -> Reply | None:
     """None means unreachable. Never retry an accepted request after a lost reply."""
     path = resolve_data_dir(settings) / "ha_spark.sock"
@@ -426,6 +442,7 @@ async def submit_socket(
             expected_revision=expected_revision, changes=changes, document=document,
             field=field, value=value, repair_token=repair_token,
             event=event, ratings_w=ratings_w, supervision_id=supervision_id,
+            from_site=from_site, to_site=to_site,
         ).model_dump_json(exclude_none=True).encode() + b"\n"
         if len(payload) > MAX_CONFIG_BYTES:
             return Reply(error="daemon request too large")
@@ -433,7 +450,7 @@ async def submit_socket(
         await writer.drain()
         return Reply.model_validate_json(await reader.readline())
     except (OSError, ValueError):
-        return Reply(error="daemon response unavailable; request may have executed")
+        return Reply(error=RESPONSE_UNAVAILABLE)
     finally:
         writer.close()
         # The daemon may close first; the reply is already read or the failure reported (#490).

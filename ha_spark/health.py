@@ -16,10 +16,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from enum import Enum
 from pathlib import Path
+from uuid import UUID
 
 import aiosqlite
 from pydantic import ValidationError
 
+from ha_spark.api.site_pairing import load_pairing
 from ha_spark.authority import load_authority, retirement_status
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import submit_socket
@@ -569,6 +571,30 @@ async def check_authority_owner(settings: Settings) -> CheckResult:
     )
 
 
+async def check_site_pairing(settings: Settings) -> CheckResult:
+    """Read pairing from disk and allowlist only the daemon's canonical refused id."""
+    paired, trusted = load_pairing(settings)
+    if not trusted:
+        return CheckResult("Site pairing", Status.WARN, "pairing record untrusted")
+    detail = f"paired {paired}" if paired is not None else "not paired"
+    try:
+        reply = await submit_socket(settings, "integration_link")
+    except OSError:
+        reply = None
+    view = reply.integration_link if reply is not None and reply.error is None else None
+    refused = view.get("refused_site_id") if view is not None else None
+    try:
+        valid = isinstance(refused, str) and str(UUID(refused)) == refused
+    except Exception:  # noqa: BLE001 - untrusted diagnostics must never abort health
+        valid = False
+    if valid and refused != paired:
+        return CheckResult(
+            "Site pairing", Status.WARN,
+            f"{detail}; last refused {refused} (site_not_paired; see ha-spark pair --replace)",
+        )
+    return CheckResult("Site pairing", Status.OK, detail)
+
+
 def check_hold_release(settings: Settings) -> list[CheckResult]:
     """A WARN per owned hold whose release has been refused (#449); nothing otherwise.
 
@@ -769,6 +795,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_operating_mode(settings),
         check_integration_link(settings),
         check_authority_owner(settings),
+        check_site_pairing(settings),
         check_ha_rest(settings),
         *([check_notify_service(settings)] if settings.notify_service else []),
         check_ha_websocket(settings),
@@ -826,6 +853,7 @@ async def run_repair_health(bootstrap: Settings, reasons: list[str]) -> list[Che
         CheckResult("Configuration", Status.FAIL, detail),
         await check_operating_mode(bootstrap),
         await check_integration_link(bootstrap),
+        await check_site_pairing(bootstrap),
     ]
 
 
