@@ -225,3 +225,31 @@ def test_without_a_writer_a_short_dip_keeps_the_cut() -> None:
             state, replace(inputs(at, watts), requested_kw=4, observe_only=True), at)
         assert not decision.write
     assert state.cut_kw == 3
+
+
+@pytest.mark.parametrize("mirror,expected", [
+    (None, "authority_unavailable"),
+    (AuthorityMirror("observe", 7, False, False, None), "mode_observe"),
+    (AuthorityMirror("observe", 7, True, False, None), "mode_observe"),
+    (AuthorityMirror("protect", 7, False, False, "observe"), "mode_observe"),
+    (AuthorityMirror("optimise", 7, False, False, "observe"), "mode_observe"),
+    (AuthorityMirror("protect", 7, False, True, None), "writes_not_permitted"),
+    (AuthorityMirror("optimise", 7, True, True, None), "writes_not_permitted"),
+    (AuthorityMirror("unknown", 7, False, False, None), "writes_not_permitted"),
+    (AuthorityMirror("unknown", None, False, False, None), "writes_not_permitted"),
+    (AuthorityMirror("protect", 7, False, False, None), None),
+    (AuthorityMirror("optimise", 7, True, False, None), None),
+    (MIRROR, None),
+])
+def test_warn_reason_precedence(mirror: AuthorityMirror | None, expected: str | None) -> None:
+    """One reason per state: missing mirror, Observe, other no-write state, replay."""
+    state = GuardState(restore_day=NOW.date())
+    _, decision = step(state, replace(inputs(NOW), mirror=mirror), NOW)
+    assert decision.warn_reason == expected
+
+
+def test_warn_reason_replay_refusal_is_authority_unavailable() -> None:
+    """A permitted mirror that refuses the loaded cut's epoch keeps today's reason."""
+    state = GuardState(restore_day=NOW.date(), cut_kw=3.5, epoch=7, restored=True)
+    _, decision = step(state, replace(inputs(NOW), mirror=replace(MIRROR, epoch=8)), NOW)
+    assert decision.warn_reason == "authority_unavailable"

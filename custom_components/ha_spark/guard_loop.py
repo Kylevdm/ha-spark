@@ -119,6 +119,8 @@ class SupplyGuardLoop:
         self._active = False
         self._stopped = False
         self._save_failed = False
+        # True only on an integration-owned site whose committed mode is Observe.
+        self._simulated = False
         self.native_writer = coordinator.writes
         coordinator.control.manual_started = self.async_manual_start
         self._request_epoch: int | None = None
@@ -259,6 +261,7 @@ class SupplyGuardLoop:
                 "restores_left": guard_state.restores_left,
                 "dormant_reason": guard_state.dormant_reason,
                 "warn_reason": decision.warn_reason if decision is not None else None,
+                "simulated": self.simulated,
             })
         readings = {
             entity: {"power_w": power,
@@ -272,6 +275,16 @@ class SupplyGuardLoop:
     def started(self) -> bool:
         """Entity availability: the loop runs without the add-on, but not before start."""
         return self._active
+
+    def _observe(self, mirror: AuthorityMirror | None) -> bool:
+        """Committed Observe on an integration-owned site: the guard only simulates."""
+        return (self.coordinator.control.owned() and mirror is not None
+                and mirror.mode == "observe")
+
+    @property
+    def simulated(self) -> bool:
+        """Observe on an integration-owned site: the shown limit is never latched or saved."""
+        return self._simulated
 
     @property
     def limiting(self) -> bool:
@@ -442,7 +455,25 @@ class SupplyGuardLoop:
                     return readings.get(entity, (None, None)) if entity else (None, None)
                 return self._power(entity)
 
-            mirror = mirror_from(self.coordinator) if not self._save_failed else None
+            real_mirror = mirror_from(self.coordinator)
+            simulating = self._observe(real_mirror)
+            flipped = simulating != self._simulated
+            if flipped:
+                # Entering or leaving Observe starts every connection clean: the
+                # daily restore budget is kept, cuts, latches and epochs are not.
+                # The reset itself never triggers a save.
+                self._simulated = simulating
+                self.states = {
+                    key: GuardState(restore_day=old.restore_day,
+                                    restores_used=old.restores_used,
+                                    dormant_reason="awaiting_reading")
+                    for key, old in self.states.items()
+                }
+            if simulating:
+                # The reason is the mode, never the save-failure None.
+                mirror = real_mirror
+            else:
+                mirror = real_mirror if not self._save_failed else None
             before = self.states.copy()
             requests = await self._requests_locked()
             writes: set[str] = set()
@@ -510,7 +541,7 @@ class SupplyGuardLoop:
                     mirror=mirror, grid_configured=connection.grid_power_entity is not None,
                     controllable=any(driver_capabilities(i.driver_kind).setpoint_step_a is not None
                                      for i in inverters), household_day=now.date(),
-                    observe_only=not self.coordinator.control.owned() or (
+                    observe_only=self._simulated or not self.coordinator.control.owned() or (
                         self.writer is None and not self.owns_connection(connection.id)),
                     restore_allowed=any(i.id in self.last_requested_a for i in inverters),
                 ), now)
@@ -522,7 +553,7 @@ class SupplyGuardLoop:
                         replay.update(i.id for i in inverters)
             durable_fields = ("cut_kw", "latched", "missing_since", "restores_used",
                               "restore_day", "epoch")
-            if any(any(getattr(before[key], field) != getattr(state, field)
+            if not self._simulated and any(any(getattr(before[key], field) != getattr(state, field)
                        for field in durable_fields) for key, state in self.states.items()):
                 await self._save()
                 if self._save_failed:
@@ -605,7 +636,7 @@ class SupplyGuardLoop:
                     self._history.append({"at": now.isoformat(), "connection_id": key,
                                           "event": "latch",
                                           "allowance_kw": guard_state.allowance_kw})
-            if any(
+            if flipped or any(
                 (prior.limiting, prior.allowance_kw, prior.restores_left)
                 != (guard_state.limiting, guard_state.allowance_kw, guard_state.restores_left)
                 for key, guard_state in self.states.items()
@@ -636,5 +667,7 @@ class SupplyGuardLoop:
         self._active = False
         self._cancel_subscriptions()
         async with self.lock:
-            if self.states:
+            # A stop right after an Observe commit, before any evaluate, saves nothing either.
+            if (self.states and not self._simulated
+                    and not self._observe(mirror_from(self.coordinator))):
                 await self._save()

@@ -1057,7 +1057,14 @@ adds *Charging limited by the supply guard.* for display only; the planner
 never plans from the live allowance. Dormancy reasons shown in diagnostics are
 `no_supply_limit`, `no_grid_source`, `no_inverter_measurement`,
 `awaiting_reading` and `missing_reading`; warn reasons are
-`authority_unavailable`, `guard_save_failed` and `guard_write_failed`.
+`authority_unavailable` (the authority mirror is missing or stale), `mode_observe`
+(the site is in Observe, or a transition to Observe is pending),
+`writes_not_permitted` (any other known state that permits no writes, such as a
+failed save), `guard_save_failed` and `guard_write_failed`. On an
+integration-owned site in Observe the guard shows the limit it would apply,
+marked `simulated` on its entities and in the diagnostics download. It never
+latches or saves that limit, and leaving Observe starts the guard with no
+latched cut.
 
 **Add-on daemon guard (add-on-owned sites only).** If an EV dispatch overlaps the battery's timed charge,
 total supply draw can exceed what the main fuse should carry. Set
