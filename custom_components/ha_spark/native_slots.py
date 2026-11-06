@@ -15,7 +15,7 @@ from .topology import Inverter
 
 if TYPE_CHECKING:
     from .guard_loop import SupplyGuardLoop
-    from .native_write import NativeChargeBoundary
+    from .native_export_write import NativeExportWrites
 
 
 def worst(results: list[IntentResult], *, written_a: float | None = None) -> IntentResult:
@@ -26,7 +26,7 @@ def worst(results: list[IntentResult], *, written_a: float | None = None) -> Int
 class NativeSlots:
     """Register operations requiring the boundary's two locks, never a new writer."""
 
-    def __init__(self, boundary: "NativeChargeBoundary", inverter: Inverter,
+    def __init__(self, boundary: "NativeExportWrites", inverter: Inverter,
                  epoch: int, mismatches: set[str], *,
                  planned_discharge: list[int] | None = None,
                  fallback: bool = False, transition: bool = False,
