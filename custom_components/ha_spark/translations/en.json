@@ -352,7 +352,7 @@
       },
       "notify": {
         "title": "Notify target",
-        "description": "Enter a bare notify service name such as mobile_app_<device>, without notify. Leave empty to clear it. Unset or failed sends use a persistent notification. Delivery never gates control.",
+        "description": "Enter a bare notify service name such as mobile_app_yourphone, without notify. Leave empty to clear it. Unset or failed sends use a persistent notification. Delivery never gates control.",
         "data": {
           "notify_target": "Notify service name"
         },
