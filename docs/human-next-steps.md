@@ -2,7 +2,7 @@
 
 The owner's ordered list of the hands-on steps, in one place. It points at
 the tickets rather than restating them; the ticket is the source of truth and
-the place to report. Updated 2026-11-03 (rulings posted). Agents: keep this current when a
+the place to report. Updated 2026-11-07 (cutover procedure settled). Agents: keep this current when a
 human ticket is created, folded or closed.
 
 **Where things stand.** Phases 1–7 shipped (0.23.0–0.30.0). Phase 8
@@ -49,39 +49,60 @@ the household's move onto the native module: the riskiest step in the
 programme and mostly hands-on. The grilling for its spec needs these from
 you:
 
-- [ ] **Energy dashboard continuity.** The native entities replace the old
+- [x] **Energy dashboard continuity.** The native entities replace the old
       integration's. Decide how long-term statistics carry over (statistic
       ids, re-selection, the gap). A hole in long-term statistics can't be
       repaired afterwards (#312, #311 Q3).
-- [ ] **Validation window before the handshake.** How long the native device
+- [x] **Validation window before the handshake.** How long the native device
       runs read-only in Observe (identity, caching probe, pacing, Energy-tier
       parity against the old integration) before authority switches. A day is
       the proposal.
-- [ ] **Rollback rehearsal.** Whether to run the migration doc's reverse
+- [x] **Rollback rehearsal.** Whether to run the migration doc's reverse
       order once before relying on it.
-- [ ] **Phase order after 9.** Phase 17's planner half (daytime cheap and
+- [x] **Phase order after 9.** Phase 17's planner half (daytime cheap and
       free charging) is unblocked and worth the most to this household;
       phases 10–14 make ha-spark installable by others. Say which goes first.
 
-## 4. Phase 9 stage 2: the cutover (after 0.32.0)
+All four were settled in the #384 grilling (phase 17 goes next). The
+cutover as shipped is in section 4 and the runbook: on an all-native site the
+read-only validation runs after the ownership handshake, in Observe.
 
-The runbook is `docs/runbooks/solis-native-migration.md` (on the phase 8
-branch until 0.31.0 merges) plus #311 stage 2 as rewritten on #384. In
-order:
+## 4. Phase 9 cutover after 0.32.0: #663
 
-1. Observe. The verified handover releases the legacy holds.
-2. Stop the other Modbus integration for the gateway.
-3. Remove the overlay YAML and restart HA.
-4. Clear `solis_control_hub`.
-5. Add the native device: connect, identify, probe, claim. Validate for the
-   agreed window (step 3 above). This is where pymodbus-on-HA, read-back
-   timing and the caching probe get their hardware confirmation.
-6. Run the ownership handshake.
-7. Validate in Observe. #495 should be gone (SoC comes from the bus).
-8. Protect, then Optimise, through readiness.
-9. Live Axle proof on the first real event (RC line; never blocks code).
+The household's run, exit checklists and results live on
+[#663](https://github.com/Kylevdm/ha-spark/issues/663). Follow the reusable
+[Solis native migration runbook](runbooks/solis-native-migration.md), including
+its stop-on-failure and no-competing-clients rules. In order:
 
-Rollback runs in reverse.
+1. Prepare a private rollback record and backup, arrange supervision, and update
+   both the add-on and integration to 0.32.0 together.
+2. First go-native from add-on-owned Observe after verified handover: disable
+   (don't delete) the other Modbus integration, remove the overlay, clear the
+   hub setting and add native. Saving an all-native topology starts the
+   ownership handshake immediately; wait for known integration authority in
+   Observe, then repoint settings and check every power entity's sign and unit.
+3. Validate read-only in Observe for 24 h, including an overnight cheap window,
+   against the runbook's telemetry, transport and repair exit criteria.
+4. Rehearse full reverse rollback in Observe, including the reverse ownership
+   handshake, before any statistics migration. Record the result on #663.
+5. Second go-native: repeat the handshake and settings checks, then carry history
+   over using the runbook's backup-first, one-pair-rehearsed registry renames.
+   Keep the actual entity mapping private; re-select native Energy sensors.
+6. Observe for 24 h after the handshake: no SoC staleness (`Native SoC` passes)
+   and no false guard cuts.
+7. Rehearse full reverse rollback again in Observe, after migration and before
+   Protect. Verify re-created old entities use old ids, never native ids.
+   Return to native with another handshake and settings checks, but do not
+   repeat migration: native history keeps a gap for the rehearsal.
+8. Configure the notify target, native protection evidence, fallback schedule
+   and SoC trust policy; enter Protect through readiness for 24 h.
+9. Review readiness and explicitly choose Optimise; verify the first actions.
+   Record completion on #663, closing #562 and #495. Live Axle proof stays on
+   the RC line and never blocks code.
+
+If removal and re-addition are necessary, follow the runbook's handover and
+`ha-spark pair --replace` recovery instructions (#646); removing the integration
+is not a way to release holds or transfer authority.
 
 ## 5. Standing: the RC line
 
