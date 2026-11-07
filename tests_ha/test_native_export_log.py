@@ -14,6 +14,7 @@ from custom_components.ha_spark.native_export_log import (
     MAX_PER_INVERTER,
     MAX_TOTAL,
     TransitionKind,
+    held_aborted,
     held_at_start,
     trim,
     visible,
@@ -141,3 +142,32 @@ def test_an_armed_row_before_the_hold_does_not_settle_it() -> None:
     state = with_append(fresh(), inverter_id="inv1", event=EVENT, kind="armed", at=NOW)
     state = with_append(state, inverter_id="inv1", event=EVENT, kind="unverified", at=NOW)
     assert held_at_start(state.export_transitions, EVENT.start) == (("inv1", EVENT),)
+
+
+def row(kind: TransitionKind, *, event: EventIdentity = EVENT, inverter: str = "inv1",
+        acked: bool = False) -> ExportTransition:
+    return ExportTransition(inverter_id=inverter, id=uuid4(), event=event, at=NOW,
+                            kind=kind, acked=acked)
+
+
+def test_held_aborted_needs_an_abort_after_the_hold() -> None:
+    """An unheld pre-start abort never latches retroactively (astra, step 7)."""
+    assert held_aborted((row("unverified"), row("aborted")), "inv1", EVENT)
+    assert not held_aborted((row("aborted"), row("unverified")), "inv1", EVENT)
+    assert not held_aborted((row("unverified"),), "inv1", EVENT)
+    assert not held_aborted((row("unverified"), row("aborted", inverter="inv2")), "inv1", EVENT)
+    other = EventIdentity(direction="export", start=EVENT.start + timedelta(days=1),
+                          end=EVENT.end + timedelta(days=1))
+    assert not held_aborted((row("unverified"), row("aborted", event=other)), "inv1", EVENT)
+
+
+@pytest.mark.parametrize("acked", [True, False])
+def test_trim_keeps_held_abort_evidence_until_the_event_ends(acked: bool) -> None:
+    """The latch evidence outlives log pressure while its event is live."""
+    filler = EventIdentity(direction="export", start=NOW - timedelta(hours=1),
+                           end=NOW + timedelta(hours=5))
+    rows = (row("unverified", acked=acked), row("aborted", acked=acked)) + tuple(
+        row("accepted", event=filler, acked=acked) for _ in range(MAX_PER_INVERTER - 2))
+    kept, _ = trim(rows, NOW, reserve=1, reserve_inverter="inv1")
+    assert sum(r.inverter_id == "inv1" for r in kept) == MAX_PER_INVERTER - 1
+    assert held_aborted(kept, "inv1", EVENT)

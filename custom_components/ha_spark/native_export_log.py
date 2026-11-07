@@ -64,9 +64,32 @@ def held_aborted(
     is logged the event never arms again, under any supervision and across
     restarts (the log is durable; acknowledged rows outlive the event's start).
     """
-    kinds = {row.kind for row in rows
-             if row.inverter_id == inverter_id and same_event(row.event, event)}
-    return "unverified" in kinds and "aborted" in kinds
+    held = False
+    for row in rows:
+        if row.inverter_id != inverter_id or not same_event(row.event, event):
+            continue
+        if row.kind == "unverified":
+            held = True
+        elif row.kind == "aborted" and held:
+            # Only an abort after the hold latches: an earlier, unheld abort
+            # never gains durable blocking semantics retroactively.
+            return True
+    return False
+
+
+def _latch_evidence(rows: Sequence[ExportTransition], now: datetime) -> set[UUID]:
+    """Row ids of held-abort latches whose event has not ended; trim keeps them."""
+    held: dict[tuple[str, datetime, datetime, str], UUID] = {}
+    pinned: set[UUID] = set()
+    for row in rows:
+        if row.event.end <= now:
+            continue
+        key = (row.inverter_id, row.event.start, row.event.end, row.event.direction)
+        if row.kind == "unverified":
+            held.setdefault(key, row.id)
+        elif row.kind == "aborted" and key in held:
+            pinned.update((held[key], row.id))
+    return pinned
 
 
 def visible(rows: Sequence[ExportTransition], inverter_id: str) -> tuple[ExportTransition, ...]:
@@ -100,16 +123,26 @@ def trim(
     Returns the kept rows and how many unacknowledged rows were dropped.
     """
     kept = [row for row in rows if not (row.acked and row.event.end <= now)]
+    # A held-abort latch (review M2) is safety evidence until its event ends:
+    # evict it only when nothing else is left to drop (two rows per live held
+    # event; the per-inverter cap would need 32 such events at once).
+    pinned = _latch_evidence(kept, now)
     dropped_unacked = 0
     while True:
         within, over = _within(kept, reserve=reserve, reserve_inverter=reserve_inverter)
         if within:
             break
-        index = next((i for i, row in enumerate(kept) if row.acked), None)
+        index = next((i for i, row in enumerate(kept)
+                      if row.acked and row.id not in pinned), None)
         if index is None:
-            index = (next((i for i, row in enumerate(kept)
-                           if row.inverter_id == over), 0) if over is not None else 0)
-            dropped_unacked += 1
+            index = next((i for i, row in enumerate(kept)
+                          if row.id not in pinned
+                          and (over is None or row.inverter_id == over)), None)
+            if index is None:
+                index = (next((i for i, row in enumerate(kept)
+                               if row.inverter_id == over), 0) if over is not None else 0)
+            if not kept[index].acked:
+                dropped_unacked += 1
         del kept[index]
     return tuple(kept), dropped_unacked
 
