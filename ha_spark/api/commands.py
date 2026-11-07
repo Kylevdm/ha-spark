@@ -81,7 +81,8 @@ WriteReason = Literal["not_available", "invalid_intent", "limits", "mode", "stal
                       "grid_charge_not_permitted", "not_supervised", "export_bound_unverified",
                       "export_bounds_exceed_site_limit", "clock_not_trusted",
                       "hold_overlaps_export", "hold_data_untrusted", "power_switch_not_on",
-                      "tripped", "export_not_available"]
+                      "tripped", "export_not_available", "modbus_hub_conflict",
+                      "transition_in_progress"]
 
 
 class IntentResult(Record):
@@ -106,7 +107,8 @@ class CommandResult(Record):
                     "grid_charge_not_permitted", "not_supervised", "export_bound_unverified",
                     "export_bounds_exceed_site_limit", "clock_not_trusted",
                     "hold_overlaps_export", "hold_data_untrusted", "power_switch_not_on",
-                    "tripped", "export_not_available", "not_admin"] | None = None
+                    "tripped", "export_not_available", "not_admin",
+                    "modbus_hub_conflict"] | None = None
     intents: list[IntentResult] = Field(default_factory=list, max_length=64)
     epoch: int | None = Field(default=None, ge=1)
     reasons: list[Literal[

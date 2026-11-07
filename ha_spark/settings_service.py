@@ -9,9 +9,9 @@ stale work is fenced before publishing the new snapshot.
 A store that can't be trusted (missing or unreadable after the marker, a
 mismatched pair with no matching ``*.prev``, invalid values, an unsupported
 ``schema_version`` or a failed seed) puts the service in configuration repair:
-nothing is written or reseeded, reasons name fields only, and the one write
-accepted is an import carrying the repair token (a keyed digest of the files
-on disk, or ``none``).
+nothing is written or reseeded, reasons name fields (and validated writer
+versions) only, and the one write accepted is an import carrying the repair
+token (a keyed digest of the files on disk, or ``none``).
 
 From 0.31 ``solis_control_hub`` defaults to empty. A store committed before
 0.31 (its ``initialised`` marker lacks ``hub_default``) and a pre-0.31 export
@@ -31,11 +31,12 @@ from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
-from pydantic import ValidationError
+from pydantic import StringConstraints, TypeAdapter, ValidationError
 
+from ha_spark import __version__
 from ha_spark.authority import AuthorityStore, load_authority, resolve_data_dir
 from ha_spark.config import (
     _OPTION_KEYS,
@@ -64,6 +65,17 @@ _REPAIR_FILES = (
 )
 # Marks a store committed under the empty hub default (0.31+); older markers are `{}`.
 _MARKER = {"hub_default": ""}
+_WRITTEN_BY = TypeAdapter(Annotated[str, StringConstraints(
+    strict=True, max_length=14, pattern=r"^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$",
+)])
+
+
+def _written_by(document: dict[str, Any]) -> str | None:
+    """Ignore malformed writer metadata without exposing the rejected input."""
+    try:
+        return _WRITTEN_BY.validate_python(document.get("written_by"))
+    except ValidationError:
+        return None
 
 
 class _PairRevisionMismatch(ConfigError):
@@ -374,7 +386,7 @@ class SettingsService:
             raise ConfigError("Configuration revision mismatch")
         inputs, secret_inputs = document.get("settings"), secrets.get("secrets")
         if (
-            set(document) != {"schema_version", "revision", "settings"}
+            set(document) - {"written_by"} != {"schema_version", "revision", "settings"}
             or set(secrets) != {"revision", "secrets"}
             or not isinstance(inputs, dict)
             or not isinstance(secret_inputs, dict)
@@ -384,7 +396,11 @@ class SettingsService:
             secret_inputs.keys() - _SECRET_OPTION_KEYS
         )
         if unknown:
-            raise ConfigError(f"Unknown configuration fields: {unknown}")
+            reason = f"Unknown configuration fields: {unknown}"
+            written_by = _written_by(document)
+            if written_by is not None and written_by != __version__:
+                reason += f" (written by ha-spark {written_by}; this is {__version__})"
+            raise ConfigError(reason)
         if any(not isinstance(value, str) for value in secret_inputs.values()):
             raise ConfigError("Invalid secret fields")
         if secrets["revision"] != revision:
@@ -422,7 +438,7 @@ class SettingsService:
             except _RestartRequired as exc:
                 raise ConfigError(str(exc)) from None
             except ConfigError as exc:
-                # Every reason is a service message naming fields, never input text.
+                # Reasons expose only fields and validated versions, never rejected input.
                 self.repair = [str(exc)]
                 self._settings = None
                 self._inputs, self._secrets, self.revision = {}, {}, 0

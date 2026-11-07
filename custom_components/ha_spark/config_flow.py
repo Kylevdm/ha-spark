@@ -42,7 +42,7 @@ from homeassistant.helpers.selector import (
 from homeassistant.helpers.service_info.hassio import HassioServiceInfo
 from pydantic import BaseModel, ValidationError
 
-from . import native
+from . import native, notify_target
 from .const import ADDON_SLUG, DOMAIN
 from .native_fallback import FallbackOptions, validate_fallback
 from .native_hold import SOURCES, EvidenceOptions
@@ -320,13 +320,14 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
     _claims: list[dict[str, Any]] | None = None
     _edit_index: int | None = None
     _load_kind: str | None = None
+    _remove_key: str | None = None
     _evidence: EvidenceOptions | None = None
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
         """Choose between the Solcast allowance and the topology editor."""
-        menu = ["solcast", "topology", "manual", "soc"]
+        menu = ["solcast", "topology", "manual", "soc", "notify"]
         topology = validate_topology(self.config_entry.options.get("topology"))
         if (isinstance(topology, Topology)
                 and any(i.transport == "native" for i in topology.inverters)):
@@ -478,6 +479,32 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
             for key, value in defaults.items()
         })
         return self.async_show_form(step_id="soc", data_schema=schema, errors=errors)
+
+    async def async_step_notify(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Choose an existing bare notify service, or clear the target."""
+        key = notify_target.NOTIFY_TARGET_OPTION
+        stored = self.config_entry.options.get(key, "")
+        schema = probatio.Schema({
+            probatio.Optional(key, description={"suggested_value": stored}): str,
+        })
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            value = user_input.get(key, "")
+            value = value.strip() if isinstance(value, str) else value
+            options = dict(self.config_entry.options)
+            if value == "":
+                options.pop(key, None)
+                return self.async_create_entry(title="", data=options)
+            name = notify_target.valid_name(value)
+            if name is None:
+                errors[key] = "invalid_notify_target"
+            elif not self.hass.services.has_service("notify", name):
+                errors[key] = "unknown_notify_target"
+            else:
+                return self.async_create_entry(title="", data={**options, key: name})
+        return self.async_show_form(step_id="notify", data_schema=schema, errors=errors)
 
     async def async_step_manual(
         self, user_input: dict[str, Any] | None = None,
@@ -810,10 +837,23 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
         elif len(identifiers) <= minimum:
             errors["base"] = "remove_last"
         if errors:
-            return self.async_show_form(step_id=step_id, errors=errors, data_schema=schema)
+            self._remove_key = key
+            return self.async_show_form(
+                step_id="remove_refused", errors=errors, data_schema=probatio.Schema({})
+            )
         self._topology_draft[key] = [
             item for item in items if item["id"] != item_id
         ]
+        return self._collection_menu(key)
+
+    async def async_step_remove_refused(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Return to editing after acknowledging a refused removal."""
+        key = self._remove_key
+        self._remove_key = None
+        if key is None:
+            return await self.async_step_topology()
         return self._collection_menu(key)
 
     def _load_form(self, defaults: dict[str, Any]) -> ConfigFlowResult:

@@ -9,8 +9,10 @@ from math import isfinite
 from typing import TYPE_CHECKING
 
 from homeassistant.core import State
+from homeassistant.helpers import issue_registry as ir
 from pydantic import ValidationError
 
+from .const import DOMAIN
 from .native_hold import (
     DispatchWindow,
     EvidenceOptions,
@@ -45,6 +47,18 @@ class NativeEvidence:
                 self.coordinator.entry.options.get("evidence", {}))
         except ValidationError:
             return None
+
+    def check_options(self) -> None:
+        """Invalid stored evidence disables holds until the owner re-saves it."""
+        c = self.coordinator
+        issue_id = f"evidence_options_invalid_{c.entry.entry_id}"
+        if self.options() is None:
+            ir.async_create_issue(
+                c.hass, DOMAIN, issue_id, is_fixable=False, severity=ir.IssueSeverity.ERROR,
+                translation_key="evidence_options_invalid",
+            )
+        else:
+            ir.async_delete_issue(c.hass, DOMAIN, issue_id)
 
     @property
     def configured(self) -> bool:

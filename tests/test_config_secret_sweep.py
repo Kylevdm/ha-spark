@@ -8,7 +8,9 @@ from datetime import datetime
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
+import httpx
 import pytest
+import respx
 from fastapi.testclient import TestClient
 
 from ha_spark import cli
@@ -18,10 +20,13 @@ from ha_spark.config import _SECRET_OPTION_KEYS, ConfigError, Settings
 from ha_spark.daemon_channel import DaemonChannel, Reply, submit_socket
 from ha_spark.devices.execution import execution_context
 from ha_spark.energy.solar_measured import MeasuredSolar
+from ha_spark.energy.supply_guard import SupplyGuard
+from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.settings_service import ConfigurationRepair, SettingsService
 from tests.api_helpers import owner_client
-from tests.authority_helpers import seed_authority, seed_settings
+from tests.authority_helpers import legacy_settings, seed_authority, seed_settings
 from tests.test_plan_timeline import stored_run
+from tests.test_settings_store import store
 
 CANARY = "SECRET-SWEEP-466-DO-NOT-ECHO"
 
@@ -218,6 +223,35 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
     assert CANARY not in caplog.text
 
 
+@pytest.mark.parametrize("writer", ["0.32.0-" + CANARY, "9.9.9"])
+def test_written_by_reason_secret_sweep(tmp_path, monkeypatch, caplog, writer):
+    from ha_spark import settings_service
+
+    context = execution_context()
+    monkeypatch.setattr(context, "config_generation", context.config_generation)
+    monkeypatch.setattr(settings_service, "__version__", "0.32.0")
+    service = store(tmp_path)
+    service.load(writable=True)
+    service.save({"min_soc": 22}, 1, "seed")
+    path = tmp_path / "ha_spark_config.json"
+    document = json.loads(path.read_text())
+    document["written_by"] = writer
+    document["settings"][CANARY] = CANARY
+    path.write_text(json.dumps(document))
+    repairing = store(tmp_path)
+    with pytest.raises(ConfigurationRepair) as caught:
+        repairing.load(writable=True)
+    expected = "Unknown configuration fields: 1"
+    if writer == "9.9.9":
+        expected += " (written by ha-spark 9.9.9; this is 0.32.0)"
+    assert str(caught.value) == expected
+    assert repairing.repair == [expected]
+    assert repairing.read_view()["reasons"] == [expected]
+    assert "Configuration repair: " + expected in caplog.text
+    surfaces = [str(caught.value), repairing.repair, repairing.read_view(), caplog.text]
+    assert CANARY not in json.dumps(surfaces)
+
+
 def test_measured_history_secret_sweep(tmp_path, caplog):
     settings = Settings(ha_url="http://ha.test", ha_token=CANARY,
                         derive_solar_generation_entity="sensor.solar",
@@ -242,3 +276,36 @@ def test_measured_history_secret_sweep(tmp_path, caplog):
     assert calls == 2
     assert "Measured solar statistics read failed" in caplog.text
     assert CANARY not in caplog.text
+
+
+@respx.mock
+@pytest.mark.usefixtures("legacy_solis_hub")
+async def test_supply_guard_read_failure_secret_sweep(caplog):
+    """A failed guard read logs fixed text and still skips the tick unchanged (#648)."""
+    settings = legacy_settings(
+        authority_mode="optimise", ha_url="http://ha.test", ha_token=CANARY,
+        grid_power_entity="sensor.house_supply_power", battery_voltage_v=51.0,
+        supply_voltage_v=240.0, supply_max_current_a=75.0,
+    )
+    posts = respx.route(method="POST").mock(return_value=httpx.Response(200, json=[]))
+    supply = respx.get(f"http://ha.test/api/states/{settings.grid_power_entity}")
+    respx.get("http://ha.test/api/states/sensor.solis_control_timed_charge_current").mock(
+        return_value=httpx.Response(200, json={"entity_id": "x", "state": "40",
+                                               "attributes": {}}))
+    failures = (
+        httpx.Response(200, json={"entity_id": "x", "state": CANARY, "attributes": {}}),
+        httpx.Response(500, text=CANARY),
+        httpx.ConnectError(CANARY),
+    )
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        for failure in failures:
+            caplog.clear()
+            if isinstance(failure, Exception):
+                supply.mock(side_effect=failure)
+            else:
+                supply.mock(return_value=failure)
+            assert await SupplyGuard(settings, rest).tick(target_w=2040.0) is None
+            assert "Supply guard: read failed; skipping" in caplog.text
+            assert CANARY not in caplog.text
+            assert "http" not in caplog.text
+    assert posts.call_count == 0

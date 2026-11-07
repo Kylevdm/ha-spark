@@ -9,9 +9,9 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import NAMESPACE_URL, uuid5
 
-from homeassistant.components import persistent_notification
 from homeassistant.util import dt as dt_util
 
+from . import notify_target
 from .authority_store import AuthorityState, HoldRecord
 from .native_evidence import EvidenceRead, NativeEvidence
 from .native_hold import (
@@ -62,8 +62,9 @@ class NativeHolds:
             return "held_identity_remapped"
         if not c._running or not c.native.polling or c.native.closed:
             return "not_available"
-        if c.native.reason(inverter) is not None:
-            return "read_only"
+        reason = c.native.write_reason(inverter)
+        if reason is not None:
+            return reason
         if current.committed_mode not in ("protect", "optimise"):
             return "mode"
         manual = current.manual_session
@@ -95,9 +96,10 @@ class NativeHolds:
             return
         self.notices[key] = (previous[0] if previous else now, previous is not None)
         identifier = str(uuid5(NAMESPACE_URL, f"{self.coordinator.entry.entry_id}:{key}"))
-        persistent_notification.async_create(self.coordinator.hass, message,
-                                             title="ha-spark protection",
-                                             notification_id=f"ha_spark_hold_{identifier}")
+        notify_target.async_notice(
+            self.coordinator.hass, self.coordinator.entry,
+            notification_id=f"ha_spark_hold_{identifier}",
+            title="ha-spark protection", message=message)
 
     async def _async_notice(self, inverter: Inverter, state: AuthorityState, now: datetime,
                             kind: Literal["apply", "degraded", "release"], message: str) -> None:
@@ -124,7 +126,7 @@ class NativeHolds:
     def _clear_notice(self, key: str) -> None:
         self.notices.pop(key, None)
         identifier = str(uuid5(NAMESPACE_URL, f"{self.coordinator.entry.entry_id}:{key}"))
-        persistent_notification.async_dismiss(self.coordinator.hass, f"ha_spark_hold_{identifier}")
+        notify_target.async_dismiss(self.coordinator.hass, f"ha_spark_hold_{identifier}")
 
     def _clear_notices(self, inverter: Inverter) -> None:
         for kind in ("apply", "degraded", "release"):
@@ -133,6 +135,7 @@ class NativeHolds:
     async def async_reconcile(self, now: datetime) -> bool:
         """Serialize whole-record saves with transitions and new add-on sessions."""
         async with self.coordinator.control.lock:
+            now = max(now, dt_util.utcnow())
             return await self.async_reconcile_held(now)
 
     async def async_reconcile_held(self, now: datetime) -> bool:
@@ -295,6 +298,7 @@ class NativeHolds:
 
     async def async_release(self, now: datetime, *, removal: bool = False) -> bool:
         async with self.coordinator.control.lock:
+            now = max(now, dt_util.utcnow())
             return await self.async_release_held(now, removal=removal)
 
     async def async_release_held(self, now: datetime, *, removal: bool = False) -> bool:

@@ -302,6 +302,11 @@ class SupplyGuardSensor(SparkEntity, SensorEntity):
         restores = guard.restores_left.values()
         return min(restores) if restores else None
 
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        # Only while the guard simulates in Observe on an integration-owned site.
+        return {"simulated": True} if self._guard.simulated else None
+
 
 class LastRun(SparkSensor, RestoreSensor):
     """Retain the last computed time through disconnection, null plans and HA restart."""

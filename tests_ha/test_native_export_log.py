@@ -3,6 +3,8 @@
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import pytest
+
 from custom_components.ha_spark.authority_store import (
     AuthorityState,
     EventIdentity,
@@ -11,6 +13,8 @@ from custom_components.ha_spark.authority_store import (
 from custom_components.ha_spark.native_export_log import (
     MAX_PER_INVERTER,
     MAX_TOTAL,
+    TransitionKind,
+    held_at_start,
     trim,
     visible,
     with_acks,
@@ -112,3 +116,28 @@ def test_the_snapshot_offers_the_oldest_unacked_rows_first_and_bounded() -> None
     assert rows == state.export_transitions[:SNAPSHOT_PER_INVERTER]
     acked = with_acks(state, [str(rows[0].id)], NOW)
     assert visible(acked.export_transitions, "inv1")[0] == state.export_transitions[1]
+
+
+@pytest.mark.parametrize("settled", ["armed", "started", "aborted", "tripped"])
+def test_held_at_start_excludes_settled_pairs(settled: TransitionKind) -> None:
+    state = with_append(fresh(), inverter_id="inv1", event=EVENT, kind="unverified", at=NOW)
+    assert held_at_start(state.export_transitions, EVENT.start - timedelta(seconds=1)) == ()
+    assert held_at_start(state.export_transitions, EVENT.start) == (("inv1", EVENT),)
+    state = with_append(state, inverter_id="inv1", event=EVENT, kind=settled, at=EVENT.start)
+    assert held_at_start(state.export_transitions, EVENT.start) == ()
+
+
+def test_held_at_start_is_scoped_to_inverter_and_event_and_deduplicates() -> None:
+    other = EventIdentity(direction="export", start=EVENT.start - timedelta(days=1),
+                          end=EVENT.end - timedelta(days=1))
+    state = with_append(fresh(), inverter_id="inv1", event=EVENT, kind="unverified", at=NOW)
+    state = with_append(state, inverter_id="inv2", event=EVENT, kind="armed", at=NOW)
+    state = with_append(state, inverter_id="inv1", event=other, kind="started", at=NOW)
+    rows = (*state.export_transitions, state.export_transitions[0])
+    assert held_at_start(rows, EVENT.start) == (("inv1", EVENT),)
+
+
+def test_an_armed_row_before_the_hold_does_not_settle_it() -> None:
+    state = with_append(fresh(), inverter_id="inv1", event=EVENT, kind="armed", at=NOW)
+    state = with_append(state, inverter_id="inv1", event=EVENT, kind="unverified", at=NOW)
+    assert held_at_start(state.export_transitions, EVENT.start) == (("inv1", EVENT),)

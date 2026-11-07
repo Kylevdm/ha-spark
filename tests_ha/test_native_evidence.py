@@ -4,8 +4,11 @@ from typing import Any
 
 import pytest
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import issue_registry as ir
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker
 
+from custom_components.ha_spark.const import DOMAIN
 from custom_components.ha_spark.native_hold import SOURCES
 from custom_components.ha_spark.solis_frames import Reading
 from tests_ha.fake_solis import FakeSolisDevice
@@ -87,6 +90,43 @@ async def test_snapshot_contains_durable_holds_and_native_source(
     assert snapshot["holds"][0]["device_id"] == "inv1"
     assert snapshot["evidence"]["battery_direction"] == {"source": "native", "max_age_s": 300}
     assert c.control.preconditions().evidence_configured
+
+
+@pytest.mark.parametrize("check", ["setup", "tick"])
+async def test_invalid_evidence_repair_clears_after_options_flow_resave(
+    held_site: Any, freezer: Any, check: str,  # noqa: F811
+) -> None:
+    c = held_site
+    entry = c.entry
+    registry = ir.async_get(c.hass)
+    issue_id = f"evidence_options_invalid_{entry.entry_id}"
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+    c.hass.config_entries.async_update_entry(entry, options={**entry.options, "evidence": {
+        "ev_status": {"entity_id": "sensor.ev"}}})
+    if check == "setup":
+        assert await c.hass.config_entries.async_reload(entry.entry_id)
+    else:
+        freezer.tick(timedelta(seconds=30))
+        async_fire_time_changed(c.hass, datetime.now(UTC))
+    await c.hass.async_block_till_done()
+    issue = registry.async_get_issue(DOMAIN, issue_id)
+    assert issue is not None
+    assert issue.translation_key == "evidence_options_invalid"
+    assert issue.severity is ir.IssueSeverity.ERROR
+    assert not issue.is_fixable
+    assert not issue.translation_placeholders
+
+    result = await c.hass.config_entries.options.async_init(entry.entry_id)
+    flow_id = result["flow_id"]
+    await c.hass.config_entries.options.async_configure(flow_id, {"next_step_id": "evidence"})
+    await c.hass.config_entries.options.async_configure(flow_id, {
+        "ev_status_entity": "sensor.ev", "battery_direction_source": "native",
+        **{f"{key}_max_age_s": 300 for key in SOURCES}})
+    result = await c.hass.config_entries.options.async_configure(flow_id, {"next_step_id": "save"})
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await c.hass.async_block_till_done()
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+    assert entry.runtime_data.holds.evidence.configured
 
 
 @pytest.fixture

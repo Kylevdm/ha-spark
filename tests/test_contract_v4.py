@@ -124,7 +124,12 @@ def test_rejected_snapshot_changes_nothing(client, state, monkeypatch, version, 
     monkeypatch.setattr(server, "_heartbeat_now", lambda: NOW + timedelta(seconds=91))
     response = post(client, changed)
     assert response.status_code == 400
-    assert response.json() == {"error": "invalid heartbeat"}
+    if change == "other_site" and version == 4:
+        assert response.json() == {
+            "error": "site_not_paired", "detail": site_pairing.SITE_NOT_PAIRED_TEXT,
+        }
+    else:
+        assert response.json() == {"error": "invalid heartbeat"}
     assert state.integration_link is before
     assert execution_context().limits_record is limits
     assert link_view(before, NOW + timedelta(seconds=91))["state"] == "unreachable"

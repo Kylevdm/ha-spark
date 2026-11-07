@@ -45,15 +45,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     assert integration.version is not None
     coordinator = SparkCoordinator(hass, entry, integration.version)
     entry.runtime_data = coordinator
+    coordinator.holds.evidence.check_options()
     hass.data.setdefault(f"{DOMAIN}.unloaded_authority", {}).pop(entry.entry_id, None)
     await coordinator.authority.async_load()
     await coordinator.ownership.async_load()
+    # A hold whose event started while HA was down owes its abort before any prune.
+    await coordinator.async_abort_held_exports(dt_util.utcnow())
     # A claim edited while the entry was unloaded still ends the affected bound.
     await coordinator.async_drop_stale_bounds()
     async_register(hass)
     await coordinator.native.async_start()
+    coordinator.clock.cleanup_repairs()
 
     async def native_tick(now: datetime) -> None:
+        coordinator.holds.evidence.check_options()
         await coordinator.native.async_check_connections()
         # Any identity change seen by a probe ends that inverter's bound.
         await coordinator.async_drop_stale_bounds(now=now)
@@ -75,6 +80,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     async def authority_tick(now: datetime) -> None:
         zone = coordinator.control.household_zone() or ZoneInfo("UTC")
         await coordinator.control.async_expire(now=now, zone=zone)
+        await coordinator.async_abort_held_exports(now)
         await coordinator.async_expire_supervisions(now)
         await coordinator.control.async_retry()
 
@@ -95,7 +101,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     site_id = entry.data["site_id"]
     identifier = (DOMAIN, f"{site_id}_solcast")
     if entry.data.get("solcast_api_key"):
-        site = registry.async_get_device(identifiers={(DOMAIN, site_id)})
+        site = registry.async_get_device_by_identifier((DOMAIN, site_id), entry.entry_id)
         registry.async_get_or_create(
             config_entry_id=entry.entry_id, identifiers={identifier}, name="Solcast",
             entry_type=dr.DeviceEntryType.SERVICE, via_device_id=site.id if site else None,

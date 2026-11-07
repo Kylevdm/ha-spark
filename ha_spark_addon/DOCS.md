@@ -58,7 +58,14 @@ legacy overlay or another Modbus client.
 4. Check device validation and repairs. Unsupported identity or firmware,
    caching, an unreachable gateway or a missing claim leaves the device
    read-only: readings continue, but writes are refused. Disable gateway
-   storage caching, not a safety guard, before Re-probing.
+   storage caching, not a safety guard, before Re-probing. The refusal reason
+   `modbus_hub_conflict` means Home Assistant's own `modbus` integration has a
+   hub or connection on the claimed gateway host and port, or is loaded but its
+   connections cannot be read. A self-clearing repair explains which condition
+   applies; reads continue and all native writes stay blocked. Matching uses the
+   host as written, case-insensitively: a hostname and its IP address do not
+   match. Third-party Modbus integrations are **not detected**; disconnecting
+   them in step 2 remains mandatory.
 5. Wait for the authority switch to settle in Observe. All inverters native
    means integration ownership; any legacy inverter, or no inverter, means
    add-on ownership. Both peers need API v4, Observe, no holds and no
@@ -81,6 +88,14 @@ read-back. A read-only device prevents entry to Protect or Optimise. Optimise
 also needs a live add-on session, trusted and recovered SoC, and valid fallback.
 Observe writes nothing; completing Setup or changing topology never escalates
 it.
+
+The native inverter's previous-period energy sensors (yesterday, last month
+and last year) are disabled by default and have no state class, so they keep
+no long-term statistics. The lifetime totals keep `total_increasing`; use them
+for the Energy dashboard. If you enabled a previous-period sensor before this
+change, Home Assistant may show a "no longer has a state class" repair for it.
+Fix it in **Developer tools → Statistics**, which offers to delete the old
+long-term statistics. History and the current value are unaffected.
 
 Disabling the integration hands over to Observe and releases any active hold.
 Removing it does not: Home Assistant unloads the integration first, so the
@@ -164,6 +179,23 @@ continue without the add-on, but requires Home Assistant to remain running;
 do not assume switch persistence through a whole-Home-Assistant outage.
 Kraken-only dispatches are not available natively.
 
+### Native notify target
+
+In **Options → Notify target**, enter an existing bare notify service name such
+as `mobile_app_<device>`, without the `notify.` prefix. Use lowercase letters,
+numbers and underscores only. The entity-based `send_message` service is not
+supported. Leave the field empty to clear the target. This option is available
+before switching to native transport.
+
+Hold notices (a hold could not be applied, identity or remap problems, degraded
+protection evidence, or a refused release) and fallback notices (entered,
+cleared, or not verified) use this target. Each notice is sent once, with one
+repeat after 30 minutes while a failure persists. Unset, unknown or failing
+targets fall back to a persistent notification with the same notification id.
+Delivery is best effort and never gates control; a slow phone service cannot
+delay protection or fallback. The removal handover result remains a persistent
+notification, regardless of this setting.
+
 ### Native supervised export
 
 Native battery export runs only in Optimise with a live export supervision for
@@ -210,6 +242,41 @@ write permission. Follow the
 [supervised-export runbook](../docs/runbooks/supervised-axle-export.md) for
 preparation, abort and verified cleanup, including lifecycle notices.
 
+### Re-pairing after re-adding the integration
+
+The add-on pairs with the first site that sends it a current snapshot and
+keeps that pairing on disk. Each new integration entry has a new site id, so
+after you remove and re-add the integration the add-on refuses the new entry's
+snapshots as `site_not_paired`, and nothing it sends is used. `ha-spark health`
+shows the **Site pairing** row with the paired site id and the last refused
+site id. To move the pairing to the new entry, run inside the add-on container:
+
+```sh
+ha-spark pair --replace --from <paired site id> --to <new site id>
+```
+
+The command asks you to type the new site id again and sends nothing if it
+doesn't match. The daemon then replaces the pairing only when:
+
+- the stored pairing is readable and equals `--from`;
+- `--to` is a different, canonical site id;
+- the site is in Observe, or authority is unknown;
+- no ownership handshake and no mode transition is pending.
+
+Otherwise it refuses with a reason code (`invalid_site_id`, `same_site`,
+`pairing_untrusted`, `pairing_mismatch`, `mode_not_observe`,
+`handshake_pending`, `transition_pending`) and changes nothing. On success
+the old site's topology revisions no longer count, so the new entry's first
+topology save (revision 1) is accepted; until then the last accepted topology
+and limits stay in force, unwidened. Snapshots from the old entry are refused.
+Re-pairing changes neither the authority owner nor the operating mode.
+
+`pairing_save_failed` means the replacement could not be verified; the new
+pairing may still have been saved. If the reply is lost, the outcome is
+unknown. In both cases check `ha-spark health` before running the command
+again. Only the daemon writes the pairing, so the command needs a running
+daemon and is refused in configuration repair.
+
 ### Health checks
 
 Run `ha-spark health` in Observe before escalation and after transport changes.
@@ -218,11 +285,24 @@ Run `ha-spark health` in Observe before escalation and after transport changes.
 Unknown or pending ownership is a warning, not permission to control hardware.
 **Operating mode** reports integration authority on integration-owned sites;
 an unavailable authority or failed save fails the check.
+**Site pairing** shows the paired site id, or `not paired`, and warns with the
+last refused site id while snapshots from another site are refused as
+`site_not_paired` (see re-pairing above). An unreadable pairing record is a
+warning: it pairs nothing.
+On an integration-owned site, **Native SoC** shows the integration snapshot's
+SoC, its trust and its age; a missing, stale, future-dated or untrusted SoC
+fails the row (SoC-derived writes are blocked), and **Entity config** no
+longer asks for the SoC, battery voltage, charge current or power switch
+entities. Entry preconditions use the same snapshot SoC, never the configured
+SoC entity.
 
 Each native **Solis transport (<id>)** row reads validation through the daemon,
 without probing Modbus or writing a test schedule. `validated` is OK;
 `unvalidated_identity`, `identity_read_failed`, `v2_tou_firmware`, `caching_on`,
-`gateway_not_owned` or `unreachable` is a warning. A missing fresh validation
+`gateway_not_owned` or `unreachable` is a warning. HA Modbus conflicts and
+unreadable HA Modbus connection data appear here as `gateway_not_owned` for
+compatibility; the integration's repair gives the specific cause and writes
+are refused as `modbus_hub_conflict`. A missing fresh validation
 is `validation unknown`, also a warning. A native inverter with a nonempty
 `solis_control_hub` is `inconsistent` and fails that check. Resolve repairs and
 restore the channel rather than treating unknown as validated. Health also
@@ -613,9 +693,9 @@ finite and within its field's range.
 - **Major load:** kind EV charger or heat pump; grid connection; optional power
   sensor. An EV charger has demand over 0 up to 50 kW (default 7.4 kW) and can
   be marked **The one dispatches drive** (at most one site-wide). A heat pump
-  needs both heating and cooling demand over 0 up to 50 kW, with no default,
-  and counts at the larger. Induction hobs and electric showers are not major
-  loads; they stay in base load.
+  needs both a heating demand over 0 up to 50 kW and a cooling demand from 0
+  (0 if it doesn't cool) up to 50 kW, with no default, and counts at the larger.
+  Induction hobs and electric showers are not major loads; they stay in base load.
 
 **Effective limits.** The add-on recomputes effective limits from the validated
 topology; the integration sends only owner values and never a computed limit.
@@ -656,6 +736,15 @@ needed, **Limits** lines. The source is one of:
   planned with the bank allocation split across them; any topology that does
   not match the live writer's exact single-inverter shape is preview-only for
   hardware, including several banks or connections until per-bank SoC arrives.
+
+Moving to a native topology replaces `battery_discharge_ceiling_kw` with the
+inverter's DC discharge limit × the bank's nominal voltage. To keep a lowered
+ceiling, enter the inverter's DC discharge limit as **A = kW × 1000 ÷ nominal V,
+rounded down** (for example, 3.0 kW at 51.2 V → 58 A). `ha-spark health` shows a
+**Discharge ceiling** WARN while a native inverter's effective limit is above the
+ceiling, whether set or the 3.68 kW default (the G98 limit, 16 A at 230 V; set a
+higher value only with G99 approval), using the durable accepted topology; it
+never fails or blocks control.
 
 The add-on stores the last accepted topology durably in
 `ha_spark_topology.json`, with an initialisation marker, beside the database in
@@ -753,6 +842,9 @@ Missing or unreadable files after initialisation, a mismatched pair with no
 matching previous pair, invalid values, an unsupported schema version, a failed
 seed or a failed pending-restart validation trigger **configuration repair**.
 A document from a newer schema is not overwritten by import.
+When a newer release recorded itself as the writer, the unknown-fields reason
+names both versions (for example, "Unknown configuration fields: 1 (written by
+ha-spark 0.33.0; this is 0.32.0)"), the usual sign of a downgrade.
 
 This bootstrap-only state serves diagnostics and repair through ingress and
 the daemon socket. It builds no device drivers, runs no scheduler tick, computes
@@ -1057,7 +1149,14 @@ adds *Charging limited by the supply guard.* for display only; the planner
 never plans from the live allowance. Dormancy reasons shown in diagnostics are
 `no_supply_limit`, `no_grid_source`, `no_inverter_measurement`,
 `awaiting_reading` and `missing_reading`; warn reasons are
-`authority_unavailable`, `guard_save_failed` and `guard_write_failed`.
+`authority_unavailable` (the authority mirror is missing or stale), `mode_observe`
+(the site is in Observe, or a transition to Observe is pending),
+`writes_not_permitted` (any other known state that permits no writes, such as a
+failed save), `guard_save_failed` and `guard_write_failed`. On an
+integration-owned site in Observe the guard shows the limit it would apply,
+marked `simulated` on its entities and in the diagnostics download. It never
+latches or saves that limit, and leaving Observe starts the guard with no
+latched cut.
 
 **Add-on daemon guard (add-on-owned sites only).** If an EV dispatch overlaps the battery's timed charge,
 total supply draw can exceed what the main fuse should carry. Set
@@ -1429,8 +1528,12 @@ notice when it accepts an event, one
 after a verified export start, one after verified cleanup, and one for a
 terminal abort. On native sites these come from the integration's durable
 transition log, including transitions made while the add-on was down. `armed`
-is logged but sends no notice. `clock_hold` is retryable; `not_supervised`
-produces a terminal abort notice. `tripped` becomes **Axle export aborted**
+is logged but sends no notice. `clock_hold` is retryable, and so is
+`unverified`: an export window or discharge-current write that did not read
+back before the event start sends **Axle export held: write not verified**
+once, with its safe result, and ha-spark retries every pass. It becomes
+**Axle export aborted** only if the event starts without a verified arm or a
+cleanup fails. `not_supervised` produces a terminal abort notice. `tripped` becomes **Axle export aborted**
 with reason **site export over limit**; it is not a cleanup notice. Notices are
 deduplicated by event and lifecycle step. A notice is never proof that a hardware write succeeded. Leave both `notify_service` and
 the deprecated `v2l_notify_service` blank to turn the notices off. The

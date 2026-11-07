@@ -197,6 +197,17 @@ def retirement_status(settings: Settings) -> Literal["active", "retired"] | None
     return None
 
 
+def rollback_pending(settings: Settings) -> bool:
+    """Read-only reverse-handshake admission check, including before confirmation."""
+    try:
+        marker = RetirementMarker.model_validate_json(
+            (resolve_data_dir(settings) / "authority.marker.json").read_text(encoding="utf-8"),
+        )
+        return marker.ownership == "pending_addon"
+    except (OSError, ValueError):
+        return False
+
+
 def operating_mode(settings: Settings) -> str:
     """Read the committed site mode; missing or invalid authority stays unknown."""
     result = load_authority(settings)

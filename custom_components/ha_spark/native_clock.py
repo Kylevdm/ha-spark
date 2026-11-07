@@ -51,6 +51,17 @@ class NativeClock:
         key = f"{self.coordinator.entry.entry_id}:{inverter.id}"
         return f"clock_drift_{uuid5(NAMESPACE_URL, key)}"
 
+    def cleanup_repairs(self) -> None:
+        """Remove departed inverters' drift repairs only within this entry."""
+        c = self.coordinator
+        for (domain, issue_id), issue in list(ir.async_get(c.hass).issues.items()):
+            data = issue.data
+            inverter_id = data.get("inverter_id") if isinstance(data, dict) else None
+            if (domain == DOMAIN and issue_id.startswith("clock_drift_")
+                    and isinstance(data, dict) and data.get("entry_id") == c.entry.entry_id
+                    and isinstance(inverter_id, str) and inverter_id not in c.native.inverters):
+                ir.async_delete_issue(c.hass, DOMAIN, issue_id)
+
     def check_drift(self, now: datetime) -> None:
         """Only fresh readable evidence creates or clears a drift repair."""
         c = self.coordinator
@@ -93,8 +104,8 @@ class NativeClock:
             reason = "not_available"
         elif c.control.household_zone() is None:
             reason = "invalid_household_zone"
-        elif c.native.reason(inverter) is not None:
-            reason = "read_only"
+        elif (device_reason := c.native.write_reason(inverter)) is not None:
+            reason = device_reason
         elif automatic and (state.committed_mode not in ("protect", "optimise")
                             or state.manual_session is not None):
             reason = "mode"

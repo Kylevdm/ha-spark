@@ -93,6 +93,7 @@ and does not control hardware. No notice replaces telemetry or cleanup checks.
 | `started` | **Axle export started**: timed-discharge current and window read back inside the window |
 | `cleanup_verified` | **Axle export cleanup verified**: resident export window cleared and read back |
 | `clock_hold` | **Axle export held: inverter clock**: retryable refusal, not a terminal abort |
+| `unverified` | **Axle export held: write not verified**: the window or discharge current did not read back before the event start; retried every pass, check its safe result. An event that starts without a verified arm is then **aborted** |
 | `aborted` | **Axle export aborted**: terminal refusal or failed operation; inspect its reason and safe result |
 | `tripped` | **Axle export aborted**, reason **site export over limit**: the stop latch is saved, not proof cleanup succeeded |
 

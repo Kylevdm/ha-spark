@@ -16,10 +16,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from enum import Enum
 from pathlib import Path
+from uuid import UUID
 
 import aiosqlite
 from pydantic import ValidationError
 
+from ha_spark.api.site_pairing import load_pairing
 from ha_spark.authority import load_authority, retirement_status
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import submit_socket
@@ -41,6 +43,7 @@ from ha_spark.energy.octopus import (
 )
 from ha_spark.energy.planner import LIMITS_UNAVAILABLE_REASON
 from ha_spark.energy.profile import history_coverage
+from ha_spark.energy.soc_integrity import SocStatus
 from ha_spark.energy.solar_source import load_solar_source_kind
 from ha_spark.energy.sources import (
     build_config,
@@ -60,6 +63,7 @@ from ha_spark.energy.topology import (
 from ha_spark.energy.topology_record import (
     PREVIEW_REASON,
     UNAVAILABLE_REASON,
+    LoadedTopology,
     load_topology_record,
     select_limits,
 )
@@ -312,9 +316,13 @@ _REQUIRED_ENTITY_FIELDS = (
 
 def check_entity_config(settings: Settings) -> CheckResult:
     """Flag required entity fields left blank (ships unconfigured by default)."""
-    native = load_solar_source_kind(settings) == "native"
+    native_solar = load_solar_source_kind(settings) == "native"
+    native = retirement_status(settings) is not None
+    legacy_fields = {"soc_entity", "battery_voltage_entity", "charge_current_entity",
+                     "inverter_power_switch_entity"}
     unset = [f for f in _REQUIRED_ENTITY_FIELDS if not getattr(settings, f)
-             and not (native and f == "solar_tomorrow_entity")]
+             and not (native_solar and f == "solar_tomorrow_entity")
+             and not (native and f in legacy_fields)]
     if not settings.battery_power_entity:
         unset.append("battery_power_entity (glitch and stuck-SoC protection are off)")
     if not unset:
@@ -569,6 +577,58 @@ async def check_authority_owner(settings: Settings) -> CheckResult:
     )
 
 
+async def check_site_pairing(settings: Settings) -> CheckResult:
+    """Read pairing from disk and allowlist only the daemon's canonical refused id."""
+    paired, trusted = load_pairing(settings)
+    if not trusted:
+        return CheckResult("Site pairing", Status.WARN, "pairing record untrusted")
+    detail = f"paired {paired}" if paired is not None else "not paired"
+    try:
+        reply = await submit_socket(settings, "integration_link")
+    except OSError:
+        reply = None
+    view = reply.integration_link if reply is not None and reply.error is None else None
+    refused = view.get("refused_site_id") if view is not None else None
+    try:
+        valid = isinstance(refused, str) and str(UUID(refused)) == refused
+    except Exception:  # noqa: BLE001 - untrusted diagnostics must never abort health
+        valid = False
+    if valid and refused != paired:
+        return CheckResult(
+            "Site pairing", Status.WARN,
+            f"{detail}; last refused {refused} (site_not_paired; see ha-spark pair --replace)",
+        )
+    return CheckResult("Site pairing", Status.OK, detail)
+
+
+async def check_native_soc(settings: Settings) -> CheckResult:
+    """Report only validated snapshot SoC diagnostics from the local daemon."""
+    try:
+        reply = await submit_socket(settings, "integration_link")
+    except OSError:
+        return CheckResult("Native SoC", Status.WARN, "unknown (daemon connection lost)")
+    if reply is None:
+        return CheckResult("Native SoC", Status.WARN, "unknown (no daemon running)")
+    view = reply.integration_link if reply.error is None else None
+    status = view.get("native_soc_status") if view is not None else None
+    if not isinstance(status, str) or status not in {s.value for s in SocStatus}:
+        return CheckResult("Native SoC", Status.WARN, "unknown")
+    if status != SocStatus.OK.value:
+        return CheckResult(
+            "Native SoC", Status.FAIL,
+            f"snapshot SoC {status}; SoC-derived writes are blocked",
+        )
+    pct = view.get("native_soc_pct") if view is not None else None
+    age = view.get("native_soc_age_s") if view is not None else None
+    if (not isinstance(pct, (int, float)) or isinstance(pct, bool)
+            or not 0 <= pct <= 100 or not math.isfinite(pct)
+            or not isinstance(age, int) or isinstance(age, bool) or age < 0):
+        return CheckResult("Native SoC", Status.WARN, "unknown")
+    return CheckResult(
+        "Native SoC", Status.OK, f"snapshot SoC {pct:g}%; trusted; read {age}s ago",
+    )
+
+
 def check_hold_release(settings: Settings) -> list[CheckResult]:
     """A WARN per owned hold whose release has been refused (#449); nothing otherwise.
 
@@ -758,6 +818,36 @@ async def check_topology_record(settings: Settings) -> CheckResult:
                        detail)
 
 
+def check_discharge_ceiling(settings: Settings, loaded: LoadedTopology) -> list[CheckResult]:
+    """Warn when accepted native discharge exceeds the effective legacy ceiling.
+
+    The default (3.68 kW, the G98 bound) is compared too, set or not.
+    """
+    if loaded.kind != "native" or loaded.topology is None:
+        return []
+    try:
+        limits = effective_limits(loaded.topology)
+    except (ValidationError, ValueError):
+        return []
+    ceiling = settings.battery_discharge_ceiling_kw
+    banks = {bank.id: bank for bank in loaded.topology.banks}
+    results = []
+    for inverter, limit in zip(loaded.topology.inverters, limits.inverters, strict=True):
+        if inverter.transport != "native":
+            continue
+        bank = banks[inverter.bank_id]
+        kw = limit.discharge_a * bank.nominal_voltage_v / 1000
+        if kw > ceiling:
+            amps = math.floor(ceiling * 1000 / bank.nominal_voltage_v)
+            results.append(CheckResult(
+                "Discharge ceiling", Status.WARN,
+                f"native discharge {kw:.2f} kW ({inverter.id}) is above "
+                f"battery_discharge_ceiling_kw {ceiling:.2f} kW; "
+                f"set its DC discharge limit to {amps} A to keep the lower ceiling",
+            ))
+    return results
+
+
 async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
     loaded = load_topology_record(settings)
@@ -769,6 +859,8 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_operating_mode(settings),
         check_integration_link(settings),
         check_authority_owner(settings),
+        check_site_pairing(settings),
+        *([check_native_soc(settings)] if retirement_status(settings) is not None else []),
         check_ha_rest(settings),
         *([check_notify_service(settings)] if settings.notify_service else []),
         check_ha_websocket(settings),
@@ -800,7 +892,8 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         evidence = [CheckResult(
             "Evidence freshness", Status.WARN, f"could not read ({type(exc).__name__})"
         )]
-    return [*results, *native_rows, check_entity_config(settings),
+    return [*results, *native_rows, *check_discharge_ceiling(settings, loaded),
+            check_entity_config(settings),
             *check_hold_release(settings), *evidence]
 
 
@@ -826,6 +919,7 @@ async def run_repair_health(bootstrap: Settings, reasons: list[str]) -> list[Che
         CheckResult("Configuration", Status.FAIL, detail),
         await check_operating_mode(bootstrap),
         await check_integration_link(bootstrap),
+        await check_site_pairing(bootstrap),
     ]
 
 

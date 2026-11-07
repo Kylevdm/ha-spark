@@ -49,7 +49,10 @@ def test_legacy_fixture_seeds_equivalent_effective_settings(tmp_path, edited):
     assert actual.model_dump() == expected.model_dump()
     document = json.loads((tmp_path / "ha_spark_config.json").read_text())
     # The 0.24 options carry the hub; with the empty 0.31 default it is now an input.
-    assert document["settings"] == {"solis_control_hub": "solis_control"} | (
+    # Their 3.2 kW ceiling is no longer the default (3.68 kW), so it is kept too.
+    assert document["settings"] == {
+        "solis_control_hub": "solis_control", "battery_discharge_ceiling_kw": "3.2",
+    } | (
         {"min_soc": 25, "inverter_power_switch_entity": "select.owner"} if edited else {}
     )
     assert CANARY not in json.dumps(document)
