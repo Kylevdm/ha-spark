@@ -14,11 +14,11 @@ from ha_spark.energy.topology_record import (
 )
 
 
-def topology(*, confirmed=True, transport="native", discharge=62.5):
+def topology(*, confirmed=True, transport="native", discharge=62.5, voltage=51.2):
     return Topology.model_validate({
         "connections": [{"id": "grid", "supply_voltage_v": 230.0}],
         "banks": [{"id": "bank", "connection_id": "grid", "usable_capacity_kwh": 10.0,
-                   "nominal_voltage_v": 51.2, "min_soc": 10.0, "target_cap": 100.0,
+                   "nominal_voltage_v": voltage, "min_soc": 10.0, "target_cap": 100.0,
                    "served_load_share_pct": 100.0}],
         "inverters": [{"id": "main", "bank_id": "bank", "driver_kind": "solis",
                        "transport": transport, "gateway_host": "PRIVATE-HOST",
@@ -48,7 +48,7 @@ def test_lower_ceiling_warns_without_failing():
     Settings(battery_discharge_ceiling_kw=3.2),
     Settings(),
 ])
-def test_no_warning_for_higher_equal_or_unset_ceiling(settings):
+def test_no_warning_for_higher_equal_or_default_ceiling(settings):
     assert health.check_discharge_ceiling(settings, LoadedTopology("native", 1, topology())) == []
 
 
@@ -62,6 +62,16 @@ def test_no_warning_for_higher_equal_or_unset_ceiling(settings):
 ])
 def test_no_warning_without_native_effective_excess(loaded):
     assert health.check_discharge_ceiling(Settings(battery_discharge_ceiling_kw=3.0), loaded) == []
+
+
+def test_default_g98_ceiling_is_compared_when_never_set():
+    assert health.check_discharge_ceiling(
+        Settings(), LoadedTopology("native", 1, topology(voltage=64.0)),
+    ) == [health.CheckResult(
+        "Discharge ceiling", health.Status.WARN,
+        "native discharge 4.00 kW (main) is above battery_discharge_ceiling_kw "
+        "3.68 kW; set its DC discharge limit to 57 A to keep the lower ceiling",
+    )]
 
 
 def test_explicit_zero_ceiling_is_compared():

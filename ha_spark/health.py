@@ -819,11 +819,11 @@ async def check_topology_record(settings: Settings) -> CheckResult:
 
 
 def check_discharge_ceiling(settings: Settings, loaded: LoadedTopology) -> list[CheckResult]:
-    """Warn when accepted native discharge exceeds an explicitly set legacy ceiling."""
-    if (
-        "battery_discharge_ceiling_kw" not in settings.model_fields_set
-        or loaded.kind != "native" or loaded.topology is None
-    ):
+    """Warn when accepted native discharge exceeds the effective legacy ceiling.
+
+    The default (3.68 kW, the G98 bound) is compared too, set or not.
+    """
+    if loaded.kind != "native" or loaded.topology is None:
         return []
     try:
         limits = effective_limits(loaded.topology)
