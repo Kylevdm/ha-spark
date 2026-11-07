@@ -4,7 +4,7 @@ Uses the driver's model-qualified hold contract and existing fallback validator.
 The daemon supplies this tick's checked SoC and live programming hold; diagnostic
 callers check a fresh observation and read the persisted monitor state, but must
 not treat a prior tick's measurement as a new grant.
-Retired sites use native snapshot SoC and skip legacy inverter entity checks.
+Retired sites skip legacy inverter entity checks; their diagnostic SoC is unavailable.
 """
 from __future__ import annotations
 
@@ -38,16 +38,17 @@ def fallback_schedule_problem(settings: Settings) -> str | None:
     return reason if isinstance(reason, str) else None
 
 
-async def entry_preconditions(
-    settings: Settings, native_soc: SocMeasurement | None = None,
-) -> dict[str, Any]:
-    """Read live diagnostic entry conditions without initialising or saving authority."""
+async def entry_preconditions(settings: Settings) -> dict[str, Any]:
+    """Read live diagnostic entry conditions without initialising or saving authority.
+
+    On a retired site the integration checks entry itself (its placeholder is
+    shown while a snapshot is live), so SoC here is always unavailable.
+    """
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
     ) as rest:
         if retirement_status(settings) is not None:
-            soc = native_soc if native_soc is not None else SocMeasurement(
-                SocStatus.UNAVAILABLE, datetime.now(UTC))
+            soc = SocMeasurement(SocStatus.UNAVAILABLE, datetime.now(UTC))
         else:
             soc = await observe_soc(settings, rest)
         monitor = SocMonitor.load(settings)

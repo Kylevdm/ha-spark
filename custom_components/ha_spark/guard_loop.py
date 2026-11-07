@@ -472,8 +472,12 @@ class SupplyGuardLoop:
             if simulating:
                 # The reason is the mode, never the save-failure None.
                 mirror = real_mirror
+            elif self._save_failed and real_mirror is not None:
+                # A failed guard save is a known state that permits no writes:
+                # keep the real mirror, marked failed (`writes_not_permitted`).
+                mirror = replace(real_mirror, save_failed=True)
             else:
-                mirror = real_mirror if not self._save_failed else None
+                mirror = real_mirror
             before = self.states.copy()
             requests = await self._requests_locked()
             writes: set[str] = set()

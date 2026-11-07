@@ -263,7 +263,7 @@ class NativeChargeBoundary(NativeExportWrites):
                 for inverter in c.native.inverters.values():
                     if not eligible():
                         return
-                    if c.native.reason(inverter) is not None:
+                    if c.native.write_reason(inverter) is not None:
                         continue
                     transport = c.native.transport(inverter)
                     connection_epoch = transport.connection_epoch
@@ -284,7 +284,7 @@ class NativeChargeBoundary(NativeExportWrites):
                     # The read awaited: unloading or a mode change may have begun.
                     if not eligible():
                         return
-                    if c.native.reason(inverter) is not None:
+                    if c.native.write_reason(inverter) is not None:
                         continue
                     self.verified_windows[inverter.id] = (epoch, tuple(words[2:10]))
 
