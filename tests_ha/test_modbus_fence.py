@@ -29,6 +29,7 @@ from tests_ha.test_native_clock import clock as clock_fixture
 from tests_ha.test_native_clock import command as clock_command
 from tests_ha.test_native_device import native_entry
 from tests_ha.test_native_export import allow_export, apply_command, arm, window_intent
+from tests_ha.test_native_fallback import connect_soc
 from tests_ha.test_native_fallback import fallback_site as fallback_fixture
 from tests_ha.test_native_fallback import optimise as fallback_optimise
 from tests_ha.test_native_holds import held_site as held_fixture
@@ -377,3 +378,28 @@ def test_write_reason_contract() -> None:
         assert IntentResult(outcome="refused", reason=reason).reason == reason
         assert CommandResult(session_id="test", sequence=1, outcome="refused",
                              reason=reason).reason == reason
+
+
+@pytest.mark.parametrize("source", ["yaml", "managed", "rtu", "unreadable"])
+async def test_conflict_keeps_native_soc_trusted(
+    fallback_site: SparkCoordinator, native_transport: FakeSolisDevice, modbus: Any, source: str,
+) -> None:
+    """Reads continue: a hub conflict refuses writes but never untrusts bank SoC."""
+    c = fallback_site
+    await fallback_optimise(c)
+    if source == "unreadable":
+        c.hass.data[modbus.const.DATA_MODBUS_HUBS] = {"hub": object()}
+    else:
+        install(c, modbus, source)
+    inverter = next(iter(c.native.inverters.values()))
+    assert c.native.write_reason(inverter) == "modbus_hub_conflict"
+    await connect_soc(c, datetime.now(UTC))
+    assert all(c.soc.bank(bank).trust == "trusted" for bank in c.soc.monitors)
+    assert not c.soc.fallback_requested
+    native_transport.traffic.clear()
+    await c.fallback.async_evaluate(datetime.now(UTC))
+    assert c.authority.state is not None
+    assert "soc_integrity" not in c.authority.state.fallback.causes
+    assert not any(t.op == "write" for t in native_transport.traffic)
+    # Optimise entry stays blocked while the hub fence holds writes.
+    assert not c.control.preconditions().devices_validated

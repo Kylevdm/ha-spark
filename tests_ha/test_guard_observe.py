@@ -242,6 +242,10 @@ async def test_entities_mark_simulated_only_in_observe(
     assert allowance is not None and allowance.attributes.get("simulated") is True
     connection = guard.diagnostics()["connections"][0]
     assert isinstance(connection, dict) and connection["simulated"] is True
+    # The add-on's plan status must not say charging is limited when nothing is
+    # written (review step 7 L2): the v4 block never reports a simulated limit.
+    block = coordinator._guard_snapshot()
+    assert block is not None and block["limiting"] is False
     state = coordinator.authority.state
     assert state is not None
     assert await coordinator.authority.async_save(
@@ -256,6 +260,8 @@ async def test_entities_mark_simulated_only_in_observe(
     assert "simulated" not in limiting.attributes
     allowance = hass.states.get(ALLOWANCE)
     assert allowance is not None and "simulated" not in allowance.attributes
+    block = coordinator._guard_snapshot()
+    assert block is not None and block["limiting"] is guard.limiting
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 

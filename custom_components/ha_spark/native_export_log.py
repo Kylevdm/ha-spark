@@ -55,6 +55,20 @@ def held_at_start(
     return tuple(held)
 
 
+def held_aborted(
+    rows: Sequence[ExportTransition], inverter_id: str, event: EventIdentity,
+) -> bool:
+    """A held (``unverified``) event that was then logged ``aborted`` (#406, review M2).
+
+    The held notice promised an abort if the arm did not verify; once that abort
+    is logged the event never arms again, under any supervision and across
+    restarts (the log is durable; acknowledged rows outlive the event's start).
+    """
+    kinds = {row.kind for row in rows
+             if row.inverter_id == inverter_id and same_event(row.event, event)}
+    return "unverified" in kinds and "aborted" in kinds
+
+
 def visible(rows: Sequence[ExportTransition], inverter_id: str) -> tuple[ExportTransition, ...]:
     """The snapshot's oldest unacknowledged rows, in order, bounded per snapshot."""
     return tuple(row for row in rows if row.inverter_id == inverter_id

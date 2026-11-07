@@ -129,7 +129,17 @@ class NativeDevices:
             for c in claims
         )
 
+    def fence_reason(self, inverter: Inverter) -> str | None:
+        """Repairs, the snapshot and writes: the Modbus hub fence, then device validity.
+
+        HA's own Modbus on this gateway fences writes only; reads continue, so
+        ``reason()`` (SoC trust, polling) never includes it.
+        """
+        conflict = hub_conflict(self.hass, inverter.gateway_host, inverter.gateway_port)
+        return conflict if conflict is not None else self.reason(inverter)
+
     def reason(self, inverter: Inverter) -> str | None:
+        """Device validity for reads; excludes the Modbus hub fence."""
         if not hold_identity_valid(inverter):
             return "unvalidated_identity"
         if self.held_remapped():
@@ -138,9 +148,6 @@ class NativeDevices:
             # Options can change before their reload runs. Old probe evidence
             # never validates a new unit or gateway in that interval.
             return "unvalidated_identity"
-        conflict = hub_conflict(self.hass, inverter.gateway_host, inverter.gateway_port)
-        if conflict is not None:
-            return conflict
         probe = self.probes.get(inverter.id, Probe())
         if not self.connected(inverter):
             return "unreachable"
@@ -163,7 +170,7 @@ class NativeDevices:
         self, inverter: Inverter,
     ) -> Literal["modbus_hub_conflict", "read_only"] | None:
         """Keep detailed repair reasons local; expose one fixed Modbus write refusal."""
-        reason = self.reason(inverter)
+        reason = self.fence_reason(inverter)
         if reason is None:
             return None
         if reason in ("modbus_hub_conflict", "modbus_hub_unreadable"):
@@ -231,7 +238,7 @@ class NativeDevices:
             return
         for inverter in self.inverters.values():
             issue = self.issue_id(inverter)
-            reason = self.reason(inverter)
+            reason = self.fence_reason(inverter)
             if reason is None:
                 ir.async_delete_issue(self.hass, DOMAIN, issue)
             else:

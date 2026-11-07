@@ -72,7 +72,7 @@ class ExportSupervisor:
             if identity is not None and len(identity) != 3:
                 identity = None
             facts[inverter.id] = DeviceExportFact(
-                validated=self.native.reason(inverter) is None,
+                validated=self.native.write_reason(inverter) is None,
                 identity=identity, claim=claim,
             )
         return facts

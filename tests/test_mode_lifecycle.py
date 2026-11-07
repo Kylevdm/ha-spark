@@ -446,3 +446,44 @@ async def test_restart_resumes_a_stored_protect_evaluation(tmp_path, monkeypatch
             device.reconcile_holds.assert_awaited()
     finally:
         execution_context().authority = prior
+
+
+@pytest.mark.parametrize("with_epoch", [True, False])
+@pytest.mark.parametrize("target", ["observe", "protect", "optimise"])
+@respx.mock
+async def test_retired_site_without_snapshot_refuses_mode_as_authority_unknown(
+    tmp_path, monkeypatch, target, with_epoch,
+):
+    """#653 gap: with no live v4 snapshot the add-on store never takes a mode request."""
+    from unittest.mock import AsyncMock
+
+    from ha_spark.authority import resolve_data_dir, retirement_status
+
+    settings = settings_at(tmp_path)
+    store = AuthorityStore(settings)
+    store.save(store.state.model_copy(update={"committed_mode": "observe"}))
+    assert store.handover("pending_integration") == "retired"
+    assert retirement_status(settings) == "retired"
+    epoch = store.state.epoch if store.state is not None else 1
+    directory = resolve_data_dir(settings)
+    files = {name: (directory / name).read_bytes()
+             for name in ("authority.json", "authority.marker.json")}
+    respx.get(url__regex=r"http://ha.test/api/.*").respond(200, json=[])
+    respx.post(url__regex=r"http://ha.test/api/.*").respond(200, json=[])
+    preconditions = AsyncMock(return_value=PreconditionReport())
+    monkeypatch.setattr("ha_spark.energy.scheduler.check_preconditions", preconditions)
+    prior = execution_context().authority
+    try:
+        async with running_daemon(settings, tmp_path, monkeypatch) as (state, _, device, _):
+            reply = await submit_socket(
+                settings, "mode", target=target,
+                expected_epoch=epoch if with_epoch else None,
+            )
+            assert reply.error == "authority_unknown"
+            assert reply.authority is None
+            preconditions.assert_not_awaited()
+            device.release_holds.assert_not_called()
+    finally:
+        execution_context().authority = prior
+    assert {name: (directory / name).read_bytes() for name in files} == files
+    assert retirement_status(settings) == "retired"

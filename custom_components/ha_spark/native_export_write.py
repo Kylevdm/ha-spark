@@ -162,11 +162,13 @@ class NativeExportWrites:
             return True
         zone = c.control.household_zone()
         # Only a validated, non-caching device's Slot 1 can re-verify a record.
-        if (zone is None or c.native.reason(inverter) is not None
+        if (zone is None or c.native.write_reason(inverter) is not None
                 or record.epoch != state.epoch
                 or record.store_id != state.store_id
                 or record.event.end <= now.astimezone(UTC)
                 or any(latch.event == record.event for latch in state.stop_latches)
+                or native_export_log.held_aborted(
+                    state.export_transitions, inverter.id, record.event)
                 or not any(row.id == record.supervision_id and row.event == record.event
                            for row in state.export_supervisions)):
             return False
@@ -201,7 +203,7 @@ class NativeExportWrites:
             return True
         if await self._async_reconcile_preserve(inverter, now, mismatches):
             return True
-        if c.native.reason(inverter) is not None:
+        if c.native.write_reason(inverter) is not None:
             # An unvalidated device is never written: the record stays unverified
             # and is retried once the device validates.
             return True
@@ -436,7 +438,7 @@ class NativeExportWrites:
             words.append(read.registers[0])
         if epoch != transport.connection_epoch:
             return "export_bound_unverified"
-        if c.native.reason(inverter) is not None:
+        if c.native.write_reason(inverter) is not None:
             return "export_bound_unverified"
         claims = c.entry.options.get("gateway_claims")
         raw_claims = claims if isinstance(claims, list) else []
@@ -457,7 +459,7 @@ class NativeExportWrites:
             if banks[member.bank_id].connection_id != connection_id:
                 continue
             if (supervision_for(same_event, member.id, supervision.event) is None
-                    or member.transport != "native" or c.native.reason(member) is not None):
+                    or member.transport != "native" or c.native.write_reason(member) is not None):
                 return "export_bound_unverified"
         total = sum(row.rating_w for row in same_event
                     if row.event == supervision.event
@@ -574,6 +576,8 @@ class NativeExportWrites:
         # A trip drops the bound with its latch, so the latch is judged first.
         if any(latch.event == event for latch in state.stop_latches):
             return "tripped"
+        if native_export_log.held_aborted(state.export_transitions, inverter.id, event):
+            return "export_aborted"
         supervision = supervision_for(state.export_supervisions, inverter.id, event)
         if supervision is None or supervision.ends_at <= dt_util.utcnow():
             return "not_supervised"
@@ -644,6 +648,10 @@ class NativeExportWrites:
                         if any(latch.event == event for latch in state.stop_latches):
                             # A trip drops the bound, so the latch is judged first.
                             refusal = "tripped"
+                        elif native_export_log.held_aborted(
+                                state.export_transitions, inverter.id, event):
+                            # A held event logged aborted stays aborted (review M2).
+                            refusal = "export_aborted"
                         elif supervision is None or not self._same_event(
                                 supervision.event, event):
                             refusal = "not_supervised"

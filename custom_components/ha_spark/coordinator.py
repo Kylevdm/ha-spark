@@ -124,7 +124,7 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
         """Every inverter of the current topology, matched against current probe evidence."""
         topology = validate_topology(self.entry.options.get("topology"))
         return isinstance(topology, Topology) and bool(topology.inverters) and all(
-            i.transport == "native" and self.native.reason(i) is None
+            i.transport == "native" and self.native.write_reason(i) is None
             and polled_power(self.native, i, dt_util.utcnow()) is not None
             for i in topology.inverters
         )
@@ -240,7 +240,9 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
                     return None
                 connections.append({"id": connection.id, "allowance_kw": allowance})
             return {
-                "limiting": guard.limiting,
+                # A simulated (Observe) limit writes nothing: never report it as
+                # limiting. The v4 block has no simulation marker.
+                "limiting": guard.limiting and not guard.simulated,
                 "connections": connections,
                 "restores_left": min(guard.restores_left.values()),
                 "revision": revision,
@@ -265,7 +267,7 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
         if isinstance(topology, Topology):
             devices: list[dict[str, object]] = []
             for inverter in topology.inverters:
-                reason = (self.native.reason(inverter) if inverter.transport == "native"
+                reason = (self.native.fence_reason(inverter) if inverter.transport == "native"
                           else "unvalidated_identity")
                 device: dict[str, object] = {
                     "id": inverter.id, "transport": inverter.transport,

@@ -1684,6 +1684,12 @@ async def _accept_mode(
     request = pending.request
     if request.target is None or request.target in ("manual", "resume"):
         return Reply(error="invalid mode request")
+    if retirement_status(settings) is not None:
+        # Integration-owned: a mode request reaches here only without a live
+        # integration snapshot, so the owner's authority is unknown (#653).
+        # The retired add-on store never takes a mode request.
+        return Reply(error="authority_unknown",
+                     text="integration authority unknown; no live integration snapshot")
     known = store.known and not store.save_failed
     if known and request.expected_epoch is None:
         return Reply(error="stale_epoch", text="authority known; use mode set observe")

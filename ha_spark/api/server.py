@@ -236,6 +236,8 @@ class AppState:
             # intake then follows the disk, never the old site's link or revision floor.
             if refusal is not None and load_pairing(self.settings) != (to_site, True):
                 return refusal
+            # The new pairing is committed: an earlier refusal no longer applies.
+            self.refused_site = None
             # Replacing back to the site the record is bound to restores that site's floor.
             topology = load_topology_record(self.settings)
             if topology.site_id != to_site:
@@ -689,10 +691,7 @@ def build_app(
             if st.native_status() is not None:
                 return JSONResponse(st.executor.authority_status(),
                                     headers={"Cache-Control": "no-store"})
-            preconditions = await entry_preconditions(
-                st.settings,
-                native_soc=snapshot_soc(st.integration_link, datetime.now(UTC), st.settings),
-            )
+            preconditions = await entry_preconditions(st.settings)
             # Snapshot after the diagnostic reads; preconditions never grant authority.
             view = dict(st.executor.authority_status())
             view["preconditions"] = preconditions

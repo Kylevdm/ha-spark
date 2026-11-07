@@ -65,7 +65,9 @@ legacy overlay or another Modbus client.
    applies; reads continue and all native writes stay blocked. Matching uses the
    host as written, case-insensitively: a hostname and its IP address do not
    match. Third-party Modbus integrations are **not detected**; disconnecting
-   them in step 2 remains mandatory.
+   them in step 2 remains mandatory. An owner edit to a native charge,
+   discharge or power control while an authority transition is pending is
+   refused as `transition_in_progress`; retry once the mode change settles.
 5. Wait for the authority switch to settle in Observe. All inverters native
    means integration ownership; any legacy inverter, or no inverter, means
    add-on ownership. Both peers need API v4, Observe, no holds and no
@@ -293,8 +295,10 @@ On an integration-owned site, **Native SoC** shows the integration snapshot's
 SoC, its trust and its age; a missing, stale, future-dated or untrusted SoC
 fails the row (SoC-derived writes are blocked), and **Entity config** no
 longer asks for the SoC, battery voltage, charge current or power switch
-entities. Entry preconditions use the same snapshot SoC, never the configured
-SoC entity.
+entities. The integration checks entry preconditions when you request a mode.
+Without a live integration snapshot the mode page shows SoC as unavailable,
+never the configured SoC entity, and every mode request is refused as
+`authority_unknown` until the snapshot returns.
 
 Each native **Solis transport (<id>)** row reads validation through the daemon,
 without probing Modbus or writing a test schedule. `validated` is OK;
@@ -1533,7 +1537,8 @@ is logged but sends no notice. `clock_hold` is retryable, and so is
 back before the event start sends **Axle export held: write not verified**
 once, with its safe result, and ha-spark retries every pass. It becomes
 **Axle export aborted** only if the event starts without a verified arm or a
-cleanup fails. `not_supervised` produces a terminal abort notice. `tripped` becomes **Axle export aborted**
+cleanup fails, and once a held event is aborted it never arms again: later
+passes, a new supervision and restarts refuse it as `export_aborted`. `not_supervised` produces a terminal abort notice. `tripped` becomes **Axle export aborted**
 with reason **site export over limit**; it is not a cleanup notice. Notices are
 deduplicated by event and lifecycle step. A notice is never proof that a hardware write succeeded. Leave both `notify_service` and
 the deprecated `v2l_notify_service` blank to turn the notices off. The

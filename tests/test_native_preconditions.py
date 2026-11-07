@@ -65,9 +65,11 @@ async def test_native_entry_soc_and_no_legacy_reads(settings, monkeypatch, condi
     )
     assert report.protect == ()
     assert report.optimise == reasons
-    entry = await entry_preconditions(settings, native_soc=measurement)
+    # Diagnostics never take snapshot SoC (step-7 L3): always unavailable here.
+    entry = await entry_preconditions(settings)
     assert entry["protect"] == {"passed": True, "reasons": []}
-    assert entry["optimise"] == {"passed": not reasons, "reasons": list(reasons)}
+    assert entry["optimise"] == {"passed": False, "reasons": [
+        "native snapshot SoC must be trusted and fresh (unavailable)"]}
     observe.assert_not_awaited()
     assert not respx.calls
 

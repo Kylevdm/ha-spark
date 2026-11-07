@@ -429,3 +429,19 @@ async def test_failure_after_commit_follows_the_new_pairing(
         assert state.integration_link.topology.topology == paired.topology
         assert (await client.post("/integration/heartbeat", json=body)).status_code == 200
     assert state.integration_link.topology.revision == 1
+
+
+async def test_committed_replacement_clears_the_last_refused_site(
+    settings, paired, state, client,
+):
+    """Review step 7 L5: health must not keep nudging toward a stale re-pair."""
+    async with client:
+        response = await client.post("/integration/heartbeat", json=snapshot() | {
+            "site_id": NEW})
+    assert response.status_code == 400
+    assert state.refused_site == NEW
+    assert await state.replace_pairing(OLD, OLD) == "same_site"
+    assert state.refused_site == NEW
+    assert await state.replace_pairing(OLD, NEW) is None
+    assert state.refused_site is None
+    assert state.integration_link_view()["refused_site_id"] is None

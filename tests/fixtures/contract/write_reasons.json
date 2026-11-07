@@ -1,6 +1,7 @@
 [
   "authority_unknown",
   "clock_not_trusted",
+  "export_aborted",
   "export_bound_unverified",
   "export_bounds_exceed_site_limit",
   "export_not_available",
