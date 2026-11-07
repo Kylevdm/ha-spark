@@ -24,6 +24,7 @@ def config(**changes: float) -> PlannerConfig:
         capacity_kwh=100, voltage_v=52, min_soc=20, target_cap=90,
         max_current_a=62.5, solar_haircut_k=1, window_start=time(23, 30),
         window_end=time(5, 30), buffer_pct=0, charge_efficiency=0.8,
+        battery_discharge_ceiling_kw=3.2,
     ), **changes)
 
 

@@ -66,6 +66,7 @@ def cfg(**kw: Any) -> PlannerConfig:
         window_end=time(5, 30),
         buffer_pct=0.0,
         charge_efficiency=1.0,
+        battery_discharge_ceiling_kw=3.2,
     )
     base.update(kw)
     return PlannerConfig(**base)

@@ -66,7 +66,7 @@ async def test_effective_limits_show_legacy_driver_and_site_caps() -> None:
     ))
     assert result.status is Status.OK
     assert result.detail == (
-        "legacy: charge 3.25 kW DC; discharge 3.20 kW; import 3.60 kW; site export 3.60 kW"
+        "legacy: charge 3.25 kW DC; discharge 3.68 kW; import 3.60 kW; site export 3.60 kW"
     )
 
 
