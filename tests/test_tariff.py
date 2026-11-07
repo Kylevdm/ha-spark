@@ -29,6 +29,8 @@ from ha_spark.energy.tariff import (
     FixedTariffProvider,
     OctopusIntelligentProvider,
     TariffSchedule,
+    _cycle_slot_prices,
+    _slot_prices_from_points,
     fixed_schedule,
 )
 
@@ -632,3 +634,79 @@ def test_validate_octopus_intelligent_still_requires_dispatch_auth() -> None:
                 octopus_tariff_code="E-1R-INTELLI-VAR-22-10-14-A",
             )
         )
+
+
+@pytest.mark.parametrize("geometry_input", [False, True])
+def test_slot_price_projection_overlap_precedence_and_gaps(geometry_input: bool) -> None:
+    """Both paths price partial overlaps, exclude touching ends and keep the last match."""
+    config = cfg()
+    if geometry_input:
+        inputs = _geom_inputs(at(MON, 0, 10))
+        start = at(MON, 0, 0)
+        points = _cycle_points(start, [0.10])
+    else:
+        inputs = _slot_inputs()
+        start = HORIZON
+        points = _points([0.10])
+    points += (
+        PricePoint(
+            start=start + timedelta(minutes=10),
+            end=start + timedelta(minutes=20),
+            price=0.20,
+        ),
+        PricePoint(
+            start=(start + timedelta(minutes=40)).replace(tzinfo=None),
+            end=(start + timedelta(minutes=50)).replace(tzinfo=None),
+            price=0.30,
+        ),
+    )
+    geometry = inputs.geometry_for(config)
+    assert geometry is not None
+    starts = tuple(start + timedelta(minutes=30 * i) for i in range(4))
+    assert _cycle_slot_prices(starts, points, inputs, geometry) == [0.20, 0.30, None, None]
+    assert _slot_prices_from_points(4, inputs.horizon_start, points, inputs, config) == [
+        0.20, 0.30, None, None,
+    ]
+
+
+def test_cycle_price_projection_off_half_hour() -> None:
+    """Cycle slots can straddle horizon slots without changing strict overlap rules."""
+    inputs = _geom_inputs(at(MON, 23, 45), window=(time(23, 45), time(5, 45)))
+    geometry = inputs.geometry
+    assert geometry is not None
+    starts = tuple(at(MON, 23, 45) + timedelta(minutes=30 * i) for i in range(4))
+    points = _cycle_points(at(MON, 23, 30), [0.10, 0.20])
+    assert _cycle_slot_prices(starts, points, inputs, geometry) == [0.20, 0.20, None, None]
+    assert _slot_prices_from_points(4, inputs.horizon_start, points, inputs, cfg()) == [
+        0.10, 0.20, None, None,
+    ]
+
+
+def test_horizon_price_projection_without_start_is_uncovered() -> None:
+    assert _slot_prices_from_points(3, None, _points([0.10]), _slot_inputs(), cfg()) == [
+        None, None, None,
+    ]
+
+
+def test_horizon_price_projection_edge_inputs_keep_old_results() -> None:
+    """No points never indexes the geometry; inputs without a horizon start
+    still project onto 30-minute slots from the passed start."""
+    assert _slot_prices_from_points(49, HORIZON, (), _slot_inputs(), cfg()) == [None] * 49
+    bare = PlannerInputs(soc=_soc(55), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0)
+    assert _slot_prices_from_points(3, HORIZON, _points([0.10]), bare, cfg()) == [
+        0.10, None, None,
+    ]
+
+
+def test_project_prices_last_match_and_partial_overlap() -> None:
+    from ha_spark.energy.tariff import _project_prices
+
+    starts = [HORIZON + timedelta(minutes=30 * i) for i in range(3)]
+    points = _points([0.10]) + (
+        PricePoint(
+            start=HORIZON + timedelta(minutes=20),
+            end=HORIZON + timedelta(minutes=40),
+            price=0.20,
+        ),
+    )
+    assert _project_prices(starts, points, HORIZON, absolute=True) == [0.20, 0.20, None]
