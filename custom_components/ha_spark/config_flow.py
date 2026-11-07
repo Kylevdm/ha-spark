@@ -320,6 +320,7 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
     _claims: list[dict[str, Any]] | None = None
     _edit_index: int | None = None
     _load_kind: str | None = None
+    _remove_key: str | None = None
     _evidence: EvidenceOptions | None = None
 
     async def async_step_init(
@@ -836,10 +837,23 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
         elif len(identifiers) <= minimum:
             errors["base"] = "remove_last"
         if errors:
-            return self.async_show_form(step_id=step_id, errors=errors, data_schema=schema)
+            self._remove_key = key
+            return self.async_show_form(
+                step_id="remove_refused", errors=errors, data_schema=probatio.Schema({})
+            )
         self._topology_draft[key] = [
             item for item in items if item["id"] != item_id
         ]
+        return self._collection_menu(key)
+
+    async def async_step_remove_refused(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Return to editing after acknowledging a refused removal."""
+        key = self._remove_key
+        self._remove_key = None
+        if key is None:
+            return await self.async_step_topology()
         return self._collection_menu(key)
 
     def _load_form(self, defaults: dict[str, Any]) -> ConfigFlowResult:

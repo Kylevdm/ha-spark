@@ -118,6 +118,14 @@ def test_invalid_numbers_have_fixed_reason(group: str, field: str, value: float)
     assert validate_topology(raw) == "invalid_topology"
 
 
+def test_heating_only_heat_pump_demand() -> None:
+    load = MajorLoad(
+        id="heat", connection_id="grid", kind="heat_pump",
+        heating_demand_kw=4, cooling_demand_kw=0,
+    )
+    assert load.effective_demand_kw == 4
+
+
 def test_reserve_planner_and_guard_predicates() -> None:
     now = datetime(2026, 10, 29, tzinfo=UTC)
     ev = MajorLoad(

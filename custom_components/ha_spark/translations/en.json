@@ -574,7 +574,10 @@
       },
       "major_load_heat": {
         "title": "Heat pump",
-        "description": "One heat pump with both seasonal demands; it counts at the larger.",
+        "description": "One heat pump; heating above 0 and cooling (0 if it doesn't cool) are both required. It counts at the larger.",
+        "data_description": {
+          "cooling_demand_kw": "0 if it doesn't cool."
+        },
         "data": {
           "id": "Identifier",
           "connection_id": "Grid connection",
@@ -582,6 +585,10 @@
           "cooling_demand_kw": "Cooling demand (kW)",
           "power_entity": "Power sensor"
         }
+      },
+      "remove_refused": {
+        "title": "Can't remove this item",
+        "description": "Submit to go back to the menu. Your unsaved changes are kept."
       },
       "major_loads_edit": {
         "title": "Edit a major load",
