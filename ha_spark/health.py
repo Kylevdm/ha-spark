@@ -63,6 +63,7 @@ from ha_spark.energy.topology import (
 from ha_spark.energy.topology_record import (
     PREVIEW_REASON,
     UNAVAILABLE_REASON,
+    LoadedTopology,
     load_topology_record,
     select_limits,
 )
@@ -817,6 +818,36 @@ async def check_topology_record(settings: Settings) -> CheckResult:
                        detail)
 
 
+def check_discharge_ceiling(settings: Settings, loaded: LoadedTopology) -> list[CheckResult]:
+    """Warn when accepted native discharge exceeds an explicitly set legacy ceiling."""
+    if (
+        "battery_discharge_ceiling_kw" not in settings.model_fields_set
+        or loaded.kind != "native" or loaded.topology is None
+    ):
+        return []
+    try:
+        limits = effective_limits(loaded.topology)
+    except (ValidationError, ValueError):
+        return []
+    ceiling = settings.battery_discharge_ceiling_kw
+    banks = {bank.id: bank for bank in loaded.topology.banks}
+    results = []
+    for inverter, limit in zip(loaded.topology.inverters, limits.inverters, strict=True):
+        if inverter.transport != "native":
+            continue
+        bank = banks[inverter.bank_id]
+        kw = limit.discharge_a * bank.nominal_voltage_v / 1000
+        if kw > ceiling:
+            amps = math.floor(ceiling * 1000 / bank.nominal_voltage_v)
+            results.append(CheckResult(
+                "Discharge ceiling", Status.WARN,
+                f"native discharge {kw:.2f} kW ({inverter.id}) is above "
+                f"battery_discharge_ceiling_kw {ceiling:.2f} kW; "
+                f"set its DC discharge limit to {amps} A to keep the lower ceiling",
+            ))
+    return results
+
+
 async def run_health(settings: Settings) -> list[CheckResult]:
     """Run all checks concurrently, returning results in a stable order."""
     loaded = load_topology_record(settings)
@@ -861,7 +892,8 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         evidence = [CheckResult(
             "Evidence freshness", Status.WARN, f"could not read ({type(exc).__name__})"
         )]
-    return [*results, *native_rows, check_entity_config(settings),
+    return [*results, *native_rows, *check_discharge_ceiling(settings, loaded),
+            check_entity_config(settings),
             *check_hold_release(settings), *evidence]
 
 
