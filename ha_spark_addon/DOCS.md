@@ -842,6 +842,9 @@ Missing or unreadable files after initialisation, a mismatched pair with no
 matching previous pair, invalid values, an unsupported schema version, a failed
 seed or a failed pending-restart validation trigger **configuration repair**.
 A document from a newer schema is not overwritten by import.
+When a newer release recorded itself as the writer, the unknown-fields reason
+names both versions (for example, "Unknown configuration fields: 1 (written by
+ha-spark 0.33.0; this is 0.32.0)"), the usual sign of a downgrade.
 
 This bootstrap-only state serves diagnostics and repair through ingress and
 the daemon socket. It builds no device drivers, runs no scheduler tick, computes

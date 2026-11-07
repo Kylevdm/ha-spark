@@ -26,6 +26,7 @@ from ha_spark.settings_service import ConfigurationRepair, SettingsService
 from tests.api_helpers import owner_client
 from tests.authority_helpers import legacy_settings, seed_authority, seed_settings
 from tests.test_plan_timeline import stored_run
+from tests.test_settings_store import store
 
 CANARY = "SECRET-SWEEP-466-DO-NOT-ECHO"
 
@@ -220,6 +221,35 @@ async def test_config_secret_canary_sweep(tmp_path, monkeypatch, capsys, caplog)
         surfaces.append(captured.out + captured.err)
     assert CANARY not in json.dumps(surfaces)
     assert CANARY not in caplog.text
+
+
+@pytest.mark.parametrize("writer", ["0.32.0-" + CANARY, "9.9.9"])
+def test_written_by_reason_secret_sweep(tmp_path, monkeypatch, caplog, writer):
+    from ha_spark import settings_service
+
+    context = execution_context()
+    monkeypatch.setattr(context, "config_generation", context.config_generation)
+    monkeypatch.setattr(settings_service, "__version__", "0.32.0")
+    service = store(tmp_path)
+    service.load(writable=True)
+    service.save({"min_soc": 22}, 1, "seed")
+    path = tmp_path / "ha_spark_config.json"
+    document = json.loads(path.read_text())
+    document["written_by"] = writer
+    document["settings"][CANARY] = CANARY
+    path.write_text(json.dumps(document))
+    repairing = store(tmp_path)
+    with pytest.raises(ConfigurationRepair) as caught:
+        repairing.load(writable=True)
+    expected = "Unknown configuration fields: 1"
+    if writer == "9.9.9":
+        expected += " (written by ha-spark 9.9.9; this is 0.32.0)"
+    assert str(caught.value) == expected
+    assert repairing.repair == [expected]
+    assert repairing.read_view()["reasons"] == [expected]
+    assert "Configuration repair: " + expected in caplog.text
+    surfaces = [str(caught.value), repairing.repair, repairing.read_view(), caplog.text]
+    assert CANARY not in json.dumps(surfaces)
 
 
 def test_measured_history_secret_sweep(tmp_path, caplog):
