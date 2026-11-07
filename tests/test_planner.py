@@ -469,6 +469,72 @@ def test_same_day_event_reservations_are_not_charge_funded() -> None:
     assert "(funds reach-next-cheap-slot)" in format_plan(plan, "test")
 
 
+@pytest.mark.parametrize(
+    ("window_start", "expected_kwh"),
+    [(time(23, 30), 1.75), (time(23, 45), 1.875)],
+)
+@pytest.mark.parametrize("discounts", [False, True])
+def test_same_day_event_reserves_pre_window_share_of_straddled_slot(
+    window_start: time, expected_kwh: float, discounts: bool,
+) -> None:
+    config = replace(_same_day_cfg(), window_start=window_start)
+    inputs = _current_event_inputs(
+        _same_day_inputs(soc_now=60.0, now=datetime(2026, 6, 8, 16, 0, tzinfo=UTC)),
+        config,
+    )
+    boundary = datetime(2026, 6, 8, 23, 30, tzinfo=UTC)
+    if discounts:
+        assert inputs.geometry is not None
+        inputs = replace(
+            inputs,
+            solar_slots=tuple(
+                0.25 if start == boundary else 0.0 for start in inputs.geometry.slot_starts
+            ),
+            dispatches=(DispatchSlot(boundary, boundary + timedelta(minutes=30)),),
+        )
+
+    plan = _plan(inputs, config)
+
+    assert plan.charge_intent.export is not None
+    # The event's reservation comes before the main slot reservation with the
+    # same name. At this SoC no protected energy is spent on export buy-back.
+    post_event = next(r for r in plan.reservations if r.name == "reach-next-cheap-slot")
+    assert post_event.target_time == boundary
+    # 20:00–23:30 is 1.75 kWh; 23:30–23:45 adds 0.125 kWh, undiscounted
+    # even when solar and a cheap dispatch cover the straddled slot.
+    assert post_event.energy_kwh == pytest.approx(expected_kwh)
+
+
+@pytest.mark.parametrize("soc_now", [29.0, 90.0])
+def test_same_day_event_with_a_collapsed_window_adds_no_straddled_share(soc_now: float) -> None:
+    """A window both of whose ends fall in the spring-forward gap covers no slot."""
+    london = ZoneInfo("Europe/London")
+    now = datetime(2026, 3, 28, 23, 0, tzinfo=london)
+    config = replace(_same_day_cfg(), window_start=time(1, 0), window_end=time(2, 0))
+    geometry = compute_horizon_geometry(now, config.window_start, config.window_end, london)
+    assert geometry.window_slot_range == (0, 0)
+    n = len(geometry.slot_starts)
+    event = replace(
+        _SAME_DAY_EVENT,
+        start=datetime(2026, 3, 29, 0, 0, tzinfo=UTC),
+        end=datetime(2026, 3, 29, 1, 0, tzinfo=UTC),
+        updated_at=now,
+    )
+    inputs = PlannerInputs(
+        soc=_soc(soc_now), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=0.25 * n,
+        load_slots=(0.25,) * n, solar_slots=(0.0,) * n, geometry=geometry,
+        horizon_start=geometry.horizon_start, flexibility_event=event, now=now,
+    )
+
+    plan = _plan(inputs, config)
+
+    post_event = [r for r in plan.reservations if r.name == "reach-next-cheap-slot"]
+    assert plan.charge_intent.export is not None
+    # The event's post reservation comes first and reserves nothing: no slot
+    # lies between the event and a window that covers none.
+    assert post_event[0].energy_kwh == pytest.approx(0.0)
+
+
 def test_same_day_export_is_funded_from_the_live_soc() -> None:
     """An event earlier than tonight's window is planned from the battery as it is now."""
     plan = _same_day_plan(
