@@ -3,6 +3,7 @@
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers.translation import async_get_translations
@@ -254,6 +255,73 @@ async def test_dependent_deletes_refused(hass: HomeAssistant) -> None:
     assert "topology" not in entry.options
 
 
+@pytest.mark.parametrize(
+    "key,item_id,error",
+    [
+        ("banks", "bank", "bank_in_use"),
+        ("connections", "grid", "connection_in_use"),
+        ("inverters", "inv1", "remove_last"),
+    ],
+)
+async def test_refused_remove_returns_to_menu_with_draft(
+    hass: HomeAssistant, key: str, item_id: str, error: str,
+) -> None:
+    """A refused removal keeps unsaved items through the eventual save."""
+    entry = entry_for(hass)
+    flow_id = await open_topology(hass, entry)
+    await build_base(hass, flow_id)
+    await choose(hass, flow_id, key)
+    await choose(hass, flow_id, f"{key}_remove")
+    result = await hass.config_entries.options.async_configure(flow_id, {"id": item_id})
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "remove_refused"
+    assert result["errors"] == {"base": error}
+    result = await hass.config_entries.options.async_configure(flow_id, {})
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == key
+    assert f"{key}_remove" in result["menu_options"]
+    assert f"{key}_edit" in result["menu_options"]
+    await choose(hass, flow_id, f"{key}_done")
+    with patch.object(hass.config_entries, "async_reload", return_value=True):
+        result = await choose(hass, flow_id, "save")
+        await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert [item["id"] for item in entry.options["topology"][key]] == [item_id]
+    assert entry.options["topology"]["inverters"][0]["charge_limit_a"] == 50
+
+
+async def test_heating_only_heat_pump_saved(hass: HomeAssistant) -> None:
+    """Seasonal validation permits no cooling, without relaxing heating."""
+    entry = entry_for(hass)
+    flow_id = await open_topology(hass, entry)
+    await build_base(hass, flow_id)
+    await choose(hass, flow_id, "major_loads")
+    await choose(hass, flow_id, "major_loads_add")
+    await hass.config_entries.options.async_configure(flow_id, {"kind": "heat_pump"})
+    for heating, cooling, errors in (
+        (0, 3, {"heating_demand_kw": "out_of_range"}),
+        (4, -1, {"cooling_demand_kw": "out_of_range"}),
+    ):
+        result = await hass.config_entries.options.async_configure(flow_id, {
+            "id": "heat", "connection_id": "grid",
+            "heating_demand_kw": heating, "cooling_demand_kw": cooling,
+        })
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == errors
+    result = await hass.config_entries.options.async_configure(flow_id, {
+        "id": "heat", "connection_id": "grid",
+        "heating_demand_kw": 4, "cooling_demand_kw": 0,
+    })
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "major_loads"
+    await choose(hass, flow_id, "major_loads_done")
+    with patch.object(hass.config_entries, "async_reload", return_value=True):
+        result = await choose(hass, flow_id, "save")
+        await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options["topology"]["major_loads"][0]["cooling_demand_kw"] == 0
+
+
 async def test_draft_level_refusals(hass: HomeAssistant) -> None:
     """Ids are unique site-wide and only one EV charger dispatches drives."""
     entry = entry_for(hass)
@@ -426,9 +494,11 @@ async def test_topology_flow_translations(hass: HomeAssistant) -> None:
         "inverters_edit", "inverters_remove", "v2l_chargers", "v2l_chargers_item",
         "v2l_chargers_edit", "v2l_chargers_remove", "major_loads",
         "major_load_kind", "major_load_ev", "major_load_heat", "major_loads_edit",
-        "major_loads_remove", "save", "fallback", "notify",
+        "major_loads_remove", "remove_refused", "save", "fallback", "notify",
     ):
         assert translations[f"{prefix}step.{step}.title"], step
+    assert translations[f"{prefix}step.major_load_heat.data_description.cooling_demand_kw"]
+    assert translations[f"{prefix}step.remove_refused.description"]
     menu_options = {
         "init": ("solcast", "topology", "soc", "notify", "fallback"),
         "topology": (

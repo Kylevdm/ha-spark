@@ -693,9 +693,9 @@ finite and within its field's range.
 - **Major load:** kind EV charger or heat pump; grid connection; optional power
   sensor. An EV charger has demand over 0 up to 50 kW (default 7.4 kW) and can
   be marked **The one dispatches drive** (at most one site-wide). A heat pump
-  needs both heating and cooling demand over 0 up to 50 kW, with no default,
-  and counts at the larger. Induction hobs and electric showers are not major
-  loads; they stay in base load.
+  needs both a heating demand over 0 up to 50 kW and a cooling demand from 0
+  (0 if it doesn't cool) up to 50 kW, with no default, and counts at the larger.
+  Induction hobs and electric showers are not major loads; they stay in base load.
 
 **Effective limits.** The add-on recomputes effective limits from the validated
 topology; the integration sends only owner values and never a computed limit.
