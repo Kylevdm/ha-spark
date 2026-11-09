@@ -40,23 +40,42 @@ def test_battery_direction_bits_clock_and_bad_words() -> None:
     assert decode(signed, (), None) is None
 
 
-@pytest.mark.parametrize(("address", "count", "expected"), [
-    (33029, 2, 65538), (33031, 2, 65538), (33033, 2, 65538),
-    (33035, 1, 0.1), (33036, 1, 0.1), (33037, 2, 65538), (33039, 2, 65538),
-    (33126, 2, 65.538),
-    (33161, 2, 65538), (33163, 1, 0.1), (33164, 1, 0.1),
-    (33165, 2, 65538), (33167, 1, 0.1), (33168, 1, 0.1),
-    (33169, 2, 65538), (33171, 1, 0.1), (33172, 1, 0.1),
-    (33173, 2, 65538), (33175, 1, 0.1), (33176, 1, 0.1),
-    (33177, 2, 65538), (33179, 1, 0.1), (33180, 1, 0.1),
-    (33186, 2, 65538), (33188, 2, 65538),
+@pytest.mark.parametrize(("address", "count", "expected", "state_class"), [
+    (33029, 2, 65538, "total_increasing"), (33031, 2, 65538, "total_increasing"),
+    (33033, 2, 65538, None), (33035, 1, 0.1, "total_increasing"),
+    (33036, 1, 0.1, None), (33037, 2, 65538, "total_increasing"), (33039, 2, 65538, None),
+    (33126, 2, 65.538, "total_increasing"),
+    (33161, 2, 65538, "total_increasing"), (33163, 1, 0.1, "total_increasing"),
+    (33164, 1, 0.1, None),
+    (33165, 2, 65538, "total_increasing"), (33167, 1, 0.1, "total_increasing"),
+    (33168, 1, 0.1, None),
+    (33169, 2, 65538, "total_increasing"), (33171, 1, 0.1, "total_increasing"),
+    (33172, 1, 0.1, None),
+    (33173, 2, 65538, "total_increasing"), (33175, 1, 0.1, "total_increasing"),
+    (33176, 1, 0.1, None),
+    (33177, 2, 65538, "total_increasing"), (33179, 1, 0.1, "total_increasing"),
+    (33180, 1, 0.1, None),
+    (33186, 2, 65538, "total_increasing"), (33188, 2, 65538, "total_increasing"),
 ])
-def test_energy_tier_table(address: int, count: int, expected: float) -> None:
+def test_energy_tier_table(
+    address: int, count: int, expected: float, state_class: str | None,
+) -> None:
     point = next(p for p in POINTS if p.address == address)
     assert point.count == count
     assert decode(point, (1, 2)[:count], None) == expected
     assert (point.unit, point.device_class, point.state_class) == (
-        "kWh", "energy", "total_increasing")
+        "kWh", "energy", state_class)
+
+
+def test_previous_period_defaults_and_lifetime_state_class() -> None:
+    previous = {33033, 33036, 33039, 33164, 33168, 33172, 33176, 33180}
+    lifetime = {33029, 33126, 33161, 33165, 33169, 33173, 33177, 33186, 33188}
+    for point in POINTS:
+        if point.address in previous:
+            assert point.state_class is None
+            assert not point.primary
+        if point.address in lifetime:
+            assert point.state_class == "total_increasing"
 
 
 def test_schedule_round_robin_and_one_request_per_second() -> None:

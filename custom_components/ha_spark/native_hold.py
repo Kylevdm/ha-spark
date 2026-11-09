@@ -27,7 +27,8 @@ class EvidenceSource(Record):
 
     @model_validator(mode="after")
     def valid_source(self) -> Self:
-        if (self.source == "entity") != (self.entity_id is not None):
+        if (self.source == "entity" and "max_age_s" not in self.model_fields_set
+                or (self.source == "entity") != (self.entity_id is not None)):
             raise ValueError("invalid evidence source")
         return self
 

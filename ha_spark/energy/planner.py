@@ -704,6 +704,10 @@ def _event_export_plan(
         net[i] if pre_window_event else (1.0 - schedule.cheap_fracs[i]) * net[i]
         for i in range(after_event, target_slot)
     ]
+    # A window covering no slot (both ends in a DST gap) leaves target_slot
+    # before the event: there is no straddled slot to add.
+    if pre_window_event and after_event <= target_slot < len(net):
+        post_needs.append(_pre_window_share(geometry, target_slot) * net[target_slot])
     post_need = sum(post_needs)
     buffered_post_energy = post_need * (1.0 + cfg.buffer_pct / 100.0)
     post_energy = (

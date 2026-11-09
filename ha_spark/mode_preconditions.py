@@ -4,16 +4,19 @@ Uses the driver's model-qualified hold contract and existing fallback validator.
 The daemon supplies this tick's checked SoC and live programming hold; diagnostic
 callers check a fresh observation and read the persisted monitor state, but must
 not treat a prior tick's measurement as a new grant.
+Retired sites skip legacy inverter entity checks; their diagnostic SoC is unavailable.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
+from ha_spark.authority import retirement_status
 from ha_spark.config import Settings
 from ha_spark.devices import get_device
 from ha_spark.devices.execution import execution_context
 from ha_spark.devices.inverters.solis import validate_fallback_schedule
-from ha_spark.energy.soc_integrity import SocMeasurement
+from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor, observe_soc
 from ha_spark.energy.topology_record import load_topology_record, unconfirmed_limits
 from ha_spark.ha.rest import HomeAssistantRest, HomeAssistantRestError
@@ -36,11 +39,18 @@ def fallback_schedule_problem(settings: Settings) -> str | None:
 
 
 async def entry_preconditions(settings: Settings) -> dict[str, Any]:
-    """Read live diagnostic entry conditions without initialising or saving authority."""
+    """Read live diagnostic entry conditions without initialising or saving authority.
+
+    On a retired site the integration checks entry itself (its placeholder is
+    shown while a snapshot is live), so SoC here is always unavailable.
+    """
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
     ) as rest:
-        soc = await observe_soc(settings, rest)
+        if retirement_status(settings) is not None:
+            soc = SocMeasurement(SocStatus.UNAVAILABLE, datetime.now(UTC))
+        else:
+            soc = await observe_soc(settings, rest)
         monitor = SocMonitor.load(settings)
         report = await check_preconditions(
             settings, rest, soc,
@@ -58,11 +68,12 @@ async def check_preconditions(
     *, soc_programming_held: bool,
 ) -> PreconditionReport:
     """Report every failed entry condition with GETs only; no refresh services."""
+    native = retirement_status(settings) is not None
     failures: list[str] = []
     inverters = [config for config in settings.devices if config.type == "inverter"]
     if len(inverters) != 1:
         failures.append("Protect requires exactly one inverter")
-    for config in inverters:
+    for config in (() if native else inverters):
         try:
             device = get_device(config, settings, rest)
         except ValueError:
@@ -110,7 +121,11 @@ async def check_preconditions(
         optimise.append(fallback)
     if soc is None or not soc.ok:
         # Do not echo raw untrusted entity states (which could contain secrets).
-        optimise.append("this tick's checked SoC measurement must pass")
+        if native:
+            status = soc.status.value if soc is not None else "unavailable"
+            optimise.append(f"native snapshot SoC must be trusted and fresh ({status})")
+        else:
+            optimise.append("this tick's checked SoC measurement must pass")
     if soc_programming_held:
         optimise.append("SoC fallback or recovery is in progress; wait for SoC recovery")
     return PreconditionReport(protect=tuple(failures), optimise=tuple(optimise))

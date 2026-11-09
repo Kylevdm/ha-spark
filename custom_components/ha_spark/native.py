@@ -10,7 +10,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import NAMESPACE_URL, uuid5
 
 from homeassistant.config_entries import ConfigEntry
@@ -19,6 +19,7 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
+from .modbus_fence import hub_conflict
 from .native_hold import hold_identity_valid
 from .solis_frames import Reading, Schedule
 from .solis_identity import caching_on, identity_reason
@@ -128,7 +129,17 @@ class NativeDevices:
             for c in claims
         )
 
+    def fence_reason(self, inverter: Inverter) -> str | None:
+        """Repairs, the snapshot and writes: the Modbus hub fence, then device validity.
+
+        HA's own Modbus on this gateway fences writes only; reads continue, so
+        ``reason()`` (SoC trust, polling) never includes it.
+        """
+        conflict = hub_conflict(self.hass, inverter.gateway_host, inverter.gateway_port)
+        return conflict if conflict is not None else self.reason(inverter)
+
     def reason(self, inverter: Inverter) -> str | None:
+        """Device validity for reads; excludes the Modbus hub fence."""
         if not hold_identity_valid(inverter):
             return "unvalidated_identity"
         if self.held_remapped():
@@ -154,6 +165,17 @@ class NativeDevices:
                 or overlay.get(inverter.id) is not False):
             return "gateway_not_owned"
         return None
+
+    def write_reason(
+        self, inverter: Inverter,
+    ) -> Literal["modbus_hub_conflict", "read_only"] | None:
+        """Keep detailed repair reasons local; expose one fixed Modbus write refusal."""
+        reason = self.fence_reason(inverter)
+        if reason is None:
+            return None
+        if reason in ("modbus_hub_conflict", "modbus_hub_unreadable"):
+            return "modbus_hub_conflict"
+        return "read_only"
 
     async def async_reprobe(self, inverter_id: str) -> bool:
         """Admin command/service seam; also used for startup and reconnect reads."""
@@ -216,7 +238,7 @@ class NativeDevices:
             return
         for inverter in self.inverters.values():
             issue = self.issue_id(inverter)
-            reason = self.reason(inverter)
+            reason = self.fence_reason(inverter)
             if reason is None:
                 ir.async_delete_issue(self.hass, DOMAIN, issue)
             else:

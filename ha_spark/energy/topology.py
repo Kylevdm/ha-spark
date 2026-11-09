@@ -27,6 +27,8 @@ EntityId = Annotated[str, Field(strict=True, pattern=r"^[a-z0-9_]+\.[a-z0-9_]+$"
 Current = Annotated[float, Field(strict=True, ge=0, le=500, allow_inf_nan=False)]
 SupplyCurrent = Annotated[float, Field(strict=True, ge=0, le=200, allow_inf_nan=False)]
 Demand = Annotated[float, Field(strict=True, gt=0, le=50, allow_inf_nan=False)]
+# A heat pump that doesn't cool declares 0.
+CoolingDemand = Annotated[float, Field(strict=True, ge=0, le=50, allow_inf_nan=False)]
 Percent = Annotated[float, Field(strict=True, ge=0, le=100, allow_inf_nan=False)]
 DriverKind = Literal["solis", "alphaess"]
 
@@ -123,7 +125,7 @@ class MajorLoad(FrozenModel):
     kind: Literal["ev_charger", "heat_pump"]
     demand_kw: Demand | None = None
     heating_demand_kw: Demand | None = None
-    cooling_demand_kw: Demand | None = None
+    cooling_demand_kw: CoolingDemand | None = None
     power_entity: EntityId | None = None
     dispatch_driven: Annotated[bool, Field(strict=True)] = False
 

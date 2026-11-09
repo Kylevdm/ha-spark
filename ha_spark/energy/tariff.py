@@ -23,6 +23,7 @@ the Octopus standard-unit-rates API.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
 from typing import Protocol
@@ -143,25 +144,36 @@ def _cycle_cheap_slots(
     return tuple(slots)
 
 
+def _project_prices(
+    starts: Sequence[datetime],
+    points: tuple[PricePoint, ...],
+    origin: datetime,
+    *,
+    absolute: bool,
+) -> list[float | None]:
+    """Project price points onto 30-minute slot starts: last match wins,
+    ``None`` where uncovered. The one projection for cycle and horizon pricing (#408).
+    """
+    prices: list[float | None] = [None] * len(starts)
+    for pt in points:
+        a = _hours_since(origin, pt.start, absolute=absolute)
+        b = _hours_since(origin, pt.end, absolute=absolute)
+        for j, start in enumerate(starts):
+            sa = _hours_since(origin, start, absolute=absolute)
+            if max(a, sa) < min(b, sa + 0.5):
+                prices[j] = pt.price
+    return prices
+
+
 def _cycle_slot_prices(
     starts: tuple[datetime, ...],
     points: tuple[PricePoint, ...],
     inputs: PlannerInputs,
     geometry: HorizonGeometry,
 ) -> list[float | None]:
-    """Per-cycle-slot live price via time overlap with ``points``, elapsed
-    slots included; ``None`` where the feed misses, exactly as
-    :func:`_slot_prices_from_points` prices the horizon slots."""
-    origin = _geometry_origin(inputs, geometry)
-    prices: list[float | None] = [None] * len(starts)
-    for pt in points:
-        a = _hours_since(origin, pt.start, absolute=True)
-        b = _hours_since(origin, pt.end, absolute=True)
-        for j, start in enumerate(starts):
-            sa = _hours_since(origin, start, absolute=True)
-            if max(a, sa) < min(b, sa + 0.5):
-                prices[j] = pt.price
-    return prices
+    """Per-cycle-slot live price via :func:`_project_prices`, elapsed slots
+    included; ``None`` where the feed misses, as for the horizon slots."""
+    return _project_prices(starts, points, _geometry_origin(inputs, geometry), absolute=True)
 
 
 def _carry_cycle_marks(
@@ -297,25 +309,18 @@ def _slot_prices_from_points(
     n_slots: int, horizon_start: datetime | None, points: tuple[PricePoint, ...],
     inputs: PlannerInputs, cfg: PlannerConfig,
 ) -> list[float | None]:
-    """Per-slot live price via time overlap with ``points``; ``None`` where uncovered."""
+    """Per-horizon-slot live price via :func:`_project_prices`; ``None`` where uncovered."""
     prices: list[float | None] = [None] * n_slots
-    if horizon_start is None:
+    if horizon_start is None or not points:
         return prices
     geometry = inputs.geometry_for(cfg)
     absolute = inputs.geometry is not None
     origin = inputs.now if absolute and inputs.now is not None else horizon_start
-    for pt in points:
-        a = _hours_since(origin, pt.start, absolute=absolute)
-        b = _hours_since(origin, pt.end, absolute=absolute)
-        for i in range(n_slots):
-            slot_start = (
-                _hours_since(origin, geometry.slot_starts[i], absolute=absolute)
-                if geometry is not None else i * 0.5
-            )
-            slot_end = slot_start + 0.5
-            if max(a, slot_start) < min(b, slot_end):
-                prices[i] = pt.price
-    return prices
+    starts = (
+        [geometry.slot_starts[i] for i in range(n_slots)] if geometry is not None
+        else [horizon_start + timedelta(minutes=30 * i) for i in range(n_slots)]
+    )
+    return _project_prices(starts, points, origin, absolute=absolute)
 
 
 @dataclass(frozen=True)

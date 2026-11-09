@@ -1,6 +1,8 @@
 """Supervised export commands, bound diagnostics and store/snapshot records."""
 
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, cast
 from unittest.mock import AsyncMock
@@ -9,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from freezegun.api import FrozenDateTimeFactory
 from pydantic import JsonValue
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.ha_spark.commands import Command
 from custom_components.ha_spark.coordinator import SparkCoordinator
@@ -1078,3 +1081,312 @@ async def test_a_clock_hold_whose_clear_fails_stays_retryable(
     result = await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
     assert result.outcome == "unverified"
     assert [kind for kind, _ in transition_kinds(writer)] == ["accepted", "clock_hold"]
+
+
+async def test_held_window_retries_verifies_and_matches_notice_fixture(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, freezer: FrozenDateTimeFactory,
+) -> None:
+    from tests_ha.fake_solis import WriteFault
+
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    native_transport.inject_write_fault(WriteFault("silent_noop"), address=43143, times=2)
+    for sequence in (2, 3):
+        result = await writer._async_dispatch_command(apply_command(
+            writer, [window_intent()], sequence=sequence))
+        assert result.outcome == "unverified"
+        assert transition_kinds(writer) == [("accepted", None), ("unverified", "unverified")]
+        state = writer.authority.state
+        assert state is not None
+        assert state.export_transitions[-1].cleared is False
+        assert state.export_records[-1].state != "armed"
+        native_transport.advance(1)
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [window_intent()], sequence=4))
+    assert result.outcome in ("applied", "unchanged")
+    assert transition_kinds(writer)[-1] == ("armed", None)
+    later = NOW + timedelta(hours=2, minutes=1)
+    freezer.move_to(later)
+    await writer.async_abort_held_exports(later)
+    assert "aborted" not in [kind for kind, _ in transition_kinds(writer)]
+    trusted_evidence(writer)
+    registers = (26, 11, 2, 14, 1, 0)
+    native_transport.set_input(33022, list(registers))
+    writer.native.readings["inv1"]["input_33022"] = Reading(later, registers, 0)
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [window_intent()], sequence=5))
+    assert result.outcome in ("applied", "unchanged")
+    state = writer.authority.state
+    assert state is not None and writer.guard is not None
+    snapshot = writer._export_snapshot(state, writer.guard.topology)
+    rows = cast(list[dict[str, object]], snapshot[0]["transitions"])
+    fixture = json.loads((Path(__file__).parents[1] /
+                         "tests/fixtures/contract/export_transitions_held.json").read_text())
+    assert [{k: v for k, v in row.items() if k not in ("id", "at")} for row in rows] == [
+        {k: v for k, v in row.items() if k not in ("id", "at")} for row in fixture]
+    # Flush the Store writes the clock jump left pending (#666 lingering timers).
+    async_fire_time_changed(writer.hass, later + timedelta(minutes=1))
+    await writer.hass.async_block_till_done()
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_unverified_current_is_held_only_when_cleanup_verifies(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, cleanup_fails: bool,
+) -> None:
+    from tests_ha.fake_solis import WriteFault
+
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    native_transport.inject_write_fault(WriteFault("silent_noop"), address=43142)
+    if cleanup_fails:
+        native_transport.set_holding(43143, [0, 0, 0, 0, 14, 0, 15, 0])
+        native_transport.inject_write_fault(WriteFault("exception"), address=43143)
+    await writer._async_dispatch_command(apply_command(writer, [window_intent()], sequence=2))
+    state = writer.authority.state
+    assert state is not None
+    row = state.export_transitions[-1]
+    assert (row.kind, row.reason, row.cleared) == (
+        "aborted" if cleanup_fails else "unverified", "unverified", not cleanup_fails)
+
+
+async def test_held_event_start_aborts_once_without_writing(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests_ha.fake_solis import WriteFault
+
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    native_transport.inject_write_fault(WriteFault("silent_noop"), address=43143)
+    await writer._async_dispatch_command(apply_command(writer, [window_intent()], sequence=2))
+    native_transport.traffic.clear()
+    await writer.async_abort_held_exports(NOW + timedelta(hours=2))
+    await writer.async_abort_held_exports(NOW + timedelta(hours=2, seconds=30))
+    assert transition_kinds(writer) == [
+        ("accepted", None), ("unverified", "unverified"), ("aborted", "unverified")]
+    assert native_transport.traffic == []
+
+
+@pytest.mark.parametrize("reason", [
+    "invalid_intent", "export_bound_unverified", "hold_overlaps_export", "tripped",
+])
+async def test_terminal_refusals_abort_immediately_not_held(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, reason: str,
+) -> None:
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    state = writer.authority.state
+    assert state is not None and writer.guard is not None
+    intent = window_intent()
+    if reason == "invalid_intent":
+        intent["planned_export_kw"] = -1
+    elif reason == "export_bound_unverified":
+        native_transport.set_identity(model=0x27)
+    elif reason == "hold_overlaps_export":
+        inverter = writer.guard.topology.inverters[0]
+        hold = HoldRecord(cause="ev", started_at=NOW, device=HoldDevice(
+            driver="solis_native", power_switch=inverter.id,
+            hub=f"{inverter.gateway_host}:{inverter.gateway_port}",
+            slave=inverter.gateway_unit_id), confirmed=True)
+        assert await writer.authority.async_save(state.model_copy(update={"holds": (hold,)}))
+    else:
+        event = EventIdentity.model_validate(EVENT)
+        latch = StopLatch(inverter_id="inv1", event=event,
+                          window_end=event.end, epoch=state.epoch)
+        assert await writer.authority.async_save(state.model_copy(
+            update={"stop_latches": (latch,)}))
+    await writer._async_dispatch_command(apply_command(writer, [intent], sequence=2))
+    assert transition_kinds(writer) == [("accepted", None), ("aborted", reason)]
+
+
+@pytest.mark.parametrize("after_start", [False, True])
+async def test_arm_failure_aborts_at_start_or_on_transport_failure(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, after_start: bool,
+) -> None:
+    from tests_ha.fake_solis import WriteFault
+
+    # An event already under way, rather than moving the clock (#666 timers).
+    event = ({"direction": "export", "start": (NOW - timedelta(minutes=1)).isoformat(),
+              "end": (NOW + timedelta(hours=1)).isoformat()} if after_start else EVENT)
+    allow_export(writer, monkeypatch, native_transport)
+    if after_start:
+        trusted_evidence(writer)
+    await arm(writer, event=event)
+    native_transport.inject_write_fault(
+        WriteFault("silent_noop" if after_start else "exception"), address=43143)
+    await writer._async_dispatch_command(apply_command(
+        writer, [window_intent(event=event)], sequence=2))
+    assert transition_kinds(writer) == [
+        ("accepted", None), ("aborted", "unverified" if after_start else "failed")]
+
+
+async def test_unverified_current_with_a_refused_cleanup_aborts(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.ha_spark import native_slots
+    from custom_components.ha_spark.commands import IntentResult
+    from tests_ha.fake_solis import WriteFault
+
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    native_transport.inject_write_fault(WriteFault("silent_noop"), address=43142)
+
+    async def refused(self: object) -> IntentResult:
+        return IntentResult(outcome="refused", reason="read_only")
+
+    monkeypatch.setattr(native_slots.NativeSlots, "clear_discharge", refused)
+    await writer._async_dispatch_command(apply_command(writer, [window_intent()], sequence=2))
+    state = writer.authority.state
+    assert state is not None
+    row = state.export_transitions[-1]
+    # Only a verified cleanup keeps the pass retryable; a refused one stays an abort.
+    assert (row.kind, row.reason, row.cleared) == ("aborted", "unverified", False)
+
+
+@pytest.mark.parametrize("rearmed", [True, False])
+async def test_a_hold_after_a_verified_arm_is_settled_only_by_a_live_record(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, rearmed: bool,
+) -> None:
+    from tests_ha.fake_solis import WriteFault
+
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    assert (await writer._async_dispatch_command(apply_command(
+        writer, [window_intent()], sequence=2))).outcome in ("applied", "unchanged")
+    native_transport.set_holding(43143, [0] * 8)
+    native_transport.inject_write_fault(WriteFault("silent_noop"), address=43143)
+    assert (await writer._async_dispatch_command(apply_command(
+        writer, [window_intent()], sequence=3))).outcome == "unverified"
+    assert [kind for kind, _ in transition_kinds(writer)] == [
+        "accepted", "armed", "unverified"]
+    native_transport.advance(1)
+    if rearmed:
+        # The re-arm verifies; `armed` is logged once per event, so the record decides.
+        assert (await writer._async_dispatch_command(apply_command(
+            writer, [window_intent()], sequence=4))).outcome in ("applied", "unchanged")
+    await writer.async_abort_held_exports(NOW + timedelta(hours=2))
+    kinds = [kind for kind, _ in transition_kinds(writer)]
+    assert ("aborted" in kinds) is not rearmed
+
+
+async def test_an_acked_hold_past_its_event_still_aborts(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests_ha.fake_solis import WriteFault
+
+    allow_export(writer, monkeypatch, native_transport)
+    await arm(writer)
+    native_transport.inject_write_fault(WriteFault("silent_noop"), address=43143)
+    await writer._async_dispatch_command(apply_command(writer, [window_intent()], sequence=2))
+    state = writer.authority.state
+    assert state is not None
+    ids = tuple(str(row.id) for row in state.export_transitions)
+    writer._export_snapshot(state, writer.guard.topology)  # type: ignore[union-attr]
+    await writer._async_ack_export_transitions(ids, NOW)
+    # HA was down across the whole event: setup's sweep runs before any prune.
+    await writer.async_abort_held_exports(NOW + timedelta(hours=4))
+    assert ("aborted", "unverified") in transition_kinds(writer)
+
+
+async def held_then_aborted(c: SparkCoordinator, transport: FakeSolisDevice,
+                            monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests_ha.fake_solis import WriteFault
+
+    allow_export(c, monkeypatch, transport)
+    await arm(c)
+    transport.inject_write_fault(WriteFault("silent_noop"), address=43143)
+    assert (await c._async_dispatch_command(apply_command(
+        c, [window_intent()], sequence=2))).outcome == "unverified"
+    await c.async_abort_held_exports(NOW + timedelta(hours=2))
+    assert transition_kinds(c)[-1] == ("aborted", "unverified")
+    transport.advance(1)
+    transport.traffic.clear()
+
+
+async def test_a_held_then_aborted_event_never_arms_again(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, freezer: FrozenDateTimeFactory,
+) -> None:
+    """Review step 7 M2: after "aborted", a later verified pass must not start it."""
+    await held_then_aborted(writer, native_transport, monkeypatch)
+    later = NOW + timedelta(hours=2, minutes=1)
+    freezer.move_to(later)
+    trusted_evidence(writer)
+    registers = (26, 11, 2, 14, 1, 0)
+    native_transport.set_input(33022, list(registers))
+    writer.native.readings["inv1"]["input_33022"] = Reading(later, registers, 0)
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [window_intent()], sequence=3))
+    assert (result.intents[0].outcome, result.intents[0].reason) == (
+        "refused", "export_aborted")
+    assert export_writes(native_transport) == []
+    kinds = [kind for kind, _ in transition_kinds(writer)]
+    assert "started" not in kinds and "armed" not in kinds
+    assert kinds.count("aborted") == 1
+    state = writer.authority.state
+    assert state is not None
+    assert all(r.state == "cleared" for r in state.export_records)
+    async_fire_time_changed(writer.hass, later + timedelta(minutes=1))
+    await writer.hass.async_block_till_done()
+
+
+async def test_a_held_then_aborted_event_is_refused_even_under_a_new_supervision(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await held_then_aborted(writer, native_transport, monkeypatch)
+    assert (await writer._async_dispatch_command(
+        command(writer, {"inv1": 3000.0}, sequence=3))).outcome == "applied"
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [window_intent()], sequence=4))
+    assert (result.intents[0].outcome, result.intents[0].reason) == (
+        "refused", "export_aborted")
+    assert export_writes(native_transport) == []
+    assert "armed" not in [kind for kind, _ in transition_kinds(writer)]
+
+
+async def test_a_held_then_aborted_event_stays_refused_after_restart(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await held_then_aborted(writer, native_transport, monkeypatch)
+    entry = writer.entry
+    assert await writer.hass.config_entries.async_reload(entry.entry_id)
+    await writer.hass.async_block_till_done()
+    restored: SparkCoordinator = entry.runtime_data
+    allow_export(restored, monkeypatch, native_transport)
+    restored.control.ready = True
+    restored.control.startup_complete = True
+    restored.control.grace_until = NOW - timedelta(seconds=1)
+    await restored.async_retry_export_records(NOW)
+    native_transport.traffic.clear()
+    result = await restored._async_dispatch_command(apply_command(
+        restored, [window_intent()], sequence=3))
+    assert (result.intents[0].outcome, result.intents[0].reason) == (
+        "refused", "export_aborted")
+    assert export_writes(native_transport) == []
+    assert "armed" not in [kind for kind, _ in transition_kinds(restored)]
+
+
+async def test_an_unheld_abort_does_not_block_a_later_arm(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a held event's abort is durable; other pre-start aborts behave as before."""
+    allow_export(writer, monkeypatch, native_transport)
+    await optimise(writer)
+    await writer._async_dispatch_command(apply_command(writer, [window_intent()], sequence=1))
+    assert transition_kinds(writer) == [("aborted", "not_supervised")]
+    assert (await writer._async_dispatch_command(
+        command(writer, {"inv1": 3000.0}, sequence=2))).outcome == "applied"
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [window_intent()], sequence=3))
+    assert result.intents[0].outcome in ("applied", "unchanged")
+    assert ("armed", None) in transition_kinds(writer)

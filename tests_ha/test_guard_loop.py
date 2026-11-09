@@ -115,7 +115,8 @@ async def test_fake_writer_and_mirror(
         await hass.async_block_till_done(wait_background_tasks=True)
     assert loop.limiting
     assert bool(fake.intents) == expected
-    assert loop.decisions[grid.id].warn_reason == (None if expected else "authority_unavailable")
+    assert loop.decisions[grid.id].warn_reason == (
+        None if expected else ("mode_observe" if mode == "observe" else "authority_unavailable"))
     if expected:
         assert fake.intents[-1].charge_a * site.banks[0].nominal_voltage_v <= 1000
     if expected:
@@ -297,6 +298,12 @@ async def test_failed_restore_save_keeps_ceiling(
     assert loop.allowance_kw[grid.id] == 1
     assert loop.states[grid.id].latched
     assert loop.decisions[grid.id].warn_reason == "guard_save_failed"
+    assert not fake.intents
+    # Later ticks keep the real mirror: a failed save is a known no-write state,
+    # never "authority unavailable" (#560/#650 precedence, review step 7 L1).
+    freezer.tick(timedelta(seconds=30))
+    await loop.async_evaluate()
+    assert loop.decisions[grid.id].warn_reason == "writes_not_permitted"
     assert not fake.intents
     await loop.async_stop()
 

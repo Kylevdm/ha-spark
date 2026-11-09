@@ -166,7 +166,7 @@ class ExportTransition(Record):
     event: EventIdentity
     at: AwareDatetime
     kind: Literal["accepted", "armed", "started", "cleanup_verified", "aborted",
-                  "clock_hold", "tripped"]
+                  "clock_hold", "tripped", "unverified"]
     reason: Text | None = None
     acked: bool = Field(default=False, strict=True)
     cleared: bool | None = Field(default=None, strict=True)

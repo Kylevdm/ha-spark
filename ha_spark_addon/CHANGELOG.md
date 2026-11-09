@@ -1,5 +1,132 @@
 # Changelog
 
+## 0.32.0
+
+- **Re-pairing after re-adding the integration (#645, #646, #601).** Removing
+  and re-adding the companion integration gives it a new site id. The add-on
+  now refuses the new entry's snapshots as `site_not_paired`, naming the fix,
+  and `ha-spark health` shows the paired and the last refused site id. Run
+  `ha-spark pair --replace --from <old id> --to <new id>` and type the new id
+  again to confirm. The daemon replaces the pairing only in Observe (or with
+  unknown authority) and with no pending ownership handshake or transition.
+  The new entry's topology revisions start again from 1, the last accepted
+  topology and limits stay in force until then, and snapshots from the old
+  entry are refused. The authority owner and operating mode are unchanged.
+
+- **Integration Modbus-hub fence (#647).** The integration now checks Home
+  Assistant's own `modbus` integration for a YAML hub or HA-managed connection
+  on the native gateway's claimed host and port. While one exists, or while
+  `modbus` is loaded but its connections can't be read, every native write
+  (charge, owner entity edits, holds, clock sync, fallback, supply guard and
+  export) is refused with the new reason `modbus_hub_conflict` and a repair
+  names the conflict; reads continue and the repair clears once the hub is
+  gone. Health reports it as `gateway_not_owned`. Third-party Modbus
+  integrations are not detected, so the runbook step to disconnect them stays
+  mandatory.
+
+- **Native hardening (#648).** An owner edit to a native charge, discharge or
+  power control during a pending authority transition is now refused as
+  `transition_in_progress` instead of `not_available`; a controller that is not
+  ready yet is still `not_available`. Clock-drift repairs for inverters no
+  longer in the accepted topology are removed on setup and after a topology
+  change. The add-on supply guard's read-failure log no longer includes the
+  error text; it still skips that pass as before.
+
+- Native holds now require an explicit maximum age for every entity evidence source. Invalid stored evidence remains unknown and raises a repair asking the owner to re-save protection evidence options; it cannot start or clear a hold.
+- Native hold reconciliation and removal release now check evidence freshness against the time after waiting for the control lock, so a long wait cannot make stale reports look fresh.
+
+- **Integration supply guard in Observe (#650, #560).** On an integration-owned
+  site in Observe the guard now shows the limit it would apply, marked
+  `simulated` on its entities and in diagnostics, clears it when the import
+  drops, and never latches or saves a cut; leaving Observe starts it clean.
+  The add-on's plan status doesn't report a simulated limit as charging
+  limited by the supply guard. Its warn reasons are now distinct:
+  `authority_unavailable` only for a missing or stale authority mirror,
+  `mode_observe` in Observe or a pending transition to Observe, and
+  `writes_not_permitted` for any other state that permits no writes, such as
+  a failed save. Protect and Optimise are unchanged.
+
+- The companion integration has a new **Notify target** option: a bare notify service name, checked when you save it. Native hold, degraded-evidence, refused-release and fallback notices go to it once each, with one repeat after 30 minutes while the problem persists. With no target set, or when a send fails or times out, the notice falls back to the persistent notification as before. Delivery never delays or changes a protection or fallback decision.
+
+- **Native SoC for integration-owned sites (#653, #495).** Once the
+  integration owns the site, the add-on never reads the configured SoC entity
+  or checks the legacy Solis write entities for entry preconditions: the
+  integration checks entry itself when you request a mode. Without a live
+  integration snapshot the mode page shows SoC as unavailable and mode
+  requests are refused as `authority_unknown`, never handled by the add-on's
+  retired authority store. `ha-spark health` adds a **Native SoC** row (the
+  snapshot's SoC, trust and age) and stops warning about the SoC, battery
+  voltage, charge current and power switch entities on those sites. Add-on-owned
+  sites are unchanged.
+
+- **Native export: a write that doesn't read back is held, not aborted (#654,
+  #406 native path).** On an integration-owned site, an export window or
+  discharge-current write that doesn't read back before the event starts now
+  sends one **Axle export held: write not verified** notice for that event,
+  with its safe result, and ha-spark retries every pass. **Axle export
+  aborted** is sent only when the event starts without a verified arm or a
+  cleanup fails; terminal refusals (invalid export, export bound, hold
+  overlap, SoC, a trip) still abort immediately. Notices still go out once per
+  event and step, across restarts. Once a held event is aborted it never arms
+  again: later passes, a new supervision and restarts refuse it as
+  `export_aborted`. Every other export gate is unchanged.
+  Install the add-on and the integration together: an older add-on refuses a
+  snapshot that carries the new transition.
+
+- **Native previous-period energy sensors have no state class (#655).** The
+  native inverter's yesterday, last-month and last-year energy sensors no
+  longer claim `total_increasing`, so Home Assistant keeps no long-term
+  statistics for them. They stay disabled by default, and the lifetime totals
+  are unchanged. If you enabled one before, clear its "no longer has a state
+  class" repair in **Developer tools → Statistics**.
+- **Site device lookup scoped to the config entry (#559, #634).** The
+  integration no longer calls Home Assistant's deprecated
+  `device_registry.async_get_device`, which logged a deprecation warning when
+  Solcast was configured and stops working in Home Assistant 2027.8. The
+  Solcast device now links only to this entry's own site device.
+
+- **Heating-only heat pumps can be entered (#558).** A heat pump's cooling
+  demand may now be 0 ("0 if it doesn't cool"). Heating stays required and
+  above 0, both fields stay required with no default, and the load still
+  counts at the larger of the two.
+- **A refused remove no longer traps the topology editor (#551).** Removing a
+  connection or bank that is still in use, or the last required item, shows
+  why on a confirm form; submitting it returns to that list's menu with your
+  unsaved changes kept.
+
+- **Carry over a lowered discharge ceiling (#657, #561).** `ha-spark health`
+  warns when a native inverter's effective DC discharge limit, converted using
+  its bank's nominal voltage, exceeds `battery_discharge_ceiling_kw`, whether
+  set or the default. The read-only warning uses the durable accepted topology
+  and never blocks control. The topology guide explains how to carry
+  the lower ceiling over as a DC current limit, rounded down.
+- **Discharge ceiling default rises to 3.68 kW (#657).** The default
+  `battery_discharge_ceiling_kw` is now the G98 limit (16 A at 230 V) instead
+  of 3.2 kW, on every site type. Installs that never set it get the higher
+  ceiling on upgrade; if you chose 3.2 kW deliberately, set it again in
+  Settings. G99-approved sites can set a higher value.
+
+- **Same-day export events reserve up to the window opening (#658, #407).**
+  When a paid export event ends before tonight's charge window and the window
+  opens partway through a half-hour (say 23:45), the energy reserved after the
+  event now also covers the house load in that half-hour before the window
+  opens, with the same strict protection as the rest of the reservation (no
+  solar or cheap-rate discount). Windows that open on the half-hour are
+  unchanged.
+
+- **Downgrade reason names the writing release (#660, #517).** The stored
+  settings document may now carry an optional `written_by` release version.
+  When a settings document holds unknown fields and records a different
+  writer, the configuration repair reason names both versions, for example
+  "Unknown configuration fields: 1 (written by ha-spark 0.33.0; this is
+  0.32.0)". A malformed `written_by` is ignored. This release reads the key
+  but never writes it, so downgrading from it still loads cleanly; a later
+  release will start writing it.
+
+- **Upgrade together.** Update the add-on and the integration to 0.32.0 at
+  the same time: a 0.31 integration fails closed on a store holding the new
+  `unverified` export row, and a 0.31 add-on refuses a snapshot carrying it.
+
 ## 0.31.0
 
 - **Add-on and integration now speak contract `api_version` 4 (#564).** Both

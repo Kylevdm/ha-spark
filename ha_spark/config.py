@@ -450,10 +450,11 @@ class Settings(BaseSettings):
     solis_fallback_current_a: Annotated[float | None, _metadata("integration")] = Field(
         default=None, ge=1, le=62.5
     )
-    # Conservative planning ceiling for battery discharge.  It is distinct
-    # from Solis's fixed hardware command and keeps the planner inverter-agnostic.
+    # Planning ceiling for battery discharge.  It is distinct from Solis's fixed
+    # hardware command and keeps the planner inverter-agnostic.  Defaults to the
+    # G98 limit (16 A at 230 V); raise it only to a G99-approved figure.
     battery_discharge_ceiling_kw: Annotated[float, _metadata("integration")] = Field(
-        default=3.2, ge=0
+        default=3.68, ge=0
     )
     # Installation-specific grid-export cap. Defaults to the G98 fit-and-inform
     # limit (16 A single-phase); raise it only to a G99-approved figure.

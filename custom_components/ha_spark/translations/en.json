@@ -1,5 +1,6 @@
 {
   "exceptions": {
+    "modbus_hub_conflict": {"message": "Home Assistant Modbus may be using this gateway. Resolve the native device repair before writing."},
     "entity_write_mode": {"message": "ha-spark owns this control in {mode}. Start manual control before editing it. Discharge controls require a manual session."},
     "protection_owned": {"message": "Protection owns the power switch. Start manual control without kept protection to edit it."},
     "read_only": {"message": "This device is read-only. Resolve its native device repair before writing."},
@@ -38,6 +39,10 @@
     "resume_control": {"name": "Resume control", "description": "End manual control using current conditions."}
   },
   "issues": {
+    "evidence_options_invalid": {
+      "title": "Protection evidence options need saving again",
+      "description": "The stored native protection evidence settings are invalid, for example an entity source without a maximum age. Open the integration options, choose Native protection evidence, check every source and its maximum age, then continue to Site topology and Save. Until then no new protection hold starts, and an existing hold is kept until its last trusted dispatch end or an explicit handover."
+    },
     "export_reading_missing": {
       "title": "Site grid reading missing during an export",
       "description": "The whole-site grid power reading has been missing or stale for over two minutes while a supervised export is live. The export continues within the inverter's confirmed bound; the tripwire cannot watch the site export limit until the reading returns."
@@ -57,6 +62,7 @@
           "not_available": "The integration is stopping or unavailable.",
           "invalid_household_zone": "Configure a valid household time zone first.",
           "read_only": "The inverter is read-only. Resolve its native device repair first.",
+          "modbus_hub_conflict": "Home Assistant Modbus may be using this gateway. Resolve the native device repair first.",
           "unverified": "The clock write could not be verified. Check connectivity and try again.",
           "failed": "The clock write failed. Check connectivity and try again."
         },
@@ -72,6 +78,8 @@
     "native_unvalidated_identity": {"title": "Solis identity not validated", "description": "This identity is not in the validated allow-list. The device remains read-only."},
     "native_v2_tou_firmware": {"title": "Unsupported Solis TOU firmware", "description": "V2 TOU firmware is read-only. Do not enable automatic control."},
     "native_caching_on": {"title": "Gateway caching detected", "description": "Disable gateway storage mode, then Re-probe. Read-back is not trustworthy while caching is on."},
+    "native_modbus_hub_conflict": {"title": "Home Assistant Modbus uses the Solis gateway", "description": "Home Assistant's Modbus integration has a hub or connection on this gateway. Remove or disable it. Reads continue; native writes stay blocked until it is gone."},
+    "native_modbus_hub_unreadable": {"title": "Home Assistant Modbus connections unreadable", "description": "Home Assistant's Modbus integration is loaded but its connections could not be read. Native writes stay blocked; reads continue. Check the Modbus integration after a Home Assistant update."},
     "native_gateway_not_owned": {"title": "Solis gateway not owned", "description": "Confirm the gateway claim in native setup, complete the authority handshake and remove the legacy overlay. Reads continue; writes remain blocked."},
     "ownership_peer_version": {
       "title": "Authority switch refused",
@@ -292,6 +300,8 @@
   },
   "options": {
     "error": {
+      "invalid_notify_target": "Enter a bare lowercase notify service name using letters, numbers and underscores, not notify. or send_message.",
+      "unknown_notify_target": "This notify service is not available. Choose an existing service or leave the field empty.",
       "invalid_manual_time": "Enter a valid HH:MM deadline and household time zone.",
       "invalid_evidence": "Configure EV status, battery direction and a positive finite maximum age for every configured source.",
       "invalid_soc_policy": "Enter a positive finite report age and whole-number failure and recovery settings of at least one.",
@@ -334,9 +344,20 @@
           "solcast": "Solcast daily allowance",
           "manual": "Manual control deadline",
           "soc": "Native SoC trust policy",
+          "notify": "Notify target",
           "evidence": "Native protection evidence",
           "fallback": "Native fallback schedule",
           "topology": "Site topology and limits"
+        }
+      },
+      "notify": {
+        "title": "Notify target",
+        "description": "Enter a bare notify service name such as mobile_app_yourphone, without notify. Leave empty to clear it. Unset or failed sends use a persistent notification. Delivery never gates control.",
+        "data": {
+          "notify_target": "Notify service name"
+        },
+        "data_description": {
+          "notify_target": "Lowercase letters, numbers and underscores only; the service must exist. Entity-based send_message is not supported."
         }
       },
       "evidence": {
@@ -553,7 +574,10 @@
       },
       "major_load_heat": {
         "title": "Heat pump",
-        "description": "One heat pump with both seasonal demands; it counts at the larger.",
+        "description": "One heat pump; heating above 0 and cooling (0 if it doesn't cool) are both required. It counts at the larger.",
+        "data_description": {
+          "cooling_demand_kw": "0 if it doesn't cool."
+        },
         "data": {
           "id": "Identifier",
           "connection_id": "Grid connection",
@@ -561,6 +585,10 @@
           "cooling_demand_kw": "Cooling demand (kW)",
           "power_entity": "Power sensor"
         }
+      },
+      "remove_refused": {
+        "title": "Can't remove this item",
+        "description": "Submit to go back to the menu. Your unsaved changes are kept."
       },
       "major_loads_edit": {
         "title": "Edit a major load",

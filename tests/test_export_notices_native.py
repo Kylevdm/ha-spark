@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
 
 from ha_spark.api.contract import IntegrationLink
 from ha_spark.api.server import AppState
@@ -187,3 +191,55 @@ async def test_an_unknown_reason_is_never_echoed(tmp_path: Path) -> None:
     [call] = rest.calls
     assert "alice_host" not in str(call[2]["message"])
     assert "operation refused" in str(call[2]["message"])
+
+
+async def test_held_fixture_notifies_without_an_abort(tmp_path: Path) -> None:
+    rows = json.loads((Path(__file__).parent / "fixtures/contract/export_transitions_held.json")
+                      .read_text())
+    body = link(entry(*(ExportTransition.model_validate(row) for row in rows)))
+    rest = FakeRest()
+    await notify_export_transitions(settings(tmp_path), rest, body,  # type: ignore[arg-type]
+                                    acknowledged=set(), planned_for=lambda _: (None, None))
+    assert [call[2]["title"] for call in rest.calls] == [
+        "Axle export accepted", "Axle export held: write not verified", "Axle export started",
+    ]
+    message = str(rest.calls[1][2]["message"])
+    assert ("Safe result: the Solis export state was not verified; "
+            "switch to Observe and inspect it.") in message
+    assert "ha-spark retries every pass" in message
+    assert "aborted if it is not verified by the event start" in message
+
+
+@pytest.mark.parametrize("settled", ["started", "aborted"])
+async def test_held_dedupe_survives_restart_and_new_row_ids(
+    tmp_path: Path, settled: str,
+) -> None:
+    rest = FakeRest()
+    config = settings(tmp_path)
+    held = transition("held", "unverified", reason="unverified", cleared=True)
+    await notify_export_transitions(config, rest, link(entry(held)),  # type: ignore[arg-type]
+                                    acknowledged=set(), planned_for=lambda _: (None, None))
+    restarted = link(entry(held, transition("new_id", "unverified", cleared=True),
+                           transition("armed", "armed"), transition("settled", settled)))
+    for _ in range(2):
+        await notify_export_transitions(config, rest, restarted,  # type: ignore[arg-type]
+                                        acknowledged=set(), planned_for=lambda _: (None, None))
+    assert [call[2]["title"] for call in rest.calls] == [
+        "Axle export held: write not verified", f"Axle export {settled}",
+    ]
+    assert "Safe result: no export window remains programmed." in rest.calls[0][2]["message"]
+
+
+async def test_held_never_echoes_an_unknown_reason(tmp_path: Path) -> None:
+    rest = FakeRest()
+    await notify_export_transitions(
+        settings(tmp_path), rest,  # type: ignore[arg-type]
+        link(entry(transition("held", "unverified", reason="private_host"))),
+        acknowledged=set(), planned_for=lambda _: (None, None))
+    assert "private_host" not in str(rest.calls)
+    assert rest.calls[0][2]["title"] == "Axle export held: write not verified"
+
+
+def test_unknown_transition_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        transition("unknown", "private_host")
