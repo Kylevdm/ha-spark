@@ -1,5 +1,4 @@
 """Owner requests activate Optimise and hand charging back in verified order."""
-import asyncio
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -13,16 +12,8 @@ from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 from ha_spark.energy.scheduler import soc_monitor_tick
 from ha_spark.energy.soc_monitor import SocMonitor
 from ha_spark.transitions import PreconditionReport
-from tests.test_daemon_executor import running_daemon, settings_at
+from tests.test_daemon_executor import running_daemon, settings_at, wait_for
 from tests.test_mode_lifecycle import _hold
-
-
-async def wait_for(predicate):
-    for _ in range(200):
-        if predicate():
-            return
-        await asyncio.sleep(0.001)
-    assert predicate()
 
 
 @pytest.mark.parametrize("entry_mode", ["observe", "protect"])
@@ -63,7 +54,8 @@ async def test_optimise_activation_retries_without_preview_baseline(
             assert reply.error is None
             assert reply.authority["epoch"] == current.epoch + 1
             await wait_for(lambda: state.executor.authority.state.transition is not None
-                           and state.executor.authority.state.transition.failing_actions)
+                           and state.executor.authority.state.transition.failing_actions,
+                           "Optimise activation failure recorded")
             current = state.executor.authority.state
             assert current.committed_mode == "optimise"
             assert current.transition.steps == ("verify_fresh_plan",)
@@ -71,11 +63,12 @@ async def test_optimise_activation_retries_without_preview_baseline(
             assert calls[-1]["previous_plan"] is None
             attempts = device.apply.await_count
             protection_passes = device.reconcile_holds.await_count
-            await wait_for(lambda: device.apply.await_count > attempts)
+            await wait_for(lambda: device.apply.await_count > attempts, "next apply attempt")
             assert device.reconcile_holds.await_count > protection_passes
             assert state.executor.authority.state.transition is not None
             device.apply.return_value = [ActionLine("verified", ActionOutcome.VERIFIED)]
-            await wait_for(lambda: state.executor.authority.state.transition is None)
+            await wait_for(lambda: state.executor.authority.state.transition is None,
+                           "Optimise activation completed")
             assert caplog.text.count("disable any pre-existing automations") == 1
     finally:
         execution_context().authority = prior
@@ -127,7 +120,8 @@ async def test_optimise_handover_orders_steps_and_clears_fallback(
             reply = await state.executor.submit_mode(target, epoch)
             assert reply.error is None
             await wait_for(lambda: state.executor.authority.state.transition
-                           and state.executor.authority.state.transition.failing_actions)
+                           and state.executor.authority.state.transition.failing_actions,
+                           "handover failure recorded")
             current = state.executor.authority.state
             assert current.committed_mode == "optimise"
             assert current.transition.steps[0] == "write_fallback"
@@ -137,7 +131,8 @@ async def test_optimise_handover_orders_steps_and_clears_fallback(
             device.write_fallback.side_effect = None
             device.write_fallback.return_value = [ActionLine("fallback verified",
                                                            ActionOutcome.VERIFIED)]
-            await wait_for(lambda: state.executor.authority.state.transition is None)
+            await wait_for(lambda: state.executor.authority.state.transition is None,
+                           "handover completed")
             current = state.executor.authority.state
             assert current.committed_mode == target
             assert current.epoch == epoch + 2
@@ -271,10 +266,11 @@ async def test_activation_completes_past_unverified_protection_notes_and_guard_m
             current = state.executor.authority.state
             reply = await state.executor.submit_mode("optimise", current.epoch)
             assert reply.error is None
-            await wait_for(lambda: guard_grants)
+            await wait_for(lambda: guard_grants, "guard charging grant during activation")
             assert state.executor.authority.state.transition is not None
             assert guard_grants[0] == "on"
             device.apply.return_value = [ActionLine("verified", ActionOutcome.VERIFIED)]
-            await wait_for(lambda: state.executor.authority.state.transition is None)
+            await wait_for(lambda: state.executor.authority.state.transition is None,
+                           "activation completed after verified apply")
     finally:
         execution_context().authority = prior

@@ -14,7 +14,7 @@ from ha_spark.api.server import AppState, build_app
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import DaemonChannel, Reply, action_lines
 from tests.authority_helpers import seed_authority, seed_settings
-from tests.test_daemon_executor import running_daemon
+from tests.test_daemon_executor import await_result, running_daemon
 
 
 def settings_at(path: Path) -> Settings:
@@ -169,9 +169,9 @@ async def test_replan_through_the_route_writes_nothing_in_observe(
                 transport=httpx.ASGITransport(app=app, client=("proxy", 1)),
                 base_url="http://local",
             ) as client:
-                response = await asyncio.wait_for(client.post("/api/replan", json={}, headers={
+                response = await await_result(client.post("/api/replan", json={}, headers={
                     "X-Remote-User-Id": "owner", "X-HA-Spark-Request": "replan",
-                }), 5)
+                }), "Observe replan route reply")
             assert response.status_code == 200
             body = response.json()
             assert body["generated_at"] is not None

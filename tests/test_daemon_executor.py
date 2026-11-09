@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import socket
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TypeVar
 from unittest.mock import AsyncMock
 
 import httpx
@@ -23,6 +26,40 @@ from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 from ha_spark.energy import scheduler
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from tests.authority_helpers import seed_authority, seed_settings
+
+T = TypeVar("T")
+WAIT_TIMEOUT = 30.0
+
+
+async def wait_for(predicate: Callable[[], object], what: str) -> None:
+    """Wait for a condition; the deadline is only a diagnostic hang guard."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + WAIT_TIMEOUT
+    while not predicate():
+        if loop.time() >= deadline:
+            pytest.fail(f"Timed out waiting for {what}")
+        await asyncio.sleep(0.001)
+
+
+async def await_result(awaitable: Awaitable[T], what: str) -> T:
+    try:
+        return await asyncio.wait_for(awaitable, WAIT_TIMEOUT)
+    except TimeoutError:
+        pytest.fail(f"Timed out waiting for {what}")
+
+
+def stub_statistics(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Patch imported names: planning and background readiness/solar recording
+    # all use HA's separate WebSocket statistics API.
+    for module in ("forecast", "orchestrator", "readiness_measurements", "solar_measured",
+                   "onboarding", "derived_base_load"):
+        monkeypatch.setattr(
+            f"ha_spark.energy.{module}.statistics_during_period", AsyncMock(return_value=[]),
+        )
+    for module in ("readiness_measurements", "solar_measured", "onboarding", "derived_base_load"):
+        monkeypatch.setattr(
+            f"ha_spark.energy.{module}.list_statistic_ids", AsyncMock(return_value=[]),
+        )
 
 
 def settings_at(path: Path, **kwargs: object) -> Settings:
@@ -64,6 +101,7 @@ async def test_without_daemon_computes_but_never_actuates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], caller: str
 ) -> None:
     settings = settings_at(tmp_path)
+    stub_statistics(monkeypatch)
     respx.get(url__regex=r"http://ha.test/api/.*").mock(
         return_value=httpx.Response(200, json=[])
     )
@@ -93,6 +131,31 @@ async def test_without_daemon_computes_but_never_actuates(
 @asynccontextmanager
 async def running_daemon(settings: Settings, path: Path, monkeypatch: pytest.MonkeyPatch):
     seed_settings(path, settings=settings)
+    stub_statistics(monkeypatch)
+    network_attempts = []
+
+    def deny_dns(*args, **kwargs):
+        network_attempts.append(f"DNS lookup: {args!r}")
+        raise AssertionError(network_attempts[-1])
+
+    original_connect = socket.socket.connect
+    original_connect_ex = socket.socket.connect_ex
+
+    def guarded_connect(sock, address):
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            network_attempts.append(f"Internet socket connect: {address!r}")
+            raise AssertionError(network_attempts[-1])
+        return original_connect(sock, address)
+
+    def guarded_connect_ex(sock, address):
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            network_attempts.append(f"Internet socket connect_ex: {address!r}")
+            raise AssertionError(network_attempts[-1])
+        return original_connect_ex(sock, address)
+
+    monkeypatch.setattr(socket, "getaddrinfo", deny_dns)
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
     captured = {}
     ready = asyncio.Event()
     planned = asyncio.Event()
@@ -145,13 +208,14 @@ async def running_daemon(settings: Settings, path: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(scheduler, "run_once", record_run)
     task = asyncio.create_task(scheduler.run_forever(settings, poll_seconds=0))
     try:
-        await asyncio.wait_for(ready.wait(), 2)
-        await asyncio.wait_for(planned.wait(), 2)
+        await await_result(ready.wait(), "daemon server ready event")
+        await await_result(planned.wait(), "daemon first plan completed event")
         yield captured["state"], calls, device, measurement
     finally:
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+        assert not network_attempts, f"Unstubbed network calls: {network_attempts}"
 
 
 @pytest.mark.parametrize("caller", CALLERS)
@@ -167,7 +231,7 @@ async def test_with_daemon_uses_live_fallback_context(
         return_value=httpx.Response(200, json=[])
     )
     async with running_daemon(settings, tmp_path, monkeypatch) as (state, calls, device, soc):
-        result = await asyncio.wait_for(invoke(caller, settings, state), 3)
+        result = await await_result(invoke(caller, settings, state), f"{caller} daemon reply")
         device.apply.assert_not_called()
         if caller == "clock":
             assert result == 0
@@ -201,19 +265,23 @@ async def test_request_failure_does_not_break_daemon(
     async with running_daemon(settings, tmp_path, monkeypatch) as (state, calls, device, soc):
         original = scheduler.run_once
         monkeypatch.setattr(scheduler, "run_once", AsyncMock(side_effect=RuntimeError("SECRET")))
-        reply = await asyncio.wait_for(submit_socket(settings, "apply"), 3)
+        reply = await await_result(submit_socket(settings, "apply"), "failed apply reply")
         assert reply.error == "daemon plan request failed"
         assert "SECRET" not in reply.model_dump_json()
         monkeypatch.setattr(scheduler, "run_once", original)
-        result = await asyncio.wait_for(tools.run_plan(settings, executor=state.executor), 3)
+        result = await await_result(
+            tools.run_plan(settings, executor=state.executor), "plan reply after failed apply",
+        )
         assert result.plan and result.refusal is None
         assert calls[-1]["previous_plan"] is None
         device.sync_clock.side_effect = RuntimeError("SECRET")
-        reply = await asyncio.wait_for(submit_socket(settings, "sync_clock"), 3)
+        reply = await await_result(submit_socket(settings, "sync_clock"), "failed clock reply")
         assert reply.error == "daemon clock request failed"
         assert "SECRET" not in reply.model_dump_json()
         assert "SECRET" not in caplog.text
-        result = await asyncio.wait_for(tools.run_plan(settings, executor=state.executor), 3)
+        result = await await_result(
+            tools.run_plan(settings, executor=state.executor), "plan reply after failed clock sync",
+        )
         assert result.plan and result.refusal is None
 
 

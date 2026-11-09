@@ -8,10 +8,9 @@ from ha_spark.authority import AuthorityStore, FallbackState
 from ha_spark.devices.execution import execution_context
 from ha_spark.devices.inverters.solis import SolisDevice
 from ha_spark.energy.export_store import ExportEventStore
-from tests.test_daemon_executor import running_daemon, settings_at
+from tests.test_daemon_executor import running_daemon, settings_at, wait_for
 from tests.test_handover_release import _resident_export
 from tests.test_mode_lifecycle import _hold
-from tests.test_optimise_lifecycle import wait_for
 from tests.test_solis_power_switch import _SWITCH, FakeRest, _options
 
 pytestmark = pytest.mark.usefixtures("legacy_solis_hub")
@@ -56,7 +55,8 @@ async def test_daemon_handover_verifies_export_then_current_then_window_then_rel
             reply = await state.executor.submit_mode(target, epoch)
             assert reply.error is None
             await wait_for(lambda: state.executor.authority.state.transition
-                           and state.executor.authority.state.transition.failing_actions)
+                           and state.executor.authority.state.transition.failing_actions,
+                           "fallback read-back failure recorded")
             current = state.executor.authority.state
             assert current.committed_mode == "optimise"
             assert current.transition.steps[0] == "write_fallback"
@@ -76,7 +76,8 @@ async def test_daemon_handover_verifies_export_then_current_then_window_then_rel
                 assert refused.startswith("[REFUSED]")
                 assert len(rest.calls) == before
             rest.call_service = original
-            await wait_for(lambda: state.executor.authority.state.transition is None)
+            await wait_for(lambda: state.executor.authority.state.transition is None,
+                           "verified Solis handover completed")
             current = state.executor.authority.state
             assert current.committed_mode == target
             assert not current.fallback.active
