@@ -3,6 +3,7 @@
 Topology derives a requested owner, not a write permission. Only a counted v4
 reply to a pending snapshot advances the handshake. Saves are independently
 reloaded, including when setup resumes a previously interrupted switch.
+A store belongs to one entry session: once closed it saves nothing.
 """
 
 import asyncio
@@ -52,7 +53,14 @@ class OwnershipStore:
         self.owner: Owner = "addon"
         self.verified = False
         self.loaded = False
+        self.closed = False
         self._lock = asyncio.Lock()
+
+    async def async_close(self) -> None:
+        """End this session's persistence; return once any admitted save finished."""
+        self.closed = True
+        async with self._lock:
+            pass
 
     def _store(self) -> Store[dict[str, Any]]:
         return Store(self.hass, 1, self.key, atomic_writes=True)
@@ -101,6 +109,10 @@ class OwnershipStore:
             self.owner, self.verified = "pending_integration", False
 
     async def _save(self, owner: Owner) -> bool:
+        # The last check before the write. A closed session's refusal changes
+        # nothing, not even the shared authority repair issue.
+        if self.closed:
+            return False
         # Publish the fence before the first await. A cancellation or failure
         # never exposes the previously confirmed writer as still permitted.
         self.verified = False

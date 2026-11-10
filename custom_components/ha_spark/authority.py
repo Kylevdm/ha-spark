@@ -3,6 +3,8 @@
 Setup loads only. Initialisation belongs to the ownership handshake; recovery
 requires explicit Observe confirmation. Every write is independently reloaded,
 including the marker. No partially saved candidate is exposed to readers.
+A store belongs to one entry session: once closed it persists nothing and never
+touches the shared repair issue, and a save is a compare-and-set against disk.
 """
 
 import asyncio
@@ -47,16 +49,33 @@ class AuthorityStore:
     ) -> None:
         self._hass = hass
         self._changed = changed
-        self._lock = asyncio.Lock()
+        # One lock per entry, shared by every session's store on the same files,
+        # so the compare-and-set below is atomic across sessions.
+        locks: dict[str, asyncio.Lock] = hass.data.setdefault(f"{DOMAIN}.authority_locks", {})
+        self._lock = locks.setdefault(entry_id, asyncio.Lock())
         self.store = self._store(f"{DOMAIN}.authority.{entry_id}")
         self.marker = self._store(f"{DOMAIN}.authority_marker.{entry_id}")
         self.issue_id = f"authority_unknown_{entry_id}"
         self._entry_id = entry_id
         self.status: StoreStatus = "uninitialised"
         self._state: AuthorityState | None = None
+        self.closed = False
 
     def _store(self, key: str) -> Store[dict[str, Any]]:
         return Store(self._hass, 1, key, atomic_writes=True)
+
+    async def async_close(self) -> None:
+        """End this session's persistence; a later session owns the same files.
+
+        Returns only once any write admitted before the close has finished.
+        """
+        self.closed = True
+        async with self._lock:
+            pass
+
+    def reopen(self) -> None:
+        """Only for the single removal handover, after which no session can exist."""
+        self.closed = False
 
     @property
     def state(self) -> AuthorityState | None:
@@ -79,7 +98,8 @@ class AuthorityStore:
 
     def publish_save_failed(self) -> None:
         """Fence authority when an associated ownership commit is unverified."""
-        self._publish("save_failed")
+        if not self.closed:
+            self._publish("save_failed")
 
     async def _read(self) -> tuple[StoreStatus, AuthorityState | None]:
         try:
@@ -133,10 +153,13 @@ class AuthorityStore:
         """Read only; a failed save remains fenced until a verified save."""
         async with self._lock:
             status, state = await self._read()
-            if self.status != "save_failed":
+            if self.status != "save_failed" and not self.closed:
                 self._publish(status, state)
 
     async def _persist(self, candidate: AuthorityState, *, initial: bool) -> bool:
+        """Callers hold the lock; the closed check is the last step before writing."""
+        if self.closed:
+            return False
         try:
             candidate = AuthorityState.model_validate(candidate.model_dump(warnings=False))
             marker = AuthorityMarker(schema_version=1, store_id=candidate.store_id)
@@ -154,24 +177,38 @@ class AuthorityStore:
                 raise
             status, loaded = await self._read()
             if status != "ok" or loaded != candidate:
-                self._publish("save_failed")
+                self._publish_unless_closed("save_failed")
                 return False
         except asyncio.CancelledError:
             # Cancelled before verification: disk may hold the candidate.
-            self._publish("save_failed")
+            self._publish_unless_closed("save_failed")
             raise
         except Exception:
-            self._publish("save_failed")
+            self._publish_unless_closed("save_failed")
             return False
-        self._publish("ok", candidate)
+        self._publish_unless_closed("ok", candidate)
         return True
 
+    def _publish_unless_closed(
+        self, status: StoreStatus, state: AuthorityState | None = None,
+    ) -> None:
+        # A write already under way when its session closed still lands whole
+        # (shielded), but the shared repair issue belongs to the next session.
+        if not self.closed:
+            self._publish(status, state)
+
     async def async_save(self, candidate: AuthorityState) -> bool:
-        """Revalidate even model_copy candidates, then independently verify disk."""
+        """Compare-and-set: disk must still hold exactly this session's record."""
         async with self._lock:
+            if self.closed:
+                return False
             status, current = await self._read()
+            if self.closed:
+                return False
+            # Any other writer (an earlier or later session on the same files)
+            # leaves disk different from this memory, even at the same epoch.
             if (status != "ok" or current is None or self._state is None
-                    or current.store_id != self._state.store_id
+                    or current != self._state
                     or candidate.store_id != current.store_id):
                 self._publish("unknown")
                 return False
@@ -186,6 +223,8 @@ class AuthorityStore:
     async def async_initialise(self) -> bool:
         """Explicit fresh handshake entry point; never repair damaged authority."""
         async with self._lock:
+            if self.closed:
+                return False
             status, _ = await self._read()
             if status not in ("uninitialised", "retired") or self.status == "save_failed":
                 return False
@@ -194,6 +233,8 @@ class AuthorityStore:
     async def async_retire(self) -> bool:
         """Invalidate the marker after an Observe-only rollback; verify before ack."""
         async with self._lock:
+            if self.closed:
+                return False
             status, state = await self._read()
             if status == "retired":
                 return True
@@ -201,25 +242,29 @@ class AuthorityStore:
                     or state.committed_mode != "observe" or state.holds
                     or state.transition is not None or state.manual_session is not None):
                 return False
+            if self.closed:
+                return False
             try:
                 await self.marker.async_save({"schema_version": 1,
                                               "store_id": str(state.store_id), "retired": True})
                 loaded, _ = await self._read()
                 if loaded != "retired":
-                    self._publish("save_failed")
+                    self._publish_unless_closed("save_failed")
                     return False
             except asyncio.CancelledError:
-                self._publish("save_failed")
+                self._publish_unless_closed("save_failed")
                 raise
             except Exception:
-                self._publish("save_failed")
+                self._publish_unless_closed("save_failed")
                 return False
-            self._publish("retired")
+            self._publish_unless_closed("retired")
             return True
 
     async def async_confirm_observe(self) -> bool:
         """Recover unknown authority with a new identity and no other effects."""
         async with self._lock:
+            if self.closed:
+                return False
             status, _ = await self._read()
             if status == "retired":
                 return False

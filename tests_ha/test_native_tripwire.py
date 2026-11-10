@@ -4,6 +4,7 @@ Every integration case asserts register effects, store state or fixed codes. The
 tripwire never writes a register itself: cleanup is the boundary's clear.
 """
 
+import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -379,3 +380,43 @@ async def test_two_inverters_on_one_connection_both_latch(
     assert not state.export_supervisions
     assert {r.inverter_id: r.state for r in state.export_records} == {
         "inv1": "cleared", "inv2": "cleared"}
+
+
+async def test_a_trip_decided_before_a_reload_latches_before_the_store_closes(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, freezer: FrozenDateTimeFactory,
+) -> None:
+    """Unload drains a pending trip while its session still persists (#672)."""
+    await armed_inside(writer, native_transport, monkeypatch, freezer)
+    guard = writer.guard
+    assert guard is not None
+    hass, entry = writer.hass, writer.entry
+    # The trip queues behind authority work in flight, as on a busy tick.
+    await writer.control.lock.acquire()
+    try:
+        for _ in range(2):
+            freezer.tick(timedelta(seconds=1))
+            reading = (-(LIMIT + 500), datetime.now(UTC))
+            monkeypatch.setattr(guard, "_power", lambda entity, r=reading: r)
+            await guard.async_evaluate()
+        reload = asyncio.create_task(hass.config_entries.async_reload(entry.entry_id))
+        for _ in range(200):
+            if reload.done():
+                break
+            await asyncio.sleep(0)
+        # Unload waits for the decided trip rather than closing the store under it.
+        assert not reload.done() and not writer.authority.closed
+    finally:
+        writer.control.lock.release()
+    assert await reload
+    await hass.async_block_till_done()
+    restored: SparkCoordinator = entry.runtime_data
+    assert restored is not writer and writer.authority.closed
+    state = restored.authority.state
+    assert state is not None and len(state.stop_latches) == 1
+    assert state.export_records[-1].state == "stop_pending"
+    # The new session finishes the cleanup the closing session could not write.
+    await restored.async_retry_export_records(datetime.now(UTC))
+    state = restored.authority.state
+    assert state is not None and state.export_records[-1].state == "cleared"
+    assert len(state.stop_latches) == 1

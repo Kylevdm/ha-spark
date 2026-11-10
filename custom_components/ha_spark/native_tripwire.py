@@ -7,6 +7,7 @@ only warns and raises a repair. Nothing here writes a register; cleanup goes
 through ``NativeChargeBoundary.async_clear_export`` after the stop latch is durable.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -89,6 +90,26 @@ class ExportTripwire:
     def __init__(self, coordinator: "SparkCoordinator") -> None:
         self.coordinator = coordinator
         self.states: dict[str, TripwireState] = {}
+        self._trips: set[asyncio.Task[None]] = set()
+
+    def spawn(self, connection_id: str, now: datetime) -> None:
+        """Start a trip outside guard.lock; unload drains it before the store closes."""
+        c = self.coordinator
+        task = c.entry.async_create_background_task(
+            c.hass, self.async_trip(connection_id, now), "Export tripwire")
+        self._trips.add(task)
+        task.add_done_callback(self._trips.discard)
+
+    async def async_drain(self) -> None:
+        """Let every decided trip save its stop latch while this session still persists.
+
+        Called on unload after the guard stops (no new trips) and before the
+        authority store closes. Cleanup writes are already fenced by then; the
+        durable stop_pending record makes the next session retry them.
+        """
+        tasks = list(self._trips)
+        if tasks:
+            await asyncio.wait(tasks)
 
     def _members(self, connection_id: str) -> list[str]:
         guard = self.coordinator.guard
