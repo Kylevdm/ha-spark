@@ -7,7 +7,6 @@ hosts or serials. Identity exposes only the three allow-list words.
 """
 
 from datetime import datetime
-from typing import cast
 from uuid import NAMESPACE_URL, uuid5
 
 from homeassistant.components.binary_sensor import BinarySensorEntity
@@ -46,11 +45,14 @@ class NativeEntity(CoordinatorEntity[SparkCoordinator]):
 
     @property
     def device_info(self) -> DeviceInfo:
-        assert self._attr_device_info is not None
-        info = cast(DeviceInfo, self._attr_device_info.copy())
+        # Built fresh each time: HA 2026.11's DeviceInfo is a dataclass without copy().
+        gateway = self.coordinator.native.gateway_id(self.inverter)
+        info = DeviceInfo(
+            identifiers={(DOMAIN, f"{gateway}_{self.inverter.gateway_unit_id}")},
+            name="Solis inverter", manufacturer="Solis",
+        )
         parent = dr.async_get(self.coordinator.hass).async_get_device_by_identifier(
-            (DOMAIN, self.coordinator.native.gateway_id(self.inverter)),
-            self.coordinator.entry.entry_id,
+            (DOMAIN, gateway), self.coordinator.entry.entry_id,
         )
         if parent:
             info["via_device_id"] = parent.id

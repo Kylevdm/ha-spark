@@ -262,3 +262,26 @@ async def test_unloading_stops_polling_before_close(
     await native.async_poll(dt_util.utcnow())
     assert len(native_transport.traffic) == before
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+class _DataclassDeviceInfo(dict[str, Any]):
+    """HA 2026.11's DeviceInfo is a mapping without copy(); keep the entities working."""
+
+    def copy(self) -> Any:
+        raise AttributeError("'DeviceInfo' object has no attribute 'copy'")
+
+
+async def test_inverter_device_info_without_dict_copy(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+    native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("custom_components.ha_spark.native_entities.DeviceInfo",
+                        _DataclassDeviceInfo)
+    native_transport.set_read_frames()
+    entry = await native_entry(hass, aioclient_mock)
+    native = entry.runtime_data.native
+    gateway = native.gateway_id(native.inverters["inv1"])
+    device = dr.async_get(hass).async_get_device_by_identifier(
+        (DOMAIN, f"{gateway}_1"), entry.entry_id)
+    assert device is not None and device.name == "Solis inverter"
+    assert er.async_get(hass).async_get_entity_id("sensor", DOMAIN, f"{gateway}_1_input_33151")
