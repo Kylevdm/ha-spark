@@ -8,8 +8,9 @@ the production guard shares that boundary; native holds own protection steps.
 Command dispatch and export supervision are provided by their dedicated mixins.
 """
 
+import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import TYPE_CHECKING, Any
@@ -113,6 +114,9 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
         self._running = True
         self._ended = False
         self._cancel_deadline: Callable[[], None] | None = None
+        # Interval ticks run as tracked tasks so unload can end them first.
+        self._ticks: set[asyncio.Task[None]] = set()
+        self._ticking = True
         # Receiver incarnation is distinct from the add-on's per-boot bearer session.
         # A fresh incarnation makes the add-on drop commands from before HA restarted.
         self.integration_session_id = str(uuid4())
@@ -165,9 +169,42 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
         self.data = False
         self.async_update_listeners()
 
+    def interval_tick(
+        self, job: Callable[[datetime], Coroutine[Any, Any, None]], name: str,
+    ) -> Callable[[datetime], None]:
+        """An interval callback whose runs end with this session, never after it."""
+
+        @callback
+        def fire(now: datetime) -> None:
+            if not self._ticking:
+                return
+            task = self.entry.async_create_background_task(self.hass, job(now), name)
+            self._ticks.add(task)
+            task.add_done_callback(self._ticks.discard)
+
+        return fire
+
+    async def async_stop_ticks(self) -> None:
+        """Cancel and await every in-flight tick before unload changes any state.
+
+        A tick that outlives its session would save authority from stale memory
+        (#672), and this session's own shutdown would read as add-on loss. A
+        save already writing still lands whole (it is shielded).
+        """
+        self._ticking = False
+        tasks = list(self._ticks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.wait(tasks)
+
     async def async_shutdown(self) -> None:
         """Stop applying results before cancelling timers and scheduled polls."""
         self._running = False
+        # Close persistence before this session's own shutdown can read as
+        # evidence: a later session owns the same authority and ownership files.
+        await self.authority.async_close()
+        await self.ownership.async_close()
         self.connected = False
         self._clear_deadline()
         await self.native.async_close()

@@ -534,9 +534,7 @@ class SupplyGuardLoop:
                 power, reported = read(connection.grid_power_entity)
                 if self.coordinator.tripwire.observe(connection.id, power, reported, now):
                     # The trip takes control.lock first: never await it under guard.lock.
-                    self.entry.async_create_background_task(
-                        self.hass, self.coordinator.tripwire.async_trip(connection.id, now),
-                        "Export tripwire")
+                    self.coordinator.tripwire.spawn(connection.id, now)
                 limit = next(c for c in self.limits.connections if c.id == connection.id)
                 state, decision = step(self.states[connection.id], GuardInputs(
                     limit_kw=limit.import_kw, requested_kw=requested, reserve_kw=reserve,

@@ -70,7 +70,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
         await coordinator.clock.async_tick(now)
         coordinator.async_update_listeners()
 
-    entry.async_on_unload(async_track_time_interval(hass, native_tick, timedelta(seconds=30)))
+    entry.async_on_unload(async_track_time_interval(
+        hass, coordinator.interval_tick(native_tick, "ha-spark native tick"),
+        timedelta(seconds=30)))
 
     async def native_poll(now: datetime) -> None:
         await coordinator.native.async_poll(now)
@@ -84,7 +86,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
         await coordinator.async_expire_supervisions(now)
         await coordinator.control.async_retry()
 
-    entry.async_on_unload(async_track_time_interval(hass, authority_tick, timedelta(seconds=30)))
+    entry.async_on_unload(async_track_time_interval(
+        hass, coordinator.interval_tick(authority_tick, "ha-spark authority tick"),
+        timedelta(seconds=30)))
     zone = coordinator.control.household_zone() or ZoneInfo("UTC")
     await coordinator.control.async_start(now=dt_util.utcnow(), zone=zone)
     if "topology_revision" in entry.options:
@@ -130,12 +134,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> bool:
-    """End this session before a new discovery loads new connection data."""
+    """End this session before a new discovery loads new connection data.
+
+    Its interval ticks end first, while the session is still whole. Decided
+    trips save their stop latch before the stores close, and the stores close
+    before shutdown flips connectivity: nothing persists from stale memory.
+    """
+    await entry.runtime_data.async_stop_ticks()
     if entry.disabled_by is not None:
         await async_handover(hass, entry)
     entry.runtime_data.async_stop()
     if entry.runtime_data.guard is not None:
         await entry.runtime_data.guard.async_stop()
+    await entry.runtime_data.tripwire.async_drain()
     if entry.runtime_data.solcast is not None:
         await entry.runtime_data.solcast.async_shutdown()
     if await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
@@ -156,4 +167,12 @@ async def async_remove_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> No
         coordinator = SparkCoordinator(hass, entry, "unknown")
         await coordinator.authority.async_load()
         control = coordinator.control
-    await async_handover(hass, entry, control)
+        await async_handover(hass, entry, control)
+        return
+    # The unloaded session closed its store. Removal is its one further write:
+    # its ticks are gone and no later session can load this entry.
+    control.store.reopen()
+    try:
+        await async_handover(hass, entry, control)
+    finally:
+        await control.store.async_close()
