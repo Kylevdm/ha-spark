@@ -1,5 +1,6 @@
 """Public daemon requests drive durable owner handovers."""
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from ha_spark.daemon_channel import submit_socket
 from ha_spark.devices.execution import execution_context
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 from ha_spark.transitions import PreconditionReport
-from tests.test_daemon_executor import running_daemon, settings_at
+from tests.test_daemon_executor import await_result, running_daemon, settings_at, wait_for
 
 
 def _hold(settings) -> HoldRecord:
@@ -105,10 +106,8 @@ async def test_daemon_protect_and_observe_handover(tmp_path: Path, monkeypatch, 
             )
             assert reply.error is None
             assert reply.authority["mode"] == "protect"
-            for _ in range(100):
-                if state.executor.authority.state.transition is None:
-                    break
-                await asyncio.sleep(0.001)
+            await wait_for(lambda: state.executor.authority.state.transition is None,
+                           "Protect handover completed")
             assert state.executor.authority.state.transition is None
             async def released():
                 state.executor.authority.save_holds(())
@@ -119,10 +118,8 @@ async def test_daemon_protect_and_observe_handover(tmp_path: Path, monkeypatch, 
             current = state.executor.authority.state
             reply = await state.executor.submit_mode("observe", current.epoch, ingress_user="owner")
             assert reply.error is None
-            for _ in range(100):
-                if state.executor.authority.state.committed_mode == "observe":
-                    break
-                await asyncio.sleep(0.001)
+            await wait_for(lambda: state.executor.authority.state.committed_mode == "observe",
+                           "Observe mode committed")
             assert state.executor.authority.state.committed_mode == "observe"
             device.release_holds.assert_awaited_once()
             audit = [r.message for r in caplog.records if "Operating mode requester=" in r.message]
@@ -154,11 +151,10 @@ async def test_failed_release_stays_switching_and_repeated_observe_joins(
             current = state.executor.authority.state
             reply = await state.executor.submit_mode("observe", current.epoch)
             epoch = reply.authority["epoch"]
-            for _ in range(100):
-                current = state.executor.authority.state
-                if current.transition and current.transition.failing_actions:
-                    break
-                await asyncio.sleep(0.001)
+            await wait_for(lambda: state.executor.authority.state.transition
+                           and state.executor.authority.state.transition.failing_actions,
+                           "release failure recorded")
+            current = state.executor.authority.state
             assert current.committed_mode == "protect"
             assert current.transition.failing_actions[0] == "release not verified"
             blocked = await state.executor.submit_mode("protect", epoch)
@@ -171,10 +167,8 @@ async def test_failed_release_stays_switching_and_repeated_observe_joins(
                 return [ActionLine("released", ActionOutcome.VERIFIED)]
 
             device.release_holds.side_effect = released
-            for _ in range(100):
-                if state.executor.authority.state.transition is None:
-                    break
-                await asyncio.sleep(0.001)
+            await wait_for(lambda: state.executor.authority.state.transition is None,
+                           "retried Observe handover completed")
             assert state.executor.authority.state.committed_mode == "observe"
     finally:
         execution_context().authority = prior
@@ -255,16 +249,25 @@ async def test_transition_waits_for_inflight_bus_action(tmp_path, monkeypatch):
             device.release_holds.return_value = []
             epoch = state.executor.authority.state.epoch
             bus = context.coordinator_for(settings.devices[0], settings)
+            transition_requested = asyncio.Event()
+            original_transition = bus.transition
+
+            @asynccontextmanager
+            async def tracked_transition():
+                transition_requested.set()
+                async with original_transition():
+                    yield
+
+            monkeypatch.setattr(bus, "transition", tracked_transition)
             async with bus.action(
                 context.gate, Ownership.PROTECTION, settings.devices[0], settings,
             ):
                 request = asyncio.create_task(state.executor.submit_mode("observe", epoch))
-                for _ in range(10):
-                    await asyncio.sleep(0)
+                await await_result(transition_requested.wait(), "mode request waiting for bus")
                 assert not request.done()
                 assert state.executor.authority.state.epoch == epoch
                 device.release_holds.assert_not_awaited()
-            reply = await asyncio.wait_for(request, 2)
+            reply = await await_result(request, "Observe request after bus action released")
             assert reply.error is None
             assert reply.authority["epoch"] == epoch + 1
     finally:
@@ -293,10 +296,8 @@ async def test_restart_resumes_stored_observe_handover(tmp_path, monkeypatch):
                 return [ActionLine("released", ActionOutcome.VERIFIED)]
 
             device.release_holds.side_effect = released
-            for _ in range(100):
-                if state.executor.authority.state.transition is None:
-                    break
-                await asyncio.sleep(0.001)
+            await wait_for(lambda: state.executor.authority.state.transition is None,
+                           "stored Observe handover resumed")
             result = state.executor.authority.state
             assert result.committed_mode == "observe"
             assert result.transition is None
@@ -338,11 +339,10 @@ async def test_protect_completes_once_evaluated_and_any_hold_verified(
                 settings, "mode", target="protect", expected_epoch=current.epoch,
             )
             assert reply.error is None
-            for _ in range(100):
-                current = state.executor.authority.state
-                if current.transition is None or current.transition.failing_actions:
-                    break
-                await asyncio.sleep(0.001)
+            await wait_for(lambda: state.executor.authority.state.transition is None
+                           or state.executor.authority.state.transition.failing_actions,
+                           "Protect evaluation completed or failure recorded")
+            current = state.executor.authority.state
             assert (current.transition is None) is confirmed
     finally:
         execution_context().authority = prior
@@ -365,11 +365,10 @@ async def test_observe_never_commits_while_a_hold_of_ours_remains(tmp_path, monk
             current = state.executor.authority.state
             reply = await state.executor.submit_mode("observe", current.epoch)
             assert reply.error is None
-            for _ in range(100):
-                current = state.executor.authority.state
-                if current.transition and current.transition.failing_actions:
-                    break
-                await asyncio.sleep(0.001)
+            await wait_for(lambda: state.executor.authority.state.transition
+                           and state.executor.authority.state.transition.failing_actions,
+                           "unreleased hold failure recorded")
+            current = state.executor.authority.state
             assert current.committed_mode == "protect"
             assert "[FAILED] hold records remain unreleased" in current.transition.failing_actions
     finally:
@@ -435,10 +434,8 @@ async def test_restart_resumes_a_stored_protect_evaluation(tmp_path, monkeypatch
     prior = execution_context().authority
     try:
         async with running_daemon(settings, tmp_path, monkeypatch) as (state, _, device, _):
-            for _ in range(100):
-                if state.executor.authority.state.transition is None:
-                    break
-                await asyncio.sleep(0.001)
+            await wait_for(lambda: state.executor.authority.state.transition is None,
+                           "stored Protect evaluation resumed")
             result = state.executor.authority.state
             assert result.transition is None
             assert result.committed_mode == "protect"
