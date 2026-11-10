@@ -180,3 +180,25 @@ def test_uk_home_bounds(group: str, field: str, value: float) -> None:
     raw = json.loads((FIXTURES / "two_inverters.json").read_text())["topology"]
     raw[group][0][field] = value
     assert validate_topology(raw) == "invalid_topology"
+
+
+@pytest.mark.parametrize("field", ["heating_demand_kw", "cooling_demand_kw"])
+@pytest.mark.parametrize("value", [-1, 50.1, float("nan"), float("inf"), -float("inf"), True, "4"])
+def test_heat_pump_refuses_invalid_demand(field: str, value: object) -> None:
+    raw = json.loads((FIXTURES / "planner_and_guard_reserve.json").read_text())["topology"]
+    raw["major_loads"][1][field] = value
+    assert validate_topology(raw) == "invalid_topology"
+
+
+@pytest.mark.parametrize("field", ["heating_demand_kw", "cooling_demand_kw"])
+def test_heat_pump_requires_both_demands(field: str) -> None:
+    raw = json.loads((FIXTURES / "planner_and_guard_reserve.json").read_text())["topology"]
+    del raw["major_loads"][1][field]
+    assert validate_topology(raw) == "invalid_topology"
+
+
+@pytest.mark.parametrize("load_index,field", [(0, "demand_kw"), (1, "heating_demand_kw")])
+def test_only_cooling_demand_may_be_zero(load_index: int, field: str) -> None:
+    raw = json.loads((FIXTURES / "planner_and_guard_reserve.json").read_text())["topology"]
+    raw["major_loads"][load_index][field] = 0
+    assert validate_topology(raw) == "invalid_topology"
