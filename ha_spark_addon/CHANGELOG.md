@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.32.2
+
+- **Native inverter entities on Home Assistant 2026.11 (#675).** HA 2026.11
+  changed how device information is stored, and every native Solis inverter
+  sensor and control failed to register, leaving no "Solis inverter" device.
+  They now register on both 2026.10 and 2026.11. Supply-guard, SoC and
+  battery-direction checks read the inverter directly and were not affected.
+
 ## 0.32.1
 
 - **Safety: a reload can no longer corrupt integration authority (#672).** On
