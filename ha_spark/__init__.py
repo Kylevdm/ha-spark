@@ -1,3 +1,3 @@
 """ha-spark: a local-first natural-language home automation agent for Home Assistant."""
 
-__version__ = "0.32.2"
+__version__ = "0.32.3"
