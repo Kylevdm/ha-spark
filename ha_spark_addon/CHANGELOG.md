@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.32.3
+
+- **Live Octopus Intelligent rates (#532).** When standard rate slots are unavailable, read current day/night prices from the account agreement while keeping the configured cheap window and planned dispatches. Health now warns when neither live rate source is usable and plans fall back to configured rates.
+- **Health on all-native sites (#678).** Once every inverter is native,
+  `ha-spark health` no longer shows a failing `Solis transport (main_inverter)`
+  overlay row next to the native inverter's row.
+
 ## 0.32.2
 
 - **Native inverter entities on Home Assistant 2026.11 (#675).** HA 2026.11
