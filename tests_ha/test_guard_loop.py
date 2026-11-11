@@ -1,12 +1,15 @@
 """HA report events feed the independent guard without hardware writes."""
 
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
 from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker
 
@@ -49,7 +52,7 @@ async def test_report_events_cut_and_stop(
     await loop.async_stop()
     before = loop.states.copy()
     hass.states.async_set("sensor.grid", "0", {"unit_of_measurement": "W"})
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert loop.states == before
 
 
@@ -182,11 +185,26 @@ async def test_burst_reports_keep_individual_values(
     for watts in (20000, 10000, 21000):
         freezer.tick(timedelta(seconds=1))
         hass.states.async_set("sensor.grid", str(watts), {"unit_of_measurement": "W"})
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert loop.states[grid.id].over_count == 1
     await loop.async_stop()
 
 
+@pytest.fixture
+def delayed_guard_store_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_load = Store.async_load
+
+    async def delayed_load(store: Store[Any]) -> Any:
+        if "guard" in store.key:
+            # Startup is a background task; plain HA drains can finish before it subscribes.
+            for _ in range(200):
+                await asyncio.sleep(0)
+        return await original_load(store)
+
+    monkeypatch.setattr(Store, "async_load", delayed_load)
+
+
+@pytest.mark.usefixtures("delayed_guard_store_load")
 async def test_entry_without_topology_then_reload_cancels_old_loop(
     hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, freezer: FrozenDateTimeFactory,
 ) -> None:
@@ -201,24 +219,24 @@ async def test_entry_without_topology_then_reload_cancels_old_loop(
     hass.config_entries.async_update_entry(entry, options={"topology_revision": 1,
                                                           "topology": site.model_dump(mode="json")})
     assert await hass.config_entries.async_reload(entry.entry_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     old = entry.runtime_data.guard
     assert old is not None
     assert await hass.config_entries.async_reload(entry.entry_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     current = entry.runtime_data.guard
     assert current is not None and current is not old
     old_states = old.states.copy()
     hass.states.async_set("sensor.inverter", "2000", {"unit_of_measurement": "W"})
     hass.states.async_set("sensor.grid", "10000", {"unit_of_measurement": "W"})
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert old.states == old_states
     assert current.states[grid.id].last_good_at is not None
     assert await hass.config_entries.async_unload(entry.entry_id)
     before = current.states.copy()
     freezer.tick(timedelta(minutes=3))
     async_fire_time_changed(hass)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert current.states == before
 
 
@@ -287,7 +305,7 @@ async def test_failed_restore_save_keeps_ceiling(
     await loop.async_start()
     hass.states.async_set("sensor.inverter", "2000", {"unit_of_measurement": "W"})
     hass.states.async_set("sensor.grid", "5000", {"unit_of_measurement": "W"})
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     now = datetime.now(UTC)
     loop.states[grid.id] = replace(loop.states[grid.id], cut_kw=1, latched=True,
                                    headroom_since=now - timedelta(minutes=5))
