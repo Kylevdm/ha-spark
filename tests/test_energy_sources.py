@@ -19,6 +19,7 @@ from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.sources import build_config, build_schedule, gather_inputs, pre_window_drain
 from ha_spark.energy.tariff import fixed_schedule
 from ha_spark.ha.rest import HomeAssistantRest
+from tests.octopus_helpers import agreement_failure, agreement_payload, token_response
 from tests.solar_source_helpers import entities_source
 
 BASE = "http://ha.test/api"
@@ -1131,6 +1132,55 @@ async def test_gather_inputs_skips_dynamic_fetch_when_fixed_provider(
         assert inputs.dynamic_prices == ()
 
 
+@pytest.mark.parametrize("failure", [None, "http", "errors", "shape", "three", "negative"])
+@pytest.mark.parametrize("rest_fails", [False, True])
+@respx.mock
+async def test_octopus_agreement_fallback_prices_and_degrades(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    failure: str | None, rest_fails: bool,
+) -> None:
+    async def fake_load(_s: Settings, **_kw: object) -> LoadForecast:
+        return LoadForecast(total_kwh=24.0, slots=(0.5,) * 48, source="test")
+
+    monkeypatch.setattr(sources, "predict_home_load", fake_load)
+    respx.route(method="GET", url__startswith="http://ha.test").mock(
+        return_value=httpx.Response(404)
+    )
+    respx.post("http://octo.test/v1/graphql/").mock(side_effect=[
+        token_response(), httpx.Response(200, json={"data": {"plannedDispatches": []}}),
+        token_response(),
+        agreement_failure(failure) if failure else httpx.Response(200, json=agreement_payload()),
+    ])
+    respx.get(url__startswith="http://octo.test/v1/products/").mock(
+        return_value=(httpx.Response(500) if rest_fails else
+                      httpx.Response(200, json={"count": 0, "next": None, "results": []}))
+    )
+    settings = _octopus_settings()
+    async with HomeAssistantRest(settings.ha_rest_url, settings.auth_token) as rest:
+        inputs, cfg, _ = await gather_inputs(settings, rest, source=entities_source(settings))
+    assert inputs.dynamic_prices == ()
+    assert cfg == build_config(settings, voltage_v=settings.battery_voltage_v)
+    schedule = build_schedule(settings, inputs, cfg)
+    if failure:
+        assert inputs.live_rates is None
+        assert schedule == fixed_schedule(inputs, cfg)
+        assert compute_plan(inputs, cfg, schedule) == compute_plan(
+            inputs, cfg, fixed_schedule(inputs, cfg)
+        )
+        assert "Could not read Octopus agreement rates" in caplog.text
+        assert "fixed rate/window" in caplog.text
+    else:
+        assert inputs.live_rates is not None
+        for price, cheap in zip(schedule.prices, schedule.cheap_fracs, strict=True):
+            assert price == pytest.approx(0.066 * cheap + 0.362828 * (1 - cheap))
+        assert min(schedule.prices) == pytest.approx(0.066)
+        assert max(schedule.prices) == pytest.approx(0.362828)
+        assert schedule.cheap_fracs == fixed_schedule(inputs, cfg).cheap_fracs
+        compute_plan(inputs, cfg, schedule)
+    assert "sk_test" not in caplog.text
+    assert "jwt-private" not in caplog.text
+
+
 # --- octopus_intelligent: dispatches + prices from the Octopus API (P8.5, #39) ---
 
 
@@ -1229,6 +1279,7 @@ async def test_octopus_dispatches_use_configured_ha_live_evidence(
                     }
                 },
             ),
+            httpx.Response(401),
         ]
     )
     respx.get(url__startswith="http://octo.test/v1/products/").mock(

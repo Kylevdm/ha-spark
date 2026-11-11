@@ -210,6 +210,14 @@ class PlannerConfig:
 
 
 @dataclass(frozen=True)
+class LiveRates:
+    """Current account agreement rates, in GBP/kWh (not timing information)."""
+
+    offpeak: float
+    peak: float
+
+
+@dataclass(frozen=True)
 class PlannerInputs:
     """Live inputs gathered from HA."""
 
@@ -259,6 +267,7 @@ class PlannerInputs:
     # Live per-slot import prices from a `dynamic` tariff price sensor, sorted
     # by start; empty when the dynamic provider isn't in use or the read failed.
     dynamic_prices: tuple[PricePoint, ...] = ()
+    live_rates: LiveRates | None = None
     # Original dispatches before evidence rating. The planner prices and sizes
     # only `dispatches`, but carries these for local per-minute hold re-rating.
     unrated_dispatches: tuple[DispatchSlot, ...] = ()

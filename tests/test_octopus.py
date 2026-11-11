@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -12,13 +13,128 @@ from ha_spark.config import Settings
 from ha_spark.energy.octopus import (
     OctopusApiError,
     discover_import_tariff,
+    fetch_agreement_rates,
     fetch_consumption,
     fetch_planned_dispatches,
     fetch_standard_unit_rates,
     parse_octopus_csv,
 )
+from tests.octopus_helpers import agreement_failure, agreement_payload, token_response
 
 API = "http://octo.test/v1"
+
+
+@pytest.mark.parametrize("values", [(6.6, 6.6, 36.2828, 36.2828), (12.0,)])
+@respx.mock
+async def test_agreement_rates(values: tuple[float, ...]) -> None:
+    route = respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(), httpx.Response(200, json=agreement_payload(values)),
+    ])
+    rates = await fetch_agreement_rates(_dispatch_settings())
+    assert rates.offpeak == pytest.approx(min(values) / 100)
+    assert rates.peak == pytest.approx(max(values) / 100)
+    request = route.calls[1].request
+    body = json.loads(request.content)
+    assert body["variables"] == {"account": "A-1234ABCD"}
+    assert "A-1234ABCD" not in body["query"]
+    assert request.headers["Authorization"] == "JWT jwt-private"
+    assert "jwt-private" not in request.content.decode()
+
+
+@pytest.mark.parametrize("reason", ["http", "errors", "shape", "three", "negative"])
+@respx.mock
+async def test_agreement_failure_is_sanitised(reason: str) -> None:
+    respx.post(f"{API}/graphql/").mock(side_effect=[token_response(), agreement_failure(reason)])
+    with pytest.raises(OctopusApiError) as error:
+        await fetch_agreement_rates(_dispatch_settings())
+    assert "sk_test" not in str(error.value)
+    assert "jwt-private" not in str(error.value)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.01, 200.01])
+@respx.mock
+async def test_agreement_rejects_unsafe_rates(value: float) -> None:
+    payload = agreement_payload()
+    units = payload["data"]["account"]["electricityAgreements"][0]["tariff"]["unitRates"]
+    units[0]["value"] = value
+    # Use raw JSON to exercise non-finite numbers, not just invalid strings.
+    respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(), httpx.Response(200, content=json.dumps(payload)),
+    ])
+    with pytest.raises(OctopusApiError):
+        await fetch_agreement_rates(_dispatch_settings())
+
+
+@pytest.mark.parametrize("change", ["expired", "future", "export", "multiple", "empty"])
+@respx.mock
+async def test_agreement_filters_current_imports(change: str) -> None:
+    payload = agreement_payload()
+    agreements = payload["data"]["account"]["electricityAgreements"]
+    agreement = agreements[0]
+    if change == "expired":
+        agreement["validTo"] = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    elif change == "future":
+        agreement["validFrom"] = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+    elif change == "export":
+        agreement["meterPoint"]["direction"] = "EXPORT"
+    elif change == "multiple":
+        agreements.append(agreement.copy())
+    else:
+        agreement["tariff"]["unitRates"] = []
+    respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(), httpx.Response(200, json=payload),
+    ])
+    with pytest.raises(OctopusApiError):
+        await fetch_agreement_rates(_dispatch_settings())
+
+
+@pytest.mark.parametrize("tariff, expected", [
+    ({"__typename": "DayNightTariff", "dayRate": 30.0, "nightRate": 7.0}, (0.07, 0.30)),
+    ({"__typename": "StandardTariff", "unitRate": 20.0}, (0.20, 0.20)),
+    ({"__typename": "ThreeRateTariff", "dayRate": 30.0, "nightRate": 7.0,
+      "offPeakRate": 7.0}, (0.07, 0.30)),
+])
+@respx.mock
+async def test_agreement_other_tariff_shapes(
+    tariff: dict[str, object], expected: tuple[float, float],
+) -> None:
+    payload = agreement_payload()
+    payload["data"]["account"]["electricityAgreements"][0]["tariff"] = tariff
+    respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(), httpx.Response(200, json=payload),
+    ])
+    rates = await fetch_agreement_rates(_dispatch_settings())
+    assert (rates.offpeak, rates.peak) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("auth", [[], {"data": []}, {"errors": ["sk_test jwt-private"]}])
+@respx.mock
+async def test_agreement_bad_auth_degrades(auth: object) -> None:
+    respx.post(f"{API}/graphql/").mock(return_value=httpx.Response(200, json=auth))
+    with pytest.raises(OctopusApiError) as error:
+        await fetch_agreement_rates(_dispatch_settings())
+    assert "sk_test" not in str(error.value)
+    assert "jwt-private" not in str(error.value)
+
+
+@respx.mock
+async def test_agreement_ignores_noncurrent_unit_rates_and_export() -> None:
+    payload = agreement_payload()
+    agreements = payload["data"]["account"]["electricityAgreements"]
+    agreements.append({**agreements[0], "meterPoint": {"direction": "EXPORT"}})
+    units = agreements[0]["tariff"]["unitRates"]
+    units.extend([
+        {"value": 99.0, "validFrom": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+         "validTo": None},
+        {"value": 98.0, "validFrom": "2020-01-01T00:00:00Z",
+         "validTo": "2020-01-02T00:00:00Z"},
+    ])
+    respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(), httpx.Response(200, json=payload),
+    ])
+    rates = await fetch_agreement_rates(_dispatch_settings())
+    assert rates.offpeak == pytest.approx(0.066)
+    assert rates.peak == pytest.approx(0.362828)
 
 
 def _settings(api_key: str = "sk_test") -> Settings:

@@ -17,7 +17,8 @@ cycle, so a replan at any hour selects exactly the slots a window-start
 replan selected (#399). ``octopus_intelligent`` keeps the fixed
 provider's dispatch/window folding exactly (dispatches sourced from the
 Octopus API instead of an HA sensor) and overlays live per-slot prices from
-the Octopus standard-unit-rates API.
+the Octopus standard-unit-rates API. When that is empty or unavailable, current
+account agreement rates price the same configured window and dispatches.
 """
 
 from __future__ import annotations
@@ -408,7 +409,9 @@ class OctopusIntelligentProvider:
     Octopus standard-unit-rates API rather than a generic HA sensor) laid
     over that same schedule, for accurate cost reporting. Falls back to
     ``fallback`` verbatim whenever there's no v2 slot horizon or no usable
-    live price — an API hiccup degrades a plan, it never blocks one.
+    slot price. That fallback uses current account agreement rates when available,
+    otherwise configured rates; neither changes cheap timing. An API hiccup
+    degrades a plan, it never blocks one.
     """
 
     fallback: FixedTariffProvider

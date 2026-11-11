@@ -1,7 +1,7 @@
 """Octopus Energy consumption, account tariff discovery, rates, and dispatches.
 
 The consumption/account/rates endpoints are the public REST v1 API (API-key Basic
-Auth). Planned Intelligent dispatches are only available over the Kraken
+Auth). Account agreement rates and planned Intelligent dispatches use the Kraken
 GraphQL API, which needs a short-lived JWT exchanged for the API key first
 (``obtainKrakenToken``) — never logged, and never echoed in any error message.
 """
@@ -12,13 +12,13 @@ import csv
 import io
 import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any, Literal
 
 import httpx
-from pydantic import BaseModel, StrictBool, StrictStr, ValidationError
+from pydantic import AwareDatetime, BaseModel, Field, StrictBool, StrictStr, ValidationError
 
 from ha_spark.config import Settings
-from ha_spark.energy.models import ConsumptionInterval, DispatchSlot, PricePoint
+from ha_spark.energy.models import ConsumptionInterval, DispatchSlot, LiveRates, PricePoint
 from ha_spark.logging import get_logger
 
 log = get_logger(__name__)
@@ -251,8 +251,12 @@ async def fetch_standard_unit_rates(
                 response = await client.get(next_url, params=next_params)
                 response.raise_for_status()
                 payload = response.json()
-            except (httpx.HTTPError, ValueError) as exc:
-                raise OctopusApiError(f"Octopus rates request failed: {exc}") from exc
+            except (httpx.HTTPError, ValueError):
+                raise OctopusApiError(
+                    "Octopus rates request failed: HTTP or payload error"
+                ) from None
+            if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+                raise OctopusApiError("Octopus rates returned an invalid payload")
             points.extend(_parse_rate_results(payload.get("results")))
             next_url = payload.get("next")
             if next_url is not None and (
@@ -271,6 +275,130 @@ mutation ObtainKrakenToken($apiKey: String!) {
   }
 }
 """
+
+_AGREEMENT_RATES_QUERY = """
+query AgreementRates($account: String!) {
+  account(accountNumber: $account) {
+    electricityAgreements(active: true) {
+      validFrom validTo
+      meterPoint { direction }
+      tariff { __typename
+        ... on HalfHourlyTariff { unitRates { validFrom validTo value } }
+        ... on DayNightTariff { dayRate nightRate }
+        ... on StandardTariff { unitRate }
+        ... on ThreeRateTariff { dayRate nightRate offPeakRate }
+      }
+    }
+  }
+}
+"""
+
+_Pence = Annotated[float, Field(strict=True, ge=0, le=200, allow_inf_nan=False)]
+
+
+class _UnitRate(BaseModel):
+    validFrom: AwareDatetime
+    validTo: AwareDatetime | None
+    value: _Pence
+
+
+class _HalfHourlyTariff(BaseModel):
+    kind: Literal["HalfHourlyTariff"] = Field(alias="__typename")
+    unitRates: list[_UnitRate]
+
+
+class _DayNightTariff(BaseModel):
+    kind: Literal["DayNightTariff"] = Field(alias="__typename")
+    dayRate: _Pence
+    nightRate: _Pence
+
+
+class _StandardTariff(BaseModel):
+    kind: Literal["StandardTariff"] = Field(alias="__typename")
+    unitRate: _Pence
+
+
+class _ThreeRateTariff(BaseModel):
+    kind: Literal["ThreeRateTariff"] = Field(alias="__typename")
+    dayRate: _Pence
+    nightRate: _Pence
+    offPeakRate: _Pence
+
+
+class _AgreementMeterPoint(BaseModel):
+    direction: Literal["IMPORT", "EXPORT"]
+
+
+class _LiveAgreement(BaseModel):
+    validFrom: AwareDatetime
+    validTo: AwareDatetime | None
+    meterPoint: _AgreementMeterPoint
+    tariff: Annotated[
+        _HalfHourlyTariff | _DayNightTariff | _StandardTariff | _ThreeRateTariff,
+        Field(discriminator="kind"),
+    ]
+
+
+class _AgreementAccount(BaseModel):
+    electricityAgreements: list[_LiveAgreement]
+
+
+class _AgreementData(BaseModel):
+    account: _AgreementAccount
+
+
+class _AgreementResponse(BaseModel):
+    data: _AgreementData
+    errors: list[Any] | None = None
+
+
+async def fetch_agreement_rates(settings: Settings) -> LiveRates:
+    """Read current import agreement rates, never inferring cheap-window timing."""
+    if not (settings.octopus_api_key and settings.octopus_account_number):
+        raise OctopusApiError("Octopus agreement rates require API key and account number")
+    graphql_url = f"{settings.octopus_api_url.rstrip('/')}/graphql/"
+    try:
+        async with httpx.AsyncClient(timeout=settings.ha_timeout) as client:
+            token = await _obtain_kraken_token(client, graphql_url, settings.octopus_api_key)
+            response = await client.post(
+                graphql_url,
+                json={
+                    "query": _AGREEMENT_RATES_QUERY,
+                    "variables": {"account": settings.octopus_account_number},
+                },
+                headers={"Authorization": f"JWT {token}"},
+            )
+            response.raise_for_status()
+            payload = _AgreementResponse.model_validate(response.json())
+    except (httpx.HTTPError, ValueError, OctopusApiError, TypeError, AttributeError):
+        raise OctopusApiError("Octopus agreement rates HTTP, auth or payload error") from None
+    if payload.errors:
+        raise OctopusApiError("Octopus agreement rates GraphQL errors")
+    now = datetime.now(UTC)
+    agreements = [
+        agreement for agreement in payload.data.account.electricityAgreements
+        if agreement.meterPoint.direction == "IMPORT"
+        and agreement.validFrom <= now
+        and (agreement.validTo is None or now < agreement.validTo)
+    ]
+    if len(agreements) != 1:
+        raise OctopusApiError("Octopus agreement rates need exactly one active import agreement")
+    tariff = agreements[0].tariff
+    if isinstance(tariff, _HalfHourlyTariff):
+        values = {
+            rate.value for rate in tariff.unitRates
+            if rate.validFrom <= now and (rate.validTo is None or now < rate.validTo)
+        }
+    elif isinstance(tariff, _StandardTariff):
+        values = {tariff.unitRate}
+    elif isinstance(tariff, _ThreeRateTariff):
+        values = {tariff.dayRate, tariff.nightRate, tariff.offPeakRate}
+    else:
+        values = {tariff.dayRate, tariff.nightRate}
+    if len(values) not in (1, 2):
+        raise OctopusApiError("Octopus agreement rates need one or two distinct current values")
+    return LiveRates(offpeak=min(values) / 100, peak=max(values) / 100)
+
 
 _PLANNED_DISPATCHES_QUERY = """
 query PlannedDispatches($account: String!) {
