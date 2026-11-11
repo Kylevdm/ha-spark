@@ -25,12 +25,13 @@ gateway addresses, credentials or real entity ids. Examples below are placeholde
 Arrange a supervised maintenance period; protection cannot be assumed while its
 transport is disconnected. Plan both 24-hour Observe periods and the Protect
 period. Back up before starting. Update **both the add-on and integration to
-0.32.0 together**: the native export `unverified` row introduced by #654 is rejected
-by a mixed-version pair.
+0.32.2 or later, together**: the native export `unverified` row introduced by #654
+is rejected by a mixed-version pair, and on Home Assistant 2026.11 or later
+earlier versions register no native inverter entities (#675).
 
 - [ ] Private rollback record and backup are complete.
 - [ ] Supervised periods are arranged and conflicting writers disabled.
-- [ ] Both peers run 0.32.0 and the integration link is connected.
+- [ ] Both peers run 0.32.2 or later and the integration link is connected.
 
 ## 2. First go-native, starting from add-on-owned Observe
 
@@ -49,9 +50,12 @@ by a mixed-version pair.
    [`docs/solis-control-modbus-overlay.yaml`](../solis-control-modbus-overlay.yaml)
    and its include, then remove them as appropriate. Confirm the old hub no
    longer connects.
-4. **Clear `solis_control_hub`** in the add-on's saved settings and restart the
-   add-on. This must be explicitly empty, not left at a former default. A
-   nonempty setting is reported as an overlay and blocks native validation.
+4. **Clear `solis_control_hub`** in the add-on's saved settings
+   (`ha-spark config set solis_control_hub=` inside the add-on container) and
+   restart the add-on. This must be explicitly empty, not left at a former
+   default. A nonempty setting is reported as an overlay and blocks native
+   validation; once cleared, health reports `no control path` until the native
+   device is added.
 5. **Add the native device:** in integration Options → Site topology and
    limits → Inverters, edit the existing Solis inverter (don't add a second
    one: a remaining legacy inverter keeps the site add-on-owned), choose
@@ -90,8 +94,11 @@ mandatory.
 ## 3. Repoint settings at each go-native
 
 Do this on the first and second go-native, and again when returning from a
-rollback. Use the private record when restoring the old settings. Edit add-on
-settings inside the add-on container with `ha-spark config set KEY=VALUE`:
+rollback. Use the private record when restoring the old settings. These are
+**add-on settings, not topology fields**: the integration's inverter form has
+no field for them. Edit them inside the add-on container with
+`ha-spark config set KEY=VALUE` (several assignments may share one command),
+after recording the old values with `ha-spark config show`:
 
 - `soc_entity`, `battery_voltage_entity`, `battery_power_entity` and its
   `battery_power_discharge_sign`;
@@ -106,12 +113,17 @@ settings inside the add-on container with `ha-spark config set KEY=VALUE`:
 
 On an integration-owned site, SoC and its trust come from the native snapshot
 (health's `Native SoC` row); still repoint `soc_entity`, which the dashboard reads.
+Native Battery power reads charging positive and discharging negative, so set
+`battery_power_discharge_sign` to `negative` when repointing to it; health's
+`Evidence battery_power` row should then report the direction you observe.
 
 In Options → Site topology and limits, repoint connection `grid_power_entity`
 and inverter `grid_port_power_entity` and `battery_power_entity`. Check the unit
 and sign of **each power entity** against observed import/export and
 charge/discharge. Set inverter `power_sign` to `positive_import` or
-`negative_import` as appropriate. The connection's `grid_power_entity` has
+`negative_import` as appropriate. On a native inverter it also applies to the
+integration's own register reads of Battery power and Grid-port power, which
+the supply guard and battery-direction evidence use instead of the entities. The connection's `grid_power_entity` has
 **no sign setting** and must read import positive: if native Meter active power
 reads the other way, keep the current grid sensor or use a template sensor
 that negates it. Never repoint to a mis-signed sensor.
