@@ -64,7 +64,8 @@ async def test_native_transport_overlay_inconsistent(monkeypatch):
     assert health.exit_code(rows) == 2
 
 
-async def test_run_health_native_replaces_legacy_row(monkeypatch):
+@pytest.mark.parametrize("native_id", ["main_inverter", "solis"])
+async def test_run_health_native_replaces_legacy_row(monkeypatch, native_id):
     for name in (
         "check_operating_mode", "check_integration_link", "check_authority_owner",
         "check_site_pairing", "check_native_soc", "check_ha_rest",
@@ -79,7 +80,7 @@ async def test_run_health_native_replaces_legacy_row(monkeypatch):
     legacy = AsyncMock(side_effect=AssertionError("legacy probe must not run"))
     monkeypatch.setattr(health, "check_legacy_solis_transport", legacy)
     topology = Topology.model_validate({
-        "inverters": [{"id": "main_inverter", "driver_kind": "solis", "transport": "native",
+        "inverters": [{"id": native_id, "driver_kind": "solis", "transport": "native",
                        "gateway_host": "PRIVATE-HOST", "bank_id": "bank"}],
         "banks": [{"id": "bank", "connection_id": "grid", "usable_capacity_kwh": 10.0,
                    "nominal_voltage_v": 50.0, "min_soc": 10.0, "target_cap": 100.0,
@@ -95,8 +96,9 @@ async def test_run_health_native_replaces_legacy_row(monkeypatch):
         {"id": "main_inverter", "type": "inverter", "driver": "solis"},
     ]))
     native = [r for r in rows if r.name.startswith("Solis transport")]
+    # A differently named native inverter must not leave a legacy main_inverter row.
     assert native == [health.CheckResult(
-        "Solis transport (main_inverter)", health.Status.WARN, "validation unknown",
+        f"Solis transport ({native_id})", health.Status.WARN, "validation unknown",
     )]
     submit.assert_awaited_once()
     assert "PRIVATE-HOST" not in health.format_report(rows)

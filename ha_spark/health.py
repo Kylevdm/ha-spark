@@ -855,6 +855,11 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         inv.id for inv in loaded.topology.inverters if inv.transport == "native"
     ) if loaded.topology is not None else ()
     native_rows = await check_native_solis_transports(settings, native_ids) if native_ids else []
+    # An all-native topology has no overlay path to check; the synthesized
+    # main_inverter device would otherwise always report "no control path".
+    all_native = loaded.topology is not None and len(native_ids) == len(
+        loaded.topology.inverters
+    ) > 0
     results = await asyncio.gather(
         check_operating_mode(settings),
         check_integration_link(settings),
@@ -878,7 +883,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
             check_legacy_solis_transport(settings, device.id)
             for device in settings.devices
             if device.type == "inverter" and device.driver == "solis"
-            and device.id not in native_ids
+            and device.id not in native_ids and not all_native
         ),
         *(
             [check_inverter_clock(settings)]
