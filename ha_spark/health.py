@@ -38,6 +38,7 @@ from ha_spark.energy.forecast import intervals_from_hourly_stats, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.octopus import (
     OctopusApiError,
+    fetch_agreement_rates,
     fetch_planned_dispatches,
     fetch_standard_unit_rates,
 )
@@ -424,22 +425,40 @@ async def _check_dynamic_tariff(settings: Settings) -> CheckResult:
 
 
 async def _check_octopus_intelligent_tariff(settings: Settings) -> CheckResult:
-    """Confirm both API calls this provider needs succeed; never logs the API key."""
+    """Confirm dispatches and either rate source are readable without exposing secrets."""
     try:
         dispatches = await fetch_planned_dispatches(settings)
+    except OctopusApiError:
+        return CheckResult(
+            "Tariff provider", Status.WARN,
+            "Octopus dispatch read failed — plans fall back to the fixed rate/window",
+        )
+    rest_reason = "no standard rate slots"
+    try:
         rates = await fetch_standard_unit_rates(
             settings,
             period_from=datetime.now(UTC),
             period_to=datetime.now(UTC) + timedelta(hours=48),
         )
     except OctopusApiError as exc:
+        rates = ()
+        rest_reason = str(exc)
+    if rates:
         return CheckResult(
-            "Tariff provider", Status.WARN, f"{exc} — plans fall back to the fixed rate/window"
+            "Tariff provider", Status.OK,
+            f"{len(rates)} rate slots, {len(dispatches)} planned dispatch(es)",
+        )
+    try:
+        live = await fetch_agreement_rates(settings)
+    except OctopusApiError as exc:
+        return CheckResult(
+            "Tariff provider", Status.WARN,
+            f"no live rates ({rest_reason}; {exc}) — plans fall back to the fixed rate/window",
         )
     return CheckResult(
-        "Tariff provider",
-        Status.OK,
-        f"{len(rates)} rate slots, {len(dispatches)} planned dispatch(es)",
+        "Tariff provider", Status.OK,
+        f"day {live.peak * 100:.2f}p / night {live.offpeak * 100:.2f}p "
+        f"(account agreement), {len(dispatches)} planned dispatch(es)",
     )
 
 

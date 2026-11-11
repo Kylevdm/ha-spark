@@ -30,6 +30,7 @@ from ha_spark.energy.horizon import compute_horizon_geometry
 from ha_spark.energy.models import (
     SLOTS_PER_DAY,
     DispatchSlot,
+    LiveRates,
     LoadForecast,
     PlannerConfig,
     PlannerInputs,
@@ -37,6 +38,7 @@ from ha_spark.energy.models import (
 )
 from ha_spark.energy.octopus import (
     OctopusApiError,
+    fetch_agreement_rates,
     fetch_planned_dispatches,
     fetch_standard_unit_rates,
 )
@@ -414,6 +416,12 @@ def build_schedule(
     if settings.tariff_provider == "dynamic":
         provider = DynamicTariffProvider(fallback=fixed)
     elif settings.tariff_provider == "octopus_intelligent":
+        if inputs.live_rates is not None:
+            fixed = FixedTariffProvider(
+                cheap_rate=inputs.live_rates.offpeak,
+                standard_rate=inputs.live_rates.peak,
+                export_rate=cfg.rate_export,
+            )
         provider = OctopusIntelligentProvider(fallback=fixed)
     if settings.export_event_provider == "axle":
         provider = AxleTariffProvider(
@@ -765,6 +773,7 @@ async def gather_inputs(
     )
 
     dynamic_prices: tuple[PricePoint, ...] = ()
+    live_rates: LiveRates | None = None
     if settings.tariff_provider == "dynamic" and settings.dynamic_rates_entity:
         today = await state(settings.dynamic_rates_entity)
         points = list(_parse_price_points(today.attributes.get("rates") if today else None))
@@ -783,8 +792,16 @@ async def gather_inputs(
                 period_from=datetime.now(UTC),
                 period_to=datetime.now(UTC) + timedelta(hours=48),
             )
-        except OctopusApiError as exc:
-            log.warning("Could not read Octopus standard unit rates (%s)", exc)
+        except OctopusApiError:
+            log.warning("Could not read Octopus standard unit rates")
+        if not dynamic_prices:
+            try:
+                live_rates = await fetch_agreement_rates(settings)
+            except OctopusApiError:
+                log.warning(
+                    "Could not read Octopus agreement rates — "
+                    "plans fall back to the fixed rate/window"
+                )
 
     lat, lon = settings.latitude, settings.longitude
     if lat is None or lon is None:
@@ -884,6 +901,7 @@ async def gather_inputs(
         geometry=geometry if load_slots is not None else None,
         now=now,
         dynamic_prices=dynamic_prices,
+        live_rates=live_rates,
         unrated_dispatches=unrated_dispatches,
         evidence_freshness=evidence_read.freshness,
         battery_direction=evidence_read.battery_direction,
