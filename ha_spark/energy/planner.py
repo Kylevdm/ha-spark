@@ -66,6 +66,8 @@ from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.models import (
     ChargeIntent,
     ChargePlan,
+    DatedChargeWindow,
+    DaytimePurchase,
     ExportIntent,
     ExportSkip,
     FlexibilityEvent,
@@ -273,6 +275,50 @@ def _slot_reservation(
     )
 
 
+def _slot_charge_capacity(
+    inputs: PlannerInputs, cfg: PlannerConfig, limits: _PlanningLimits, efficiency: float,
+    index: int, loads: tuple[MajorLoad, ...],
+    observations: tuple[MajorLoadObservation, ...], *, without_reserve: bool = False,
+    planned_v2l_dc_kw: float = 0.0,
+) -> float:
+    """The shared overnight/daytime stored-power ceiling, including the reserve."""
+    geometry = inputs.geometry_for(cfg)
+    evidence = {observation.load_id: observation for observation in observations}
+    running: dict[str, float] = {}
+    for major in loads:
+        observation = evidence.get(major.id)
+        if (major.power_entity is not None and observation is not None and inputs.now is not None
+                and is_running(major, observation.reading_kw, observation.reported_at, inputs.now)):
+            assert observation.reading_kw is not None
+            running[major.id] = observation.reading_kw
+    slot_start = (
+        geometry.slot_starts[index] if geometry is not None
+        else inputs.horizon_start + timedelta(minutes=30 * index)
+        if inputs.horizon_start is not None else None
+    )
+    expected = {
+        major.id for major in loads if major.dispatch_driven
+        and slot_start is not None
+        and any(_overlaps(slot_start, slot_start + timedelta(minutes=30),
+                          (dispatch.start, dispatch.end)) for dispatch in inputs.dispatches)
+    }
+    active_kw = sum(
+        running[major.id] if major.id in running else major.effective_demand_kw
+        for major in loads if major.id in running or major.id in expected
+    )
+
+    def excluded(major: MajorLoad) -> bool:
+        return major.id in running or major.id in expected
+
+    reserve_kw = 0.0 if without_reserve else major_load_reserve_kw(loads, exclude=excluded)
+    assert inputs.load_slots is not None
+    return charge_capacity_kw(
+        limits.bank, limits.connection, charge_efficiency=efficiency,
+        base_load_kw=inputs.load_slots[index] * 2, active_major_loads_kw=active_kw,
+        reserve_kw=reserve_kw, planned_v2l_dc_kw=planned_v2l_dc_kw,
+    )
+
+
 def _window_charge_limit(
     inputs: PlannerInputs, cfg: PlannerConfig, limits: _PlanningLimits, efficiency: float,
     loads: tuple[MajorLoad, ...] = (),
@@ -288,18 +334,10 @@ def _window_charge_limit(
     """
     geometry = inputs.geometry_for(cfg)
     binding_id = limits.hardware_id
-    evidence = {observation.load_id: observation for observation in observations}
-    running: dict[str, float] = {}
-    for major in loads:
-        observation = evidence.get(major.id)
-        if (major.power_entity is not None and observation is not None and inputs.now is not None
-                and is_running(major, observation.reading_kw, observation.reported_at, inputs.now)):
-            assert observation.reading_kw is not None
-            running[major.id] = observation.reading_kw
     charge_capacity_kw(limits.bank, limits.connection, charge_efficiency=efficiency)
     if inputs.load_slots is not None:
         energy = 0.0
-        for i, load in enumerate(inputs.load_slots):
+        for i, _load in enumerate(inputs.load_slots):
             if geometry is not None:
                 start = max(geometry.slot_starts[i], geometry.window_start)
                 if inputs.now is not None:
@@ -317,29 +355,9 @@ def _window_charge_limit(
                 hours = max(0.0, min(0.5, cfg.window_hours - i * 0.5))
             if hours <= 0:
                 continue
-            slot_start = (
-                geometry.slot_starts[i] if geometry is not None
-                else inputs.horizon_start + timedelta(minutes=30 * i)
-                if inputs.horizon_start is not None else None
-            )
-            expected = {
-                major.id for major in loads if major.dispatch_driven
-                and slot_start is not None
-                and any(_overlaps(slot_start, slot_start + timedelta(minutes=30),
-                                  (dispatch.start, dispatch.end)) for dispatch in inputs.dispatches)
-            }
-            active_kw = sum(
-                running[major.id] if major.id in running else major.effective_demand_kw
-                for major in loads if major.id in running or major.id in expected
-            )
-            def excluded(major: MajorLoad, expected: set[str] = expected) -> bool:
-                return major.id in running or major.id in expected
-
-            reserve_kw = 0.0 if without_reserve else major_load_reserve_kw(loads, exclude=excluded)
-            capacity = charge_capacity_kw(
-                limits.bank, limits.connection, charge_efficiency=efficiency,
-                base_load_kw=load * 2, active_major_loads_kw=active_kw, reserve_kw=reserve_kw,
-                planned_v2l_dc_kw=planned_v2l_dc_kw,
+            capacity = _slot_charge_capacity(
+                inputs, cfg, limits, efficiency, i, loads, observations,
+                without_reserve=without_reserve, planned_v2l_dc_kw=planned_v2l_dc_kw,
             )
             # The connection binds only when the import term, not the bank room
             # shared with a V2L charger, is what lowered the capacity.
@@ -849,6 +867,7 @@ def _soc_path(
     cfg: PlannerConfig,
     refills: tuple[V2LRefill, ...] = (),
     solar_surplus: tuple[float, ...] = (),
+    daytime_purchases: tuple[DaytimePurchase, ...] = (),
 ) -> tuple[tuple[datetime, float], ...]:
     """Expected SoC at each slot start from the window end, if the plan holds.
 
@@ -879,6 +898,8 @@ def _soc_path(
         )
         soc = max(cfg.min_soc, soc - drain / cfg.capacity_kwh * 100.0)
         added = sum(action.kwh for action in refills if action.slot == i)
+        if daytime_purchases:
+            added += _daytime_slot_energy(daytime_purchases, i)
         added += solar_surplus[i] if solar_surplus else 0.0
         soc = min(cfg.target_cap, soc + added / cfg.capacity_kwh * 100.0)
     return tuple(path)
@@ -908,7 +929,8 @@ def _soc_series(
     charge_seconds = max(0.0, (window_end - charge_start).total_seconds())
     path = {at.astimezone(UTC): value for at, value in plan.soc_path}
     times = {now, *(at.astimezone(UTC) for at in geometry.slot_starts if at > now),
-             *(at for at in (window_start, window_end) if at > now)}
+             *(at for at in (window_start, window_end) if at > now),
+             *(at for p in plan.daytime_purchases for at in (p.start, p.end) if at > now)}
     if not path:
         times = {at for at in times if at <= window_end}
     exported = dict(zip(
@@ -956,7 +978,45 @@ def _soc_series(
             seconds = max(0.0, (min(at, window_end)
                                 - max(previous, charge_start)).total_seconds())
             added = plan.required_kwh * seconds / charge_seconds if charge_seconds else 0.0
+            for p in plan.daytime_purchases:
+                for i in range(*p.slot_range):
+                    lo = max(p.start, geometry.slot_starts[i])
+                    hi = min(p.end, geometry.slot_starts[i] + timedelta(minutes=30))
+                    seconds = max(0.0, (hi - lo).total_seconds())
+                    overlap = max(0.0, (min(at, hi) - max(previous, lo)).total_seconds())
+                    if seconds > 0:
+                        added += _daytime_slot_energy((p,), i) * overlap / seconds
             soc = min(cfg.target_cap, max(min(soc, cfg.min_soc),
+                                         soc + (added - drain) / cfg.capacity_kwh * 100))
+        elif plan.daytime_purchases:
+            # Partial session bounds may fall between the slot-start ledger's
+            # points. Integrate those intervals too, without discharging inside
+            # the session or applying charging losses a second time.
+            drain = added = 0.0
+            for i, start in enumerate(geometry.slot_starts):
+                lo = max(start, now, window_end)
+                hi = start + timedelta(minutes=30)
+                seconds = max(0.0, (hi - lo).total_seconds())
+                overlap = max(0.0, (min(at, hi) - max(previous, lo)).total_seconds())
+                covered_seconds = covered_overlap = 0.0
+                for p in plan.daytime_purchases:
+                    if not p.slot_range[0] <= i < p.slot_range[1]:
+                        continue
+                    a, b = max(lo, p.start), min(hi, p.end)
+                    duration = max(0.0, (b - a).total_seconds())
+                    part = max(0.0, (min(at, b) - max(previous, a)).total_seconds())
+                    covered_seconds += duration
+                    covered_overlap += part
+                    if duration > 0:
+                        added += _daytime_slot_energy((p,), i) * part / duration
+                if seconds > covered_seconds:
+                    drain += ((1 - schedule.cheap_fracs[i]) * net[i]
+                              * (overlap - covered_overlap) / (seconds - covered_seconds))
+                if seconds > 0:
+                    drain += exported.get(start, 0.0) * overlap / 3600
+                    added += sum(r.kwh for r in plan.v2l_refills if r.slot == i) \
+                        * overlap / seconds
+            soc = min(cfg.target_cap, max(cfg.min_soc,
                                          soc + (added - drain) / cfg.capacity_kwh * 100))
         # Never feed the forecast back into soc_path or V2L sizing. At matching
         # instants that ledger is authoritative, including the window end.
@@ -1056,6 +1116,86 @@ def _v2l_refills(
             if need <= 1e-9 or budget <= 1e-9:
                 break
     return tuple(sorted(actions, key=lambda action: action.slot)), False, saving
+
+
+def _daytime_purchases(
+    inputs: PlannerInputs, cfg: PlannerConfig, schedule: TariffSchedule,
+    geometry: HorizonGeometry, net: list[float], initial_energy: float,
+    first: int, stop: int, limits: _PlanningLimits, efficiency: float,
+    loads: tuple[MajorLoad, ...], observations: tuple[MajorLoadObservation, ...],
+    export: ExportIntent | None,
+) -> tuple[tuple[DaytimePurchase, ...], tuple[DatedChargeWindow, ...], list[float], float]:
+    """Greedily fill dated overlay runs in order, never borrowing a future buy."""
+    purchases: list[DaytimePurchase] = []
+    windows: list[DatedChargeWindow] = []
+    remaining = list(net)
+    energy = max(0.0, initial_energy)
+    cap = max(0.0, cfg.capacity_kwh * (cfg.target_cap - cfg.min_soc) / 100)
+    exported = dict(zip(export.selected_slots, export.slot_export_kw, strict=True)) \
+        if export else {}
+    selected = set(exported)
+    i = first
+    while i < stop:
+        session = schedule.import_sessions[i] if i < len(schedule.import_sessions) else None
+        eligible = (session is not None and schedule.import_overlays[i] == "free_electricity"
+                    and geometry.window_fracs[i] == 0
+                    and geometry.slot_starts[i] not in selected)
+        if not eligible:
+            drain = ((net[i] + exported[geometry.slot_starts[i]] * _slot_hours(geometry, i))
+                     if geometry.slot_starts[i] in exported
+                     else (1 - schedule.cheap_fracs[i]) * net[i])
+            energy = max(0.0, energy - drain)
+            i += 1
+            continue
+        assert session is not None
+        j = i + 1
+        while (j < stop and schedule.import_sessions[j] == session
+               and geometry.window_fracs[j] == 0 and geometry.slot_starts[j] not in selected):
+            j += 1
+        start = max(session.start.astimezone(UTC), geometry.slot_starts[i].astimezone(UTC),
+                    (inputs.now or geometry.horizon_start).astimezone(UTC))
+        end = min(session.end.astimezone(UTC),
+                  geometry.slot_starts[j - 1].astimezone(UTC) + timedelta(minutes=30))
+        capacities = []
+        for k in range(i, j):
+            lo = max(start, geometry.slot_starts[k].astimezone(UTC))
+            hi = min(end, geometry.slot_starts[k].astimezone(UTC) + timedelta(minutes=30))
+            hours = max(0.0, (hi - lo).total_seconds() / 3600)
+            remaining[k] *= 1 - hours / _slot_hours(geometry, k)
+            capacities.append(_slot_charge_capacity(
+                inputs, cfg, limits, efficiency, k, loads, observations,
+            ) * hours)
+        amount = min(max(0.0, cap - energy), sum(capacities))
+        left = amount
+        delivered = []
+        for k, capacity in zip(range(i, j), capacities, strict=True):
+            added = min(left, capacity)
+            delivered.append(added)
+            left -= added
+            energy = min(cap, max(0.0, energy - (1 - schedule.cheap_fracs[k]) * remaining[k])
+                         + added)
+        if amount > 1e-9:
+            price = schedule.battery_import_prices[i]
+            evidence = (f"listed session {_clock(session.start, inputs)}–"
+                        f"{_clock(session.end, inputs)}")
+            reason = (f"Buy {amount:.2f} kWh from Free Electricity at £{price:g}/kWh using the "
+                      f"{evidence}.")
+            purchases.append(DaytimePurchase(
+                slot_range=(i, j), start=start, end=end, overlay="free_electricity",
+                evidence=evidence, session_id=session.session_id, effective_price=price,
+                energy_kwh=amount, reason=reason, slot_energy_kwh=tuple(delivered),
+            ))
+            windows.append(DatedChargeWindow(
+                start, end, min(cfg.target_cap, cfg.min_soc + energy / cfg.capacity_kwh * 100),
+            ))
+        i = j
+    return tuple(purchases), tuple(windows), remaining, energy
+
+
+def _daytime_slot_energy(purchases: tuple[DaytimePurchase, ...], index: int) -> float:
+    """Stored energy assigned to one slot, without reapplying efficiency."""
+    return sum(p.slot_energy_kwh[index - p.slot_range[0]] for p in purchases
+               if p.slot_range[0] <= index < p.slot_range[1])
 
 
 def compute_plan(
@@ -1256,7 +1396,37 @@ def compute_plan(
         else 0.0
     )
     pre_window_outflow += pre_window_export_kwh
-    usable_at_window = usable_now - pre_window_outflow
+    daytime_purchases: tuple[DaytimePurchase, ...] = ()
+    daytime_windows: tuple[DatedChargeWindow, ...] = ()
+    daytime_enabled = (inputs.load_slots is not None and geometry is not None
+                       and len(schedule.import_sessions) == len(schedule.import_overlays)
+                       == len(schedule.battery_import_prices) == len(net)
+                       and bool(schedule.import_sessions) and limits_reason is None
+                       and inputs.soc.ok and cfg.capacity_kwh > 0)
+    daytime_balance = None
+    if daytime_enabled and geometry is not None:
+        before, windows, daytime_net, balance = _daytime_purchases(
+            inputs, cfg, schedule, geometry, net,
+            usable_now - inputs.pre_window_drain_kwh, 0, window_first,
+            planning_limits, efficiency, loads, major_loads, export,
+        )
+        if before:
+            daytime_purchases, daytime_windows = before, windows
+            net = daytime_net
+            pre_window_outflow = inputs.pre_window_drain_kwh + sum(
+                (1 - schedule.cheap_fracs[i]) * net[i] for i in range(window_first)
+            ) + straddle + pre_window_export_kwh
+            # The walk above already spent the exports in the slots it
+            # covered; only an export outside them is still to subtract.
+            walked_export_kwh = sum(
+                power * _slot_hours(geometry, geometry.slot_starts.index(start))
+                for start, power in zip(export.selected_slots, export.slot_export_kw, strict=True)
+                if start in geometry.slot_starts[:window_first]
+            ) if export is not None else 0.0
+            daytime_balance = max(0.0, balance - straddle - max(
+                0.0, pre_window_export_kwh - walked_export_kwh))
+    usable_at_window = (daytime_balance if daytime_balance is not None
+                        else usable_now - pre_window_outflow)
     # Explicit current-slot geometry uses the window-start balance. Legacy
     # inputs and the daily fallback retain their original numbers.
     if inputs.load_slots is not None and inputs.geometry is not None:
@@ -1350,7 +1520,7 @@ def compute_plan(
         # (soc_now + required) already prices in the drain. Never above the
         # observed SoC: a battery below min_soc sizes from what it holds.
         expected_window_start_soc = min(
-            inputs.soc_now,
+            cfg.target_cap if daytime_balance is not None else inputs.soc_now,
             cfg.min_soc + max(0.0, usable_at_window) / cfg.capacity_kwh * 100.0,
         )
         if window_first > 0 and export_overlaps_charge:
@@ -1360,7 +1530,7 @@ def compute_plan(
             target_soc = expected_window_start_soc
         elif window_first > 0:
             target_energy = usable_at_window + required
-            if pre_window_outflow > 0 and required == 0:
+            if pre_window_outflow > 0 and required == 0 and daytime_balance is None:
                 target_energy = obligation
             target_soc = min(
                 cfg.target_cap, cfg.min_soc + target_energy / cfg.capacity_kwh * 100.0
@@ -1373,6 +1543,17 @@ def compute_plan(
             target_soc,
             expected_window_start_soc if expected_window_start_soc is not None else inputs.soc_now,
         )
+
+    if daytime_enabled and geometry is not None:
+        after, windows, daytime_net, _ = _daytime_purchases(
+            inputs, cfg, schedule, geometry, net, usable_at_window + required,
+            geometry.window_slot_range[1], len(net), planning_limits, efficiency,
+            loads, major_loads, export,
+        )
+        if after:
+            daytime_purchases += after
+            daytime_windows += windows
+            net = daytime_net
 
     refills, v2l_unavailable, v2l_saving = _v2l_refills(
         inputs, cfg, schedule, reservations, usable_at_window + required, export
@@ -1402,8 +1583,40 @@ def compute_plan(
             ) if refills or inputs.geometry is not None else target_soc
         )
         soc_path = _soc_path(
-            geometry, net, schedule, export, path_start_soc, cfg, refills, surplus
+            geometry, net, schedule, export, path_start_soc, cfg, refills, surplus,
+            daytime_purchases,
         )
+
+    if daytime_purchases and geometry is not None:
+        # Cost house imports at the base tariff, separately from battery buys.
+        energy = max(0.0, usable_now - inputs.pre_window_drain_kwh)
+        house_cost = 0.0
+        original_net = [
+            max(0.0, load - solar * cfg.solar_haircut_k)
+            * (_slot0_remaining(geometry) if i == 0 else 1.0)
+            for i, (load, solar) in enumerate(zip(inputs.load_slots or (), solar_slots,
+                                                  strict=True))
+        ]
+        for i, demand in enumerate(net):
+            covered = schedule.cheap_fracs[i] * demand
+            drain = demand - covered
+            missing = max(0.0, drain - energy)
+            house_cost += (original_net[i] - demand + covered + missing) * schedule.prices[i]
+            energy = max(0.0, energy - drain)
+            energy += _daytime_slot_energy(daytime_purchases, i)
+            energy += sum(r.kwh for r in refills if r.slot == i)
+            if charge_limit > 0:
+                hours = _slot_hours(geometry, i) * geometry.window_fracs[i]
+                remaining_hours = sum(_slot_hours(geometry, k) * f
+                                      for k, f in enumerate(geometry.window_fracs))
+                if remaining_hours > 0:
+                    energy += required * hours / remaining_hours
+            energy = min(cfg.capacity_kwh * (cfg.target_cap - cfg.min_soc) / 100, energy)
+        planned_cost = house_cost + purchase * schedule.cheap_rate - (export_revenue or 0.0)
+        planned_cost += sum(p.energy_kwh / efficiency * p.effective_price
+                            for p in daytime_purchases)
+        planned_cost += sum(r.kwh * cfg.v2l_offpeak_rate_gbp / cfg.v2l_round_trip_efficiency
+                            for r in refills) if cfg.v2l_round_trip_efficiency > 0 else 0.0
 
     # This reservation is carried from now, never funded by charging or V2L.
     if inputs.load_slots is not None and pre_window_outflow > 0:
@@ -1433,6 +1646,7 @@ def compute_plan(
         window_start=cfg.window_start,
         window_end=cfg.window_end,
         holds=holds,
+        daytime_windows=daytime_windows,
         export=export,
         hold_trusted=inputs.dispatches_trusted,
         export_trusted=inputs.flexibility_event_trusted,
@@ -1509,6 +1723,7 @@ def compute_plan(
             sum(abs(d.charge_in_kwh) for d in inputs.dispatches) if inputs.dispatches else None
         ),
         reservations=reservations,
+        daytime_purchases=daytime_purchases,
         charge_funded_reservations=charge_funded,
         v2l_refills=refills,
         v2l_wanted_but_unavailable=v2l_unavailable,
