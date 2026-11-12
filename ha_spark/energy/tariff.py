@@ -33,6 +33,7 @@ from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.models import (
     DispatchSlot,
     FlexibilityEvent,
+    FreeSession,
     PlannerConfig,
     PlannerInputs,
     PricePoint,
@@ -238,6 +239,51 @@ class TariffSchedule:
     # across a DST change; elapsed slots included). Empty on legacy,
     # window-anchored inputs — their ``cheap_fracs`` is the cycle already.
     cycle_cheap_slots: tuple[tuple[datetime, float], ...] = ()
+    battery_import_prices: tuple[float, ...] = ()
+    import_overlays: tuple[str | None, ...] = ()
+    import_allowances: tuple[float | None, ...] = ()
+    # Retains dated eligibility and identity at the schedule/planner seam.
+    import_sessions: tuple[FreeSession | None, ...] = ()
+
+
+def apply_import_overlay(
+    schedule: TariffSchedule, inputs: PlannerInputs, cfg: PlannerConfig,
+) -> TariffSchedule:
+    """Layer trusted Free Electricity over battery prices, never house prices.
+
+    Coverage is absolute interval overlap with the remaining part of each slot.
+    Happy Hour eligibility alone is insufficient until its allowance is supplied.
+    """
+    geometry = inputs.geometry_for(cfg)
+    if inputs.load_slots is None or geometry is None:
+        return schedule
+    # A schedule that does not price every horizon slot is left alone, never
+    # part-overlaid and never an error.
+    if len(schedule.prices) != len(geometry.slot_starts):
+        return schedule
+    sessions: list[FreeSession | None] = [None] * len(schedule.prices)
+    for session in inputs.free_sessions:
+        if (session.kind != "free_electricity" or session.start.utcoffset() is None
+                or session.end.utcoffset() is None):
+            continue
+        a, b = session.start.astimezone(UTC), session.end.astimezone(UTC)
+        if b <= a:
+            continue
+        for i, start in enumerate(geometry.slot_starts):
+            end = start.astimezone(UTC) + timedelta(minutes=30)
+            lo = end - timedelta(minutes=30 * (geometry.slot0_remaining_frac if i == 0 else 1))
+            if max(a, lo) < min(b, end) and sessions[i] is None:
+                sessions[i] = session
+    if not any(sessions):
+        return schedule
+    return replace(
+        schedule,
+        battery_import_prices=tuple(0.0 if s else p for s, p in
+                                    zip(sessions, schedule.prices, strict=True)),
+        import_overlays=tuple("free_electricity" if s else None for s in sessions),
+        import_allowances=(None,) * len(sessions),
+        import_sessions=tuple(sessions),
+    )
 
 
 class TariffProvider(Protocol):
