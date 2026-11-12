@@ -1,7 +1,8 @@
 """Ingress serialises the stored planner view, never recomputing a plan."""
 
+import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
@@ -9,26 +10,27 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ha_spark.api.server import INGRESS_PROXY_IP, build_app
-from ha_spark.energy.models import LoadForecast, PlannerInputs
+from ha_spark.energy.models import FreeSession, LoadForecast, PlannerInputs
 from ha_spark.energy.plan_run import PlanRun, StoredPlanRun
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
-from ha_spark.energy.tariff import fixed_schedule
+from ha_spark.energy.tariff import apply_import_overlay, fixed_schedule
 from tests.api_helpers import owner_client
 from tests.test_api import _soc, _state
 from tests.test_planner import cfg
 from tests.test_planner_slots_view import LONDON, slot_inputs
 
 
-def stored_run(*, slots=True, measurement=None):
+def stored_run(*, slots=True, measurement=None, free_sessions=()):
     inputs = PlannerInputs(
         soc=measurement or _soc(40), solar_tomorrow_kwh=4, predicted_home_load_kwh=12,
         load_slots=(0.25,) * 48 if slots else None,
         horizon_start=datetime(2026, 10, 25, 0, 30, tzinfo=UTC),
         now=datetime(2026, 10, 25, 1, 10, tzinfo=UTC),
     )
+    inputs = replace(inputs, free_sessions=free_sessions)
     config = cfg()
-    schedule = fixed_schedule(inputs, config)
+    schedule = apply_import_overlay(fixed_schedule(inputs, config), inputs, config)
     plan = compute_plan(inputs, config, schedule)
     return StoredPlanRun(PlanRun(
         plan, inputs, config, schedule, "test", LoadForecast(12, None, "test"),
@@ -201,6 +203,60 @@ def test_ingress_timeline_uses_daemon_authority_mode(tmp_path):
     with owner_client(state) as client:
         timeline = client.get("/api/plan").json()["timeline"]
     assert timeline["operating_mode"] == "protect"
+
+
+def test_timeline_payload_lists_daytime_purchase_and_omits_session_id(tmp_path):
+    now = datetime(2026, 10, 25, 1, 10, tzinfo=UTC)
+    session_start = now.replace(hour=12, minute=0)
+    session_end = session_start + timedelta(hours=1)
+    record = stored_run(free_sessions=(
+        FreeSession("free_electricity", "private-canary-id", session_start, session_end),
+    ))
+    assert record.run.plan.daytime_purchases
+    purchase, = record.run.plan.daytime_purchases
+    state = _state(tmp_path)
+    state.set_plan(record.run.plan, record)
+    with owner_client(state) as client:
+        timeline = client.get("/api/plan").json()["timeline"]
+    purchase_line = next(line for line in timeline["lines"] if line["text"] == purchase.reason)
+    assert purchase_line["kind"] == "charge"
+    assert purchase_line["kwh"] == pytest.approx(purchase.energy_kwh)
+    assert purchase_line["start"] == purchase.start.isoformat()
+    assert purchase_line["end"] == purchase.end.isoformat()
+    assert any("charge" in slot["actions"] for slot in timeline["slots"]
+               if slot["start"] == purchase.start.isoformat())
+    soc = {datetime.fromisoformat(p["at"]): p["soc_pct"] for p in timeline["soc"]}
+    assert soc[purchase.end] > soc[purchase.start]  # the SoC rises through the purchase
+    json_text = json.dumps(timeline)
+    assert "private-canary-id" not in json_text
+
+
+def test_timeline_observe_suffix_only_on_purchase_lines_and_only_in_observe(tmp_path):
+    now = datetime(2026, 10, 25, 1, 10, tzinfo=UTC)
+    session_start = now.replace(hour=12, minute=0)
+    session_end = session_start + timedelta(hours=1)
+    record = stored_run(free_sessions=(
+        FreeSession("free_electricity", "x", session_start, session_end),
+    ))
+    purchase, = record.run.plan.daytime_purchases
+    state = _state(tmp_path)
+    state.set_plan(record.run.plan, record)
+    state.executor = Mock()
+    state.executor.authority_status.return_value = {"mode": "observe"}
+    with owner_client(state) as client:
+        timeline = client.get("/api/plan").json()["timeline"]
+    suffix = " Simulated in Observe: nothing is written."
+    state.executor.authority_status.return_value = {"mode": "optimise"}
+    with owner_client(state) as client:
+        optimise = client.get("/api/plan").json()["timeline"]
+    assert all(suffix not in line["text"] for line in optimise["lines"])
+    # Observe differs only in the mode and the purchase line's suffix.
+    expected = dict(optimise, operating_mode="observe", lines=[
+        dict(line, text=line["text"] + suffix) if line["text"] == purchase.reason else line
+        for line in optimise["lines"]
+    ])
+    assert timeline == expected
+    assert any(line["text"] == purchase.reason + suffix for line in timeline["lines"])
 
 
 @pytest.mark.parametrize("now", [

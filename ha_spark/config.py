@@ -89,6 +89,7 @@ _OPTION_KEYS = frozenset(
         "derive_invert_ev_charge",
         "octopus_api_key",
         "octopus_mpan",
+        "free_electricity_enabled",
         "octopus_meter_serial",
         "octopus_api_url",
         "octopus_account_number",
@@ -537,10 +538,18 @@ class Settings(BaseSettings):
     # below (Kraken GraphQL auth + REST standard-unit-rates).
     octopus_api_key: Annotated[str, _metadata("addon", secret=True)] = Field(default="")
     octopus_mpan: Annotated[str, _metadata("addon")] = Field(default="")
+    free_electricity_enabled: Annotated[bool, _metadata("addon")] = Field(default=True)
     octopus_meter_serial: Annotated[str, _metadata("addon")] = Field(default="")
     octopus_api_url: Annotated[str, _metadata("addon")] = Field(
         default="https://api.octopus.energy/v1"
     )
+    # Weekend Happy Hour bookings: the undocumented backend GraphQL endpoint the
+    # Octopus web app uses (ADR-0004), read-only; blanking it turns the source
+    # off. Not a secret, and independent of `tariff_provider`.
+    octopus_backend_api_url: Annotated[str, _metadata("addon")] = Field(
+        default="https://api.backend.octopus.energy/v1"
+    )
+    happy_hour_enabled: Annotated[bool, _metadata("addon")] = Field(default=True)
     # Octopus Intelligent tariff provider: account number for the GraphQL
     # plannedDispatches query, product/tariff code for the standard-unit-rates
     # REST endpoint (e.g. "INTELLI-VAR-22-10-14" / "E-1R-INTELLI-VAR-22-10-14-A").
