@@ -37,6 +37,8 @@ def timeline_payload(
         return value.astimezone(UTC).astimezone(run.tz or UTC).isoformat()
 
     lines = view.lines + ((ev_hold_line(run.inputs.now),) if record.ev_hold_active else ())
+    purchase_reasons = {p.reason for p in run.plan.daytime_purchases}
+    observe_suffix = " Simulated in Observe: nothing is written."
     geometry = run.inputs.geometry
     horizon_start = geometry.horizon_start if geometry is not None else run.inputs.horizon_start
     today_start = household_midnight(now.astimezone(run.tz or UTC))
@@ -46,8 +48,15 @@ def timeline_payload(
         "strategy": run.plan.strategy,
         "headline": asdict(view.headline),
         "costs": asdict(view.costs),
-        "lines": [dict(asdict(line), start=instant(line.start), end=instant(line.end))
-                  for line in lines],
+        "lines": [
+            dict(
+                asdict(line), start=instant(line.start), end=instant(line.end),
+                text=(line.text + observe_suffix
+                      if operating_mode == "observe" and line.kind == "charge"
+                      and line.text in purchase_reasons else line.text),
+            )
+            for line in lines
+        ],
         "horizon_start": instant(horizon_start),
         "today_start": instant(today_start),
         "slot_minutes": 30,

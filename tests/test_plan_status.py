@@ -8,7 +8,8 @@ import pytest
 
 from ha_spark.api.plan_status import resolve
 from ha_spark.authority import HoldDevice, HoldRecord
-from ha_spark.energy.models import ExportIntent, Reservation
+from ha_spark.config import Settings
+from ha_spark.energy.models import DaytimePurchase, ExportIntent, Reservation
 from tests.test_api import _plan
 
 TZ = ZoneInfo("Europe/London")
@@ -178,3 +179,95 @@ def test_reason_numbers_are_bounded_and_finite(field, value):
     for reason in (status.reason, status.next_reason or ""):
         assert len(reason) <= 120
         assert "inf" not in reason and "nan" not in reason
+
+
+def _purchase(
+    start: datetime, end: datetime,
+    reason: str = "Buy 3.19 kWh from Free Electricity at £0/kWh.",
+    **overrides: object,
+) -> DaytimePurchase:
+    defaults: dict[str, object] = dict(
+        slot_range=(0, 2),
+        overlay="free_electricity",
+        evidence="listed",
+        session_id="private-id",
+        effective_price=0.0,
+        energy_kwh=3.19,
+        reason=reason,
+        slot_energy_kwh=(),
+    )
+    defaults.update(overrides)
+    return DaytimePurchase(start=start, end=end, **defaults)  # type: ignore[arg-type]
+
+
+def test_purchase_inside_window_shows_charge_with_planner_reason():
+    purchase = _purchase(start=at(12), end=at(13))
+    plan = replace(_plan(), daytime_purchases=(purchase,))
+    status = resolve(plan, (), at(12, 30), TZ)
+    assert status.action == "charge"
+    assert status.reason == purchase.reason
+    assert status.next_at == at(13)
+    assert status.next_action == "idle"
+
+
+def test_before_purchase_next_change_is_at_purchase_start():
+    purchase = _purchase(start=at(12), end=at(13))
+    plan = replace(_plan(), daytime_purchases=(purchase,))
+    status = resolve(plan, (), at(11), TZ)
+    assert status.action == "idle"
+    assert status.next_at == at(12)
+    assert status.next_action == "charge"
+    assert status.next_reason == purchase.reason
+
+
+def test_hold_wins_over_daytime_purchase():
+    purchase = _purchase(start=at(12), end=at(13))
+    plan = replace(_plan(), daytime_purchases=(purchase,))
+    status = resolve(plan, (record("ev"),), at(12, 30), TZ)
+    assert status.action == "hold"
+    assert status.reason != purchase.reason
+
+
+def test_overnight_charge_wins_over_purchase_overlap():
+    purchase = _purchase(start=at(0), end=at(1))
+    plan = replace(_plan(), daytime_purchases=(purchase,))
+    status = resolve(plan, (), at(0, 30), TZ)
+    assert status.action == "charge"
+    assert status.reason != purchase.reason
+    assert "05:30" in status.reason  # overnight charge reason, not purchase reason
+
+
+def test_non_printable_or_overlong_purchase_reason_degrades():
+    long_reason = "x" * 256
+    purchase = _purchase(start=at(12), end=at(13), reason=long_reason)
+    status = resolve(replace(_plan(), daytime_purchases=(purchase,)), (), at(12, 30), TZ)
+    assert status.reason == "Charging from a daytime purchase."
+
+    bad_reason = "Buy energy\x00now."
+    purchase = _purchase(start=at(12), end=at(13), reason=bad_reason)
+    status = resolve(replace(_plan(), daytime_purchases=(purchase,)), (), at(12, 30), TZ)
+    assert status.reason == "Charging from a daytime purchase."
+
+
+def test_no_purchase_status_is_unchanged():
+    baseline = resolve(_plan(), (), at(12), TZ)
+    assert baseline.action == "idle"
+    assert baseline.reason == "Nothing to charge, export or hold right now."
+    status = resolve(replace(_plan(), daytime_purchases=()), (), at(12), TZ)
+    assert status == baseline
+
+
+def test_plan_summary_carries_daytime_purchase():
+    from ha_spark.api.contract import plan_summary
+
+    purchase = _purchase(start=at(12), end=at(13))
+    plan = replace(_plan(), daytime_purchases=(purchase,))
+    summary = plan_summary(
+        api_version=4, session_id="test", built_at=at(12, 30), loop_tick=at(12, 30),
+        plan=plan, plan_at=at(12, 30), soc_observation_ok=True,
+        settings=Settings(timezone="Europe/London"),
+    )
+    assert summary["plan"]["status"]["action"] == "charge"
+    assert summary["plan"]["status"]["reason"] == purchase.reason
+    assert summary["plan"]["next_change"]["at"] == at(13).isoformat()
+    assert summary["plan"]["next_change"]["action"] == "idle"
