@@ -4,6 +4,9 @@ The consumption/account/rates endpoints are the public REST v1 API (API-key Basi
 Auth). Account agreement rates and planned Intelligent dispatches use the Kraken
 GraphQL API, which needs a short-lived JWT exchanged for the API key first
 (``obtainKrakenToken``) — never logged, and never echoed in any error message.
+Weekend Happy Hour bookings are read from the undocumented Octopus backend
+GraphQL endpoint (``octopus_backend_api_url``, ADR-0004) with the same shared
+token, read-only, degrading to a failed reading on any error.
 
 Every GraphQL read goes through ``kraken_graphql``, which shares one in-memory
 token per endpoint (#688): minted on first use, replaced shortly before its
@@ -626,3 +629,162 @@ async def fetch_planned_dispatches(settings: Settings) -> tuple[DispatchSlot, ..
         source = str((item.get("meta") or {}).get("source") or "")
         slots.append(DispatchSlot(start, end, charge_in_kwh, source))
     return tuple(slots)
+
+
+_HAPPY_HOURS_QUERY = """
+query HappyHours($account: String!) {
+  savingSessions { account(accountNumber: $account) {
+    joinedEvents { eventId eventType startAt endAt } } }
+}
+"""
+
+
+class _SavingSessionEvent(BaseModel):
+    """One ``joinedEvents`` entry; only ``eventType`` is trusted by the model.
+
+    The other fields are checked by hand: a bad ``eventId`` or a missing field is
+    schema drift (the read fails), while unusable times drop only that booking.
+    """
+
+    eventType: StrictStr
+    eventId: Any = None
+    startAt: Any = None
+    endAt: Any = None
+
+
+class _SavingSessionAccount(BaseModel):
+    joinedEvents: list[_SavingSessionEvent]
+
+
+class _SavingSessions(BaseModel):
+    account: _SavingSessionAccount
+
+
+class _SavingSessionsData(BaseModel):
+    savingSessions: _SavingSessions
+
+
+class _HappyHourResponse(BaseModel):
+    data: _SavingSessionsData
+    errors: list[Any] | None = None
+
+
+@dataclass(frozen=True)
+class HappyHourBooking:
+    """One booked Weekend Happy Hour (Octopus's numeric ``eventId`` as text)."""
+
+    event_id: str
+    start: datetime
+    end: datetime
+
+
+@dataclass(frozen=True)
+class HappyHourReading:
+    """One Happy Hour read: ``bookings`` is ``None`` when the read failed.
+
+    ``()`` means read with no booking; a non-empty tuple means booked. The
+    planner treats a failed read as no session, never as a booking.
+    """
+
+    read_at: datetime
+    bookings: tuple[HappyHourBooking, ...] | None
+
+
+def happy_hour_source(settings: Settings) -> Literal["disabled", "not_configured", "active"]:
+    """Whether the Happy Hour source may read; never a ``tariff_provider`` question."""
+    if not settings.happy_hour_enabled:
+        return "disabled"
+    if not (
+        settings.octopus_api_key
+        and settings.octopus_account_number
+        and settings.octopus_backend_api_url.strip()
+    ):
+        return "not_configured"
+    return "active"
+
+
+def _happy_hour_event_id(raw: Any) -> str | None:
+    """The booking's ``eventId`` as text, or ``None`` when missing or wrong-typed."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return str(raw)
+    # Text is accepted only as digits: an id is never a place to echo anything.
+    if isinstance(raw, str) and raw.isascii() and raw.isdigit() and len(raw) <= 20:
+        return raw
+    return None
+
+
+_CALENDAR_START = datetime.min.replace(tzinfo=UTC) + timedelta(days=2)
+_CALENDAR_END = datetime.max.replace(tzinfo=UTC) - timedelta(days=2)
+
+
+def _booking_instant(raw: object) -> datetime:
+    """Parse a booking time; it must carry its own UTC offset, never a guessed one."""
+    if not isinstance(raw, str):
+        raise ValueError("booking time is not a string")
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        raise ValueError("booking time carries no UTC offset")
+    try:
+        instant = parsed.astimezone(UTC)
+    except OverflowError:
+        raise ValueError("booking time is out of range") from None
+    # Within two days of either end of the calendar it cannot be shown on every
+    # household clock.
+    if not _CALENDAR_START <= instant <= _CALENDAR_END:
+        raise ValueError("booking time is out of range")
+    return instant
+
+
+async def fetch_happy_hours(
+    settings: Settings, *, now: datetime | None = None
+) -> HappyHourReading:
+    """Read booked Weekend Happy Hours from the backend endpoint (ADR-0004).
+
+    Never raises for anything Octopus sends or fails to send: any HTTP, transport,
+    auth or payload failure is a failed reading, which the planner treats as no
+    session. A booking whose times cannot be read as UTC-offset instants is
+    dropped, never zone-guessed. Offered slots are not selected and can never
+    become bookings. `now` is the read time (an aware instant; a naive one is
+    replaced by the clock).
+    """
+    read_at = now if now is not None and now.tzinfo is not None else datetime.now(UTC)
+    if happy_hour_source(settings) != "active":
+        # Disabled or unconfigured: no request, and no booking implied.
+        return HappyHourReading(read_at, None)
+    graphql_url = f"{settings.octopus_backend_api_url.rstrip('/')}/graphql/"
+    reply: _HappyHourResponse | None = None
+    try:
+        async with httpx.AsyncClient(timeout=settings.ha_timeout) as client:
+            payload = await kraken_graphql(
+                client, graphql_url, settings.octopus_api_key,
+                _HAPPY_HOURS_QUERY, {"account": settings.octopus_account_number},
+            )
+        reply = _HappyHourResponse.model_validate(payload)
+    except (httpx.HTTPError, ValueError, OctopusApiError, RecursionError):
+        pass  # RecursionError: a reply nested too deeply to decode
+    if reply is None or reply.errors:
+        # Fixed text, outside the handler: the failed request carries the token.
+        log.warning("Happy Hour read failed; no Happy Hour is planned")
+        return HappyHourReading(read_at, None)
+    bookings: dict[str, HappyHourBooking] = {}
+    for event in reply.data.savingSessions.account.joinedEvents:
+        if event.eventType != "WEEKEND_HAPPY_HOUR":
+            continue
+        event_id = _happy_hour_event_id(event.eventId)
+        if event_id is None or event.startAt is None or event.endAt is None:
+            # A missing field or a wrong-typed id is schema drift, not a booking.
+            log.warning("Happy Hour read failed; no Happy Hour is planned")
+            return HappyHourReading(read_at, None)
+        try:
+            start = _booking_instant(event.startAt)
+            end = _booking_instant(event.endAt)
+        except ValueError:
+            continue  # dropped: this hour's times cannot be read as instants
+        if end <= start:
+            continue
+        if end > read_at and event_id not in bookings:
+            bookings[event_id] = HappyHourBooking(event_id, start, end)
+    ordered = tuple(sorted(bookings.values(), key=lambda booking: booking.start))
+    return HappyHourReading(read_at, ordered)

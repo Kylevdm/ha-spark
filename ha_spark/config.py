@@ -541,6 +541,13 @@ class Settings(BaseSettings):
     octopus_api_url: Annotated[str, _metadata("addon")] = Field(
         default="https://api.octopus.energy/v1"
     )
+    # Weekend Happy Hour bookings: the undocumented backend GraphQL endpoint the
+    # Octopus web app uses (ADR-0004), read-only; blanking it turns the source
+    # off. Not a secret, and independent of `tariff_provider`.
+    octopus_backend_api_url: Annotated[str, _metadata("addon")] = Field(
+        default="https://api.backend.octopus.energy/v1"
+    )
+    happy_hour_enabled: Annotated[bool, _metadata("addon")] = Field(default=True)
     # Octopus Intelligent tariff provider: account number for the GraphQL
     # plannedDispatches query, product/tariff code for the standard-unit-rates
     # REST endpoint (e.g. "INTELLI-VAR-22-10-14" / "E-1R-INTELLI-VAR-22-10-14-A").
