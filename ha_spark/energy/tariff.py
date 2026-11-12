@@ -39,6 +39,9 @@ from ha_spark.energy.models import (
     PricePoint,
 )
 
+HAPPY_HOUR_ALLOWANCE_KWH = 16.0
+HAPPY_HOUR_MARGIN = 0.10
+
 
 def _in_overnight_window(t: time, start: time, end: time) -> bool:
     """True if clock time ``t`` falls in the charge window (which may wrap midnight).
@@ -249,39 +252,61 @@ class TariffSchedule:
 def apply_import_overlay(
     schedule: TariffSchedule, inputs: PlannerInputs, cfg: PlannerConfig,
 ) -> TariffSchedule:
-    """Layer trusted Free Electricity over battery prices, never house prices.
+    """Layer trusted free sessions over battery prices with per-session allowances.
 
-    Coverage is absolute interval overlap with the remaining part of each slot.
-    Happy Hour eligibility alone is insufficient until its allowance is supplied.
+    Coverage and gross house load use only the real interval still to come.
+    Base house prices remain available; the planner credits Happy Hour load only
+    when it actually buys within the session's allowance.
     """
     geometry = inputs.geometry_for(cfg)
     if inputs.load_slots is None or geometry is None:
         return schedule
     # A schedule that does not price every horizon slot is left alone, never
     # part-overlaid and never an error.
-    if len(schedule.prices) != len(geometry.slot_starts):
+    if (len(schedule.prices) != len(geometry.slot_starts)
+            or len(inputs.load_slots) != len(schedule.prices)):
         return schedule
     sessions: list[FreeSession | None] = [None] * len(schedule.prices)
-    for session in inputs.free_sessions:
-        if (session.kind != "free_electricity" or session.start.utcoffset() is None
+    allowances: list[float | None] = [None] * len(schedule.prices)
+    # Free Electricity wins a shared slot over Happy Hour, whatever the input order.
+    for session in sorted(inputs.free_sessions, key=lambda s: s.kind != "free_electricity"):
+        if (session.kind not in ("free_electricity", "happy_hour")
+                or session.start.utcoffset() is None
                 or session.end.utcoffset() is None):
             continue
         a, b = session.start.astimezone(UTC), session.end.astimezone(UTC)
         if b <= a:
             continue
+        overlaps = []
         for i, start in enumerate(geometry.slot_starts):
             end = start.astimezone(UTC) + timedelta(minutes=30)
             lo = end - timedelta(minutes=30 * (geometry.slot0_remaining_frac if i == 0 else 1))
-            if max(a, lo) < min(b, end) and sessions[i] is None:
+            overlaps.append(max(0.0, (min(b, end) - max(a, lo)).total_seconds()) / 1800)
+        allowance = None
+        if session.kind == "happy_hour":
+            r = inputs.happy_hour_remaining_kwh.get(session.session_id, HAPPY_HOUR_ALLOWANCE_KWH)
+            if (isinstance(r, bool) or not isinstance(r, (int, float))
+                    or not math.isfinite(r) or r <= 0):
+                continue
+            # Subtract the full margin: r - 1.6 is narrower than 0.9 * r.
+            house = sum(max(0.0, load) * share for load, share in
+                        zip(inputs.load_slots, overlaps, strict=True))
+            allowance = (min(r, HAPPY_HOUR_ALLOWANCE_KWH)
+                         - HAPPY_HOUR_MARGIN * HAPPY_HOUR_ALLOWANCE_KWH - house)
+            if not math.isfinite(allowance) or allowance <= 0:
+                continue
+        for i, share in enumerate(overlaps):
+            if share > 0 and sessions[i] is None:
                 sessions[i] = session
+                allowances[i] = allowance
     if not any(sessions):
         return schedule
     return replace(
         schedule,
         battery_import_prices=tuple(0.0 if s else p for s, p in
                                     zip(sessions, schedule.prices, strict=True)),
-        import_overlays=tuple("free_electricity" if s else None for s in sessions),
-        import_allowances=(None,) * len(sessions),
+        import_overlays=tuple(s.kind if s else None for s in sessions),
+        import_allowances=tuple(allowances),
         import_sessions=tuple(sessions),
     )
 

@@ -1118,6 +1118,9 @@ def _v2l_refills(
     return tuple(sorted(actions, key=lambda action: action.slot)), False, saving
 
 
+_IMPORT_LABELS = {"free_electricity": "Free Electricity", "happy_hour": "Happy Hour"}
+
+
 def _daytime_purchases(
     inputs: PlannerInputs, cfg: PlannerConfig, schedule: TariffSchedule,
     geometry: HorizonGeometry, net: list[float], initial_energy: float,
@@ -1134,12 +1137,21 @@ def _daytime_purchases(
     exported = dict(zip(export.selected_slots, export.slot_export_kw, strict=True)) \
         if export else {}
     selected = set(exported)
+    spent: dict[str, float] = {}
     i = first
     while i < stop:
         session = schedule.import_sessions[i] if i < len(schedule.import_sessions) else None
-        eligible = (session is not None and schedule.import_overlays[i] == "free_electricity"
+        overlay = schedule.import_overlays[i]
+        allowance = schedule.import_allowances[i]
+        budget = (max(0.0, allowance * efficiency - spent.get(session.session_id, 0.0))
+                  if allowance is not None and session is not None else float("inf"))
+        eligible = (session is not None and overlay is not None and budget > 1e-9
                     and geometry.window_fracs[i] == 0
-                    and geometry.slot_starts[i] not in selected)
+                    and geometry.slot_starts[i] not in selected
+                    # A booked hour straddling the overnight window buys only
+                    # before it, never spending its allowance again after it.
+                    and not (overlay == "happy_hour" and first > 0
+                             and session.start.astimezone(UTC) < geometry.window_start))
         if not eligible:
             drain = ((net[i] + exported[geometry.slot_starts[i]] * _slot_hours(geometry, i))
                      if geometry.slot_starts[i] in exported
@@ -1157,15 +1169,26 @@ def _daytime_purchases(
         end = min(session.end.astimezone(UTC),
                   geometry.slot_starts[j - 1].astimezone(UTC) + timedelta(minutes=30))
         capacities = []
+        shares = []
         for k in range(i, j):
             lo = max(start, geometry.slot_starts[k].astimezone(UTC))
             hi = min(end, geometry.slot_starts[k].astimezone(UTC) + timedelta(minutes=30))
             hours = max(0.0, (hi - lo).total_seconds() / 3600)
-            remaining[k] *= 1 - hours / _slot_hours(geometry, k)
+            shares.append(hours / _slot_hours(geometry, k))
             capacities.append(_slot_charge_capacity(
                 inputs, cfg, limits, efficiency, k, loads, observations,
             ) * hours)
-        amount = min(max(0.0, cap - energy), sum(capacities))
+        bounds = (max(0.0, cap - energy), budget, sum(capacities))
+        amount = min(bounds)
+        if overlay == "happy_hour" and amount <= 1e-9:
+            # No buy means no tariff or discharge change for this run.
+            for k in range(i, j):
+                energy = max(0.0, energy - (1 - schedule.cheap_fracs[k]) * net[k])
+            i = j
+            continue
+        for k, share in zip(range(i, j), shares, strict=True):
+            remaining[k] *= 1 - share
+        spent[session.session_id] = spent.get(session.session_id, 0.0) + amount
         left = amount
         delivered = []
         for k, capacity in zip(range(i, j), capacities, strict=True):
@@ -1176,12 +1199,18 @@ def _daytime_purchases(
                          + added)
         if amount > 1e-9:
             price = schedule.battery_import_prices[i]
-            evidence = (f"listed session {_clock(session.start, inputs)}–"
-                        f"{_clock(session.end, inputs)}")
-            reason = (f"Buy {amount:.2f} kWh from Free Electricity at £{price:g}/kWh using the "
-                      f"{evidence}.")
+            evidence = (f"{'booked hour' if overlay == 'happy_hour' else 'listed session'} "
+                        f"{_clock(session.start, inputs)}–{_clock(session.end, inputs)}")
+            label = _IMPORT_LABELS.get(overlay or "", overlay)
+            reason = (f"Buy {amount:.2f} kWh from {label} at £{price:g}/kWh using the "
+                      f"{evidence}")
+            if overlay == "happy_hour":
+                bound = ("the headroom to the target cap", "the Happy Hour allowance",
+                         "the charge rate")[bounds.index(amount)]
+                reason += f"; limited by {bound}"
+            reason += "."
             purchases.append(DaytimePurchase(
-                slot_range=(i, j), start=start, end=end, overlay="free_electricity",
+                slot_range=(i, j), start=start, end=end, overlay=overlay or "",
                 evidence=evidence, session_id=session.session_id, effective_price=price,
                 energy_kwh=amount, reason=reason, slot_energy_kwh=tuple(delivered),
             ))
@@ -1400,7 +1429,8 @@ def compute_plan(
     daytime_windows: tuple[DatedChargeWindow, ...] = ()
     daytime_enabled = (inputs.load_slots is not None and geometry is not None
                        and len(schedule.import_sessions) == len(schedule.import_overlays)
-                       == len(schedule.battery_import_prices) == len(net)
+                       == len(schedule.battery_import_prices) == len(schedule.import_allowances)
+                       == len(net)
                        and bool(schedule.import_sessions) and limits_reason is None
                        and inputs.soc.ok and cfg.capacity_kwh > 0)
     daytime_balance = None
@@ -1588,7 +1618,8 @@ def compute_plan(
         )
 
     if daytime_purchases and geometry is not None:
-        # Cost house imports at the base tariff, separately from battery buys.
+        # Free Electricity covers only battery buys. Happy Hour also credits
+        # house imports inside an admitted purchase; sizing reserved gross load.
         energy = max(0.0, usable_now - inputs.pre_window_drain_kwh)
         house_cost = 0.0
         original_net = [
@@ -1601,7 +1632,16 @@ def compute_plan(
             covered = schedule.cheap_fracs[i] * demand
             drain = demand - covered
             missing = max(0.0, drain - energy)
-            house_cost += (original_net[i] - demand + covered + missing) * schedule.prices[i]
+            house_import = original_net[i] - demand + covered + missing
+            house_cost += house_import * schedule.prices[i]
+            for p in daytime_purchases:
+                if p.overlay == "happy_hour" and p.slot_range[0] <= i < p.slot_range[1]:
+                    lo = max(p.start, geometry.slot_starts[i].astimezone(UTC))
+                    hi = min(p.end, geometry.slot_starts[i].astimezone(UTC)
+                             + timedelta(minutes=30))
+                    share = max(0.0, (hi - lo).total_seconds() / 3600) / _slot_hours(geometry, i)
+                    credited = min(house_import, original_net[i] * share)
+                    house_cost -= credited * (schedule.prices[i] - p.effective_price)
             energy = max(0.0, energy - drain)
             energy += _daytime_slot_energy(daytime_purchases, i)
             energy += sum(r.kwh for r in refills if r.slot == i)
