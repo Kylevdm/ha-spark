@@ -126,6 +126,10 @@ def _slots(
                 lo, geometry.window_start.astimezone(UTC)
             ) < min(end, geometry.window_end.astimezone(UTC)):
                 actions.append("charge")
+        if plan.soc.ok and any(p.slot_range[0] <= i < p.slot_range[1]
+                               for p in plan.daytime_purchases):
+            if "charge" not in actions:
+                actions.append("charge")
         if any(
             align(a, clock).astimezone(UTC) < end and lo < align(b, clock).astimezone(UTC)
             for a, b in plan.charge_intent.holds
@@ -211,6 +215,10 @@ def _lines(plan: ChargePlan, cfg: PlannerConfig, inputs: PlannerInputs) -> tuple
                                       f"Charge the house battery with {plan.required_kwh:.2f} kWh "
                                       f"to reach {plan.target_soc:.0f}% SoC.",
                                       plan.required_kwh), ""))
+        for purchase in plan.daytime_purchases:
+            start = max(purchase.start, now) if now is not None else purchase.start
+            rows.append((PlanLine("charge", start, purchase.end, purchase.reason,
+                                  purchase.energy_kwh), ""))
         for reservation in plan.reservations:
             target = instant(reservation.target_time)
             if target is None and absolute and geometry is not None:
