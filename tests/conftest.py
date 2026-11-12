@@ -24,6 +24,16 @@ def _unbind_authority():
 
 
 @pytest.fixture(autouse=True)
+def _forget_kraken_tokens():
+    """The Kraken token is shared process-wide (#688); no test inherits another's."""
+    from ha_spark.energy.octopus import forget_kraken_tokens
+
+    forget_kraken_tokens()
+    yield
+    forget_kraken_tokens()
+
+
+@pytest.fixture(autouse=True)
 def _ignore_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep a developer's ``.env`` out of every ``Settings()`` built in tests (#212).
 

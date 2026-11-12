@@ -4,14 +4,24 @@ The consumption/account/rates endpoints are the public REST v1 API (API-key Basi
 Auth). Account agreement rates and planned Intelligent dispatches use the Kraken
 GraphQL API, which needs a short-lived JWT exchanged for the API key first
 (``obtainKrakenToken``) — never logged, and never echoed in any error message.
+
+Every GraphQL read goes through ``kraken_graphql``, which shares one in-memory
+token per endpoint (#688): minted on first use, replaced shortly before its
+expiry, and replaced once more (with one retry of the call) when Kraken rejects
+it. The token is never persisted.
 """
 
 from __future__ import annotations
 
+import base64
 import csv
+import hashlib
 import io
+import json
+import math
 import re
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 
 import httpx
@@ -357,21 +367,18 @@ async def fetch_agreement_rates(settings: Settings) -> LiveRates:
     if not (settings.octopus_api_key and settings.octopus_account_number):
         raise OctopusApiError("Octopus agreement rates require API key and account number")
     graphql_url = f"{settings.octopus_api_url.rstrip('/')}/graphql/"
+    payload: _AgreementResponse | None = None
     try:
         async with httpx.AsyncClient(timeout=settings.ha_timeout) as client:
-            token = await _obtain_kraken_token(client, graphql_url, settings.octopus_api_key)
-            response = await client.post(
-                graphql_url,
-                json={
-                    "query": _AGREEMENT_RATES_QUERY,
-                    "variables": {"account": settings.octopus_account_number},
-                },
-                headers={"Authorization": f"JWT {token}"},
-            )
-            response.raise_for_status()
-            payload = _AgreementResponse.model_validate(response.json())
+            payload = _AgreementResponse.model_validate(await kraken_graphql(
+                client, graphql_url, settings.octopus_api_key,
+                _AGREEMENT_RATES_QUERY, {"account": settings.octopus_account_number},
+            ))
     except (httpx.HTTPError, ValueError, OctopusApiError, TypeError, AttributeError):
-        raise OctopusApiError("Octopus agreement rates HTTP, auth or payload error") from None
+        pass
+    if payload is None:
+        # Raised outside the handler: the failed request carries the token.
+        raise OctopusApiError("Octopus agreement rates HTTP, auth or payload error")
     if payload.errors:
         raise OctopusApiError("Octopus agreement rates GraphQL errors")
     now = datetime.now(UTC)
@@ -412,29 +419,170 @@ query PlannedDispatches($account: String!) {
 """
 
 
+# Kraken documents a one-hour token. A longer `exp` claim is not believed, and a
+# token whose expiry cannot be read is kept only briefly.
+_TOKEN_MAX_LIFETIME = timedelta(minutes=60)
+_TOKEN_UNREADABLE_LIFETIME = timedelta(minutes=5)
+_TOKEN_REFRESH_MARGIN = timedelta(minutes=5)
+# Kraken reports a rejected token as HTTP 401 or, more often, as HTTP 200 with
+# one of these error codes (expired JWT, authentication failed).
+_AUTH_ERROR_CODES = frozenset({"KT-CT-1124", "KT-CT-1139"})
+
+
+@dataclass(frozen=True)
+class _CachedToken:
+    """One endpoint's token. Secret fields stay out of the repr."""
+
+    key_digest: bytes = field(repr=False)
+    token: str = field(repr=False)
+    refresh_at: datetime
+
+
+# Keyed by GraphQL endpoint; the entry remembers which API key minted it, so a
+# changed key or endpoint never reuses another key's token. Memory only.
+_kraken_tokens: dict[str, _CachedToken] = {}
+
+
+def forget_kraken_tokens() -> None:
+    """Drop every cached Kraken token (the next read mints a new one)."""
+    _kraken_tokens.clear()
+
+
+def _kraken_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _key_digest(api_key: str) -> bytes:
+    return hashlib.sha256(api_key.encode()).digest()
+
+
+def _token_expiry(token: str) -> datetime | None:
+    """The token's own `exp` claim, read without trusting anything else in it."""
+    try:
+        _header, body, _signature = token.split(".")
+        claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        exp = claims["exp"]
+        if isinstance(exp, bool) or not isinstance(exp, int | float) or not math.isfinite(exp):
+            return None
+        return datetime.fromtimestamp(exp, UTC)
+    except (ValueError, KeyError, TypeError, OverflowError, OSError, RecursionError):
+        return None
+
+
 async def _obtain_kraken_token(client: httpx.AsyncClient, graphql_url: str, api_key: str) -> str:
     """Exchange the Octopus API key for a short-lived Kraken GraphQL JWT.
 
     The key is sent once as a GraphQL variable (never interpolated into the
-    query text); the returned token is used only in the Authorization header
-    of the caller's next request, never logged.
+    query text). Failures carry fixed text only and are raised outside the
+    handler, so the failed request (whose body holds the key) is not kept on
+    the error as cause or context.
     """
+    payload: Any = None
+    failed = False
     try:
         response = await client.post(
             graphql_url, json={"query": _KRAKEN_TOKEN_QUERY, "variables": {"apiKey": api_key}}
         )
         response.raise_for_status()
         payload = response.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        raise OctopusApiError(f"Octopus GraphQL auth request failed: {exc}") from exc
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+        failed = True
+    if failed:
+        raise OctopusApiError("Octopus GraphQL auth request failed: HTTP or payload error")
+    if not isinstance(payload, dict):
+        raise OctopusApiError("Octopus GraphQL auth returned an invalid payload")
     if payload.get("errors"):
-        raise OctopusApiError(
-            f"Octopus GraphQL auth rejected: {len(payload['errors'])} error(s)"
-        )
-    token = ((payload.get("data") or {}).get("obtainKrakenToken") or {}).get("token")
-    if not token:
+        raise OctopusApiError("Octopus GraphQL auth rejected")
+    data = payload.get("data")
+    obtained = data.get("obtainKrakenToken") if isinstance(data, dict) else None
+    token = obtained.get("token") if isinstance(obtained, dict) else None
+    if not isinstance(token, str) or not token:
         raise OctopusApiError("Octopus GraphQL auth returned no token")
-    return str(token)
+    return token
+
+
+async def _kraken_token(
+    client: httpx.AsyncClient, graphql_url: str, api_key: str, *, rejected: str | None = None
+) -> tuple[str, bool]:
+    """The shared token for this endpoint and key, and whether it was just minted.
+
+    `rejected` is a token Kraken has just refused: it is never handed out again.
+    """
+    digest = _key_digest(api_key)
+    cached = _kraken_tokens.get(graphql_url)
+    now = _kraken_now()
+    if (
+        cached is not None
+        and cached.key_digest == digest
+        and cached.token != rejected
+        and now < cached.refresh_at
+    ):
+        return cached.token, False
+    _kraken_tokens.pop(graphql_url, None)
+    token = await _obtain_kraken_token(client, graphql_url, api_key)
+    expiry = _token_expiry(token)
+    if expiry is None:
+        keep_for = _TOKEN_UNREADABLE_LIFETIME
+    else:
+        keep_for = min(expiry - now, _TOKEN_MAX_LIFETIME) - _TOKEN_REFRESH_MARGIN
+    # A token already due for refresh serves this one call and is not kept.
+    if keep_for > timedelta(0):
+        _kraken_tokens[graphql_url] = _CachedToken(digest, token, now + keep_for)
+    return token, True
+
+
+def _auth_rejected(response: httpx.Response) -> bool:
+    if response.status_code == 401:
+        return True
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    if not isinstance(errors, list):
+        return False
+    for error in errors:
+        extensions = error.get("extensions") if isinstance(error, dict) else None
+        code = extensions.get("errorCode") if isinstance(extensions, dict) else None
+        if isinstance(code, str) and code in _AUTH_ERROR_CODES:
+            return True
+    return False
+
+
+async def kraken_graphql(
+    client: httpx.AsyncClient,
+    graphql_url: str,
+    api_key: str,
+    query: str,
+    variables: dict[str, Any],
+) -> Any:
+    """POST one read-only GraphQL query with the shared Kraken token; return its JSON.
+
+    `graphql_url` must be built from configured settings. If Kraken rejects a
+    token this call did not mint itself, the token is replaced once and the
+    query retried once.
+
+    Raises `OctopusApiError` (fixed text) when no token can be obtained, and
+    lets `httpx.HTTPError` / `ValueError` from the query itself through, so each
+    reader words its own failure. A reader must catch all three and report a
+    failed read with fixed text and `from None`: the failed request carries the
+    token in its headers.
+    """
+    token, minted = await _kraken_token(client, graphql_url, api_key)
+    body = {"query": query, "variables": variables}
+    response = await client.post(graphql_url, json=body, headers={"Authorization": f"JWT {token}"})
+    if _auth_rejected(response) and not minted:
+        token, _minted = await _kraken_token(client, graphql_url, api_key, rejected=token)
+        response = await client.post(
+            graphql_url, json=body, headers={"Authorization": f"JWT {token}"}
+        )
+    if _auth_rejected(response):
+        # Still refused: no later read is handed this token.
+        cached = _kraken_tokens.get(graphql_url)
+        if cached is not None and cached.token == token:
+            del _kraken_tokens[graphql_url]
+    response.raise_for_status()
+    return response.json()
 
 
 async def fetch_planned_dispatches(settings: Settings) -> tuple[DispatchSlot, ...]:
@@ -445,21 +593,18 @@ async def fetch_planned_dispatches(settings: Settings) -> tuple[DispatchSlot, ..
             "OCTOPUS_ACCOUNT_NUMBER"
         )
     graphql_url = f"{settings.octopus_api_url.rstrip('/')}/graphql/"
+    failed = False
     async with httpx.AsyncClient(timeout=settings.ha_timeout) as client:
-        token = await _obtain_kraken_token(client, graphql_url, settings.octopus_api_key)
         try:
-            response = await client.post(
-                graphql_url,
-                json={
-                    "query": _PLANNED_DISPATCHES_QUERY,
-                    "variables": {"account": settings.octopus_account_number},
-                },
-                headers={"Authorization": f"JWT {token}"},
+            payload = await kraken_graphql(
+                client, graphql_url, settings.octopus_api_key,
+                _PLANNED_DISPATCHES_QUERY, {"account": settings.octopus_account_number},
             )
-            response.raise_for_status()
-            payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise OctopusApiError(f"Octopus dispatches request failed: {exc}") from exc
+        except (httpx.HTTPError, ValueError):
+            failed = True
+    if failed or not isinstance(payload, dict):
+        # Raised outside the handler: the failed request carries the token.
+        raise OctopusApiError("Octopus dispatches request failed: HTTP or payload error")
     if payload.get("errors"):
         raise OctopusApiError(
             f"Octopus dispatches request rejected: {len(payload['errors'])} error(s)"
