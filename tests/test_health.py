@@ -48,6 +48,45 @@ async def test_reserve_advisory_for_tight_supply(base, warned) -> None:
         assert "Major-load reserve exceeds supply room" in result.detail
 
 
+@pytest.mark.parametrize("state, text", [
+    ("disabled", "disabled"), ("not_configured", "not configured"),
+    ("failed", "read failed"), ("not_enrolled", "not enrolled"),
+    ("no_session", "no session"), ("past_only", "no session"),
+    ("sessions", "2999-11-12T11:00:00+00:00 to 2999-11-12T12:00:00+00:00"),
+])
+@respx.mock
+async def test_free_electricity_health_states(state: str, text: str) -> None:
+    from tests.octopus_helpers import token_response
+    from tests.test_octopus import _free_payload
+
+    settings = Settings(
+        octopus_api_url="http://octo.test/v1", octopus_api_key="key-private",
+        octopus_account_number="account-private" if state != "not_configured" else "",
+        octopus_mpan="mpan-private", free_electricity_enabled=state != "disabled",
+        tariff_provider="fixed",
+    )
+    if state not in {"disabled", "not_configured"}:
+        payload = _free_payload(enrolled=state != "not_enrolled", edges=[])
+        if state in {"sessions", "past_only"}:
+            year = "2999" if state == "sessions" else "2025"
+            payload = _free_payload(edges=[{"node": {
+                "code": "event-private", "startAt": f"{year}-11-12T11:00:00Z",
+                "endAt": f"{year}-11-12T12:00:00Z",
+            }}])
+        respx.post("http://octo.test/v1/graphql/").mock(side_effect=[
+            token_response(),
+            httpx.Response(503 if state == "failed" else 200, json=payload),
+        ])
+    row = await health.check_free_electricity(settings)
+    assert row.name == "Free Electricity"
+    assert text in row.detail
+    assert row.status == (Status.WARN if state == "failed" else Status.OK)
+    for secret in (
+        "jwt-private", "key-private", "account-private", "mpan-private", "event-private",
+    ):
+        assert secret not in format_report([row])
+
+
 HA = "http://ha.test"
 OLLAMA = "http://ollama.test"
 
