@@ -309,7 +309,11 @@ compatibility; the integration's repair gives the specific cause and writes
 are refused as `modbus_hub_conflict`. A missing fresh validation
 is `validation unknown`, also a warning. A native inverter with a nonempty
 `solis_control_hub` is `inconsistent` and fails that check. Resolve repairs and
-restore the channel rather than treating unknown as validated. Health also
+restore the channel rather than treating unknown as validated. **Happy Hour**
+reports the Weekend Happy Hour booking source: `disabled`, `not configured`
+(naming the missing setting), a failed read as a warning (no Happy Hour is
+planned), `no booking`, or each booked hour's date and start-end times on the
+household clock. Health also
 reports the integration link, topology, effective limits and provider checks.
 Exit codes are `0` for all green, `1` for a failed critical check, and `2`
 for other degraded results. A green report is diagnostic evidence, not an
@@ -1579,6 +1583,17 @@ for every live test.
 `ha-spark pull-consumption`, which downloads grid-import history for cost
 backtesting only. The load forecast does **not** use it. The same
 `octopus_api_key` also serves the `octopus_intelligent` tariff provider above.
+
+`octopus_backend_api_url` (default `https://api.backend.octopus.energy/v1`) is
+the undocumented backend GraphQL endpoint the Octopus web app uses for Weekend
+Happy Hour bookings. It is read-only: ha-spark sends only the `savingSessions`
+query and never books or cancels a slot. `happy_hour_enabled` (default `true`)
+turns the booking source on or off independently of your tariff provider. With
+the API key and account number set, `ha-spark health` reports your booked
+hours; nothing is planned from them yet. The endpoint is undocumented and can
+change without notice: a failed or changed reply means no Happy Hour, and the
+health row shows the failed read. Blanking `octopus_backend_api_url` turns the
+source off.
 
 ### Ollama (optional)
 
