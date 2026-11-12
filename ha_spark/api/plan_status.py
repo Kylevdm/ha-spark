@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from ha_spark.authority import HoldRecord
 from ha_spark.energy.horizon import _window_bounds
-from ha_spark.energy.models import ChargePlan
+from ha_spark.energy.models import ChargePlan, DaytimePurchase
 
 Action = Literal["hold", "export", "charge", "idle"]
 
@@ -48,6 +48,14 @@ def _amount(value: object, unit: str, ndigits: int) -> str | None:
     return f"{number:.{ndigits}f}{unit}"
 
 
+def _purchase_reason(purchase: DaytimePurchase) -> str:
+    """Use the planner's sentence when it is wire-safe, else a fixed fallback."""
+    reason = purchase.reason
+    if isinstance(reason, str) and reason.isprintable() and 1 <= len(reason) <= 255:
+        return reason
+    return "Charging from a daytime purchase."
+
+
 def resolve(
     plan: ChargePlan, holds: Sequence[HoldRecord], now: datetime, tz: ZoneInfo,
     *, guard_limited: bool = False,
@@ -69,6 +77,11 @@ def resolve(
     needs_charge = required is not None and required > 0
     dispatch = tuple((s.astimezone(UTC), e.astimezone(UTC)) for s, e in intent.holds)
     export = intent.export
+    purchases = tuple(
+        (s.astimezone(UTC), e.astimezone(UTC), _purchase_reason(p))
+        for p in plan.daytime_purchases
+        for s, e in ((p.start, p.end),)
+    )
     # A record still awaiting release has no scheduled end once its end has passed.
     indefinite = any(h.cause == "ev" or h.trusted_end is not None and h.trusted_end <= now
                      for h in holds)
@@ -112,6 +125,9 @@ def resolve(
             return "charge", (f"Charging {kwh or 'the battery'} to reach "
                               f"{soc or 'the target'} by {clock(end)}."
                               f"{reserve_reason}{guard_reason}")
+        for start, end, reason in purchases:
+            if start <= t < end:
+                return "charge", reason
         return "idle", "Nothing to charge, export or hold right now."
 
     action, reason = action_at(now)
@@ -119,6 +135,7 @@ def resolve(
     boundaries.update(store_ends)
     if export is not None:
         boundaries.update((export.window_start.astimezone(UTC), export.window_end.astimezone(UTC)))
+    boundaries.update(b for s, e, _ in purchases for b in (s, e))
     if not indefinite:
         for boundary in sorted(b for b in boundaries if now < b < horizon):
             next_action, next_reason = action_at(boundary)

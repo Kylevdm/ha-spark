@@ -9,7 +9,7 @@ import pytest
 
 from ha_spark import intent_parser
 from ha_spark.config import Settings
-from ha_spark.energy.models import ChargeIntent, ChargePlan, LoadForecast
+from ha_spark.energy.models import ChargeIntent, ChargePlan, DaytimePurchase, LoadForecast
 from ha_spark.energy.plan_run import PlanRun
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.intent_parser import parse_offline
@@ -232,6 +232,51 @@ async def test_answer_context_query_empty(tmp_path: Any) -> None:
     settings = Settings(db_path=str(tmp_path / "test.db"))
     out = await answer_context_query(settings, _TODAY)
     assert "No context facts" in out
+
+
+async def test_why_charging_answers_from_purchase_reasons(monkeypatch: pytest.MonkeyPatch) -> None:
+    purchase = DaytimePurchase(
+        slot_range=(0, 2), start=datetime(2026, 1, 12, 12, tzinfo=UTC),
+        end=datetime(2026, 1, 12, 13, tzinfo=UTC), overlay="free_electricity",
+        evidence="listed", session_id="private-id", effective_price=0.0,
+        energy_kwh=3.19,
+        reason="Buy 3.19 kWh from Free Electricity at £0/kWh using the listed session 12:00–13:00.",
+    )
+    _patch_plan(monkeypatch, _plan(daytime_purchases=(purchase,)))
+    result = await parse_offline("Why is the battery charging at midday?", Settings(), REST)  # type: ignore[arg-type]
+    assert result.matched
+    assert result.text == purchase.reason
+    assert "private-id" not in result.text
+
+
+async def test_why_charging_in_observe_appends_simulated_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    purchase = DaytimePurchase(
+        slot_range=(0, 2), start=datetime(2026, 1, 12, 12, tzinfo=UTC),
+        end=datetime(2026, 1, 12, 13, tzinfo=UTC), overlay="free_electricity",
+        evidence="listed", session_id="x", effective_price=0.0, energy_kwh=3.19,
+        reason="Buy 3.19 kWh from Free Electricity.",
+    )
+    _patch_plan(monkeypatch, _plan(daytime_purchases=(purchase,)))
+    monkeypatch.setattr(intent_parser, "operating_mode", lambda _settings: "observe")
+    result = await parse_offline(
+        "why is the battery charging?", Settings(), REST,  # type: ignore[arg-type]
+    )
+    assert result.text == (
+        purchase.reason + "\nObserve: this is simulated, nothing is written."
+    )
+
+
+async def test_why_charging_without_purchase_falls_through_to_soc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_plan(monkeypatch, _plan())
+    result = await parse_offline(
+        "Why is the battery charging at midday?", Settings(), REST,  # type: ignore[arg-type]
+    )
+    assert result.matched
+    assert result.text == "Battery is at 69% (13.17 kWh usable)."
 
 
 async def test_solar_query_names_served_day(monkeypatch: pytest.MonkeyPatch) -> None:

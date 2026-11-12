@@ -97,7 +97,11 @@ async def parse_offline(
         log.warning("Offline parser could not compute the plan: %r", exc)
         return IntentResult(f"Could not compute the charge plan: {exc}", matched=True)
 
-    if _contains(text, "soc", "battery", "state of charge"):
+    if "why" in text and "charg" in text and plan.daytime_purchases:
+        answer = "\n".join(purchase.reason for purchase in plan.daytime_purchases)
+        if operating_mode(settings) == "observe":
+            answer += "\nObserve: this is simulated, nothing is written."
+    elif _contains(text, "soc", "battery", "state of charge"):
         answer = _soc_line(plan)
     elif _contains(text, "solar", "forecast"):
         answer = _solar_line(plan, run.forecast.target_date)
