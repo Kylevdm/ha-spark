@@ -54,6 +54,7 @@ from ha_spark.energy.tariff import (
     TariffProvider,
     TariffSchedule,
     _in_overnight_window,
+    apply_import_overlay,
 )
 from ha_spark.ha.models import EntityState
 from ha_spark.ha.rest import HomeAssistantRest
@@ -427,7 +428,7 @@ def build_schedule(
         provider = AxleTariffProvider(
             fallback=provider, event_rate_gbp_kwh=settings.axle_event_rate_gbp_kwh
         )
-    return provider.schedule(inputs, cfg)
+    return apply_import_overlay(provider.schedule(inputs, cfg), inputs, cfg)
 
 
 async def read_dispatches(
