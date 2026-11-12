@@ -234,7 +234,6 @@ async def test_check_octopus_agreement_rates(failure: str | None) -> None:
 
     respx.post("http://octo.test/v1/graphql/").mock(side_effect=[
         token_response(), httpx.Response(200, json={"data": {"plannedDispatches": []}}),
-        token_response(),
         agreement_failure(failure) if failure else httpx.Response(200, json=agreement_payload()),
     ])
     respx.get(url__startswith="http://octo.test/v1/products/").mock(
@@ -322,7 +321,8 @@ async def test_check_tariff_provider_warns_without_exposing_account_or_mpan() ->
     respx.post("http://octo.test/v1/graphql/").mock(side_effect=[
         httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": "jwt-abc"}}}),
         httpx.Response(200, json={"data": {"plannedDispatches": []}}),
-        httpx.Response(401),
+        # The shared token (#688) is rejected, then its one refresh fails too.
+        httpx.Response(401), httpx.Response(401),
     ])
     respx.get("http://octo.test/v1/accounts/A-1234ABCD/").mock(
         return_value=httpx.Response(200, json={"properties": [{"electricity_meter_points": [
@@ -348,7 +348,8 @@ async def test_check_tariff_provider_warns_when_discovery_fails(failure: str) ->
     respx.post("http://octo.test/v1/graphql/").mock(side_effect=[
         httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": "jwt-abc"}}}),
         httpx.Response(200, json={"data": {"plannedDispatches": []}}),
-        httpx.Response(401),
+        # The shared token (#688) is rejected, then its one refresh fails too.
+        httpx.Response(401), httpx.Response(401),
     ])
     response = (httpx.Response(401) if failure == "http" else httpx.Response(200, json={
         "properties": [{"electricity_meter_points": [{

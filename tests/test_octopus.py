@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import logging
+import traceback
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
 import pytest
 import respx
 
 from ha_spark.config import Settings
+from ha_spark.energy import octopus
 from ha_spark.energy.octopus import (
     OctopusApiError,
     discover_import_tariff,
@@ -615,3 +620,289 @@ async def test_dispatches_tolerates_malformed_entries() -> None:
 async def test_dispatches_error_when_unconfigured() -> None:
     with pytest.raises(OctopusApiError, match="not configured"):
         await fetch_planned_dispatches(_dispatch_settings(octopus_account_number=""))
+
+
+# --- shared Kraken token (#688) ---
+
+GRAPHQL = f"{API}/graphql/"
+T0 = datetime(2026, 11, 11, 12, 0, tzinfo=UTC)
+
+
+def _jwt(expires: datetime, tag: str = "a") -> str:
+    def part(value: dict[str, object]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+    return f"{part({'alg': 'none'})}.{part({'exp': int(expires.timestamp())})}.sig-{tag}"
+
+
+def _token(token: str) -> httpx.Response:
+    return httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": token}}})
+
+
+def _no_dispatches() -> httpx.Response:
+    return httpx.Response(200, json={"data": {"plannedDispatches": []}})
+
+
+def _mints(route: respx.Route) -> int:
+    return sum(b"obtainKrakenToken" in call.request.content for call in route.calls)
+
+
+def _freeze(monkeypatch: pytest.MonkeyPatch, now: datetime) -> None:
+    monkeypatch.setattr(octopus, "_kraken_now", lambda: now)
+
+
+@respx.mock
+async def test_two_graphql_reads_mint_one_token() -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token("jwt-private"), _no_dispatches(),
+        httpx.Response(200, json=agreement_payload()),
+    ])
+    await fetch_planned_dispatches(_dispatch_settings())
+    await fetch_agreement_rates(_dispatch_settings())
+    assert route.call_count == 3
+    assert _mints(route) == 1
+    assert route.calls[2].request.headers["Authorization"] == "JWT jwt-private"
+
+
+@respx.mock
+async def test_token_is_replaced_shortly_before_it_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _jwt(T0 + timedelta(minutes=60), "first")
+    second = _jwt(T0 + timedelta(minutes=120), "second")
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token(first), _no_dispatches(), _no_dispatches(),
+        _token(second), _no_dispatches(),
+    ])
+    _freeze(monkeypatch, T0)
+    await fetch_planned_dispatches(_dispatch_settings())
+    _freeze(monkeypatch, T0 + timedelta(minutes=54))
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert _mints(route) == 1
+    _freeze(monkeypatch, T0 + timedelta(minutes=56))
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert _mints(route) == 2
+    assert route.calls[4].request.headers["Authorization"] == f"JWT {second}"
+
+
+@pytest.mark.parametrize("token", [
+    "not-a-jwt", "a.b.c", "a.e30.c",
+    "a." + base64.urlsafe_b64encode(b'{"exp": "soon"}').decode() + ".c",
+    "a." + base64.urlsafe_b64encode(b'{"exp": 1e999}').decode() + ".c",
+    "a." + base64.urlsafe_b64encode(b'{"exp": true}').decode() + ".c",
+    "a." + base64.urlsafe_b64encode(b"[1]").decode() + ".c",
+])
+@respx.mock
+async def test_token_with_unreadable_expiry_is_kept_only_briefly(
+    monkeypatch: pytest.MonkeyPatch, token: str,
+) -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token(token), _no_dispatches(), _no_dispatches(), _token(token), _no_dispatches(),
+    ])
+    _freeze(monkeypatch, T0)
+    await fetch_planned_dispatches(_dispatch_settings())
+    _freeze(monkeypatch, T0 + timedelta(minutes=4))
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert _mints(route) == 1
+    _freeze(monkeypatch, T0 + timedelta(minutes=6))
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert _mints(route) == 2
+
+
+@respx.mock
+async def test_token_expiry_claim_beyond_an_hour_is_not_believed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token(_jwt(T0 + timedelta(days=365))), _no_dispatches(),
+        _token(_jwt(T0 + timedelta(days=365))), _no_dispatches(),
+    ])
+    _freeze(monkeypatch, T0)
+    await fetch_planned_dispatches(_dispatch_settings())
+    _freeze(monkeypatch, T0 + timedelta(minutes=61))
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert _mints(route) == 2
+
+
+def _rejected(kind: str) -> httpx.Response:
+    if kind == "http":
+        return httpx.Response(401, text="sk_test jwt-private")
+    code = "KT-CT-1124" if kind == "expired" else "KT-CT-1139"
+    return httpx.Response(200, json={"errors": [{
+        "message": "sk_test jwt-private", "extensions": {"errorCode": code},
+    }]})
+
+
+@pytest.mark.parametrize("kind", ["http", "expired", "failed"])
+@respx.mock
+async def test_rejected_token_is_refreshed_once_and_the_read_retried_once(kind: str) -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token("jwt-private"), _no_dispatches(),
+        _rejected(kind), _token("jwt-second"), httpx.Response(200, json=agreement_payload()),
+        _no_dispatches(),
+    ])
+    await fetch_planned_dispatches(_dispatch_settings())
+    rates = await fetch_agreement_rates(_dispatch_settings())
+    assert rates.offpeak == pytest.approx(0.066)
+    assert route.call_count == 5
+    assert _mints(route) == 2
+    assert route.calls[4].request.headers["Authorization"] == "JWT jwt-second"
+    # The replacement is the shared token from then on.
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert _mints(route) == 2
+    assert route.calls[5].request.headers["Authorization"] == "JWT jwt-second"
+
+
+@pytest.mark.parametrize("kind", ["http", "expired", "failed"])
+@respx.mock
+async def test_token_still_rejected_after_refresh_degrades_without_a_second_retry(
+    kind: str,
+) -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token("jwt-private"), _no_dispatches(),
+        _rejected(kind), _token("jwt-second"), _rejected(kind),
+    ])
+    await fetch_planned_dispatches(_dispatch_settings())
+    with pytest.raises(OctopusApiError):
+        await fetch_planned_dispatches(_dispatch_settings())
+    assert route.call_count == 5
+
+
+@respx.mock
+async def test_newly_minted_token_that_is_rejected_is_not_minted_again() -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[_token("jwt-private"), _rejected("http")])
+    with pytest.raises(OctopusApiError):
+        await fetch_planned_dispatches(_dispatch_settings())
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_failed_refresh_degrades_and_the_next_read_mints_again() -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token("jwt-private"), _no_dispatches(),
+        _rejected("http"), httpx.Response(500),
+        _token("jwt-second"), _no_dispatches(),
+    ])
+    await fetch_planned_dispatches(_dispatch_settings())
+    with pytest.raises(OctopusApiError, match="auth request failed"):
+        await fetch_planned_dispatches(_dispatch_settings())
+    assert await fetch_planned_dispatches(_dispatch_settings()) == ()
+    assert route.calls[5].request.headers["Authorization"] == "JWT jwt-second"
+
+
+@respx.mock
+async def test_changed_api_key_mints_a_new_token() -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token("jwt-private"), _no_dispatches(), _token("jwt-other"), _no_dispatches(),
+        _token("jwt-third"), _no_dispatches(),
+    ])
+    await fetch_planned_dispatches(_dispatch_settings())
+    await fetch_planned_dispatches(_dispatch_settings(octopus_api_key="sk_other"))
+    assert _mints(route) == 2
+    assert b"sk_other" in route.calls[2].request.content
+    assert route.calls[3].request.headers["Authorization"] == "JWT jwt-other"
+    # Changing back does not revive the first key's token either.
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert _mints(route) == 3
+
+
+@respx.mock
+async def test_changed_endpoint_mints_a_new_token() -> None:
+    first = respx.post(GRAPHQL).mock(side_effect=[_token("jwt-private"), _no_dispatches()])
+    other = respx.post("http://other.test/v1/graphql/").mock(
+        side_effect=[_token("jwt-other"), _no_dispatches()]
+    )
+    await fetch_planned_dispatches(_dispatch_settings())
+    await fetch_planned_dispatches(_dispatch_settings(octopus_api_url="http://other.test/v1"))
+    assert _mints(first) == 1
+    assert _mints(other) == 1
+    assert other.calls[1].request.headers["Authorization"] == "JWT jwt-other"
+
+
+def _chain(error: BaseException) -> list[BaseException]:
+    seen: list[BaseException] = []
+    todo: list[BaseException | None] = [error]
+    while todo:
+        item = todo.pop()
+        if item is not None and item not in seen:
+            seen.append(item)
+            todo += [item.__cause__, item.__context__]
+    return seen
+
+
+@pytest.mark.parametrize("failure", [
+    "mint_http", "mint_errors", "mint_shape", "mint_transport", "mint_not_json",
+    "query_http", "query_rejected", "query_transport", "query_not_json", "query_errors",
+    "refresh_http",
+])
+@pytest.mark.parametrize(
+    "read", [fetch_planned_dispatches, fetch_agreement_rates], ids=["dispatches", "rates"]
+)
+@respx.mock
+async def test_key_and_token_never_reach_logs_or_errors(
+    failure: str, read: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    echo = "sk_test jwt-private"
+    transport = httpx.ConnectError(echo)
+    responses: dict[str, list[Any]] = {
+        "mint_http": [httpx.Response(500, text=echo)],
+        "mint_errors": [httpx.Response(200, json={"errors": [{"message": echo}]})],
+        "mint_shape": [httpx.Response(200, json={"data": {"obtainKrakenToken": [echo]}})],
+        "mint_transport": [transport],
+        "mint_not_json": [httpx.Response(200, text=echo)],
+        "query_http": [_token("jwt-private"), httpx.Response(500, text=echo)],
+        "query_rejected": [_token("jwt-private"), _rejected("http")],
+        "query_transport": [_token("jwt-private"), transport],
+        "query_not_json": [_token("jwt-private"), httpx.Response(200, text=echo)],
+        "query_errors": [_token("jwt-private"), _rejected("expired")],
+        "refresh_http": [
+            _token("jwt-private"), _no_dispatches(), _rejected("http"),
+            httpx.Response(500, text=echo),
+        ],
+    }
+    respx.post(GRAPHQL).mock(side_effect=responses[failure])
+    caplog.set_level(logging.DEBUG)
+    if failure == "refresh_http":
+        await fetch_planned_dispatches(_dispatch_settings())
+    with pytest.raises(OctopusApiError) as error:
+        await read(_dispatch_settings())
+    chain = _chain(error.value)
+    assert chain == [error.value]  # no failed request rides along as cause or context
+    exposed = "".join(
+        [caplog.text, repr(octopus._kraken_tokens)]
+        + [text for item in chain for text in (str(item), repr(item), repr(item.args))]
+        + traceback.format_exception(error.value)
+    )
+    assert "sk_test" not in exposed
+    assert "jwt-private" not in exposed
+
+
+@respx.mock
+async def test_cached_token_and_key_stay_out_of_the_cache_repr() -> None:
+    respx.post(GRAPHQL).mock(side_effect=[_token("jwt-private"), _no_dispatches()])
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert octopus._kraken_tokens
+    shown = repr(octopus._kraken_tokens) + str(octopus._kraken_tokens)
+    assert "jwt-private" not in shown
+    assert "sk_test" not in shown
+
+
+@respx.mock
+async def test_token_mint_is_never_redirected() -> None:
+    elsewhere = respx.post("http://elsewhere.test/graphql/").mock(
+        return_value=_token("jwt-private")
+    )
+    respx.post(GRAPHQL).mock(
+        return_value=httpx.Response(307, headers={"Location": "http://elsewhere.test/graphql/"})
+    )
+    with pytest.raises(OctopusApiError):
+        await fetch_planned_dispatches(_dispatch_settings())
+    assert not elsewhere.called
+
+
+@respx.mock
+async def test_failed_mint_raises_only_the_readers_own_error_type() -> None:
+    respx.post(GRAPHQL).mock(side_effect=httpx.ReadTimeout("sk_test"))
+    for read in (fetch_planned_dispatches, fetch_agreement_rates):
+        with pytest.raises(OctopusApiError):
+            await read(_dispatch_settings())
