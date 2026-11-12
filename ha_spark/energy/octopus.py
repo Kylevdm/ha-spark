@@ -25,7 +25,15 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 
 import httpx
-from pydantic import AwareDatetime, BaseModel, Field, StrictBool, StrictStr, ValidationError
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    Field,
+    StrictBool,
+    StrictStr,
+    ValidationError,
+    field_validator,
+)
 
 from ha_spark.config import Settings
 from ha_spark.energy.models import ConsumptionInterval, DispatchSlot, LiveRates, PricePoint
@@ -58,8 +66,8 @@ class _Account(BaseModel):
     properties: list[_Property]
 
 
-async def discover_import_tariff(settings: Settings) -> tuple[str, str]:
-    """Read the current import tariff from the configured Octopus account API."""
+async def _discover_import_meter_point(settings: Settings) -> _MeterPoint:
+    """Select the account's single eligible import supply point."""
     if not (settings.octopus_api_key and settings.octopus_account_number):
         raise OctopusApiError("Octopus Intelligent not configured: set API key and account number")
     url = f"{settings.octopus_api_url.rstrip('/')}/accounts/{settings.octopus_account_number}/"
@@ -87,9 +95,15 @@ async def discover_import_tariff(settings: Settings) -> tuple[str, str]:
             raise OctopusApiError("Configured OCTOPUS_MPAN matches no import meter point")
     if len(imports) != 1:
         raise OctopusApiError(f"Octopus account has {len(imports)} eligible import meter points")
+    return imports[0]
+
+
+async def discover_import_tariff(settings: Settings) -> tuple[str, str]:
+    """Read the current import tariff from the configured Octopus account API."""
+    point = await _discover_import_meter_point(settings)
     now = datetime.now(UTC)
     agreements = [
-        item for item in imports[0].agreements
+        item for item in point.agreements
         if item.valid_from.tzinfo is not None
         and (item.valid_to is None or item.valid_to.tzinfo is not None)
         and item.valid_from <= now
@@ -104,6 +118,126 @@ async def discover_import_tariff(settings: Settings) -> tuple[str, str]:
     if match is None:
         raise OctopusApiError("Octopus current tariff code has an invalid shape")
     return match.group(1), tariff_code
+
+
+@dataclass(frozen=True)
+class FreeElectricitySession:
+    """A listed event, trusted only with campaign enrolment."""
+
+    id: str
+    start: datetime
+    end: datetime
+
+
+@dataclass(frozen=True)
+class FreeElectricityRead:
+    """Read outcome for health and subsequent session input gathering."""
+
+    state: Literal["failed", "not_enrolled", "no_session", "sessions"]
+    read_at: datetime
+    sessions: tuple[FreeElectricitySession, ...] = ()
+    reason: Literal[
+        "not_configured", "supply_point_unavailable", "read_error", "graphql_error",
+    ] | None = None
+
+
+_FREE_ELECTRICITY_QUERY = """
+query FreeElectricity($accountNumber: String!, $mpan: String!) {
+  isEnrolledInCustomerFlexibilityCampaign(accountNumber: $accountNumber,
+    supplyPointIdentifier: $mpan, campaignSlug: "free_electricity")
+  customerFlexibilityCampaignEvents(accountNumber: $accountNumber,
+    supplyPointIdentifier: $mpan, campaignSlug: "free_electricity", first: 10) {
+    edges { node { code startAt endAt } }
+  }
+}
+"""
+
+
+class _FreeElectricityEvent(BaseModel):
+    code: Annotated[StrictStr, Field(min_length=1)]
+    startAt: AwareDatetime
+    endAt: AwareDatetime
+
+    @field_validator("startAt", "endAt", mode="before")
+    @classmethod
+    def _time_is_text(cls, value: object) -> object:
+        # ISO text only: a number, or digits as text, would otherwise be read
+        # as a Unix timestamp.
+        if not isinstance(value, str):
+            raise ValueError("time must be text")
+        return datetime.fromisoformat(value)
+
+
+class _FreeElectricityConnection(BaseModel):
+    # Each edge is validated on its own: a bad event is dropped, not the read.
+    edges: list[Any]
+
+
+class _FreeElectricityData(BaseModel):
+    isEnrolledInCustomerFlexibilityCampaign: StrictBool | None
+    customerFlexibilityCampaignEvents: _FreeElectricityConnection
+
+
+class _FreeElectricityResponse(BaseModel):
+    data: _FreeElectricityData
+    errors: list[Any] | None = None
+
+
+async def fetch_free_electricity_sessions(
+    settings: Settings, *, now: datetime | None = None,
+) -> FreeElectricityRead:
+    """Read enrolled Free Electricity events, past ones included; read-only, never raises."""
+    read_at = (now or datetime.now(UTC)).astimezone(UTC)
+    if not (settings.octopus_api_key and settings.octopus_account_number):
+        return FreeElectricityRead("failed", read_at, reason="not_configured")
+    mpan = settings.octopus_mpan
+    if not mpan:
+        try:
+            mpan = (await _discover_import_meter_point(settings)).mpan
+        except (
+            OctopusApiError, httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError,
+            AttributeError,
+        ):
+            return FreeElectricityRead("failed", read_at, reason="supply_point_unavailable")
+    if not mpan:
+        return FreeElectricityRead("failed", read_at, reason="supply_point_unavailable")
+    payload: _FreeElectricityResponse | None = None
+    try:
+        async with httpx.AsyncClient(timeout=settings.ha_timeout) as client:
+            payload = _FreeElectricityResponse.model_validate(await kraken_graphql(
+                client, f"{settings.octopus_api_url.rstrip('/')}/graphql/",
+                settings.octopus_api_key, _FREE_ELECTRICITY_QUERY,
+                {"accountNumber": settings.octopus_account_number, "mpan": mpan},
+            ))
+    except (httpx.HTTPError, ValueError, OctopusApiError, TypeError, AttributeError):
+        pass
+    if payload is None:
+        return FreeElectricityRead("failed", read_at, reason="read_error")
+    if payload.errors:
+        return FreeElectricityRead("failed", read_at, reason="graphql_error")
+    if payload.data.isEnrolledInCustomerFlexibilityCampaign is not True:
+        return FreeElectricityRead("not_enrolled", read_at)
+    sessions = []
+    for edge in payload.data.customerFlexibilityCampaignEvents.edges:
+        # A null edge or node, a missing, unreadable or naive time, or an end
+        # not after its start drops that event; it is never guessed.
+        if not isinstance(edge, dict):
+            continue
+        try:
+            event = _FreeElectricityEvent.model_validate(edge.get("node"))
+        except ValidationError:
+            continue
+        try:
+            start, end = event.startAt.astimezone(UTC), event.endAt.astimezone(UTC)
+        except (OverflowError, ValueError):
+            continue  # A time at the edge of the calendar has no UTC form.
+        if end <= start:
+            continue
+        sessions.append(FreeElectricitySession(event.code, start, end))
+    return FreeElectricityRead(
+        "sessions" if sessions else "no_session", read_at,
+        tuple(sorted(sessions, key=lambda session: session.start)),
+    )
 
 
 def _to_utc(raw: str) -> datetime:

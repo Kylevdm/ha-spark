@@ -39,6 +39,7 @@ from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.octopus import (
     OctopusApiError,
     fetch_agreement_rates,
+    fetch_free_electricity_sessions,
     fetch_planned_dispatches,
     fetch_standard_unit_rates,
 )
@@ -460,6 +461,30 @@ async def _check_octopus_intelligent_tariff(settings: Settings) -> CheckResult:
         f"day {live.peak * 100:.2f}p / night {live.offpeak * 100:.2f}p "
         f"(account agreement), {len(dispatches)} planned dispatch(es)",
     )
+
+
+async def check_free_electricity(settings: Settings) -> CheckResult:
+    """Report campaign eligibility and listed times without account or event identifiers."""
+    name = "Free Electricity"
+    if not settings.free_electricity_enabled:
+        return CheckResult(name, Status.OK, "disabled")
+    if not (settings.octopus_api_key and settings.octopus_account_number):
+        return CheckResult(
+            name, Status.OK, "not configured — set Octopus API key and account number",
+        )
+    result = await fetch_free_electricity_sessions(settings)
+    if result.state == "failed":
+        return CheckResult(name, Status.WARN, f"read failed ({result.reason})")
+    if result.state == "not_enrolled":
+        return CheckResult(name, Status.OK, "not enrolled")
+    # The reader returns past events too; only a session not yet over is listed.
+    times = "; ".join(
+        f"{session.start.isoformat()} to {session.end.isoformat()}"
+        for session in result.sessions if session.end > result.read_at
+    )
+    if not times:
+        return CheckResult(name, Status.OK, "no session")
+    return CheckResult(name, Status.OK, f"listed: {times}")
 
 
 async def check_export_event_provider(settings: Settings) -> CheckResult:
@@ -895,6 +920,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_limits(settings),
         check_topology_record(settings),
         check_tariff_provider(settings),
+        check_free_electricity(settings),
         check_export_event_provider(settings),
         check_ha_timezone(settings),
         *([check_ev_status(settings)] if settings.ev_status_entity else []),
