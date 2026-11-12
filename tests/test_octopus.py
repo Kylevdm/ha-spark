@@ -29,6 +29,168 @@ from tests.octopus_helpers import agreement_failure, agreement_payload, token_re
 API = "http://octo.test/v1"
 
 
+def _free_payload(enrolled: Any = True, edges: Any = None) -> dict[str, Any]:
+    return {"data": {
+        "isEnrolledInCustomerFlexibilityCampaign": enrolled,
+        "customerFlexibilityCampaignEvents": {"edges": edges if edges is not None else [
+            {"node": {"code": "event-private", "startAt": "2025-10-25T11:00:00+00:00",
+                      "endAt": "2025-10-25T14:00:00+00:00", "isEventParticipant": False}},
+        ]},
+    }}
+
+
+@pytest.mark.parametrize("enrolled, state", [
+    (True, "sessions"), (False, "not_enrolled"), (None, "not_enrolled"),
+])
+@respx.mock
+async def test_free_electricity_eligibility(enrolled: Any, state: str) -> None:
+    route = respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(), httpx.Response(200, json=_free_payload(enrolled)),
+    ])
+    now = datetime(2026, 11, 12, tzinfo=UTC)
+    result = await octopus.fetch_free_electricity_sessions(
+        _dispatch_settings(octopus_mpan="mpan-private"), now=now,
+    )
+    assert result.state == state
+    assert result.read_at == now
+    if enrolled:
+        assert result.sessions[0].id == "event-private"
+        assert result.sessions[0].end < now  # Past events remain readable.
+    else:
+        assert result.sessions == ()
+    body = json.loads(route.calls[1].request.content)
+    assert body["variables"] == {"accountNumber": "A-1234ABCD", "mpan": "mpan-private"}
+    assert 'campaignSlug: "free_electricity"' in body["query"]
+    assert "first: 10" in body["query"]
+    assert "mutation" not in body["query"]
+
+
+@respx.mock
+async def test_free_electricity_times_null_edges_and_shared_token() -> None:
+    edges = [
+        {"node": {"code": "later", "startAt": "2026-11-13T15:00:00+01:00",
+                  "endAt": "2026-11-13T16:00:00+01:00"}},
+        None, {"node": None},
+        {"node": {"code": "earlier", "startAt": "2026-11-12T11:00:00Z",
+                  "endAt": "2026-11-12T12:00:00Z"}},
+    ]
+    route = respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(), httpx.Response(200, json=_free_payload(edges=edges)),
+        httpx.Response(200, json=agreement_payload((6.6, 36.0))),
+    ])
+    settings = _dispatch_settings(octopus_mpan="configured")
+    result = await octopus.fetch_free_electricity_sessions(settings)
+    assert result.state == "sessions"
+    assert [session.id for session in result.sessions] == ["earlier", "later"]
+    assert result.sessions[1].start == datetime(2026, 11, 13, 14, tzinfo=UTC)
+    await fetch_agreement_rates(settings)
+    assert route.call_count == 3  # Both readers share the same token.
+
+
+async def test_free_electricity_without_credentials() -> None:
+    result = await octopus.fetch_free_electricity_sessions(Settings())
+    assert result.state == "failed"
+    assert result.reason == "not_configured"
+
+
+@pytest.mark.parametrize("failure", [
+    "http", "graphql", "shape", "no_data", "errors_shape", "truthy",
+    "top_list", "top_null", "top_number", "top_text", "data_null", "data_list",
+])
+@respx.mock
+async def test_free_electricity_failed_reads(
+    failure: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload = _free_payload()
+    if failure == "graphql":
+        payload["errors"] = [{"message": "jwt-private key-private account-private mpan-private"}]
+    elif failure == "shape":
+        payload["data"]["customerFlexibilityCampaignEvents"]["edges"] = {}
+    elif failure == "no_data":
+        del payload["data"]["isEnrolledInCustomerFlexibilityCampaign"]
+    elif failure == "errors_shape":
+        payload["errors"] = True
+    elif failure == "truthy":
+        payload["data"]["isEnrolledInCustomerFlexibilityCampaign"] = "true"
+    odd: dict[str, Any] = {
+        "top_list": [], "top_null": None, "top_number": 5, "top_text": "text",
+        "data_null": {"data": None}, "data_list": {"data": []},
+    }
+    respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(),
+        httpx.Response(503 if failure == "http" else 200, json=odd.get(failure, payload)),
+    ])
+    result = await octopus.fetch_free_electricity_sessions(_dispatch_settings(
+        octopus_api_key="key-private", octopus_account_number="account-private",
+        octopus_mpan="mpan-private",
+    ))
+    assert result.state == "failed"
+    assert result.reason
+    assert result.sessions == ()
+    for secret in ("jwt-private", "key-private", "account-private", "mpan-private"):
+        assert secret not in repr(result) + caplog.text
+
+
+@respx.mock
+async def test_free_electricity_bad_event_is_dropped_not_guessed() -> None:
+    good = {"code": "good", "startAt": "2026-11-12T11:00:00Z", "endAt": "2026-11-12T12:00:00Z",
+            "isEventParticipant": False}
+    edges = [
+        {"node": good}, 7, {"cursor": "x"}, {"node": "text"},
+        {"node": {**good, "code": "no-start", "startAt": None}},
+        {"node": {k: v for k, v in good.items() if k != "endAt"} | {"code": "no-end"}},
+        {"node": {**good, "code": "bad-time", "startAt": "bad"}},
+        {"node": {**good, "code": "number", "startAt": 1794481200, "endAt": 1794484800}},
+        {"node": {**good, "code": "digits", "startAt": "1794481200", "endAt": "1794484800"}},
+        {"node": {**good, "code": "year-one", "startAt": "0001-01-01T00:00:00+14:00",
+                  "endAt": "0001-01-02T00:00:00+14:00"}},
+        {"node": {**good, "code": "naive", "endAt": "2026-11-12T12:00:00"}},
+        {"node": {**good, "code": "reversed", "endAt": "2026-11-12T10:00:00Z"}},
+        {"node": {**good, "code": "empty", "endAt": "2026-11-12T11:00:00Z"}},
+        {"node": {**good, "code": ""}},
+        {"node": {**good, "code": "joined", "isEventParticipant": True}},
+    ]
+    respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(), httpx.Response(200, json=_free_payload(edges=edges)),
+        httpx.Response(200, json=_free_payload(edges=edges[1:-1])),
+    ])
+    settings = _dispatch_settings(octopus_mpan="configured")
+    result = await octopus.fetch_free_electricity_sessions(settings)
+    assert result.state == "sessions"
+    assert [session.id for session in result.sessions] == ["good", "joined"]
+    result = await octopus.fetch_free_electricity_sessions(settings)
+    assert (result.state, result.sessions) == ("no_session", ())
+
+
+@respx.mock
+async def test_free_electricity_discovered_mpan_and_missing() -> None:
+    account = respx.get(f"{API}/accounts/A-1234ABCD/").mock(return_value=httpx.Response(200, json={
+        "properties": [{"electricity_meter_points": [
+            {"mpan": "discovered", "is_export": False, "agreements": []},
+        ]}],
+    }))
+    route = respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(), httpx.Response(200, json=_free_payload(edges=[])),
+    ])
+    result = await octopus.fetch_free_electricity_sessions(_dispatch_settings())
+    assert result.state == "no_session"
+    assert json.loads(route.calls[1].request.content)["variables"]["mpan"] == "discovered"
+    account.mock(return_value=httpx.Response(200, json={"properties": []}))
+    result = await octopus.fetch_free_electricity_sessions(_dispatch_settings())
+    assert result.state == "failed"
+    assert result.reason == "supply_point_unavailable"
+
+
+@pytest.mark.parametrize("mpan, reason", [
+    ("", "supply_point_unavailable"), ("configured", "read_error"),
+])
+async def test_free_electricity_malformed_endpoint_is_a_failed_read(mpan: str, reason: str) -> None:
+    result = await octopus.fetch_free_electricity_sessions(
+        _dispatch_settings(octopus_api_url="http://[::1/v1", octopus_mpan=mpan),
+    )
+    assert (result.state, result.reason, result.sessions) == ("failed", reason, ())
+
+
 @pytest.mark.parametrize("values", [(6.6, 6.6, 36.2828, 36.2828), (12.0,)])
 @respx.mock
 async def test_agreement_rates(values: tuple[float, ...]) -> None:
