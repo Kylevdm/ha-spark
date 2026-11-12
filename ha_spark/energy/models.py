@@ -266,6 +266,8 @@ class PlannerInputs:
     # (the horizon starts at the window, so this load is otherwise invisible).
     pre_window_drain_kwh: float = 0.0
     free_sessions: tuple[FreeSession, ...] = ()
+    # Grid import still uncounted per booked hour; absent assumes 16 kWh until #694.
+    happy_hour_remaining_kwh: dict[str, float] = field(default_factory=dict)
     dispatches: tuple[DispatchSlot, ...] = ()
     # False when the dispatch source could not be read (the Octopus call raised,
     # or the configured entity was missing/unavailable/unknown), so an empty
