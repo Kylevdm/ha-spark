@@ -40,8 +40,10 @@ from ha_spark.energy.octopus import (
     OctopusApiError,
     fetch_agreement_rates,
     fetch_free_electricity_sessions,
+    fetch_happy_hours,
     fetch_planned_dispatches,
     fetch_standard_unit_rates,
+    happy_hour_source,
 )
 from ha_spark.energy.planner import LIMITS_UNAVAILABLE_REASON
 from ha_spark.energy.profile import history_coverage
@@ -511,6 +513,37 @@ async def check_export_event_provider(settings: Settings) -> CheckResult:
     )
 
 
+async def check_happy_hour(settings: Settings) -> CheckResult:
+    """Report the Weekend Happy Hour booking source without exposing its credentials."""
+    source = happy_hour_source(settings)
+    if source == "disabled":
+        return CheckResult("Happy Hour", Status.OK, "disabled")
+    if source == "not_configured":
+        missing: list[str] = []
+        if not settings.octopus_api_key:
+            missing.append("the Octopus API key")
+        if not settings.octopus_account_number:
+            missing.append("the Octopus account number")
+        if not settings.octopus_backend_api_url.strip():
+            missing.append("the Octopus backend endpoint")
+        names = ", ".join(missing[:-1]) + f" and {missing[-1]}" if len(missing) > 1 else missing[0]
+        return CheckResult("Happy Hour", Status.OK, f"not configured; set {names}")
+    reading = await fetch_happy_hours(settings)
+    if reading.bookings is None:
+        return CheckResult(
+            "Happy Hour", Status.WARN,
+            "Happy Hour read failed; no Happy Hour is planned",
+        )
+    if not reading.bookings:
+        return CheckResult("Happy Hour", Status.OK, "no booking")
+    tz = load_timezone(settings.timezone)
+    times = ", ".join(
+        f"{booking.start.astimezone(tz):%Y-%m-%d %H:%M}-{booking.end.astimezone(tz):%H:%M}"
+        for booking in reading.bookings
+    )
+    return CheckResult("Happy Hour", Status.OK, f"booked: {times}")
+
+
 async def check_tariff_provider(settings: Settings) -> CheckResult:
     """Confirm the configured tariff provider reads end-to-end (`fixed` needs no live read)."""
     if settings.tariff_provider == "dynamic":
@@ -922,6 +955,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_tariff_provider(settings),
         check_free_electricity(settings),
         check_export_event_provider(settings),
+        check_happy_hour(settings),
         check_ha_timezone(settings),
         *([check_ev_status(settings)] if settings.ev_status_entity else []),
         *(
