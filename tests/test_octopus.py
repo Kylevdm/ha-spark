@@ -719,9 +719,40 @@ async def test_token_expiry_claim_beyond_an_hour_is_not_believed(
     ])
     _freeze(monkeypatch, T0)
     await fetch_planned_dispatches(_dispatch_settings())
-    _freeze(monkeypatch, T0 + timedelta(minutes=61))
+    _freeze(monkeypatch, T0 + timedelta(minutes=56))
     await fetch_planned_dispatches(_dispatch_settings())
     assert _mints(route) == 2
+
+
+def _jwt_exp(exp: object) -> str:
+    return "a." + base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode() + ".c"
+
+
+@pytest.mark.parametrize("exp", [
+    -62135596800, 0, int(T0.timestamp()), int((T0 + timedelta(minutes=5)).timestamp()),
+])
+@respx.mock
+async def test_token_already_due_for_refresh_serves_one_read_and_is_not_kept(
+    monkeypatch: pytest.MonkeyPatch, exp: int,
+) -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token(_jwt_exp(exp)), _no_dispatches(), _token(_jwt_exp(exp)), _no_dispatches(),
+    ])
+    _freeze(monkeypatch, T0)
+    assert await fetch_planned_dispatches(_dispatch_settings()) == ()
+    assert not octopus._kraken_tokens
+    assert await fetch_planned_dispatches(_dispatch_settings()) == ()
+    assert _mints(route) == 2
+
+
+@respx.mock
+async def test_malformed_endpoint_degrades_without_echoing_it() -> None:
+    settings = _dispatch_settings(octopus_api_url="http://octo.test:sk_test")
+    for read in (fetch_planned_dispatches, fetch_agreement_rates):
+        with pytest.raises(OctopusApiError) as error:
+            await read(settings)
+        assert _chain(error.value) == [error.value]
+        assert "sk_test" not in str(error.value)
 
 
 def _rejected(kind: str) -> httpx.Response:
@@ -766,14 +797,21 @@ async def test_token_still_rejected_after_refresh_degrades_without_a_second_retr
     with pytest.raises(OctopusApiError):
         await fetch_planned_dispatches(_dispatch_settings())
     assert route.call_count == 5
+    assert not octopus._kraken_tokens  # the refused replacement is not kept
 
 
+@pytest.mark.parametrize("kind", ["http", "expired", "failed"])
 @respx.mock
-async def test_newly_minted_token_that_is_rejected_is_not_minted_again() -> None:
-    route = respx.post(GRAPHQL).mock(side_effect=[_token("jwt-private"), _rejected("http")])
+async def test_newly_minted_token_that_is_rejected_is_not_retried_or_kept(kind: str) -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token("jwt-private"), _rejected(kind), _token("jwt-second"), _no_dispatches(),
+    ])
     with pytest.raises(OctopusApiError):
         await fetch_planned_dispatches(_dispatch_settings())
     assert route.call_count == 2
+    # The next read starts from a new token, never the refused one.
+    assert await fetch_planned_dispatches(_dispatch_settings()) == ()
+    assert route.calls[3].request.headers["Authorization"] == "JWT jwt-second"
 
 
 @respx.mock

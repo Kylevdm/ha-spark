@@ -485,7 +485,7 @@ async def _obtain_kraken_token(client: httpx.AsyncClient, graphql_url: str, api_
         )
         response.raise_for_status()
         payload = response.json()
-    except (httpx.HTTPError, ValueError):
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
         failed = True
     if failed:
         raise OctopusApiError("Octopus GraphQL auth request failed: HTTP or payload error")
@@ -522,10 +522,12 @@ async def _kraken_token(
     token = await _obtain_kraken_token(client, graphql_url, api_key)
     expiry = _token_expiry(token)
     if expiry is None:
-        refresh_at = now + _TOKEN_UNREADABLE_LIFETIME
+        keep_for = _TOKEN_UNREADABLE_LIFETIME
     else:
-        refresh_at = min(expiry, now + _TOKEN_MAX_LIFETIME) - _TOKEN_REFRESH_MARGIN
-    _kraken_tokens[graphql_url] = _CachedToken(digest, token, refresh_at)
+        keep_for = min(expiry - now, _TOKEN_MAX_LIFETIME) - _TOKEN_REFRESH_MARGIN
+    # A token already due for refresh serves this one call and is not kept.
+    if keep_for > timedelta(0):
+        _kraken_tokens[graphql_url] = _CachedToken(digest, token, now + keep_for)
     return token, True
 
 
@@ -574,6 +576,11 @@ async def kraken_graphql(
         response = await client.post(
             graphql_url, json=body, headers={"Authorization": f"JWT {token}"}
         )
+    if _auth_rejected(response):
+        # Still refused: no later read is handed this token.
+        cached = _kraken_tokens.get(graphql_url)
+        if cached is not None and cached.token == token:
+            del _kraken_tokens[graphql_url]
     response.raise_for_status()
     return response.json()
 
