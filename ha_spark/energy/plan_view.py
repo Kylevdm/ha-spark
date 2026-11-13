@@ -126,8 +126,10 @@ def _slots(
                 lo, geometry.window_start.astimezone(UTC)
             ) < min(end, geometry.window_end.astimezone(UTC)):
                 actions.append("charge")
-        if plan.soc.ok and any(p.slot_range[0] <= i < p.slot_range[1]
-                               for p in plan.daytime_purchases):
+        if plan.soc.ok and any(
+            not p.refused and p.slot_range[0] <= i < p.slot_range[1]
+            for p in plan.daytime_purchases
+        ):
             if "charge" not in actions:
                 actions.append("charge")
         if any(
@@ -217,8 +219,11 @@ def _lines(plan: ChargePlan, cfg: PlannerConfig, inputs: PlannerInputs) -> tuple
                                       plan.required_kwh), ""))
         for purchase in plan.daytime_purchases:
             start = max(purchase.start, now) if now is not None else purchase.start
-            rows.append((PlanLine("charge", start, purchase.end, purchase.reason,
-                                  purchase.energy_kwh), ""))
+            if purchase.refused:
+                rows.append((PlanLine("warning", start, purchase.end, purchase.reason), ""))
+            else:
+                rows.append((PlanLine("charge", start, purchase.end, purchase.reason,
+                                      purchase.energy_kwh), ""))
         for reservation in plan.reservations:
             target = instant(reservation.target_time)
             if target is None and absolute and geometry is not None:

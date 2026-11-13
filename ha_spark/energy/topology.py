@@ -231,17 +231,22 @@ class DriverCapabilities(FrozenModel):
     charge_ceiling_a: float | None
     discharge_ceiling_a: float | None
     setpoint_step_a: float | None
+    # A coarse whole-inverter hold stops discharge but also refuses a daytime
+    # charge on the same inverter. Solis is coarse; AlphaESS has no hold.
+    coarse_hold: bool
 
 
 def driver_capabilities(kind: DriverKind) -> DriverCapabilities:
     """AlphaESS has no settable charge rate but retains owner planning limits."""
     if kind == "solis":
         return DriverCapabilities(
-            charge_ceiling_a=62.5, discharge_ceiling_a=62.5, setpoint_step_a=1
+            charge_ceiling_a=62.5, discharge_ceiling_a=62.5, setpoint_step_a=1,
+            coarse_hold=True,
         )
     if kind == "alphaess":
         return DriverCapabilities(
-            charge_ceiling_a=None, discharge_ceiling_a=None, setpoint_step_a=None
+            charge_ceiling_a=None, discharge_ceiling_a=None, setpoint_step_a=None,
+            coarse_hold=False,
         )
     raise ValueError("invalid_driver_kind")
 

@@ -431,6 +431,10 @@ def apply_import_overlay(
                         else "Axle export event" if axle[i]
                         else "negative tariff price"
                     )
+                    if held[i]:
+                        # The refused diagnostic is sized with the same
+                        # allowance the admitted purchase would use (#697).
+                        allowances[i] = allowance
                 if losers[i] is None:
                     losers[i] = session.kind
                 continue

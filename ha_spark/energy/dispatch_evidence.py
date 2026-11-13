@@ -11,12 +11,12 @@ uncorroborated dispatch.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import StrEnum
 from math import isfinite
 
-from ha_spark.energy.models import DispatchSlot
+from ha_spark.energy.models import DispatchSlot, align
 
 
 class DispatchRating(StrEnum):
@@ -137,3 +137,31 @@ def partition_dispatches(
         else:
             kept.append(slot)
     return tuple(kept), tuple(dropped)
+
+
+def draw_confirmed_dispatches(
+    slots: tuple[DispatchSlot, ...], evidence: DispatchEvidence, now: datetime
+) -> tuple[DispatchSlot, ...]:
+    """Dispatches confirmed by actual car draw, the top rung for a purchase.
+
+    A live-dispatch or adjusted-rate flag confirms the whole planned picture
+    (valid for a hold) but is not evidence that the car is drawing now, so this
+    rating strips those two global confirmations. The established fresh
+    car-status and measured-power proof then decides, and only the active slot
+    can qualify.
+    """
+    drawing_only = replace(evidence, live_dispatch=None, rate_adjusted=None)
+    # A draw confirms only the half-hour it was observed in, from now to that
+    # half-hour's end. The hold keeps the whole original dispatch window.
+    half_hour_end = now.replace(
+        minute=0 if now.minute < 30 else 30, second=0, microsecond=0
+    ) + timedelta(minutes=30)
+    confirmed: list[DispatchSlot] = []
+    for slot in slots:
+        if rate_dispatch(slot, drawing_only, now) is not DispatchRating.CONFIRMED:
+            continue
+        start = max(align(slot.start, now), now)
+        end = min(align(slot.end, now), half_hour_end)
+        if start < end:
+            confirmed.append(replace(slot, start=start, end=end))
+    return tuple(confirmed)
