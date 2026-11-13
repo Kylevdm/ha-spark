@@ -7,10 +7,12 @@ solar uses each slot's calendar date. The planner prorates slot 0's energy.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from math import isfinite
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 from zoneinfo import ZoneInfo
 
 from ha_spark.authority import retirement_status
@@ -30,6 +32,7 @@ from ha_spark.energy.horizon import compute_horizon_geometry
 from ha_spark.energy.models import (
     SLOTS_PER_DAY,
     DispatchSlot,
+    FreeSession,
     LiveRates,
     LoadForecast,
     PlannerConfig,
@@ -39,8 +42,12 @@ from ha_spark.energy.models import (
 from ha_spark.energy.octopus import (
     OctopusApiError,
     fetch_agreement_rates,
+    fetch_free_electricity_sessions,
+    fetch_happy_hours,
     fetch_planned_dispatches,
     fetch_standard_unit_rates,
+    free_electricity_source,
+    happy_hour_source,
 )
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import observe_soc
@@ -72,6 +79,182 @@ _EV_HOLD_ACTIVE = {"charging", "boosting", "delivering"}
 NATIVE_MAX_AGE = timedelta(hours=36)
 EXPORT_P90_MAX_AGE = timedelta(hours=6)
 EXPORT_SNAPSHOT_MAX_AGE = timedelta(seconds=90)
+
+# #692: each session source is polled at most once per half-hour, and a
+# successful reading stays usable for two hours. Octopus is rate-limited, so a
+# failed poll waits for the next interval rather than retrying every tick.
+SESSION_POLL_INTERVAL = timedelta(minutes=30)
+SESSION_READ_MAX_AGE = timedelta(hours=2)
+
+SessionSource = Literal["free_electricity", "happy_hour"]
+
+
+@dataclass(frozen=True)
+class SessionSourceReading:
+    """One session source's effective input, and whether its evidence is trusted.
+
+    ``trusted`` is false only while an active source has no usable reading: it
+    has never been read successfully, or its last good read is at least
+    :data:`SESSION_READ_MAX_AGE` old. A disabled or unconfigured source is
+    trusted with no session — "no session" is the known answer, not a failed
+    read.
+    """
+
+    sessions: tuple[FreeSession, ...] = ()
+    trusted: bool = False
+
+
+@dataclass(frozen=True)
+class SessionReadings:
+    """Both session sources' effective input for one plan (#692)."""
+
+    free_electricity: SessionSourceReading = field(default_factory=SessionSourceReading)
+    happy_hour: SessionSourceReading = field(default_factory=SessionSourceReading)
+
+    @property
+    def sessions(self) -> tuple[FreeSession, ...]:
+        """Every trusted session, both sources, in whatever order they read."""
+        return self.free_electricity.sessions + self.happy_hour.sessions
+
+
+@dataclass
+class _SessionSourceState:
+    """Last good reading and last poll attempt for one source (in memory only)."""
+
+    sessions: tuple[FreeSession, ...] = ()
+    # When the last *successful* read happened; failures never move it.
+    read_at: datetime | None = None
+    # When the last poll was attempted, successful or not. Drives the interval.
+    polled_at: datetime | None = None
+    # The settings identity the reading belongs to, so a changed account or
+    # endpoint never reuses another configuration's sessions.
+    identity: tuple[str, ...] = ()
+
+
+class SessionCache:
+    """In-memory, per-source Octopus session poller (#692).
+
+    ``poll`` reads an active source at most once per
+    :data:`SESSION_POLL_INTERVAL`; planning never calls Octopus per tick. A
+    failed poll keeps the last good reading, a successful read replaces it (so a
+    successful empty read clears the bookings), and a reading at least
+    :data:`SESSION_READ_MAX_AGE` old keeps only a session that has already
+    started and whose start that reading still covered, until that session
+    ends. The cache is never persisted: after a restart the first poll happens
+    before any session is trusted.
+
+    ``clock`` is injectable so tests can move through a day; production callers
+    use the module clock (and therefore the same freeze seam as planning).
+    """
+
+    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._free = _SessionSourceState()
+        self._happy = _SessionSourceState()
+        # One poll at a time, so a plan tick and an API request never mint two
+        # reads inside the same half-hour interval.
+        self._lock = asyncio.Lock()
+
+    async def poll(self, settings: Settings) -> SessionReadings:
+        """Poll both sources concurrently as their interval allows."""
+        async with self._lock:
+            now = self._clock()
+            (free, free_state), (happy, happy_state) = await asyncio.gather(
+                self._poll(
+                    self._free, settings, now,
+                    source="free_electricity", status=free_electricity_source(settings),
+                ),
+                self._poll(
+                    self._happy, settings, now,
+                    source="happy_hour", status=happy_hour_source(settings),
+                ),
+            )
+            self._free, self._happy = free_state, happy_state
+            return SessionReadings(free_electricity=free, happy_hour=happy)
+
+    async def _poll(
+        self,
+        state: _SessionSourceState,
+        settings: Settings,
+        now: datetime,
+        *,
+        source: SessionSource,
+        status: Literal["disabled", "not_configured", "active"],
+    ) -> tuple[SessionSourceReading, _SessionSourceState]:
+        identity = self._identity(settings, source)
+        if state.identity != identity:
+            state = _SessionSourceState(identity=identity)
+        if status != "active":
+            # Disabled or unconfigured: never call Octopus. The owner's answer
+            # is "no session", not an unreadable failure; dropping the state
+            # means re-enabling starts from a fresh poll.
+            return SessionSourceReading((), True), _SessionSourceState(identity=identity)
+        if state.polled_at is not None and now - state.polled_at < SESSION_POLL_INTERVAL:
+            return self._effective(state, now), state
+        state.polled_at = now
+        try:
+            sessions = await self._read(settings, source, now)
+        except Exception:  # noqa: BLE001 - a source failure only means no update
+            sessions = None
+        if sessions is not None:
+            state.sessions = sessions
+            state.read_at = now
+        return self._effective(state, now), state
+
+    @staticmethod
+    async def _read(
+        settings: Settings, source: SessionSource, now: datetime
+    ) -> tuple[FreeSession, ...] | None:
+        """One reader call; ``None`` means the read failed and proves nothing."""
+        if source == "free_electricity":
+            result = await fetch_free_electricity_sessions(settings, now=now)
+            if result.state == "failed":
+                return None
+            return tuple(
+                FreeSession("free_electricity", session.id, session.start, session.end)
+                for session in result.sessions
+            )
+        reading = await fetch_happy_hours(settings, now=now)
+        if reading.bookings is None:
+            return None
+        return tuple(
+            FreeSession("happy_hour", booking.event_id, booking.start, booking.end)
+            for booking in reading.bookings
+        )
+
+    @staticmethod
+    def _effective(state: _SessionSourceState, now: datetime) -> SessionSourceReading:
+        """Apply the two-hour staleness rule to one source's last good reading."""
+        if state.read_at is None:
+            return SessionSourceReading((), False)
+        if now - state.read_at < SESSION_READ_MAX_AGE:
+            return SessionSourceReading(
+                tuple(session for session in state.sessions if session.end > now), True,
+            )
+        # Stale: keep only a session already under way whose start was still
+        # covered by the last good read. A session starting at or after
+        # read_at + 2 h was never covered, so time passing must not resurrect
+        # it; at exactly 2 h the evidence fails closed (#692).
+        covered_until = state.read_at + SESSION_READ_MAX_AGE
+        return SessionSourceReading(
+            tuple(
+                session for session in state.sessions
+                if session.start <= now < session.end and session.start < covered_until
+            ),
+            False,
+        )
+
+    @staticmethod
+    def _identity(settings: Settings, source: SessionSource) -> tuple[str, ...]:
+        """The non-secret settings a cached reading belongs to."""
+        if source == "free_electricity":
+            return (
+                settings.octopus_api_url, settings.octopus_account_number,
+                settings.octopus_mpan,
+            )
+        return (
+            settings.octopus_backend_api_url, settings.octopus_account_number,
+        )
 
 
 def _native_export_p90(
@@ -665,6 +848,7 @@ async def gather_inputs(
     *,
     soc: SocMeasurement | None = None,
     source: SolarSource,
+    sessions: SessionReadings | None = None,
 ) -> tuple[PlannerInputs, PlannerConfig, LoadForecast]:
     """Read live HA state and build (inputs, config, load forecast).
 
@@ -678,7 +862,14 @@ async def gather_inputs(
     and the plan's ``now`` as the caller states it. With kind ``entities``
     the forecast entities are read and the clock is kept exactly as before;
     native sizing and horizon placement use the context's ``now``.
+
+    ``sessions`` are the effective Octopus session inputs already polled by
+    :class:`SessionCache` (#692). Omitted by callers that gather HA state only
+    (the agent's state view): no session is claimed and its evidence is
+    untrusted, rather than reading Octopus outside a plan.
     """
+
+    session_readings = sessions if sessions is not None else SessionReadings()
 
     async def state(entity_id: str) -> EntityState | None:
         if not entity_id:
@@ -885,6 +1076,9 @@ async def gather_inputs(
     inputs = PlannerInputs(
         soc=soc_measurement,
         pre_window_drain_kwh=drain,
+        free_sessions=session_readings.sessions,
+        free_electricity_trusted=session_readings.free_electricity.trusted,
+        happy_hour_trusted=session_readings.happy_hour.trusted,
         solar_tomorrow_kwh=solar_kwh,
         predicted_home_load_kwh=forecast.total_kwh,
         dispatches=dispatches,

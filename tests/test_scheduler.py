@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from pathlib import Path
@@ -957,7 +958,8 @@ async def test_run_forever_runs_once_per_day_and_retries_on_error(
 
 
 def _patch_loop(
-    monkeypatch: pytest.MonkeyPatch, ticks: list[datetime]
+    monkeypatch: pytest.MonkeyPatch, ticks: list[datetime], *,
+    on_tick: Callable[[datetime], None] | None = None,
 ) -> type[Exception]:
     """Drive run_forever through ``ticks``, then raise to stop the loop."""
     it = iter(ticks)
@@ -969,9 +971,12 @@ def _patch_loop(
         @staticmethod
         def now(_tz: object) -> datetime:
             try:
-                return next(it)
+                tick = next(it)
             except StopIteration as exc:
                 raise _StopLoop from exc
+            if on_tick is not None:
+                on_tick(tick)
+            return tick
 
     original_sleep = asyncio.sleep
 
@@ -997,6 +1002,78 @@ def _patch_loop(
     monkeypatch.setattr(scheduler, "stop_server", fake_stop_server)
     monkeypatch.setattr(scheduler, "run_v2l_tick", noop_v2l_tick)
     return _StopLoop
+
+
+async def test_run_forever_polls_session_sources_every_half_hour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every daemon tick drives the session readers, not only replans (#692).
+
+    Plan runs jitter around the half-hour boundary (12:00:10, 12:30:05), so a
+    plan-only poll skips the 12:30 read. A later tick in the same slot still
+    refreshes the due source, and the planner's own read shares the cache.
+    """
+    from ha_spark.energy.octopus import FreeElectricityRead, HappyHourReading
+
+    free_calls: list[datetime] = []
+    happy_calls: list[datetime] = []
+
+    async def fake_free(_s: Settings, *, now: datetime | None = None) -> FreeElectricityRead:
+        at = now or datetime.now(UTC)
+        free_calls.append(at)
+        return FreeElectricityRead("no_session", at)
+
+    async def fake_happy(_s: Settings, *, now: datetime | None = None) -> HappyHourReading:
+        at = now or datetime.now(UTC)
+        happy_calls.append(at)
+        return HappyHourReading(at, ())
+
+    monkeypatch.setattr(sources, "fetch_free_electricity_sessions", fake_free)
+    monkeypatch.setattr(sources, "fetch_happy_hours", fake_happy)
+
+    cache_now = [datetime(2026, 6, 10, 0, 0)]
+    monkeypatch.setattr(
+        scheduler, "SessionCache",
+        lambda: sources.SessionCache(clock=lambda: cache_now[0]),
+    )
+
+    async def fake_run_once(_s: Settings, **_kwargs: object) -> scheduler.RunResult:
+        cache = execution_context().session_cache
+        assert cache is not None
+        await cache.poll(_s)  # the planner's own read shares the tick's cache
+        plan = _plan()
+        return scheduler.RunResult(plan, plan)
+
+    async def noop_sample_signals(_s: Settings, _now: datetime) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "sample_signals", noop_sample_signals)
+
+    start = datetime(2026, 6, 10, 0, 0)
+    ticks: list[datetime] = []
+    for slot in range(48):
+        base = start + timedelta(minutes=30 * slot)
+        ticks.append(base + timedelta(seconds=10 if slot % 2 == 0 else 5))
+        ticks.append(base + timedelta(seconds=10))
+
+    def set_cache_now(tick: datetime) -> None:
+        cache_now[0] = tick
+
+    stop = _patch_loop(monkeypatch, ticks, on_tick=set_cache_now)
+
+    s = Settings(
+        ha_url="http://ha.test", ha_token="t", plan_run_time="00:00",
+        octopus_api_key="sk_test", octopus_account_number="A-1234ABCD",
+        octopus_mpan="mpan-test", octopus_backend_api_url="http://backend.test/v1",
+    )
+    with pytest.raises(stop):
+        await run_forever(s, poll_seconds=0)
+
+    assert len(free_calls) == len(happy_calls) == 48
+    assert [b - a for a, b in zip(free_calls, free_calls[1:], strict=False)] == [
+        timedelta(minutes=30)
+    ] * 47
 
 
 async def test_run_forever_records_control_loop_tick(monkeypatch: pytest.MonkeyPatch) -> None:
