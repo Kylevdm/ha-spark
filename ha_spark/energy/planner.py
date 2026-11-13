@@ -77,7 +77,13 @@ from ha_spark.energy.models import (
     V2LRefill,
 )
 from ha_spark.energy.plan_view import SocPoint, build_plan_view, v2l_refill_reason
-from ha_spark.energy.tariff import TariffSchedule, _controlled_windows
+from ha_spark.energy.tariff import (
+    TariffSchedule,
+    _axle_export_slot_flags,
+    _controlled_windows,
+    _hold_slot_flags,
+    _negative_price_slots,
+)
 from ha_spark.energy.topology import (
     FIXED_EXPORT_CEILING_REFUSAL,
     FIXED_EXPORT_COMMAND_A,
@@ -1139,6 +1145,31 @@ def _daytime_purchases(
         if export else {}
     selected = set(exported)
     spent: dict[str, float] = {}
+    held = _hold_slot_flags(schedule, inputs, geometry)
+    axle = _axle_export_slot_flags(inputs, geometry)
+    negative_price = _negative_price_slots(schedule, len(net))
+    # A hold, an Axle export event or a scheduled export wins the slot: it is
+    # never a daytime purchase, whatever session or price overlays it carries.
+    blocked = tuple(
+        held[i] or axle[i] or geometry.slot_starts[i] in selected
+        for i in range(len(net))
+    )
+
+    def loser_label(index: int) -> str | None:
+        if index >= len(schedule.import_overlay_losers):
+            return None
+        kind = schedule.import_overlay_losers[index]
+        return _IMPORT_LABELS.get(kind, kind) if kind else None
+
+    def drain_slot(index: int) -> None:
+        nonlocal energy
+        if geometry.slot_starts[index] in exported:
+            drain = (net[index]
+                     + exported[geometry.slot_starts[index]] * _slot_hours(geometry, index))
+        else:
+            drain = (1 - schedule.cheap_fracs[index]) * net[index]
+        energy = max(0.0, energy - drain)
+
     i = first
     while i < stop:
         session = schedule.import_sessions[i] if i < len(schedule.import_sessions) else None
@@ -1148,24 +1179,32 @@ def _daytime_purchases(
                      if i < len(schedule.import_allowances) else None)
         budget = (max(0.0, allowance * efficiency - spent.get(session.session_id, 0.0))
                   if allowance is not None and session is not None else float("inf"))
+        live_price = (schedule.explicit_import_prices[i]
+                      if i < len(schedule.explicit_import_prices) else None)
+        overnight_average = schedule.overnight_average_price
+        if blocked[i]:
+            drain_slot(i)
+            i += 1
+            continue
+        negative = negative_price[i]
         eligible = (session is not None and overlay is not None and budget > 1e-9
                     and geometry.window_fracs[i] == 0
-                    and geometry.slot_starts[i] not in selected
+                    and not negative
                     # A booked hour straddling the overnight window buys only
                     # before it, never spending its allowance again after it.
                     and not (overlay == "happy_hour" and first > 0
                              and session.start.astimezone(UTC) < geometry.window_start))
         if not eligible:
-            live_price = (schedule.explicit_import_prices[i]
-                          if i < len(schedule.explicit_import_prices) else None)
-            overnight_average = schedule.overnight_average_price
+            # Precedence at this slot: a hold/event/export is already excluded
+            # above, then a negative explicit price (here), then the reserved
+            # Power-up slot (#684, not built), then the session overlays below.
             # An explicit live price below the selected overnight average is
             # top-rung evidence (#696); the fallback-filled ``prices`` entry is
             # never evidence, hence the separate live field.
-            if (live_price is not None and overnight_average is not None
+            if (live_price is not None
+                    and overnight_average is not None
                     and live_price < overnight_average
-                    and geometry.window_fracs[i] == 0
-                    and geometry.slot_starts[i] not in selected):
+                    and geometry.window_fracs[i] == 0):
                 hours = _slot_hours(geometry, i)
                 capacity = _slot_charge_capacity(
                     inputs, cfg, limits, efficiency, i, loads, observations,
@@ -1177,14 +1216,23 @@ def _daytime_purchases(
                         slot_start, (inputs.now or geometry.horizon_start).astimezone(UTC)
                     )
                     end = slot_start + timedelta(minutes=30)
-                    drain = (1 - schedule.cheap_fracs[i]) * net[i]
-                    energy = min(cap, max(0.0, energy - drain) + amount)
+                    drain_slot(i)
+                    energy = min(cap, energy + amount)
                     price = live_price
-                    evidence = (f"explicit tariff price £{price:g}/kWh for "
+                    winning = ("negative explicit tariff price" if negative
+                               else "explicit tariff price")
+                    evidence = (f"{winning} £{price:g}/kWh for "
                                 f"{_clock(start, inputs)}–{_clock(end, inputs)}")
-                    reason = (f"Buy {amount:.2f} kWh using the {evidence}, "
-                              f"below the £{overnight_average:g}/kWh average "
-                              f"overnight price.")
+                    reason = f"Buy {amount:.2f} kWh using the {evidence}"
+                    if overnight_average is not None:
+                        reason += (f", below the £{overnight_average:g}/kWh average "
+                                   f"overnight price")
+                    loser = loser_label(i)
+                    if loser is None and session is not None:
+                        loser = _IMPORT_LABELS.get(overlay or "", overlay)
+                    if loser:
+                        reason += f"; {loser} was set aside in this slot"
+                    reason += "."
                     purchases.append(DaytimePurchase(
                         slot_range=(i, i + 1), start=start, end=end,
                         overlay="dynamic_price", evidence=evidence, session_id="",
@@ -1198,16 +1246,14 @@ def _daytime_purchases(
                     ))
                     i += 1
                     continue
-            drain = ((net[i] + exported[geometry.slot_starts[i]] * _slot_hours(geometry, i))
-                     if geometry.slot_starts[i] in exported
-                     else (1 - schedule.cheap_fracs[i]) * net[i])
-            energy = max(0.0, energy - drain)
+            drain_slot(i)
             i += 1
             continue
         assert session is not None
         j = i + 1
-        while (j < stop and schedule.import_sessions[j] == session
-               and geometry.window_fracs[j] == 0 and geometry.slot_starts[j] not in selected):
+        while (j < stop and not blocked[j] and not negative_price[j]
+               and schedule.import_sessions[j] == session
+               and geometry.window_fracs[j] == 0):
             j += 1
         start = max(session.start.astimezone(UTC), geometry.slot_starts[i].astimezone(UTC),
                     (inputs.now or geometry.horizon_start).astimezone(UTC))
@@ -1253,6 +1299,13 @@ def _daytime_purchases(
                 bound = ("the headroom to the target cap", "the Happy Hour allowance",
                          "the charge rate")[bounds.index(amount)]
                 reason += f"; limited by {bound}"
+            set_aside: list[str] = []
+            for k in range(i, j):
+                other = loser_label(k)
+                if other and other != label and other not in set_aside:
+                    set_aside.append(other)
+            if set_aside:
+                reason += f"; {' and '.join(set_aside)} set aside by precedence"
             reason += "."
             purchases.append(DaytimePurchase(
                 slot_range=(i, j), start=start, end=end, overlay=overlay or "",

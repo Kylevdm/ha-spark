@@ -37,6 +37,7 @@ from ha_spark.energy.models import (
     PlannerConfig,
     PlannerInputs,
     PricePoint,
+    align,
 )
 
 HAPPY_HOUR_ALLOWANCE_KWH = 16.0
@@ -288,16 +289,86 @@ class TariffSchedule:
     import_allowances: tuple[float | None, ...] = ()
     # Retains dated eligibility and identity at the schedule/planner seam.
     import_sessions: tuple[FreeSession | None, ...] = ()
+    # Per-slot offer set aside by a higher-precedence overlay (#695): the
+    # session kind that lost to a negative price, an Axle export event or a
+    # hold. ``None`` where no offer was set aside.
+    import_overlay_losers: tuple[str | None, ...] = ()
+    # Session candidates whose slot was won by a hold or Axle export event,
+    # kept for the coarse-hold refusal display (#697). Never an overlay: the
+    # effective import price stays the hold/event/base price.
+    suppressed_import_sessions: tuple[FreeSession | None, ...] = ()
+    import_suppression_reasons: tuple[str | None, ...] = ()
+
+
+def _slot_overlap(
+    geometry: HorizonGeometry, start: datetime, end: datetime,
+) -> list[float]:
+    """Fraction of each slot's full half-hour overlapped by ``[start, end)``.
+
+    Slot 0 counts only the part still to come, so its fraction never exceeds
+    what remains of the half-hour (the session-allowance house load rule).
+    """
+    reference = geometry.horizon_start
+    a, b = align(start, reference).astimezone(UTC), align(end, reference).astimezone(UTC)
+    overlaps: list[float] = []
+    for i, slot_start in enumerate(geometry.slot_starts):
+        slot_end = slot_start.astimezone(UTC) + timedelta(minutes=30)
+        length = timedelta(
+            minutes=30 * (geometry.slot0_remaining_frac if i == 0 else 1)
+        )
+        lo = slot_end - length
+        overlaps.append(
+            max(0.0, (min(b, slot_end) - max(a, lo)).total_seconds()) / 1800.0
+        )
+    return overlaps
+
+
+def _hold_slot_flags(
+    schedule: TariffSchedule, inputs: PlannerInputs, geometry: HorizonGeometry,
+) -> tuple[bool, ...]:
+    """Slots inside a dispatch hold, plus a current EV hold's slot 0 (#695)."""
+    flags = [False] * len(geometry.slot_starts)
+    for start, end in schedule.controlled_windows:
+        for i, share in enumerate(_slot_overlap(geometry, start, end)):
+            if share > 0:
+                flags[i] = True
+    if flags and inputs.ev_hold_charging is True:
+        flags[0] = True
+    return tuple(flags)
+
+
+def _axle_export_slot_flags(
+    inputs: PlannerInputs, geometry: HorizonGeometry,
+) -> tuple[bool, ...]:
+    """Slots inside an Axle export event, scheduled or not (#695)."""
+    event = inputs.flexibility_event
+    if event is None or event.direction != "export":
+        return (False,) * len(geometry.slot_starts)
+    return tuple(share > 0 for share in _slot_overlap(geometry, event.start, event.end))
+
+
+def _negative_price_slots(schedule: TariffSchedule, n_slots: int) -> tuple[bool, ...]:
+    """Slots with an explicit negative tariff price (#695)."""
+    flags: list[bool] = []
+    for i in range(n_slots):
+        price = (schedule.explicit_import_prices[i]
+                 if i < len(schedule.explicit_import_prices) else None)
+        flags.append(price is not None and price < 0)
+    return tuple(flags)
 
 
 def apply_import_overlay(
     schedule: TariffSchedule, inputs: PlannerInputs, cfg: PlannerConfig,
 ) -> TariffSchedule:
-    """Layer trusted free sessions over battery prices with per-session allowances.
+    """Layer the winning import offer over battery prices (#695).
 
-    Coverage and gross house load use only the real interval still to come.
-    Base house prices remain available; the planner credits Happy Hour load only
-    when it actually buys within the session's allowance.
+    Precedence is holds, Axle export events, negative explicit prices, the
+    reserved Power-up place (#684, not built), Free Electricity, then Happy
+    Hour. A held or Axle-event slot takes no session overlay; a negative price
+    beats a session and spends none of its allowance. Coverage and gross house
+    load use only the real interval still to come. Base house prices remain
+    available; the planner credits Happy Hour load only when it actually buys
+    within the session's allowance.
     """
     geometry = inputs.geometry_for(cfg)
     if inputs.load_slots is None or geometry is None:
@@ -309,7 +380,17 @@ def apply_import_overlay(
         return schedule
     sessions: list[FreeSession | None] = [None] * len(schedule.prices)
     allowances: list[float | None] = [None] * len(schedule.prices)
-    # Free Electricity wins a shared slot over Happy Hour, whatever the input order.
+    losers: list[str | None] = [None] * len(schedule.prices)
+    suppressed: list[FreeSession | None] = [None] * len(schedule.prices)
+    suppression_reasons: list[str | None] = [None] * len(schedule.prices)
+    n_slots = len(schedule.prices)
+    held = _hold_slot_flags(schedule, inputs, geometry)
+    axle = _axle_export_slot_flags(inputs, geometry)
+    negative = _negative_price_slots(schedule, n_slots)
+    # Precedence, highest first: holds and Axle events (above), then a
+    # negative explicit price (``negative``), then the reserved Power-up slot
+    # (#684, not built), then Free Electricity, then Happy Hour. One session
+    # overlay per slot, never stacked.
     for session in sorted(inputs.free_sessions, key=lambda s: s.kind != "free_electricity"):
         if (session.kind not in ("free_electricity", "happy_hour")
                 or session.start.utcoffset() is None
@@ -318,11 +399,7 @@ def apply_import_overlay(
         a, b = session.start.astimezone(UTC), session.end.astimezone(UTC)
         if b <= a:
             continue
-        overlaps = []
-        for i, start in enumerate(geometry.slot_starts):
-            end = start.astimezone(UTC) + timedelta(minutes=30)
-            lo = end - timedelta(minutes=30 * (geometry.slot0_remaining_frac if i == 0 else 1))
-            overlaps.append(max(0.0, (min(b, end) - max(a, lo)).total_seconds()) / 1800)
+        overlaps = _slot_overlap(geometry, session.start, session.end)
         allowance = None
         if session.kind == "happy_hour":
             r = inputs.happy_hour_remaining_kwh.get(session.session_id, HAPPY_HOUR_ALLOWANCE_KWH)
@@ -337,10 +414,27 @@ def apply_import_overlay(
             if not math.isfinite(allowance) or allowance <= 0:
                 continue
         for i, share in enumerate(overlaps):
-            if share > 0 and sessions[i] is None:
-                sessions[i] = session
-                allowances[i] = allowance
-    if not any(sessions):
+            if share <= 0:
+                continue
+            if sessions[i] is not None:
+                # A higher-precedence session already owns this slot.
+                if losers[i] is None:
+                    losers[i] = session.kind
+                continue
+            if held[i] or axle[i] or negative[i]:
+                if suppressed[i] is None:
+                    suppressed[i] = session
+                    suppression_reasons[i] = (
+                        "EV or dispatch hold" if held[i]
+                        else "Axle export event" if axle[i]
+                        else "negative tariff price"
+                    )
+                if losers[i] is None:
+                    losers[i] = session.kind
+                continue
+            sessions[i] = session
+            allowances[i] = allowance
+    if not any(sessions) and not any(suppressed) and not any(losers):
         return schedule
     return replace(
         schedule,
@@ -349,6 +443,11 @@ def apply_import_overlay(
         import_overlays=tuple(s.kind if s else None for s in sessions),
         import_allowances=tuple(allowances),
         import_sessions=tuple(sessions),
+        import_overlay_losers=tuple(losers) if any(losers) else (),
+        suppressed_import_sessions=tuple(suppressed) if any(suppressed) else (),
+        import_suppression_reasons=(
+            tuple(suppression_reasons) if any(suppressed) else ()
+        ),
     )
 
 
