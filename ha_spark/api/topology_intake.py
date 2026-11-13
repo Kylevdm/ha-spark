@@ -68,7 +68,9 @@ class SupplyGuardBlock(FrozenModel):
     revision: int = Field(strict=True, ge=0)
 
 
-_READINGS = TypeAdapter(Annotated[list[MajorLoadReading], Field(max_length=12)])
+_READINGS: TypeAdapter[list[MajorLoadReading]] = TypeAdapter(
+    Annotated[list[MajorLoadReading], Field(max_length=12)],
+)
 
 
 def accept_topology(
