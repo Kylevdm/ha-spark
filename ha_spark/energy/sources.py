@@ -21,6 +21,7 @@ from ha_spark.config import Settings
 from ha_spark.energy.axle import AxleApiError, read_axle_event
 from ha_spark.energy.dispatch_evidence import (
     DispatchEvidence,
+    draw_confirmed_dispatches,
     partition_dispatches,
 )
 from ha_spark.energy.evidence_freshness import (
@@ -1077,8 +1078,18 @@ async def gather_inputs(
         solar_kwh = totals.get(served_day, 0.0)
 
     unrated_dispatches = dispatches
+    dispatch_evidence = replace(
+        evidence_read.evidence, forecast_house_kw=forecast.total_kwh / 24
+    )
     dispatches, dropped_dispatches = partition_dispatches(
-        dispatches, replace(evidence_read.evidence, forecast_house_kw=forecast.total_kwh / 24), now
+        dispatches, dispatch_evidence, now
+    )
+    # A purchase needs more than a hold: the active dispatch half-hour must
+    # show the car drawing. An untrusted dispatch source is no purchase
+    # evidence at all; holds keep their separate trusted/untrusted contract.
+    dispatch_purchase_slots = (
+        draw_confirmed_dispatches(dispatches, dispatch_evidence, now)
+        if dispatches_trusted else ()
     )
     for dropped in dropped_dispatches:
         plug_value = (
@@ -1123,6 +1134,7 @@ async def gather_inputs(
         solar_tomorrow_kwh=solar_kwh,
         predicted_home_load_kwh=forecast.total_kwh,
         dispatches=dispatches,
+        dispatch_purchase_slots=dispatch_purchase_slots,
         dispatches_trusted=dispatches_trusted,
         flexibility_event=flexibility_event,
         flexibility_event_trusted=flexibility_event_trusted,

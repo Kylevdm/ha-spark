@@ -229,7 +229,12 @@ class FreeSession:
 
 @dataclass(frozen=True)
 class DaytimePurchase:
-    """A named stored-energy purchase, with its per-slot delivery ledger."""
+    """A named stored-energy purchase, with its per-slot delivery ledger.
+
+    ``refused`` purchases are diagnostic only: they keep their potential energy
+    and reason in the plan view, but contribute nothing to sizing, costing, the
+    SoC path or a charge intent.
+    """
 
     slot_range: tuple[int, int]
     start: datetime
@@ -241,6 +246,12 @@ class DaytimePurchase:
     energy_kwh: float
     reason: str
     slot_energy_kwh: tuple[float, ...] = ()
+    refused: bool = False
+
+    @property
+    def refusal_reason(self) -> str | None:
+        """The hold that refused this diagnostic purchase, if any."""
+        return self.reason if self.refused else None
 
 
 @dataclass(frozen=True)
@@ -277,6 +288,11 @@ class PlannerInputs:
     # map has no provable allowance and stays on the ordinary tariff (#694).
     happy_hour_remaining_kwh: dict[str, float] = field(default_factory=dict)
     dispatches: tuple[DispatchSlot, ...] = ()
+    # Planned dispatches whose active half-hour also has fresh trusted evidence
+    # of the car actually drawing, clipped to that started half-hour's remaining
+    # time. Dispatches remain the full hold source; this is purchase evidence
+    # only (#697), so a live/adjusted flag alone never buys.
+    dispatch_purchase_slots: tuple[DispatchSlot, ...] = ()
     # False when the dispatch source could not be read (the Octopus call raised,
     # or the configured entity was missing/unavailable/unknown), so an empty
     # ``dispatches`` stops meaning both "no dispatch" and "unreadable" (#143 §3).
