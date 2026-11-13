@@ -273,7 +273,8 @@ class PlannerInputs:
     # from "unreadable"; the planner itself reads only ``free_sessions``.
     free_electricity_trusted: bool = False
     happy_hour_trusted: bool = False
-    # Grid import still uncounted per booked hour; absent assumes 16 kWh until #694.
+    # Grid import still uncounted per booked hour. A booking absent from this
+    # map has no provable allowance and stays on the ordinary tariff (#694).
     happy_hour_remaining_kwh: dict[str, float] = field(default_factory=dict)
     dispatches: tuple[DispatchSlot, ...] = ()
     # False when the dispatch source could not be read (the Octopus call raised,

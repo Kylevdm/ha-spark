@@ -36,7 +36,9 @@ from ha_spark.devices.inverters.solis_clock import (
 from ha_spark.energy.axle import AxleApiError, read_axle_event
 from ha_spark.energy.forecast import intervals_from_hourly_stats, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
+from ha_spark.energy.models import FreeSession
 from ha_spark.energy.octopus import (
+    HappyHourBooking,
     OctopusApiError,
     fetch_agreement_rates,
     fetch_free_electricity_sessions,
@@ -47,6 +49,12 @@ from ha_spark.energy.octopus import (
 )
 from ha_spark.energy.planner import LIMITS_UNAVAILABLE_REASON
 from ha_spark.energy.profile import history_coverage
+from ha_spark.energy.session_allowance import (
+    SessionAllowanceCounter,
+    allowance_source_identity,
+    max_plausible_import_kw,
+    read_grid_import,
+)
 from ha_spark.energy.soc_integrity import SocStatus
 from ha_spark.energy.solar_source import load_solar_source_kind
 from ha_spark.energy.sources import (
@@ -513,6 +521,34 @@ async def check_export_event_provider(settings: Settings) -> CheckResult:
     )
 
 
+async def _happy_hour_allowance_note(
+    settings: Settings, bookings: tuple[HappyHourBooking, ...], now: datetime,
+) -> str | None:
+    """Name why a booking's import allowance cannot be counted, or ``None`` if usable."""
+    sessions = tuple(
+        FreeSession("happy_hour", booking.event_id, booking.start, booking.end)
+        for booking in bookings if booking.end > now
+    )
+    if not sessions:
+        return None
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
+        ) as rest:
+            grid_import = await read_grid_import(settings, rest, now)
+        outcome = await SessionAllowanceCounter(
+            settings.db_path,
+            identity=allowance_source_identity(settings),
+            max_jump_kw=max_plausible_import_kw(settings),
+        ).inspect(
+            sessions, reading=grid_import.reading, reason=grid_import.reason, now=now,
+        )
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must never abort health
+        return f"allowance unusable: counter read failed ({type(exc).__name__})"
+    reason = outcome.reason or next(iter(outcome.session_reasons.values()), None)
+    return f"allowance unusable: {reason}" if reason else None
+
+
 async def check_happy_hour(settings: Settings) -> CheckResult:
     """Report the Weekend Happy Hour booking source without exposing its credentials."""
     source = happy_hour_source(settings)
@@ -541,7 +577,13 @@ async def check_happy_hour(settings: Settings) -> CheckResult:
         f"{booking.start.astimezone(tz):%Y-%m-%d %H:%M}-{booking.end.astimezone(tz):%H:%M}"
         for booking in reading.bookings
     )
-    return CheckResult("Happy Hour", Status.OK, f"booked: {times}")
+    detail = f"booked: {times}"
+    note = await _happy_hour_allowance_note(
+        settings, reading.bookings, datetime.now(UTC),
+    )
+    if note:
+        detail += f"; {note}"
+    return CheckResult("Happy Hour", Status.OK, detail)
 
 
 async def check_tariff_provider(settings: Settings) -> CheckResult:

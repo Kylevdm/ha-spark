@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from math import isfinite
+from pathlib import Path
 from typing import Any, Literal, NamedTuple
 from zoneinfo import ZoneInfo
 
@@ -48,6 +49,13 @@ from ha_spark.energy.octopus import (
     fetch_standard_unit_rates,
     free_electricity_source,
     happy_hour_source,
+)
+from ha_spark.energy.session_allowance import (
+    AllowanceOutcome,
+    SessionAllowanceCounter,
+    allowance_source_identity,
+    max_plausible_import_kw,
+    read_grid_import,
 )
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import observe_soc
@@ -1011,6 +1019,38 @@ async def gather_inputs(
     now = datetime.now(tz) if source.kind == "entities" else source.now.astimezone(tz)
     geometry = compute_horizon_geometry(now, window_start, window_end, tz)
     served_day = geometry.served_day
+    # Count each booked Happy Hour's delivered import before building inputs.
+    # The counter is fail-closed: any failure simply leaves that booking out of
+    # ``happy_hour_remaining_kwh``, so the overlay keeps the ordinary tariff.
+    # Every gather also drives bounded cleanup, even with no bookings or an
+    # unreadable meter; a data store that was never used is not created.
+    allowances = AllowanceOutcome()
+    happy_booked = any(
+        session.kind == "happy_hour" for session in session_readings.sessions
+    )
+    try:
+        if happy_booked or await asyncio.to_thread(Path(settings.db_path).exists):
+            counter = SessionAllowanceCounter(
+                settings.db_path,
+                identity=allowance_source_identity(settings),
+                max_jump_kw=max_plausible_import_kw(settings),
+            )
+            if happy_booked:
+                grid_import = await read_grid_import(settings, rest, now)
+                allowances = await counter.update(
+                    session_readings.sessions,
+                    reading=grid_import.reading, reason=grid_import.reason, now=now,
+                )
+            else:
+                allowances = await counter.update(
+                    session_readings.sessions,
+                    reading=None, reason=None, now=now,
+                )
+    except Exception as exc:  # noqa: BLE001 - the counter never fails a plan
+        log.warning(
+            "Happy Hour allowance counter unavailable (%s)", type(exc).__name__,
+        )
+        allowances = AllowanceOutcome(reason="allowance counter unavailable")
     forecast = await predict_home_load(settings, lat=lat, lon=lon, target=served_day)
     # Solar is forecast per calendar date (#398): today's from the optional
     # today's-solar entity, tomorrow's from the existing tomorrow entity. A
@@ -1079,6 +1119,7 @@ async def gather_inputs(
         free_sessions=session_readings.sessions,
         free_electricity_trusted=session_readings.free_electricity.trusted,
         happy_hour_trusted=session_readings.happy_hour.trusted,
+        happy_hour_remaining_kwh=allowances.remaining_kwh,
         solar_tomorrow_kwh=solar_kwh,
         predicted_home_load_kwh=forecast.total_kwh,
         dispatches=dispatches,

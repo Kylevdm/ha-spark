@@ -111,7 +111,7 @@ def test_negative_price_must_still_beat_the_selected_overnight_average(daytime_p
 def test_negative_price_slot_does_not_spend_the_happy_hour_allowance():
     config = cfg(capacity_kwh=100, strategy="fill", charge_efficiency=1.0)
     inputs = _zero_load(_dynamic_inputs(NOW, config, [-0.05] + [0.30] * 70))
-    inputs = replace(inputs, free_sessions=(HAPPY,))
+    inputs = replace(inputs, free_sessions=(HAPPY,), happy_hour_remaining_kwh={"happy": 16.0})
     schedule = apply_import_overlay(_dynamic_schedule(inputs, config), inputs, config)
     assert schedule.import_sessions[0] is None
     assert schedule.import_allowances[0] is None
@@ -130,7 +130,10 @@ def test_negative_price_slot_does_not_spend_the_happy_hour_allowance():
 
 def test_free_electricity_wins_a_shared_slot_over_happy_hour():
     config = cfg(capacity_kwh=100, strategy="fill")
-    inputs = _zero_load(replace(slot_inputs(NOW, config), free_sessions=(HAPPY, FREE)))
+    inputs = _zero_load(replace(
+        slot_inputs(NOW, config), free_sessions=(HAPPY, FREE),
+        happy_hour_remaining_kwh={"happy": 16.0},
+    ))
     schedule = apply_import_overlay(fixed_schedule(inputs, config), inputs, config)
     assert schedule.import_overlays[:2] == ("free_electricity", "free_electricity")
     assert schedule.import_overlay_losers[:2] == ("happy_hour", "happy_hour")
