@@ -19,7 +19,10 @@ def hour_inputs(config, *, load=0.0, hours=1, now=None):
     return replace(inputs, load_slots=(load,) * (2 * hours) + (0.0,) * (n - 2 * hours),
                    solar_slots=(0.0,) * n, free_sessions=(
                        FreeSession("happy_hour", "private-id", now,
-                                   now + timedelta(hours=hours)),))
+                                   now + timedelta(hours=hours)),),
+                   # #694: absent allowance now fails closed, so fixtures that
+                   # relied on the old implicit 16 kWh state it explicitly.
+                   happy_hour_remaining_kwh={"private-id": 16.0})
 
 
 def test_happy_hour_fills_cap_and_shrinks_next_overnight():
@@ -54,7 +57,7 @@ def test_adjacent_hours_never_pool_unused_allowance():
     second = replace(first, session_id="second", start=first.end,
                      end=first.end + timedelta(hours=1))
     inputs = replace(inputs, free_sessions=(first, second),
-                     happy_hour_remaining_kwh={"second": 3.6})
+                     happy_hour_remaining_kwh={"private-id": 16.0, "second": 3.6})
     purchases = planned(inputs, config).daytime_purchases
     assert len(purchases) == 2
     assert purchases[0].energy_kwh == pytest.approx(config.voltage_v * 50 / 1000)
@@ -96,7 +99,8 @@ def test_post_window_hour_leaves_overnight_sizing_and_reservations_identical():
     ordinary = planned(inputs, config, topology=native(config))
     start = datetime(2026, 1, 13, 12, tzinfo=LONDON)
     inputs = replace(inputs, free_sessions=(
-        FreeSession("happy_hour", "x", start, start + timedelta(hours=1)),))
+        FreeSession("happy_hour", "x", start, start + timedelta(hours=1)),),
+        happy_hour_remaining_kwh={"x": 16.0})
     plan = planned(inputs, config, topology=native(config))
     assert plan.daytime_purchases
     for name in ("required_kwh", "target_soc", "inverter_allocations", "reservations",

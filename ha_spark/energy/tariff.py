@@ -402,8 +402,10 @@ def apply_import_overlay(
         overlaps = _slot_overlap(geometry, session.start, session.end)
         allowance = None
         if session.kind == "happy_hour":
-            r = inputs.happy_hour_remaining_kwh.get(session.session_id, HAPPY_HOUR_ALLOWANCE_KWH)
-            if (isinstance(r, bool) or not isinstance(r, (int, float))
+            # An absent or unusable remaining count fails closed: a booking
+            # never assumes its full allowance when the counter cannot prove it.
+            r = inputs.happy_hour_remaining_kwh.get(session.session_id)
+            if (r is None or isinstance(r, bool) or not isinstance(r, (int, float))
                     or not math.isfinite(r) or r <= 0):
                 continue
             # Subtract the full margin: r - 1.6 is narrower than 0.9 * r.

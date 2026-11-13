@@ -53,7 +53,7 @@ def test_no_usable_session_returns_identical_schedule(case):
     assert apply_import_overlay(schedule, inputs, config) is schedule
 
 
-@pytest.mark.parametrize("remaining,expected", [(None, 12.4), (8, 4.4), (40, 12.4)])
+@pytest.mark.parametrize("remaining,expected", [(16, 12.4), (8, 4.4), (40, 12.4)])
 def test_happy_hour_overlay_has_one_grid_allowance_after_gross_house_load(remaining, expected):
     config = cfg()
     now = datetime(2026, 1, 12, 12, tzinfo=LONDON)
@@ -62,7 +62,7 @@ def test_happy_hour_overlay_has_one_grid_allowance_after_gross_house_load(remain
     inputs = replace(inputs, load_slots=(1.0,) * n, solar_slots=(1.0,) * n,
                      free_sessions=(FreeSession("happy_hour", "x", now,
                                                 now + timedelta(hours=1)),),
-                     happy_hour_remaining_kwh={} if remaining is None else {"x": remaining})
+                     happy_hour_remaining_kwh={"x": remaining})
     schedule = fixed_schedule(inputs, config)
     result = apply_import_overlay(schedule, inputs, config)
     assert result.battery_import_prices[:2] == (0.0, 0.0)
@@ -81,7 +81,8 @@ def test_happy_hour_load_deduction_uses_remaining_real_overlap_even_in_claimed_s
     # the booked hour's allowance. Only 15 minutes of that slot remain.
     inputs = replace(inputs, load_slots=(2.0,) * n, free_sessions=(
         FreeSession("free_electricity", "free", start, start + timedelta(minutes=30)),
-        FreeSession("happy_hour", "happy", start, start + timedelta(hours=1)),))
+        FreeSession("happy_hour", "happy", start, start + timedelta(hours=1)),),
+        happy_hour_remaining_kwh={"happy": 16.0})
     result = apply_import_overlay(fixed_schedule(inputs, config), inputs, config)
     assert result.import_overlays[:2] == ("free_electricity", "happy_hour")
     assert result.import_allowances[1] == pytest.approx(14.4 - 1 - 2)
@@ -95,6 +96,19 @@ def test_house_load_exhausting_happy_hour_allowance_claims_no_slot():
     now = datetime(2026, 1, 12, 12, tzinfo=LONDON)
     inputs = slot_inputs(now, config)
     inputs = replace(inputs, load_slots=(8.0,) * len(inputs.load_slots), free_sessions=(
-        FreeSession("happy_hour", "x", now, now + timedelta(hours=1)),))
+        FreeSession("happy_hour", "x", now, now + timedelta(hours=1)),),
+        happy_hour_remaining_kwh={"x": 16.0})
     schedule = fixed_schedule(inputs, config)
     assert apply_import_overlay(schedule, inputs, config) is schedule
+
+
+def test_free_electricity_survives_a_happy_hour_with_no_allowance():
+    config = cfg()
+    now = datetime(2026, 1, 12, 12, tzinfo=LONDON)
+    inputs = slot_inputs(now, config, free_sessions=(
+        FreeSession("free_electricity", "free", now, now + timedelta(hours=1)),
+        FreeSession("happy_hour", "happy", now + timedelta(hours=1),
+                    now + timedelta(hours=2)),
+    ))
+    result = apply_import_overlay(fixed_schedule(inputs, config), inputs, config)
+    assert result.import_overlays[:3] == ("free_electricity", "free_electricity", None)
