@@ -144,6 +144,15 @@ class FreeElectricityRead:
     ] | None = None
 
 
+def free_electricity_source(settings: Settings) -> Literal["disabled", "not_configured", "active"]:
+    """Whether the Free Electricity source may read; never a ``tariff_provider`` question."""
+    if not settings.free_electricity_enabled:
+        return "disabled"
+    if not (settings.octopus_api_key and settings.octopus_account_number):
+        return "not_configured"
+    return "active"
+
+
 _FREE_ELECTRICITY_QUERY = """
 query FreeElectricity($accountNumber: String!, $mpan: String!) {
   isEnrolledInCustomerFlexibilityCampaign(accountNumber: $accountNumber,

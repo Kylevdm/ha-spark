@@ -4,9 +4,14 @@ from datetime import UTC, datetime, time, timedelta
 
 import pytest
 
-from ha_spark.energy.models import FreeSession
+from ha_spark.energy.models import FreeSession, PricePoint
 from ha_spark.energy.planner import compute_plan
-from ha_spark.energy.tariff import apply_import_overlay, fixed_schedule
+from ha_spark.energy.tariff import (
+    DynamicTariffProvider,
+    FixedTariffProvider,
+    apply_import_overlay,
+    fixed_schedule,
+)
 from tests.test_planner import _soc, _soc_unavailable, cfg
 from tests.test_planner_limits import config as limits_config
 from tests.test_planner_limits import native
@@ -278,3 +283,232 @@ def test_short_overlay_arrays_and_unpriced_schedules_never_purchase():
     assert compute_plan(inputs, config, short).daytime_purchases == ()
     unpriced = replace(fixed_schedule(inputs, config), prices=())
     assert apply_import_overlay(unpriced, inputs, config) is unpriced
+
+
+# --- dynamic live prices as purchase evidence (#696) ---
+
+
+def _price_points(start: datetime, prices: list[float]) -> tuple[PricePoint, ...]:
+    """One half-hourly PricePoint per slot from ``start``, in order."""
+    start = start.astimezone(UTC)
+    return tuple(
+        PricePoint(start + timedelta(minutes=30 * i),
+                   start + timedelta(minutes=30 * (i + 1)), price)
+        for i, price in enumerate(prices)
+    )
+
+
+def _dynamic_schedule(inputs, config):
+    return DynamicTariffProvider(FixedTariffProvider(
+        config.rate_offpeak, config.rate_peak, config.rate_export,
+    )).schedule(inputs, config)
+
+
+def _dynamic_inputs(now, config, prices: list[float]):
+    """Zero-load inputs whose horizon carries one explicit live price per slot."""
+    inputs = slot_inputs(now, config)
+    n = len(inputs.geometry.slot_starts)
+    return replace(
+        inputs,
+        load_slots=(0.0,) * n,
+        solar_slots=(0.0,) * n,
+        dynamic_prices=_price_points(inputs.geometry.horizon_start, prices),
+    )
+
+
+def test_dynamic_buy_below_overnight_shrinks_the_next_purchase():
+    config = cfg(strategy="fill", buffer_pct=0)
+    now = datetime(2026, 1, 12, 12, tzinfo=LONDON)
+    inputs = _dynamic_inputs(now, config, [0.05] + [0.30] * 70)
+    schedule = _dynamic_schedule(inputs, config)
+    assert schedule.overnight_average_price == pytest.approx(0.30)
+    ordinary = compute_plan(
+        inputs, config, replace(schedule, explicit_import_prices=(None,) * len(schedule.prices)))
+    plan = compute_plan(inputs, config, schedule)
+    purchase, = plan.daytime_purchases
+    assert purchase.effective_price == pytest.approx(0.05)
+    assert purchase.overlay == "dynamic_price"
+    assert purchase.start == now.astimezone(UTC)
+    assert purchase.end == now.astimezone(UTC) + timedelta(minutes=30)
+    assert "£0.05/kWh" in purchase.reason
+    assert "£0.3/kWh average overnight price" in purchase.reason
+    assert ordinary.required_kwh - plan.required_kwh == pytest.approx(purchase.energy_kwh)
+
+
+@pytest.mark.parametrize("price", [0.30, 0.31])
+def test_dynamic_slot_at_or_above_the_overnight_price_is_not_bought(price):
+    config = cfg(strategy="fill", buffer_pct=0)
+    now = datetime(2026, 1, 12, 12, tzinfo=LONDON)
+    inputs = _dynamic_inputs(now, config, [price] + [0.30] * 70)
+    schedule = _dynamic_schedule(inputs, config)
+    assert schedule.overnight_average_price == pytest.approx(0.30)
+    assert compute_plan(inputs, config, schedule).daytime_purchases == ()
+
+
+def test_dynamic_comparison_uses_the_selected_overnight_average():
+    config = cfg(strategy="fill", buffer_pct=0)
+    now = datetime(2026, 1, 12, 12, tzinfo=LONDON)
+    # Six selected overnight slots at £0.05 and six at £0.25 average £0.15,
+    # well above the £0.069 fixed fallback. A £0.10 daytime slot is above the
+    # fallback but below that selected average, so it is still bought.
+    prices = [0.10] + [0.20] * 22 + [0.05] * 6 + [0.25] * 42
+    inputs = _dynamic_inputs(now, config, prices)
+    schedule = _dynamic_schedule(inputs, config)
+    assert schedule.overnight_average_price == pytest.approx(0.15)
+    purchase, = compute_plan(inputs, config, schedule).daytime_purchases
+    assert purchase.effective_price == pytest.approx(0.10)
+    assert "£0.15/kWh average overnight price" in purchase.reason
+    assert "£0.069/kWh" not in purchase.reason
+
+
+def test_dynamic_slot_at_the_selected_average_is_not_bought():
+    config = cfg(strategy="fill", buffer_pct=0)
+    now = datetime(2026, 1, 12, 12, tzinfo=LONDON)
+    prices = [0.15] + [0.20] * 22 + [0.05] * 6 + [0.25] * 42
+    inputs = _dynamic_inputs(now, config, prices)
+    schedule = _dynamic_schedule(inputs, config)
+    assert schedule.overnight_average_price == pytest.approx(0.15)
+    assert compute_plan(inputs, config, schedule).daytime_purchases == ()
+
+
+def test_dynamic_average_below_fallback_blocks_a_slot_above_it():
+    config = cfg(strategy="fill", buffer_pct=0)
+    now = datetime(2026, 1, 12, 12, tzinfo=LONDON)
+    # Six selected overnight slots at £0.03 and six at £0.05 average £0.04,
+    # below the £0.069 fixed fallback. A £0.05 daytime slot beats the fallback
+    # but not the selected average, so it must not be bought.
+    prices = [0.05] * 23 + [0.03] * 6 + [0.05] * 6 + [0.20] * 36
+    inputs = _dynamic_inputs(now, config, prices)
+    schedule = _dynamic_schedule(inputs, config)
+    assert schedule.overnight_average_price == pytest.approx(0.04)
+    assert compute_plan(inputs, config, schedule).daytime_purchases == ()
+
+
+def test_fallback_filled_price_is_never_purchase_evidence():
+    config = cfg(strategy="fill", buffer_pct=0)
+    now = datetime(2026, 1, 12, 12, tzinfo=LONDON)
+    # Only slot 0 has a live read; every other slot's cost is the fallback
+    # standard rate, which must never count as an explicit price.
+    inputs = slot_inputs(now, config, dynamic_prices=(
+        PricePoint(now, now + timedelta(minutes=30), 0.05),
+    ))
+    n = len(inputs.geometry.slot_starts)
+    inputs = replace(inputs, load_slots=(0.0,) * n, solar_slots=(0.0,) * n)
+    schedule = _dynamic_schedule(inputs, config)
+    assert schedule.prices[1] == pytest.approx(config.rate_peak)
+    assert schedule.explicit_import_prices[1] is None
+    assert compute_plan(inputs, config, schedule).daytime_purchases
+    no_evidence = replace(schedule, explicit_import_prices=(None,) * len(schedule.prices))
+    assert compute_plan(inputs, config, no_evidence).daytime_purchases == ()
+
+
+def test_negative_dynamic_price_is_bought_and_costed_negative():
+    config = cfg(strategy="fill", buffer_pct=0)
+    now = datetime(2026, 1, 12, 12, tzinfo=LONDON)
+    inputs = _dynamic_inputs(now, config, [-0.05] + [0.30] * 70)
+    schedule = _dynamic_schedule(inputs, config)
+    ordinary = compute_plan(
+        inputs, config, replace(schedule, explicit_import_prices=(None,) * len(schedule.prices)))
+    plan = compute_plan(inputs, config, schedule)
+    purchase, = plan.daytime_purchases
+    assert purchase.effective_price == pytest.approx(-0.05)
+    assert purchase.energy_kwh > 0
+    assert "£0.3/kWh average overnight price" in purchase.reason
+    # The purchase displaces the overnight buy at ``cheap_rate`` and is itself
+    # costed at its negative price.
+    assert ordinary.planned_cost - plan.planned_cost == pytest.approx(
+        purchase.energy_kwh / config.charge_efficiency
+        * (schedule.cheap_rate - purchase.effective_price))
+
+
+def test_fixed_schedule_carries_no_explicit_dynamic_prices():
+    config = cfg()
+    now = datetime(2026, 1, 12, 12, tzinfo=LONDON)
+    assert fixed_schedule(slot_inputs(now, config), config).explicit_import_prices == ()
+
+
+def test_expired_price_interval_is_not_purchase_evidence():
+    """An expired read overlapping slot 0 must not price the rest of the slot."""
+    config = cfg(strategy="fill", buffer_pct=0)
+    now = datetime(2026, 1, 12, 12, 17, tzinfo=LONDON)
+    inputs = slot_inputs(now, config)
+    n = len(inputs.geometry.slot_starts)
+    next_slot = now.replace(minute=30, second=0, microsecond=0)
+    inputs = replace(
+        inputs,
+        load_slots=(0.0,) * n,
+        solar_slots=(0.0,) * n,
+        dynamic_prices=(
+            PricePoint(now.replace(minute=0), now.replace(minute=10), 0.05),
+            PricePoint(next_slot, next_slot + timedelta(minutes=30), 0.05),
+        ),
+    )
+    schedule = _dynamic_schedule(inputs, config)
+    # Costing still projects the overlapping read onto slot 0; evidence does not.
+    assert schedule.prices[0] == pytest.approx(0.05)
+    assert schedule.explicit_import_prices[0] is None
+    purchase, = compute_plan(inputs, config, schedule).daytime_purchases
+    assert purchase.start == next_slot.astimezone(UTC)
+    assert purchase.effective_price == pytest.approx(0.05)
+
+
+def test_partially_covered_future_slot_is_not_purchase_evidence():
+    """A read covering only part of a future slot must not price the whole slot."""
+    config = cfg(strategy="fill", buffer_pct=0)
+    now = datetime(2026, 1, 12, 12, tzinfo=LONDON)
+    inputs = slot_inputs(now, config)
+    n = len(inputs.geometry.slot_starts)
+    partial = now.replace(minute=30, second=0, microsecond=0)
+    inputs = replace(
+        inputs,
+        load_slots=(0.0,) * n,
+        solar_slots=(0.0,) * n,
+        dynamic_prices=(
+            PricePoint(now, now + timedelta(minutes=30), 0.30),
+            PricePoint(partial, partial + timedelta(minutes=10), 0.05),
+        ),
+    )
+    schedule = _dynamic_schedule(inputs, config)
+    # Costing keeps its overlap projection, but a partial read is not evidence.
+    assert schedule.prices[1] == pytest.approx(0.05)
+    assert schedule.explicit_import_prices[1] is None
+    assert compute_plan(inputs, config, schedule).daytime_purchases == ()
+
+
+def test_partial_current_slot_buys_remaining_time_and_projects_soc():
+    config = cfg(strategy="fill", buffer_pct=0)
+    now = datetime(2026, 1, 12, 12, 17, tzinfo=LONDON)
+    inputs = _dynamic_inputs(now, config, [0.05] + [0.30] * 70)
+    schedule = _dynamic_schedule(inputs, config)
+    ordinary = compute_plan(
+        inputs, config, replace(schedule, explicit_import_prices=(None,) * len(schedule.prices)))
+    plan = compute_plan(inputs, config, schedule)
+    purchase, = plan.daytime_purchases
+    slot_end = now.replace(minute=30, second=0, microsecond=0)
+    hours = (slot_end - now).total_seconds() / 3600
+    expected = config.voltage_v * config.max_current_a / 1000 * hours
+    assert purchase.start == now.astimezone(UTC)
+    assert purchase.end == slot_end.astimezone(UTC)
+    assert purchase.energy_kwh == pytest.approx(expected)
+    assert ordinary.required_kwh - plan.required_kwh == pytest.approx(expected)
+    at_end = next(p for p in plan.view.soc if p.at == slot_end.astimezone(UTC))
+    assert at_end.soc_pct == pytest.approx(
+        inputs.soc_now + expected / config.capacity_kwh * 100)
+    assert ordinary.planned_cost - plan.planned_cost == pytest.approx(
+        expected / config.charge_efficiency * (schedule.cheap_rate - purchase.effective_price))
+
+
+def test_repeated_cheap_slots_never_buy_beyond_the_target_cap():
+    config = cfg(strategy="fill", buffer_pct=0)
+    now = datetime(2026, 1, 12, 12, tzinfo=LONDON)
+    # Every pre-window slot is £0.05; all selected overnight slots are £0.10.
+    inputs = _dynamic_inputs(now, config, [0.05] * 23 + [0.10] * 48)
+    schedule = _dynamic_schedule(inputs, config)
+    assert schedule.overnight_average_price == pytest.approx(0.10)
+    plan = compute_plan(inputs, config, schedule)
+    usable_cap = config.capacity_kwh * (config.target_cap - config.min_soc) / 100
+    assert len(plan.daytime_purchases) > 1
+    assert sum(p.energy_kwh for p in plan.daytime_purchases) == pytest.approx(
+        usable_cap - (inputs.soc_now - config.min_soc) / 100 * config.capacity_kwh)
+    assert max(point.soc_pct for point in plan.view.soc) <= config.target_cap + 1e-9
+    assert plan.required_kwh == pytest.approx(0)

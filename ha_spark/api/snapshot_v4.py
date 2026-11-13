@@ -250,11 +250,19 @@ class Export(FrozenModel):
     transitions: Annotated[tuple[ExportTransition, ...], Field(max_length=64)]
 
 
-_OWNER = TypeAdapter(Owner)
-_HOLDS = TypeAdapter(Annotated[tuple[Hold, ...], Field(max_length=16)])
-_DEVICES = TypeAdapter(Annotated[tuple[Device, ...], Field(max_length=8)])
-_EXPORT = TypeAdapter(Annotated[tuple[Export, ...], Field(max_length=8)])
-_WRITERS = TypeAdapter(Annotated[tuple[Writer, ...], Field(max_length=4)])
+_OWNER: TypeAdapter[Owner] = TypeAdapter(Owner)
+_HOLDS: TypeAdapter[tuple[Hold, ...]] = TypeAdapter(
+    Annotated[tuple[Hold, ...], Field(max_length=16)],
+)
+_DEVICES: TypeAdapter[tuple[Device, ...]] = TypeAdapter(
+    Annotated[tuple[Device, ...], Field(max_length=8)],
+)
+_EXPORT: TypeAdapter[tuple[Export, ...]] = TypeAdapter(
+    Annotated[tuple[Export, ...], Field(max_length=8)],
+)
+_WRITERS: TypeAdapter[tuple[Writer, ...]] = TypeAdapter(
+    Annotated[tuple[Writer, ...], Field(max_length=4)],
+)
 
 
 @dataclass(frozen=True)

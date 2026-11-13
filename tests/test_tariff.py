@@ -257,6 +257,18 @@ def test_dynamic_provider_marks_cheapest_slots_as_cheap() -> None:
     assert sched.cheap_fracs[:12] == (0.0,) * 12
 
 
+def test_dynamic_provider_records_only_explicit_live_prices() -> None:
+    """Live-price provenance is per slot: a fallback-filled cost is not evidence."""
+    sched = _dynamic().schedule(_dynamic_inputs([0.05] * 10), cfg())
+    assert sched.prices[0] == pytest.approx(0.05)
+    assert sched.prices[10] == pytest.approx(0.30)  # fallback-filled
+    assert sched.explicit_import_prices[0] == pytest.approx(0.05)
+    assert sched.explicit_import_prices[10] is None
+    # Twelve cheapest slots are selected (ten live at £0.05, two fallback-filled
+    # at £0.30): their average is the daytime comparison, not the £0.069 rate.
+    assert sched.overnight_average_price == pytest.approx((10 * 0.05 + 2 * 0.30) / 12)
+
+
 def test_dynamic_provider_uncovered_slot_costs_standard_rate() -> None:
     """A slot with no live price (partial sensor read) costs at the standard rate."""
     inputs = PlannerInputs(soc=_soc(55), solar_tomorrow_kwh=0.0, predicted_home_load_kwh=24.0,
