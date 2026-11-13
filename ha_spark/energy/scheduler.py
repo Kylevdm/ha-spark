@@ -154,6 +154,7 @@ from ha_spark.energy.soc_monitor import SocMonitor, SocMonitorSnapshot, observe_
 from ha_spark.energy.solar_forecasts import SolarForecastStore
 from ha_spark.energy.solar_source import SolarSource
 from ha_spark.energy.sources import (
+    SessionCache,
     ev_hold_status_from_read,
     parse_time,
     read_dispatch_evidence,
@@ -405,6 +406,7 @@ async def run_once(
     native_apply: NativeApply | None = None,
     native_link: IntegrationLink | None = None,
     native_epoch: int | None = None,
+    session_cache: SessionCache | None = None,
 ) -> RunResult:
     """Compute the charge plan, log it, and apply it under site authority.
 
@@ -417,6 +419,11 @@ async def run_once(
     ``source`` states where the plan's solar comes from (#519): the daemon
     builds it per plan from its last accepted snapshot; callers without
     daemon state read the persisted kind.
+
+    ``session_cache`` is the daemon's in-memory session poller (#692), so the
+    Octopus session sources are read at most once per half-hour across ticks.
+    The daemon loop publishes its instance on the process execution context;
+    a one-off run without one reads the sources once itself.
 
     ``trusted_holds`` is the daemon's last trusted hold set, used by the
     reconcile when this plan's hold data is untrusted (#143 §3).
@@ -446,6 +453,9 @@ async def run_once(
         run = await current_plan(
             settings, rest, soc=soc, source=source,
             limits=context.limits_record or LoadedTopology(), major_loads=context.major_loads,
+            session_cache=(
+                session_cache if session_cache is not None else context.session_cache
+            ),
         )
         plan, inputs, load_source = run.plan, run.inputs, run.load_source
         log.info(
@@ -1988,6 +1998,11 @@ async def _run_paired(
         log.warning("Authority persistence failed; hardware writes refused")
     context = execution_context()
     context.authority = authority
+    # #692: one in-memory session poller for the daemon's lifetime. It keeps
+    # the last good Octopus reading across ticks (polling each source at most
+    # every half-hour) and resets itself when the account or endpoint changes.
+    # Every in-process plan surface reads it through the execution context.
+    context.session_cache = SessionCache()
     # The accepted limits record; the heartbeat replaces it on every change.
     context.limits_record = state.integration_link.topology
     channel.authority = authority
@@ -2126,6 +2141,12 @@ async def _run_paired(
                     await _charger_supports_live_rate(settings)
                 )
             now = datetime.now(tz)
+            # #692: every daemon tick drives the session readers, independent of
+            # replanning. The cache enforces the half-hour interval, so a tick
+            # between plan slots still refreshes a due source instead of waiting
+            # for the next replan.
+            if context.session_cache is not None:
+                await context.session_cache.poll(settings)
             record = state.plan_run
             geometry = (record.run.inputs.geometry
                         if record is not None and record.run.plan.model == "slots" else None)

@@ -266,6 +266,13 @@ class PlannerInputs:
     # (the horizon starts at the window, so this load is otherwise invisible).
     pre_window_drain_kwh: float = 0.0
     free_sessions: tuple[FreeSession, ...] = ()
+    # Per-source evidence trust for ``free_sessions`` (#692): true when the
+    # source is deliberately off, or its last good read is younger than two
+    # hours; false while an active source is unreadable or stale (including
+    # exactly two hours old). Recorded so a later ticket can tell "no session"
+    # from "unreadable"; the planner itself reads only ``free_sessions``.
+    free_electricity_trusted: bool = False
+    happy_hour_trusted: bool = False
     # Grid import still uncounted per booked hour; absent assumes 16 kWh until #694.
     happy_hour_remaining_kwh: dict[str, float] = field(default_factory=dict)
     dispatches: tuple[DispatchSlot, ...] = ()
