@@ -77,6 +77,26 @@ async def test_native_evidence_uses_bus_not_forged_ha_power_and_never_future_rep
     assert c.holds.evidence.read(now - timedelta(seconds=1)).charging is None
 
 
+async def test_native_battery_direction_ignores_grid_port_power_sign(
+    held_site: Any, native_transport: FakeSolisDevice,  # noqa: F811
+) -> None:
+    # Observed firmware: s32 battery power, charge negative; grid port import negative.
+    c = held_site
+    old = next(iter(c.native.inverters.values()))
+    inv = old.model_copy(update={"power_sign": "negative_import"})
+    c.native.inverters[inv.id] = inv
+    now = datetime.now(UTC)
+    c.hass.states.async_set("sensor.ev", "charging")
+    c.native.readings[inv.id]["holding_43141"] = Reading(now, (300, 0, 11, 0, 13, 0) + (0,) * 24)
+    words = [0] * 21
+    words[3], words[17], words[18] = 0, 0xFFFF, 0x10000 - 3156  # charging 3156 W
+    c.native.readings[inv.id]["input_33132"] = Reading(now, tuple(words))
+    assert c.holds.evidence.read(now).overnight
+    words[3], words[17], words[18] = 1, 0, 453  # discharging 453 W
+    c.native.readings[inv.id]["input_33132"] = Reading(now, tuple(words))
+    assert not c.holds.evidence.read(now).overnight
+
+
 async def test_snapshot_contains_durable_holds_and_native_source(
     held_site: Any, aioclient_mock: AiohttpClientMocker,  # noqa: F811
 ) -> None:

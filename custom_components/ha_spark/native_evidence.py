@@ -164,10 +164,8 @@ class NativeEvidence:
             watts = decode(point, reading.registers, zone, frame=True)
             if not isinstance(watts, (int, float)):
                 return False
-            # Native decoding reports charging positive; apply the same
-            # owner-set sign convention as the native guard input.
-            if inverter.power_sign == "negative_import":
-                watts = -watts
+            # The direction register signs native battery power (charging
+            # positive), so the owner's grid-port power_sign does not apply.
             return watts > -50
         state = c.hass.states.get(source.entity_id) if source.entity_id else None
         if (state is None or not fresh(state.last_reported, now, source.max_age_s)

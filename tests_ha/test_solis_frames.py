@@ -29,6 +29,11 @@ def test_battery_direction_bits_clock_and_bad_words() -> None:
     assert decode(signed, tuple(words), None, frame=True) == 123
     words[3] = 2
     assert decode(signed, tuple(words), None, frame=True) is None
+    # Firmware with an s32 register (charge negative): the direction word signs it.
+    words[3], words[17], words[18] = 0, 0xFFFF, 0x10000 - 3156
+    assert decode(signed, tuple(words), None, frame=True) == 3156
+    words[3], words[17], words[18] = 1, 0, 453
+    assert decode(signed, tuple(words), None, frame=True) == -453
     bit = next(p for p in POINTS if p.key == "input_33132_b5")
     assert decode(bit, (32,), None) is True
     clock = next(p for p in POINTS if p.address == 33022)
