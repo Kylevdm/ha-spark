@@ -1128,7 +1128,8 @@ def _daytime_purchases(
     loads: tuple[MajorLoad, ...], observations: tuple[MajorLoadObservation, ...],
     export: ExportIntent | None,
 ) -> tuple[tuple[DaytimePurchase, ...], tuple[DatedChargeWindow, ...], list[float], float]:
-    """Greedily fill dated overlay runs in order, never borrowing a future buy."""
+    """Greedily fill dated overlay runs and explicit cheap slots in time order,
+    never borrowing a future buy."""
     purchases: list[DaytimePurchase] = []
     windows: list[DatedChargeWindow] = []
     remaining = list(net)
@@ -1141,8 +1142,10 @@ def _daytime_purchases(
     i = first
     while i < stop:
         session = schedule.import_sessions[i] if i < len(schedule.import_sessions) else None
-        overlay = schedule.import_overlays[i]
-        allowance = schedule.import_allowances[i]
+        overlay = (schedule.import_overlays[i]
+                   if i < len(schedule.import_overlays) else None)
+        allowance = (schedule.import_allowances[i]
+                     if i < len(schedule.import_allowances) else None)
         budget = (max(0.0, allowance * efficiency - spent.get(session.session_id, 0.0))
                   if allowance is not None and session is not None else float("inf"))
         eligible = (session is not None and overlay is not None and budget > 1e-9
@@ -1153,6 +1156,48 @@ def _daytime_purchases(
                     and not (overlay == "happy_hour" and first > 0
                              and session.start.astimezone(UTC) < geometry.window_start))
         if not eligible:
+            live_price = (schedule.explicit_import_prices[i]
+                          if i < len(schedule.explicit_import_prices) else None)
+            overnight_average = schedule.overnight_average_price
+            # An explicit live price below the selected overnight average is
+            # top-rung evidence (#696); the fallback-filled ``prices`` entry is
+            # never evidence, hence the separate live field.
+            if (live_price is not None and overnight_average is not None
+                    and live_price < overnight_average
+                    and geometry.window_fracs[i] == 0
+                    and geometry.slot_starts[i] not in selected):
+                hours = _slot_hours(geometry, i)
+                capacity = _slot_charge_capacity(
+                    inputs, cfg, limits, efficiency, i, loads, observations,
+                ) * hours
+                amount = min(max(0.0, cap - energy), capacity)
+                if amount > 1e-9:
+                    slot_start = geometry.slot_starts[i].astimezone(UTC)
+                    start = max(
+                        slot_start, (inputs.now or geometry.horizon_start).astimezone(UTC)
+                    )
+                    end = slot_start + timedelta(minutes=30)
+                    drain = (1 - schedule.cheap_fracs[i]) * net[i]
+                    energy = min(cap, max(0.0, energy - drain) + amount)
+                    price = live_price
+                    evidence = (f"explicit tariff price £{price:g}/kWh for "
+                                f"{_clock(start, inputs)}–{_clock(end, inputs)}")
+                    reason = (f"Buy {amount:.2f} kWh using the {evidence}, "
+                              f"below the £{overnight_average:g}/kWh average "
+                              f"overnight price.")
+                    purchases.append(DaytimePurchase(
+                        slot_range=(i, i + 1), start=start, end=end,
+                        overlay="dynamic_price", evidence=evidence, session_id="",
+                        effective_price=price, energy_kwh=amount, reason=reason,
+                        slot_energy_kwh=(amount,),
+                    ))
+                    windows.append(DatedChargeWindow(
+                        start, end,
+                        min(cfg.target_cap,
+                            cfg.min_soc + energy / cfg.capacity_kwh * 100),
+                    ))
+                    i += 1
+                    continue
             drain = ((net[i] + exported[geometry.slot_starts[i]] * _slot_hours(geometry, i))
                      if geometry.slot_starts[i] in exported
                      else (1 - schedule.cheap_fracs[i]) * net[i])
@@ -1427,12 +1472,23 @@ def compute_plan(
     pre_window_outflow += pre_window_export_kwh
     daytime_purchases: tuple[DaytimePurchase, ...] = ()
     daytime_windows: tuple[DatedChargeWindow, ...] = ()
+    slots_ready = inputs.load_slots is not None and geometry is not None
+    sessions_ready = (
+        slots_ready
+        and len(schedule.import_sessions) == len(schedule.import_overlays)
+        == len(schedule.battery_import_prices) == len(schedule.import_allowances)
+        == len(net) and bool(schedule.import_sessions)
+    )
+    # Live-price provenance must cover the horizon before it can buy anything;
+    # an uncovered slot is ``None`` and never evidence.
+    dynamic_ready = (
+        slots_ready
+        and len(schedule.explicit_import_prices) == len(net)
+        and any(price is not None for price in schedule.explicit_import_prices)
+    )
     daytime_enabled = (inputs.load_slots is not None and geometry is not None
-                       and len(schedule.import_sessions) == len(schedule.import_overlays)
-                       == len(schedule.battery_import_prices) == len(schedule.import_allowances)
-                       == len(net)
-                       and bool(schedule.import_sessions) and limits_reason is None
-                       and inputs.soc.ok and cfg.capacity_kwh > 0)
+                       and (sessions_ready or dynamic_ready)
+                       and limits_reason is None and inputs.soc.ok and cfg.capacity_kwh > 0)
     daytime_balance = None
     if daytime_enabled and geometry is not None:
         before, windows, daytime_net, balance = _daytime_purchases(

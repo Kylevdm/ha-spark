@@ -170,6 +170,37 @@ def _project_prices(
     return prices
 
 
+def _fully_covered_prices(
+    starts: Sequence[datetime],
+    points: tuple[PricePoint, ...],
+    origin: datetime,
+    *,
+    absolute: bool,
+    now: datetime | None = None,
+) -> list[float | None]:
+    """Per-slot live price only where one original interval covers the slot.
+
+    Purchase evidence needs the whole remaining charge interval priced by the
+    same read: a point that merely overlaps the slot, a projection between
+    reads, or the fallback fill is never evidence (#696). ``now`` trims slot 0
+    to its part still to come.
+    """
+    prices: list[float | None] = [None] * len(starts)
+    for j, start in enumerate(starts):
+        sa = _hours_since(origin, start, absolute=absolute)
+        lo = (
+            max(sa, _hours_since(origin, now, absolute=absolute))
+            if j == 0 and now is not None else sa
+        )
+        hi = sa + 0.5
+        for pt in points:
+            a = _hours_since(origin, pt.start, absolute=absolute)
+            b = _hours_since(origin, pt.end, absolute=absolute)
+            if a <= lo + 1e-9 and b >= hi - 1e-9:
+                prices[j] = pt.price
+    return prices
+
+
 def _cycle_slot_prices(
     starts: tuple[datetime, ...],
     points: tuple[PricePoint, ...],
@@ -232,6 +263,16 @@ class TariffSchedule:
     window_hours: float
     window_start: time | None = None
     prices: tuple[float, ...] = ()
+    # Per-slot explicit live import price from a dynamic-tariff feed (#696),
+    # ``None`` where the feed gave no reading for that slot. This is
+    # provenance, not costing: ``prices`` fills an uncovered slot with the
+    # fallback standard rate, which is never purchase evidence.
+    explicit_import_prices: tuple[float | None, ...] = ()
+    # Average price the selected overnight charge slots pay (#696), including
+    # the fallback rate where that selection already used it. A live daytime
+    # slot must beat this average; ``None`` on a fixed schedule or when no
+    # slot was selected.
+    overnight_average_price: float | None = None
     cheap_fracs: tuple[float, ...] = ()
     controlled_windows: tuple[tuple[datetime, datetime], ...] = ()
     export_prices: tuple[float, ...] = ()
@@ -379,9 +420,14 @@ def fixed_schedule(inputs: PlannerInputs, cfg: PlannerConfig) -> TariffSchedule:
 
 def _slot_prices_from_points(
     n_slots: int, horizon_start: datetime | None, points: tuple[PricePoint, ...],
-    inputs: PlannerInputs, cfg: PlannerConfig,
+    inputs: PlannerInputs, cfg: PlannerConfig, *, full_coverage: bool = False,
 ) -> list[float | None]:
-    """Per-horizon-slot live price via :func:`_project_prices`; ``None`` where uncovered."""
+    """Per-horizon-slot live price; ``None`` where uncovered.
+
+    The default is the overlap projection used for costing. ``full_coverage``
+    instead requires one original price interval to cover every slot's whole
+    remaining charge interval, for purchase evidence (#696).
+    """
     prices: list[float | None] = [None] * n_slots
     if horizon_start is None or not points:
         return prices
@@ -392,6 +438,11 @@ def _slot_prices_from_points(
         [geometry.slot_starts[i] for i in range(n_slots)] if geometry is not None
         else [horizon_start + timedelta(minutes=30 * i) for i in range(n_slots)]
     )
+    if full_coverage:
+        return _fully_covered_prices(
+            starts, points, origin, absolute=absolute,
+            now=inputs.now if absolute else None,
+        )
     return _project_prices(starts, points, origin, absolute=absolute)
 
 
@@ -422,6 +473,10 @@ class DynamicTariffProvider:
         )
         if not any(p is not None for p in raw_prices):
             return self.fallback.schedule(inputs, cfg)
+        explicit_prices = _slot_prices_from_points(
+            n, inputs.horizon_start, inputs.dynamic_prices, inputs, cfg,
+            full_coverage=True,
+        )
         # ponytail: an uncovered slot (partial sensor read) costs at the
         # standard rate rather than being guessed at.
         prices = [p if p is not None else self.fallback.standard_rate for p in raw_prices]
@@ -432,6 +487,7 @@ class DynamicTariffProvider:
             # cycle, so the selection is exactly the pre-#399 one and no
             # separate cycle view is exposed.
             cheapest = set(sorted(range(n), key=lambda i: prices[i])[:n_window])
+            comparison_prices = prices
             cheap_fracs = tuple(1.0 if i in cheapest else 0.0 for i in range(n))
             cycle: tuple[tuple[datetime, float], ...] = ()
         else:
@@ -450,10 +506,15 @@ class DynamicTariffProvider:
             cheapest = set(
                 sorted(range(len(starts)), key=lambda j: cycle_prices[j])[:n_window]
             )
+            comparison_prices = cycle_prices
             cheap_fracs = tuple(_carry_cycle_marks(geometry, starts, cheapest, inputs))
             cycle = tuple(
                 (start, 1.0 if j in cheapest else 0.0) for j, start in enumerate(starts)
             )
+        overnight_average = (
+            sum(comparison_prices[i] for i in cheapest) / len(cheapest)
+            if cheapest else None
+        )
         controlled = _controlled_windows(inputs.dispatches, cfg.window_start, cfg.window_end)
         return TariffSchedule(
             cheap_rate=self.fallback.cheap_rate,
@@ -462,6 +523,8 @@ class DynamicTariffProvider:
             window_hours=cfg.window_hours,
             window_start=cfg.window_start,
             prices=tuple(prices),
+            explicit_import_prices=tuple(explicit_prices),
+            overnight_average_price=overnight_average,
             cheap_fracs=cheap_fracs,
             controlled_windows=controlled,
             cycle_cheap_slots=cycle,
