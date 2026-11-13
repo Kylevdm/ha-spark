@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.32.4
+
+- **Native Solis battery power sign (#707).** Battery power now reads correctly on firmware that reports it as a signed value. Before, it showed about 4.29 GW while charging and made the SoC check reject SoC. The inverter `power_sign` now applies only to grid-port power, so `negative_import` can be set where Grid-port power reads import negative without flipping battery-direction evidence.
+- **After updating:** on firmware whose Grid-port power reads import negative, set the native inverter's `power_sign` to `negative_import` in Options → Site topology and limits, then check a cheap-window charge (runbook step 3).
+
 ## 0.32.3
 
 - **Live Octopus Intelligent rates (#532).** When standard rate slots are unavailable, read current day/night prices from the account agreement while keeping the configured cheap window and planned dispatches. Health now warns when neither live rate source is usable and plans fall back to configured rates.
