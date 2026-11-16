@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.5
+
+- **Native fallback schedule form (#712).** The form now shows a charge current box (A) for every native inverter. Before, the current field never appeared, so every save failed with "expected float". Leaving every field empty now reaches the clear rule. A wrong time format says "Use HH:MM, for example 23:30", and a missing current is reported against that inverter.
+
 ## 0.32.4
 
 - **Native Solis battery power sign (#707).** Battery power now reads correctly on firmware that reports it as a signed value. Before, it showed about 4.29 GW while charging and made the SoC check reject SoC. The inverter `power_sign` now applies only to grid-port power, so `negative_import` can be set where Grid-port power reads import negative without flipping battery-direction evidence.
