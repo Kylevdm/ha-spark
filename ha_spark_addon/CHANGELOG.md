@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.7
+
+- Native protection evidence can now use an optional liveness entity per group (EV: status, plug and power; dispatch: live dispatch and adjusted rate). A change-only source whose own report is stale but no older than 12 hours counts as fresh while its group's liveness entity reported within that source's maximum age. A sibling never clears an EV hold. Diagnostics and the snapshot show `via_sibling`, and on integration-owned sites `ha-spark health` Evidence rows now show the integration's own maximum ages and sibling result (#679).
+
 ## 0.32.6
 
 - **Settings writer version (#664).** Every settings save now records the validated running version, so downgrade repair reasons can name the release that wrote unknown fields. Releases 0.32.0 or later accept this metadata; downgrading below 0.32.0 after any save now triggers configuration repair ("Invalid configuration envelope").
