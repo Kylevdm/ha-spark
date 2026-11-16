@@ -54,6 +54,21 @@ def _guard_health(coordinator: SparkCoordinator | None) -> dict[str, Any] | None
     return guard.diagnostics() if guard is not None else None
 
 
+def _native_links(coordinator: SparkCoordinator | None) -> dict[str, Any] | None:
+    """Key link stats by opaque gateway ids, never transport endpoint tuples."""
+    native = getattr(coordinator, "native", None)
+    if native is None or not native.transports:
+        return None
+    links: dict[str, Any] = {}
+    for inverter in native.inverters.values():
+        key = (inverter.gateway_host, inverter.gateway_port)
+        transport = native.transports.get(key)
+        stats = getattr(transport, "link_stats", None)
+        if callable(stats):
+            links[native.gateway_id(inverter)] = stats()
+    return links
+
+
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: SparkConfigEntry,
 ) -> dict[str, Any]:
@@ -70,6 +85,7 @@ async def async_get_config_entry_diagnostics(
             "addon_api_version": None,
             "solcast": _solcast_health(entry, None),
             "supply_guard": None,
+            "native_links": None,
             "last_refusal": None,
         }
     return {
@@ -90,4 +106,5 @@ async def async_get_config_entry_diagnostics(
         "addon_api_version": coordinator.addon_api_version,
         "solcast": _solcast_health(entry, coordinator),
         "supply_guard": _guard_health(coordinator),
+        "native_links": _native_links(coordinator),
     }
