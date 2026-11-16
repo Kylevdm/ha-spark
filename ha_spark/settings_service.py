@@ -65,7 +65,7 @@ _REPAIR_FILES = (
 )
 # Marks a store committed under the empty hub default (0.31+); older markers are `{}`.
 _MARKER = {"hub_default": ""}
-_WRITTEN_BY = TypeAdapter(Annotated[str, StringConstraints(
+_WRITTEN_BY: TypeAdapter[str] = TypeAdapter(Annotated[str, StringConstraints(
     strict=True, max_length=14, pattern=r"^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$",
 )])
 

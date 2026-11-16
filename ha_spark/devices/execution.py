@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
     from ha_spark.authority import AuthorityStore
     from ha_spark.config import DeviceConfig, Settings
+    from ha_spark.energy.sources import SessionCache
     from ha_spark.energy.topology import MajorLoadObservation
     from ha_spark.energy.topology_record import LoadedTopology
 
@@ -224,6 +225,10 @@ class ExecutionContext:
         self.limits_record: LoadedTopology | None = None
         # The accepted snapshot's major-load observations, for planning only.
         self.major_loads: tuple[MajorLoadObservation, ...] = ()
+        # The daemon's in-memory Octopus session poller (#692). Set once at
+        # daemon start so every plan surface in the process shares the same
+        # half-hourly reads; a one-off command leaves it None and reads once.
+        self.session_cache: SessionCache | None = None
         self.planned_limits: ContextVar[tuple[str, int | None]] = ContextVar(
             "planned_limits", default=("legacy", None)
         )

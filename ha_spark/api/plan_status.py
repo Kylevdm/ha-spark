@@ -79,7 +79,7 @@ def resolve(
     export = intent.export
     purchases = tuple(
         (s.astimezone(UTC), e.astimezone(UTC), _purchase_reason(p))
-        for p in plan.daytime_purchases
+        for p in plan.daytime_purchases if not p.refused
         for s, e in ((p.start, p.end),)
     )
     # A record still awaiting release has no scheduled end once its end has passed.

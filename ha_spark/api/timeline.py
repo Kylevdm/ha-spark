@@ -37,7 +37,9 @@ def timeline_payload(
         return value.astimezone(UTC).astimezone(run.tz or UTC).isoformat()
 
     lines = view.lines + ((ev_hold_line(run.inputs.now),) if record.ev_hold_active else ())
-    purchase_reasons = {p.reason for p in run.plan.daytime_purchases}
+    purchase_reasons = {
+        p.reason for p in run.plan.daytime_purchases if not p.refused
+    }
     observe_suffix = " Simulated in Observe: nothing is written."
     geometry = run.inputs.geometry
     horizon_start = geometry.horizon_start if geometry is not None else run.inputs.horizon_start

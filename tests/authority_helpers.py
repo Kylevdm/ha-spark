@@ -134,10 +134,12 @@ def cleanup_authority() -> None:
         context.planned_generation.set(None)
         context.config_generation = 0
         context.release_backoff.clear()
+        context.session_cache = None
     _contexts.clear()
     execution_context().release_backoff.clear()
     execution_context().limits_record = None
     execution_context().major_loads = ()
+    execution_context().session_cache = None
     execution_context().planned_limits.set(("legacy", None))
     for directory in _directories:
         directory.cleanup()
