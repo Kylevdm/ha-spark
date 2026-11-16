@@ -108,7 +108,10 @@ class NativeDevices:
         assert inverter.gateway_host is not None
         key = (inverter.gateway_host, inverter.gateway_port)
         if key not in self.transports:
-            self.transports[key] = transport_factory(*key)
+            transport = transport_factory(*key)
+            if hasattr(transport, "label"):
+                transport.label = self.gateway_id(inverter)[:8]
+            self.transports[key] = transport
         return self.transports[key]
 
     def gateway_id(self, inverter: Inverter) -> str:

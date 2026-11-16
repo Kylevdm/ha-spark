@@ -13,10 +13,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from itertools import count
 from typing import Literal, Protocol
@@ -25,6 +27,8 @@ from pymodbus.client import AsyncModbusTcpClient
 from pymodbus.exceptions import ConnectionException, ModbusIOException
 from pymodbus.framer import FramerType
 from pymodbus.pdu import ModbusPDU
+
+_LOGGER = logging.getLogger(__name__)
 
 _IN_TRANSPORT = ContextVar("solis_transport_io", default=False)
 
@@ -161,10 +165,23 @@ class PymodbusTcpTransport:
         self, host: str, port: int = 502, *,
         client_factory: Callable[[str, int], ModbusClient] = _client,
         monotonic: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         with _wire_context():
             self._client = client_factory(host, port)
+        self.label: str = "gateway"
+        self._wall_clock = wall_clock
+        self._up_since: float | None = None
+        self._down_since: float | None = None
+        # Bounded even during a pathological flapping storm.
+        self._drops: deque[float] = deque(maxlen=100_000)
+        self._last_drop_reason: str | None = None
+        self._last_drop_at: str | None = None
+        self._log_times: dict[int, deque[float]] = {
+            logging.WARNING: deque(maxlen=10), logging.INFO: deque(maxlen=10),
+        }
+        self._suppressed = {logging.WARNING: 0, logging.INFO: 0}
         self._monotonic = monotonic
         self._sleep = sleep
         self._queue: asyncio.PriorityQueue[tuple[int, int, _Request]] = asyncio.PriorityQueue()
@@ -186,6 +203,68 @@ class PymodbusTcpTransport:
     def connection_epoch(self) -> int:
         """Changes after every successful connection, invalidating validation."""
         return self._connection
+
+    def _prune_drops(self, now: float) -> None:
+        while self._drops and self._drops[0] <= now - 86400:
+            self._drops.popleft()
+
+    def link_stats(self) -> dict[str, int | str | bool | None]:
+        """Non-identifying link history; independent of write permissions."""
+        self._prune_drops(self._wall_clock())
+        return {
+            "drops_24h": len(self._drops),
+            "last_drop_reason": self._last_drop_reason,
+            "last_drop_at": self._last_drop_at,
+            "connected": self.connected,
+        }
+
+    def _link_log(self, level: int, now: float, message: str, *args: object) -> None:
+        times = self._log_times[level]
+        while times and times[0] <= now - 3600:
+            times.popleft()
+        if len(times) >= 10:
+            self._suppressed[level] += 1
+            _LOGGER.debug(message, *args)
+        else:
+            times.append(now)
+            suppressed = self._suppressed[level]
+            self._suppressed[level] = 0
+            _LOGGER.log(level, message + " suppressed=%d", *args, suppressed)
+
+    def _link_drop(
+        self, reason: TransportError, op: str | None, address: int | None,
+    ) -> None:
+        # Observability must never interfere with bus I/O, even if a clock or
+        # logging handler fails. Only the first observation of a drop counts.
+        with suppress(Exception):
+            if self._up_since is None or self._closed:
+                return
+            now = self._monotonic()
+            uptime = now - self._up_since
+            self._up_since = None
+            self._down_since = now
+            wall_now = self._wall_clock()
+            self._prune_drops(wall_now)
+            self._drops.append(wall_now)
+            self._last_drop_reason = reason.value
+            self._last_drop_at = datetime.fromtimestamp(wall_now, UTC).isoformat()
+            self._link_log(
+                logging.WARNING, now,
+                "Native link %s dropped reason=%s op=%s address=%s uptime_s=%.3f",
+                self.label, reason.value, op, address, uptime,
+            )
+
+    def _link_up(self) -> None:
+        with suppress(Exception):
+            now = self._monotonic()
+            self._up_since = now
+            down_since = self._down_since
+            self._down_since = None
+            if down_since is not None:
+                self._link_log(
+                    logging.INFO, now, "Native link %s reconnected downtime_s=%.3f",
+                    self.label, now - down_since,
+                )
 
     async def _start(self) -> None:
         async with self._start_lock:
@@ -209,6 +288,7 @@ class PymodbusTcpTransport:
             else:
                 self._connection += 1
                 self._reconnect_needed.clear()
+                self._link_up()
 
     async def _reconnect(self) -> None:
         while True:
@@ -235,6 +315,7 @@ class PymodbusTcpTransport:
         if self._closed or not self._client.connected:
             if not self._closed:
                 self._reconnect_needed.set()
+                self._link_drop(TransportError.DISCONNECTED, op, address)
             return ReadResult(error=TransportError.DISCONNECTED)
         result = await self._submit(op, address, size, (), device_id)
         assert isinstance(result, ReadResult)
@@ -249,6 +330,7 @@ class PymodbusTcpTransport:
         if self._closed or not self._client.connected:
             if not self._closed and self._worker is not None:
                 self._reconnect_needed.set()
+                self._link_drop(TransportError.DISCONNECTED, "write", address)
             return WriteResult(error=TransportError.DISCONNECTED)
         result = await self._submit("write", address, len(words), words, device_id)
         assert isinstance(result, WriteResult)
@@ -279,6 +361,7 @@ class PymodbusTcpTransport:
                 if not self._client.connected or request.connection != self._connection:
                     if not self._client.connected:
                         self._reconnect_needed.set()
+                        self._link_drop(TransportError.DISCONNECTED, request.op, request.address)
                     result = request.failure(TransportError.DISCONNECTED)
                 else:
                     with _wire_context():
@@ -334,6 +417,13 @@ class PymodbusTcpTransport:
         if error in (TransportError.DISCONNECTED, TransportError.TIMEOUT):
             self._client.close()
             self._reconnect_needed.set()
+            self._link_drop(error, request.op, request.address)
+        else:
+            with suppress(Exception):
+                if not self._client.connected:
+                    self._link_drop(
+                        error or TransportError.DISCONNECTED, request.op, request.address,
+                    )
         if request.op == "write":
             return WriteResult(elapsed, error is None, error, code)
         return ReadResult(elapsed, registers, error, code)
