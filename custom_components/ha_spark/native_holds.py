@@ -315,7 +315,8 @@ class NativeHolds:
             for inverter in c.native.inverters.values():
                 records = [h for h in state.holds if h.device == hold_device(inverter)]
                 if removal and any(
-                    evidence.charging is not False if h.cause == "ev" else
+                    (evidence.charging is not False or evidence.ev_via_sibling)
+                    if h.cause == "ev" else
                     not (h.trusted_end is not None and now >= h.trusted_end or
                          evidence.dispatch_trusted and not any(
                              w.start <= now < w.end for w in evidence.dispatches))

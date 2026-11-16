@@ -71,6 +71,28 @@ async def test_hold_start_persists_before_off_and_confirms_only_after_readback(
     assert state is not None and state.holds[0].confirmed
 
 
+async def test_sibling_cannot_clear_or_remove_ev_hold(
+    held_site: SparkCoordinator, native_transport: FakeSolisDevice, freezer: Any,
+) -> None:
+    c = held_site
+    c.hass.states.async_set("sensor.ev", "charging")
+    await tick(c)
+    c.hass.states.async_set("sensor.ev", "stopped")
+    freezer.tick(timedelta(hours=1))
+    c.hass.config_entries.async_update_entry(c.entry, options={**c.entry.options, "evidence": {
+        **c.entry.options["evidence"], "ev_liveness_entity": "sensor.live"}})
+    for _ in range(6):
+        freezer.tick(timedelta(seconds=1))
+        c.hass.states.async_set("sensor.live", "alive", force_update=True)
+        await tick(c)
+    assert c.holds.evidence.read(datetime.now(UTC)).charging is False
+    assert c.holds.evidence.read(datetime.now(UTC)).ev_via_sibling
+    assert not await c.holds.async_release(datetime.now(UTC), removal=True)
+    assert c.authority.state is not None and c.authority.state.holds[0].clear_count == 0
+    assert not c.authority.state.holds[0].pending_release
+    assert native_transport.holding[43007] == 222
+
+
 async def test_missing_evidence_age_neither_starts_nor_clears_hold(
     held_site: SparkCoordinator, native_transport: FakeSolisDevice, freezer: Any,
 ) -> None:

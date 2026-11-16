@@ -1,9 +1,11 @@
 """HA-free protection evidence policy and durable EV clearance rules.
 
 Only advancing fresh reports clear an EV hold. Unknown evidence resets clearance,
-including a release that has not yet verified. No sibling timestamp rescues a
-stale source. Dispatch records retain their last trusted end through outages.
+including a release that has not yet verified. Configured sibling liveness may
+rescue change-only EV/dispatch reports up to 12 hours old, but never clears an
+EV hold. Dispatch records retain their last trusted end through outages.
 """
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from math import isfinite
 from typing import Annotated, Literal, Self
@@ -14,6 +16,9 @@ from .authority_store import HoldDevice, HoldRecord, Record
 from .topology import EntityId, Inverter, Topology
 
 MAX_AGE = 300
+MAX_UNCHANGED = timedelta(hours=12)
+EV_GROUP = ("ev_status", "ev_plug", "ev_power")
+DISPATCH_GROUP = ("live_dispatch", "adjusted_rate")
 DEGRADED_AFTER = timedelta(minutes=60)
 RELEASE_BACKOFF_AFTER = 5
 RELEASE_BACKOFF = timedelta(minutes=10)
@@ -34,6 +39,8 @@ class EvidenceSource(Record):
 
 
 class EvidenceOptions(Record):
+    ev_liveness_entity: EntityId | None = None
+    dispatch_liveness_entity: EntityId | None = None
     ev_status: EvidenceSource | None = None
     battery_direction: EvidenceSource = EvidenceSource(source="native")
     ev_plug: EvidenceSource | None = None
@@ -62,6 +69,31 @@ class EvidenceOptions(Record):
 
 SOURCES = ("ev_status", "battery_direction", "ev_plug", "ev_power", "live_dispatch",
            "adjusted_rate", "dispatch_grid_power")
+
+
+@dataclass(frozen=True)
+class Freshness:
+    validity: Literal["fresh", "stale", "future", "unknown"]
+    age_s: float | None
+    via_sibling: bool = False
+
+
+def report_freshness(own: datetime | None, sibling: datetime | None,
+                     now: datetime, max_age_s: float) -> Freshness:
+    """Own reports take precedence; sibling liveness cannot rescue invalid own time."""
+    if own is None or own.utcoffset() is None:
+        return Freshness("unknown", None)
+    age = (now - own).total_seconds()
+    if age < 0:
+        return Freshness("future", None)
+    if age <= max_age_s:
+        return Freshness("fresh", age)
+    if age <= MAX_UNCHANGED.total_seconds() and sibling is not None and (
+            sibling.utcoffset() is not None):
+        sibling_age = (now - sibling).total_seconds()
+        if 0 <= sibling_age <= max_age_s:
+            return Freshness("fresh", sibling_age, True)
+    return Freshness("stale", age)
 
 
 def fresh(reported: datetime | None, now: datetime, age: float) -> bool:

@@ -88,6 +88,7 @@ async def test_diagnostics_without_a_key_has_no_solcast(
     await hass.async_block_till_done(wait_background_tasks=True)
     data = await get_diagnostics_for_config_entry(hass, hass_client, entry)
     assert data["solcast"] is None
+    assert data["evidence"] is None
     assert TOKEN not in json.dumps(data)
 
 
@@ -149,3 +150,11 @@ async def test_diagnostics_native_links_none_without_runtime_or_native(
     await hass.async_block_till_done(wait_background_tasks=True)
     data = await get_diagnostics_for_config_entry(hass, hass_client, entry)
     assert data["native_links"] is None
+
+
+async def test_unloaded_diagnostics_has_no_evidence(hass: HomeAssistant) -> None:
+    from custom_components.ha_spark.diagnostics import async_get_config_entry_diagnostics
+
+    entry = entry_for(hass)
+    data = await async_get_config_entry_diagnostics(hass, entry)
+    assert data["evidence"] is None

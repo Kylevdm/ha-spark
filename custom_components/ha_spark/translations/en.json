@@ -366,6 +366,8 @@
         "title": "Native protection evidence",
         "description": "Only fresh reports may start or clear protection. Native battery direction uses successful bus reads. Protection requires Home Assistant to remain running; no switch persistence through a whole-HA outage is assumed. Kraken-only dispatches are not available natively. Continue to Site topology and Save to apply.",
         "data": {
+          "ev_liveness_entity": "EV group liveness entity (optional)",
+          "dispatch_liveness_entity": "Dispatch group liveness entity (optional)",
           "ev_status_entity": "EV status",
           "ev_status_max_age_s": "EV status maximum age (seconds)",
           "battery_direction_source": "Battery direction source",
@@ -383,6 +385,10 @@
           "dispatch_grid_power_entity": "Dispatch grid power (optional)",
           "dispatch_grid_power_max_age_s": "Dispatch grid power maximum age (seconds)",
           "dispatch_grid_invert": "Invert dispatch grid power"
+        },
+        "data_description": {
+          "ev_liveness_entity": "A reporting sibling for EV status, plug and power; never clears an EV hold.",
+          "dispatch_liveness_entity": "A reporting sibling for live dispatch and adjusted rate. Own reports must be no older than 12 hours."
         }
       },
       "fallback": {

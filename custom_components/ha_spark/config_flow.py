@@ -437,6 +437,9 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                 elif entity:
                     raw[key] = {"entity_id": entity,
                                 "max_age_s": user_input.get(f"{key}_max_age_s")}
+            for key in ("ev_liveness_entity", "dispatch_liveness_entity"):
+                if user_input.get(key):
+                    raw[key] = user_input[key]
             raw["battery_discharge_sign"] = user_input.get("battery_discharge_sign", "positive")
             raw["dispatch_grid_invert"] = user_input.get("dispatch_grid_invert", False)
             try:
@@ -462,6 +465,10 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                 BooleanSelector(),
         }
         suggested: dict[str, Any] = {}
+        for key in ("ev_liveness_entity", "dispatch_liveness_entity"):
+            fields[probatio.Optional(key)] = EntitySelector()
+            if getattr(current, key) is not None:
+                suggested[key] = getattr(current, key)
         for key in SOURCES:
             source = getattr(current, key)
             if source is not None and source.entity_id is not None:

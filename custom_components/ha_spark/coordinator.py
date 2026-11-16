@@ -345,7 +345,13 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
                              for h in state.holds]
         evidence = self.holds.evidence.options()
         if evidence is not None and evidence.configured:
-            snapshot["evidence"] = evidence.snapshot()
+            sources = evidence.snapshot()
+            for key, result in self.holds.evidence.freshness(dt_util.utcnow()).items():
+                source = sources[key]
+                if isinstance(source, dict):
+                    source.update(validity=result.validity, age_s=result.age_s,
+                                  via_sibling=result.via_sibling)
+            snapshot["evidence"] = sources
         snapshot["banks"] = self.soc.snapshot()
         if isinstance(topology, Topology):
             try:
