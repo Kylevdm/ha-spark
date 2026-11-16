@@ -848,6 +848,10 @@ A document from a newer schema is not overwritten by import.
 When a newer release recorded itself as the writer, the unknown-fields reason
 names both versions (for example, "Unknown configuration fields: 1 (written by
 ha-spark 0.33.0; this is 0.32.0)"), the usual sign of a downgrade.
+From this release, every save records the writing version; after any save, a
+downgrade below 0.32.0 triggers configuration repair ("Invalid configuration
+envelope"). Releases 0.32.0 or later accept this metadata, but still refuse
+unknown settings fields.
 
 This bootstrap-only state serves diagnostics and repair through ingress and
 the daemon socket. It builds no device drivers, runs no scheduler tick, computes
