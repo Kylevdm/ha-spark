@@ -315,6 +315,29 @@ async def test_second_hour_needs_its_own_start_boundary_reading(tmp_path: Path) 
     assert missing.session_reasons == {"second": "no trustworthy start baseline"}
 
 
+async def test_a_reading_just_before_the_start_becomes_and_rolls_the_baseline(
+    tmp_path: Path,
+) -> None:
+    session = _session()
+    db_path = tmp_path / "t.db"
+    counter = _counter(db_path)
+    # Readings within the freshness window before the start are kept as the
+    # provisional baseline and rolled forward to the last one before START.
+    for minutes, kwh in ((-8, 99.0), (-2, 99.5)):
+        at = START + timedelta(minutes=minutes)
+        early = await counter.update(
+            [session], reading=GridImport(kwh, at), reason=None, now=at,
+        )
+        assert early.remaining_kwh == {"hh-1": HAPPY_HOUR_ALLOWANCE_KWH}
+    # The first gather after the start sees only a post-start report, yet the
+    # pre-start baseline counts it (conservatively including 12:58-13:00).
+    counted = await counter.update(
+        [session], reading=GridImport(101.5, START + timedelta(minutes=5)),
+        reason=None, now=START + timedelta(minutes=5),
+    )
+    assert counted.remaining_kwh == {"hh-1": pytest.approx(14.0)}
+
+
 async def test_a_pre_start_reading_cannot_become_the_next_hours_baseline(
     tmp_path: Path,
 ) -> None:

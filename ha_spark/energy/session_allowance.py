@@ -450,9 +450,22 @@ def _evaluate(
             return row, None, row.trust_reason
 
     if now < start:
-        # A future booking may report its full allowance, but nothing is
-        # persisted: a reading from before the start is not a start baseline.
-        return None, HAPPY_HOUR_ALLOWANCE_KWH, None
+        # A future booking may report its full allowance. A reading only
+        # becomes its provisional start baseline once it is within the meter
+        # freshness window of the start; later pre-start readings roll it
+        # forward (below), so the kept baseline is the last reading at or
+        # before the start. Counting from slightly before the start only ever
+        # over-counts import, never under-counts it. Without this, a baseline
+        # needed a gather to see a pre-start report after the start, which a
+        # frequently reporting meter almost never allows.
+        if start - reading.read_at > GRID_IMPORT_MAX_AGE:
+            return row, HAPPY_HOUR_ALLOWANCE_KWH, None
+        if row is None:
+            new_row = _AllowanceRow(
+                session.session_id, identity, start, end,
+                reading.kwh, reading.read_at, reading.kwh, reading.read_at,
+            )
+            return new_row, HAPPY_HOUR_ALLOWANCE_KWH, None
 
     if row is None:
         if (reading.read_at <= start

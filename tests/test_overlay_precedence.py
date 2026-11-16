@@ -174,8 +174,14 @@ def test_session_partly_under_a_dispatch_hold_buys_only_outside_it():
     assert schedule.suppressed_import_sessions[1] == FREE
     assert schedule.import_suppression_reasons[1] == "EV or dispatch hold"
     plan = compute_plan(inputs, config, schedule)
-    purchase, = plan.daytime_purchases
+    purchase, refused = plan.daytime_purchases
     assert purchase.slot_range == (0, 1)
+    assert purchase.refused is False
+    # The held half of the same session stays as a refused diagnostic (#697).
+    assert refused.slot_range == (1, 2)
+    assert refused.refused is True
+    assert "dispatch hold" in refused.reason
+    assert len(plan.charge_intent.daytime_windows) == 1
     assert plan.charge_intent.holds == (hold,)
 
 
@@ -190,8 +196,47 @@ def test_current_ev_hold_suppresses_the_current_slot_only():
     assert schedule.import_overlays[0] is None
     assert schedule.suppressed_import_sessions[0] == FREE
     assert schedule.import_overlays[1] == "free_electricity"
-    purchase, = compute_plan(inputs, config, schedule).daytime_purchases
+    plan = compute_plan(inputs, config, schedule)
+    refused, purchase = plan.daytime_purchases
     assert purchase.slot_range == (1, 2)
+    assert purchase.refused is False
+    assert refused.slot_range == (0, 1)
+    assert refused.refused is True
+    assert "EV hold" in refused.reason
+    assert len(plan.charge_intent.daytime_windows) == 1
+    without = compute_plan(replace(inputs, free_sessions=()), config, fixed_schedule(
+        replace(inputs, free_sessions=()), config))
+    assert plan.charge_intent.holds == without.charge_intent.holds
+
+
+@pytest.mark.parametrize("price", [-0.05, 0.10], ids=["negative", "cheap"])
+def test_cheap_or_negative_price_under_a_coarse_hold_is_a_refused_diagnostic(price):
+    config = cfg(capacity_kwh=100, strategy="fill")
+    inputs = _zero_load(_dynamic_inputs(NOW, config, [price] + [0.30] * 70))
+    inputs = replace(inputs, free_sessions=(FREE,), dispatches=(
+        DispatchSlot(NOW, NOW + timedelta(minutes=30)),
+    ))
+    schedule = apply_import_overlay(_dynamic_schedule(inputs, config), inputs, config)
+    plan = compute_plan(inputs, config, schedule)
+    held = [p for p in plan.daytime_purchases if p.slot_range == (0, 1)]
+    refused, = held
+    assert refused.refused is True
+    # Precedence under the hold matches the admitted branch: a negative price
+    # beats the session; a positive cheap price yields to it.
+    expected = "dynamic_price" if price < 0 else "free_electricity"
+    assert refused.overlay == expected
+    assert "dispatch hold" in refused.reason
+    if price < 0:
+        assert "negative explicit tariff price" in refused.reason
+    assert all(window.start > NOW for window in plan.charge_intent.daytime_windows)
+    ordinary = compute_plan(
+        replace(inputs, free_sessions=()),
+        config,
+        apply_import_overlay(_dynamic_schedule(replace(inputs, free_sessions=()), config),
+                             replace(inputs, free_sessions=()), config),
+    )
+    assert "charge" not in plan.view.slots[0].actions
+    assert ordinary.view.slots[0].actions == plan.view.slots[0].actions
 
 
 @pytest.mark.parametrize("case", ["free", "free_and_happy", "negative", "hold"])

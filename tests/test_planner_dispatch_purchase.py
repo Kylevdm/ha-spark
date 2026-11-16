@@ -146,15 +146,31 @@ def test_untrusted_dispatch_proof_produces_no_purchase():
     assert plan.daytime_purchases == ()
 
 
+# Gathering reads the wall clock; freeze it so half-hour clipping is
+# deterministic. Late-half-hour by default (the minutes 30-59 case).
+GATHER_NOW = datetime(2026, 11, 16, 14, 40, tzinfo=UTC)
+
+
+def _freeze_sources_clock(monkeypatch: pytest.MonkeyPatch, now: datetime) -> None:
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[no-untyped-def, override]
+            return now if tz is None else now.astimezone(tz)
+
+    monkeypatch.setattr(sources, "datetime", _Frozen)
+
+
 async def _gather_dispatch_proof(
     monkeypatch: pytest.MonkeyPatch, *, ev_state: str, dispatch_last_reported: str | None,
-    duration_minutes: int = 20,
+    duration_minutes: int = 20, now: datetime = GATHER_NOW,
 ) -> tuple[object, datetime, datetime]:
     async def fake_load(_settings: object, **_kw: object) -> LoadForecast:
         return LoadForecast(total_kwh=24.0, slots=None, source="test")
 
     monkeypatch.setattr(sources, "predict_home_load", fake_load)
-    now = datetime.now(UTC)
+    _freeze_sources_clock(monkeypatch, now)
+    if dispatch_last_reported == "now":
+        dispatch_last_reported = now.isoformat()
     start, end = now - timedelta(minutes=10), now + timedelta(minutes=duration_minutes)
     dispatch = {
         "start": start.isoformat(),
@@ -170,7 +186,7 @@ async def _gather_dispatch_proof(
             )
         )
         respx.get(f"{BASE}/states/sensor.ev").mock(
-            return_value=_state("sensor.ev", ev_state)
+            return_value=_state("sensor.ev", ev_state, last_reported=now.isoformat())
         )
         respx.route(method="GET").mock(return_value=httpx.Response(404))
         settings = _settings()
@@ -181,18 +197,26 @@ async def _gather_dispatch_proof(
     return inputs, start, end
 
 
+@pytest.mark.parametrize(
+    ("now", "expected_end"),
+    [
+        # Early half-hour: the draw is clipped to the :30 boundary.
+        (datetime(2026, 11, 16, 14, 10, tzinfo=UTC), datetime(2026, 11, 16, 14, 30, tzinfo=UTC)),
+        # Late half-hour: the dispatch ends (15:00) at the next hour boundary.
+        (GATHER_NOW, datetime(2026, 11, 16, 15, 0, tzinfo=UTC)),
+    ],
+    ids=["early-half-hour", "late-half-hour"],
+)
 async def test_gather_carries_only_fresh_trusted_draw_as_purchase_evidence(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, now: datetime, expected_end: datetime,
 ) -> None:
-    inputs, start, end = await _gather_dispatch_proof(
-        monkeypatch, ev_state="Charging", dispatch_last_reported="now",
+    inputs, _start, _end = await _gather_dispatch_proof(
+        monkeypatch, ev_state="Charging", dispatch_last_reported="now", now=now,
     )
     slot, = inputs.dispatch_purchase_slots
-    now = inputs.now
-    assert now is not None
-    half_hour_end = now.replace(minute=30, second=0, microsecond=0)
+    assert inputs.now == now
     assert slot.start == now
-    assert slot.end == min(end, half_hour_end)
+    assert slot.end == expected_end
 
 
 async def test_gather_clips_a_long_dispatch_proof_to_the_current_half_hour(
@@ -203,20 +227,16 @@ async def test_gather_clips_a_long_dispatch_proof_to_the_current_half_hour(
         duration_minutes=150,
     )
     slot, = inputs.dispatch_purchase_slots
-    now = inputs.now
-    assert now is not None
-    half_hour_end = now.replace(
-        minute=0 if now.minute < 30 else 30, second=0, microsecond=0
-    ) + timedelta(minutes=30)
-    assert slot.start == now
-    assert slot.end == min(end, half_hour_end)
+    assert end > datetime(2026, 11, 16, 15, 0, tzinfo=UTC)
+    assert slot.start == GATHER_NOW
+    assert slot.end == datetime(2026, 11, 16, 15, 0, tzinfo=UTC)
 
 
 @pytest.mark.parametrize(
     ("ev_state", "last_reported"),
     [
         ("EV Connected", "now"),  # a live/adjusted flag is not actual draw
-        ("Charging", (datetime.now(UTC) - timedelta(seconds=301)).isoformat()),
+        ("Charging", (GATHER_NOW - timedelta(seconds=301)).isoformat()),
     ],
     ids=["no-draw", "untrusted-dispatch-source"],
 )

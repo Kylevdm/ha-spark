@@ -1133,7 +1133,9 @@ _IMPORT_LABELS = {"free_electricity": "Free Electricity", "happy_hour": "Happy H
 
 def _coarse_hold(topology: Topology | None, cfg: PlannerConfig) -> bool:
     """Whether an effective planned inverter refuses a charge while it holds."""
-    if topology is None:
+    if topology is None or not topology.inverters:
+        # No planned inverter to ask: fall back to the configured driver
+        # rather than assuming a hold never blocks a charge.
         return driver_capabilities(cfg.driver_kind).coarse_hold
     return any(driver_capabilities(inverter.driver_kind).coarse_hold
                for inverter in topology.inverters)
@@ -1255,6 +1257,23 @@ def _daytime_purchases(
         kind = schedule.import_overlay_losers[index]
         return _IMPORT_LABELS.get(kind, kind) if kind else None
 
+    def dynamic_candidate(index: int) -> bool:
+        """An explicit live price below the selected overnight average (#696).
+
+        Shared by the admitted and refused branches so their eligibility
+        cannot diverge; the fallback-filled ``prices`` entry is never evidence.
+        """
+        live = (schedule.explicit_import_prices[index]
+                if index < len(schedule.explicit_import_prices) else None)
+        average = schedule.overnight_average_price
+        return (live is not None and average is not None and live < average
+                and geometry.window_fracs[index] == 0)
+
+    def refusable(index: int) -> bool:
+        """A slot that a coarse hold (not an Axle event or export) refuses."""
+        return (coarse_hold and held[index] and not axle[index]
+                and geometry.slot_starts[index] not in selected)
+
     def drain_slot(index: int) -> None:
         nonlocal energy
         if geometry.slot_starts[index] in exported:
@@ -1352,94 +1371,87 @@ def _daytime_purchases(
                 schedule.import_suppression_reasons[i]
                 if i < len(schedule.import_suppression_reasons) else None
             )
-            if (coarse_hold and held[i] and not axle[i]
-                    and geometry.slot_starts[i] not in selected
+            # Under a coarse hold the refusal follows the admitted precedence:
+            # a negative explicit price beats a session, then the session,
+            # then a positive explicit price below the overnight average.
+            negative_refusal = (refusable(i) and negative_price[i]
+                                and dynamic_candidate(i))
+            if (refusable(i) and not negative_refusal
                     and suppressed is not None
-                    and suppressed_reason == "EV or dispatch hold"):
-                # A source wholly inside the hold has no admitted part; a
-                # partly-held session still buys its free part as before. The
+                    and suppressed_reason == "EV or dispatch hold"
+                    and geometry.window_fracs[i] == 0
+                    and not (suppressed.kind == "happy_hour" and first > 0
+                             and suppressed.start.astimezone(UTC)
+                             < geometry.window_start)):
+                # The held run of a session is refused even when another part
+                # of the same session is admitted outside the hold. The
                 # refusal is diagnostic only: it changes no energy, cost, SoC,
                 # intent or overnight sizing.
-                session_overlaps = _slot_overlap(
-                    geometry, suppressed.start, suppressed.end,
+                j = i + 1
+                while (
+                    j < stop
+                    and j < len(schedule.suppressed_import_sessions)
+                    and schedule.suppressed_import_sessions[j] == suppressed
+                    and j < len(schedule.import_suppression_reasons)
+                    and schedule.import_suppression_reasons[j] == suppressed_reason
+                    and refusable(j) and not negative_price[j]
+                    and geometry.window_fracs[j] == 0
+                ):
+                    j += 1
+                start = max(
+                    suppressed.start.astimezone(UTC),
+                    geometry.slot_starts[i].astimezone(UTC),
+                    (inputs.now or geometry.horizon_start).astimezone(UTC),
                 )
-                admitted_elsewhere = any(
-                    share > 0 and not held[k] and not axle[k]
-                    and not negative_price[k]
-                    and geometry.slot_starts[k] not in selected
-                    and geometry.window_fracs[k] == 0
-                    for k, share in enumerate(session_overlaps)
+                end = min(
+                    suppressed.end.astimezone(UTC),
+                    geometry.slot_starts[j - 1].astimezone(UTC)
+                    + timedelta(minutes=30),
                 )
-                if not admitted_elsewhere:
-                    j = i + 1
-                    while (
-                        j < stop
-                        and j < len(schedule.suppressed_import_sessions)
-                        and schedule.suppressed_import_sessions[j] == suppressed
-                        and j < len(schedule.import_suppression_reasons)
-                        and schedule.import_suppression_reasons[j] == suppressed_reason
-                    ):
-                        j += 1
-                    start = max(
-                        suppressed.start.astimezone(UTC),
-                        geometry.slot_starts[i].astimezone(UTC),
-                        (inputs.now or geometry.horizon_start).astimezone(UTC),
+                capacities, _ = _run_slot_capacities(
+                    inputs, cfg, limits, efficiency, geometry, start, end,
+                    i, j, loads, observations,
+                )
+                refused_allowance = (
+                    schedule.import_allowances[i]
+                    if i < len(schedule.import_allowances) else None
+                )
+                refused_budget = (
+                    max(0.0, refused_allowance * efficiency
+                        - spent.get(suppressed.session_id, 0.0))
+                    if refused_allowance is not None else float("inf")
+                )
+                amount = _run_amount(energy, cap, capacities, refused_budget)
+                for k in range(i, j):
+                    drain_slot(k)
+                if amount > 1e-9:
+                    refused_label = _IMPORT_LABELS.get(
+                        suppressed.kind, suppressed.kind,
                     )
-                    end = min(
-                        suppressed.end.astimezone(UTC),
-                        geometry.slot_starts[j - 1].astimezone(UTC)
-                        + timedelta(minutes=30),
+                    evidence_kind = (
+                        "booked hour" if suppressed.kind == "happy_hour"
+                        else "listed session"
                     )
-                    capacities, _ = _run_slot_capacities(
-                        inputs, cfg, limits, efficiency, geometry, start, end,
-                        i, j, loads, observations,
+                    evidence = (
+                        f"{evidence_kind} "
+                        f"{_clock(start, inputs)}–{_clock(end, inputs)}"
                     )
-                    refused_allowance = (
-                        schedule.import_allowances[i]
-                        if i < len(schedule.import_allowances) else None
+                    hold = hold_names[i] or "EV or dispatch hold"
+                    reason = (
+                        f"Would buy {amount:.2f} kWh from {refused_label} at £0/kWh "
+                        f"using the {evidence}, but the {hold} refuses it."
                     )
-                    refused_budget = (
-                        max(0.0, refused_allowance * efficiency
-                            - spent.get(suppressed.session_id, 0.0))
-                        if refused_allowance is not None else float("inf")
-                    )
-                    amount = _run_amount(energy, cap, capacities, refused_budget)
-                    for k in range(i, j):
-                        drain_slot(k)
-                    if amount > 1e-9:
-                        refused_label = _IMPORT_LABELS.get(
-                            suppressed.kind, suppressed.kind,
-                        )
-                        evidence_kind = (
-                            "booked hour" if suppressed.kind == "happy_hour"
-                            else "listed session"
-                        )
-                        evidence = (
-                            f"{evidence_kind} "
-                            f"{_clock(start, inputs)}–{_clock(end, inputs)}"
-                        )
-                        hold = hold_names[i] or "EV or dispatch hold"
-                        reason = (
-                            f"Would buy {amount:.2f} kWh from {refused_label} at £0/kWh "
-                            f"using the {evidence}, but the {hold} refuses it."
-                        )
-                        purchases.append(DaytimePurchase(
-                            slot_range=(i, j), start=start, end=end,
-                            overlay=suppressed.kind, evidence=evidence,
-                            session_id=suppressed.session_id, effective_price=0.0,
-                            energy_kwh=amount, reason=reason,
-                            slot_energy_kwh=_delivered_amounts(amount, capacities),
-                            refused=True,
-                        ))
-                    i = j
-                    continue
-            if (coarse_hold and held[i] and not axle[i]
-                    and geometry.slot_starts[i] not in selected
-                    and suppressed is None
-                    and live_price is not None and live_price >= 0
-                    and overnight_average is not None
-                    and live_price < overnight_average
-                    and geometry.window_fracs[i] == 0):
+                    purchases.append(DaytimePurchase(
+                        slot_range=(i, j), start=start, end=end,
+                        overlay=suppressed.kind, evidence=evidence,
+                        session_id=suppressed.session_id, effective_price=0.0,
+                        energy_kwh=amount, reason=reason,
+                        slot_energy_kwh=_delivered_amounts(amount, capacities),
+                        refused=True,
+                    ))
+                i = j
+                continue
+            if refusable(i) and dynamic_candidate(i):
                 hours = _slot_hours(geometry, i)
                 capacities = [_slot_charge_capacity(
                     inputs, cfg, limits, efficiency, i, loads, observations,
@@ -1453,9 +1465,12 @@ def _daytime_purchases(
                         (inputs.now or geometry.horizon_start).astimezone(UTC),
                     )
                     end = slot_start + timedelta(minutes=30)
+                    assert live_price is not None
                     price = live_price
+                    winning = ("negative explicit tariff price" if negative_price[i]
+                               else "explicit tariff price")
                     evidence = (
-                        f"explicit tariff price £{price:g}/kWh for "
+                        f"{winning} £{price:g}/kWh for "
                         f"{_clock(start, inputs)}–{_clock(end, inputs)}"
                     )
                     hold = hold_names[i] or "EV or dispatch hold"
@@ -1489,10 +1504,8 @@ def _daytime_purchases(
             # An explicit live price below the selected overnight average is
             # top-rung evidence (#696); the fallback-filled ``prices`` entry is
             # never evidence, hence the separate live field.
-            if (live_price is not None
-                    and overnight_average is not None
-                    and live_price < overnight_average
-                    and geometry.window_fracs[i] == 0):
+            if dynamic_candidate(i):
+                assert live_price is not None
                 hours = _slot_hours(geometry, i)
                 capacity = _slot_charge_capacity(
                     inputs, cfg, limits, efficiency, i, loads, observations,
