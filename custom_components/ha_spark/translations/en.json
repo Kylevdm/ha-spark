@@ -335,6 +335,8 @@
       "bank_in_use": "Inverters or a V2L charger still use this bank.",
       "invalid_fallback": "Enter a cheap-window start and end on the household clock and a current for every native inverter within its limits.",
       "fallback_in_use": "Fallback cannot be cleared while Optimise is committed or fallback is active.",
+      "invalid_time": "Use HH:MM on the household clock, for example 23:30.",
+      "missing_current": "Enter a charge current in amps for this inverter.",
       "fallback_invalidated": "This edit would invalidate the saved fallback schedule. Update or clear the fallback first."
     },
     "step": {
@@ -385,7 +387,7 @@
       },
       "fallback": {
         "title": "Native fallback schedule",
-        "description": "The fallback charges only in this cheap window, at these per-inverter currents, when a cause is active in Optimise. Leave every field empty to clear it only outside Optimise.",
+        "description": "The fallback charges only in this cheap window, at these per-inverter currents, when a cause is active in Optimise. Enter times as HH:MM (for example 23:30) and a charge current in amps for every native inverter ({inverters}). Leave every field empty to clear it only outside Optimise.",
         "data": {
           "window_start": "Window start (HH:MM)",
           "window_end": "Window end (HH:MM)"

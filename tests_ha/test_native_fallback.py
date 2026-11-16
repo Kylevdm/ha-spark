@@ -6,10 +6,11 @@ from typing import Any
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import probatio
 import pytest
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import InvalidData
+from homeassistant.helpers import config_validation as cv
 from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker
 
 from custom_components.ha_spark import native_write
@@ -168,17 +169,63 @@ async def test_options_flow_rejects_a_schedule_over_a_limit(
     assert result["errors"] == {"base": "invalid_fallback"}
 
 
-async def test_options_flow_rejects_an_invalid_window(hass: HomeAssistant) -> None:
+@pytest.mark.parametrize("window", ["24:00", "2330"])
+async def test_options_flow_rejects_an_invalid_window(
+    hass: HomeAssistant, window: str,
+) -> None:
     entry = entry_for(hass, topology=native_topology())
     result = await hass.config_entries.options.async_init(entry.entry_id)
     flow_id = result["flow_id"]
     choose_result = await choose(hass, flow_id, "fallback")
     assert choose_result["type"].value == "form"
-    with pytest.raises(InvalidData):
-        await hass.config_entries.options.async_configure(flow_id, {
-            "window_start": "24:00", "window_end": "05:30", "current_inv1": 20,
-        })
+    result = await hass.config_entries.options.async_configure(flow_id, {
+        "window_start": window, "window_end": "05:30", "current_inv1": 20,
+    })
+    assert result["type"].value == "form"
+    assert result["errors"] == {"window_start": "invalid_time"}
     assert "fallback" not in entry.options
+
+
+async def test_options_flow_names_a_missing_current(hass: HomeAssistant) -> None:
+    entry = entry_for(hass, topology=native_topology())
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    flow_id = result["flow_id"]
+    await choose(hass, flow_id, "fallback")
+    result = await hass.config_entries.options.async_configure(flow_id, {
+        "window_start": "23:30", "window_end": "05:30",
+    })
+    assert result["errors"] == {"current_inv1": "missing_current"}
+    assert "fallback" not in entry.options
+
+
+async def test_fallback_form_has_no_null_defaults_and_suggests_stored(
+    hass: HomeAssistant,
+) -> None:
+    # A null default comes back as null and fails "expected float" (#712).
+    entry = entry_for(hass, topology=native_topology(), fallback={
+        "window_start": "23:30", "window_end": "05:30", "currents": {"inv1": 20}})
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await choose(hass, result["flow_id"], "fallback")
+    assert result["description_placeholders"] == {"inverters": "current_inv1"}
+    fields = {key.schema: key for key in result["data_schema"].schema}
+    assert set(fields) == {"window_start", "window_end", "current_inv1"}
+    serialized = probatio.to_field_list(
+        result["data_schema"], custom_serializer=cv.custom_serializer)
+    assert all("default" not in field for field in serialized)
+    suggested = {name: key.description["suggested_value"] for name, key in fields.items()}
+    assert suggested == {"window_start": "23:30", "window_end": "05:30", "current_inv1": 20}
+
+
+async def test_empty_fallback_submit_reaches_the_clear_rule(hass: HomeAssistant) -> None:
+    entry = entry_for(hass, topology=native_topology(), fallback={
+        "window_start": "23:30", "window_end": "05:30", "currents": {"inv1": 20}})
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    flow_id = result["flow_id"]
+    await choose(hass, flow_id, "fallback")
+    result = await hass.config_entries.options.async_configure(flow_id, {})
+    # No loaded authority here, so the clear rule refuses rather than the schema.
+    assert result["errors"] == {"base": "fallback_in_use"}
+    assert "fallback" in entry.options
 
 
 async def test_topology_limit_edit_that_invalidates_fallback_is_refused(

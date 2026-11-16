@@ -8,6 +8,7 @@ The options flow edits the Solcast allowance and, as one atomic document, the
 site topology (#535's contract) that later phases send on the heartbeat.
 """
 
+import re
 from collections.abc import Callable
 from math import isclose, isfinite
 from typing import Any, TypeGuard, cast
@@ -219,6 +220,7 @@ _COLLECTIONS = ("connections", "banks", "inverters", "v2l_chargers", "major_load
 # Pydantic error types mapped to fixed outcome codes; never values or error text.
 _NON_FINITE = {"finite_number", "float_type", "int_type", "string_type", "bool_type"}
 _BOUNDS = {"greater_than_equal", "less_than_equal", "greater_than", "less_than"}
+_HHMM = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 _TEXT_PATTERN = {"string_pattern_mismatch", "too_long", "string_too_long"}
 
 
@@ -352,8 +354,8 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
         except ValidationError:
             current = None
         if user_input is not None and native:
-            start = user_input.get("window_start")
-            end = user_input.get("window_end")
+            start = user_input.get("window_start") or ""
+            end = user_input.get("window_end") or ""
             currents: dict[str, Any] = {}
             for inverter in native:
                 value = user_input.get(f"current_{inverter.id}")
@@ -371,6 +373,13 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                         data={key: value for key, value in self.config_entry.options.items()
                               if key != "fallback"},
                     )
+            if not errors:
+                for key, text in (("window_start", start), ("window_end", end)):
+                    if not isinstance(text, str) or not _HHMM.fullmatch(text):
+                        errors[key] = "invalid_time"
+                for inverter in native:
+                    if inverter.id not in currents:
+                        errors[f"current_{inverter.id}"] = "missing_current"
             if not errors and isinstance(topology, Topology):
                 try:
                     options = FallbackOptions.model_validate({
@@ -388,21 +397,30 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                             **self.config_entry.options,
                             "fallback": options.model_dump(mode="json"),
                         })
+        # Suggested values, not defaults: an untouched empty field is left out of the
+        # input rather than sent as null, so "leave every field empty" can clear.
         fields: dict[Any, Any] = {
-            probatio.Optional("window_start", default=(
-                current.window_start if current else "")): probatio.Match(
-                    r"^(?:[01]\d|2[0-3]):[0-5]\d$"),
-            probatio.Optional("window_end", default=(
-                current.window_end if current else "")): probatio.Match(
-                    r"^(?:[01]\d|2[0-3]):[0-5]\d$"),
+            probatio.Optional("window_start"): str,
+            probatio.Optional("window_end"): str,
         }
+        suggested: dict[str, Any] = {}
+        if current is not None:
+            suggested = {"window_start": current.window_start,
+                         "window_end": current.window_end}
         for inverter in native:
-            fields[probatio.Optional(f"current_{inverter.id}", default=(
-                current.currents.get(inverter.id) if current else None))] = NumberSelector(
-                    NumberSelectorConfig(min=0, max=500, step=0.1,
-                                         mode=NumberSelectorMode.BOX))
+            fields[probatio.Optional(f"current_{inverter.id}")] = NumberSelector(
+                NumberSelectorConfig(min=0, max=500, step=0.1, unit_of_measurement="A",
+                                     mode=NumberSelectorMode.BOX))
+            if current is not None and inverter.id in current.currents:
+                suggested[f"current_{inverter.id}"] = current.currents[inverter.id]
         return self.async_show_form(
-            step_id="fallback", data_schema=probatio.Schema(fields), errors=errors)
+            step_id="fallback",
+            data_schema=self.add_suggested_values_to_schema(probatio.Schema(fields), suggested),
+            errors=errors,
+            # Field keys follow inverter ids, so the description names them instead.
+            description_placeholders={"inverters": ", ".join(
+                f"current_{inverter.id}" for inverter in native)},
+        )
 
     async def async_step_evidence(
         self, user_input: dict[str, Any] | None = None,
