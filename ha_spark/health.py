@@ -34,7 +34,7 @@ from ha_spark.devices.inverters.solis_clock import (
     describe_error,
 )
 from ha_spark.energy.axle import AxleApiError, read_axle_event
-from ha_spark.energy.evidence_freshness import EvidenceFreshness, check_report_time
+from ha_spark.energy.evidence_freshness import EvidenceFreshness
 from ha_spark.energy.forecast import intervals_from_hourly_stats, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.octopus import (
@@ -734,26 +734,11 @@ async def check_evidence_freshness(settings: Settings) -> list[CheckResult]:
         reply = None
     view = reply.integration_link if reply is not None and reply.error is None else None
     integration = view is not None and view.get("authority_owner") == "integration"
+    integration_rows: list[CheckResult] = []
     if integration:
         # A snapshot older than the link window says nothing about current freshness.
-        results = _integration_evidence_rows(
+        integration_rows = _integration_evidence_rows(
             view.get("evidence") if view and view.get("state") == "connected" else None)
-        if settings.tariff_provider == "octopus_intelligent":
-            reported = None
-            try:
-                await fetch_planned_dispatches(settings)
-                reported = datetime.now(UTC)
-            except OctopusApiError:
-                pass
-            supplier = check_report_time(
-                reported, now=datetime.now(UTC),
-                max_age_s=settings.octopus_dispatch_max_age_seconds,
-                option="octopus_dispatch_max_age_seconds")
-            results.append(CheckResult(
-                "Evidence octopus_dispatch",
-                Status.OK if supplier.validity == "fresh" else Status.WARN,
-                _evidence_detail(supplier)))
-        return results
     reports: dict[str, datetime | None] = {}
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
@@ -771,8 +756,10 @@ async def check_evidence_freshness(settings: Settings) -> list[CheckResult]:
             settings, rest, dispatches, live_dispatch=live,
             report_times=reports, read_all=True,
         )
-    results = []
+    results = integration_rows
     for source, evidence in snapshot.freshness.items():
+        if integration and source not in ("battery_power", "octopus_dispatch"):
+            continue  # The integration's own rows above gate holds on this site.
         detail = _evidence_detail(evidence)
         if source == "battery_power":
             detail += f"; direction={snapshot.battery_direction}"

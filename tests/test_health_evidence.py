@@ -6,7 +6,43 @@ import pytest
 
 from ha_spark import health
 from ha_spark.config import Settings
+from ha_spark.energy.evidence_freshness import check_report_time
 from ha_spark.health import Status
+
+ADDON_EXTRA: dict = {}
+
+
+class FakeRest:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+@pytest.fixture(autouse=True)
+def addon_evidence(monkeypatch):
+    """The add-on's own read: every source it knows, of which only some survive."""
+    ADDON_EXTRA.clear()
+
+    async def read(settings, rest, dispatches, *, report_times, **kwargs):
+        now = health.datetime.now(health.UTC)
+        freshness = {"ev_status": check_report_time(
+            None, now=now, max_age_s=300, option="ev_status_max_age_seconds"), **ADDON_EXTRA}
+        if "octopus_dispatch" in report_times:
+            freshness["octopus_dispatch"] = check_report_time(
+                report_times["octopus_dispatch"], now=now,
+                max_age_s=settings.octopus_dispatch_max_age_seconds,
+                option="octopus_dispatch_max_age_seconds")
+        return SimpleNamespace(freshness=freshness, battery_direction="charging")
+
+    monkeypatch.setattr(health, "HomeAssistantRest", FakeRest)
+    monkeypatch.setattr(health, "read_dispatches_and_live",
+                        AsyncMock(return_value=((), None, None)))
+    monkeypatch.setattr(health, "read_dispatch_evidence", read)
 
 
 def view(evidence):
@@ -82,3 +118,16 @@ async def test_sibling_never_claimed_for_ungrouped_sources(monkeypatch):
         return_value=view({"dispatch_grid_power": item})))
     rows = await health.check_evidence_freshness(Settings(supervisor_token="unused"))
     assert rows[0].detail == "integration evidence unavailable"
+
+
+async def test_integration_site_keeps_addon_battery_power_row(monkeypatch):
+    now = health.datetime.now(health.UTC)
+    ADDON_EXTRA["battery_power"] = check_report_time(
+        now, now=now, max_age_s=300, option="battery_power_max_age_seconds")
+    monkeypatch.setattr(health, "submit_socket", AsyncMock(return_value=view({
+        "ev_status": {"validity": "fresh", "age_s": 1.0, "max_age_s": 300.0,
+                      "via_sibling": False}})))
+    rows = await health.check_evidence_freshness(Settings(supervisor_token="unused"))
+    assert [r.name for r in rows] == ["Evidence ev_status", "Evidence battery_power"]
+    assert rows[0].detail.startswith("integration; ")
+    assert rows[1].status == Status.OK and "direction=charging" in rows[1].detail
