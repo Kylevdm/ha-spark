@@ -143,8 +143,7 @@ checks apply. Do not use manual control as a way to run a supervised export.
 
 ### Native fallback and protection evidence
 
-**Options → Native fallback schedule** saves `window_start`, `window_end`
-and an explicit `current_<inverter_id>` for every native inverter. There is no
+**Options → Native fallback schedule** saves `window_start` and `window_end` as HH:MM (for example `23:30`), and an explicit `current_<inverter_id>` for every native inverter. There is no
 default current. Use a cheap window on the household clock. Validation checks
 each current against the inverter's effective limit and 62.5 A register
 ceiling, the combined bank limit, and site import including one-way charge
