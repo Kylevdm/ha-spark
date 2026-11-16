@@ -69,6 +69,19 @@ def _native_links(coordinator: SparkCoordinator | None) -> dict[str, Any] | None
     return links
 
 
+def _evidence_health(coordinator: SparkCoordinator | None) -> dict[str, Any] | None:
+    if coordinator is None:
+        return None
+    evidence = coordinator.holds.evidence
+    options = evidence.options()
+    if options is None or not options.configured:
+        return None
+    return {key: {"validity": result.validity, "age_s": result.age_s,
+                  "max_age_s": getattr(options, key).max_age_s,
+                  "via_sibling": result.via_sibling}
+            for key, result in evidence.freshness(dt_util.utcnow()).items()}
+
+
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: SparkConfigEntry,
 ) -> dict[str, Any]:
@@ -86,6 +99,7 @@ async def async_get_config_entry_diagnostics(
             "solcast": _solcast_health(entry, None),
             "supply_guard": None,
             "native_links": None,
+            "evidence": None,
             "last_refusal": None,
         }
     return {
@@ -107,4 +121,5 @@ async def async_get_config_entry_diagnostics(
         "solcast": _solcast_health(entry, coordinator),
         "supply_guard": _guard_health(coordinator),
         "native_links": _native_links(coordinator),
+        "evidence": _evidence_health(coordinator),
     }

@@ -134,11 +134,19 @@ class EvidenceSource(FrozenModel):
     source: Literal["entity", "native"] = "entity"
     entity_id: EntityId | None = None
     max_age_s: float = Field(strict=True, gt=0, le=86400, allow_inf_nan=False)
+    validity: Literal["fresh", "stale", "future", "unknown"] | None = None
+    age_s: float | None = Field(default=None, strict=True, ge=0, allow_inf_nan=False)
+    via_sibling: bool | None = Field(default=None, strict=True)
 
     @model_validator(mode="after")
     def validate_source(self) -> Self:
         if (self.source == "entity") != (self.entity_id is not None):
             raise ValueError("invalid evidence source")
+        # Freshness metadata must be self-consistent: fresh within its maximum
+        # age, and a sibling only ever vouches for a fresh source.
+        if (self.validity == "fresh" and (self.age_s is None or self.age_s > self.max_age_s)
+                or self.via_sibling and self.validity != "fresh"):
+            raise ValueError("invalid evidence freshness")
         return self
 
 
@@ -160,6 +168,10 @@ class Evidence(FrozenModel):
             self.adjusted_rate, self.dispatch_grid_power,
         )):
             raise ValueError("invalid evidence source")
+        if any(source is not None and source.via_sibling for source in (
+            self.battery_direction, self.dispatch_grid_power,
+        )):
+            raise ValueError("invalid evidence freshness")
         return self
 
 

@@ -1459,31 +1459,52 @@
   "evidence": {
     "ev_status": {
       "entity_id": "sensor.ev_status",
-      "max_age_s": 60.0
+      "max_age_s": 60.0,
+      "validity": "fresh",
+      "age_s": 10.0,
+      "via_sibling": true
     },
     "battery_direction": {
       "entity_id": "sensor.battery_direction",
-      "max_age_s": 60.0
+      "max_age_s": 60.0,
+      "validity": "fresh",
+      "age_s": 10.0,
+      "via_sibling": false
     },
     "ev_plug": {
       "entity_id": "sensor.ev_plug",
-      "max_age_s": 60.0
+      "max_age_s": 60.0,
+      "validity": "fresh",
+      "age_s": 10.0,
+      "via_sibling": true
     },
     "ev_power": {
       "entity_id": "sensor.ev_power",
-      "max_age_s": 60.0
+      "max_age_s": 60.0,
+      "validity": "fresh",
+      "age_s": 10.0,
+      "via_sibling": true
     },
     "live_dispatch": {
       "entity_id": "sensor.live_dispatch",
-      "max_age_s": 60.0
+      "max_age_s": 60.0,
+      "validity": "fresh",
+      "age_s": 10.0,
+      "via_sibling": true
     },
     "adjusted_rate": {
       "entity_id": "sensor.adjusted_rate",
-      "max_age_s": 60.0
+      "max_age_s": 60.0,
+      "validity": "fresh",
+      "age_s": 10.0,
+      "via_sibling": true
     },
     "dispatch_grid_power": {
       "entity_id": "sensor.dispatch_grid_power",
-      "max_age_s": 60.0
+      "max_age_s": 60.0,
+      "validity": "fresh",
+      "age_s": 10.0,
+      "via_sibling": false
     }
   },
   "export": [

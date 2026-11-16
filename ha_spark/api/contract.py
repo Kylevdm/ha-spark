@@ -150,6 +150,14 @@ def link_view(link: IntegrationLink, now: datetime) -> dict[str, object]:
             for device in link.v4.devices
         ] if link.v4 is not None and link.v4.devices_reason is None else None,
         "authority_owner": link.v4.owner if link.v4 is not None else "addon",
+        "evidence": {
+            key: {"validity": source.validity, "age_s": source.age_s,
+                  "max_age_s": source.max_age_s, "via_sibling": source.via_sibling}
+            for key in type(link.v4.evidence).model_fields
+            if (source := getattr(link.v4.evidence, key)) is not None
+            and source.source == "entity"
+        } if (link.v4 is not None and link.v4.owner == "integration"
+              and link.v4.evidence is not None and link.v4.evidence_reason is None) else None,
         "topology_source": link.topology.kind,
         "topology_revision": link.topology.revision,
         "topology_reason": link.topology.reason,

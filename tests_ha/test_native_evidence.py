@@ -27,7 +27,9 @@ async def test_evidence_options_stage_until_whole_document_save(
         flow_id, {"next_step_id": "evidence"})
     assert result["step_id"] == "evidence"
     payload = {"ev_status_entity": "sensor.ev", "battery_direction_source": "native",
-               **{f"{key}_max_age_s": 300 for key in SOURCES}}
+               **{f"{key}_max_age_s": 300 for key in SOURCES},
+               "ev_liveness_entity": "sensor.ev_live",
+               "dispatch_liveness_entity": "sensor.dispatch_live"}
     result = await c.hass.config_entries.options.async_configure(flow_id, payload)
     assert result["step_id"] == "topology"
     assert dict(c.entry.options) == old
@@ -35,12 +37,16 @@ async def test_evidence_options_stage_until_whole_document_save(
         flow_id, {"next_step_id": "save"})
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"]["evidence"]["battery_direction"]["source"] == "native"
+    assert result["data"]["evidence"]["ev_liveness_entity"] == "sensor.ev_live"
+    assert result["data"]["evidence"]["dispatch_liveness_entity"] == "sensor.dispatch_live"
     await c.hass.async_block_till_done()
 
 
 @pytest.mark.parametrize("change", [{"battery_direction_max_age_s": 86401},
                                    {"ev_status_max_age_s": 0},
-                                   {"battery_direction_source": "entity"}])
+                                   {"battery_direction_source": "entity"},
+                                   {"ev_liveness_entity": "sensor." + "a" * 256},
+                                   {"dispatch_liveness_entity": "sensor." + "a" * 256}])
 async def test_invalid_evidence_options_do_not_save(
     held_site: Any, change: dict[str, object],  # noqa: F811
 ) -> None:
@@ -147,6 +153,79 @@ async def test_invalid_evidence_repair_clears_after_options_flow_resave(
     await c.hass.async_block_till_done()
     assert registry.async_get_issue(DOMAIN, issue_id) is None
     assert entry.runtime_data.holds.evidence.configured
+
+
+@pytest.mark.parametrize("group", ["ev", "dispatch"])
+async def test_sibling_evidence_read_and_redacted_diagnostics(
+    held_site: Any, freezer: Any, group: str,  # noqa: F811
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    from custom_components.ha_spark.diagnostics import async_get_config_entry_diagnostics
+
+    c = held_site
+    options = {**c.entry.options["evidence"],
+               f"{group}_liveness_entity": "sensor.live",
+               "live_dispatch": {"entity_id": "binary_sensor.dispatch", "max_age_s": 123}}
+    c.hass.config_entries.async_update_entry(c.entry, options={**c.entry.options,
+                                                              "evidence": options})
+    now = datetime.now(UTC)
+    c.hass.states.async_set("sensor.ev", "charging")
+    c.hass.states.async_set("binary_sensor.dispatch", "on", {"planned_dispatches": [{
+        "start": now.isoformat(), "end": (now + timedelta(hours=2)).isoformat()}]})
+    freezer.tick(timedelta(hours=1))
+    c.hass.states.async_set("sensor.live", "alive")
+    now = datetime.now(UTC)
+    evidence = c.holds.evidence.read(now)
+    key = "ev_status" if group == "ev" else "live_dispatch"
+    assert c.holds.evidence.freshness(now)[key].via_sibling
+    if group == "ev":
+        assert evidence.charging is True
+        assert evidence.ev_report is None
+        assert evidence.ev_via_sibling
+    else:
+        assert evidence.dispatch_trusted and len(evidence.dispatches) == 1
+    diagnostics = await async_get_config_entry_diagnostics(c.hass, c.entry)
+    assert diagnostics["evidence"][key] == {
+        "validity": "fresh", "age_s": 0.0,
+        "max_age_s": 300 if group == "ev" else 123, "via_sibling": True}
+    assert "sensor.live" not in str(diagnostics["evidence"])
+    await c.async_refresh()
+    snapshot = next(call[2] for call in reversed(aioclient_mock.mock_calls)
+                    if "heartbeat" in str(call[1]))
+    assert snapshot["evidence"][key]["via_sibling"] is True
+    assert snapshot["evidence"][key]["validity"] == "fresh"
+    assert snapshot["evidence"][key]["age_s"] == 0
+    for state in ("unknown", "unavailable"):
+        c.hass.states.async_set("sensor.live", state)
+        assert c.holds.evidence.freshness(now)[key].validity == "stale"
+    c.hass.states.async_set("sensor.live", "alive")
+    source_id = "sensor.ev" if group == "ev" else "binary_sensor.dispatch"
+    c.hass.states.async_set(source_id, "unavailable")
+    assert c.holds.evidence.freshness(now)[key].validity == "unknown"
+
+
+async def test_siblings_are_limited_to_their_source_groups(
+    held_site: Any, freezer: Any,  # noqa: F811
+) -> None:
+    c = held_site
+    options: dict[str, Any] = {
+        key: {"entity_id": f"sensor.{key}", "max_age_s": 300} for key in SOURCES}
+    options.update(ev_liveness_entity="sensor.ev_live",
+                   dispatch_liveness_entity="sensor.dispatch_live")
+    c.hass.config_entries.async_update_entry(c.entry, options={**c.entry.options,
+                                                              "evidence": options})
+    for key in SOURCES:
+        c.hass.states.async_set(f"sensor.{key}", "0")
+    freezer.tick(timedelta(hours=1))
+    c.hass.states.async_set("sensor.ev_live", "alive")
+    c.hass.states.async_set("sensor.dispatch_live", "alive")
+    result = c.holds.evidence.freshness(datetime.now(UTC))
+    for key in SOURCES:
+        rescued = key not in ("battery_direction", "dispatch_grid_power")
+        assert result[key].via_sibling is rescued
+        assert result[key].validity == ("fresh" if rescued else "stale")
+    # Fresh liveness cannot turn a missing dispatch list into trusted-empty clearance.
+    assert not c.holds.evidence.read(datetime.now(UTC)).dispatch_trusted
 
 
 @pytest.fixture

@@ -170,10 +170,16 @@ reads or an `entity` with `battery_direction_entity` and
 sign. Set each configured source's `*_max_age_s`. Continue to Site topology
 and **Save topology** to apply the evidence draft.
 
-Only fresh reports start or clear holds. An unchanged cached state or a sibling
-sensor's timestamp cannot rescue stale native protection evidence. A confirmed
-EV hold needs five distinct advancing fresh not-charging reports to clear;
-a dispatch hold retains its last trusted end through an outage. A verified
+Only fresh evidence starts holds. Optional `ev_liveness_entity` (EV status,
+plug and power) and `dispatch_liveness_entity` (live dispatch and adjusted rate)
+have no defaults: choose one reporting sibling per group. Own fresh reports take
+precedence. A stale source is rescued only when its own report is known,
+non-future and no older than 12 hours, and the sibling's non-future report is
+within that source's `*_max_age_s`. Unknown/unavailable states cannot be rescued
+or supply liveness. Battery direction and dispatch grid power never use siblings.
+A confirmed EV hold needs five distinct advancing **own** fresh not-charging
+reports to clear; a sibling never advances clearance or permits removal. A
+dispatch hold retains its last trusted end through an outage. A verified
 charging window and fresh no-discharge evidence can prevent a new EV hold,
 never clear a confirmed one. Holds beat fallback and exports. Protection can
 continue without the add-on, but requires Home Assistant to remain running;
@@ -1746,8 +1752,10 @@ every hardware decision.
 ## Hold evidence freshness and durable ownership
 
 The settings and sibling-liveness rules below describe add-on-owned sites.
-Integration-owned sites use **Native protection evidence** above; no sibling
-report rescues a stale source there.
+Integration-owned sites use **Native protection evidence** above, including its
+optional group liveness entities and per-source `*_max_age_s`. Health's Evidence
+rows on those sites show the integration's snapshot validity, maximum age and
+`sibling=yes|no`, rather than the add-on's evidence settings.
 
 Only fresh EV/dispatch evidence can start a new hold. A confirmed EV hold
 survives stale evidence and restarts, and clears after five strictly advancing

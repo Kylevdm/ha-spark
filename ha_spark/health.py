@@ -34,6 +34,7 @@ from ha_spark.devices.inverters.solis_clock import (
     describe_error,
 )
 from ha_spark.energy.axle import AxleApiError, read_axle_event
+from ha_spark.energy.evidence_freshness import EvidenceFreshness
 from ha_spark.energy.forecast import intervals_from_hourly_stats, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.octopus import (
@@ -671,12 +672,73 @@ def check_hold_release(settings: Settings) -> list[CheckResult]:
     ]
 
 
+def _evidence_detail(evidence: EvidenceFreshness) -> str:
+    detail = (
+        f"{evidence.validity}; effective report={evidence.reported_at}; "
+        f"age={evidence.age_s}s; max-age={evidence.max_age_s}s; "
+        f"sibling={'yes' if evidence.via_sibling else 'no'}"
+    )
+    return detail + (f"; {evidence.reason}" if evidence.reason else "")
+
+
+def _evidence_number(value: object) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
+
+
+def _integration_evidence_rows(raw: object) -> list[CheckResult]:
+    """Validate the complete IPC projection before printing any of it."""
+    unavailable = [CheckResult("Evidence", Status.WARN, "integration evidence unavailable")]
+    if not isinstance(raw, dict) or not raw:
+        return unavailable
+    rows = []
+    for source, item in raw.items():
+        if source not in ("ev_status", "ev_plug", "ev_power", "live_dispatch",
+                          "adjusted_rate", "dispatch_grid_power", "battery_direction"):
+            return unavailable
+        if not isinstance(item, dict):
+            return unavailable
+        validity, age, maximum, sibling = (
+            item.get("validity"), item.get("age_s"), item.get("max_age_s"),
+            item.get("via_sibling"))
+        if (not isinstance(validity, str) or validity not in (
+                "fresh", "stale", "future", "unknown") or type(sibling) is not bool
+                or not _evidence_number(maximum)
+                or not isinstance(maximum, (int, float)) or not 0 < maximum <= 86400
+                or (age is not None and not _evidence_number(age))
+                or (validity in ("fresh", "stale") and age is None)
+                or (validity == "fresh" and isinstance(age, (int, float)) and age > maximum)
+                or (sibling and (validity != "fresh" or source in (
+                    "battery_direction", "dispatch_grid_power")))):
+            return unavailable
+        rows.append(CheckResult(
+            f"Evidence {source}", Status.OK if validity == "fresh" else Status.WARN,
+            f"integration; {validity}; age={age}s; max-age={maximum}s; "
+            f"sibling={'yes' if sibling else 'no'}"))
+    return rows
+
+
 async def check_evidence_freshness(settings: Settings) -> list[CheckResult]:
     """Read-only source validity; no hardware or authority-store writes.
 
     Supplier validity describes this diagnostic's own fetch, not a cached
     planner fetch. PlannerInputs separately retains the gather_inputs fetch time.
     """
+    try:
+        reply = await submit_socket(settings, "integration_link")
+    except OSError:
+        reply = None
+    view = reply.integration_link if reply is not None and reply.error is None else None
+    integration = view is not None and view.get("authority_owner") == "integration"
+    integration_rows: list[CheckResult] = []
+    if integration:
+        # A snapshot older than the link window says nothing about current freshness.
+        integration_rows = _integration_evidence_rows(
+            view.get("evidence") if view and view.get("state") == "connected" else None)
     reports: dict[str, datetime | None] = {}
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
@@ -694,15 +756,11 @@ async def check_evidence_freshness(settings: Settings) -> list[CheckResult]:
             settings, rest, dispatches, live_dispatch=live,
             report_times=reports, read_all=True,
         )
-    results = []
+    results = integration_rows
     for source, evidence in snapshot.freshness.items():
-        detail = (
-            f"{evidence.validity}; effective report={evidence.reported_at}; "
-            f"age={evidence.age_s}s; max-age={evidence.max_age_s}s; "
-            f"sibling={'yes' if evidence.via_sibling else 'no'}"
-        )
-        if evidence.reason:
-            detail += f"; {evidence.reason}"
+        if integration and source not in ("battery_power", "octopus_dispatch"):
+            continue  # The integration's own rows above gate holds on this site.
+        detail = _evidence_detail(evidence)
         if source == "battery_power":
             detail += f"; direction={snapshot.battery_direction}"
             if settings.battery_power_discharge_sign is None:
