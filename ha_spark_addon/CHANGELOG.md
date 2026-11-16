@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.32.6
+
+- **Settings writer version (#664).** Every settings save now records the validated running version, so downgrade repair reasons can name the release that wrote unknown fields. Releases 0.32.0 or later accept this metadata; downgrading below 0.32.0 after any save now triggers configuration repair ("Invalid configuration envelope").
+- Native Solis link drops are no longer silent: each drop logs one warning with its reason (timeout, disconnected or bad response), the operation and register being read and how long the link was up, and each reconnect logs its downtime, capped at 10 lines per gateway per hour and keyed by an opaque gateway id. Integration diagnostics now show drops in the last 24 hours and the last drop's reason and time (#708).
+
 ## 0.32.5
 
 - **Native fallback schedule form (#712).** The form now shows a charge current box (A) for every native inverter. Before, the current field never appeared, so every save failed with "expected float". Leaving every field empty now reaches the clear rule. A wrong time format says "Use HH:MM, for example 23:30", and a missing current is reported against that inverter.
