@@ -1266,7 +1266,9 @@ def _daytime_purchases(
         live = (schedule.explicit_import_prices[index]
                 if index < len(schedule.explicit_import_prices) else None)
         average = schedule.overnight_average_price
-        return (live is not None and average is not None and live < average
+        # A tolerance so float summation of the average (which differs across
+        # Python versions) never lets an equal price count as "below" it.
+        return (live is not None and average is not None and live < average - 1e-9
                 and geometry.window_fracs[index] == 0)
 
     def refusable(index: int) -> bool:
