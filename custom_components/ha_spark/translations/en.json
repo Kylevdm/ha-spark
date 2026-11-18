@@ -23,7 +23,9 @@
     "no_manual_session": {"message": "There is no manual session to resume."},
     "not_in_active_mode": {"message": "Manual control requires Protect or Optimise and no existing manual session."},
     "invalid_household_zone": {"message": "Configure a valid household time zone before choosing until tomorrow."},
-    "not_admin": {"message": "Only a non-system Home Assistant administrator may do that."}
+    "not_admin": {"message": "Only a non-system Home Assistant administrator may do that."},
+    "missing_rating": {"message": "Enter an export rating for every native inverter in the Flexibility events options first."},
+    "export_bound_unverified": {"message": "The stored export ratings fail the export checks: unverified device identity or gateway claim, or a total above the site export limit. Re-check them in the Flexibility events options."}
   },
   "services": {
     "commands_pending": {"name": "Commands pending", "description": "Prompt a fetch from the authenticated add-on channel. Accepts no command data."},
@@ -36,7 +38,12 @@
         "keep_protection": {"name": "Keep protection", "description": "Keep battery-to-car protection during manual control."}
       }
     },
-    "resume_control": {"name": "Resume control", "description": "End manual control using current conditions."}
+    "resume_control": {"name": "Resume control", "description": "End manual control using current conditions."},
+    "set_export_during_events": {
+      "name": "Set export during events",
+      "description": "Turn the export opt-in on or off (administrator only). While on, the integration supervises every export flexibility event with the stored ratings, as you.",
+      "fields": {"enabled": {"name": "Enabled", "description": "On needs a valid stored rating for every native inverter. Off keeps the ratings and ends no running export."}}
+    }
   },
   "issues": {
     "evidence_options_invalid": {
@@ -337,7 +344,12 @@
       "fallback_in_use": "Fallback cannot be cleared while Optimise is committed or fallback is active.",
       "invalid_time": "Use HH:MM on the household clock, for example 23:30.",
       "missing_current": "Enter a charge current in amps for this inverter.",
-      "fallback_invalidated": "This edit would invalidate the saved fallback schedule. Update or clear the fallback first."
+      "fallback_invalidated": "This edit would invalidate the saved fallback schedule. Update or clear the fallback first.",
+      "export_on": "Export during events is on. Turn it off with the Set export during events action before changing the ratings.",
+      "missing_rating": "Enter an export rating in watts for every native inverter, or leave every field empty to clear them.",
+      "export_bound_unverified": "A device identity or gateway claim is not verified yet. Check the native device repairs and try again.",
+      "export_bounds_exceed_site_limit": "The ratings on a connection add up to more than its site export limit.",
+      "limits": "The site limits are not confirmed right now. Try again shortly."
     },
     "step": {
       "init": {
@@ -349,6 +361,7 @@
           "notify": "Notify target",
           "evidence": "Native protection evidence",
           "fallback": "Native fallback schedule",
+          "flexibility_events": "Flexibility events",
           "topology": "Site topology and limits"
         }
       },
@@ -398,6 +411,11 @@
           "window_start": "Window start (HH:MM)",
           "window_end": "Window end (HH:MM)"
         }
+      },
+      "flexibility_events": {
+        "title": "Flexibility events",
+        "description": "Export during events is {export_state}. Enter the export rating in watts that each native inverter ({inverters}) may export during an event; the ratings are checked as a manual export supervision's are. Leave every field empty to clear them. Turn export on or off with the Set export during events action (administrator only); it supervises every export event with these ratings.",
+        "data": {}
       },
       "soc": {
         "title": "Native SoC trust policy",

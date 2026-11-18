@@ -43,7 +43,7 @@ from homeassistant.helpers.selector import (
 from homeassistant.helpers.service_info.hassio import HassioServiceInfo
 from pydantic import BaseModel, ValidationError
 
-from . import native, notify_target
+from . import flexibility_events, native, notify_target
 from .const import ADDON_SLUG, DOMAIN
 from .native_fallback import FallbackOptions, validate_fallback
 from .native_hold import SOURCES, EvidenceOptions
@@ -335,6 +335,7 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                 and any(i.transport == "native" for i in topology.inverters)):
             menu.append("evidence")
             menu.append("fallback")
+            menu.append("flexibility_events")
         return self.async_show_menu(step_id="init", menu_options=menu)
 
     async def async_step_fallback(
@@ -420,6 +421,62 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
             # Field keys follow inverter ids, so the description names them instead.
             description_placeholders={"inverters": ", ".join(
                 f"current_{inverter.id}" for inverter in native)},
+        )
+
+    async def async_step_flexibility_events(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Owner export ratings; only the admin-only owner service turns export on."""
+        topology = validate_topology(self.config_entry.options.get("topology"))
+        native = ([i for i in topology.inverters if i.transport == "native"]
+                  if isinstance(topology, Topology) else [])
+        current = flexibility_events.stored(
+            self.config_entry.options.get(flexibility_events.OPTION_KEY))
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            ratings: dict[str, float] = {}
+            for inverter in native:
+                value = user_input.get(f"rating_{inverter.id}")
+                if _is_number(value):
+                    ratings[inverter.id] = float(value)
+            if current.export_during_events:
+                # The enabling admin confirmed these ratings; they change only while off.
+                errors = {"base": "export_on"}
+            elif not native:
+                errors = {"base": "missing_rating"}
+            elif ratings:
+                runtime = getattr(self.config_entry, "runtime_data", None)
+                reason = (runtime.export_opt_in_refusal(ratings) if runtime is not None
+                          else "export_bound_unverified")
+                if reason == "invalid_intent":
+                    reason = "missing_rating"
+                if reason is not None:
+                    errors = {"base": reason if reason in (
+                        "missing_rating", "limits", "export_bounds_exceed_site_limit",
+                    ) else "export_bound_unverified"}
+            if not errors:
+                updated = current.model_copy(update={"export_ratings_w": ratings})
+                return self.async_create_entry(title="", data={
+                    **self.config_entry.options,
+                    flexibility_events.OPTION_KEY: updated.model_dump(mode="json"),
+                })
+        # Suggested values, not defaults, so leaving every field empty can clear.
+        fields: dict[Any, Any] = {}
+        suggested: dict[str, Any] = {}
+        for inverter in native:
+            fields[probatio.Optional(f"rating_{inverter.id}")] = NumberSelector(
+                NumberSelectorConfig(min=1, max=100000, step=1, unit_of_measurement="W",
+                                     mode=NumberSelectorMode.BOX))
+            if inverter.id in current.export_ratings_w:
+                suggested[f"rating_{inverter.id}"] = current.export_ratings_w[inverter.id]
+        return self.async_show_form(
+            step_id="flexibility_events",
+            data_schema=self.add_suggested_values_to_schema(probatio.Schema(fields), suggested),
+            errors=errors,
+            description_placeholders={
+                "export_state": "on" if current.export_during_events else "off",
+                "inverters": ", ".join(f"rating_{inverter.id}" for inverter in native),
+            },
         )
 
     async def async_step_evidence(

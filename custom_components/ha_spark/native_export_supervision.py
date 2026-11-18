@@ -1,11 +1,12 @@
 """Event-scoped native export supervision and snapshot projection."""
+from collections.abc import Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from homeassistant.util import dt as dt_util
 
-from . import native_export_log
+from . import flexibility_events, native_export_log
 from .authority_store import ExportSupervision, GatewayClaim
 from .commands import (
     Command,
@@ -20,6 +21,7 @@ from .native_export import (
     event_from_raw,
     latest_latch,
     latest_record,
+    ratings_bound_refusal,
     ratings_refusal,
     record_is_live,
     site_export_limit_w,
@@ -84,6 +86,44 @@ class ExportSupervisor:
         if not isinstance(topology, Topology):
             return None, None
         return topology, effective_limits(topology)
+
+    def export_opt_in_refusal(self, ratings: Mapping[str, float]) -> str | None:
+        """Opt-in ratings checked as a manual supervision's are, for every native inverter."""
+        topology, limits = self._topology_and_limits()
+        guard = self.guard
+        if topology is None or limits is None:
+            return "limits"
+        if guard is not None:
+            if not guard.boundary_open:
+                return "limits"
+            topology, limits = guard.topology, guard.limits
+        native = {inverter.id for inverter in topology.inverters
+                  if inverter.transport == "native"}
+        if not native or set(ratings) != native:
+            return "missing_rating"
+        return ratings_bound_refusal(ratings, topology, limits, self._export_facts(topology))
+
+    async def async_set_export_during_events(
+        self, *, enabled: bool, user_id: str, now: datetime,
+    ) -> str | None:
+        """Switch the export opt-in for a verified admin; off keeps the ratings."""
+        async with self.control.lock:
+            current = flexibility_events.stored(
+                self.entry.options.get(flexibility_events.OPTION_KEY))
+            if enabled:
+                reason = self.export_opt_in_refusal(current.export_ratings_w)
+                if reason is not None:
+                    return reason
+            updated = current.model_copy(update={
+                "export_during_events": enabled,
+                "export_enabled_by": user_id if enabled else None,
+                "export_enabled_at": now if enabled else None,
+            })
+            self.hass.config_entries.async_update_entry(self.entry, options={
+                **self.entry.options,
+                flexibility_events.OPTION_KEY: updated.model_dump(mode="json"),
+            })
+            return None
 
     async def _async_supervise_export(self, command: Command) -> CommandResult:
         async with self.control.lock:
