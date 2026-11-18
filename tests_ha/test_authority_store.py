@@ -69,6 +69,38 @@ def test_full_authority_contents_round_trip() -> None:
     assert AuthorityState.model_validate_json(complete.model_dump_json()) == complete
 
 
+def _supervision(**updates: object) -> ExportSupervision:
+    event = EventIdentity(direction="export", start=NOW, end=NOW + timedelta(hours=1))
+    return ExportSupervision.model_validate({
+        "inverter_id": "inverter", "id": uuid4(), "event": event,
+        "confirming_user_id": "user-id", "epoch": 1, "ends_at": event.end,
+        "rating_w": 3000.0, "identity": (0x0026, 0x2031, 0x0000),
+        "claim": GatewayClaim(host="gateway.invalid", port=502, unit_id=1),
+        **updates,
+    })
+
+
+def test_supervision_provenance_survives_a_save_and_reload() -> None:
+    automatic = _supervision(provenance="automatic")
+    state = fresh().model_copy(update={"export_supervisions": (automatic,)})
+    loaded = AuthorityState.model_validate_json(state.model_dump_json())
+    assert loaded.export_supervisions[0].provenance == "automatic"
+
+
+def test_supervision_rows_stored_before_provenance_load_as_manual() -> None:
+    stored = fresh().model_copy(update={"export_supervisions": (_supervision(),)})
+    raw = stored.model_dump(mode="json")
+    for row in raw["export_supervisions"]:
+        del row["provenance"]
+    loaded = AuthorityState.model_validate(raw)
+    assert [row.provenance for row in loaded.export_supervisions] == ["manual"]
+
+
+def test_supervision_rejects_unknown_provenance() -> None:
+    with pytest.raises(ValidationError):
+        _supervision(provenance="addon")
+
+
 @pytest.mark.parametrize("updates", [
     {"epoch": True}, {"epoch": "1"}, {"epoch": 0}, {"schema_version": True},
     {"committed_mode": "manual"},
