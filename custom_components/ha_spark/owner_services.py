@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 SERVICES = ("set_observe", "start_manual_control", "resume_control", "reprobe",
-            "commands_pending")
+            "commands_pending", "set_export_during_events")
 
 
 def async_register(hass: HomeAssistant) -> None:
@@ -44,6 +44,22 @@ def async_register(hass: HomeAssistant) -> None:
                 raise ServiceValidationError(
                     translation_domain=DOMAIN, translation_key="native_device_missing",
                 )
+            return {}
+        if call.service == "set_export_during_events":
+            enabled = call.data["enabled"]
+            refusal = await entry.runtime_data.async_set_export_during_events(
+                enabled=enabled, user_id=user.id, now=dt_util.utcnow())
+            if refusal is not None:
+                raise ServiceValidationError(
+                    translation_domain=DOMAIN, translation_key=(
+                        refusal if refusal in ("missing_rating", "limits")
+                        else "export_bound_unverified"),
+                )
+            state_word = "on" if enabled else "off"
+            _LOGGER.info("Owner %s: export during events %s", user.id, state_word)
+            logbook.async_log_entry(hass, "ha-spark",
+                                    f"{user.id}: export during events {state_word}",
+                                    domain=DOMAIN, context=call.context)
             return {}
         control = entry.runtime_data.control
         target = {"set_observe": "observe", "start_manual_control": "manual",
@@ -82,6 +98,8 @@ def async_register(hass: HomeAssistant) -> None:
         schema = vol.Schema({})
         if service == "reprobe":
             schema = vol.Schema({vol.Required("inverter_id"): str})
+        if service == "set_export_during_events":
+            schema = vol.Schema({vol.Required("enabled"): bool})
         if service == "start_manual_control":
             schema = vol.Schema({
                 vol.Optional("duration", default="one_hour"): vol.In(

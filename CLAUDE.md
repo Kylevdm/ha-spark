@@ -70,7 +70,8 @@ security and prefer the safe default. Hard rules:
     device (failed identity, caching on, gateway not owned) and a pending
     switch write nothing.
   - *Native export is supervised only:* it runs only in Optimise with a live
-    owner `supervise_export` for that event, within the device export bound,
+    owner supervision for that event (sent by the owner or by the owner's
+    durable export opt-in, ADR-0013), within the device export bound,
     and never in fallback, Protect, manual control or Observe. Every clear is
     zero-confirmed. The live tripwire stops every export on a connection after
     two consecutive fresh grid readings more than 200 W over the site export

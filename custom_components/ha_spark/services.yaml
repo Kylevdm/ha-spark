@@ -31,3 +31,14 @@ start_manual_control:
 resume_control:
   name: Resume control
   description: End manual control using current conditions, never an old plan.
+set_export_during_events:
+  name: Set export during events
+  description: >-
+    Turn the export opt-in on or off. On, the integration supervises every export
+    flexibility event with the stored ratings, as this administrator. Requires a
+    non-system administrator; turning it on needs a valid rating for every native inverter.
+  fields:
+    enabled:
+      required: true
+      selector:
+        boolean:
