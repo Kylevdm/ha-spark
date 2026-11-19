@@ -145,6 +145,8 @@ class ExportSupervision(Record):
     rating_w: Annotated[float, Field(gt=0, le=100000, allow_inf_nan=False)]
     identity: tuple[int, int, int]
     claim: GatewayClaim
+    # Rows stored before provenance existed were all owner commands.
+    provenance: Literal["manual", "automatic"] = "manual"
 
 
 class ExportRecord(Record):
