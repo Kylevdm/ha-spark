@@ -108,6 +108,7 @@ class V2LCharger(FrozenModel):
     id: SafeId
     bank_id: SafeId
     max_current_a: Current = 0
+    power_entity: EntityId | None = None
 
 
 class MajorLoad(FrozenModel):

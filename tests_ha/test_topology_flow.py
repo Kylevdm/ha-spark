@@ -448,6 +448,37 @@ async def test_edit_form_suggests_stored_optional_sensors(hass: HomeAssistant) -
     hass.config_entries.options.async_abort(flow_id)
 
 
+async def test_v2l_power_sensor_is_saved_suggested_and_cleared(hass: HomeAssistant) -> None:
+    entry = entry_for(hass, topology=STORED_TOPOLOGY, topology_revision=1)
+    charger = {"id": "car", "bank_id": "bank", "max_current_a": 8}
+    flow_id = await open_topology(hass, entry)
+    await add_item(hass, flow_id, "v2l_chargers", {**charger, "power_entity": "sensor.v2l"})
+    with patch.object(hass.config_entries, "async_reload", return_value=True):
+        result = await choose(hass, flow_id, "save")
+        await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options["topology"]["v2l_chargers"][0]["power_entity"] == "sensor.v2l"
+
+    flow_id = await open_topology(hass, entry)
+    await choose(hass, flow_id, "v2l_chargers")
+    await choose(hass, flow_id, "v2l_chargers_edit")
+    result = await hass.config_entries.options.async_configure(flow_id, {"id": "car"})
+    assert result["step_id"] == "v2l_chargers_item"
+    schema = result["data_schema"]
+    assert schema is not None
+    field = next(marker for marker in schema.schema if str(marker) == "power_entity")
+    assert (field.description or {}).get("suggested_value") == "sensor.v2l"
+    # A cleared optional selector is omitted on submission.
+    result = await hass.config_entries.options.async_configure(flow_id, charger)
+    assert result["type"] is FlowResultType.MENU
+    await choose(hass, flow_id, "v2l_chargers_done")
+    with patch.object(hass.config_entries, "async_reload", return_value=True):
+        result = await choose(hass, flow_id, "save")
+        await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options["topology"]["v2l_chargers"][0].get("power_entity") is None
+
+
 async def test_v2l_charger_one_per_bank_and_removable(hass: HomeAssistant) -> None:
     """A second V2L charger on one bank is refused; the first can be removed."""
     entry = entry_for(hass, topology=STORED_TOPOLOGY, topology_revision=1)
@@ -546,7 +577,7 @@ async def test_topology_flow_translations(hass: HomeAssistant) -> None:
         ),
         "inverters_edit": ("id",),
         "inverters_remove": ("id",),
-        "v2l_chargers_item": ("id", "bank_id", "max_current_a"),
+        "v2l_chargers_item": ("id", "bank_id", "max_current_a", "power_entity"),
         "v2l_chargers_edit": ("id",),
         "v2l_chargers_remove": ("id",),
         "major_load_kind": ("kind",),

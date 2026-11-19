@@ -756,7 +756,9 @@ finite and within its field's range.
   limits 0–500 A (default 0); **Limits confirmed** (default off, and
   unconfirmed limits count as 0 A); optional grid-port power and battery power
   sensors, with power sign `positive_import` or `negative_import`.
-- **V2L charger:** bank; maximum DC current 0–500 A. At most one per bank.
+- **V2L charger:** bank; maximum DC current 0–500 A; optional V2L power sensor
+  (W). At most one per bank. The SoC check uses the power sensor to account
+  for V2L charging (see below).
 - **Major load:** kind EV charger or heat pump; grid connection; optional power
   sensor. An EV charger has demand over 0 up to 50 kW (default 7.4 kW) and can
   be marked **The one dispatches drive** (at most one site-wide). A heat pump
@@ -957,7 +959,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `soc_failure_threshold` | How many consecutive failed SoC observations trigger the configured Solis fallback (default `3`). Before fallback entry, one good observation resets the count. Once fallback is requested, verified, or unconfirmed, a passing observation leaves it in place until recovery (`soc_recovery_minutes`) |
 | `soc_recovery_minutes` | How many minutes of continuously passing SoC observations an active Solis fallback needs before ha-spark recovers (default `10`). Any failed observation restarts the count. The SoC may move, but its `last_reported` must never go backwards and must advance at least once; the battery-voltage liveness exception does not count. ha-spark then computes a fresh plan from the current SoC and the remaining cheap-rate window. The fallback stays in place until that plan is written and read back; a failed or mismatched read-back keeps the fallback and retries every minute. In Observe nothing is written, so recovery completes once the fresh plan is computed |
 | `solis_fallback_current_a` | Optional fallback-current ceiling in amps. When set, a sustained SoC failure programs only the configured `charge_window_start`–`charge_window_end` and this current. It is checked against the effective charge limit (your setting and the 62.5 A Solis register limit, or the saved native inverter and bank limits) and the effective site supply, and refused with a named reason when above either. The setting remains bounded at 1–62.5 A. It is disabled when blank; there is no implicit current default. Only a successful Solis read-back is reported as verified |
-| `battery_power_entity` | Optional battery power in W, sampled each minute to check SoC against energy flow. The Solis preset uses `sensor.solisac_battery_power`. Both power signs count. Jumps unexplained by energy flow by more than 2 percentage points fail; unchanged SoC fails after more than 2 points of energy flows. Two consecutive reads of a rejected changed value accept a possible BMS recalibration with a warning. Missing power skips that interval; without this setting these checks are off. The baseline resets on restart |
+| `battery_power_entity` | Optional battery power in W, sampled each minute to check SoC against energy flow. The Solis preset uses `sensor.solisac_battery_power`. Both power signs count. Jumps unexplained by energy flow by more than 2 percentage points fail; unchanged SoC fails after more than 2 points of energy flows. Two consecutive reads of a rejected changed value accept a possible BMS recalibration with a warning. Missing power skips that interval; without this setting these checks are off. The baseline resets on restart. With `v2l_power_entity` and `battery_power_discharge_sign` set, V2L charging is counted too (see "SoC integrity and fallback") |
 | `battery_voltage_entity` | Battery voltage (V). ha-spark also uses it to tell whether the SoC's source is live, so pick the voltage sensor from the same integration as `soc_entity` |
 | `solar_tomorrow_entity` | Solcast "forecast tomorrow" sensor (with `detailedForecast` attribute). Used only by sites without native Solcast; ignored once a Solcast key is configured |
 | `solar_today_entity` | Optional Solcast "forecast today" sensor; recommended for accurate charge sizing on sites without native Solcast. Honours `solar_percentile` and `detailedForecast`, like the tomorrow sensor. If missing or invalid, today's solar counts as zero: this oversizes the charge, never undersizes it. Ignored once a Solcast key is configured |
@@ -1259,6 +1261,18 @@ native SoC policy and fallback options described above, not
 `solis_fallback_current_a`.
 
 ha-spark checks `soc_entity` once a minute (see the `soc_*` settings above).
+
+**V2L charging.** The V2L charger feeds the battery directly, so the inverter's
+battery power doesn't show it. While V2L charges and the inverter discharges,
+SoC can stay level for hours, which used to fail the stuck-SoC check and start
+fallback. Now, when an observation has a fresh V2L reading (explicit `W`,
+reported within 120 s, not negative), the check counts V2L input at face
+value: it nets V2L against the signed battery power for the stuck-SoC test,
+and adds V2L energy to what can explain a SoC change. On add-on-owned sites
+this uses `v2l_power_entity` and needs `battery_power_discharge_sign`; on
+integration-owned sites set the V2L charger's power sensor in **Site topology
+and limits**. A missing, stale or invalid V2L reading leaves the check exactly
+as strict as before, for that observation too.
 The companion integration shows fallback state in **Fallback active** and the
 plan's SoC status and reason in **Plan status** attributes. The log and action
 lines give the detailed operating state and recovery progress:

@@ -1,5 +1,6 @@
 """Native SoC trust through config entries, fake frames, options and v4 snapshots."""
 
+from copy import deepcopy
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ from tests_ha.fake_solis import FakeSolisDevice
 from tests_ha.test_native_device import native_entry
 from tests_ha.test_native_entities import ticks
 from tests_ha.test_polling import fixture
+from tests_ha.test_topology_flow import STORED_TOPOLOGY
 
 
 @pytest.fixture
@@ -84,6 +86,59 @@ async def test_native_soc_snapshot_preconditions_live_fences_and_no_writes(
         c.soc.observe(dt_util.utcnow())
     assert c.soc.fallback_requested
     assert all(t.op == "read" for t in native_transport.traffic)
+
+
+@pytest.mark.parametrize("scenario,value,unit", [
+    ("fresh", "1740", "W"),
+    ("stale", "1740", "W"),
+    ("wrong_unit", "1740", "kW"),
+    ("unavailable", "unavailable", "W"),
+    ("negative", "-1740", "W"),
+    ("nonfinite", "inf", "W"),
+    ("zero", "0", "W"),
+    ("no_entity", "1740", "W"),
+])
+async def test_native_soc_accounts_only_for_fresh_valid_v2l_power(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+    native_transport: FakeSolisDevice, freezer: FrozenDateTimeFactory,
+    scenario: str, value: str, unit: str,
+) -> None:
+    native_transport.set_read_frames()
+    native_transport.set_input(33139, [50])
+    native_transport.set_input(33135, [1])  # Discharging 1300 W.
+    native_transport.set_input(33149, [0, 1300])
+    topology = deepcopy(STORED_TOPOLOGY)
+    topology["banks"][0]["usable_capacity_kwh"] = 26.88
+    charger = {"id": "car", "bank_id": "bank"}
+    entity_id = "sensor.v2l_power"
+    if scenario != "no_entity":
+        charger["power_entity"] = entity_id
+    topology["v2l_chargers"] = [charger]
+    attributes = {"unit_of_measurement": unit}
+    hass.states.async_set(entity_id, value, attributes)
+    if scenario == "stale":
+        freezer.tick(timedelta(minutes=10))
+    entry = await native_entry(hass, aioclient_mock, topology=topology)
+    c = entry.runtime_data
+    for _ in range(36):
+        freezer.tick(timedelta(seconds=50))
+        # Poll all due frames to get a distinct battery read for this minute.
+        for _ in range(10):
+            freezer.tick(timedelta(seconds=1))
+            await c.native.async_poll(dt_util.utcnow())
+        if scenario != "stale":
+            hass.states.async_set(entity_id, value, attributes)
+        before = len(native_transport.traffic)
+        c.soc.observe(dt_util.utcnow())
+        assert len(native_transport.traffic) == before
+        if scenario == "fresh":
+            assert c.soc.bank("bank").reason == "ok"
+            assert c.soc.trusted("bank")
+            assert not c.soc.fallback_requested
+    if scenario != "fresh":
+        assert c.soc.bank("bank").reason == "implausible"
+        assert not c.soc.trusted("bank")
+        assert c.soc.fallback_requested
 
 
 async def test_failed_frame_ages_last_good_read_but_reconnect_never_reuses_it(

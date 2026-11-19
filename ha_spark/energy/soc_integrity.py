@@ -138,6 +138,7 @@ def check_soc(
     baseline_soc: float | None = None,
     energy_kwh: float | None = None,
     battery_capacity_kwh: float = 0.0,
+    stuck_energy_kwh: float | None = None,
 ) -> SocMeasurement:
     """Check one SoC observation and record the verdict with its evidence.
 
@@ -207,12 +208,15 @@ def check_soc(
                     f"{energy_kwh:.2f} kWh through the battery"
                 ),
             )
-        if delta == 0 and explained > ENERGY_TOLERANCE_PCT:
+        # V2L input the inverter never sees nets against its discharge (#735).
+        stuck = energy_kwh if stuck_energy_kwh is None else stuck_energy_kwh
+        if (delta == 0 and math.isfinite(stuck) and stuck >= 0
+                and stuck / battery_capacity_kwh * 100 > ENERGY_TOLERANCE_PCT):
             return replace(
                 fail,
                 status=SocStatus.IMPLAUSIBLE,
                 energy_reason=(
-                    f"SoC stuck at {value:g}% with {energy_kwh:.2f} kWh through the battery"
+                    f"SoC stuck at {value:g}% with {stuck:.2f} kWh through the battery"
                 ),
             )
     if age_s <= max_age_s:
