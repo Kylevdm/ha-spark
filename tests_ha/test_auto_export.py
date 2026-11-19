@@ -377,17 +377,23 @@ async def test_exception_in_automatic_step_does_not_change_charge_result(
     assert all(r.outcome in ("applied", "unchanged") for r in result.intents)
 
 
-async def test_stale_epoch_cannot_supervise(writer: SparkCoordinator, admin: None) -> None:
+async def test_stale_epoch_cannot_supervise(
+    writer: SparkCoordinator, admin: None, native_transport: FakeSolisDevice,
+) -> None:
     await enable(writer)
     state = writer.authority.state
     assert state is not None
     assert await writer.authority.async_save(state.model_copy(update={"epoch": state.epoch + 1}))
-    await writer._async_dispatch_command(apply_command(
-        writer, [window_intent()], epoch=state.epoch))
+    native_transport.traffic.clear()
+    with patch("custom_components.ha_spark.notify_target.async_notice",
+               new_callable=Mock) as notice:
+        await writer._async_dispatch_command(apply_command(
+            writer, [window_intent()], epoch=state.epoch))
     assert writer.authority.state is not None
     assert not writer.authority.state.export_supervisions
-    assert any(t.kind == "refused" and t.reason == "stale_authority"
-               for t in writer.authority.state.export_transitions)
+    assert not [t for t in writer.authority.state.export_transitions if t.kind == "refused"]
+    notice.assert_not_called()
+    assert not [t for t in native_transport.traffic if t.op == "write"]
 
 
 async def test_failed_refusal_save_is_retried_without_a_notice(

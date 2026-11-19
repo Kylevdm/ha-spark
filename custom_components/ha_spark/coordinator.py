@@ -150,6 +150,8 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
                 kept = tuple(row for row in state.export_supervisions
                              if row.inverter_id != inverter_id or row.identity == identity)
                 if len(kept) != len(state.export_supervisions):
+                    if not self._export_device_changed_locked({inverter_id}):
+                        return found
                     await self.authority.async_save(state.model_copy(update={
                         "export_supervisions": kept, "last_changed_at": dt_util.utcnow()}))
                 # The identity latch is cleared only by the tick's verified drop.

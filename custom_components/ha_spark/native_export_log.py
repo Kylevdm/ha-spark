@@ -158,14 +158,20 @@ def with_append(
     cleared: bool | None = None, transition_id: UUID | None = None,
     source: Literal["manual", "automatic"] = "manual",
 ) -> AuthorityState:
-    """Append once per inverter/event/kind (and refusal reason), trimming first."""
+    """Append once per kind, acceptance source or refusal reason, trimming first."""
     if any(row.inverter_id == inverter_id and row.kind == kind
            and same_event(row.event, event)
            and (kind != "refused" or row.reason == reason)
+           and (kind != "accepted" or row.source == source)
            for row in state.export_transitions):
         return state
     rows, dropped = trim(state.export_transitions, at, reserve=1,
                          reserve_inverter=inverter_id)
+    if kind == "refused":
+        kept_ids = {row.id for row in rows}
+        if any(row.kind != "refused" and row.id not in kept_ids
+               for row in state.export_transitions):
+            return state  # A refusal must never displace lifecycle evidence.
     if dropped:
         log.warning("Dropped unacknowledged export transitions at the log cap")
     row = ExportTransition(

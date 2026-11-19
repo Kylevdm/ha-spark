@@ -1343,13 +1343,14 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
             else self.config_entry.options.get("gateway_claims", []),
         )
         changed_ratings = flexibility_events.changed_rated_claims(
-            self.config_entry.options, claims)
+            self.config_entry.options, claims, proposed_topology=topology.model_dump(mode="json"))
         export_options = ({flexibility_events.OPTION_KEY: flexibility_events.switched_off(
             self.config_entry.options.get(flexibility_events.OPTION_KEY))}
             if changed_ratings else {})
         if coordinator is not None:
             # A claim edited for a native inverter ends that inverter's bound.
-            await coordinator.async_drop_stale_bounds(claims=claims)
+            await coordinator.async_drop_stale_bounds(
+                claims=claims, proposed_topology=topology.model_dump(mode="json"))
         return self.async_create_entry(title="", data={
             **self.config_entry.options,
             **export_options,

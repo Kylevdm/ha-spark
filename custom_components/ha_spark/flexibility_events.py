@@ -47,7 +47,9 @@ def switched_off(raw: object) -> dict[str, Any]:
     }).model_dump(mode="json")
 
 
-def changed_rated_claims(options: Mapping[str, Any], claims: object) -> set[str]:
+def changed_rated_claims(
+    options: Mapping[str, Any], claims: object, *, proposed_topology: object = None,
+) -> set[str]:
     """Compare proposed gateway claims with the entry's previous claims, without rows."""
     from .native_export import claim_from_raw
     from .topology import Topology, validate_topology
@@ -62,8 +64,17 @@ def changed_rated_claims(options: Mapping[str, Any], claims: object) -> set[str]
                      if isinstance(item, dict) and item.get("host") == host
                      and item.get("port") == port and item.get("unit_id") == unit), None)
 
-    return {inverter.id for inverter in topology.inverters if inverter.id in ratings
-            and claim_for(options.get("gateway_claims"), inverter.gateway_host,
-                          inverter.gateway_port, inverter.gateway_unit_id)
-            != claim_for(claims, inverter.gateway_host,
-                         inverter.gateway_port, inverter.gateway_unit_id)}
+    proposed = (validate_topology(proposed_topology) if proposed_topology is not None
+                else topology)
+
+    def bindings(site: Topology, raw_claims: object) -> dict[str, object]:
+        return {inverter.id: (
+            inverter.gateway_host, inverter.gateway_port, inverter.gateway_unit_id,
+            claim_for(raw_claims, inverter.gateway_host,
+                      inverter.gateway_port, inverter.gateway_unit_id),
+        ) for inverter in site.inverters}
+
+    previous = bindings(topology, options.get("gateway_claims"))
+    current = bindings(proposed, claims) if isinstance(proposed, Topology) else {}
+    return {inverter_id for inverter_id in ratings
+            if previous.get(inverter_id) != current.get(inverter_id)}
