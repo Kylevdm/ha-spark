@@ -234,6 +234,15 @@ class ExportSupervisor:
             state = self.authority.state
             if (not self.control.owned() or state is None or command.epoch != state.epoch):
                 return
+            # A first probe after restart has no previous in-memory identity.
+            identities = self.native.identities
+            changed = {row.inverter_id for row in state.export_supervisions
+                       if row.inverter_id in options.export_ratings_w
+                       and identities.get(row.inverter_id)
+                       and identities[row.inverter_id] != row.identity}
+            if changed:
+                self._export_device_changed_locked(changed)
+                return  # Keep durable evidence until the stale-bound pass saves its drop.
             # Manual supervision belongs to the owner, not the opt-in reconciler.
             if any(row.provenance == "manual" for row in state.export_supervisions):
                 return
@@ -527,7 +536,8 @@ class ExportSupervisor:
             identities = self.native.identities
             if state is not None:
                 affected |= {row.inverter_id for row in state.export_supervisions
-                             if identities.get(row.inverter_id, row.identity) != row.identity
+                             if (bool(identities.get(row.inverter_id))
+                                 and identities[row.inverter_id] != row.identity)
                              or row.inverter_id in current
                              and current[row.inverter_id] != row.claim}
             if not self._export_device_changed_locked(affected):

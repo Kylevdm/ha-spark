@@ -170,7 +170,7 @@ def with_append(
     if kind == "refused":
         kept_ids = {row.id for row in rows}
         if any(row.kind != "refused" and row.id not in kept_ids
-               for row in state.export_transitions):
+               for row in with_pruned(state, at).export_transitions):
             return state  # A refusal must never displace lifecycle evidence.
     if dropped:
         log.warning("Dropped unacknowledged export transitions at the log cap")

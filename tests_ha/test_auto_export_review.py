@@ -21,7 +21,14 @@ from tests_ha.test_auto_export import admin as admin_fixture
 from tests_ha.test_auto_export import clock, enable  # noqa: F401
 from tests_ha.test_auto_export import writer as writer_fixture
 from tests_ha.test_flexibility_events import submit, switch
-from tests_ha.test_native_export import EVENT, NOW, apply_command, command, window_intent
+from tests_ha.test_native_export import (
+    EVENT,
+    NOW,
+    allow_export,
+    apply_command,
+    command,
+    window_intent,
+)
 from tests_ha.test_native_export_interplay import restart
 from tests_ha.test_native_write import hass_config_dir, hass_storage  # noqa: F401
 
@@ -252,3 +259,133 @@ async def test_manual_then_automatic_acceptance_records_both_sources(
     await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
     accepted = [r for r in writer.authority.state.export_transitions if r.kind == "accepted"]
     assert [r.source for r in accepted] == ["manual", "automatic"]
+
+
+async def test_trip_refuses_surviving_supervision_after_switch_off_and_latch_expiry(
+    writer: SparkCoordinator, admin: None, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await enable(writer)
+    allow_export(writer, monkeypatch, native_transport)
+    first = await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
+    assert first.intents[0].outcome == "applied"
+    state = writer.authority.state
+    assert state is not None and state.export_supervisions
+    surviving_rows = state.export_supervisions
+    # Model completed trip cleanup while a supervision for the event survives.
+    cleared = await writer.writes.async_clear_export("inv1", epoch=state.epoch)
+    assert cleared.outcome == "applied"
+    state = writer.authority.state
+    event = event_from_raw(EVENT)
+    assert state is not None and event is not None
+    assert state.export_records[0].state == "cleared"
+    state = native_export_log.with_append(state, inverter_id="inv1", event=event,
+                                          kind="tripped", at=NOW)
+    assert await writer.authority.async_save(state.model_copy(update={
+        "export_supervisions": surviving_rows, "stop_latches": (),
+    }))
+    await switch(writer, False)
+    native_transport.traffic.clear()
+    result = await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
+    assert (result.intents[0].outcome, result.intents[0].reason) == ("refused", "tripped")
+    assert not [t for t in native_transport.traffic if t.op == "write"]
+
+
+async def test_expired_acked_row_does_not_suppress_refusal_or_notice(
+    writer: SparkCoordinator, admin: None,
+) -> None:
+    await enable(writer)
+    state = writer.authority.state
+    ended = event_from_raw({"direction": "export",
+                            "start": (NOW - timedelta(hours=2)).isoformat(),
+                            "end": (NOW - timedelta(hours=1)).isoformat()})
+    assert state is not None and ended is not None
+    state = native_export_log.with_append(state, inverter_id="inv1", event=ended,
+                                          kind="accepted", at=ended.start)
+    assert await writer.authority.async_save(state.model_copy(update={
+        "committed_mode": "observe",
+        "export_transitions": tuple(r.model_copy(update={"acked": True})
+                                    for r in state.export_transitions),
+    }))
+    with patch("custom_components.ha_spark.notify_target.async_notice", new_callable=Mock) as n:
+        await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
+    assert writer.authority.state is not None
+    refused = [r for r in writer.authority.state.export_transitions if r.kind == "refused"]
+    assert len(refused) == 1 and refused[0].reason == "mode"
+    assert not any(r.event == ended for r in writer.authority.state.export_transitions)
+    assert n.call_count == 1
+
+
+@pytest.mark.parametrize("provenance", ["automatic", "manual"])
+async def test_moved_event_after_restart_cannot_discard_changed_identity_evidence(
+    writer: SparkCoordinator, admin: None, native_transport: FakeSolisDevice,
+    provenance: str,
+) -> None:
+    await enable(writer)
+    await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
+    assert writer.authority.state is not None
+    if provenance == "manual":
+        assert await writer.authority.async_save(writer.authority.state.model_copy(update={
+            "export_supervisions": tuple(row.model_copy(update={"provenance": "manual"})
+                                        for row in writer.authority.state.export_supervisions),
+        }))
+    native_transport.set_input(35000, [0x2032])
+    restored = await restart(writer)
+    assert not restored.native.identity_changed
+    moved = {**EVENT, "end": (NOW + timedelta(hours=4)).isoformat()}
+    with patch("custom_components.ha_spark.notify_target.async_notice", new_callable=Mock) as n:
+        await restored._async_dispatch_command(apply_command(
+            restored, [window_intent(event=moved)]))
+    assert not flexibility_events.stored(restored.entry.options.get(
+        flexibility_events.OPTION_KEY)).export_during_events
+    assert restored.authority.state is not None
+    assert not any(row.event.end == NOW + timedelta(hours=4)
+                   for row in restored.authority.state.export_supervisions)
+    assert n.call_count == 1
+    await restored.async_drop_stale_bounds()
+    assert not restored.authority.state.export_supervisions
+
+
+async def test_reprobe_changed_identity_without_row_revokes_consent_immediately(
+    writer: SparkCoordinator, admin: None, native_transport: FakeSolisDevice,
+) -> None:
+    await enable(writer)
+    assert writer.authority.state is not None and not writer.authority.state.export_supervisions
+    native_transport.set_input(35000, [0x2032])
+    with patch("custom_components.ha_spark.notify_target.async_notice", new_callable=Mock) as n:
+        await writer.async_reprobe("inv1")
+    assert not flexibility_events.stored(writer.entry.options.get(
+        flexibility_events.OPTION_KEY)).export_during_events
+    assert n.call_count == 1
+
+
+@pytest.mark.parametrize("with_row", [False, True])
+async def test_unreadable_reprobe_drops_bound_without_revoking_consent(
+    writer: SparkCoordinator, admin: None, native_transport: FakeSolisDevice, with_row: bool,
+) -> None:
+    await enable(writer)
+    if with_row:
+        await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
+        assert writer.authority.state is not None and writer.authority.state.export_supervisions
+    native_transport.connected = False
+    with patch("custom_components.ha_spark.notify_target.async_notice", new_callable=Mock) as n:
+        await writer.async_reprobe("inv1")
+        await writer.async_drop_stale_bounds()
+    assert flexibility_events.stored(writer.entry.options.get(
+        flexibility_events.OPTION_KEY)).export_during_events
+    assert writer.authority.state is not None and not writer.authority.state.export_supervisions
+    n.assert_not_called()
+
+
+async def test_empty_identity_is_not_durable_evidence_of_replacement(
+    writer: SparkCoordinator, admin: None,
+) -> None:
+    await enable(writer)
+    await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
+    writer.native.identities["inv1"] = ()
+    with patch("custom_components.ha_spark.notify_target.async_notice", new_callable=Mock) as n:
+        await writer._async_dispatch_command(apply_command(writer, [window_intent()]))
+        await writer.async_drop_stale_bounds()
+    assert flexibility_events.stored(writer.entry.options.get(
+        flexibility_events.OPTION_KEY)).export_during_events
+    n.assert_not_called()
