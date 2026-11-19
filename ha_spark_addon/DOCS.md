@@ -118,6 +118,7 @@ For integration-owned sites, Home Assistant exposes these `ha_spark` services:
 | `ha_spark.start_manual_control` | Start temporary manual control from Protect or Optimise |
 | `ha_spark.resume_control` | End manual control using current conditions, never an old plan |
 | `ha_spark.reprobe` | Re-read identity and test caching for `inverter_id` |
+| `ha_spark.set_export_during_events` | Turn **Export during events** on or off (`enabled`); see below |
 | `ha_spark.commands_pending` | Prompt a fetch from the authenticated add-on channel; accepts no command data and grants no authority |
 
 Except for the fetch prompt, these services require a non-system Home Assistant
@@ -249,6 +250,60 @@ write permission. Follow the
 [supervised-export runbook](../docs/runbooks/supervised-axle-export.md) for
 preparation, abort and verified cleanup, including lifecycle notices.
 
+### Export during events
+
+With **Export during events** on, the integration supervises each export
+flexibility event itself, so you don't have to choose **Arm supervised export**
+for every event. It is off by default and is site-wide.
+
+1. In **Options → Flexibility events** (native topologies only), enter the
+   export rating in watts for every native inverter. The ratings are checked
+   as a manual supervision's are: verified identity and gateway claim, and a
+   total within the site export limit. Leave every field empty to clear them.
+2. Call `ha_spark.set_export_during_events` with `enabled: true`. Only a
+   non-system Home Assistant administrator can, so automations and scripts
+   are refused. Turning it on re-checks the ratings and records you as the
+   enabling admin, with the time.
+
+Ratings can't be changed while the switch is on; turn it off first. Turning it
+off keeps the ratings and stops further automatic supervisions. An export that
+is already running finishes, or you end it with **End supervision**.
+
+Each automatic supervision passes exactly the checks a manual one does:
+Optimise only, no manual control, no fallback, authority known and current,
+limits and supply guard open, device export bounds verified, and not tripped.
+The enabling admin is its confirming user and must still be a non-system
+administrator. Automatic export never runs in Observe, Protect, manual control
+or fallback. The tripwire, the stop latch and zero-confirmed clears apply
+unchanged, and an event refused as `tripped` stays refused until it ends.
+
+A refused event is retried on later plans until it ends, for example after a
+late switch into Optimise or a restart. Each event sends one notice per refusal
+reason (`ha-spark export`, through the notify target). Acceptances and
+refusals go to the export log, marked automatic. When an event moves or is
+cancelled, the automatic supervision for the old event ends with a
+zero-confirmed clear; the new event isn't armed until that clear is verified.
+A manual supervision is never replaced or ended by automatic export. An
+untrusted event read keeps the existing rule: a still-live verified export is
+preserved and nothing new is armed.
+
+If a rated inverter's identity or gateway claim changes (a Re-probe, a
+topology or claim edit, or a stored supervision that no longer matches after
+a restart), the switch turns itself off and you get a notice. Check the
+ratings, then turn it on again with the service.
+
+Limits:
+
+- An inverter swapped while Home Assistant was down, with no stored
+  supervision for it, can't be detected, because the opt-in stores no device
+  identity. Turn the switch off before you replace an inverter.
+- The export log holds a bounded number of entries. After a trip's stop latch
+  ends, a busy log can drop the `tripped` entry, after which that event is no
+  longer refused as `tripped`.
+
+`ha-spark health` and the integration's diagnostics show whether the switch is
+on, since when, and the stored ratings. They never show the admin's user id.
+
 ### Re-pairing after re-adding the integration
 
 The add-on pairs with the first site that sends it a current snapshot and
@@ -304,6 +359,9 @@ entities. The integration checks entry preconditions when you request a mode.
 Without a live integration snapshot the mode page shows SoC as unavailable,
 never the configured SoC entity, and every mode request is refused as
 `authority_unknown` until the snapshot returns.
+On an integration-owned site, **Export during events** shows `on since <time>`
+or `off`, with each inverter's stored rating in watts; without a current
+integration snapshot it warns `integration state unavailable`.
 
 Each native **Solis transport (<id>)** row reads validation through the daemon,
 without probing Modbus or writing a test schedule. `validated` is OK;

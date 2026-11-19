@@ -114,6 +114,32 @@ def test_invalid_evidence_freshness_is_field_local(client, state, change):
     assert link_view(state.integration_link, NOW)["evidence"] is None
 
 
+@pytest.mark.usefixtures("retired_addon")
+@pytest.mark.parametrize("change", [
+    None, {"export_enabled_by": "stored-admin-user-id-canary"},
+    {"export_enabled_at": None}, {"export_ratings_w": {"unknown": 5000}},
+])
+def test_flexibility_events_never_changes_snapshot_acceptance(client, state, change):
+    body = fixture("site_snapshot_v4_max")
+    assert post(client, body).status_code == 200
+    before = state.integration_link.v4
+    if change is None:
+        body.pop("flexibility_events")
+    else:
+        body["flexibility_events"].update(change)
+    assert post(client, body).status_code == 200
+    after = state.integration_link.v4
+    for field in ("owner", "authority", "holds", "devices", "banks", "evidence",
+                  "export", "writers"):
+        assert getattr(after, field) == getattr(before, field)
+    assert after.flexibility_events is None
+    assert after.flexibility_events_reason == (
+        None if change is None else "invalid_flexibility_events")
+    view = link_view(state.integration_link, NOW)
+    assert view["flexibility_events"] is None
+    assert "stored-admin-user-id-canary" not in json.dumps(view)
+
+
 def test_shared_versions():
     contract = fixture("contract")
     assert API_VERSION == contract["api_version"] == 4

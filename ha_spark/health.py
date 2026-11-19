@@ -22,6 +22,7 @@ import aiosqlite
 from pydantic import ValidationError
 
 from ha_spark.api.site_pairing import load_pairing
+from ha_spark.api.snapshot_v4 import FlexibilityEvents
 from ha_spark.authority import load_authority, retirement_status
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import submit_socket
@@ -649,6 +650,27 @@ async def check_native_soc(settings: Settings) -> CheckResult:
     )
 
 
+async def check_flexibility_events(settings: Settings) -> CheckResult:
+    """Re-validate the display-only IPC projection; never expose rejected values."""
+    unavailable = CheckResult(
+        "Export during events", Status.WARN, "integration state unavailable")
+    try:
+        reply = await submit_socket(settings, "integration_link")
+        view = reply.integration_link if reply is not None and reply.error is None else None
+        if not isinstance(view, dict) or view.get("state") != "connected":
+            return unavailable
+        events = FlexibilityEvents.model_validate(view.get("flexibility_events"))
+        ratings = ", ".join(
+            f"{key} {watts:.0f} W" for key, watts in sorted(events.export_ratings_w.items()))
+        state = (f"on since {events.export_enabled_at.isoformat()}"
+                 if events.export_during_events and events.export_enabled_at else "off")
+        return CheckResult(
+            "Export during events", Status.OK,
+            f"{state}; ratings {ratings}" if ratings else f"{state}; no ratings")
+    except Exception:  # noqa: BLE001 - no diagnostic failure may abort the other health rows
+        return unavailable
+
+
 def check_hold_release(settings: Settings) -> list[CheckResult]:
     """A WARN per owned hold whose release has been refused (#449); nothing otherwise.
 
@@ -942,7 +964,8 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_integration_link(settings),
         check_authority_owner(settings),
         check_site_pairing(settings),
-        *([check_native_soc(settings)] if retirement_status(settings) is not None else []),
+        *([check_native_soc(settings), check_flexibility_events(settings)]
+          if retirement_status(settings) is not None else []),
         check_ha_rest(settings),
         *([check_notify_service(settings)] if settings.notify_service else []),
         check_ha_websocket(settings),

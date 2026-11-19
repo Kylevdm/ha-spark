@@ -158,6 +158,11 @@ def link_view(link: IntegrationLink, now: datetime) -> dict[str, object]:
             and source.source == "entity"
         } if (link.v4 is not None and link.v4.owner == "integration"
               and link.v4.evidence is not None and link.v4.evidence_reason is None) else None,
+        "flexibility_events": link.v4.flexibility_events.model_dump(mode="json") if (
+            link.v4 is not None and link.v4.owner == "integration"
+            and link.v4.flexibility_events is not None
+            and link.v4.flexibility_events_reason is None
+        ) else None,
         "topology_source": link.topology.kind,
         "topology_revision": link.topology.revision,
         "topology_reason": link.topology.reason,

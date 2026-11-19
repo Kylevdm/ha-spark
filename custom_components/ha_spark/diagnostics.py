@@ -1,7 +1,8 @@
 """Redacted entry diagnostics with validated display data and fixed link outcomes.
 
 Only the last counted summary, version metadata, Solcast health and the supply
-guard's bounded state, history and raw readings are exposed, never HTTP objects,
+guard's bounded state, history and raw readings, plus the Export during events
+switch, enabling time and stored ratings are exposed, never enabling user ids, HTTP objects,
 headers, raw payloads, site identifiers or exception text.
 """
 
@@ -14,7 +15,7 @@ from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
-from . import SparkConfigEntry, wire
+from . import SparkConfigEntry, flexibility_events, wire
 from .coordinator import SparkCoordinator
 
 # Entry fields that identify or authenticate the site; redaction never fails open.
@@ -90,6 +91,10 @@ async def async_get_config_entry_diagnostics(
     redacted = async_redact_data(dict(entry.data), TO_REDACT)
     # Home Assistant deletes runtime_data on unload but still serves diagnostics.
     coordinator = getattr(entry, "runtime_data", None)
+    events = flexibility_events.stored(
+        entry.options.get(flexibility_events.OPTION_KEY)).model_dump(mode="json", include={
+            "export_during_events", "export_enabled_at", "export_ratings_w",
+        })
     if coordinator is None:
         return {
             "entry": redacted, "summary": None, "last_outcome": None, "last_outcome_at": None,
@@ -100,6 +105,7 @@ async def async_get_config_entry_diagnostics(
             "supply_guard": None,
             "native_links": None,
             "evidence": None,
+            "flexibility_events": events,
             "last_refusal": None,
         }
     return {
@@ -122,4 +128,5 @@ async def async_get_config_entry_diagnostics(
         "supply_guard": _guard_health(coordinator),
         "native_links": _native_links(coordinator),
         "evidence": _evidence_health(coordinator),
+        "flexibility_events": events,
     }

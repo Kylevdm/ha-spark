@@ -24,7 +24,7 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from . import wire
+from . import flexibility_events, wire
 from .authority import AuthorityStore
 from .authority_control import AuthorityControl
 from .channel import Outcome, PollResult, async_poll
@@ -362,6 +362,14 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
                                   via_sibling=result.via_sibling)
             snapshot["evidence"] = sources
         snapshot["banks"] = self.soc.snapshot()
+        try:
+            options = flexibility_events.stored(
+                self.entry.options.get(flexibility_events.OPTION_KEY))
+            snapshot["flexibility_events"] = options.model_dump(mode="json", include={
+                "export_during_events", "export_enabled_at", "export_ratings_w",
+            })
+        except Exception:  # noqa: BLE001 - a display block never blocks the heartbeat
+            snapshot.pop("flexibility_events", None)
         if isinstance(topology, Topology):
             try:
                 snapshot["export"] = self._export_snapshot(state, topology)

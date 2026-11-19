@@ -120,3 +120,4 @@ async def test_native_soc_row_only_when_retired(settings, monkeypatch, retired):
     monkeypatch.setattr(health, "check_evidence_freshness", AsyncMock(return_value=[]))
     rows = await health.run_health(settings)
     assert any(row.name == "check_native_soc" for row in rows) is retired
+    assert any(row.name == "check_flexibility_events" for row in rows) is retired
