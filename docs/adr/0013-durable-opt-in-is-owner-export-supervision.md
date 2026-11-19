@@ -44,8 +44,9 @@ No supervision is added for import.
   control or fallback.
 - Turning the opt-in off stops further automatic supervisions. It does not
   end one that is already running.
-- Alternatives rejected: an HA automation that sends `supervise_export` (not
-  durable, and the add-on would hold no owner consent); the switch in the
+- Alternatives rejected: an owner automation that sends `supervise_export`
+  for each event (consent would live outside the authority owner, and a
+  missed send is a silent missed event, as on 2026-11-17); the switch in the
   options flow (no trusted user id, so it could never be turned on);
   recording a generic "options flow admin" (no accountable user, and an
   options flow started from code bypasses the admin check).
