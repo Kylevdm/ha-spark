@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.0
+
+- **Export during events (#721–#724).** On native sites, the integration can now supervise every export flexibility event itself, so a paid export event no longer needs **Arm supervised export** each time. Enter each inverter's export rating in **Options → Flexibility events**, then an administrator turns it on with the new `ha_spark.set_export_during_events` service. It's off by default. Each automatic supervision passes the same checks as a manual one: Optimise only, never in Observe, Protect, manual control or fallback. The tripwire and stop latch are unchanged, and a manual supervision is never replaced. A refused event is retried until it ends and sends one notice per reason. A change to a rated inverter's identity or gateway claim switches it off. `ha-spark health` and the integration diagnostics show the switch state and ratings.
+
 ## 0.32.7
 
 - Native protection evidence can now use an optional liveness entity per group (EV: status, plug and power; dispatch: live dispatch and adjusted rate). A change-only source whose own report is stale but no older than 12 hours counts as fresh while its group's liveness entity reported within that source's maximum age. A sibling never clears an EV hold. Diagnostics and the snapshot show `via_sibling`, and on integration-owned sites `ha-spark health` Evidence rows now show the integration's own maximum ages and sibling result (#679).
