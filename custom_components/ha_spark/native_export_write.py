@@ -645,7 +645,10 @@ class NativeExportWrites:
                     zone = c.control.household_zone()
                     refusal = self._export_policy_reason(inverter, epoch)
                     if refusal is None:
-                        if any(latch.event == event for latch in state.stop_latches):
+                        if (any(latch.event == event for latch in state.stop_latches)
+                                or any(row.kind == "tripped"
+                                       and native_export_log.same_event(row.event, event)
+                                       for row in state.export_transitions)):
                             # A trip drops the bound, so the latch is judged first.
                             refusal = "tripped"
                         elif native_export_log.held_aborted(

@@ -4,7 +4,8 @@ The options step stores the per-inverter export ratings; only the admin-only
 ``set_export_during_events`` owner service turns **Export during events** on,
 because Home Assistant's options flow carries no trusted user id.
 """
-from typing import Annotated
+from collections.abc import Mapping
+from typing import Annotated, Any
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
@@ -37,3 +38,43 @@ def stored(raw: object) -> FlexibilityEventsOptions:
         # An enabled switch with no accountable admin is never on.
         return options.model_copy(update={"export_during_events": False})
     return options
+
+
+def switched_off(raw: object) -> dict[str, Any]:
+    """Keep ratings, but require the owner service to confirm consent again."""
+    return stored(raw).model_copy(update={
+        "export_during_events": False, "export_enabled_by": None, "export_enabled_at": None,
+    }).model_dump(mode="json")
+
+
+def changed_rated_claims(
+    options: Mapping[str, Any], claims: object, *, proposed_topology: object = None,
+) -> set[str]:
+    """Compare proposed gateway claims with the entry's previous claims, without rows."""
+    from .native_export import claim_from_raw
+    from .topology import Topology, validate_topology
+
+    topology = validate_topology(options.get("topology"))
+    if not isinstance(topology, Topology):
+        return set()
+    ratings = stored(options.get(OPTION_KEY)).export_ratings_w
+
+    def claim_for(raw: object, host: str | None, port: int, unit: int) -> object:
+        return next((claim_from_raw(item) for item in (raw if isinstance(raw, list) else [])
+                     if isinstance(item, dict) and item.get("host") == host
+                     and item.get("port") == port and item.get("unit_id") == unit), None)
+
+    proposed = (validate_topology(proposed_topology) if proposed_topology is not None
+                else topology)
+
+    def bindings(site: Topology, raw_claims: object) -> dict[str, object]:
+        return {inverter.id: (
+            inverter.gateway_host, inverter.gateway_port, inverter.gateway_unit_id,
+            claim_for(raw_claims, inverter.gateway_host,
+                      inverter.gateway_port, inverter.gateway_unit_id),
+        ) for inverter in site.inverters}
+
+    previous = bindings(topology, options.get("gateway_claims"))
+    current = bindings(proposed, claims) if isinstance(proposed, Topology) else {}
+    return {inverter_id for inverter_id in ratings
+            if previous.get(inverter_id) != current.get(inverter_id)}

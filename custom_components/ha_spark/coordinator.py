@@ -139,14 +139,23 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
 
     async def async_reprobe(self, inverter_id: str) -> bool:
         """Native admin command seam; authentication belongs to the caller boundary."""
+        previous = self.native.identities.get(inverter_id)
         found = await self.native.async_reprobe(inverter_id)
         # A Re-probe that changes the identity invalidates that inverter's bound
         # until a new supervise_export (Q22a): its supervision rows are dropped.
         async with self.control.lock:
             state = self.authority.state
+            probe = self.native.probes.get(inverter_id)
+            identity = tuple(probe.identity) if probe is not None else None
+            # A failed read drops the bound, but is not evidence of a replacement.
+            if identity and (inverter_id in self.native.identity_changed
+                             or previous is not None and identity != previous
+                             or state is not None and any(
+                                 row.inverter_id == inverter_id and row.identity != identity
+                                 for row in state.export_supervisions)):
+                if not self._export_device_changed_locked({inverter_id}):
+                    return found
             if state is not None:
-                probe = self.native.probes.get(inverter_id)
-                identity = tuple(probe.identity) if probe is not None else None
                 kept = tuple(row for row in state.export_supervisions
                              if row.inverter_id != inverter_id or row.identity == identity)
                 if len(kept) != len(state.export_supervisions):
