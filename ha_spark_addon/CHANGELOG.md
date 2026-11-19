@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.33.1
+
+- **SoC check and V2L charging (#735).** V2L charging no longer makes the SoC integrity check fail and start fallback. Before, a V2L charger topping up the battery while the inverter discharged kept SoC level, the check reported "SoC disagrees with battery energy flow", and fallback cancelled export events. The check now counts fresh V2L input at face value. On integration-owned sites, set the new optional **V2L power sensor** on the V2L charger in Options → Site topology and limits; on add-on-owned sites it uses `v2l_power_entity` and `battery_power_discharge_sign`. Without a fresh V2L reading the check is as strict as before.
+- **After updating:** on integration-owned sites with a V2L charger, set its **V2L power sensor** in Options → Site topology and limits. Update the add-on and the integration together: an older add-on refuses a topology with this field.
+
 ## 0.33.0
 
 - **Export during events (#721–#724).** On native sites, the integration can now supervise every export flexibility event itself, so a paid export event no longer needs **Arm supervised export** each time. Enter each inverter's export rating in **Options → Flexibility events**, then an administrator turns it on with the new `ha_spark.set_export_during_events` service. It's off by default. Each automatic supervision passes the same checks as a manual one: Optimise only, never in Observe, Protect, manual control or fallback. The tripwire and stop latch are unchanged, and a manual supervision is never replaced. A refused event is retried until it ends and sends one notice per reason. A change to a rated inverter's identity or gateway claim switches it off. `ha-spark health` and the integration diagnostics show the switch state and ratings.
