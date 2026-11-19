@@ -755,6 +755,7 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                 "bank_id", default=defaults.get("bank_id")
             ): self._select_over("banks"),
             probatio.Required("max_current_a", default=defaults.get("max_current_a", 0)): _NUMBER,
+            probatio.Optional("power_entity"): _ENTITY,
         })
 
     def _ev_schema(self, defaults: dict[str, Any]) -> probatio.Schema:

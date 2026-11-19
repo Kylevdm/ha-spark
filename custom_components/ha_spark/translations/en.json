@@ -563,7 +563,11 @@
         "data": {
           "id": "Identifier",
           "bank_id": "Battery bank",
-          "max_current_a": "Maximum DC current (A)"
+          "max_current_a": "Maximum DC current (A)",
+          "power_entity": "V2L power sensor (W)"
+        },
+        "data_description": {
+          "power_entity": "Lets the SoC check account for V2L charging."
         }
       },
       "v2l_chargers_edit": {

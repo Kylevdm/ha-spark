@@ -2,8 +2,9 @@
 
 Successful native read time replaces HA last_reported. There is no sibling
 liveness substitution: unchanged_too_long remains wire vocabulary but is
-unreachable here. Absolute power is integrated by trapezoid; a changed passing
-SoC rebaselines it, and two distinct reads may confirm a BMS recalibration.
+unreachable here. Absolute power is integrated by trapezoid, with separate
+adjustments for fresh V2L evidence. A changed passing SoC rebaselines the sums,
+and two distinct reads may confirm a BMS recalibration.
 Neither failure counts nor recovery progress survive a restart. No substitute
 SoC, persistence, fallback application or write permission lives here.
 """
@@ -45,7 +46,8 @@ class BankTrust:
 
 def check_soc(value: object, read_at: datetime | None, *, now: datetime,
               max_age: timedelta, baseline_soc: float | None = None,
-              energy_kwh: float | None = None, capacity_kwh: float = 0) -> BankTrust:
+              energy_kwh: float | None = None, capacity_kwh: float = 0,
+              stuck_energy_kwh: float | None = None) -> BankTrust:
     """Judge a native observation without inventing either a value or timestamp."""
     reason: SocStatus = "ok"
     parsed: float | None = None
@@ -75,8 +77,10 @@ def check_soc(value: object, read_at: datetime | None, *, now: datetime,
               and isfinite(capacity_kwh) and capacity_kwh > 0):
             delta = abs(parsed - baseline_soc)
             explained = energy_kwh / capacity_kwh * 100
+            stuck_explained = (explained if stuck_energy_kwh is None
+                               else stuck_energy_kwh / capacity_kwh * 100)
             if delta > explained + ENERGY_TOLERANCE_PCT or (
-                delta == 0 and explained > ENERGY_TOLERANCE_PCT
+                delta == 0 and stuck_explained > ENERGY_TOLERANCE_PCT
             ):
                 reason = "implausible"
         if reason == "ok" and read_at is not None and now - read_at > max_age:
@@ -104,8 +108,10 @@ class SocMonitor:
         self._read_at: datetime | None = None
         self._baseline: float | None = None
         self._energy = 0.0
+        self._v2l_jump = self._v2l_stuck = 0.0
         self._power_at: datetime | None = None
         self._power: float | None = None
+        self._v2l_power: float | None = None
         self._rejected: float | None = None
         self._blocked = False
         self._since: datetime | None = None
@@ -135,7 +141,8 @@ class SocMonitor:
 
     def observe(self, value: object, *, read_at: datetime | None, now: datetime,
                 power_w: float | None, capacity_kwh: float, valid: bool = True,
-                fallback_active: bool = False, count: bool = True) -> BankTrust:
+                fallback_active: bool = False, count: bool = True,
+                v2l_power_w: float | None = None) -> BankTrust:
         """Consume only native evidence; collection outside ownership never counts failures."""
         minute = int(now.timestamp() // 60)
         if fallback_active:
@@ -158,13 +165,31 @@ class SocMonitor:
         if fresh:
             if power_w is not None and not isfinite(power_w):
                 power_w = None
+            if v2l_power_w is not None and (not isfinite(v2l_power_w) or v2l_power_w < 0):
+                v2l_power_w = None
             if self._power_at is not None and self._power is not None and power_w is not None:
                 elapsed = max(0.0, (now - self._power_at).total_seconds())
-                self._energy += (abs(self._power) + abs(power_w)) / 2 * elapsed / 3_600_000
-            self._power_at, self._power = now, power_w
+                absolute = (abs(self._power) + abs(power_w)) / 2 * elapsed / 3_600_000
+                self._energy += absolute
+                jump = stuck = absolute
+                if self._v2l_power is not None and v2l_power_w is not None:
+                    v2l_mean = (self._v2l_power + v2l_power_w) / 2
+                    jump += v2l_mean * elapsed / 3_600_000
+                    if self._v2l_power > 0 and v2l_power_w > 0:
+                        net = (self._power + power_w) / 2 + v2l_mean
+                        stuck = abs(net) * elapsed / 3_600_000
+                self._v2l_jump += jump
+                self._v2l_stuck += stuck
+            self._power_at, self._power, self._v2l_power = now, power_w, v2l_power_w
+            # Neither earlier V2L credit nor overflow may bypass the original check.
+            use_v2l = (v2l_power_w is not None and isfinite(self._v2l_jump)
+                       and isfinite(self._v2l_stuck))
+            energy = self._v2l_jump if use_v2l else self._energy
             result = check_soc(value, read_at, now=now, max_age=max_age,
                                baseline_soc=self._baseline,
-                               energy_kwh=self._energy if power_w is not None else None,
+                               energy_kwh=energy if power_w is not None else None,
+                               stuck_energy_kwh=(self._v2l_stuck
+                                                 if use_v2l and power_w is not None else None),
                                capacity_kwh=capacity_kwh)
             if result.reason == "implausible" and result.value != self._baseline:
                 if result.value == self._rejected:
@@ -174,6 +199,7 @@ class SocMonitor:
                 self._rejected = None
             if result.reason == "ok" and result.value != self._baseline:
                 self._baseline, self._energy = result.value, 0.0
+                self._v2l_jump = self._v2l_stuck = 0.0
             self._read_at = read_at
         else:
             # Do not re-run energy/recalibration or adopt a different value on
@@ -181,7 +207,7 @@ class SocMonitor:
             # and a minute without fresh evidence discards a recalibration candidate.
             self._rejected = None
             if power_w is None:
-                self._power_at, self._power = now, None
+                self._power_at, self._power, self._v2l_power = now, None, None
             result = check_soc(self.view.value, self.view.read_at, now=now, max_age=max_age)
             if result.reason == "ok" and self.view.reason != "ok":
                 result = BankTrust(result.value, result.read_at, "untrusted", self.view.reason)

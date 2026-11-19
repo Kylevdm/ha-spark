@@ -76,17 +76,76 @@ def test_same_read_cannot_recalibrate_or_advance_recovery() -> None:
     assert result.reason == "implausible"
 
 
-def test_stuck_energy_and_missing_power() -> None:
+@pytest.mark.parametrize("v2l_power_w", [None, 0.0])
+def test_stuck_energy_without_v2l(v2l_power_w: float | None) -> None:
     monitor = SocMonitor()
-    for minute in range(35):
+    for minute in range(36):
         at = NOW + timedelta(minutes=minute)
-        result = monitor.observe(50, read_at=at, now=at, power_w=1000, capacity_kwh=26.88)
+        result = monitor.observe(50, read_at=at, now=at, power_w=1000, capacity_kwh=26.88,
+                                 v2l_power_w=v2l_power_w)
     assert result.reason == "implausible"
+    assert monitor.fallback_requested
+
+
+def test_stuck_energy_and_missing_power() -> None:
     monitor = SocMonitor()
     for minute, power in [(0, 1000), (60, None), (120, 1000)]:
         at = NOW + timedelta(minutes=minute)
         result = monitor.observe(50, read_at=at, now=at, power_w=power, capacity_kwh=26.88)
     assert result.trust == "trusted"
+
+
+@pytest.mark.parametrize("missing_at", [None, 25])
+def test_v2l_offsets_discharge_only_with_current_evidence(missing_at: int | None) -> None:
+    monitor = SocMonitor()
+    for minute in range(36):
+        at = NOW + timedelta(minutes=minute)
+        result = monitor.observe(50, read_at=at, now=at, power_w=-1300, capacity_kwh=26.88,
+                                 v2l_power_w=None if minute == missing_at else 1740)
+        if minute == missing_at:
+            assert result.reason == "implausible"
+            assert result.trust == "untrusted"
+        else:
+            assert result.reason == "ok"
+            assert result.trust == "trusted"
+        assert not monitor.fallback_requested
+
+
+@pytest.mark.parametrize("value,v2l_power_w,reason", [
+    (56, 2000, "ok"), (70, 2000, "implausible"), (55, None, "implausible"),
+])
+def test_v2l_jump_requires_enough_energy_and_current_evidence(
+    value: int, v2l_power_w: float | None, reason: str,
+) -> None:
+    monitor = SocMonitor()
+    for minute in range(10):
+        at = NOW + timedelta(minutes=minute)
+        assert monitor.observe(50, read_at=at, now=at, power_w=-1000, capacity_kwh=10,
+                               v2l_power_w=2000).reason == "ok"
+    at = NOW + timedelta(minutes=10)
+    assert monitor.observe(value, read_at=at, now=at, power_w=-1000, capacity_kwh=10,
+                           v2l_power_w=v2l_power_w).reason == reason
+    if reason == "ok":
+        at += timedelta(minutes=1)
+        assert monitor.observe(value, read_at=at, now=at, power_w=0, capacity_kwh=10,
+                               v2l_power_w=None).trust == "trusted"
+
+
+def test_stuck_soc_fails_when_v2l_drives_significant_net_charge() -> None:
+    monitor = SocMonitor()
+    monitor.observe(50, read_at=NOW, now=NOW, power_w=-1000, capacity_kwh=10, v2l_power_w=3000)
+    at = NOW + timedelta(minutes=10)
+    result = monitor.observe(50, read_at=at, now=at, power_w=-1000, capacity_kwh=10,
+                             v2l_power_w=3000)
+    assert result.reason == "implausible"
+
+
+def test_overflowing_v2l_energy_does_not_bypass_integrity_check() -> None:
+    monitor = SocMonitor()
+    monitor.observe(50, read_at=NOW, now=NOW, power_w=0, capacity_kwh=10, v2l_power_w=1e308)
+    at = NOW + timedelta(minutes=1)
+    result = monitor.observe(70, read_at=at, now=at, power_w=0, capacity_kwh=10, v2l_power_w=1e308)
+    assert result.reason == "implausible"
 
 
 @pytest.mark.parametrize("seconds,reason", [(-1, "report_time_future"), (0, "ok"),

@@ -6,10 +6,12 @@ only for the confirmed integration owner with a working authority store.
 """
 
 from datetime import UTC, datetime, timedelta
+from math import isfinite
 from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
+from .native_hold import fresh
 from .soc_trust import BankTrust, Policy, SocMonitor
 from .solis_frames import POINTS, Reading, decode
 from .topology import Inverter, Topology, validate_topology
@@ -41,6 +43,21 @@ class NativeSoc:
     def _source(self, bank_id: str) -> Inverter | None:
         sources = [i for i in self.coordinator.native.inverters.values() if i.bank_id == bank_id]
         return sources[0] if len(sources) == 1 else None
+
+    def _v2l_power(self, bank_id: str, now: datetime) -> float | None:
+        if self.topology is None:
+            return None
+        entity_id = next((c.power_entity for c in self.topology.v2l_chargers
+                          if c.bank_id == bank_id), None)
+        state = self.coordinator.hass.states.get(entity_id) if entity_id else None
+        if (state is None or state.attributes.get("unit_of_measurement") != "W"
+                or not fresh(state.last_reported, now, 120)):
+            return None
+        try:
+            watts = float(state.state)
+        except (ValueError, OverflowError):
+            return None
+        return watts if isfinite(watts) and watts >= 0 else None
 
     def observe(self, now: datetime) -> None:
         """Minute-deduplicated observations; last-good cache is never a reconnect substitute."""
@@ -75,6 +92,7 @@ class NativeSoc:
                 value, read_at=good.read_at if good else None, now=now,
                 power_w=power if isinstance(power, float) and reading is not None else None,
                 capacity_kwh=bank.usable_capacity_kwh, valid=valid, fallback_active=fallback,
+                v2l_power_w=self._v2l_power(bank.id, now),
             )
 
     def bank(self, bank_id: str) -> BankTrust:

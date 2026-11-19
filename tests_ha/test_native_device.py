@@ -38,8 +38,9 @@ def hass_config_dir(tmp_path: Path) -> str:
 
 async def native_entry(
     hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, *, two_units: bool = False,
+    topology: dict[str, Any] | None = None,
 ) -> MockConfigEntry:
-    topology = deepcopy(STORED_TOPOLOGY)
+    topology = deepcopy(STORED_TOPOLOGY if topology is None else topology)
     topology["inverters"][0].update(transport="native", gateway_host="gateway.invalid")
     claims = [{"host": "gateway.invalid", "port": 502, "unit_id": 1}]
     if two_units:
