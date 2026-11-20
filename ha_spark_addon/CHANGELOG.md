@@ -1,5 +1,97 @@
 # Changelog
 
+## 0.40.0
+
+- **Daytime purchases now reach native Solis (#687).** On an integration-owned
+  native Solis site in Optimise, a daytime purchase sends a dated charge device
+  intent using API version 5. An older integration gets no daytime window and
+  the plan names that refusal. The integration writes and reads back the
+  charge half of Slot 2, leaving Slot 1
+  and Slot 2's discharge half untouched. The shared charge current follows the
+  next charge window; later-day windows wait until they cannot fire early.
+  Protect, fallback, manual control, Observe, untrusted SoC or inverter clock,
+  and an active hold never arm one (`hold_active` names the hold refusal).
+  Add-on-owned, AlphaESS and legacy Solis sites get no window and the plan
+  names the refusal. At the window's end, when no purchase remains or when the
+  site leaves Optimise, the integration clears it with five further zero
+  reads. A failed clear retries every 30 seconds and raises **Daytime charge
+  window not cleared**, warning that the inverter may charge daily at that
+  time until cleared. The record survives restarts and Re-probes, so cleanup
+  still runs without the add-on. The plan shows purchases and refusals with
+  their reasons, without a purchase saving figure. Power-ups (#684), shrinking
+  the purchase before a session (#685) and live trimming of the Happy Hour
+  session allowance (#686) are not included.
+- **One shared Octopus sign-in token (#688).** Every Octopus GraphQL read (planned dispatches, agreement rates) now shares one short-lived token, held in memory only, instead of requesting a new one each time. It is renewed shortly before it expires and once if Octopus rejects it.
+- **Weekend Happy Hour bookings are read (#689).** ha-spark reads your booked
+  Octopus Weekend Happy Hours from the Octopus backend endpoint (ADR-0004),
+  read-only, with the Octopus API key and account number you already set.
+  `ha-spark health` gains a **Happy Hour** row: disabled, not configured, read
+  failed, no booking, or booked with its times.
+  New settings: `octopus_backend_api_url` (blank turns the
+  source off) and `happy_hour_enabled` (default on).
+- **Free Electricity Sessions are read (#690).** ha-spark now reads the Octopus Free Electricity Sessions listed for your account from the public Octopus API, read-only, and counts them only when the account is enrolled in the campaign. `ha-spark health` gains a Free Electricity line: disabled, not configured, read failed, not enrolled, no session, or the session times. The new setting `free_electricity_enabled` (default on) switches the source off.
+- **Daytime charging in a Free Electricity session (#691).** The planner can now plan a daytime charge during an Octopus Free Electricity session: the battery fills towards its target cap within the device, bank and site limits and the major-load reserve, house load in the session is still costed at the normal rate, and the next overnight charge shrinks by what the session provides. The plan lists each daytime purchase with its reason.
+- **Octopus sessions now reach the plan (#692).** Each enabled session source
+  is polled at most every 30 minutes, concurrently, and cached in memory, so a
+  plan never calls Octopus on every tick and one slow source cannot add its
+  timeout after the other's. A reading 2 hours old counts as no session, a
+  session already under way keeps its last good reading until it ends only when
+  that reading still covered its start, and a session whose evidence expired
+  before it started never comes back merely because time passed. A failed poll
+  never clears a reading still inside its 2 hours; a successful read with
+  nothing booked clears the old bookings. Trusted sessions, and whether each
+  source's evidence is trusted, are carried into the plan's inputs; one-off CLI
+  plan commands read once and follow the same rules, while every plan surface
+  in the daemon shares the same half-hourly cache.
+- **Happy Hour charging (#693).** The planner can plan a daytime charge during a booked Octopus Happy Hour, sized inside what Octopus credits: at most 16 kWh per booked hour, less a 10% margin and the forecast house load for that hour. Each hour has its own allowance, never pooled with the next, and the reason line names the limit that bound the size (the headroom to the target cap, the Happy Hour allowance or the charge rate). Free Electricity wins a slot both offers cover.
+- **Happy Hour allowance is counted from your meter (#694).** Each booked
+  Happy Hour's remaining allowance now reflects the grid import actually
+  delivered since that hour began. The start reading and latest reading are
+  kept per booking in the add-on's data store, so a restart mid-hour does not
+  reset the count, and adjacent hours are counted separately. If the cumulative
+  import entity is unset, unreadable, stale, goes backwards or jumps by more
+  than the site's supply limit allows, the booking falls back to the ordinary
+  tariff instead of assuming free energy, and `health` names the reason. A
+  reset or implausible jump keeps that hour on the ordinary tariff even after a
+  later reading catches up, a changed meter source never reuses the old count,
+  and an hour without a reading that covers its start is not granted an
+  allowance; a fresh reading taken shortly before the hour starts counts as
+  its start reading. Once the allowance is used up, the rest of that hour is costed at
+  the ordinary tariff. Free Electricity is unaffected because it has no cap or
+  counter.
+- **One import-price winner per slot, with the loser named (#695).** When a
+  hold, an Axle export event, a negative explicit price, Free Electricity and a
+  Happy Hour overlap, the plan now uses the highest-precedence offer only:
+  holds first, then Axle export events, then negative explicit prices, then Free
+  Electricity, then Happy Hour (the Power-up place stays reserved for #684).
+  A held or Axle-event slot carries no session overlay, so a session only buys
+  in its slots outside the event or hold. A negative price beats a free session
+  in the same slot and spends none of the Happy Hour allowance. Each purchase
+  reason names its winning overlay and any offer set aside, and held session
+  candidates are retained for the later refusal display.
+- **Cheap daytime charging on a dynamic tariff (#696).** When a
+  half-hour has an explicit live price below the overnight price, the planner
+  now buys cheap daytime energy towards the target cap and shrinks the next
+  overnight charge by what it bought. A negative price is bought and costed at
+  that price. Only a real per-slot price can justify a purchase; a fallback,
+  partial or projected price is ignored.
+- **Daytime purchases from a started dispatch, with the hold refusal (#697).** A
+  dispatch half-hour already under way with the car drawing now plans a
+  daytime purchase at the off-peak rate and shrinks the next overnight charge,
+  clipped to that half-hour's remaining time. A live or adjusted dispatch flag
+  alone still only holds. On a coarse-hold inverter such as Solis the purchase
+  is kept in the plan as a refused diagnostic that names the dispatch hold: it
+  adds no energy, cost or SoC benefit, sends no dated charge window and does not
+  shrink the overnight purchase. The held part of a Happy Hour, Free
+  Electricity session or explicit cheap or negative dynamic slot inside an EV or
+  dispatch hold is refused the same way, even when another part of the same
+  session buys outside the hold, and a refused Happy Hour is sized with the same allowance,
+  margin, house forecast and charge limits as an admitted one. A driver without
+  coarse holds can admit the dispatch purchase. Planned or forecast dispatches
+  and untrusted draw evidence never buy.
+- **Daytime purchases in the plan views (#698).** The plan summary shows a daytime purchase as the current or next charge with the planner's own reason, the CLI plan report lists every daytime purchase, the ingress timeline marks purchase lines as simulated in Observe, and the offline assistant answers "why is the battery charging?" from the purchase reasons.
+- **After updating:** update the add-on and the companion integration together. Either order works, but daytime windows need both at 0.40.0 (API version 5); until then the plan names the refusal and no window is written.
+
 ## 0.33.1
 
 - **SoC check and V2L charging (#735).** V2L charging no longer makes the SoC integrity check fail and start fallback. Before, a V2L charger topping up the battery while the inverter discharged kept SoC level, the check reported "SoC disagrees with battery energy flow", and fallback cancelled export events. The check now counts fresh V2L input at face value. On integration-owned sites, set the new optional **V2L power sensor** on the V2L charger in Options → Site topology and limits; on add-on-owned sites it uses `v2l_power_entity` and `battery_power_discharge_sign`. Without a fresh V2L reading the check is as strict as before.
