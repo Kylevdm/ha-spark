@@ -51,6 +51,19 @@ buy-back can spend that protection. Events outside the horizon are skipped.
 
 Daytime dispatch slots are expressed as ``holds`` on the ``ChargeIntent``, so
 the battery holds (doesn't discharge) while cheap grid covers the house.
+
+A daytime purchase is a named charge towards the target cap, with evidence,
+price and reason. The import-price overlay supplies free session candidates
+(Free Electricity or Happy Hour, within its session allowance). Explicit dynamic
+prices below the overnight price and a started dispatch half-hour with trusted
+car-draw evidence can also buy. Purchases respect effective limits and the
+major-load reserve; the next overnight purchase shrinks by what was bought,
+not by an anticipated session. A purchase inside an EV or dispatch hold on a
+coarse-hold inverter such as Solis remains a refused diagnostic: no energy,
+cost or SoC benefit, no smaller overnight purchase and no dated charge window.
+Admitted purchases can produce a dated charge device intent; only the gated
+native Solis integration actuates it. Plan surfaces show purchase reasons and
+refusals, never a purchase saving figure.
 """
 
 from __future__ import annotations

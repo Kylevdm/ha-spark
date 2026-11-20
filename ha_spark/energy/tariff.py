@@ -19,6 +19,15 @@ provider's dispatch/window folding exactly (dispatches sourced from the
 Octopus API instead of an HA sensor) and overlays live per-slot prices from
 the Octopus standard-unit-rates API. When that is empty or unavailable, current
 account agreement rates price the same configured window and dispatches.
+
+The import-price overlay selects one offer per slot: holds, Axle export events,
+negative explicit prices, Free Electricity, then Happy Hour. A free session is
+an enrolled Free Electricity Session or a booked Happy Hour. Free Electricity
+has no cap; each Happy Hour's session allowance is 16 kWh less a fixed 10%
+margin, forecast house load and counted grid import. An unusable counter leaves
+the ordinary tariff in force. The schedule carries the winning offer, evidence,
+price and offers set aside for the planner's daytime purchases; it grants no
+write authority.
 """
 
 from __future__ import annotations

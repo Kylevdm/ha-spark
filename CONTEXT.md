@@ -559,11 +559,12 @@ _Avoid_: published plan, plan push
 
 **Device intent**:
 What an add-on command asks one device to do, in device terms rather than
-register values: a charge window, a current limit, a dated export window. The
-integration decides how to carry it out on that device, and reports back
-whether it landed: applied, unchanged, deferred, refused, unverified or failed.
-An export intent names a date as well as a time, and the integration programs
-it only when the device's clock-only window would fire inside the event.
+register values: an overnight charge window, a current limit, a dated export
+window or a dated charge window for a daytime purchase. The integration decides
+how to carry it out on that device, and reports back whether it landed: applied,
+unchanged, deferred, refused, unverified or failed. A dated intent names a date
+as well as a time. The integration programs it only when the device's clock-only
+window will next fire inside the dated window; otherwise it is deferred.
 (Decision: #323, 2026-10-15.)
 _Avoid_: setpoint, register write (when meaning the request)
 
@@ -594,13 +595,45 @@ the plan. Without fresh carbon data the plan is exactly the cost-only plan.
 (Decision: #329, 2026-10-16.)
 _Avoid_: green mode, carbon optimisation, eco charging
 
+**Free session**:
+An Octopus period of free grid import: a booked Weekend Happy Hour or a Free
+Electricity Session for an enrolled account. Reading a free session never books
+it or changes the account. Free Electricity has no cap; a Happy Hour has its
+own session allowance.
+
+**Session allowance**:
+The energy a booked Happy Hour can still provide: up to 16 kWh per booking,
+less a fixed 10% margin, the forecast house load for that hour and grid import
+already counted against it. Bookings never share their allowance. An unusable
+cumulative import reading means ordinary tariff prices, not assumed free
+energy. This is distinct from the supply guard's charging allowance.
+
+**Import-price overlay**:
+The choice of one import-price offer for each slot, over the ordinary tariff.
+Precedence is holds, Axle export events, negative explicit prices, Free
+Electricity, then Happy Hour. A hold or Axle export event prevents a free
+session overlay in that slot. A purchase names the winning offer and any offer
+set aside.
+
+**Daytime purchase**:
+A named charge towards the target cap outside the overnight window, with its
+evidence, price and reason. It can use a free session, an explicit dynamic price
+below the overnight price, or a started dispatch half-hour at the off-peak
+rate. The next overnight purchase shrinks by what was bought, not by an
+anticipated session. A purchase inside an EV or dispatch hold on a coarse-hold
+inverter such as Solis remains a refused diagnostic naming the hold. It adds
+no energy or cost benefit and sends no dated charge window. A purchase has no
+saving figure.
+
 **Dispatch top-up**:
 Charging the house battery during a daytime Octopus dispatch, at the off-peak
 rate, with the energy it would otherwise need before the next overnight
 window. It is a cost decision, independent of Charge when clean. The overnight
 charge is never reduced in anticipation of a dispatch; only a dispatch that
-happens tops up, and replanning shrinks the next overnight charge.
-(Decision: #329, 2026-10-16.)
+happens tops up, and replanning shrinks the next overnight charge. On a
+coarse-hold inverter such as Solis, an EV or dispatch hold refuses the daytime
+purchase. The plan names the hold and leaves the overnight purchase unchanged.
+(Decision: #329, 2026-10-16; hold refusal #697.)
 
 **Clean dispatch**:
 A daytime dispatch whose forecast grid carbon intensity is lower than that of

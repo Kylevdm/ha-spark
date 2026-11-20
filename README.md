@@ -103,6 +103,23 @@ them.
 > [milestones](https://github.com/Kylevdm/ha-spark/milestones) track open work,
 > and [`CONTEXT.md`](CONTEXT.md) defines the project's terms.
 
+## Free and cheap daytime charging
+
+Alongside the overnight charge, ha-spark plans a **daytime purchase** towards
+the target cap from a booked Octopus Weekend Happy Hour, an enrolled Free
+Electricity Session, or an explicit dynamic price below the overnight price.
+A started dispatch half-hour can also buy at the off-peak rate. Each free
+session uses the import-price overlay; Happy Hour has a per-booking session
+allowance, while Free Electricity has no cap. The next overnight purchase
+shrinks by what was bought, not in anticipation of a session.
+
+Actuation is native Solis only, on integration-owned sites in Optimise. A hold
+refuses the daytime window. Other sites still show the plan and its refusal.
+Session reads never book or cancel anything or change the account, and no
+third-party session feeds are used. Power-ups (#684), shrinking the purchase
+before a session (#685) and live trimming of the Happy Hour session allowance
+(#686) are not included. See the [option reference](ha_spark_addon/DOCS.md#daytime-cheap-and-free-charging).
+
 ## Axle export events
 
 ha-spark can take part in [Axle](https://axle.energy) flexibility events. It
