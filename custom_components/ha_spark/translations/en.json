@@ -54,6 +54,10 @@
       "title": "Site grid reading missing during an export",
       "description": "The whole-site grid power reading has been missing or stale for over two minutes while a supervised export is live. The export continues within the inverter's confirmed bound; the tripwire cannot watch the site export limit until the reading returns."
     },
+    "dated_clear_failed": {
+      "title": "Daytime charge window not cleared",
+      "description": "A daytime charge window in the inverter's second time slot could not be cleared and confirmed zero. Until it is, the inverter may charge from the grid every day at that time. ha-spark retries the clear every 30 seconds outside Observe, and this repair clears itself once the slot reads zero. To stop it now, clear the second charge slot on the inverter."
+    },
     "clock_drift": {
       "title": "Inverter clock differs from the household clock",
       "fix_flow": {

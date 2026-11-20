@@ -304,6 +304,10 @@ class NativeFallback:
     async def _cancel_export(self, epoch: int, *, removal: bool = False) -> bool:
         results = [await self.coordinator.writes.async_cancel_export(
             i.id, epoch=epoch, removal=removal) for i in self._native()]
+        # A daytime window never outlives Optimise: its zero confirm and record
+        # retirement belong to the same step (#701).
+        results += [await self.coordinator.writes.async_clear_dated(
+            i.id, epoch=epoch, transition=True) for i in self._native()]
         return all(result.outcome in ("applied", "unchanged") for result in results)
 
     async def _write_fallback(self, state: AuthorityState, now: datetime) -> bool:

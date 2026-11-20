@@ -150,8 +150,8 @@ class NativeChargeBoundary(NativeDatedChargeWrites):
                 return "mode"
         elif cleanup:
             # A stale record is cleaned up in any owned non-Observe mode; Observe
-            # is the safe exit and never writes. Only a discharge-half zero is
-            # ever written on this path.
+            # is the safe exit and never writes. Only a Slot 1 discharge-half zero
+            # or a Slot 2 charge-half zero (#701) is ever written on this path.
             if state.committed_mode == "observe":
                 return "mode"
         elif transition:

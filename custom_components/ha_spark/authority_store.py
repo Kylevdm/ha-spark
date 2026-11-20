@@ -186,7 +186,8 @@ class DatedChargeRecord(Record):
     """A daytime window for Slot 2's charge half; in force only once ``armed``.
 
     Saved as ``unknown`` before the write, so a restart or Re-probe still knows
-    a window may be resident and must be cleared.
+    a window may be resident and must be cleared. ``clear_pending`` is a clear
+    that failed: the native tick retries it whatever the window's end.
     """
 
     inverter_id: Text
@@ -194,7 +195,7 @@ class DatedChargeRecord(Record):
     end: AwareDatetime
     store_id: UUID
     epoch: Epoch
-    state: Literal["unknown", "armed"]
+    state: Literal["unknown", "armed", "clear_pending"]
     last_reconcile_at: AwareDatetime
 
     @model_validator(mode="after")

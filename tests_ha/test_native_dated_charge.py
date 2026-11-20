@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from freezegun.api import FrozenDateTimeFactory
+from homeassistant.helpers import issue_registry as ir
 
 from custom_components.ha_spark.authority_store import (
     HoldDevice,
@@ -24,6 +25,7 @@ from custom_components.ha_spark.commands import (
 )
 from custom_components.ha_spark.coordinator import SparkCoordinator
 from custom_components.ha_spark.solis_frames import Reading
+from custom_components.ha_spark.transitions import Preconditions, TransitionRequest
 from tests_ha.fake_solis import FakeSolisDevice, WriteFault
 from tests_ha.test_native_export import (
     NOW,
@@ -367,3 +369,175 @@ async def test_a_malformed_dated_charge_is_refused_without_echo(
     text = result.model_dump_json()
     assert "secret-value" not in text and "99.5" not in text and "2026" not in text
     assert all(t.address == 43141 for t in native_transport.traffic if t.op == "write")
+
+
+# --- #701 clearing the daytime window ------------------------------------------
+
+def slot2_reads(transport: FakeSolisDevice) -> int:
+    return len([t for t in transport.traffic if t.op == "read" and t.address == 43153])
+
+
+async def armed(c: SparkCoordinator, transport: FakeSolisDevice,
+                monkeypatch: pytest.MonkeyPatch, **window: Any) -> None:
+    allow_export(c, monkeypatch, transport)
+    transport.set_holding(43143, [23, 30, 5, 30, 0, 0, 0, 0])
+    transport.set_holding(43153, [0, 0, 0, 0, 3, 0, 4, 0])
+    result = await c._async_dispatch_command(apply_command(c, [dated(**window)]))
+    assert result.intents[0].outcome == "applied"
+    transport.traffic.clear()
+
+
+async def test_none_clears_an_armed_window_and_confirms_the_zero(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await armed(writer, native_transport, monkeypatch)
+    result = await writer._async_dispatch_command(apply_command(writer, [
+        {"kind": "dated_charge", "inverter_id": "inv1", "request": "none"}], sequence=2))
+    assert result.intents[0].outcome == "applied"
+    assert slot_writes(native_transport, 43153) == [(0, 0, 0, 0, 3, 0, 4, 0)]
+    assert slot_writes(native_transport, 43143) == []
+    # Fresh read, verify read, then five further matching zero reads.
+    assert slot2_reads(native_transport) >= 7
+    assert records(writer) == []
+
+
+def request(kind: str) -> dict[str, Any]:
+    return {"kind": "dated_charge", "inverter_id": "inv1", "request": kind}
+
+
+async def test_untrusted_keeps_a_verified_window_for_a_session_under_way(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, freezer: FrozenDateTimeFactory,
+) -> None:
+    await armed(writer, native_transport, monkeypatch, start=NOW - timedelta(minutes=30))
+    freezer.move_to(NOW + timedelta(minutes=10))
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [request("untrusted")], sequence=2))
+    assert result.intents[0].outcome == "unchanged"
+    assert not [t for t in native_transport.traffic if t.op == "write"]
+    assert [state for *_, state in records(writer)] == ["armed"]
+
+
+@pytest.mark.parametrize("resident", ["foreign", "moved"])
+async def test_untrusted_clears_a_window_it_cannot_verify(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, resident: str,
+) -> None:
+    if resident == "foreign":
+        allow_export(writer, monkeypatch, native_transport)
+        native_transport.set_holding(43153, [13, 0, 15, 0, 0, 0, 0, 0])
+    else:
+        await armed(writer, native_transport, monkeypatch)
+        native_transport.set_holding(43153, [13, 0, 15, 0, 0, 0, 0, 0])
+    native_transport.traffic.clear()
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [request("untrusted")], sequence=2))
+    assert result.intents[0].outcome == "applied"
+    assert slot_writes(native_transport, 43153) == [(0,) * 8]
+    assert records(writer) == []
+
+
+@pytest.mark.parametrize("how", ["running", "restart"])
+async def test_the_tick_clears_the_window_at_its_end(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, freezer: FrozenDateTimeFactory, how: str,
+) -> None:
+    await armed(writer, native_transport, monkeypatch)
+    c = writer
+    if how == "restart":
+        # The add-on never calls again: the durable record alone drives the clear.
+        entry = writer.entry
+        assert await writer.hass.config_entries.async_reload(entry.entry_id)
+        await writer.hass.async_block_till_done()
+        c = entry.runtime_data
+        c.control.grace_until = NOW - timedelta(seconds=1)
+    native_transport.traffic.clear()
+    await c.writes.async_retry_dated(NOW + timedelta(hours=1, minutes=59))
+    assert not [t for t in native_transport.traffic if t.op == "write"]
+    end = NOW + timedelta(hours=2)
+    freezer.move_to(end)
+    await c.writes.async_retry_dated(end)
+    assert slot_writes(native_transport, 43153) == [(0, 0, 0, 0, 3, 0, 4, 0)]
+    assert slot_writes(native_transport, 43143) == []
+    assert slot2_reads(native_transport) >= 7
+    assert records(c) == []
+
+
+@pytest.mark.parametrize("target", ["protect", "observe", "manual"])
+async def test_leaving_optimise_clears_the_window_in_the_transition(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, target: str,
+) -> None:
+    await armed(writer, native_transport, monkeypatch)
+    writer.control.preconditions = lambda: Preconditions(True, True, True)
+    writer.control.grace_until = NOW - timedelta(seconds=1)
+    decision = await writer.control.async_request(
+        TransitionRequest(target=target), now=NOW, zone=ZoneInfo("UTC"))  # type: ignore[arg-type]
+    assert decision.refusal is None
+    assert records(writer) == []
+    assert slot_writes(native_transport, 43153)[-1][:4] == (0, 0, 0, 0)
+    assert slot2_reads(native_transport) >= 7
+    state = writer.authority.state
+    assert state is not None and "cancel_export" not in (
+        state.transition.steps if state.transition is not None else ())
+
+
+def dated_issues(c: SparkCoordinator) -> list[str]:
+    return [issue_id for (domain, issue_id) in ir.async_get(c.hass).issues
+            if domain == "ha_spark" and issue_id.startswith("dated_clear_failed_")]
+
+
+@pytest.mark.parametrize("fault", ["readback", "confirm"])
+async def test_a_failed_clear_keeps_the_record_retries_and_raises_a_repair(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    await armed(writer, native_transport, monkeypatch)
+    if fault == "readback":
+        native_transport.inject_write_fault(WriteFault("silent_noop"), address=43153)
+    else:
+        read = native_transport.read_holding
+        reads = 0
+
+        async def flicker(address: int, *args: Any, **kwargs: Any) -> Any:
+            nonlocal reads
+            result = await read(address, *args, **kwargs)
+            reads += address == 43153
+            if reads == 4:  # the window comes back during the five further zero reads
+                native_transport.set_holding(43153, [13, 0, 14, 0, 3, 0, 4, 0])
+            return result
+
+        monkeypatch.setattr(native_transport, "read_holding", AsyncMock(side_effect=flicker))
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [request("none")], sequence=2))
+    assert result.intents[0].outcome == "unverified"
+    assert [state for *_, state in records(writer)] == ["clear_pending"]
+    assert len(dated_issues(writer)) == 1
+    native_transport.__dict__.pop("read_holding", None)
+    native_transport.set_holding(43153, [13, 0, 14, 0, 3, 0, 4, 0])
+    # The window is still ahead, but the clear obligation is the tick's to retry.
+    await writer.writes.async_retry_dated(NOW)
+    assert records(writer) == []
+    assert slot_writes(native_transport, 43153)[-1] == (0, 0, 0, 0, 3, 0, 4, 0)
+    assert dated_issues(writer) == []
+
+
+async def test_dated_and_export_clears_leave_each_other_alone(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await armed(writer, native_transport, monkeypatch)
+    native_transport.set_holding(43143, [23, 30, 5, 30, 14, 0, 15, 0])
+    state = writer.authority.state
+    assert state is not None
+    async with writer.control.lock:
+        result = await writer.writes.async_clear_export("inv1", epoch=state.epoch, cleanup=True)
+    assert result.outcome == "applied"
+    assert slot_writes(native_transport, 43153) == []
+    assert [state for *_, state in records(writer)] == ["armed"]
+    native_transport.set_holding(43143, [23, 30, 5, 30, 14, 0, 15, 0])
+    native_transport.traffic.clear()
+    await writer._async_dispatch_command(apply_command(writer, [request("none")], sequence=2))
+    assert records(writer) == []
+    assert slot_writes(native_transport, 43143) == []
