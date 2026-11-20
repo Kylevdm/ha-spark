@@ -541,3 +541,41 @@ async def test_dated_and_export_clears_leave_each_other_alone(
     await writer._async_dispatch_command(apply_command(writer, [request("none")], sequence=2))
     assert records(writer) == []
     assert slot_writes(native_transport, 43143) == []
+
+
+async def test_rearming_the_same_window_in_a_new_epoch_restamps_the_record(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await armed(writer, native_transport, monkeypatch)
+    state = writer.authority.state
+    assert state is not None
+    # A failed clear left the record behind, then the site came back to Optimise.
+    [record] = state.dated_charges
+    await writer.authority.async_save(state.model_copy(update={
+        "epoch": state.epoch + 1,
+        "dated_charges": (record.model_copy(update={"state": "clear_pending"}),)}))
+    native_transport.set_holding(43153, [0, 0, 0, 0, 3, 0, 4, 0])
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [dated()], sequence=2))
+    assert result.intents[0].outcome == "applied"
+    state = writer.authority.state
+    assert state is not None
+    [record] = state.dated_charges
+    assert (record.state, record.epoch) == ("armed", state.epoch)
+    native_transport.traffic.clear()
+    await writer.writes.async_retry_dated(NOW)
+    assert not [t for t in native_transport.traffic if t.op == "write"]
+
+
+async def test_untrusted_clears_an_armed_window_that_has_not_started(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A booking that goes stale before it starts no longer justifies the window.
+    await armed(writer, native_transport, monkeypatch)
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [request("untrusted")], sequence=2))
+    assert result.intents[0].outcome == "applied"
+    assert slot_writes(native_transport, 43153) == [(0, 0, 0, 0, 3, 0, 4, 0)]
+    assert records(writer) == []

@@ -209,14 +209,18 @@ class NativeDatedChargeWrites(NativeExportWrites):
 
     async def _dated_kept(self, inverter: Inverter, slots: "NativeSlots",
                           now: datetime) -> bool:
-        """An armed record of this epoch, still ahead, whose clock face is resident."""
+        """An armed record of this epoch, under way, whose clock face is resident.
+
+        A window that has not started is cleared: untrusted evidence no longer
+        justifies it, and the next trusted plan re-arms it if it still stands.
+        """
         c = self.coordinator
         state = c.authority.state
         record = self._dated_record(inverter.id)
         zone = c.control.household_zone()
         if (state is None or record is None or zone is None or record.state != "armed"
                 or record.epoch != state.epoch or record.store_id != state.store_id
-                or record.end.astimezone(UTC) <= now):
+                or not record.start.astimezone(UTC) <= now < record.end.astimezone(UTC)):
             return False
         resident = await slots.read(SLOT2_REG)
         if resident is None or resident[:4] != clock_face(record.start, record.end, zone):
@@ -255,8 +259,11 @@ class NativeDatedChargeWrites(NativeExportWrites):
             return IntentResult(outcome="failed")
         target = clock_face(request.start, request.end, zone) + resident[4:]
         record = self._dated_record(inverter.id)
+        # A record from another epoch or store is replaced, never re-armed as is:
+        # the tick would clear it again and the next apply would re-arm it.
         same = (record is not None and record.start == request.start
-                and record.end == request.end)
+                and record.end == request.end and record.epoch == state.epoch
+                and record.store_id == state.store_id)
         if not same:
             # Write-ahead: a failed save writes nothing at all.
             record = DatedChargeRecord(
