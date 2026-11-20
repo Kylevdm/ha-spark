@@ -47,6 +47,28 @@ def test_free_session_fills_cap_and_shrinks_next_overnight():
     assert max(point.soc_pct for point in plan.view.soc) == pytest.approx(config.target_cap)
 
 
+@pytest.mark.parametrize(("fe", "hh", "dispatch", "trusted"), [
+    (True, True, True, True),
+    (False, True, True, False),
+    (True, False, True, False),
+    (True, True, False, False),
+])
+def test_dated_window_carries_its_energy_and_the_evidence_trust(fe, hh, dispatch, trusted):
+    config = cfg(strategy="fill", buffer_pct=0)
+    now = datetime(2026, 1, 12, 12, tzinfo=LONDON)
+    inputs = slot_inputs(now, config)
+    inputs = replace(inputs, load_slots=(0.0,) * len(inputs.load_slots),
+                     solar_slots=(0.0,) * len(inputs.load_slots),
+                     free_electricity_trusted=fe, happy_hour_trusted=hh,
+                     dispatches_trusted=dispatch)
+    session = FreeSession("free_electricity", "private-id", now, now + timedelta(hours=6))
+    plan = planned(replace(inputs, free_sessions=(session,)), config)
+    purchase, = plan.daytime_purchases
+    window, = plan.charge_intent.daytime_windows
+    assert window.energy_kwh == purchase.energy_kwh > 0
+    assert plan.charge_intent.daytime_trusted is trusted
+
+
 def test_post_window_session_does_not_reduce_prior_purchase():
     config = cfg()
     now = datetime(2026, 1, 12, 0, tzinfo=LONDON)

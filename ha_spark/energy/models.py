@@ -256,11 +256,12 @@ class DaytimePurchase:
 
 @dataclass(frozen=True)
 class DatedChargeWindow:
-    """A dated target carried for future actuation; no writer consumes it yet."""
+    """A dated target and the stored energy its purchase adds, for a dated charge intent."""
 
     start: datetime
     end: datetime
     target_soc_pct: float
+    energy_kwh: float = 0.0  # stored kWh, as on the purchase it came from
 
 
 @dataclass(frozen=True)
@@ -398,6 +399,10 @@ class ChargeIntent:
     # False means an empty export is an unreadable Axle event, not a
     # cancellation (#148).
     export_trusted: bool = True
+    # False means an empty ``daytime_windows`` is unreadable session or
+    # dispatch evidence, not "no purchase", so a verified resident dated
+    # charge window must not be cleared (#699).
+    daytime_trusted: bool = True
     # A current, per-minute EV hold is separate from dispatch windows because
     # it has no scheduled end. Dispatch trust remains independent of EV trust.
     ev_hold_active: bool = False

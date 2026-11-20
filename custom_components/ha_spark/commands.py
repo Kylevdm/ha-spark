@@ -187,6 +187,35 @@ class ExportWindow(Record):
     soc: ExportSoc
 
 
+class DatedChargeNone(Record):
+    kind: Literal["dated_charge"]
+    inverter_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    request: Literal["none"]
+
+
+class DatedChargeUntrusted(Record):
+    kind: Literal["dated_charge"]
+    inverter_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    request: Literal["untrusted"]
+
+
+class DatedChargeWindow(Record):
+    kind: Literal["dated_charge"]
+    inverter_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    request: Literal["window"]
+    current_a: float = Field(ge=0, le=62.5)
+    start: Instant
+    end: Instant
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "DatedChargeWindow":
+        if self.start.utcoffset() is None or self.end.utcoffset() is None:
+            raise ValueError("invalid charge window")
+        if self.end <= self.start:
+            raise ValueError("invalid charge window")
+        return self
+
+
 class CommandResult(Record):
     session_id: str = Field(min_length=1, max_length=128)
     sequence: int = Field(ge=1)

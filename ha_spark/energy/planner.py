@@ -1361,6 +1361,7 @@ def _daytime_purchases(
                         start, end,
                         min(cfg.target_cap,
                             cfg.min_soc + energy / cfg.capacity_kwh * 100),
+                        amount,
                     ))
             i = j
             continue
@@ -1546,6 +1547,7 @@ def _daytime_purchases(
                         start, end,
                         min(cfg.target_cap,
                             cfg.min_soc + energy / cfg.capacity_kwh * 100),
+                        amount,
                     ))
                     i += 1
                     continue
@@ -1607,6 +1609,7 @@ def _daytime_purchases(
             ))
             windows.append(DatedChargeWindow(
                 start, end, min(cfg.target_cap, cfg.min_soc + energy / cfg.capacity_kwh * 100),
+                amount,
             ))
         i = j
     return tuple(purchases), tuple(windows), remaining, energy
@@ -2102,6 +2105,8 @@ def compute_plan(
         export=export,
         hold_trusted=inputs.dispatches_trusted,
         export_trusted=inputs.flexibility_event_trusted,
+        daytime_trusted=(inputs.free_electricity_trusted and inputs.happy_hour_trusted
+                         and inputs.dispatches_trusted),
         octopus_dispatch_reported_at=(
             octopus.own_reported_at
             if (octopus := inputs.evidence_freshness.get("octopus_dispatch")) is not None

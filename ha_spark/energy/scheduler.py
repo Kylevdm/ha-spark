@@ -552,6 +552,12 @@ async def run_once(
             applied_plan = plan if accepted else None
         else:
             lines.append("[SKIP] charge setpoint unchanged")
+        if not native and intent.daytime_windows:
+            # Only the integration arms a dated window (Solis Slot 2).
+            lines.append(ActionLine(
+                "[REFUSED] daytime purchase: dated charge windows need an "
+                "integration-owned Solis site", ActionOutcome.REFUSED,
+            ))
         for line in lines:
             log.info(line)
         if settings.v2l_power_entity and not native:

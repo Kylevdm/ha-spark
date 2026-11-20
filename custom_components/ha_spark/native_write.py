@@ -25,6 +25,9 @@ from .commands import (
     ChargeWindow,
     Command,
     CommandResult,
+    DatedChargeNone,
+    DatedChargeUntrusted,
+    DatedChargeWindow,
     ExportNone,
     ExportUntrusted,
     ExportWindow,
@@ -309,6 +312,19 @@ class NativeChargeBoundary(NativeExportWrites):
         for index, raw in enumerate(raw_intents):
             kind = raw.get("kind")
             kinds.append(kind if isinstance(kind, str) else None)
+            if kind == "dated_charge":
+                # Validated so a bad intent is named, but nothing arms Slot 2 yet (#700).
+                dated: type[DatedChargeNone | DatedChargeUntrusted | DatedChargeWindow] = (
+                    DatedChargeNone if raw.get("request") == "none"
+                    else DatedChargeUntrusted if raw.get("request") == "untrusted"
+                    else DatedChargeWindow)
+                try:
+                    dated.model_validate(raw)
+                except ValidationError:
+                    results[index] = IntentResult(outcome="refused", reason="invalid_intent")
+                    continue
+                results[index] = IntentResult(outcome="refused", reason="not_available")
+                continue
             if not isinstance(kind, str) or kind not in schemas:
                 results[index] = IntentResult(outcome="refused", reason="not_available")
                 continue

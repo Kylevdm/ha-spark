@@ -110,6 +110,60 @@ class ExportWindow(Record):
     soc: ExportSoc
 
 
+class DatedChargeNone(Record):
+    kind: Literal["dated_charge"] = "dated_charge"
+    inverter_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    request: Literal["none"] = "none"
+
+
+class DatedChargeUntrusted(Record):
+    kind: Literal["dated_charge"] = "dated_charge"
+    inverter_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    request: Literal["untrusted"] = "untrusted"
+
+
+class DatedChargeWindow(CurrentIntent):
+    kind: Literal["dated_charge"] = "dated_charge"
+    request: Literal["window"] = "window"
+    start: Instant
+    end: Instant
+
+    @model_validator(mode="after")
+    def validate_window(self) -> DatedChargeWindow:
+        if self.start.utcoffset() is None or self.end.utcoffset() is None:
+            raise ValueError("invalid charge window")
+        if self.end <= self.start:
+            raise ValueError("invalid charge window")
+        return self
+
+
+def _daytime_window(intent: ChargeIntent) -> tuple[datetime, datetime, float] | None:
+    """The first dated window, merged with any that touch it (one Slot 2 to arm).
+
+    Returns its start, end and the stored kWh its purchases add.
+    """
+    windows = sorted(intent.daytime_windows, key=lambda w: w.start)
+    if not windows:
+        return None
+    start, end, energy = windows[0].start, windows[0].end, windows[0].energy_kwh
+    for window in windows[1:]:
+        if window.start > end:
+            break
+        end, energy = max(end, window.end), energy + window.energy_kwh
+    return start, end, energy
+
+
+def _daytime_bank_a(window: tuple[datetime, datetime, float], settings: Settings,
+                    voltage_v: float, limit_a: float) -> float:
+    """Bank current that buys the window's energy evenly, never above the bank limit."""
+    start, end, energy = window
+    hours = (end - start).total_seconds() / 3600
+    eff = settings.charge_efficiency if settings.charge_efficiency > 0 else 1.0
+    if hours <= 0 or voltage_v <= 0:
+        return 0.0
+    return min(limit_a, max(0.0, energy) / eff * 1000 / (hours * voltage_v))
+
+
 def _export_intent(
     intent: ChargeIntent, inverter_id: str,
 ) -> ExportNone | ExportUntrusted | ExportWindow:
@@ -142,6 +196,13 @@ def build_intents(intent: ChargeIntent, settings: Settings, execution: Execution
     bank = topology.banks[0]
     total_a = min(solis_current_a(intent, settings, execution), limits.banks[0].charge_a)
     allocations = split_bank_allocation(total_a, topology, limits, bank.id)
+    daytime = _daytime_window(intent)
+    daytime_a: dict[str, float | None] = {}
+    if daytime is not None:
+        bank_a = _daytime_bank_a(daytime, settings, bank.nominal_voltage_v,
+                                 limits.banks[0].charge_a)
+        daytime_a = {allocation.inverter_id: allocation.charge_a for allocation in
+                     split_bank_allocation(bank_a, topology, limits, bank.id)}
     intents: list[dict[str, JsonValue]] = []
     by_id = {inverter.id: inverter for inverter in topology.inverters}
     for allocation in allocations:
@@ -149,13 +210,24 @@ def build_intents(intent: ChargeIntent, settings: Settings, execution: Execution
         if inverter.transport != "native" or allocation.charge_a is None:
             continue
         current = allocation.charge_a
-        for action in (
+        actions: list[Record] = [
             ChargeWindow(inverter_id=inverter.id, current_a=current,
                          start=intent.window_start.strftime("%H:%M"),
                          end=intent.window_end.strftime("%H:%M")),
             ChargeCurrentLimit(inverter_id=inverter.id, current_a=current),
             _export_intent(intent, inverter.id),
-        ):
+        ]
+        # Slot 2 is a Solis register block; other drivers get no dated charge.
+        if inverter.driver_kind == "solis":
+            day_a = daytime_a.get(inverter.id)
+            if daytime is not None and day_a is not None:
+                actions.append(DatedChargeWindow(inverter_id=inverter.id, current_a=day_a,
+                                                 start=daytime[0], end=daytime[1]))
+            elif not intent.daytime_trusted:
+                actions.append(DatedChargeUntrusted(inverter_id=inverter.id))
+            else:
+                actions.append(DatedChargeNone(inverter_id=inverter.id))
+        for action in actions:
             intents.append(action.model_dump(mode="json"))
     return intents
 
