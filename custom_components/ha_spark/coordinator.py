@@ -298,7 +298,7 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
 
     def _ownership_snapshot(self, snapshot: dict[str, object]) -> None:
         """Project local validation without granting hardware permission."""
-        if snapshot["api_version"] != 4:
+        if not isinstance(snapshot["api_version"], int) or snapshot["api_version"] < 4:
             return
         owner = self.ownership.owner if self.ownership.verified else "pending_integration"
         snapshot["authority_owner"] = owner

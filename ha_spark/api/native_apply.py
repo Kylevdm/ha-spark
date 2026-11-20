@@ -188,8 +188,11 @@ def _export_intent(
 
 
 def build_intents(intent: ChargeIntent, settings: Settings, execution: ExecutionContext,
-                  topology: Topology) -> list[dict[str, JsonValue]]:
-    """Share the planner's single-bank current without multiplying it per inverter."""
+                  topology: Topology, *, api_version: int) -> list[dict[str, JsonValue]]:
+    """Share the planner's single-bank current without multiplying it per inverter.
+
+    `api_version` is the integration's negotiated one: dated charge needs 5.
+    """
     if not intent.soc.ok:
         return []
     limits = effective_limits(topology)
@@ -218,7 +221,7 @@ def build_intents(intent: ChargeIntent, settings: Settings, execution: Execution
             _export_intent(intent, inverter.id),
         ]
         # Slot 2 is a Solis register block; other drivers get no dated charge.
-        if inverter.driver_kind == "solis":
+        if inverter.driver_kind == "solis" and api_version >= 5:
             day_a = daytime_a.get(inverter.id)
             if daytime is not None and day_a is not None:
                 actions.append(DatedChargeWindow(inverter_id=inverter.id, current_a=day_a,

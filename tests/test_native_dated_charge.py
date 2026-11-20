@@ -48,10 +48,11 @@ ONE = _topology(("inverter", "native", 62.5))
 TWO = _topology(("first", "native", 40.0), ("second", "native", 40.0))
 
 
-def _build(intent: ChargeIntent, topology: Topology = ONE) -> list[dict[str, object]]:
+def _build(intent: ChargeIntent, topology: Topology = ONE,
+           api_version: int = 5) -> list[dict[str, object]]:
     context = ExecutionContext()
     context.limits_record = LoadedTopology("native", 1, topology)
-    return build_intents(intent, SETTINGS, context, topology)
+    return build_intents(intent, SETTINGS, context, topology, api_version=api_version)
 
 
 def _intent(*windows: models.DatedChargeWindow, ok: bool = True,
@@ -84,7 +85,8 @@ def test_efficiency_raises_the_grid_current():
     settings = SETTINGS.model_copy(update={"charge_efficiency": 0.8})
     context = ExecutionContext()
     context.limits_record = LoadedTopology("native", 1, ONE)
-    [dated] = _dated(build_intents(_intent(_window(0, 1, 2.0)), settings, context, ONE))
+    [dated] = _dated(build_intents(_intent(_window(0, 1, 2.0)), settings, context, ONE,
+                                   api_version=5))
     assert dated["current_a"] == 50.0
 
 
@@ -127,6 +129,13 @@ def test_legacy_inverters_get_no_dated_charge():
     built = _build(_intent(_window(0, 1, 2.0)), mixed)
     assert {intent["inverter_id"] for intent in built} == {"native"}
     assert [d["inverter_id"] for d in _dated(built)] == ["native"]
+
+
+def test_a_v4_integration_gets_no_dated_charge():
+    # A pre-0.40 integration would refuse it as not_available on every tick.
+    intent = _intent(_window(0, 1, 2.0))
+    assert _build(intent, api_version=4) == [
+        raw for raw in _build(intent) if raw["kind"] != "dated_charge"]
 
 
 @pytest.mark.parametrize("raw", [

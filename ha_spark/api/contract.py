@@ -35,8 +35,8 @@ from ha_spark.energy.topology import MajorLoadObservation
 from ha_spark.energy.topology_record import LoadedTopology
 from ha_spark.energy.v2l import V2LSession, delivered_fraction, savings
 
-API_VERSION: Final = 4
-SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3, 4})
+API_VERSION: Final = 5
+SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3, 4, 5})
 
 
 class SiteSnapshot(BaseModel):

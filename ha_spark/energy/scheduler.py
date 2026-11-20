@@ -521,7 +521,11 @@ async def run_once(
                 )]
             else:
                 apply_lines = list(await native_apply.send(
-                    build_intents(intent, settings, context, topology), epoch=native_epoch,
+                    build_intents(intent, settings, context, topology, api_version=(
+                        native_link.snapshot.api_version
+                        if native_link is not None and native_link.snapshot is not None else 0
+                    )),
+                    epoch=native_epoch,
                 ))
             lines.extend(apply_lines)
             applied_plan = plan if not _apply_failed(apply_lines) else None

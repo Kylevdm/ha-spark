@@ -206,7 +206,8 @@ def test_charge_intent_golden():
     context.limits_record = link.topology
     intent = ChargeIntent(60, SocMeasurement(SocStatus.OK, NOW, value=0),
                           time(23, 30), time(5, 30))
-    intents = build_intents(intent, settings, context, link.topology.topology)
+    intents = build_intents(intent, settings, context, link.topology.topology,
+                            api_version=5)
     command = Command(session_id="addon-session", epoch=7, sequence=1, kind="apply",
                       payload={"intents": intents})
     golden = json.loads((Path(__file__).parent / "fixtures/contract/command_apply_intents.json")
@@ -397,7 +398,7 @@ def test_build_intents_selects_the_typed_export_request():
     )
     soc = SocMeasurement(SocStatus.OK, NOW, value=42)
     window = build_intents(ChargeIntent(60, soc, time(23, 30), time(5, 30), export=export),
-                           settings, context, link.topology.topology)
+                           settings, context, link.topology.topology, api_version=5)
     window = [raw for raw in window if raw["kind"] == "export"]
     assert window[-1]["request"] == "window"
     assert window[-1]["event"]["start"].startswith(event_start.isoformat()[:19])
@@ -405,9 +406,9 @@ def test_build_intents_selects_the_typed_export_request():
                                    "observed_at": NOW.isoformat().replace("+00:00", "Z")}
     untrusted = build_intents(ChargeIntent(60, soc, time(23, 30), time(5, 30),
                                           export_trusted=False),
-                              settings, context, link.topology.topology)
+                              settings, context, link.topology.topology, api_version=5)
     assert untrusted[-2] == {"kind": "export", "inverter_id": "inverter",
                              "request": "untrusted"}
     empty = build_intents(ChargeIntent(60, soc, time(23, 30), time(5, 30)),
-                          settings, context, link.topology.topology)
+                          settings, context, link.topology.topology, api_version=5)
     assert empty[-2] == {"kind": "export", "inverter_id": "inverter", "request": "none"}

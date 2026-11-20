@@ -140,7 +140,7 @@ class OwnershipStore:
             return "ownership_switch_pending"
         if target == self.owner:
             return None
-        if summary is None or summary.api_version != 4 or summary.addon_authority is None:
+        if summary is None or summary.api_version < 4 or summary.addon_authority is None:
             return "ownership_peer_version"
         addon = summary.addon_authority
         if addon.store_state != "ok" or (self.owner == "addon" and addon.active != "active"):
@@ -225,7 +225,7 @@ class OwnershipStore:
                 return None
             if self.owner.startswith("pending_"):
                 reason = None
-                if summary.api_version != 4 or addon is None:
+                if summary.api_version < 4 or addon is None:
                     reason = "ownership_peer_version"
                 elif addon.store_state != "ok":
                     reason = "ownership_store_unknown"

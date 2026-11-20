@@ -35,11 +35,12 @@ def test_command_result_and_fetch_golden(name: str) -> None:
     assert FetchRequest.model_validate(request).model_dump() == request
 
 
-def test_v4_snapshot_golden() -> None:
-    body = fixture("site_snapshot_v4")
+@pytest.mark.parametrize("version", [4, 5])
+def test_v4_snapshot_golden(version: int) -> None:
+    body = fixture(f"site_snapshot_v{version}")
     assert wire.build_snapshot(
         site_id=body["site_id"], release_version=body["release_version"],
-        sent_at=datetime.fromisoformat(body["sent_at"]), api_version=4,
+        sent_at=datetime.fromisoformat(body["sent_at"]), api_version=version,
         topology=body["topology"], major_loads=body["major_loads"],
     ) == body
     for version in (1, 2, 3):
@@ -90,7 +91,7 @@ async def test_v4_negotiates_to_030_and_counts(
     hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
 ) -> None:
     async def respond(_method: str, _url: Any, data: Any) -> AiohttpClientMockResponse:
-        if data["api_version"] == 4:
+        if data["api_version"] >= 4:
             return AiohttpClientMockResponse("post", YarlURL(URL), status=409,
                                             json=fixture("version_refusal_v3"))
         return AiohttpClientMockResponse("post", YarlURL(URL), json={
@@ -100,7 +101,7 @@ async def test_v4_negotiates_to_030_and_counts(
     aioclient_mock.post(URL, side_effect=respond)
     entry = await setup(hass)
     bodies = [call[2] for call in aioclient_mock.mock_calls]
-    assert [body["api_version"] for body in bodies] == [4, 3]
+    assert [body["api_version"] for body in bodies] == [5, 3]
     assert bodies[0]["authority_owner"] == "addon"
     assert "authority_owner" not in bodies[1]
     assert state_value(hass) == "on"
@@ -109,6 +110,26 @@ async def test_v4_negotiates_to_030_and_counts(
     await entry.runtime_data.async_refresh()
     assert [call[2]["api_version"] for call in aioclient_mock.mock_calls] == [3]
     assert state_value(hass) == "on"
+
+
+async def test_v5_falls_back_to_a_v4_addon(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+) -> None:
+    # A 0.33 add-on refuses v5; the v4 retry keeps the ownership projection.
+    async def respond(_method: str, _url: Any, data: Any) -> AiohttpClientMockResponse:
+        if data["api_version"] == 5:
+            return AiohttpClientMockResponse("post", YarlURL(URL), status=409,
+                                            json=fixture("version_refusal_v4"))
+        return AiohttpClientMockResponse("post", YarlURL(URL), json={
+            **fixture("plan_summary_v4"), "loop_tick": dt_util.utcnow().isoformat(),
+        })
+
+    aioclient_mock.post(URL, side_effect=respond)
+    entry = await setup(hass)
+    bodies = [call[2] for call in aioclient_mock.mock_calls]
+    assert [body["api_version"] for body in bodies] == [5, 4]
+    assert "authority_owner" in bodies[1]
+    assert entry.runtime_data.api_version == 4
 
 
 def test_v4_version_refusal_golden() -> None:
