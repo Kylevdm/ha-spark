@@ -199,8 +199,10 @@ async def test_add_on_owned_site_names_the_refusal(monkeypatch):
 
     result = await run_once(settings, soc=plan.soc, source=entities_source(settings))
 
+    # A plan diagnostic, not a refused device action: it must not hold activation.
     refusals = [line for line in result.action_lines
-                if getattr(line, "outcome", None) == ActionOutcome.REFUSED]
+                if getattr(line, "outcome", None) == ActionOutcome.BLOCKED
+                and "daytime purchase" in line]
     assert [str(line) for line in refusals] == [
         "[REFUSED] daytime purchase: dated charge windows need an integration-owned "
         "Solis site"]

@@ -82,6 +82,10 @@ def resolve(
         for p in plan.daytime_purchases if not p.refused
         for s, e in ((p.start, p.end),)
     )
+    refusals = tuple(
+        (p.start.astimezone(UTC), p.end.astimezone(UTC), _purchase_reason(p))
+        for p in plan.daytime_purchases if p.refused
+    )
     # A record still awaiting release has no scheduled end once its end has passed.
     indefinite = any(h.cause == "ev" or h.trusted_end is not None and h.trusted_end <= now
                      for h in holds)
@@ -91,14 +95,21 @@ def resolve(
     def clock(t: datetime) -> str:
         return t.astimezone(tz).strftime("%H:%M")
 
+    def held(t: datetime, reason: str) -> tuple[Action, str]:
+        # A purchase the hold refused is named beside it while it fits the wire.
+        refusal = next((r for start, end, r in refusals if start <= t < end), None)
+        if refusal is not None and len(reason) + 1 + len(refusal) <= 255:
+            return "hold", f"{reason} {refusal}"
+        return "hold", reason
+
     def action_at(t: datetime) -> tuple[Action, str]:
         ends = [e for s, e in dispatch if s <= t < e] + [e for e in store_ends if t < e]
         if indefinite or ends:
             if any(h.cause == "ev" for h in holds):
-                return "hold", "Battery held while the EV charges."
+                return held(t, "Battery held while the EV charges.")
             # An expired record is still held; its trusted end is descriptive only.
             end = max(ends or [h.trusted_end for h in holds if h.trusted_end is not None])
-            return "hold", f"Battery held for a smart-charge dispatch until {clock(end)}."
+            return held(t, f"Battery held for a smart-charge dispatch until {clock(end)}.")
         if export is not None and (
             export.window_start.astimezone(UTC) <= t < export.window_end.astimezone(UTC)
         ):

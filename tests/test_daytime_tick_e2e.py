@@ -6,6 +6,7 @@ clock, the data directory and the integration's command-channel receiver.
 
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 import httpx
@@ -113,11 +114,12 @@ def _supplier(router, kind):
     router.post(GRAPHQL).mock(side_effect=reply)
 
 
-async def _tick(settings, monkeypatch, *, native=True, mode="observe"):
+async def _tick(settings, monkeypatch, *, native=True, mode="observe", api_version=5):
     context = ExecutionContext()
     store = seed_authority(settings, mode, context=context)
     queue = CommandQueue("test-session")
     link = native_link(settings)
+    link = replace(link, snapshot=link.snapshot.model_copy(update={"api_version": api_version}))
     if native:
         assert store.handover("pending_integration") == "retired"
         context.limits_record = link.topology
@@ -245,3 +247,28 @@ async def test_add_on_owned_tick_names_dated_charge_refusal(tick_site, monkeypat
     assert not sent
     assert "[REFUSED] daytime purchase: dated charge windows need an integration-owned " \
            "Solis site" in result.action_lines
+
+
+async def test_an_older_integration_names_the_dated_charge_refusal(tick_site, monkeypatch):
+    settings, router = tick_site
+    _supplier(router, "happy")
+    result, sent, link = await _tick(settings, monkeypatch, api_version=4)
+    _purchase(result, "happy_hour")
+    assert _dated(sent, link) == []
+    assert "[REFUSED] daytime purchase: dated charge windows need the companion " \
+           "integration updated to API version 5" in result.action_lines
+
+
+@pytest.mark.parametrize(("native", "api_version"), [(False, 5), (True, 4)])
+async def test_a_dated_charge_refusal_never_holds_optimise_activation(
+    tick_site, monkeypatch, native, api_version,
+):
+    # Activation and the CLI reply treat REFUSED and FAILED lines as device actions
+    # that went wrong; a purchase the site cannot arm is a plan diagnostic.
+    settings, router = tick_site
+    _supplier(router, "happy")
+    result, _, _ = await _tick(settings, monkeypatch, native=native,
+                               mode="observe" if native else "protect",
+                               api_version=api_version)
+    [line] = [line for line in result.action_lines if "daytime purchase" in line]
+    assert line.outcome not in (ActionOutcome.REFUSED, ActionOutcome.FAILED)

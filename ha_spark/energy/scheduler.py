@@ -520,13 +520,19 @@ async def run_once(
                     "[REFUSED] native apply unavailable", ActionOutcome.REFUSED,
                 )]
             else:
+                api_version = (native_link.snapshot.api_version
+                               if native_link is not None and native_link.snapshot is not None
+                               else 0)
                 apply_lines = list(await native_apply.send(
-                    build_intents(intent, settings, context, topology, api_version=(
-                        native_link.snapshot.api_version
-                        if native_link is not None and native_link.snapshot is not None else 0
-                    )),
+                    build_intents(intent, settings, context, topology, api_version=api_version),
                     epoch=native_epoch,
                 ))
+                if intent.daytime_windows and api_version < 5:
+                    # An older integration cannot arm Slot 2, so the add-on sends none.
+                    lines.append(ActionLine(
+                        "[REFUSED] daytime purchase: dated charge windows need the companion "
+                        "integration updated to API version 5", ActionOutcome.BLOCKED,
+                    ))
             lines.extend(apply_lines)
             applied_plan = plan if not _apply_failed(apply_lines) else None
         elif fallback_active:
@@ -560,7 +566,7 @@ async def run_once(
             # Only the integration arms a dated window (Solis Slot 2).
             lines.append(ActionLine(
                 "[REFUSED] daytime purchase: dated charge windows need an "
-                "integration-owned Solis site", ActionOutcome.REFUSED,
+                "integration-owned Solis site", ActionOutcome.BLOCKED,
             ))
         for line in lines:
             log.info(line)

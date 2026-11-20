@@ -89,7 +89,6 @@ _OPTION_KEYS = frozenset(
         "derive_invert_ev_charge",
         "octopus_api_key",
         "octopus_mpan",
-        "free_electricity_enabled",
         "octopus_meter_serial",
         "octopus_api_url",
         "octopus_account_number",

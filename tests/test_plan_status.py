@@ -271,3 +271,17 @@ def test_plan_summary_carries_daytime_purchase():
     assert summary["plan"]["status"]["reason"] == purchase.reason
     assert summary["plan"]["next_change"]["at"] == at(13).isoformat()
     assert summary["plan"]["next_change"]["action"] == "idle"
+
+
+def test_a_refused_purchase_inside_a_hold_names_its_refusal():
+    refused = _purchase(start=at(12), end=at(13), refused=True,
+                        reason="Not buying 3.19 kWh in Free Electricity: the EV hold refuses it.")
+    plan = replace(_plan(), daytime_purchases=(refused,))
+    status = resolve(plan, (record("ev"),), at(12, 30), TZ)
+    assert status.action == "hold"
+    assert status.reason == ("Battery held while the EV charges. "
+                             "Not buying 3.19 kWh in Free Electricity: the EV hold refuses it.")
+    # Outside its span the hold reads as before, and a refusal never charges.
+    assert resolve(plan, (record("ev"),), at(13, 30), TZ).reason == (
+        "Battery held while the EV charges.")
+    assert resolve(plan, (), at(12, 30), TZ).action == "idle"
