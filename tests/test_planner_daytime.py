@@ -67,6 +67,11 @@ def test_dated_window_carries_its_energy_and_the_evidence_trust(fe, hh, dispatch
     window, = plan.charge_intent.daytime_windows
     assert window.energy_kwh == purchase.energy_kwh > 0
     assert plan.charge_intent.daytime_trusted is trusted
+    # Tonight's window opens after the purchase, so the purchase fires first.
+    assert config.window_start > time(18)
+    assert plan.charge_intent.window_start_at == datetime.combine(
+        now.date(), config.window_start, LONDON)
+    assert window.start < plan.charge_intent.window_start_at
 
 
 def test_post_window_session_does_not_reduce_prior_purchase():

@@ -213,6 +213,12 @@ def build_intents(intent: ChargeIntent, settings: Settings, execution: Execution
         if inverter.transport != "native" or allocation.charge_a is None:
             continue
         current = allocation.charge_a
+        day_a = daytime_a.get(inverter.id)
+        if (daytime is not None and day_a is not None and intent.window_start_at is not None
+                and daytime[0] < intent.window_start_at
+                and inverter.driver_kind == "solis" and api_version >= 5):
+            # Slot 1 and Slot 2 share one charge current: the next to fire sets it.
+            current = day_a
         actions: list[Record] = [
             ChargeWindow(inverter_id=inverter.id, current_a=current,
                          start=intent.window_start.strftime("%H:%M"),
@@ -222,7 +228,6 @@ def build_intents(intent: ChargeIntent, settings: Settings, execution: Execution
         ]
         # Slot 2 is a Solis register block; other drivers get no dated charge.
         if inverter.driver_kind == "solis" and api_version >= 5:
-            day_a = daytime_a.get(inverter.id)
             if daytime is not None and day_a is not None:
                 actions.append(DatedChargeWindow(inverter_id=inverter.id, current_a=day_a,
                                                  start=daytime[0], end=daytime[1]))

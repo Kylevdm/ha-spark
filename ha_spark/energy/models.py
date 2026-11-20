@@ -403,6 +403,10 @@ class ChargeIntent:
     # dispatch evidence, not "no purchase", so a verified resident dated
     # charge window must not be cleared (#699).
     daytime_trusted: bool = True
+    # Start of the running-or-next charge window. Solis holds one charge
+    # current for both slots, so a dated window that opens before it takes
+    # that current until it ends (#700). None keeps the overnight current.
+    window_start_at: datetime | None = None
     # A current, per-minute EV hold is separate from dispatch windows because
     # it has no scheduled end. Dispatch trust remains independent of EV trust.
     ev_hold_active: bool = False

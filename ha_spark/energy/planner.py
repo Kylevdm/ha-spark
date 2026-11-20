@@ -2100,6 +2100,7 @@ def compute_plan(
         soc=inputs.soc,
         window_start=cfg.window_start,
         window_end=cfg.window_end,
+        window_start_at=geometry.window_start if geometry is not None else None,
         holds=holds,
         daytime_windows=daytime_windows,
         export=export,

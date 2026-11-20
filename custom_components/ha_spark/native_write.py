@@ -34,11 +34,11 @@ from .commands import (
     IntentResult,
     WriteReason,
 )
+from .native_dated_write import NativeDatedChargeWrites
 from .native_export import (
     event_from_raw,
     fixed_export_refusal,
 )
-from .native_export_write import NativeExportWrites
 from .native_verify import confirm
 from .solis_frames import Reading
 from .solis_transport import Transport, valid_words
@@ -68,7 +68,7 @@ def current_word(current: float) -> int:
     return floor(round(max(current, 0.0) * 10, 6))
 
 
-class NativeChargeBoundary(NativeExportWrites):
+class NativeChargeBoundary(NativeDatedChargeWrites):
     """Shared guard/bus transactions with caller-specific authority policies."""
 
     def __init__(self, coordinator: "SparkCoordinator") -> None:
@@ -77,6 +77,9 @@ class NativeChargeBoundary(NativeExportWrites):
         self.written_at: dict[str, datetime] = {}
         self.verified_windows: dict[str, tuple[int, tuple[int, ...]]] = {}
         self.verified_fallback: dict[str, tuple[int, tuple[int, ...]]] = {}
+        # The last exactly read-back armed Slot 2 block, per inverter.
+        self.verified_slot2: dict[str, tuple[int, tuple[int, ...]]] = {}
+        self.slot2_dated: frozenset[str] = frozenset()
         self.last_apply: tuple[int, datetime, bool] | None = None
         # Reloaded records are live only after the startup stage re-verified them
         # against Slot 1; records saved in this session need no such re-read.
@@ -231,8 +234,10 @@ class NativeChargeBoundary(NativeExportWrites):
                     return False
             elif self.verified_windows.get(inverter.id) != (epoch, tuple(words[2:10])):
                 return False
-            if (self.written_a.get(inverter.id) != words[0] / 10
-                    or any(words[12:20] + words[22:30])):
+            # Slot 2 may hold only this epoch's verified dated charge window.
+            slot2 = tuple(words[12:20])
+            if (self.written_a.get(inverter.id) != words[0] / 10 or any(words[22:30])
+                    or any(slot2) and self.verified_slot2.get(inverter.id) != (epoch, slot2)):
                 return False
         c.native.readings[inverter.id][CHARGE_BLOCK_FRAME] = Reading(
             dt_util.utcnow(), words, connection_epoch)
@@ -309,21 +314,19 @@ class NativeChargeBoundary(NativeExportWrites):
         malformed_events: dict[str, EventIdentity | None] = {}
         parsed: list[tuple[str, ChargeCurrentLimit | ChargeWindow | ExportNone
                            | ExportUntrusted | ExportWindow, int]] = []
+        dated: list[tuple[DatedChargeNone | DatedChargeUntrusted | DatedChargeWindow, int]] = []
         for index, raw in enumerate(raw_intents):
             kind = raw.get("kind")
             kinds.append(kind if isinstance(kind, str) else None)
             if kind == "dated_charge":
-                # Validated so a bad intent is named, but nothing arms Slot 2 yet (#700).
-                dated: type[DatedChargeNone | DatedChargeUntrusted | DatedChargeWindow] = (
+                schema: type[DatedChargeNone | DatedChargeUntrusted | DatedChargeWindow] = (
                     DatedChargeNone if raw.get("request") == "none"
                     else DatedChargeUntrusted if raw.get("request") == "untrusted"
                     else DatedChargeWindow)
                 try:
-                    dated.model_validate(raw)
+                    dated.append((schema.model_validate(raw), index))
                 except ValidationError:
                     results[index] = IntentResult(outcome="refused", reason="invalid_intent")
-                    continue
-                results[index] = IntentResult(outcome="refused", reason="not_available")
                 continue
             if not isinstance(kind, str) or kind not in schemas:
                 results[index] = IntentResult(outcome="refused", reason="not_available")
@@ -374,40 +377,56 @@ class NativeChargeBoundary(NativeExportWrites):
                                      | ExportUntrusted | ExportWindow, int]]] = {}
         for kind, intent, index in parsed:
             groups.setdefault(intent.inverter_id, []).append((kind, intent, index))
-        for inverter_id, entries in groups.items():
-            if any(kind == "export" for kind, _, _ in entries):
-                inverter = (next((i for i in guard.topology.inverters if i.id == inverter_id),
-                                 None) if guard is not None else None)
-                reason = None if inverter is None else fixed.get(inverter.bank_id)
-                if inverter is None:
-                    reason = "limits"
-                mismatches: set[str] = set()
+        # The Slot 1 window leaves Slot 2 to a dated intent in this command.
+        self.slot2_dated = frozenset(intent.inverter_id for intent, _ in dated)
+        try:
+            for inverter_id, entries in groups.items():
+                if any(kind == "export" for kind, _, _ in entries):
+                    inverter = (next((i for i in guard.topology.inverters if i.id == inverter_id),
+                                     None) if guard is not None else None)
+                    reason = None if inverter is None else fixed.get(inverter.bank_id)
+                    if inverter is None:
+                        reason = "limits"
+                    mismatches: set[str] = set()
+                    try:
+                        group = await self._async_export_group(
+                            entries, epoch=command.epoch, mismatches=mismatches, fixed=reason,
+                            malformed=inverter_id in malformed,
+                            malformed_event=malformed_events.get(inverter_id))
+                    except Exception:
+                        self.written_a.pop(inverter_id, None)
+                        group = {index: IntentResult(outcome="failed")
+                                 for _, _, index in entries}
+                    finally:
+                        for mismatched in mismatches:
+                            await self.coordinator.native.async_readback_mismatch(mismatched)
+                    for index, result in group.items():
+                        results[index] = result
+                    continue
+                for _, intent, index in entries:
+                    if not isinstance(intent, (ChargeCurrentLimit, ChargeWindow)):
+                        results[index] = IntentResult(
+                            outcome="refused", reason="not_available")
+                        continue
+                    try:
+                        results[index] = await self.async_current(intent, epoch=command.epoch)
+                    except Exception:
+                        # Fixed outcomes only; a broken device cannot skip its peers.
+                        self.written_a.pop(intent.inverter_id, None)
+                        results[index] = IntentResult(outcome="failed")
+            # Slot 2 after the inverter's charge intents set the shared current.
+            for request, index in dated:
+                mismatches = set()
                 try:
-                    group = await self._async_export_group(
-                        entries, epoch=command.epoch, mismatches=mismatches, fixed=reason,
-                        malformed=inverter_id in malformed,
-                        malformed_event=malformed_events.get(inverter_id))
+                    results[index] = await self.async_dated(
+                        request, epoch=command.epoch, mismatches=mismatches)
                 except Exception:
-                    self.written_a.pop(inverter_id, None)
-                    group = {index: IntentResult(outcome="failed")
-                             for _, _, index in entries}
+                    results[index] = IntentResult(outcome="failed")
                 finally:
                     for mismatched in mismatches:
                         await self.coordinator.native.async_readback_mismatch(mismatched)
-                for index, result in group.items():
-                    results[index] = result
-                continue
-            for _, intent, index in entries:
-                if not isinstance(intent, (ChargeCurrentLimit, ChargeWindow)):
-                    results[index] = IntentResult(
-                        outcome="refused", reason="not_available")
-                    continue
-                try:
-                    results[index] = await self.async_current(intent, epoch=command.epoch)
-                except Exception:
-                    # Fixed outcomes only; a broken device cannot skip its peers.
-                    self.written_a.pop(intent.inverter_id, None)
-                    results[index] = IntentResult(outcome="failed")
+        finally:
+            self.slot2_dated = frozenset()
         final = [result or IntentResult(outcome="failed") for result in results]
         charge = [result for kind, result in zip(kinds, final, strict=False)
                   if kind in ("charge_current_limit", "charge_window")]

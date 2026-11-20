@@ -182,6 +182,28 @@ class StopLatch(Record):
     epoch: Epoch
 
 
+class DatedChargeRecord(Record):
+    """A daytime window for Slot 2's charge half; in force only once ``armed``.
+
+    Saved as ``unknown`` before the write, so a restart or Re-probe still knows
+    a window may be resident and must be cleared.
+    """
+
+    inverter_id: Text
+    start: AwareDatetime
+    end: AwareDatetime
+    store_id: UUID
+    epoch: Epoch
+    state: Literal["unknown", "armed"]
+    last_reconcile_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_window(self) -> Self:
+        if self.end <= self.start:
+            raise ValueError("invalid dated charge window")
+        return self
+
+
 class AuthorityState(Record):
     schema_version: Literal[1] = 1
     store_id: UUID
@@ -196,6 +218,7 @@ class AuthorityState(Record):
     export_records: Annotated[tuple[ExportRecord, ...], Field(max_length=64)] = ()
     export_transitions: Annotated[tuple[ExportTransition, ...], Field(max_length=1024)] = ()
     stop_latches: Annotated[tuple[StopLatch, ...], Field(max_length=64)] = ()
+    dated_charges: Annotated[tuple[DatedChargeRecord, ...], Field(max_length=64)] = ()
     last_changed_at: AwareDatetime
     requester_kind: Literal["cli", "ingress", "system", "service", "repair"] = "system"
 

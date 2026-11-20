@@ -62,6 +62,8 @@ class NativeExportWrites:
         verified_fallback: dict[str, tuple[int, tuple[int, ...]]]
         reverified: set[str]
         armed_this_session: set[str]
+        # Inverters whose apply in progress carries a dated charge intent.
+        slot2_dated: frozenset[str]
 
         def _refusal(self, inverter: Inverter, epoch: int, *,
                      guard_write: bool = False,

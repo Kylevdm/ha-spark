@@ -131,6 +131,23 @@ def test_legacy_inverters_get_no_dated_charge():
     assert [d["inverter_id"] for d in _dated(built)] == ["native"]
 
 
+@pytest.mark.parametrize("overnight_h,daytime", [(8, True), (0.5, False), (None, False)])
+def test_the_charge_current_follows_the_window_that_fires_next(overnight_h, daytime):
+    # One Solis register (43141) holds the current for both slots (#700).
+    window_start_at = None if overnight_h is None else START + timedelta(hours=overnight_h)
+    intent = replace(_intent(_window(1, 2, 2.0)), window_start_at=window_start_at)
+    overnight = _build(_intent())
+    built = _build(intent)
+    [dated] = _dated(built)
+    currents = {raw["kind"]: raw["current_a"] for raw in built if "current_a" in raw}
+    expected = 40.0 if daytime else next(
+        raw["current_a"] for raw in overnight if raw["kind"] == "charge_current_limit")
+    assert currents == {"charge_window": expected, "charge_current_limit": expected,
+                        "dated_charge": 40.0}
+    assert expected != 40.0 or daytime
+    assert dated["current_a"] == 40.0
+
+
 def test_a_v4_integration_gets_no_dated_charge():
     # A pre-0.40 integration would refuse it as not_available on every tick.
     intent = _intent(_window(0, 1, 2.0))
