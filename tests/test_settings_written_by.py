@@ -37,6 +37,8 @@ def test_written_by_unknown_fields_reason(tmp_path, seeded, monkeypatch, writer)
     document["settings"]["future_setting"] = True
     if writer != "absent":
         document["written_by"] = writer
+    else:
+        document.pop("written_by", None)
     path.write_text(json.dumps(document))
     before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
     expected = "Unknown configuration fields: 1"
@@ -88,7 +90,9 @@ def test_written_by_not_allowed_in_secrets(tmp_path, seeded):
     assert str(caught.value) == "Invalid configuration envelope"
 
 
-def test_commit_does_not_write_written_by(tmp_path, seeded):
+@pytest.mark.parametrize("version", ["0.33.0", "9999.9999.9999"])
+def test_commit_writes_running_version(tmp_path, seeded, monkeypatch, version):
+    monkeypatch.setattr(settings_service, "__version__", version)
     path = tmp_path / "ha_spark_config.json"
     document = json.loads(path.read_text())
     document["written_by"] = "9.9.9"
@@ -98,10 +102,70 @@ def test_commit_does_not_write_written_by(tmp_path, seeded):
     service.save({"min_soc": 23}, service.revision, "cli")
     assert json.loads(path.read_text()) == {
         "schema_version": 1, "revision": 3, "settings": {"min_soc": 23},
+        "written_by": version,
     }
     assert json.loads((tmp_path / "ha_spark_secrets.json").read_text()) == {
         "revision": 3, "secrets": {},
     }
+
+
+@pytest.mark.parametrize("version", ["0.33.0-CANARY", *MALFORMED])
+def test_invalid_running_version_is_not_written(tmp_path, monkeypatch, version):
+    monkeypatch.setattr(settings_service, "__version__", version)
+    service = store(tmp_path)
+    service.load(writable=True)
+    for revision in (1, 2):
+        assert "written_by" not in json.loads(
+            (tmp_path / "ha_spark_config.json").read_text()
+        )
+        assert json.loads((tmp_path / "ha_spark_secrets.json").read_text()) == {
+            "revision": revision, "secrets": {},
+        }
+        if revision == 1:
+            service.save({"min_soc": 22}, revision, "cli")
+    assert store(tmp_path).load(writable=True) == service.settings
+
+
+@pytest.fixture
+def newer_document(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings_service, "__version__", "0.33.0")
+    service = store(tmp_path)
+    service.load(writable=True)
+    service.save({"min_soc": 22}, 1, "seed")
+    return service
+
+
+def test_downgrade_unknown_fields_reason(tmp_path, newer_document, monkeypatch):
+    path = tmp_path / "ha_spark_config.json"
+    document = json.loads(path.read_text())
+    assert document["written_by"] == "0.33.0"
+    document["settings"]["future_setting"] = True
+    path.write_text(json.dumps(document))
+    monkeypatch.setattr(settings_service, "__version__", "0.32.0")
+    with pytest.raises(ConfigurationRepair) as caught:
+        store(tmp_path).load(writable=True)
+    assert str(caught.value) == (
+        "Unknown configuration fields: 1 (written by ha-spark 0.33.0; this is 0.32.0)"
+    )
+
+
+@pytest.mark.parametrize("recover", [False, True])
+def test_committed_writer_round_trip(tmp_path, newer_document, monkeypatch, recover):
+    if recover:
+        newer_document.save({"min_soc": 23}, 2, "cli")
+        # Simulate interruption after replacing secrets but before replacing config.
+        (tmp_path / "ha_spark_secrets.json").write_text('{"revision": 4, "secrets": {}}')
+    monkeypatch.setattr(settings_service, "__version__", "0.32.0")
+    service = store(tmp_path)
+    assert service.load(writable=True).min_soc == 22
+    assert service.revision == 2
+    assert service.repair is None
+    document = json.loads((tmp_path / "ha_spark_config.json").read_text())
+    assert document["written_by"] == ("0.32.0" if recover else "0.33.0")
+    assert json.loads((tmp_path / "ha_spark_secrets.json").read_text()) == {
+        "revision": 2, "secrets": {},
+    }
+    assert store(tmp_path).load(writable=True) == service.settings
 
 
 @pytest.mark.parametrize("writer", ["9.9.9", "0.32.0-CANARY"])
@@ -116,7 +180,9 @@ def test_previous_pair_with_written_by_still_recovers(tmp_path, seeded, writer):
     service.load(writable=True)
     assert service.repair is None
     assert service.settings.min_soc != 22
-    assert "written_by" not in json.loads((tmp_path / "ha_spark_config.json").read_text())
+    assert json.loads((tmp_path / "ha_spark_config.json").read_text())["written_by"] == (
+        settings_service.__version__
+    )
 
 
 @pytest.mark.parametrize("writer", [False, True])

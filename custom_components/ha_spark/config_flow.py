@@ -8,6 +8,7 @@ The options flow edits the Solcast allowance and, as one atomic document, the
 site topology (#535's contract) that later phases send on the heartbeat.
 """
 
+import re
 from collections.abc import Callable
 from math import isclose, isfinite
 from typing import Any, TypeGuard, cast
@@ -42,7 +43,7 @@ from homeassistant.helpers.selector import (
 from homeassistant.helpers.service_info.hassio import HassioServiceInfo
 from pydantic import BaseModel, ValidationError
 
-from . import native, notify_target
+from . import flexibility_events, native, notify_target
 from .const import ADDON_SLUG, DOMAIN
 from .native_fallback import FallbackOptions, validate_fallback
 from .native_hold import SOURCES, EvidenceOptions
@@ -219,6 +220,7 @@ _COLLECTIONS = ("connections", "banks", "inverters", "v2l_chargers", "major_load
 # Pydantic error types mapped to fixed outcome codes; never values or error text.
 _NON_FINITE = {"finite_number", "float_type", "int_type", "string_type", "bool_type"}
 _BOUNDS = {"greater_than_equal", "less_than_equal", "greater_than", "less_than"}
+_HHMM = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 _TEXT_PATTERN = {"string_pattern_mismatch", "too_long", "string_too_long"}
 
 
@@ -333,6 +335,7 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                 and any(i.transport == "native" for i in topology.inverters)):
             menu.append("evidence")
             menu.append("fallback")
+            menu.append("flexibility_events")
         return self.async_show_menu(step_id="init", menu_options=menu)
 
     async def async_step_fallback(
@@ -352,8 +355,8 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
         except ValidationError:
             current = None
         if user_input is not None and native:
-            start = user_input.get("window_start")
-            end = user_input.get("window_end")
+            start = user_input.get("window_start") or ""
+            end = user_input.get("window_end") or ""
             currents: dict[str, Any] = {}
             for inverter in native:
                 value = user_input.get(f"current_{inverter.id}")
@@ -371,6 +374,13 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                         data={key: value for key, value in self.config_entry.options.items()
                               if key != "fallback"},
                     )
+            if not errors:
+                for key, text in (("window_start", start), ("window_end", end)):
+                    if not isinstance(text, str) or not _HHMM.fullmatch(text):
+                        errors[key] = "invalid_time"
+                for inverter in native:
+                    if inverter.id not in currents:
+                        errors[f"current_{inverter.id}"] = "missing_current"
             if not errors and isinstance(topology, Topology):
                 try:
                     options = FallbackOptions.model_validate({
@@ -388,21 +398,86 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                             **self.config_entry.options,
                             "fallback": options.model_dump(mode="json"),
                         })
+        # Suggested values, not defaults: an untouched empty field is left out of the
+        # input rather than sent as null, so "leave every field empty" can clear.
         fields: dict[Any, Any] = {
-            probatio.Optional("window_start", default=(
-                current.window_start if current else "")): probatio.Match(
-                    r"^(?:[01]\d|2[0-3]):[0-5]\d$"),
-            probatio.Optional("window_end", default=(
-                current.window_end if current else "")): probatio.Match(
-                    r"^(?:[01]\d|2[0-3]):[0-5]\d$"),
+            probatio.Optional("window_start"): str,
+            probatio.Optional("window_end"): str,
         }
+        suggested: dict[str, Any] = {}
+        if current is not None:
+            suggested = {"window_start": current.window_start,
+                         "window_end": current.window_end}
         for inverter in native:
-            fields[probatio.Optional(f"current_{inverter.id}", default=(
-                current.currents.get(inverter.id) if current else None))] = NumberSelector(
-                    NumberSelectorConfig(min=0, max=500, step=0.1,
-                                         mode=NumberSelectorMode.BOX))
+            fields[probatio.Optional(f"current_{inverter.id}")] = NumberSelector(
+                NumberSelectorConfig(min=0, max=500, step=0.1, unit_of_measurement="A",
+                                     mode=NumberSelectorMode.BOX))
+            if current is not None and inverter.id in current.currents:
+                suggested[f"current_{inverter.id}"] = current.currents[inverter.id]
         return self.async_show_form(
-            step_id="fallback", data_schema=probatio.Schema(fields), errors=errors)
+            step_id="fallback",
+            data_schema=self.add_suggested_values_to_schema(probatio.Schema(fields), suggested),
+            errors=errors,
+            # Field keys follow inverter ids, so the description names them instead.
+            description_placeholders={"inverters": ", ".join(
+                f"current_{inverter.id}" for inverter in native)},
+        )
+
+    async def async_step_flexibility_events(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Owner export ratings; only the admin-only owner service turns export on."""
+        topology = validate_topology(self.config_entry.options.get("topology"))
+        native = ([i for i in topology.inverters if i.transport == "native"]
+                  if isinstance(topology, Topology) else [])
+        current = flexibility_events.stored(
+            self.config_entry.options.get(flexibility_events.OPTION_KEY))
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            ratings: dict[str, float] = {}
+            for inverter in native:
+                value = user_input.get(f"rating_{inverter.id}")
+                if _is_number(value):
+                    ratings[inverter.id] = float(value)
+            if current.export_during_events:
+                # The enabling admin confirmed these ratings; they change only while off.
+                errors = {"base": "export_on"}
+            elif not native:
+                errors = {"base": "missing_rating"}
+            elif ratings:
+                runtime = getattr(self.config_entry, "runtime_data", None)
+                reason = (runtime.export_opt_in_refusal(ratings) if runtime is not None
+                          else "export_bound_unverified")
+                if reason == "invalid_intent":
+                    reason = "missing_rating"
+                if reason is not None:
+                    errors = {"base": reason if reason in (
+                        "missing_rating", "limits", "export_bounds_exceed_site_limit",
+                    ) else "export_bound_unverified"}
+            if not errors:
+                updated = current.model_copy(update={"export_ratings_w": ratings})
+                return self.async_create_entry(title="", data={
+                    **self.config_entry.options,
+                    flexibility_events.OPTION_KEY: updated.model_dump(mode="json"),
+                })
+        # Suggested values, not defaults, so leaving every field empty can clear.
+        fields: dict[Any, Any] = {}
+        suggested: dict[str, Any] = {}
+        for inverter in native:
+            fields[probatio.Optional(f"rating_{inverter.id}")] = NumberSelector(
+                NumberSelectorConfig(min=1, max=100000, step=1, unit_of_measurement="W",
+                                     mode=NumberSelectorMode.BOX))
+            if inverter.id in current.export_ratings_w:
+                suggested[f"rating_{inverter.id}"] = current.export_ratings_w[inverter.id]
+        return self.async_show_form(
+            step_id="flexibility_events",
+            data_schema=self.add_suggested_values_to_schema(probatio.Schema(fields), suggested),
+            errors=errors,
+            description_placeholders={
+                "export_state": "on" if current.export_during_events else "off",
+                "inverters": ", ".join(f"rating_{inverter.id}" for inverter in native),
+            },
+        )
 
     async def async_step_evidence(
         self, user_input: dict[str, Any] | None = None,
@@ -419,6 +494,9 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                 elif entity:
                     raw[key] = {"entity_id": entity,
                                 "max_age_s": user_input.get(f"{key}_max_age_s")}
+            for key in ("ev_liveness_entity", "dispatch_liveness_entity"):
+                if user_input.get(key):
+                    raw[key] = user_input[key]
             raw["battery_discharge_sign"] = user_input.get("battery_discharge_sign", "positive")
             raw["dispatch_grid_invert"] = user_input.get("dispatch_grid_invert", False)
             try:
@@ -444,6 +522,10 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                 BooleanSelector(),
         }
         suggested: dict[str, Any] = {}
+        for key in ("ev_liveness_entity", "dispatch_liveness_entity"):
+            fields[probatio.Optional(key)] = EntitySelector()
+            if getattr(current, key) is not None:
+                suggested[key] = getattr(current, key)
         for key in SOURCES:
             source = getattr(current, key)
             if source is not None and source.entity_id is not None:
@@ -673,6 +755,7 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
                 "bank_id", default=defaults.get("bank_id")
             ): self._select_over("banks"),
             probatio.Required("max_current_a", default=defaults.get("max_current_a", 0)): _NUMBER,
+            probatio.Optional("power_entity"): _ENTITY,
         })
 
     def _ev_schema(self, defaults: dict[str, Any]) -> probatio.Schema:
@@ -1260,11 +1343,18 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
             topology, self._claims if self._claims is not None
             else self.config_entry.options.get("gateway_claims", []),
         )
+        changed_ratings = flexibility_events.changed_rated_claims(
+            self.config_entry.options, claims, proposed_topology=topology.model_dump(mode="json"))
+        export_options = ({flexibility_events.OPTION_KEY: flexibility_events.switched_off(
+            self.config_entry.options.get(flexibility_events.OPTION_KEY))}
+            if changed_ratings else {})
         if coordinator is not None:
             # A claim edited for a native inverter ends that inverter's bound.
-            await coordinator.async_drop_stale_bounds(claims=claims)
+            await coordinator.async_drop_stale_bounds(
+                claims=claims, proposed_topology=topology.model_dump(mode="json"))
         return self.async_create_entry(title="", data={
             **self.config_entry.options,
+            **export_options,
             **({"evidence": self._evidence.model_dump(mode="json")} if self._evidence else {}),
             "topology": topology.model_dump(mode="json"),
             "gateway_claims": claims,

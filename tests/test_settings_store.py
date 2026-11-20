@@ -10,6 +10,7 @@ import httpx
 import pytest
 import respx
 
+from ha_spark import __version__
 from ha_spark.config import ConfigError, Settings
 from ha_spark.devices.execution import execution_context
 from ha_spark.settings_service import SUPERVISOR_INFO_URL, SettingsService
@@ -45,6 +46,7 @@ def test_preview_writes_nothing_and_daemon_initialises_pair(tmp_path):
         "schema_version": 1,
         "revision": 1,
         "settings": {},
+        "written_by": __version__,
     }
     secrets = tmp_path / "ha_spark_secrets.json"
     assert json.loads(secrets.read_text()) == {"revision": 1, "secrets": {}}

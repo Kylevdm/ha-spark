@@ -47,6 +47,14 @@ def test_limits_contract(path: Path) -> None:
         assert major_load_reserve_kw(topology.major_loads, exclude) == reserve["expected_kw"]
 
 
+def test_v2l_power_entity_round_trips() -> None:
+    raw = json.loads((FIXTURES / "two_inverters.json").read_text())["topology"]
+    raw["v2l_chargers"] = [{"id": "car", "bank_id": "bank", "power_entity": "sensor.v2l"}]
+    topology = Topology.model_validate(raw)
+    assert topology.v2l_chargers[0].power_entity == "sensor.v2l"
+    assert Topology.model_validate_json(topology.model_dump_json()) == topology
+
+
 @pytest.mark.parametrize("owner", [0, 0.1, 42.6, 62.5, 100])
 @pytest.mark.parametrize("step", [0.1, 0.5, 1, 2.5])
 def test_rounding_never_exceeds_ceiling(owner: float, step: float) -> None:

@@ -156,6 +156,10 @@ def decode(point: Point, words: tuple[int, ...], zone: ZoneInfo | None,
     if point.kind == "battery":
         if not frame or len(words) != point.frame.count or words[3] not in (0, 1):
             return None
+        # Firmware reports either a magnitude or an s32 (charge negative); the
+        # direction word alone sets the sign, charging positive.
+        if value >= 0x80000000:
+            value = 0x100000000 - value
         value *= -1 if words[3] else 1
     if point.unit == "%" and value > 100:
         return None

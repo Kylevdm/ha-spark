@@ -623,18 +623,17 @@ class SettingsService:
     def _commit(
         self, inputs: dict[str, Any], secrets: dict[str, Any], revision: int, *, backup: bool = True
     ) -> None:
+        document: dict[str, Any] = {
+            "schema_version": 1,
+            "revision": revision,
+            "settings": inputs,
+        }
+        written_by = _written_by({"written_by": __version__})
+        if written_by is not None:
+            document["written_by"] = written_by
         temporary: list[Path] = []
         try:
-            temporary.append(
-                self._temporary(
-                    "ha_spark_config.json",
-                    {
-                        "schema_version": 1,
-                        "revision": revision,
-                        "settings": inputs,
-                    },
-                )
-            )
+            temporary.append(self._temporary("ha_spark_config.json", document))
             temporary.append(
                 self._temporary(
                     "ha_spark_secrets.json",

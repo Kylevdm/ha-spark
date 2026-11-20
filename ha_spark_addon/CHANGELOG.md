@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.33.1
+
+- **SoC check and V2L charging (#735).** V2L charging no longer makes the SoC integrity check fail and start fallback. Before, a V2L charger topping up the battery while the inverter discharged kept SoC level, the check reported "SoC disagrees with battery energy flow", and fallback cancelled export events. The check now counts fresh V2L input at face value. On integration-owned sites, set the new optional **V2L power sensor** on the V2L charger in Options → Site topology and limits; on add-on-owned sites it uses `v2l_power_entity` and `battery_power_discharge_sign`. Without a fresh V2L reading the check is as strict as before.
+- **After updating:** on integration-owned sites with a V2L charger, set its **V2L power sensor** in Options → Site topology and limits. Update the add-on and the integration together: an older add-on refuses a topology with this field.
+
+## 0.33.0
+
+- **Export during events (#721–#724).** On native sites, the integration can now supervise every export flexibility event itself, so a paid export event no longer needs **Arm supervised export** each time. Enter each inverter's export rating in **Options → Flexibility events**, then an administrator turns it on with the new `ha_spark.set_export_during_events` service. It's off by default. Each automatic supervision passes the same checks as a manual one: Optimise only, never in Observe, Protect, manual control or fallback. The tripwire and stop latch are unchanged, and a manual supervision is never replaced. A refused event is retried until it ends and sends one notice per reason. A change to a rated inverter's identity or gateway claim switches it off. `ha-spark health` and the integration diagnostics show the switch state and ratings.
+
+## 0.32.7
+
+- Native protection evidence can now use an optional liveness entity per group (EV: status, plug and power; dispatch: live dispatch and adjusted rate). A change-only source whose own report is stale but no older than 12 hours counts as fresh while its group's liveness entity reported within that source's maximum age. A sibling never clears an EV hold. Diagnostics and the snapshot show `via_sibling`, and on integration-owned sites `ha-spark health` Evidence rows now show the integration's own maximum ages and sibling result (#679).
+
+## 0.32.6
+
+- **Settings writer version (#664).** Every settings save now records the validated running version, so downgrade repair reasons can name the release that wrote unknown fields. Releases 0.32.0 or later accept this metadata; downgrading below 0.32.0 after any save now triggers configuration repair ("Invalid configuration envelope").
+- Native Solis link drops are no longer silent: each drop logs one warning with its reason (timeout, disconnected or bad response), the operation and register being read and how long the link was up, and each reconnect logs its downtime, capped at 10 lines per gateway per hour and keyed by an opaque gateway id. Integration diagnostics now show drops in the last 24 hours and the last drop's reason and time (#708).
+
+## 0.32.5
+
+- **Native fallback schedule form (#712).** The form now shows a charge current box (A) for every native inverter. Before, the current field never appeared, so every save failed with "expected float". Leaving every field empty now reaches the clear rule. A wrong time format says "Use HH:MM, for example 23:30", and a missing current is reported against that inverter.
+
+## 0.32.4
+
+- **Native Solis battery power sign (#707).** Battery power now reads correctly on firmware that reports it as a signed value. Before, it showed about 4.29 GW while charging and made the SoC check reject SoC. The inverter `power_sign` now applies only to grid-port power, so `negative_import` can be set where Grid-port power reads import negative without flipping battery-direction evidence.
+- **After updating:** on firmware whose Grid-port power reads import negative, set the native inverter's `power_sign` to `negative_import` in Options → Site topology and limits, then check a cheap-window charge (runbook step 3).
+
 ## 0.32.3
 
 - **Live Octopus Intelligent rates (#532).** When standard rate slots are unavailable, read current day/night prices from the account agreement while keeping the configured cheap window and planned dispatches. Health now warns when neither live rate source is usable and plans fall back to configured rates.

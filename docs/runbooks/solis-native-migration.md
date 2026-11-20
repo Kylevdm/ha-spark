@@ -121,9 +121,13 @@ In Options → Site topology and limits, repoint connection `grid_power_entity`
 and inverter `grid_port_power_entity` and `battery_power_entity`. Check the unit
 and sign of **each power entity** against observed import/export and
 charge/discharge. Set inverter `power_sign` to `positive_import` or
-`negative_import` as appropriate. On a native inverter it also applies to the
-integration's own register reads of Battery power and Grid-port power, which
-the supply guard and battery-direction evidence use instead of the entities. The connection's `grid_power_entity` has
+`negative_import` for the grid-port reading. On a native inverter it also
+applies to the integration's own Grid-port power register read, which the supply
+guard uses instead of the entity. It does not apply to native Battery power:
+the battery direction register signs that read, charging positive, whether the
+firmware reports a magnitude or a signed value. Some Solis firmware reads
+Grid-port power and Meter active power import negative; check them during a
+cheap-window charge. The connection's `grid_power_entity` has
 **no sign setting** and must read import positive: if native Meter active power
 reads the other way, keep the current grid sensor or use a template sensor
 that negates it. Never repoint to a mis-signed sensor.

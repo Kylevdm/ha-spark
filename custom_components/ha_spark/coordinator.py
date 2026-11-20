@@ -24,7 +24,7 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from . import wire
+from . import flexibility_events, wire
 from .authority import AuthorityStore
 from .authority_control import AuthorityControl
 from .channel import Outcome, PollResult, async_poll
@@ -139,14 +139,23 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
 
     async def async_reprobe(self, inverter_id: str) -> bool:
         """Native admin command seam; authentication belongs to the caller boundary."""
+        previous = self.native.identities.get(inverter_id)
         found = await self.native.async_reprobe(inverter_id)
         # A Re-probe that changes the identity invalidates that inverter's bound
         # until a new supervise_export (Q22a): its supervision rows are dropped.
         async with self.control.lock:
             state = self.authority.state
+            probe = self.native.probes.get(inverter_id)
+            identity = tuple(probe.identity) if probe is not None else None
+            # A failed read drops the bound, but is not evidence of a replacement.
+            if identity and (inverter_id in self.native.identity_changed
+                             or previous is not None and identity != previous
+                             or state is not None and any(
+                                 row.inverter_id == inverter_id and row.identity != identity
+                                 for row in state.export_supervisions)):
+                if not self._export_device_changed_locked({inverter_id}):
+                    return found
             if state is not None:
-                probe = self.native.probes.get(inverter_id)
-                identity = tuple(probe.identity) if probe is not None else None
                 kept = tuple(row for row in state.export_supervisions
                              if row.inverter_id != inverter_id or row.identity == identity)
                 if len(kept) != len(state.export_supervisions):
@@ -345,8 +354,22 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
                              for h in state.holds]
         evidence = self.holds.evidence.options()
         if evidence is not None and evidence.configured:
-            snapshot["evidence"] = evidence.snapshot()
+            sources = evidence.snapshot()
+            for key, result in self.holds.evidence.freshness(dt_util.utcnow()).items():
+                source = sources[key]
+                if isinstance(source, dict):
+                    source.update(validity=result.validity, age_s=result.age_s,
+                                  via_sibling=result.via_sibling)
+            snapshot["evidence"] = sources
         snapshot["banks"] = self.soc.snapshot()
+        try:
+            options = flexibility_events.stored(
+                self.entry.options.get(flexibility_events.OPTION_KEY))
+            snapshot["flexibility_events"] = options.model_dump(mode="json", include={
+                "export_during_events", "export_enabled_at", "export_ratings_w",
+            })
+        except Exception:  # noqa: BLE001 - a display block never blocks the heartbeat
+            snapshot.pop("flexibility_events", None)
         if isinstance(topology, Topology):
             try:
                 snapshot["export"] = self._export_snapshot(state, topology)

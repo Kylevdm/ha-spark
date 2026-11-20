@@ -88,6 +88,58 @@ def test_command_result_and_fetch_golden(name):
     assert FetchRequest.model_validate(request).model_dump() == request
 
 
+@pytest.mark.usefixtures("retired_addon")
+def test_evidence_link_projection(client, state):
+    assert link_view(state.integration_link, NOW)["evidence"] is None
+    body = fixture("site_snapshot_v4_max")
+    assert post(client, body).status_code == 200
+    view = link_view(state.integration_link, NOW)["evidence"]
+    assert view["ev_status"] == {"validity": "fresh", "age_s": 10.0,
+                                 "max_age_s": 60.0, "via_sibling": True}
+    assert "entity_id" not in str(view)
+
+
+@pytest.mark.usefixtures("retired_addon")
+@pytest.mark.parametrize("change", [
+    {"validity": "SECRET"}, {"age_s": -1}, {"age_s": "inf"},
+    {"age_s": True}, {"via_sibling": 1}, {"unexpected": True},
+    {"validity": "fresh", "age_s": 3600, "via_sibling": False},
+    {"validity": "stale", "via_sibling": True},
+])
+def test_invalid_evidence_freshness_is_field_local(client, state, change):
+    body = fixture("site_snapshot_v4_max")
+    body["evidence"]["ev_status"].update(change)
+    assert post(client, body).status_code == 200
+    assert state.integration_link.v4.evidence_reason == "invalid_evidence"
+    assert link_view(state.integration_link, NOW)["evidence"] is None
+
+
+@pytest.mark.usefixtures("retired_addon")
+@pytest.mark.parametrize("change", [
+    None, {"export_enabled_by": "stored-admin-user-id-canary"},
+    {"export_enabled_at": None}, {"export_ratings_w": {"unknown": 5000}},
+])
+def test_flexibility_events_never_changes_snapshot_acceptance(client, state, change):
+    body = fixture("site_snapshot_v4_max")
+    assert post(client, body).status_code == 200
+    before = state.integration_link.v4
+    if change is None:
+        body.pop("flexibility_events")
+    else:
+        body["flexibility_events"].update(change)
+    assert post(client, body).status_code == 200
+    after = state.integration_link.v4
+    for field in ("owner", "authority", "holds", "devices", "banks", "evidence",
+                  "export", "writers"):
+        assert getattr(after, field) == getattr(before, field)
+    assert after.flexibility_events is None
+    assert after.flexibility_events_reason == (
+        None if change is None else "invalid_flexibility_events")
+    view = link_view(state.integration_link, NOW)
+    assert view["flexibility_events"] is None
+    assert "stored-admin-user-id-canary" not in json.dumps(view)
+
+
 def test_shared_versions():
     contract = fixture("contract")
     assert API_VERSION == contract["api_version"] == 4

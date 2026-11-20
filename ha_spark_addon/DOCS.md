@@ -118,6 +118,7 @@ For integration-owned sites, Home Assistant exposes these `ha_spark` services:
 | `ha_spark.start_manual_control` | Start temporary manual control from Protect or Optimise |
 | `ha_spark.resume_control` | End manual control using current conditions, never an old plan |
 | `ha_spark.reprobe` | Re-read identity and test caching for `inverter_id` |
+| `ha_spark.set_export_during_events` | Turn **Export during events** on or off (`enabled`); see below |
 | `ha_spark.commands_pending` | Prompt a fetch from the authenticated add-on channel; accepts no command data and grants no authority |
 
 Except for the fetch prompt, these services require a non-system Home Assistant
@@ -143,8 +144,7 @@ checks apply. Do not use manual control as a way to run a supervised export.
 
 ### Native fallback and protection evidence
 
-**Options → Native fallback schedule** saves `window_start`, `window_end`
-and an explicit `current_<inverter_id>` for every native inverter. There is no
+**Options → Native fallback schedule** saves `window_start` and `window_end` as HH:MM (for example `23:30`), and an explicit `current_<inverter_id>` for every native inverter. There is no
 default current. Use a cheap window on the household clock. Validation checks
 each current against the inverter's effective limit and 62.5 A register
 ceiling, the combined bank limit, and site import including one-way charge
@@ -171,10 +171,16 @@ reads or an `entity` with `battery_direction_entity` and
 sign. Set each configured source's `*_max_age_s`. Continue to Site topology
 and **Save topology** to apply the evidence draft.
 
-Only fresh reports start or clear holds. An unchanged cached state or a sibling
-sensor's timestamp cannot rescue stale native protection evidence. A confirmed
-EV hold needs five distinct advancing fresh not-charging reports to clear;
-a dispatch hold retains its last trusted end through an outage. A verified
+Only fresh evidence starts holds. Optional `ev_liveness_entity` (EV status,
+plug and power) and `dispatch_liveness_entity` (live dispatch and adjusted rate)
+have no defaults: choose one reporting sibling per group. Own fresh reports take
+precedence. A stale source is rescued only when its own report is known,
+non-future and no older than 12 hours, and the sibling's non-future report is
+within that source's `*_max_age_s`. Unknown/unavailable states cannot be rescued
+or supply liveness. Battery direction and dispatch grid power never use siblings.
+A confirmed EV hold needs five distinct advancing **own** fresh not-charging
+reports to clear; a sibling never advances clearance or permits removal. A
+dispatch hold retains its last trusted end through an outage. A verified
 charging window and fresh no-discharge evidence can prevent a new EV hold,
 never clear a confirmed one. Holds beat fallback and exports. Protection can
 continue without the add-on, but requires Home Assistant to remain running;
@@ -244,6 +250,60 @@ write permission. Follow the
 [supervised-export runbook](../docs/runbooks/supervised-axle-export.md) for
 preparation, abort and verified cleanup, including lifecycle notices.
 
+### Export during events
+
+With **Export during events** on, the integration supervises each export
+flexibility event itself, so you don't have to choose **Arm supervised export**
+for every event. It is off by default and is site-wide.
+
+1. In **Options → Flexibility events** (native topologies only), enter the
+   export rating in watts for every native inverter. The ratings are checked
+   as a manual supervision's are: verified identity and gateway claim, and a
+   total within the site export limit. Leave every field empty to clear them.
+2. Call `ha_spark.set_export_during_events` with `enabled: true`. Only a
+   non-system Home Assistant administrator can, so automations and scripts
+   are refused. Turning it on re-checks the ratings and records you as the
+   enabling admin, with the time.
+
+Ratings can't be changed while the switch is on; turn it off first. Turning it
+off keeps the ratings and stops further automatic supervisions. An export that
+is already running finishes, or you end it with **End supervision**.
+
+Each automatic supervision passes exactly the checks a manual one does:
+Optimise only, no manual control, no fallback, authority known and current,
+limits and supply guard open, device export bounds verified, and not tripped.
+The enabling admin is its confirming user and must still be a non-system
+administrator. Automatic export never runs in Observe, Protect, manual control
+or fallback. The tripwire, the stop latch and zero-confirmed clears apply
+unchanged, and an event refused as `tripped` stays refused until it ends.
+
+A refused event is retried on later plans until it ends, for example after a
+late switch into Optimise or a restart. Each event sends one notice per refusal
+reason (`ha-spark export`, through the notify target). Acceptances and
+refusals go to the export log, marked automatic. When an event moves or is
+cancelled, the automatic supervision for the old event ends with a
+zero-confirmed clear; the new event isn't armed until that clear is verified.
+A manual supervision is never replaced or ended by automatic export. An
+untrusted event read keeps the existing rule: a still-live verified export is
+preserved and nothing new is armed.
+
+If a rated inverter's identity or gateway claim changes (a Re-probe, a
+topology or claim edit, or a stored supervision that no longer matches after
+a restart), the switch turns itself off and you get a notice. Check the
+ratings, then turn it on again with the service.
+
+Limits:
+
+- An inverter swapped while Home Assistant was down, with no stored
+  supervision for it, can't be detected, because the opt-in stores no device
+  identity. Turn the switch off before you replace an inverter.
+- The export log holds a bounded number of entries. After a trip's stop latch
+  ends, a busy log can drop the `tripped` entry, after which that event is no
+  longer refused as `tripped`.
+
+`ha-spark health` and the integration's diagnostics show whether the switch is
+on, since when, and the stored ratings. They never show the admin's user id.
+
 ### Re-pairing after re-adding the integration
 
 The add-on pairs with the first site that sends it a current snapshot and
@@ -299,6 +359,9 @@ entities. The integration checks entry preconditions when you request a mode.
 Without a live integration snapshot the mode page shows SoC as unavailable,
 never the configured SoC entity, and every mode request is refused as
 `authority_unknown` until the snapshot returns.
+On an integration-owned site, **Export during events** shows `on since <time>`
+or `off`, with each inverter's stored rating in watts; without a current
+integration snapshot it warns `integration state unavailable`.
 
 Each native **Solis transport (<id>)** row reads validation through the daemon,
 without probing Modbus or writing a test schedule. `validated` is OK;
@@ -697,7 +760,9 @@ finite and within its field's range.
   limits 0–500 A (default 0); **Limits confirmed** (default off, and
   unconfirmed limits count as 0 A); optional grid-port power and battery power
   sensors, with power sign `positive_import` or `negative_import`.
-- **V2L charger:** bank; maximum DC current 0–500 A. At most one per bank.
+- **V2L charger:** bank; maximum DC current 0–500 A; optional V2L power sensor
+  (W). At most one per bank. The SoC check uses the power sensor to account
+  for V2L charging (see below).
 - **Major load:** kind EV charger or heat pump; grid connection; optional power
   sensor. An EV charger has demand over 0 up to 50 kW (default 7.4 kW) and can
   be marked **The one dispatches drive** (at most one site-wide). A heat pump
@@ -853,6 +918,10 @@ A document from a newer schema is not overwritten by import.
 When a newer release recorded itself as the writer, the unknown-fields reason
 names both versions (for example, "Unknown configuration fields: 1 (written by
 ha-spark 0.33.0; this is 0.32.0)"), the usual sign of a downgrade.
+From this release, every save records the writing version; after any save, a
+downgrade below 0.32.0 triggers configuration repair ("Invalid configuration
+envelope"). Releases 0.32.0 or later accept this metadata, but still refuse
+unknown settings fields.
 
 This bootstrap-only state serves diagnostics and repair through ingress and
 the daemon socket. It builds no device drivers, runs no scheduler tick, computes
@@ -894,7 +963,7 @@ Intelligent, myenergi zappi). Point these at your own entities:
 | `soc_failure_threshold` | How many consecutive failed SoC observations trigger the configured Solis fallback (default `3`). Before fallback entry, one good observation resets the count. Once fallback is requested, verified, or unconfirmed, a passing observation leaves it in place until recovery (`soc_recovery_minutes`) |
 | `soc_recovery_minutes` | How many minutes of continuously passing SoC observations an active Solis fallback needs before ha-spark recovers (default `10`). Any failed observation restarts the count. The SoC may move, but its `last_reported` must never go backwards and must advance at least once; the battery-voltage liveness exception does not count. ha-spark then computes a fresh plan from the current SoC and the remaining cheap-rate window. The fallback stays in place until that plan is written and read back; a failed or mismatched read-back keeps the fallback and retries every minute. In Observe nothing is written, so recovery completes once the fresh plan is computed |
 | `solis_fallback_current_a` | Optional fallback-current ceiling in amps. When set, a sustained SoC failure programs only the configured `charge_window_start`–`charge_window_end` and this current. It is checked against the effective charge limit (your setting and the 62.5 A Solis register limit, or the saved native inverter and bank limits) and the effective site supply, and refused with a named reason when above either. The setting remains bounded at 1–62.5 A. It is disabled when blank; there is no implicit current default. Only a successful Solis read-back is reported as verified |
-| `battery_power_entity` | Optional battery power in W, sampled each minute to check SoC against energy flow. The Solis preset uses `sensor.solisac_battery_power`. Both power signs count. Jumps unexplained by energy flow by more than 2 percentage points fail; unchanged SoC fails after more than 2 points of energy flows. Two consecutive reads of a rejected changed value accept a possible BMS recalibration with a warning. Missing power skips that interval; without this setting these checks are off. The baseline resets on restart |
+| `battery_power_entity` | Optional battery power in W, sampled each minute to check SoC against energy flow. The Solis preset uses `sensor.solisac_battery_power`. Both power signs count. Jumps unexplained by energy flow by more than 2 percentage points fail; unchanged SoC fails after more than 2 points of energy flows. Two consecutive reads of a rejected changed value accept a possible BMS recalibration with a warning. Missing power skips that interval; without this setting these checks are off. The baseline resets on restart. With `v2l_power_entity` and `battery_power_discharge_sign` set, V2L charging is counted too (see "SoC integrity and fallback") |
 | `battery_voltage_entity` | Battery voltage (V). ha-spark also uses it to tell whether the SoC's source is live, so pick the voltage sensor from the same integration as `soc_entity` |
 | `solar_tomorrow_entity` | Solcast "forecast tomorrow" sensor (with `detailedForecast` attribute). Used only by sites without native Solcast; ignored once a Solcast key is configured |
 | `solar_today_entity` | Optional Solcast "forecast today" sensor; recommended for accurate charge sizing on sites without native Solcast. Honours `solar_percentile` and `detailedForecast`, like the tomorrow sensor. If missing or invalid, today's solar counts as zero: this oversizes the charge, never undersizes it. Ignored once a Solcast key is configured |
@@ -1196,6 +1265,18 @@ native SoC policy and fallback options described above, not
 `solis_fallback_current_a`.
 
 ha-spark checks `soc_entity` once a minute (see the `soc_*` settings above).
+
+**V2L charging.** The V2L charger feeds the battery directly, so the inverter's
+battery power doesn't show it. While V2L charges and the inverter discharges,
+SoC can stay level for hours, which used to fail the stuck-SoC check and start
+fallback. Now, when an observation has a fresh V2L reading (explicit `W`,
+reported within 120 s, not negative), the check counts V2L input at face
+value: it nets V2L against the signed battery power for the stuck-SoC test,
+and adds V2L energy to what can explain a SoC change. On add-on-owned sites
+this uses `v2l_power_entity` and needs `battery_power_discharge_sign`; on
+integration-owned sites set the V2L charger's power sensor in **Site topology
+and limits**. A missing, stale or invalid V2L reading leaves the check exactly
+as strict as before, for that observation too.
 The companion integration shows fallback state in **Fallback active** and the
 plan's SoC status and reason in **Plan status** attributes. The log and action
 lines give the detailed operating state and recovery progress:
@@ -1758,8 +1839,10 @@ every hardware decision.
 ## Hold evidence freshness and durable ownership
 
 The settings and sibling-liveness rules below describe add-on-owned sites.
-Integration-owned sites use **Native protection evidence** above; no sibling
-report rescues a stale source there.
+Integration-owned sites use **Native protection evidence** above, including its
+optional group liveness entities and per-source `*_max_age_s`. Health's Evidence
+rows on those sites show the integration's snapshot validity, maximum age and
+`sibling=yes|no`, rather than the add-on's evidence settings.
 
 Only fresh EV/dispatch evidence can start a new hold. A confirmed EV hold
 survives stale evidence and restarts, and clears after five strictly advancing

@@ -83,11 +83,28 @@ and every plan line must trace to one.
 (Decision: Q8, 2026-07-12.)
 
 **Flexibility event**:
-A time window from an aggregator (Axle) during which imported or exported
-energy earns an event rate (about £1/kWh). It is modelled as price slots laid
-over the tariff schedule, not as a separate planner concept or a control
-authority. The planner responds to the prices, and ha-spark's own drivers write
-to the hardware. (Decision: Q2 of the 2026-07-12 grilling session.)
+A time-bound import or export event with a source: a window from an aggregator
+(Axle) or a supplier session during which imported or exported energy earns an
+event rate (about £1/kWh) or is free. It is modelled as price slots laid over
+the tariff schedule, not as a separate planner concept or a control authority.
+The planner responds to the prices, and ha-spark's own drivers write to the
+hardware. (Decision: Q2 of the 2026-07-12 grilling session; direction and
+source #720, 2026-11-18.)
+
+**Export during events**:
+The owner's durable, site-wide opt-in for every export flexibility event to
+get an export supervision automatically, with the export ratings the owner
+stored once. The admin who turned it on confirms each of those supervisions.
+It is off by default and native-only. It adds no new way to export: each
+automatic supervision passes the same checks as a manual one.
+(Decision: #720, ADR-0013.)
+_Avoid_: auto-export, export automation
+
+**Import during events**:
+The owner's site-wide switch for whether the planner turns import flexibility
+events, from any source, into charge windows. It is on by default. It is a
+planner gate only, so import adds no new write path or supervision.
+(Decision: #720, ADR-0013.)
 
 **SoC freshness**:
 Whether a reported SoC can be believed *now*. An unchanged SoC is fresh while
@@ -202,7 +219,8 @@ _Avoid_: EPM (vendor term), export guard
 
 **Export supervision**:
 An owner's arming of one planned flexibility-event export on a natively
-connected inverter, with each inverter's rated output confirmed. It covers that
+connected inverter, with each inverter's rated output confirmed. It is sent by
+hand (`supervise_export`) or made automatically under **Export during events**. It covers that
 event only and ends at the event's end, on a cancel, when the site leaves
 Optimise, or when the owner ends it. Without a live supervision a native
 export is refused, and it never runs outside Optimise. It is not a hold, an

@@ -134,11 +134,19 @@ class EvidenceSource(FrozenModel):
     source: Literal["entity", "native"] = "entity"
     entity_id: EntityId | None = None
     max_age_s: float = Field(strict=True, gt=0, le=86400, allow_inf_nan=False)
+    validity: Literal["fresh", "stale", "future", "unknown"] | None = None
+    age_s: float | None = Field(default=None, strict=True, ge=0, allow_inf_nan=False)
+    via_sibling: bool | None = Field(default=None, strict=True)
 
     @model_validator(mode="after")
     def validate_source(self) -> Self:
         if (self.source == "entity") != (self.entity_id is not None):
             raise ValueError("invalid evidence source")
+        # Freshness metadata must be self-consistent: fresh within its maximum
+        # age, and a sibling only ever vouches for a fresh source.
+        if (self.validity == "fresh" and (self.age_s is None or self.age_s > self.max_age_s)
+                or self.via_sibling and self.validity != "fresh"):
+            raise ValueError("invalid evidence freshness")
         return self
 
 
@@ -160,6 +168,27 @@ class Evidence(FrozenModel):
             self.adjusted_rate, self.dispatch_grid_power,
         )):
             raise ValueError("invalid evidence source")
+        if any(source is not None and source.via_sibling for source in (
+            self.battery_direction, self.dispatch_grid_power,
+        )):
+            raise ValueError("invalid evidence freshness")
+        return self
+
+
+class FlexibilityEvents(FrozenModel):
+    """Display-only owner opt-in and stored export ratings."""
+
+    export_during_events: bool = Field(strict=True)
+    export_enabled_at: Instant | None
+    export_ratings_w: dict[SafeId, Annotated[
+        float, Field(strict=True, gt=0, le=100000, allow_inf_nan=False),
+    ]] = Field(max_length=8)
+
+    @model_validator(mode="after")
+    def enabled_state(self) -> Self:
+        if self.export_during_events and (
+                self.export_enabled_at is None or not self.export_ratings_w):
+            raise ValueError("invalid_flexibility_events")
         return self
 
 
@@ -281,6 +310,8 @@ class SnapshotV4:
     export_reason: str | None = None
     writers: tuple[Writer, ...] = ()
     writers_reason: str | None = None
+    flexibility_events: FlexibilityEvents | None = None
+    flexibility_events_reason: str | None = None
 
 
 def parse_snapshot_v4(raw: dict[str, object], topology: Topology | None) -> SnapshotV4:
@@ -319,6 +350,15 @@ def parse_snapshot_v4(raw: dict[str, object], topology: Topology | None) -> Snap
                 raise ValueError
         except (ValidationError, ValueError, TypeError):
             exports, export_reason = (), "invalid_export"
+    flexibility_events, flexibility_events_reason = None, None
+    if owner == "integration" and raw.get("flexibility_events") is not None:
+        try:
+            flexibility_events = FlexibilityEvents.model_validate(raw["flexibility_events"])
+            if not set(flexibility_events.export_ratings_w) <= known:
+                raise ValueError
+        except (ValidationError, ValueError, TypeError):
+            flexibility_events = None
+            flexibility_events_reason = "invalid_flexibility_events"
     banks: list[BankSoc] = []
     bank_raw = raw.get("banks")
     for bank in topology.banks if topology else ():
@@ -357,4 +397,5 @@ def parse_snapshot_v4(raw: dict[str, object], topology: Topology | None) -> Snap
         except (ValidationError, ValueError, TypeError):
             writers, writers_reason = (), "invalid_writer"
     return SnapshotV4(owner, authority, holds, devices, devices_reason, tuple(banks), evidence,
-                      evidence_reason, exports, export_reason, writers, writers_reason)
+                      evidence_reason, exports, export_reason, writers, writers_reason,
+                      flexibility_events, flexibility_events_reason)

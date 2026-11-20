@@ -1,6 +1,13 @@
 {
   "api_version": 4,
-  "release_version": "0.32.3",
+  "flexibility_events": {
+    "export_during_events": true,
+    "export_enabled_at": "2026-10-24T11:00:00+00:00",
+    "export_ratings_w": {
+      "i0_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx": 5000.0
+    }
+  },
+  "release_version": "0.33.1",
   "site_id": "6f1c2b3a-9d84-4e57-a1c0-2f3e4d5c6b7a",
   "sent_at": "2026-10-24T11:59:58+00:00",
   "solar_forecast": {
@@ -1459,31 +1466,52 @@
   "evidence": {
     "ev_status": {
       "entity_id": "sensor.ev_status",
-      "max_age_s": 60.0
+      "max_age_s": 60.0,
+      "validity": "fresh",
+      "age_s": 10.0,
+      "via_sibling": true
     },
     "battery_direction": {
       "entity_id": "sensor.battery_direction",
-      "max_age_s": 60.0
+      "max_age_s": 60.0,
+      "validity": "fresh",
+      "age_s": 10.0,
+      "via_sibling": false
     },
     "ev_plug": {
       "entity_id": "sensor.ev_plug",
-      "max_age_s": 60.0
+      "max_age_s": 60.0,
+      "validity": "fresh",
+      "age_s": 10.0,
+      "via_sibling": true
     },
     "ev_power": {
       "entity_id": "sensor.ev_power",
-      "max_age_s": 60.0
+      "max_age_s": 60.0,
+      "validity": "fresh",
+      "age_s": 10.0,
+      "via_sibling": true
     },
     "live_dispatch": {
       "entity_id": "sensor.live_dispatch",
-      "max_age_s": 60.0
+      "max_age_s": 60.0,
+      "validity": "fresh",
+      "age_s": 10.0,
+      "via_sibling": true
     },
     "adjusted_rate": {
       "entity_id": "sensor.adjusted_rate",
-      "max_age_s": 60.0
+      "max_age_s": 60.0,
+      "validity": "fresh",
+      "age_s": 10.0,
+      "via_sibling": true
     },
     "dispatch_grid_power": {
       "entity_id": "sensor.dispatch_grid_power",
-      "max_age_s": 60.0
+      "max_age_s": 60.0,
+      "validity": "fresh",
+      "age_s": 10.0,
+      "via_sibling": false
     }
   },
   "export": [

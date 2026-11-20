@@ -145,6 +145,8 @@ class ExportSupervision(Record):
     rating_w: Annotated[float, Field(gt=0, le=100000, allow_inf_nan=False)]
     identity: tuple[int, int, int]
     claim: GatewayClaim
+    # Rows stored before provenance existed were all owner commands.
+    provenance: Literal["manual", "automatic"] = "manual"
 
 
 class ExportRecord(Record):
@@ -166,7 +168,8 @@ class ExportTransition(Record):
     event: EventIdentity
     at: AwareDatetime
     kind: Literal["accepted", "armed", "started", "cleanup_verified", "aborted",
-                  "clock_hold", "tripped", "unverified"]
+                  "clock_hold", "tripped", "unverified", "refused"]
+    source: Literal["manual", "automatic"] = "manual"
     reason: Text | None = None
     acked: bool = Field(default=False, strict=True)
     cleared: bool | None = Field(default=None, strict=True)

@@ -69,6 +69,7 @@ async def test_supervise_export_stores_bound_identity_claim_and_renders_diagnost
     assert row.identity == (0x0026, 0x2031, 0x0000)
     assert row.claim.host == "gateway.invalid" and row.claim.unit_id == 1
     assert row.confirming_user_id == "cli" and row.epoch == state.epoch
+    assert row.provenance == "manual"
     assert row.event.end == NOW + timedelta(hours=3)
     snapshot = writer._export_snapshot(state, writer.guard.topology)  # type: ignore[union-attr]
     [entry] = snapshot

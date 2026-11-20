@@ -81,6 +81,14 @@ def ratings_refusal(
     """Validate one supervision's ratings and the per-connection sum rule."""
     if event.end <= now.astimezone(UTC):
         return "invalid_intent"
+    return ratings_bound_refusal(ratings, topology, limits, facts)
+
+
+def ratings_bound_refusal(
+    ratings: Mapping[str, float], topology: Topology, limits: EffectiveLimits,
+    facts: Mapping[str, DeviceExportFact],
+) -> str | None:
+    """The event-free half of ``ratings_refusal``; the export opt-in checks it too."""
     if not ratings:
         return "invalid_intent"
     by_id = {inverter.id: inverter for inverter in topology.inverters}

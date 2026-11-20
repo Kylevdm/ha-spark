@@ -21,7 +21,7 @@ NOW = datetime(2026, 10, 24, 12, tzinfo=UTC)
 KEYS = {"state", "site_id", "integration_release_version", "api_version", "sent_at",
         "snapshot_age_s", "solar_source", "topology_source", "topology_revision",
         "topology_reason", "major_loads_reason", "supply_guard_reason", "devices",
-        "authority_owner"}
+        "authority_owner", "evidence", "flexibility_events"}
 TOKEN = "TOKEN-CANARY-480"
 SESSION = "SESSION-CANARY-480"
 
@@ -46,6 +46,8 @@ def test_link_view(age: int | None, skew: bool, expected: str) -> None:
     assert view == {
         "solar_source": "entities",
         "authority_owner": "addon",
+        "evidence": None,
+        "flexibility_events": None,
         "topology_source": "legacy",
         "topology_revision": None,
         "topology_reason": None,

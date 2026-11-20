@@ -22,7 +22,7 @@ MAX_PER_INVERTER = 64
 SNAPSHOT_PER_INVERTER = 8
 TransitionKind = Literal[
     "accepted", "armed", "started", "cleanup_verified", "aborted", "clock_hold", "tripped",
-    "unverified",
+    "unverified", "refused",
 ]
 
 
@@ -95,7 +95,7 @@ def _latch_evidence(rows: Sequence[ExportTransition], now: datetime) -> set[UUID
 def visible(rows: Sequence[ExportTransition], inverter_id: str) -> tuple[ExportTransition, ...]:
     """The snapshot's oldest unacknowledged rows, in order, bounded per snapshot."""
     return tuple(row for row in rows if row.inverter_id == inverter_id
-                 and not row.acked)[:SNAPSHOT_PER_INVERTER]
+                 and row.kind != "refused" and not row.acked)[:SNAPSHOT_PER_INVERTER]
 
 
 def _within(
@@ -118,11 +118,12 @@ def trim(
     rows: Sequence[ExportTransition], now: datetime, *,
     reserve: int = 0, reserve_inverter: str | None = None,
 ) -> tuple[tuple[ExportTransition, ...], int]:
-    """Drop acked rows past their event, then oldest acked, then oldest unacked.
+    """Prune ended refusals/acked rows, then evict refusals before lifecycle evidence.
 
     Returns the kept rows and how many unacknowledged rows were dropped.
     """
-    kept = [row for row in rows if not (row.acked and row.event.end <= now)]
+    kept = [row for row in rows
+            if not ((row.acked or row.kind == "refused") and row.event.end <= now)]
     # A held-abort latch (review M2) is safety evidence until its event ends:
     # evict it only when nothing else is left to drop (two rows per live held
     # event; the per-inverter cap would need 32 such events at once).
@@ -133,7 +134,11 @@ def trim(
         if within:
             break
         index = next((i for i, row in enumerate(kept)
-                      if row.acked and row.id not in pinned), None)
+                      if row.kind == "refused"
+                      and (over is None or row.inverter_id == over)), None)
+        if index is None:
+            index = next((i for i, row in enumerate(kept)
+                          if row.acked and row.id not in pinned), None)
         if index is None:
             index = next((i for i, row in enumerate(kept)
                           if row.id not in pinned
@@ -151,18 +156,27 @@ def with_append(
     state: AuthorityState, *, inverter_id: str, event: EventIdentity,
     kind: TransitionKind, at: datetime, reason: str | None = None,
     cleared: bool | None = None, transition_id: UUID | None = None,
+    source: Literal["manual", "automatic"] = "manual",
 ) -> AuthorityState:
-    """Append one kind at most once per inverter and event, trimming first."""
+    """Append once per kind, acceptance source or refusal reason, trimming first."""
     if any(row.inverter_id == inverter_id and row.kind == kind
-           and same_event(row.event, event) for row in state.export_transitions):
+           and same_event(row.event, event)
+           and (kind != "refused" or row.reason == reason)
+           and (kind != "accepted" or row.source == source)
+           for row in state.export_transitions):
         return state
     rows, dropped = trim(state.export_transitions, at, reserve=1,
                          reserve_inverter=inverter_id)
+    if kind == "refused":
+        kept_ids = {row.id for row in rows}
+        if any(row.kind != "refused" and row.id not in kept_ids
+               for row in with_pruned(state, at).export_transitions):
+            return state  # A refusal must never displace lifecycle evidence.
     if dropped:
         log.warning("Dropped unacknowledged export transitions at the log cap")
     row = ExportTransition(
         inverter_id=inverter_id, id=transition_id or uuid4(), event=event, at=at,
-        kind=kind, reason=reason, cleared=cleared,
+        kind=kind, reason=reason, cleared=cleared, source=source,
     )
     return state.model_copy(update={
         "export_transitions": rows + (row,), "last_changed_at": at,
@@ -180,7 +194,7 @@ def with_acks(
         if str(row.id) in known and not row.acked:
             row = row.model_copy(update={"acked": True})
             changed = True
-        if row.acked and row.event.end <= now:
+        if (row.acked or row.kind == "refused") and row.event.end <= now:
             changed = True
             continue
         kept.append(row)
@@ -192,9 +206,9 @@ def with_acks(
 
 
 def with_pruned(state: AuthorityState, now: datetime) -> AuthorityState:
-    """Delete acknowledged rows whose event has ended."""
+    """Delete ended refusals and acknowledged lifecycle rows."""
     kept = tuple(row for row in state.export_transitions
-                 if not (row.acked and row.event.end <= now))
+                 if not ((row.acked or row.kind == "refused") and row.event.end <= now))
     if len(kept) == len(state.export_transitions):
         return state
     return state.model_copy(update={

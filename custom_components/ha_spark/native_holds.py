@@ -207,7 +207,10 @@ class NativeHolds:
                 # Unknown evidence re-arms an unfinished release until the last trusted end.
                 h = h.model_copy(update={"pending_release": h.trusted_end is not None
                                          and now >= h.trusted_end})
-            fresh = evidence.charging is not None if h.cause == "ev" else evidence.dispatch_trusted
+            # A sibling vouches for liveness, not for this hold's own status:
+            # a quiet own report still raises the degraded notice (#679).
+            fresh = (evidence.charging is not None and not evidence.ev_via_sibling
+                     if h.cause == "ev" else evidence.dispatch_trusted)
             since = None if fresh else h.evidence_stale_since or now
             h = h.model_copy(update={"evidence_stale_since": since,
                 "degraded_notified": h.degraded_notified if not fresh else False,
@@ -315,7 +318,8 @@ class NativeHolds:
             for inverter in c.native.inverters.values():
                 records = [h for h in state.holds if h.device == hold_device(inverter)]
                 if removal and any(
-                    evidence.charging is not False if h.cause == "ev" else
+                    (evidence.charging is not False or evidence.ev_via_sibling)
+                    if h.cause == "ev" else
                     not (h.trusted_end is not None and now >= h.trusted_end or
                          evidence.dispatch_trusted and not any(
                              w.start <= now < w.end for w in evidence.dispatches))

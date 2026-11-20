@@ -14,12 +14,17 @@ from pydantic import ValidationError
 
 from .const import DOMAIN
 from .native_hold import (
+    DISPATCH_GROUP,
+    EV_GROUP,
+    SOURCES,
     DispatchWindow,
     EvidenceOptions,
+    Freshness,
     charge_window,
     dispatch_kept,
     fresh,
     in_window,
+    report_freshness,
 )
 from .solis_frames import POINTS, decode
 from .topology import Inverter
@@ -35,6 +40,7 @@ class EvidenceRead:
     dispatch_trusted: bool
     dispatches: tuple[DispatchWindow, ...]
     overnight: bool
+    ev_via_sibling: bool = False
 
 
 class NativeEvidence:
@@ -65,19 +71,43 @@ class NativeEvidence:
         options = self.options()
         return options is not None and options.configured
 
+    def _state(self, entity_id: str | None) -> State | None:
+        state = self.coordinator.hass.states.get(entity_id) if entity_id else None
+        return state if state is not None and state.state.strip().lower() not in (
+            "unknown", "unavailable") else None
+
+    def freshness(self, now: datetime) -> dict[str, Freshness]:
+        """Freshness of every configured entity source, without exposing state values."""
+        options = self.options()
+        if options is None:
+            return {}
+        result: dict[str, Freshness] = {}
+        for key in SOURCES:
+            source = getattr(options, key)
+            if source is None or source.entity_id is None:
+                continue
+            sibling_id = (options.ev_liveness_entity if key in EV_GROUP else
+                          options.dispatch_liveness_entity if key in DISPATCH_GROUP else None)
+            own = self._state(source.entity_id)
+            sibling = self._state(sibling_id)
+            result[key] = report_freshness(
+                own.last_reported if own else None,
+                sibling.last_reported if sibling else None, now, source.max_age_s)
+        return result
+
     def read(self, now: datetime) -> EvidenceRead:
         c = self.coordinator
         options = self.options()
         if options is None:
             return EvidenceRead(None, None, False, (), False)
+        freshness = self.freshness(now)
         states: dict[str, State | None] = {}
         for key in ("ev_status", "ev_plug", "ev_power", "live_dispatch", "adjusted_rate",
                     "dispatch_grid_power", "battery_direction"):
             source = getattr(options, key)
-            state = c.hass.states.get(source.entity_id) if source and source.entity_id else None
-            states[key] = state if (state is not None and
-                state.state.strip().lower() not in ("unknown", "unavailable") and
-                fresh(state.last_reported, now, source.max_age_s)) else None
+            state = self._state(source.entity_id) if source else None
+            result = freshness.get(key)
+            states[key] = state if result is not None and result.validity == "fresh" else None
         def power(key: str) -> float | None:
             reading = states[key]
             if reading is not None:
@@ -131,8 +161,9 @@ class NativeEvidence:
         # Match the shipped start-clock exclusion, only when
         # every inverter has a fresh readable window. Unknown retains the hold.
         windows = [w for w in windows if not all(self._covered(i, w, now) for i in inverters)]
-        return EvidenceRead(charging, ev.last_reported if ev else None,
-                            trusted, tuple(windows), overnight)
+        via_sibling = freshness.get("ev_status", Freshness("unknown", None)).via_sibling
+        return EvidenceRead(charging, ev.last_reported if ev and not via_sibling else None,
+                            trusted, tuple(windows), overnight, via_sibling)
 
     def _window(self, inverter: Inverter, now: datetime) -> tuple[time, time] | None:
         reading = self.coordinator.native.reading(inverter, "holding_43141")
@@ -164,10 +195,8 @@ class NativeEvidence:
             watts = decode(point, reading.registers, zone, frame=True)
             if not isinstance(watts, (int, float)):
                 return False
-            # Native decoding reports charging positive; apply the same
-            # owner-set sign convention as the native guard input.
-            if inverter.power_sign == "negative_import":
-                watts = -watts
+            # The direction register signs native battery power (charging
+            # positive), so the owner's grid-port power_sign does not apply.
             return watts > -50
         state = c.hass.states.get(source.entity_id) if source.entity_id else None
         if (state is None or not fresh(state.last_reported, now, source.max_age_s)

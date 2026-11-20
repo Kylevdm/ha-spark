@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from collections.abc import Sequence
+from datetime import UTC, datetime
 
 import pytest
 from pymodbus.exceptions import ConnectionException, ModbusIOException
@@ -14,7 +15,12 @@ from pymodbus.pdu.register_message import (
     WriteMultipleRegistersResponse,
 )
 
-from custom_components.ha_spark.solis_transport import PymodbusTcpTransport, TransportError
+from custom_components.ha_spark.solis_transport import (
+    PymodbusTcpTransport,
+    ReadResult,
+    TransportError,
+    WriteResult,
+)
 
 
 class WireTimeout(ModbusIOException):
@@ -398,4 +404,215 @@ async def test_write_queued_during_pacing_gap_goes_before_waiting_read() -> None
         assert client.calls[1][3] >= 0.04 + 0.31
     finally:
         gap_done.set()
+        await transport.close()
+
+
+async def test_drop_timeout_and_reconnect_logs_once_during_long_outage(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="custom_components.ha_spark.solis_transport")
+    clock = Clock()
+    client = Client(clock)
+    delays: asyncio.Queue[float] = asyncio.Queue()
+    permits: asyncio.Queue[None] = asyncio.Queue()
+
+    async def sleep(seconds: float) -> None:
+        if seconds >= 1:
+            delays.put_nowait(seconds)
+            await permits.get()
+        clock.now += seconds
+        await asyncio.sleep(0)
+
+    transport = PymodbusTcpTransport(
+        "secret-host", 1502, client_factory=lambda host, port: client,
+        monotonic=clock.monotonic, wall_clock=lambda: 1_700_000_000 + clock.now, sleep=sleep,
+    )
+    transport.label = "abcd1234"
+    try:
+        assert (await transport.read_input(33000, 1)).error is None
+        assert not caplog.records
+        client.reply = WireTimeout("secret-exception")
+        client.connections = [False] * 8 + [True]
+        result = await transport.read_holding(43141, 1)
+        assert result.error == TransportError.TIMEOUT
+        drops = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(drops) == 1
+        assert drops[0].message == (
+            "Native link abcd1234 dropped reason=timeout op=holding address=43141 "
+            "uptime_s=0.390 suppressed=0"
+        )
+        stats = transport.link_stats()
+        assert stats == {
+            "drops_24h": 1, "last_drop_reason": "timeout",
+            "last_drop_at": datetime.fromtimestamp(1_700_000_000.39, UTC).isoformat(),
+            "connected": False,
+        }
+        for expected in [1, 2, 4, 8, 16, 32, 60, 60]:
+            assert await delays.get() == expected
+            assert (await transport.read_input(33000, 1)).error == TransportError.DISCONNECTED
+            assert (await transport.write(43141, [1])).error == TransportError.DISCONNECTED
+            assert len(caplog.records) == 1
+            permits.put_nowait(None)
+        assert await delays.get() == 60
+        assert len(caplog.records) == 1
+        permits.put_nowait(None)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert transport.connected
+        assert len(caplog.records) == 2
+        assert caplog.records[-1].levelno == logging.INFO
+        assert caplog.records[-1].message == (
+            "Native link abcd1234 reconnected downtime_s=243.310 suppressed=0"
+        )
+        assert transport.link_stats()["drops_24h"] == 1
+        assert "secret" not in caplog.text
+        assert "1502" not in caplog.text
+    finally:
+        await transport.close()
+    assert len(caplog.records) == 2  # terminal close is not a drop
+
+
+@pytest.mark.parametrize("op", ["input", "holding", "write", "queued"])
+async def test_observed_disconnect_has_request_context(
+    op: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = Clock()
+    client = Client(clock)
+    blocked = asyncio.Event()
+
+    async def sleep(seconds: float) -> None:
+        await blocked.wait()
+
+    transport = PymodbusTcpTransport(
+        "secret-host", client_factory=lambda host, port: client,
+        monotonic=clock.monotonic, sleep=sleep,
+    )
+    pending: asyncio.Task[ReadResult] | None = None
+    result: ReadResult | WriteResult
+    try:
+        await transport.read_input(33000, 1)
+        if op == "queued":
+            # Worker is in its pacing gap: disconnect after submission.
+            pending = asyncio.create_task(transport.read_holding(43141, 1))
+            await asyncio.sleep(0)
+        client.connected = False
+        if pending is not None:
+            blocked.set()
+            result = await pending
+        elif op == "write":
+            result = await transport.write(43141, [1])
+        elif op == "holding":
+            result = await transport.read_holding(43141, 1)
+        else:
+            result = await transport.read_input(43141, 1)
+        assert result.error == TransportError.DISCONNECTED
+        assert transport.link_stats()["drops_24h"] == 1
+        expected_op = "holding" if op == "queued" else op
+        assert f"reason=disconnected op={expected_op} address=43141" in caplog.text
+    finally:
+        await transport.close()
+
+
+async def test_bad_response_counts_only_when_client_also_disconnected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = Clock()
+
+    class BadReplyClient(Client):
+        async def exchange(self, op: str, address: int, device_id: int) -> ModbusPDU:
+            reply = await super().exchange(op, address, device_id)
+            self.connected = False
+            return reply
+
+    client = BadReplyClient(clock)
+    client.reply = ReadInputRegistersResponse(registers=[])
+    transport = make_transport(client, clock)
+    try:
+        result = await transport.read_input(33000, 1)
+        assert result.error == TransportError.BAD_RESPONSE
+        assert transport.link_stats()["drops_24h"] == 1
+        assert "reason=bad_response op=input address=33000" in caplog.text
+    finally:
+        await transport.close()
+    healthy_client = Client(clock)
+    healthy_client.reply = ReadInputRegistersResponse(registers=[])
+    transport = make_transport(healthy_client, clock)
+    try:
+        assert (await transport.read_input(33000, 1)).error == TransportError.BAD_RESPONSE
+        assert transport.link_stats()["drops_24h"] == 0
+    finally:
+        await transport.close()
+
+
+async def test_link_log_rolling_caps_suppression_and_24h_pruning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="custom_components.ha_spark.solis_transport")
+    clock = Clock()
+    client = Client(clock)
+    transport = PymodbusTcpTransport(
+        "secret-host", client_factory=lambda host, port: client,
+        monotonic=clock.monotonic, wall_clock=clock.monotonic,
+    )
+    try:
+        await transport._connect()
+        for _ in range(13):
+            clock.now += 1
+            transport._link_drop(TransportError.DISCONNECTED, None, None)
+            transport._link_drop(TransportError.TIMEOUT, "input", 33000)
+            await transport._connect()
+        assert transport.link_stats()["drops_24h"] == 13
+        assert sum(r.levelno == logging.WARNING for r in caplog.records) == 10
+        assert sum(r.levelno == logging.INFO for r in caplog.records) == 10
+        assert sum(r.levelno == logging.DEBUG for r in caplog.records) == 6
+        # Just before the oldest line expires, both buckets still suppress.
+        clock.now = 3600.9
+        transport._link_drop(TransportError.TIMEOUT, "input", 33000)
+        await transport._connect()
+        assert caplog.records[-1].levelno == logging.DEBUG
+        clock.now = 3601
+        transport._link_drop(TransportError.TIMEOUT, "input", 33000)
+        await transport._connect()
+        assert caplog.records[-2].levelno == logging.WARNING
+        assert caplog.records[-1].levelno == logging.INFO
+        assert all("suppressed=4" in r.message for r in caplog.records[-2:])
+        assert transport.link_stats()["drops_24h"] == 15
+        clock.now = 86401
+        assert transport.link_stats()["drops_24h"] == 14
+        clock.now = 86413
+        assert transport.link_stats()["drops_24h"] == 2
+        clock.now = 90001
+        assert transport.link_stats() == {
+            "drops_24h": 0, "last_drop_reason": "timeout",
+            "last_drop_at": datetime.fromtimestamp(3601, UTC).isoformat(),
+            "connected": True,
+        }
+    finally:
+        await transport.close()
+
+
+async def test_bookkeeping_failures_cannot_change_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = Clock()
+    client = Client(clock)
+    transport = make_transport(client, clock)
+
+    def broken(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("secret")
+
+    monkeypatch.setattr("custom_components.ha_spark.solis_transport._LOGGER.log", broken)
+    try:
+        assert (await transport.read_input(33000, 1)).registers == (42,)
+        client.reply = WireTimeout("secret")
+        assert (await transport.write(43141, [1])).error == TransportError.TIMEOUT
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert transport.connection_epoch == 2
+        client.reply = None
+        assert (await transport.read_holding(43141, 1)).registers == (42,)
+        monkeypatch.setattr(transport, "_wall_clock", broken)
+        client.reply = WireDisconnected("secret")
+        assert (await transport.read_input(33000, 1)).error == TransportError.DISCONNECTED
+    finally:
         await transport.close()

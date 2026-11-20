@@ -53,6 +53,8 @@ log = get_logger(__name__)
 # Durable state lives next to the ledger DB (same convention as the published-
 # states cache). JSON, not SQLite: the count and fallback status are tiny.
 MONITOR_FILE = "ha_spark_soc_monitor.json"
+# V2L evidence older than this says nothing about the current interval (#735).
+V2L_MAX_AGE_S = 120.0
 
 
 class SocOperatingState(StrEnum):
@@ -120,12 +122,22 @@ async def observe_soc(
                 power = None
         except Exception:  # noqa: BLE001 - missing evidence skips this interval
             log.debug("SoC monitor: battery power unreadable", exc_info=True)
+    v2l: float | None = None
+    if monitor is not None and settings.battery_power_entity and settings.v2l_power_entity:
+        try:
+            v2l = _v2l_input_w(await rest.get_state(settings.v2l_power_entity), observed_at)
+        except Exception:  # noqa: BLE001 - no V2L evidence keeps today's strict check
+            log.debug("SoC monitor: V2L power unreadable", exc_info=True)
+    sign = settings.battery_power_discharge_sign
     if monitor is not None and settings.battery_power_entity:
         return monitor.check_observation(
             state,
             observed_at=observed_at,
             source=source,
             power_w=power,
+            charge_w=(None if power is None or sign is None
+                      else -power if sign == "positive" else power),
+            v2l_power_w=v2l,
             max_age=timedelta(minutes=settings.soc_max_report_age_minutes),
             battery_capacity_kwh=settings.battery_capacity_kwh,
         )
@@ -135,6 +147,20 @@ async def observe_soc(
         max_age=timedelta(minutes=settings.soc_max_report_age_minutes),
         source=source,
     )
+
+
+def _v2l_input_w(state: EntityState, observed_at: datetime) -> float | None:
+    """A fresh, explicit-W, finite, non-negative V2L reading; anything else is no evidence."""
+    reported = state.last_reported
+    if (state.attributes.get("unit_of_measurement") != "W" or reported is None
+            or reported.tzinfo is None
+            or not 0 <= (observed_at - reported).total_seconds() <= V2L_MAX_AGE_S):
+        return None
+    try:
+        watts = float(state.state)
+    except (TypeError, ValueError):
+        return None
+    return watts if math.isfinite(watts) and watts >= 0 else None
 
 
 class SocMonitor:
@@ -174,8 +200,12 @@ class SocMonitor:
         self._recovery_ready = False
         self._energy_baseline: float | None = None
         self._energy_kwh = 0.0
+        self._v2l_jump_kwh = 0.0
+        self._v2l_stuck_kwh = 0.0
         self._power_at: datetime | None = None
         self._power_w: float | None = None
+        self._charge_w: float | None = None
+        self._v2l_w: float | None = None
         self._rejected_value: float | None = None
 
     def check_observation(
@@ -187,23 +217,53 @@ class SocMonitor:
         source: EntityState | None = None,
         power_w: float | None,
         battery_capacity_kwh: float,
+        charge_w: float | None = None,
+        v2l_power_w: float | None = None,
     ) -> SocMeasurement:
-        """Integrate absolute power between readable observations; check without persistence."""
+        """Integrate absolute power between readable observations; check without persistence.
+
+        V2L input reaches the battery without passing the inverter (#735), so
+        V2L-adjusted sums run beside the absolute-power sum: the jump sum adds
+        V2L energy, and the stuck sum uses net flow over intervals with V2L input
+        and signed (charging-positive) battery power at both ends. They judge
+        only an observation that has its own fresh V2L reading; any other is
+        judged on the absolute-power sum alone, exactly as without V2L.
+        """
         if power_w is not None and not math.isfinite(power_w):
             power_w = None
+        if power_w is None or charge_w is None or not math.isfinite(charge_w):
+            charge_w = None
+        if v2l_power_w is not None and not (math.isfinite(v2l_power_w) and v2l_power_w >= 0):
+            v2l_power_w = None
         if self._power_at is not None and self._power_w is not None and power_w is not None:
             elapsed = max(0.0, (observed_at - self._power_at).total_seconds())
-            self._energy_kwh += (abs(self._power_w) + abs(power_w)) / 2 * elapsed / 3_600_000
+            gross = (abs(self._power_w) + abs(power_w)) / 2 * elapsed / 3_600_000
+            self._energy_kwh += gross
+            jump = stuck = gross
+            if self._v2l_w is not None and v2l_power_w is not None:
+                v2l = (self._v2l_w + v2l_power_w) / 2
+                jump += v2l * elapsed / 3_600_000
+                if (self._v2l_w > 0 and v2l_power_w > 0
+                        and self._charge_w is not None and charge_w is not None):
+                    net = (self._charge_w + charge_w) / 2 + v2l
+                    stuck = abs(net) * elapsed / 3_600_000
+            self._v2l_jump_kwh += jump
+            self._v2l_stuck_kwh += stuck
         self._power_at = observed_at
         self._power_w = power_w
+        self._charge_w = charge_w
+        self._v2l_w = v2l_power_w
         measurement = check_soc(
             state,
             observed_at=observed_at,
             max_age=max_age,
             source=source,
             baseline_soc=self._energy_baseline,
-            energy_kwh=self._energy_kwh if power_w is not None else None,
+            energy_kwh=(None if power_w is None else self._energy_kwh if v2l_power_w is None
+                        else self._v2l_jump_kwh),
             battery_capacity_kwh=battery_capacity_kwh,
+            stuck_energy_kwh=(self._v2l_stuck_kwh
+                              if power_w is not None and v2l_power_w is not None else None),
         )
         if (
             measurement.status is SocStatus.IMPLAUSIBLE
@@ -224,6 +284,8 @@ class SocMonitor:
         if measurement.ok and measurement.value != self._energy_baseline:
             self._energy_baseline = measurement.value
             self._energy_kwh = 0.0
+            self._v2l_jump_kwh = 0.0
+            self._v2l_stuck_kwh = 0.0
         return measurement
 
     @classmethod

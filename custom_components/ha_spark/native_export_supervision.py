@@ -1,16 +1,20 @@
 """Event-scoped native export supervision and snapshot projection."""
-from datetime import datetime
-from typing import TYPE_CHECKING, Any
-from uuid import UUID, uuid4
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Literal
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from homeassistant.util import dt as dt_util
 
-from . import native_export_log
-from .authority_store import ExportSupervision, GatewayClaim
+from . import flexibility_events, native_export_log, notify_target
+from .authority_store import EventIdentity, ExportSupervision, GatewayClaim
 from .commands import (
     Command,
     CommandResult,
     EndSupervisionPayload,
+    ExportNone,
+    ExportUntrusted,
+    ExportWindow,
     SupervisionPayload,
 )
 from .native_export import (
@@ -20,6 +24,7 @@ from .native_export import (
     event_from_raw,
     latest_latch,
     latest_record,
+    ratings_bound_refusal,
     ratings_refusal,
     record_is_live,
     site_export_limit_w,
@@ -85,6 +90,44 @@ class ExportSupervisor:
             return None, None
         return topology, effective_limits(topology)
 
+    def export_opt_in_refusal(self, ratings: Mapping[str, float]) -> str | None:
+        """Opt-in ratings checked as a manual supervision's are, for every native inverter."""
+        topology, limits = self._topology_and_limits()
+        guard = self.guard
+        if topology is None or limits is None:
+            return "limits"
+        if guard is not None:
+            if not guard.boundary_open:
+                return "limits"
+            topology, limits = guard.topology, guard.limits
+        native = {inverter.id for inverter in topology.inverters
+                  if inverter.transport == "native"}
+        if not native or set(ratings) != native:
+            return "missing_rating"
+        return ratings_bound_refusal(ratings, topology, limits, self._export_facts(topology))
+
+    async def async_set_export_during_events(
+        self, *, enabled: bool, user_id: str, now: datetime,
+    ) -> str | None:
+        """Switch the export opt-in for a verified admin; off keeps the ratings."""
+        async with self.control.lock:
+            current = flexibility_events.stored(
+                self.entry.options.get(flexibility_events.OPTION_KEY))
+            if enabled:
+                reason = self.export_opt_in_refusal(current.export_ratings_w)
+                if reason is not None:
+                    return reason
+            updated = current.model_copy(update={
+                "export_during_events": enabled,
+                "export_enabled_by": user_id if enabled else None,
+                "export_enabled_at": now if enabled else None,
+            })
+            self.hass.config_entries.async_update_entry(self.entry, options={
+                **self.entry.options,
+                flexibility_events.OPTION_KEY: updated.model_dump(mode="json"),
+            })
+            return None
+
     async def _async_supervise_export(self, command: Command) -> CommandResult:
         async with self.control.lock:
             return await self._async_supervise_export_locked(command)
@@ -106,6 +149,22 @@ class ExportSupervisor:
         event = event_from_raw(payload.event)
         if event is None:
             return base.model_copy(update={"reason": "invalid_intent"})
+        return await self._async_supervise_event_locked(
+            command, event, payload.ratings_w, confirming_user, provenance="manual")
+
+    async def _async_supervise_event_locked(
+        self, command: Command, event: EventIdentity, ratings: Mapping[str, float],
+        confirming_user: str, *, provenance: Literal["manual", "automatic"],
+    ) -> CommandResult:
+        base = CommandResult(session_id=command.session_id, sequence=command.sequence,
+                             outcome="refused")
+        if not self.control.owned():
+            return base.model_copy(update={"reason": "not_owner"})
+        state = self.authority.state
+        if state is None:
+            return base.model_copy(update={"reason": "authority_unknown"})
+        if command.epoch != state.epoch:
+            return base.model_copy(update={"reason": "stale_authority"})
         now = dt_util.utcnow()
         if (state.committed_mode != "optimise" or state.manual_session is not None
                 or state.fallback.active
@@ -119,13 +178,15 @@ class ExportSupervisor:
             if not guard.boundary_open:
                 return base.model_copy(update={"reason": "limits"})
             topology, limits = guard.topology, guard.limits
+        if provenance == "automatic" and set(ratings) & self.native.identity_changed:
+            return base.model_copy(update={"reason": "export_bound_unverified"})
         facts = self._export_facts(topology)
-        reason = ratings_refusal(event, payload.ratings_w, topology, limits, facts, now=now)
+        reason = ratings_refusal(event, ratings, topology, limits, facts, now=now)
         if reason is not None:
             return base.model_copy(update={"reason": reason})
         supervision_id = uuid4()
         rows: list[ExportSupervision] = []
-        for inverter_id in payload.ratings_w:
+        for inverter_id in ratings:
             fact = facts[inverter_id]
             identity = fact.identity
             claim = fact.claim
@@ -134,7 +195,7 @@ class ExportSupervisor:
             rows.append(ExportSupervision(
                 inverter_id=inverter_id, id=supervision_id, event=event,
                 confirming_user_id=confirming_user, epoch=state.epoch,
-                ends_at=event.end, rating_w=payload.ratings_w[inverter_id],
+                ends_at=event.end, rating_w=ratings[inverter_id], provenance=provenance,
                 identity=(identity[0], identity[1], identity[2]), claim=claim,
             ))
         # Re-supervising the same event replaces its rows; other events stay.
@@ -145,12 +206,125 @@ class ExportSupervisor:
         for row in rows:
             candidate = native_export_log.with_append(
                 candidate, inverter_id=row.inverter_id, event=event,
-                kind="accepted", at=now,
+                kind="accepted", at=now, source=provenance,
             )
         if not await self.authority.async_save(candidate):
             return base.model_copy(update={"reason": "authority_unknown"})
         return base.model_copy(update={"outcome": "applied", "reason": None,
                                        "epoch": state.epoch})
+
+    async def async_supervise_export_intents(
+        self, command: Command, intents: list[ExportNone | ExportUntrusted | ExportWindow],
+        *, malformed: bool,
+    ) -> None:
+        """Supervise unanimous trusted flexibility events, never inside a group lock."""
+        async with self.control.lock:
+            options = flexibility_events.stored(
+                self.entry.options.get(flexibility_events.OPTION_KEY))
+            if not options.export_during_events or malformed or not intents:
+                return
+            if any(isinstance(intent, ExportUntrusted) for intent in intents):
+                return
+            windows = [intent for intent in intents if isinstance(intent, ExportWindow)]
+            event = event_from_raw(windows[0].event.model_dump()) if windows else None
+            if windows and (len(windows) != len(intents) or event is None
+                            or any(event_from_raw(intent.event.model_dump()) != event
+                                   for intent in windows)):
+                return
+            state = self.authority.state
+            if (not self.control.owned() or state is None or command.epoch != state.epoch):
+                return
+            # A first probe after restart has no previous in-memory identity.
+            identities = self.native.identities
+            changed = {row.inverter_id for row in state.export_supervisions
+                       if row.inverter_id in options.export_ratings_w
+                       and identities.get(row.inverter_id)
+                       and identities[row.inverter_id] != row.identity}
+            if changed:
+                self._export_device_changed_locked(changed)
+                return  # Keep durable evidence until the stale-bound pass saves its drop.
+            # Manual supervision belongs to the owner, not the opt-in reconciler.
+            if any(row.provenance == "manual" for row in state.export_supervisions):
+                return
+            tripped = event is not None and (
+                any(row.event == event for row in state.stop_latches)
+                or any(row.event == event and row.kind == "tripped"
+                       for row in state.export_transitions))
+            # A changed device cannot inherit consent; a trip still retires its peers.
+            if not tripped and set(options.export_ratings_w) & self.native.identity_changed:
+                return
+            dropped = tuple(row for row in state.export_supervisions
+                            if row.provenance == "automatic" and (row.event != event or tripped))
+            if dropped:
+                kept = tuple(row for row in state.export_supervisions if row not in dropped)
+                if not await self.authority.async_save(state.model_copy(update={
+                        "export_supervisions": kept, "last_changed_at": dt_util.utcnow()})):
+                    return
+                cleared = True
+                for inverter_id in dict.fromkeys(row.inverter_id for row in dropped):
+                    clear_result = await self.writes.async_clear_export(
+                        inverter_id, epoch=state.epoch)
+                    cleared = cleared and clear_result.outcome in ("applied", "unchanged")
+                if not cleared:
+                    if tripped and event is not None:
+                        await self._async_export_refusal_locked(
+                            event, options.export_ratings_w, "tripped", dt_util.utcnow())
+                    return
+                state = self.authority.state
+                if state is None:
+                    return
+            now = dt_util.utcnow()
+            if event is None or event.end <= now:
+                return
+            if not tripped and any(row.event == event for row in state.export_supervisions):
+                return
+            reason = "tripped" if tripped else None
+            if reason is None:
+                for inverter_id in options.export_ratings_w:
+                    record = latest_record(state.export_records, inverter_id)
+                    if (record is not None and record.state != "cleared"
+                            and record.event != event):
+                        return  # The group pass owns retrying the zero-confirmed clear.
+                user_id = options.export_enabled_by
+                user = (await self.hass.auth.async_get_user(user_id)
+                        if user_id is not None and user_id != "cli" else None)
+                if event.end <= dt_util.utcnow():
+                    return
+                if user is None or not user.is_admin or user.system_generated:
+                    reason = "not_admin"
+                else:
+                    assert user_id is not None
+                    result = await self._async_supervise_event_locked(
+                        command, event, options.export_ratings_w, user_id,
+                        provenance="automatic")
+                    if result.outcome == "applied" or result.reason == "authority_unknown":
+                        return  # A failed save has no log or notice effects either.
+                    reason = result.reason
+            if reason is not None:
+                await self._async_export_refusal_locked(
+                    event, options.export_ratings_w, reason, dt_util.utcnow())
+
+    async def _async_export_refusal_locked(
+        self, event: EventIdentity, ratings: Mapping[str, float], reason: str, now: datetime,
+    ) -> None:
+        state = self.authority.state
+        if state is None or event.end <= dt_util.utcnow():
+            return
+        already = any(row.kind == "refused" and row.event == event and row.reason == reason
+                      for row in state.export_transitions)
+        candidate = state
+        for inverter_id in ratings:
+            candidate = native_export_log.with_append(
+                candidate, inverter_id=inverter_id, event=event, kind="refused",
+                reason=reason, at=now, source="automatic")
+        if (candidate is state or not await self.authority.async_save(candidate) or already
+                or event.end <= dt_util.utcnow()):
+            return
+        start, end = event.start.astimezone(UTC).isoformat(), event.end.astimezone(UTC).isoformat()
+        key = f"{self.entry.entry_id}:export:{event.direction}:{start}:{end}:{reason}"
+        notify_target.async_notice(
+            self.hass, self.entry, notification_id=str(uuid5(NAMESPACE_URL, key)),
+            title="ha-spark export", message=f"Export event {start} to {end}: {reason}.")
 
     async def _async_end_supervision(self, command: Command) -> CommandResult:
         async with self.control.lock:
@@ -302,8 +476,36 @@ class ExportSupervisor:
                     await self.writes.async_clear_export(
                         inverter.id, epoch=state.epoch, cleanup=True)
 
+    def _export_device_changed_locked(self, affected: set[str]) -> bool:
+        """Revoke rated-device consent before discarding durable identity evidence."""
+        opt_in = flexibility_events.stored(
+            self.entry.options.get(flexibility_events.OPTION_KEY))
+        affected = affected & set(opt_in.export_ratings_w)
+        if not affected:
+            return True
+        self.native.identity_changed |= affected
+        if not opt_in.export_during_events:
+            return True
+        self.hass.config_entries.async_update_entry(self.entry, options={
+            **self.entry.options,
+            flexibility_events.OPTION_KEY: flexibility_events.switched_off(
+                self.entry.options.get(flexibility_events.OPTION_KEY)),
+        })
+        if flexibility_events.stored(self.entry.options.get(
+                flexibility_events.OPTION_KEY)).export_during_events:
+            return False
+        notify_target.async_notice(
+            self.hass, self.entry,
+            notification_id=str(uuid5(NAMESPACE_URL,
+                f"{self.entry.entry_id}:export:device_changed")),
+            title="ha-spark export",
+            message="Export during events was switched off because an inverter's "
+                    "identity or gateway claim changed.")
+        return True
+
     async def async_drop_stale_bounds(
         self, *, claims: object = None, now: datetime | None = None,
+        proposed_topology: object = None,
     ) -> bool:
         """Drop supervision rows whose identity or claim can no longer hold (W9-2).
 
@@ -312,7 +514,8 @@ class ExportSupervisor:
         the in-memory identity latch is cleared only once the save verified.
         """
         changed = set(self.native.identity_changed)
-        topology = validate_topology(self.entry.options.get("topology"))
+        topology = validate_topology(proposed_topology if proposed_topology is not None
+                                     else self.entry.options.get("topology"))
         raw_claims = claims if claims is not None else self.entry.options.get("gateway_claims")
         current: dict[str, GatewayClaim | None] = {}
         if isinstance(topology, Topology):
@@ -325,10 +528,23 @@ class ExportSupervisor:
                     and raw.get("unit_id") == inverter.gateway_unit_id), None)
                 current[inverter.id] = claim
         async with self.control.lock:
+            affected = set(changed)
+            if claims is not None:
+                affected |= flexibility_events.changed_rated_claims(
+                    self.entry.options, claims, proposed_topology=proposed_topology)
             state = self.authority.state
+            identities = self.native.identities
+            if state is not None:
+                affected |= {row.inverter_id for row in state.export_supervisions
+                             if (bool(identities.get(row.inverter_id))
+                                 and identities[row.inverter_id] != row.identity)
+                             or row.inverter_id in current
+                             and current[row.inverter_id] != row.claim}
+            if not self._export_device_changed_locked(affected):
+                return False
+            changed |= affected
             if state is None:
                 return False
-            identities = self.native.identities
             kept = tuple(row for row in state.export_supervisions
                          if row.inverter_id not in changed
                          and identities.get(row.inverter_id, row.identity) == row.identity

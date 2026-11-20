@@ -17,6 +17,7 @@ from custom_components.ha_spark.native_hold import (
     fresh,
     hold_device,
     hold_identity_valid,
+    report_freshness,
 )
 from custom_components.ha_spark.topology import Inverter
 
@@ -32,6 +33,39 @@ def record(**changes: object) -> HoldRecord:
 @pytest.mark.parametrize("offset", [-301, -300, 0, 1])
 def test_evidence_uses_nonfuture_report_time(offset: int) -> None:
     assert fresh(NOW + timedelta(seconds=offset), NOW, 300) is (-300 <= offset <= 0)
+
+
+@pytest.mark.parametrize("own,sibling,validity,via,age", [
+    (0, 0, "fresh", False, 0),
+    (-3600, -10, "fresh", True, 10),
+    (-43200, -300, "fresh", True, 300),
+    (-43201, 0, "stale", False, 43201),
+    (1, 0, "future", False, None),
+    (-3600, -301, "stale", False, 3600),
+    (-3600, None, "stale", False, 3600),
+    (-3600, 1, "stale", False, 3600),
+    (None, 0, "unknown", False, None),
+])
+def test_report_freshness(own: int | None, sibling: int | None, validity: str,
+                          via: bool, age: float | None) -> None:
+    result = report_freshness(
+        NOW + timedelta(seconds=own) if own is not None else None,
+        NOW + timedelta(seconds=sibling) if sibling is not None else None, NOW, 300)
+    assert (result.validity, result.via_sibling, result.age_s) == (validity, via, age)
+
+
+def test_naive_reports_are_not_liveness() -> None:
+    assert report_freshness(NOW.replace(tzinfo=None), NOW, NOW, 300).validity == "unknown"
+    assert report_freshness(NOW - timedelta(hours=1), NOW.replace(tzinfo=None),
+                            NOW, 300).validity == "stale"
+
+
+@pytest.mark.parametrize("key", ["ev_liveness_entity", "dispatch_liveness_entity"])
+def test_liveness_options_validate_without_becoming_sources(key: str) -> None:
+    assert getattr(EvidenceOptions(), key) is None
+    assert not EvidenceOptions.model_validate({key: "sensor.live"}).configured
+    with pytest.raises(ValidationError):
+        EvidenceOptions.model_validate({key: "invalid"})
 
 
 def test_gateway_identity_is_never_truncated() -> None:

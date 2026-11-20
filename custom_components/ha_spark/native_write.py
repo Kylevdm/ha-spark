@@ -7,6 +7,7 @@ Resident state is evidence only after exact read-back, never a requested value.
 Export transactions live in NativeExportWrites and share these checks and locks.
 """
 import asyncio
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, time
@@ -52,6 +53,8 @@ if TYPE_CHECKING:
     from .coordinator import SparkCoordinator
     from .guard_loop import SupplyGuardLoop
     from .native_slots import NativeSlots
+
+log = logging.getLogger(__name__)
 
 verify_sleep = asyncio.sleep
 _SEVERITY = ("applied", "unchanged", "deferred", "refused", "unverified", "failed")
@@ -341,6 +344,16 @@ class NativeChargeBoundary(NativeExportWrites):
                     by_bank.setdefault(banks[inverter.bank_id].id, []).append(inverter_id)
             for bank_id, members in by_bank.items():
                 fixed[bank_id] = fixed_export_refusal(members, guard.topology, guard.limits)
+        try:
+            await self.coordinator.async_supervise_export_intents(
+                command, [intent for kind, intent, _ in parsed
+                          if kind == "export"
+                          and isinstance(intent, (ExportNone, ExportUntrusted, ExportWindow))],
+                malformed=any(kind == "export" and results[index] is not None
+                              for index, kind in enumerate(kinds)))
+        except Exception:
+            # Payloads and exception text may contain owner configuration.
+            log.warning("Automatic export supervision failed; continuing apply")
         groups: dict[str, list[tuple[str, ChargeCurrentLimit | ChargeWindow | ExportNone
                                      | ExportUntrusted | ExportWindow, int]]] = {}
         for kind, intent, index in parsed:
