@@ -4,18 +4,39 @@ The consumption/account/rates endpoints are the public REST v1 API (API-key Basi
 Auth). Account agreement rates and planned Intelligent dispatches use the Kraken
 GraphQL API, which needs a short-lived JWT exchanged for the API key first
 (``obtainKrakenToken``) — never logged, and never echoed in any error message.
+Weekend Happy Hour bookings are read from the undocumented Octopus backend
+GraphQL endpoint (``octopus_backend_api_url``, ADR-0004) with the same shared
+token, read-only, degrading to a failed reading on any error.
+
+Every GraphQL read goes through ``kraken_graphql``, which shares one in-memory
+token per endpoint (#688): minted on first use, replaced shortly before its
+expiry, and replaced once more (with one retry of the call) when Kraken rejects
+it. The token is never persisted.
 """
 
 from __future__ import annotations
 
+import base64
 import csv
+import hashlib
 import io
+import json
+import math
 import re
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 
 import httpx
-from pydantic import AwareDatetime, BaseModel, Field, StrictBool, StrictStr, ValidationError
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    Field,
+    StrictBool,
+    StrictStr,
+    ValidationError,
+    field_validator,
+)
 
 from ha_spark.config import Settings
 from ha_spark.energy.models import ConsumptionInterval, DispatchSlot, LiveRates, PricePoint
@@ -48,8 +69,8 @@ class _Account(BaseModel):
     properties: list[_Property]
 
 
-async def discover_import_tariff(settings: Settings) -> tuple[str, str]:
-    """Read the current import tariff from the configured Octopus account API."""
+async def _discover_import_meter_point(settings: Settings) -> _MeterPoint:
+    """Select the account's single eligible import supply point."""
     if not (settings.octopus_api_key and settings.octopus_account_number):
         raise OctopusApiError("Octopus Intelligent not configured: set API key and account number")
     url = f"{settings.octopus_api_url.rstrip('/')}/accounts/{settings.octopus_account_number}/"
@@ -77,9 +98,15 @@ async def discover_import_tariff(settings: Settings) -> tuple[str, str]:
             raise OctopusApiError("Configured OCTOPUS_MPAN matches no import meter point")
     if len(imports) != 1:
         raise OctopusApiError(f"Octopus account has {len(imports)} eligible import meter points")
+    return imports[0]
+
+
+async def discover_import_tariff(settings: Settings) -> tuple[str, str]:
+    """Read the current import tariff from the configured Octopus account API."""
+    point = await _discover_import_meter_point(settings)
     now = datetime.now(UTC)
     agreements = [
-        item for item in imports[0].agreements
+        item for item in point.agreements
         if item.valid_from.tzinfo is not None
         and (item.valid_to is None or item.valid_to.tzinfo is not None)
         and item.valid_from <= now
@@ -94,6 +121,135 @@ async def discover_import_tariff(settings: Settings) -> tuple[str, str]:
     if match is None:
         raise OctopusApiError("Octopus current tariff code has an invalid shape")
     return match.group(1), tariff_code
+
+
+@dataclass(frozen=True)
+class FreeElectricitySession:
+    """A listed event, trusted only with campaign enrolment."""
+
+    id: str
+    start: datetime
+    end: datetime
+
+
+@dataclass(frozen=True)
+class FreeElectricityRead:
+    """Read outcome for health and subsequent session input gathering."""
+
+    state: Literal["failed", "not_enrolled", "no_session", "sessions"]
+    read_at: datetime
+    sessions: tuple[FreeElectricitySession, ...] = ()
+    reason: Literal[
+        "not_configured", "supply_point_unavailable", "read_error", "graphql_error",
+    ] | None = None
+
+
+def free_electricity_source(settings: Settings) -> Literal["disabled", "not_configured", "active"]:
+    """Whether the Free Electricity source may read; never a ``tariff_provider`` question."""
+    if not settings.free_electricity_enabled:
+        return "disabled"
+    if not (settings.octopus_api_key and settings.octopus_account_number):
+        return "not_configured"
+    return "active"
+
+
+_FREE_ELECTRICITY_QUERY = """
+query FreeElectricity($accountNumber: String!, $mpan: String!) {
+  isEnrolledInCustomerFlexibilityCampaign(accountNumber: $accountNumber,
+    supplyPointIdentifier: $mpan, campaignSlug: "free_electricity")
+  customerFlexibilityCampaignEvents(accountNumber: $accountNumber,
+    supplyPointIdentifier: $mpan, campaignSlug: "free_electricity", first: 10) {
+    edges { node { code startAt endAt } }
+  }
+}
+"""
+
+
+class _FreeElectricityEvent(BaseModel):
+    code: Annotated[StrictStr, Field(min_length=1)]
+    startAt: AwareDatetime
+    endAt: AwareDatetime
+
+    @field_validator("startAt", "endAt", mode="before")
+    @classmethod
+    def _time_is_text(cls, value: object) -> object:
+        # ISO text only: a number, or digits as text, would otherwise be read
+        # as a Unix timestamp.
+        if not isinstance(value, str):
+            raise ValueError("time must be text")
+        return datetime.fromisoformat(value)
+
+
+class _FreeElectricityConnection(BaseModel):
+    # Each edge is validated on its own: a bad event is dropped, not the read.
+    edges: list[Any]
+
+
+class _FreeElectricityData(BaseModel):
+    isEnrolledInCustomerFlexibilityCampaign: StrictBool | None
+    customerFlexibilityCampaignEvents: _FreeElectricityConnection
+
+
+class _FreeElectricityResponse(BaseModel):
+    data: _FreeElectricityData
+    errors: list[Any] | None = None
+
+
+async def fetch_free_electricity_sessions(
+    settings: Settings, *, now: datetime | None = None,
+) -> FreeElectricityRead:
+    """Read enrolled Free Electricity events, past ones included; read-only, never raises."""
+    read_at = (now or datetime.now(UTC)).astimezone(UTC)
+    if not (settings.octopus_api_key and settings.octopus_account_number):
+        return FreeElectricityRead("failed", read_at, reason="not_configured")
+    mpan = settings.octopus_mpan
+    if not mpan:
+        try:
+            mpan = (await _discover_import_meter_point(settings)).mpan
+        except (
+            OctopusApiError, httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError,
+            AttributeError,
+        ):
+            return FreeElectricityRead("failed", read_at, reason="supply_point_unavailable")
+    if not mpan:
+        return FreeElectricityRead("failed", read_at, reason="supply_point_unavailable")
+    payload: _FreeElectricityResponse | None = None
+    try:
+        async with httpx.AsyncClient(timeout=settings.ha_timeout) as client:
+            payload = _FreeElectricityResponse.model_validate(await kraken_graphql(
+                client, f"{settings.octopus_api_url.rstrip('/')}/graphql/",
+                settings.octopus_api_key, _FREE_ELECTRICITY_QUERY,
+                {"accountNumber": settings.octopus_account_number, "mpan": mpan},
+            ))
+    except (httpx.HTTPError, ValueError, OctopusApiError, TypeError, AttributeError):
+        pass
+    if payload is None:
+        return FreeElectricityRead("failed", read_at, reason="read_error")
+    if payload.errors:
+        return FreeElectricityRead("failed", read_at, reason="graphql_error")
+    if payload.data.isEnrolledInCustomerFlexibilityCampaign is not True:
+        return FreeElectricityRead("not_enrolled", read_at)
+    sessions = []
+    for edge in payload.data.customerFlexibilityCampaignEvents.edges:
+        # A null edge or node, a missing, unreadable or naive time, or an end
+        # not after its start drops that event; it is never guessed.
+        if not isinstance(edge, dict):
+            continue
+        try:
+            event = _FreeElectricityEvent.model_validate(edge.get("node"))
+        except ValidationError:
+            continue
+        try:
+            start, end = event.startAt.astimezone(UTC), event.endAt.astimezone(UTC)
+        except (OverflowError, ValueError):
+            continue  # A time at the edge of the calendar has no UTC form.
+        if end <= start:
+            continue
+        sessions.append(FreeElectricitySession(event.code, start, end))
+    return FreeElectricityRead(
+        "sessions" if sessions else "no_session", read_at,
+        tuple(sorted(sessions, key=lambda session: session.start)),
+    )
 
 
 def _to_utc(raw: str) -> datetime:
@@ -357,21 +513,18 @@ async def fetch_agreement_rates(settings: Settings) -> LiveRates:
     if not (settings.octopus_api_key and settings.octopus_account_number):
         raise OctopusApiError("Octopus agreement rates require API key and account number")
     graphql_url = f"{settings.octopus_api_url.rstrip('/')}/graphql/"
+    payload: _AgreementResponse | None = None
     try:
         async with httpx.AsyncClient(timeout=settings.ha_timeout) as client:
-            token = await _obtain_kraken_token(client, graphql_url, settings.octopus_api_key)
-            response = await client.post(
-                graphql_url,
-                json={
-                    "query": _AGREEMENT_RATES_QUERY,
-                    "variables": {"account": settings.octopus_account_number},
-                },
-                headers={"Authorization": f"JWT {token}"},
-            )
-            response.raise_for_status()
-            payload = _AgreementResponse.model_validate(response.json())
+            payload = _AgreementResponse.model_validate(await kraken_graphql(
+                client, graphql_url, settings.octopus_api_key,
+                _AGREEMENT_RATES_QUERY, {"account": settings.octopus_account_number},
+            ))
     except (httpx.HTTPError, ValueError, OctopusApiError, TypeError, AttributeError):
-        raise OctopusApiError("Octopus agreement rates HTTP, auth or payload error") from None
+        pass
+    if payload is None:
+        # Raised outside the handler: the failed request carries the token.
+        raise OctopusApiError("Octopus agreement rates HTTP, auth or payload error")
     if payload.errors:
         raise OctopusApiError("Octopus agreement rates GraphQL errors")
     now = datetime.now(UTC)
@@ -412,29 +565,170 @@ query PlannedDispatches($account: String!) {
 """
 
 
+# Kraken documents a one-hour token. A longer `exp` claim is not believed, and a
+# token whose expiry cannot be read is kept only briefly.
+_TOKEN_MAX_LIFETIME = timedelta(minutes=60)
+_TOKEN_UNREADABLE_LIFETIME = timedelta(minutes=5)
+_TOKEN_REFRESH_MARGIN = timedelta(minutes=5)
+# Kraken reports a rejected token as HTTP 401 or, more often, as HTTP 200 with
+# one of these error codes (expired JWT, authentication failed).
+_AUTH_ERROR_CODES = frozenset({"KT-CT-1124", "KT-CT-1139"})
+
+
+@dataclass(frozen=True)
+class _CachedToken:
+    """One endpoint's token. Secret fields stay out of the repr."""
+
+    key_digest: bytes = field(repr=False)
+    token: str = field(repr=False)
+    refresh_at: datetime
+
+
+# Keyed by GraphQL endpoint; the entry remembers which API key minted it, so a
+# changed key or endpoint never reuses another key's token. Memory only.
+_kraken_tokens: dict[str, _CachedToken] = {}
+
+
+def forget_kraken_tokens() -> None:
+    """Drop every cached Kraken token (the next read mints a new one)."""
+    _kraken_tokens.clear()
+
+
+def _kraken_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _key_digest(api_key: str) -> bytes:
+    return hashlib.sha256(api_key.encode()).digest()
+
+
+def _token_expiry(token: str) -> datetime | None:
+    """The token's own `exp` claim, read without trusting anything else in it."""
+    try:
+        _header, body, _signature = token.split(".")
+        claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        exp = claims["exp"]
+        if isinstance(exp, bool) or not isinstance(exp, int | float) or not math.isfinite(exp):
+            return None
+        return datetime.fromtimestamp(exp, UTC)
+    except (ValueError, KeyError, TypeError, OverflowError, OSError, RecursionError):
+        return None
+
+
 async def _obtain_kraken_token(client: httpx.AsyncClient, graphql_url: str, api_key: str) -> str:
     """Exchange the Octopus API key for a short-lived Kraken GraphQL JWT.
 
     The key is sent once as a GraphQL variable (never interpolated into the
-    query text); the returned token is used only in the Authorization header
-    of the caller's next request, never logged.
+    query text). Failures carry fixed text only and are raised outside the
+    handler, so the failed request (whose body holds the key) is not kept on
+    the error as cause or context.
     """
+    payload: Any = None
+    failed = False
     try:
         response = await client.post(
             graphql_url, json={"query": _KRAKEN_TOKEN_QUERY, "variables": {"apiKey": api_key}}
         )
         response.raise_for_status()
         payload = response.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        raise OctopusApiError(f"Octopus GraphQL auth request failed: {exc}") from exc
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+        failed = True
+    if failed:
+        raise OctopusApiError("Octopus GraphQL auth request failed: HTTP or payload error")
+    if not isinstance(payload, dict):
+        raise OctopusApiError("Octopus GraphQL auth returned an invalid payload")
     if payload.get("errors"):
-        raise OctopusApiError(
-            f"Octopus GraphQL auth rejected: {len(payload['errors'])} error(s)"
-        )
-    token = ((payload.get("data") or {}).get("obtainKrakenToken") or {}).get("token")
-    if not token:
+        raise OctopusApiError("Octopus GraphQL auth rejected")
+    data = payload.get("data")
+    obtained = data.get("obtainKrakenToken") if isinstance(data, dict) else None
+    token = obtained.get("token") if isinstance(obtained, dict) else None
+    if not isinstance(token, str) or not token:
         raise OctopusApiError("Octopus GraphQL auth returned no token")
-    return str(token)
+    return token
+
+
+async def _kraken_token(
+    client: httpx.AsyncClient, graphql_url: str, api_key: str, *, rejected: str | None = None
+) -> tuple[str, bool]:
+    """The shared token for this endpoint and key, and whether it was just minted.
+
+    `rejected` is a token Kraken has just refused: it is never handed out again.
+    """
+    digest = _key_digest(api_key)
+    cached = _kraken_tokens.get(graphql_url)
+    now = _kraken_now()
+    if (
+        cached is not None
+        and cached.key_digest == digest
+        and cached.token != rejected
+        and now < cached.refresh_at
+    ):
+        return cached.token, False
+    _kraken_tokens.pop(graphql_url, None)
+    token = await _obtain_kraken_token(client, graphql_url, api_key)
+    expiry = _token_expiry(token)
+    if expiry is None:
+        keep_for = _TOKEN_UNREADABLE_LIFETIME
+    else:
+        keep_for = min(expiry - now, _TOKEN_MAX_LIFETIME) - _TOKEN_REFRESH_MARGIN
+    # A token already due for refresh serves this one call and is not kept.
+    if keep_for > timedelta(0):
+        _kraken_tokens[graphql_url] = _CachedToken(digest, token, now + keep_for)
+    return token, True
+
+
+def _auth_rejected(response: httpx.Response) -> bool:
+    if response.status_code == 401:
+        return True
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    if not isinstance(errors, list):
+        return False
+    for error in errors:
+        extensions = error.get("extensions") if isinstance(error, dict) else None
+        code = extensions.get("errorCode") if isinstance(extensions, dict) else None
+        if isinstance(code, str) and code in _AUTH_ERROR_CODES:
+            return True
+    return False
+
+
+async def kraken_graphql(
+    client: httpx.AsyncClient,
+    graphql_url: str,
+    api_key: str,
+    query: str,
+    variables: dict[str, Any],
+) -> Any:
+    """POST one read-only GraphQL query with the shared Kraken token; return its JSON.
+
+    `graphql_url` must be built from configured settings. If Kraken rejects a
+    token this call did not mint itself, the token is replaced once and the
+    query retried once.
+
+    Raises `OctopusApiError` (fixed text) when no token can be obtained, and
+    lets `httpx.HTTPError` / `ValueError` from the query itself through, so each
+    reader words its own failure. A reader must catch all three and report a
+    failed read with fixed text and `from None`: the failed request carries the
+    token in its headers.
+    """
+    token, minted = await _kraken_token(client, graphql_url, api_key)
+    body = {"query": query, "variables": variables}
+    response = await client.post(graphql_url, json=body, headers={"Authorization": f"JWT {token}"})
+    if _auth_rejected(response) and not minted:
+        token, _minted = await _kraken_token(client, graphql_url, api_key, rejected=token)
+        response = await client.post(
+            graphql_url, json=body, headers={"Authorization": f"JWT {token}"}
+        )
+    if _auth_rejected(response):
+        # Still refused: no later read is handed this token.
+        cached = _kraken_tokens.get(graphql_url)
+        if cached is not None and cached.token == token:
+            del _kraken_tokens[graphql_url]
+    response.raise_for_status()
+    return response.json()
 
 
 async def fetch_planned_dispatches(settings: Settings) -> tuple[DispatchSlot, ...]:
@@ -445,21 +739,18 @@ async def fetch_planned_dispatches(settings: Settings) -> tuple[DispatchSlot, ..
             "OCTOPUS_ACCOUNT_NUMBER"
         )
     graphql_url = f"{settings.octopus_api_url.rstrip('/')}/graphql/"
+    failed = False
     async with httpx.AsyncClient(timeout=settings.ha_timeout) as client:
-        token = await _obtain_kraken_token(client, graphql_url, settings.octopus_api_key)
         try:
-            response = await client.post(
-                graphql_url,
-                json={
-                    "query": _PLANNED_DISPATCHES_QUERY,
-                    "variables": {"account": settings.octopus_account_number},
-                },
-                headers={"Authorization": f"JWT {token}"},
+            payload = await kraken_graphql(
+                client, graphql_url, settings.octopus_api_key,
+                _PLANNED_DISPATCHES_QUERY, {"account": settings.octopus_account_number},
             )
-            response.raise_for_status()
-            payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise OctopusApiError(f"Octopus dispatches request failed: {exc}") from exc
+        except (httpx.HTTPError, ValueError):
+            failed = True
+    if failed or not isinstance(payload, dict):
+        # Raised outside the handler: the failed request carries the token.
+        raise OctopusApiError("Octopus dispatches request failed: HTTP or payload error")
     if payload.get("errors"):
         raise OctopusApiError(
             f"Octopus dispatches request rejected: {len(payload['errors'])} error(s)"
@@ -481,3 +772,162 @@ async def fetch_planned_dispatches(settings: Settings) -> tuple[DispatchSlot, ..
         source = str((item.get("meta") or {}).get("source") or "")
         slots.append(DispatchSlot(start, end, charge_in_kwh, source))
     return tuple(slots)
+
+
+_HAPPY_HOURS_QUERY = """
+query HappyHours($account: String!) {
+  savingSessions { account(accountNumber: $account) {
+    joinedEvents { eventId eventType startAt endAt } } }
+}
+"""
+
+
+class _SavingSessionEvent(BaseModel):
+    """One ``joinedEvents`` entry; only ``eventType`` is trusted by the model.
+
+    The other fields are checked by hand: a bad ``eventId`` or a missing field is
+    schema drift (the read fails), while unusable times drop only that booking.
+    """
+
+    eventType: StrictStr
+    eventId: Any = None
+    startAt: Any = None
+    endAt: Any = None
+
+
+class _SavingSessionAccount(BaseModel):
+    joinedEvents: list[_SavingSessionEvent]
+
+
+class _SavingSessions(BaseModel):
+    account: _SavingSessionAccount
+
+
+class _SavingSessionsData(BaseModel):
+    savingSessions: _SavingSessions
+
+
+class _HappyHourResponse(BaseModel):
+    data: _SavingSessionsData
+    errors: list[Any] | None = None
+
+
+@dataclass(frozen=True)
+class HappyHourBooking:
+    """One booked Weekend Happy Hour (Octopus's numeric ``eventId`` as text)."""
+
+    event_id: str
+    start: datetime
+    end: datetime
+
+
+@dataclass(frozen=True)
+class HappyHourReading:
+    """One Happy Hour read: ``bookings`` is ``None`` when the read failed.
+
+    ``()`` means read with no booking; a non-empty tuple means booked. The
+    planner treats a failed read as no session, never as a booking.
+    """
+
+    read_at: datetime
+    bookings: tuple[HappyHourBooking, ...] | None
+
+
+def happy_hour_source(settings: Settings) -> Literal["disabled", "not_configured", "active"]:
+    """Whether the Happy Hour source may read; never a ``tariff_provider`` question."""
+    if not settings.happy_hour_enabled:
+        return "disabled"
+    if not (
+        settings.octopus_api_key
+        and settings.octopus_account_number
+        and settings.octopus_backend_api_url.strip()
+    ):
+        return "not_configured"
+    return "active"
+
+
+def _happy_hour_event_id(raw: Any) -> str | None:
+    """The booking's ``eventId`` as text, or ``None`` when missing or wrong-typed."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return str(raw)
+    # Text is accepted only as digits: an id is never a place to echo anything.
+    if isinstance(raw, str) and raw.isascii() and raw.isdigit() and len(raw) <= 20:
+        return raw
+    return None
+
+
+_CALENDAR_START = datetime.min.replace(tzinfo=UTC) + timedelta(days=2)
+_CALENDAR_END = datetime.max.replace(tzinfo=UTC) - timedelta(days=2)
+
+
+def _booking_instant(raw: object) -> datetime:
+    """Parse a booking time; it must carry its own UTC offset, never a guessed one."""
+    if not isinstance(raw, str):
+        raise ValueError("booking time is not a string")
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        raise ValueError("booking time carries no UTC offset")
+    try:
+        instant = parsed.astimezone(UTC)
+    except OverflowError:
+        raise ValueError("booking time is out of range") from None
+    # Within two days of either end of the calendar it cannot be shown on every
+    # household clock.
+    if not _CALENDAR_START <= instant <= _CALENDAR_END:
+        raise ValueError("booking time is out of range")
+    return instant
+
+
+async def fetch_happy_hours(
+    settings: Settings, *, now: datetime | None = None
+) -> HappyHourReading:
+    """Read booked Weekend Happy Hours from the backend endpoint (ADR-0004).
+
+    Never raises for anything Octopus sends or fails to send: any HTTP, transport,
+    auth or payload failure is a failed reading, which the planner treats as no
+    session. A booking whose times cannot be read as UTC-offset instants is
+    dropped, never zone-guessed. Offered slots are not selected and can never
+    become bookings. `now` is the read time (an aware instant; a naive one is
+    replaced by the clock).
+    """
+    read_at = now if now is not None and now.tzinfo is not None else datetime.now(UTC)
+    if happy_hour_source(settings) != "active":
+        # Disabled or unconfigured: no request, and no booking implied.
+        return HappyHourReading(read_at, None)
+    graphql_url = f"{settings.octopus_backend_api_url.rstrip('/')}/graphql/"
+    reply: _HappyHourResponse | None = None
+    try:
+        async with httpx.AsyncClient(timeout=settings.ha_timeout) as client:
+            payload = await kraken_graphql(
+                client, graphql_url, settings.octopus_api_key,
+                _HAPPY_HOURS_QUERY, {"account": settings.octopus_account_number},
+            )
+        reply = _HappyHourResponse.model_validate(payload)
+    except (httpx.HTTPError, ValueError, OctopusApiError, RecursionError):
+        pass  # RecursionError: a reply nested too deeply to decode
+    if reply is None or reply.errors:
+        # Fixed text, outside the handler: the failed request carries the token.
+        log.warning("Happy Hour read failed; no Happy Hour is planned")
+        return HappyHourReading(read_at, None)
+    bookings: dict[str, HappyHourBooking] = {}
+    for event in reply.data.savingSessions.account.joinedEvents:
+        if event.eventType != "WEEKEND_HAPPY_HOUR":
+            continue
+        event_id = _happy_hour_event_id(event.eventId)
+        if event_id is None or event.startAt is None or event.endAt is None:
+            # A missing field or a wrong-typed id is schema drift, not a booking.
+            log.warning("Happy Hour read failed; no Happy Hour is planned")
+            return HappyHourReading(read_at, None)
+        try:
+            start = _booking_instant(event.startAt)
+            end = _booking_instant(event.endAt)
+        except ValueError:
+            continue  # dropped: this hour's times cannot be read as instants
+        if end <= start:
+            continue
+        if end > read_at and event_id not in bookings:
+            bookings[event_id] = HappyHourBooking(event_id, start, end)
+    ordered = tuple(sorted(bookings.values(), key=lambda booking: booking.start))
+    return HappyHourReading(read_at, ordered)

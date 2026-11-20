@@ -218,6 +218,53 @@ class LiveRates:
 
 
 @dataclass(frozen=True)
+class FreeSession:
+    """Trusted account eligibility for a dated free session."""
+
+    kind: Literal["free_electricity", "happy_hour"]
+    session_id: str
+    start: datetime
+    end: datetime
+
+
+@dataclass(frozen=True)
+class DaytimePurchase:
+    """A named stored-energy purchase, with its per-slot delivery ledger.
+
+    ``refused`` purchases are diagnostic only: they keep their potential energy
+    and reason in the plan view, but contribute nothing to sizing, costing, the
+    SoC path or a charge intent.
+    """
+
+    slot_range: tuple[int, int]
+    start: datetime
+    end: datetime
+    overlay: str
+    evidence: str
+    session_id: str
+    effective_price: float
+    energy_kwh: float
+    reason: str
+    slot_energy_kwh: tuple[float, ...] = ()
+    refused: bool = False
+
+    @property
+    def refusal_reason(self) -> str | None:
+        """The hold that refused this diagnostic purchase, if any."""
+        return self.reason if self.refused else None
+
+
+@dataclass(frozen=True)
+class DatedChargeWindow:
+    """A dated target and the stored energy its purchase adds, for a dated charge intent."""
+
+    start: datetime
+    end: datetime
+    target_soc_pct: float
+    energy_kwh: float = 0.0  # stored kWh, as on the purchase it came from
+
+
+@dataclass(frozen=True)
 class PlannerInputs:
     """Live inputs gathered from HA."""
 
@@ -230,7 +277,23 @@ class PlannerInputs:
     # Forecast battery drain between plan time and the charge-window start
     # (the horizon starts at the window, so this load is otherwise invisible).
     pre_window_drain_kwh: float = 0.0
+    free_sessions: tuple[FreeSession, ...] = ()
+    # Per-source evidence trust for ``free_sessions`` (#692): true when the
+    # source is deliberately off, or its last good read is younger than two
+    # hours; false while an active source is unreadable or stale (including
+    # exactly two hours old). Recorded so a later ticket can tell "no session"
+    # from "unreadable"; the planner itself reads only ``free_sessions``.
+    free_electricity_trusted: bool = False
+    happy_hour_trusted: bool = False
+    # Grid import still uncounted per booked hour. A booking absent from this
+    # map has no provable allowance and stays on the ordinary tariff (#694).
+    happy_hour_remaining_kwh: dict[str, float] = field(default_factory=dict)
     dispatches: tuple[DispatchSlot, ...] = ()
+    # Planned dispatches whose active half-hour also has fresh trusted evidence
+    # of the car actually drawing, clipped to that started half-hour's remaining
+    # time. Dispatches remain the full hold source; this is purchase evidence
+    # only (#697), so a live/adjusted flag alone never buys.
+    dispatch_purchase_slots: tuple[DispatchSlot, ...] = ()
     # False when the dispatch source could not be read (the Octopus call raised,
     # or the configured entity was missing/unavailable/unknown), so an empty
     # ``dispatches`` stops meaning both "no dispatch" and "unreadable" (#143 §3).
@@ -329,12 +392,21 @@ class ChargeIntent:
     soc: SocMeasurement  # failed -> chargers must refuse real writes
     window_start: time
     window_end: time
+    daytime_windows: tuple[DatedChargeWindow, ...] = ()
     holds: tuple[tuple[datetime, datetime], ...] = ()
     export: ExportIntent | None = None
     hold_trusted: bool = True
     # False means an empty export is an unreadable Axle event, not a
     # cancellation (#148).
     export_trusted: bool = True
+    # False means an empty ``daytime_windows`` is unreadable session or
+    # dispatch evidence, not "no purchase", so a verified resident dated
+    # charge window must not be cleared (#699).
+    daytime_trusted: bool = True
+    # Start of the running-or-next charge window. Solis holds one charge
+    # current for both slots, so a dated window that opens before it takes
+    # that current until it ends (#700). None keeps the overnight current.
+    window_start_at: datetime | None = None
     # A current, per-minute EV hold is separate from dispatch windows because
     # it has no scheduled end. Dispatch trust remains independent of EV trust.
     ev_hold_active: bool = False
@@ -463,6 +535,7 @@ class ChargePlan:
     dispatch_ev_kwh: float | None = None
     # Named battery obligations computed from the slot horizon. The daily model
     # intentionally leaves this empty to preserve its legacy contract.
+    daytime_purchases: tuple[DaytimePurchase, ...] = ()
     reservations: tuple[Reservation, ...] = ()
     # The reservations tonight's charge funds: those targeted after the window
     # start (a pre-window one is carried from now, never charged).

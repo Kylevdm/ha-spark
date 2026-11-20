@@ -1,0 +1,11 @@
+{
+  "api_version": 5,
+  "release_version": "0.40.0",
+  "supported_api_versions": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ]
+}

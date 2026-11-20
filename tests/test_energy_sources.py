@@ -1148,7 +1148,6 @@ async def test_octopus_agreement_fallback_prices_and_degrades(
     )
     respx.post("http://octo.test/v1/graphql/").mock(side_effect=[
         token_response(), httpx.Response(200, json={"data": {"plannedDispatches": []}}),
-        token_response(),
         agreement_failure(failure) if failure else httpx.Response(200, json=agreement_payload()),
     ])
     respx.get(url__startswith="http://octo.test/v1/products/").mock(
@@ -1279,7 +1278,8 @@ async def test_octopus_dispatches_use_configured_ha_live_evidence(
                     }
                 },
             ),
-            httpx.Response(401),
+            # The shared token (#688) is rejected, then its one refresh fails too.
+            httpx.Response(401), httpx.Response(401),
         ]
     )
     respx.get(url__startswith="http://octo.test/v1/products/").mock(

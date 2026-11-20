@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import logging
+import traceback
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
 import pytest
 import respx
 
 from ha_spark.config import Settings
+from ha_spark.energy import octopus
 from ha_spark.energy.octopus import (
     OctopusApiError,
     discover_import_tariff,
@@ -22,6 +27,168 @@ from ha_spark.energy.octopus import (
 from tests.octopus_helpers import agreement_failure, agreement_payload, token_response
 
 API = "http://octo.test/v1"
+
+
+def _free_payload(enrolled: Any = True, edges: Any = None) -> dict[str, Any]:
+    return {"data": {
+        "isEnrolledInCustomerFlexibilityCampaign": enrolled,
+        "customerFlexibilityCampaignEvents": {"edges": edges if edges is not None else [
+            {"node": {"code": "event-private", "startAt": "2025-10-25T11:00:00+00:00",
+                      "endAt": "2025-10-25T14:00:00+00:00", "isEventParticipant": False}},
+        ]},
+    }}
+
+
+@pytest.mark.parametrize("enrolled, state", [
+    (True, "sessions"), (False, "not_enrolled"), (None, "not_enrolled"),
+])
+@respx.mock
+async def test_free_electricity_eligibility(enrolled: Any, state: str) -> None:
+    route = respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(), httpx.Response(200, json=_free_payload(enrolled)),
+    ])
+    now = datetime(2026, 11, 12, tzinfo=UTC)
+    result = await octopus.fetch_free_electricity_sessions(
+        _dispatch_settings(octopus_mpan="mpan-private"), now=now,
+    )
+    assert result.state == state
+    assert result.read_at == now
+    if enrolled:
+        assert result.sessions[0].id == "event-private"
+        assert result.sessions[0].end < now  # Past events remain readable.
+    else:
+        assert result.sessions == ()
+    body = json.loads(route.calls[1].request.content)
+    assert body["variables"] == {"accountNumber": "A-1234ABCD", "mpan": "mpan-private"}
+    assert 'campaignSlug: "free_electricity"' in body["query"]
+    assert "first: 10" in body["query"]
+    assert "mutation" not in body["query"]
+
+
+@respx.mock
+async def test_free_electricity_times_null_edges_and_shared_token() -> None:
+    edges = [
+        {"node": {"code": "later", "startAt": "2026-11-13T15:00:00+01:00",
+                  "endAt": "2026-11-13T16:00:00+01:00"}},
+        None, {"node": None},
+        {"node": {"code": "earlier", "startAt": "2026-11-12T11:00:00Z",
+                  "endAt": "2026-11-12T12:00:00Z"}},
+    ]
+    route = respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(), httpx.Response(200, json=_free_payload(edges=edges)),
+        httpx.Response(200, json=agreement_payload((6.6, 36.0))),
+    ])
+    settings = _dispatch_settings(octopus_mpan="configured")
+    result = await octopus.fetch_free_electricity_sessions(settings)
+    assert result.state == "sessions"
+    assert [session.id for session in result.sessions] == ["earlier", "later"]
+    assert result.sessions[1].start == datetime(2026, 11, 13, 14, tzinfo=UTC)
+    await fetch_agreement_rates(settings)
+    assert route.call_count == 3  # Both readers share the same token.
+
+
+async def test_free_electricity_without_credentials() -> None:
+    result = await octopus.fetch_free_electricity_sessions(Settings())
+    assert result.state == "failed"
+    assert result.reason == "not_configured"
+
+
+@pytest.mark.parametrize("failure", [
+    "http", "graphql", "shape", "no_data", "errors_shape", "truthy",
+    "top_list", "top_null", "top_number", "top_text", "data_null", "data_list",
+])
+@respx.mock
+async def test_free_electricity_failed_reads(
+    failure: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload = _free_payload()
+    if failure == "graphql":
+        payload["errors"] = [{"message": "jwt-private key-private account-private mpan-private"}]
+    elif failure == "shape":
+        payload["data"]["customerFlexibilityCampaignEvents"]["edges"] = {}
+    elif failure == "no_data":
+        del payload["data"]["isEnrolledInCustomerFlexibilityCampaign"]
+    elif failure == "errors_shape":
+        payload["errors"] = True
+    elif failure == "truthy":
+        payload["data"]["isEnrolledInCustomerFlexibilityCampaign"] = "true"
+    odd: dict[str, Any] = {
+        "top_list": [], "top_null": None, "top_number": 5, "top_text": "text",
+        "data_null": {"data": None}, "data_list": {"data": []},
+    }
+    respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(),
+        httpx.Response(503 if failure == "http" else 200, json=odd.get(failure, payload)),
+    ])
+    result = await octopus.fetch_free_electricity_sessions(_dispatch_settings(
+        octopus_api_key="key-private", octopus_account_number="account-private",
+        octopus_mpan="mpan-private",
+    ))
+    assert result.state == "failed"
+    assert result.reason
+    assert result.sessions == ()
+    for secret in ("jwt-private", "key-private", "account-private", "mpan-private"):
+        assert secret not in repr(result) + caplog.text
+
+
+@respx.mock
+async def test_free_electricity_bad_event_is_dropped_not_guessed() -> None:
+    good = {"code": "good", "startAt": "2026-11-12T11:00:00Z", "endAt": "2026-11-12T12:00:00Z",
+            "isEventParticipant": False}
+    edges = [
+        {"node": good}, 7, {"cursor": "x"}, {"node": "text"},
+        {"node": {**good, "code": "no-start", "startAt": None}},
+        {"node": {k: v for k, v in good.items() if k != "endAt"} | {"code": "no-end"}},
+        {"node": {**good, "code": "bad-time", "startAt": "bad"}},
+        {"node": {**good, "code": "number", "startAt": 1794481200, "endAt": 1794484800}},
+        {"node": {**good, "code": "digits", "startAt": "1794481200", "endAt": "1794484800"}},
+        {"node": {**good, "code": "year-one", "startAt": "0001-01-01T00:00:00+14:00",
+                  "endAt": "0001-01-02T00:00:00+14:00"}},
+        {"node": {**good, "code": "naive", "endAt": "2026-11-12T12:00:00"}},
+        {"node": {**good, "code": "reversed", "endAt": "2026-11-12T10:00:00Z"}},
+        {"node": {**good, "code": "empty", "endAt": "2026-11-12T11:00:00Z"}},
+        {"node": {**good, "code": ""}},
+        {"node": {**good, "code": "joined", "isEventParticipant": True}},
+    ]
+    respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(), httpx.Response(200, json=_free_payload(edges=edges)),
+        httpx.Response(200, json=_free_payload(edges=edges[1:-1])),
+    ])
+    settings = _dispatch_settings(octopus_mpan="configured")
+    result = await octopus.fetch_free_electricity_sessions(settings)
+    assert result.state == "sessions"
+    assert [session.id for session in result.sessions] == ["good", "joined"]
+    result = await octopus.fetch_free_electricity_sessions(settings)
+    assert (result.state, result.sessions) == ("no_session", ())
+
+
+@respx.mock
+async def test_free_electricity_discovered_mpan_and_missing() -> None:
+    account = respx.get(f"{API}/accounts/A-1234ABCD/").mock(return_value=httpx.Response(200, json={
+        "properties": [{"electricity_meter_points": [
+            {"mpan": "discovered", "is_export": False, "agreements": []},
+        ]}],
+    }))
+    route = respx.post(f"{API}/graphql/").mock(side_effect=[
+        token_response(), httpx.Response(200, json=_free_payload(edges=[])),
+    ])
+    result = await octopus.fetch_free_electricity_sessions(_dispatch_settings())
+    assert result.state == "no_session"
+    assert json.loads(route.calls[1].request.content)["variables"]["mpan"] == "discovered"
+    account.mock(return_value=httpx.Response(200, json={"properties": []}))
+    result = await octopus.fetch_free_electricity_sessions(_dispatch_settings())
+    assert result.state == "failed"
+    assert result.reason == "supply_point_unavailable"
+
+
+@pytest.mark.parametrize("mpan, reason", [
+    ("", "supply_point_unavailable"), ("configured", "read_error"),
+])
+async def test_free_electricity_malformed_endpoint_is_a_failed_read(mpan: str, reason: str) -> None:
+    result = await octopus.fetch_free_electricity_sessions(
+        _dispatch_settings(octopus_api_url="http://[::1/v1", octopus_mpan=mpan),
+    )
+    assert (result.state, result.reason, result.sessions) == ("failed", reason, ())
 
 
 @pytest.mark.parametrize("values", [(6.6, 6.6, 36.2828, 36.2828), (12.0,)])
@@ -615,3 +782,327 @@ async def test_dispatches_tolerates_malformed_entries() -> None:
 async def test_dispatches_error_when_unconfigured() -> None:
     with pytest.raises(OctopusApiError, match="not configured"):
         await fetch_planned_dispatches(_dispatch_settings(octopus_account_number=""))
+
+
+# --- shared Kraken token (#688) ---
+
+GRAPHQL = f"{API}/graphql/"
+T0 = datetime(2026, 11, 11, 12, 0, tzinfo=UTC)
+
+
+def _jwt(expires: datetime, tag: str = "a") -> str:
+    def part(value: dict[str, object]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+    return f"{part({'alg': 'none'})}.{part({'exp': int(expires.timestamp())})}.sig-{tag}"
+
+
+def _token(token: str) -> httpx.Response:
+    return httpx.Response(200, json={"data": {"obtainKrakenToken": {"token": token}}})
+
+
+def _no_dispatches() -> httpx.Response:
+    return httpx.Response(200, json={"data": {"plannedDispatches": []}})
+
+
+def _mints(route: respx.Route) -> int:
+    return sum(b"obtainKrakenToken" in call.request.content for call in route.calls)
+
+
+def _freeze(monkeypatch: pytest.MonkeyPatch, now: datetime) -> None:
+    monkeypatch.setattr(octopus, "_kraken_now", lambda: now)
+
+
+@respx.mock
+async def test_two_graphql_reads_mint_one_token() -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token("jwt-private"), _no_dispatches(),
+        httpx.Response(200, json=agreement_payload()),
+    ])
+    await fetch_planned_dispatches(_dispatch_settings())
+    await fetch_agreement_rates(_dispatch_settings())
+    assert route.call_count == 3
+    assert _mints(route) == 1
+    assert route.calls[2].request.headers["Authorization"] == "JWT jwt-private"
+
+
+@respx.mock
+async def test_token_is_replaced_shortly_before_it_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _jwt(T0 + timedelta(minutes=60), "first")
+    second = _jwt(T0 + timedelta(minutes=120), "second")
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token(first), _no_dispatches(), _no_dispatches(),
+        _token(second), _no_dispatches(),
+    ])
+    _freeze(monkeypatch, T0)
+    await fetch_planned_dispatches(_dispatch_settings())
+    _freeze(monkeypatch, T0 + timedelta(minutes=54))
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert _mints(route) == 1
+    _freeze(monkeypatch, T0 + timedelta(minutes=56))
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert _mints(route) == 2
+    assert route.calls[4].request.headers["Authorization"] == f"JWT {second}"
+
+
+@pytest.mark.parametrize("token", [
+    "not-a-jwt", "a.b.c", "a.e30.c",
+    "a." + base64.urlsafe_b64encode(b'{"exp": "soon"}').decode() + ".c",
+    "a." + base64.urlsafe_b64encode(b'{"exp": 1e999}').decode() + ".c",
+    "a." + base64.urlsafe_b64encode(b'{"exp": true}').decode() + ".c",
+    "a." + base64.urlsafe_b64encode(b"[1]").decode() + ".c",
+])
+@respx.mock
+async def test_token_with_unreadable_expiry_is_kept_only_briefly(
+    monkeypatch: pytest.MonkeyPatch, token: str,
+) -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token(token), _no_dispatches(), _no_dispatches(), _token(token), _no_dispatches(),
+    ])
+    _freeze(monkeypatch, T0)
+    await fetch_planned_dispatches(_dispatch_settings())
+    _freeze(monkeypatch, T0 + timedelta(minutes=4))
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert _mints(route) == 1
+    _freeze(monkeypatch, T0 + timedelta(minutes=6))
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert _mints(route) == 2
+
+
+@respx.mock
+async def test_token_expiry_claim_beyond_an_hour_is_not_believed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token(_jwt(T0 + timedelta(days=365))), _no_dispatches(),
+        _token(_jwt(T0 + timedelta(days=365))), _no_dispatches(),
+    ])
+    _freeze(monkeypatch, T0)
+    await fetch_planned_dispatches(_dispatch_settings())
+    _freeze(monkeypatch, T0 + timedelta(minutes=56))
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert _mints(route) == 2
+
+
+def _jwt_exp(exp: object) -> str:
+    return "a." + base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode() + ".c"
+
+
+@pytest.mark.parametrize("exp", [
+    -62135596800, 0, int(T0.timestamp()), int((T0 + timedelta(minutes=5)).timestamp()),
+])
+@respx.mock
+async def test_token_already_due_for_refresh_serves_one_read_and_is_not_kept(
+    monkeypatch: pytest.MonkeyPatch, exp: int,
+) -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token(_jwt_exp(exp)), _no_dispatches(), _token(_jwt_exp(exp)), _no_dispatches(),
+    ])
+    _freeze(monkeypatch, T0)
+    assert await fetch_planned_dispatches(_dispatch_settings()) == ()
+    assert not octopus._kraken_tokens
+    assert await fetch_planned_dispatches(_dispatch_settings()) == ()
+    assert _mints(route) == 2
+
+
+@respx.mock
+async def test_malformed_endpoint_degrades_without_echoing_it() -> None:
+    settings = _dispatch_settings(octopus_api_url="http://octo.test:sk_test")
+    for read in (fetch_planned_dispatches, fetch_agreement_rates):
+        with pytest.raises(OctopusApiError) as error:
+            await read(settings)
+        assert _chain(error.value) == [error.value]
+        assert "sk_test" not in str(error.value)
+
+
+def _rejected(kind: str) -> httpx.Response:
+    if kind == "http":
+        return httpx.Response(401, text="sk_test jwt-private")
+    code = "KT-CT-1124" if kind == "expired" else "KT-CT-1139"
+    return httpx.Response(200, json={"errors": [{
+        "message": "sk_test jwt-private", "extensions": {"errorCode": code},
+    }]})
+
+
+@pytest.mark.parametrize("kind", ["http", "expired", "failed"])
+@respx.mock
+async def test_rejected_token_is_refreshed_once_and_the_read_retried_once(kind: str) -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token("jwt-private"), _no_dispatches(),
+        _rejected(kind), _token("jwt-second"), httpx.Response(200, json=agreement_payload()),
+        _no_dispatches(),
+    ])
+    await fetch_planned_dispatches(_dispatch_settings())
+    rates = await fetch_agreement_rates(_dispatch_settings())
+    assert rates.offpeak == pytest.approx(0.066)
+    assert route.call_count == 5
+    assert _mints(route) == 2
+    assert route.calls[4].request.headers["Authorization"] == "JWT jwt-second"
+    # The replacement is the shared token from then on.
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert _mints(route) == 2
+    assert route.calls[5].request.headers["Authorization"] == "JWT jwt-second"
+
+
+@pytest.mark.parametrize("kind", ["http", "expired", "failed"])
+@respx.mock
+async def test_token_still_rejected_after_refresh_degrades_without_a_second_retry(
+    kind: str,
+) -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token("jwt-private"), _no_dispatches(),
+        _rejected(kind), _token("jwt-second"), _rejected(kind),
+    ])
+    await fetch_planned_dispatches(_dispatch_settings())
+    with pytest.raises(OctopusApiError):
+        await fetch_planned_dispatches(_dispatch_settings())
+    assert route.call_count == 5
+    assert not octopus._kraken_tokens  # the refused replacement is not kept
+
+
+@pytest.mark.parametrize("kind", ["http", "expired", "failed"])
+@respx.mock
+async def test_newly_minted_token_that_is_rejected_is_not_retried_or_kept(kind: str) -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token("jwt-private"), _rejected(kind), _token("jwt-second"), _no_dispatches(),
+    ])
+    with pytest.raises(OctopusApiError):
+        await fetch_planned_dispatches(_dispatch_settings())
+    assert route.call_count == 2
+    # The next read starts from a new token, never the refused one.
+    assert await fetch_planned_dispatches(_dispatch_settings()) == ()
+    assert route.calls[3].request.headers["Authorization"] == "JWT jwt-second"
+
+
+@respx.mock
+async def test_failed_refresh_degrades_and_the_next_read_mints_again() -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token("jwt-private"), _no_dispatches(),
+        _rejected("http"), httpx.Response(500),
+        _token("jwt-second"), _no_dispatches(),
+    ])
+    await fetch_planned_dispatches(_dispatch_settings())
+    with pytest.raises(OctopusApiError, match="auth request failed"):
+        await fetch_planned_dispatches(_dispatch_settings())
+    assert await fetch_planned_dispatches(_dispatch_settings()) == ()
+    assert route.calls[5].request.headers["Authorization"] == "JWT jwt-second"
+
+
+@respx.mock
+async def test_changed_api_key_mints_a_new_token() -> None:
+    route = respx.post(GRAPHQL).mock(side_effect=[
+        _token("jwt-private"), _no_dispatches(), _token("jwt-other"), _no_dispatches(),
+        _token("jwt-third"), _no_dispatches(),
+    ])
+    await fetch_planned_dispatches(_dispatch_settings())
+    await fetch_planned_dispatches(_dispatch_settings(octopus_api_key="sk_other"))
+    assert _mints(route) == 2
+    assert b"sk_other" in route.calls[2].request.content
+    assert route.calls[3].request.headers["Authorization"] == "JWT jwt-other"
+    # Changing back does not revive the first key's token either.
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert _mints(route) == 3
+
+
+@respx.mock
+async def test_changed_endpoint_mints_a_new_token() -> None:
+    first = respx.post(GRAPHQL).mock(side_effect=[_token("jwt-private"), _no_dispatches()])
+    other = respx.post("http://other.test/v1/graphql/").mock(
+        side_effect=[_token("jwt-other"), _no_dispatches()]
+    )
+    await fetch_planned_dispatches(_dispatch_settings())
+    await fetch_planned_dispatches(_dispatch_settings(octopus_api_url="http://other.test/v1"))
+    assert _mints(first) == 1
+    assert _mints(other) == 1
+    assert other.calls[1].request.headers["Authorization"] == "JWT jwt-other"
+
+
+def _chain(error: BaseException) -> list[BaseException]:
+    seen: list[BaseException] = []
+    todo: list[BaseException | None] = [error]
+    while todo:
+        item = todo.pop()
+        if item is not None and item not in seen:
+            seen.append(item)
+            todo += [item.__cause__, item.__context__]
+    return seen
+
+
+@pytest.mark.parametrize("failure", [
+    "mint_http", "mint_errors", "mint_shape", "mint_transport", "mint_not_json",
+    "query_http", "query_rejected", "query_transport", "query_not_json", "query_errors",
+    "refresh_http",
+])
+@pytest.mark.parametrize(
+    "read", [fetch_planned_dispatches, fetch_agreement_rates], ids=["dispatches", "rates"]
+)
+@respx.mock
+async def test_key_and_token_never_reach_logs_or_errors(
+    failure: str, read: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    echo = "sk_test jwt-private"
+    transport = httpx.ConnectError(echo)
+    responses: dict[str, list[Any]] = {
+        "mint_http": [httpx.Response(500, text=echo)],
+        "mint_errors": [httpx.Response(200, json={"errors": [{"message": echo}]})],
+        "mint_shape": [httpx.Response(200, json={"data": {"obtainKrakenToken": [echo]}})],
+        "mint_transport": [transport],
+        "mint_not_json": [httpx.Response(200, text=echo)],
+        "query_http": [_token("jwt-private"), httpx.Response(500, text=echo)],
+        "query_rejected": [_token("jwt-private"), _rejected("http")],
+        "query_transport": [_token("jwt-private"), transport],
+        "query_not_json": [_token("jwt-private"), httpx.Response(200, text=echo)],
+        "query_errors": [_token("jwt-private"), _rejected("expired")],
+        "refresh_http": [
+            _token("jwt-private"), _no_dispatches(), _rejected("http"),
+            httpx.Response(500, text=echo),
+        ],
+    }
+    respx.post(GRAPHQL).mock(side_effect=responses[failure])
+    caplog.set_level(logging.DEBUG)
+    if failure == "refresh_http":
+        await fetch_planned_dispatches(_dispatch_settings())
+    with pytest.raises(OctopusApiError) as error:
+        await read(_dispatch_settings())
+    chain = _chain(error.value)
+    assert chain == [error.value]  # no failed request rides along as cause or context
+    exposed = "".join(
+        [caplog.text, repr(octopus._kraken_tokens)]
+        + [text for item in chain for text in (str(item), repr(item), repr(item.args))]
+        + traceback.format_exception(error.value)
+    )
+    assert "sk_test" not in exposed
+    assert "jwt-private" not in exposed
+
+
+@respx.mock
+async def test_cached_token_and_key_stay_out_of_the_cache_repr() -> None:
+    respx.post(GRAPHQL).mock(side_effect=[_token("jwt-private"), _no_dispatches()])
+    await fetch_planned_dispatches(_dispatch_settings())
+    assert octopus._kraken_tokens
+    shown = repr(octopus._kraken_tokens) + str(octopus._kraken_tokens)
+    assert "jwt-private" not in shown
+    assert "sk_test" not in shown
+
+
+@respx.mock
+async def test_token_mint_is_never_redirected() -> None:
+    elsewhere = respx.post("http://elsewhere.test/graphql/").mock(
+        return_value=_token("jwt-private")
+    )
+    respx.post(GRAPHQL).mock(
+        return_value=httpx.Response(307, headers={"Location": "http://elsewhere.test/graphql/"})
+    )
+    with pytest.raises(OctopusApiError):
+        await fetch_planned_dispatches(_dispatch_settings())
+    assert not elsewhere.called
+
+
+@respx.mock
+async def test_failed_mint_raises_only_the_readers_own_error_type() -> None:
+    respx.post(GRAPHQL).mock(side_effect=httpx.ReadTimeout("sk_test"))
+    for read in (fetch_planned_dispatches, fetch_agreement_rates):
+        with pytest.raises(OctopusApiError):
+            await read(_dispatch_settings())

@@ -26,7 +26,7 @@ def native_link(settings: Settings) -> IntegrationLink:
                        "confirmed": True, "transport": "native", "gateway_host": "gateway.test"}],
     })
     snapshot = SiteSnapshot.model_validate({
-        "api_version": 4, "release_version": "0.30.0",
+        "api_version": 5, "release_version": "0.30.0",
         "site_id": "12345678-1234-5678-1234-567812345678", "sent_at": NOW.isoformat(),
     })
     return IntegrationLink(

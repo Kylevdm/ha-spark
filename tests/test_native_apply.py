@@ -173,7 +173,7 @@ async def test_run_once_uses_command_not_driver(tmp_path, monkeypatch, outcome, 
     )
     assert seen[0].soc_now == 42.0
     assert (result.applied_plan is plan) is accepted
-    assert len(result.apply_lines) == 3
+    assert len(result.apply_lines) == 4
     assert queue.sequence == 1
     assert apply.stale_authority is (reason == "stale_authority")
     assert not queue.pending
@@ -190,6 +190,7 @@ def test_charge_intent_golden():
     from ha_spark.api.native_apply import (
         ChargeCurrentLimit,
         ChargeWindow,
+        DatedChargeNone,
         ExportNone,
         build_intents,
     )
@@ -205,13 +206,15 @@ def test_charge_intent_golden():
     context.limits_record = link.topology
     intent = ChargeIntent(60, SocMeasurement(SocStatus.OK, NOW, value=0),
                           time(23, 30), time(5, 30))
-    intents = build_intents(intent, settings, context, link.topology.topology)
+    intents = build_intents(intent, settings, context, link.topology.topology,
+                            api_version=5)
     command = Command(session_id="addon-session", epoch=7, sequence=1, kind="apply",
                       payload={"intents": intents})
     golden = json.loads((Path(__file__).parent / "fixtures/contract/command_apply_intents.json")
                         .read_text())
     assert command.model_dump() == golden
-    for model, raw in zip((ChargeWindow, ChargeCurrentLimit, ExportNone), intents, strict=True):
+    for model, raw in zip((ChargeWindow, ChargeCurrentLimit, ExportNone, DatedChargeNone),
+                          intents, strict=True):
         assert model.model_validate(raw).model_dump() == raw
 
 
@@ -395,16 +398,17 @@ def test_build_intents_selects_the_typed_export_request():
     )
     soc = SocMeasurement(SocStatus.OK, NOW, value=42)
     window = build_intents(ChargeIntent(60, soc, time(23, 30), time(5, 30), export=export),
-                           settings, context, link.topology.topology)
+                           settings, context, link.topology.topology, api_version=5)
+    window = [raw for raw in window if raw["kind"] == "export"]
     assert window[-1]["request"] == "window"
     assert window[-1]["event"]["start"].startswith(event_start.isoformat()[:19])
     assert window[-1]["soc"] == {"ok": True, "soc_pct": 42.0,
                                    "observed_at": NOW.isoformat().replace("+00:00", "Z")}
     untrusted = build_intents(ChargeIntent(60, soc, time(23, 30), time(5, 30),
                                           export_trusted=False),
-                              settings, context, link.topology.topology)
-    assert untrusted[-1] == {"kind": "export", "inverter_id": "inverter",
+                              settings, context, link.topology.topology, api_version=5)
+    assert untrusted[-2] == {"kind": "export", "inverter_id": "inverter",
                              "request": "untrusted"}
     empty = build_intents(ChargeIntent(60, soc, time(23, 30), time(5, 30)),
-                          settings, context, link.topology.topology)
-    assert empty[-1]["request"] == "none"
+                          settings, context, link.topology.topology, api_version=5)
+    assert empty[-2] == {"kind": "export", "inverter_id": "inverter", "request": "none"}

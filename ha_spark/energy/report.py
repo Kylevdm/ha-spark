@@ -164,6 +164,12 @@ def format_plan(
         f"  Usable now         {usable}",
         f"  Energy deficit     {deficit}",
         f"  Required charge    {required}",
+    ]
+    if plan.daytime_purchases:
+        lines.append("  Daytime purchases:")
+        for purchase in sorted(plan.daytime_purchases, key=lambda p: p.start):
+            lines.append(f"    {purchase.reason}")
+    lines += [
         f"  Charge to          {plan.target_soc:.0f}%  over the {plan.window_hours:.1f} h window "
         f"({_fmt(plan.charge_intent.window_start)}-{_fmt(plan.charge_intent.window_end)})",
         f"  EV                 {'charging' if plan.ev_charging else 'not charging'}",

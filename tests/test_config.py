@@ -30,6 +30,13 @@ def _isolate_from_dotenv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
         monkeypatch.delenv(var, raising=False)
 
 
+def test_free_electricity_enabled_by_default() -> None:
+    assert Settings().free_electricity_enabled is True
+    assert Settings(free_electricity_enabled=False).free_electricity_enabled is False
+    # Like happy_hour_enabled, it postdates the frozen 0.24 legacy vocabulary.
+    assert "free_electricity_enabled" not in _OPTION_KEYS
+
+
 def test_addon_mode_uses_supervisor_endpoints() -> None:
     s = Settings(supervisor_token="sup-token")
     assert s.is_standalone is False

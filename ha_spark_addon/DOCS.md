@@ -372,8 +372,17 @@ compatibility; the integration's repair gives the specific cause and writes
 are refused as `modbus_hub_conflict`. A missing fresh validation
 is `validation unknown`, also a warning. A native inverter with a nonempty
 `solis_control_hub` is `inconsistent` and fails that check. Resolve repairs and
-restore the channel rather than treating unknown as validated. Health also
-reports the integration link, topology, effective limits and provider checks.
+restore the channel rather than treating unknown as validated. **Happy Hour**
+reports the Weekend Happy Hour booking source: `disabled`, `not configured`
+(naming the missing setting), a failed read as a warning (no Happy Hour is
+planned), `no booking`, or each booked hour's date and start-end times on the
+household clock. A booked hour can add `allowance unusable: <reason>` when
+the session allowance counter cannot be used; the booking then uses the ordinary
+tariff. **Free Electricity** reports `disabled`, `not configured` (set the
+Octopus API key and account number), `read failed (<reason>)`, `not enrolled`,
+`no session`, or `listed:` with session start and end timestamps. These rows
+never print a token, key, account number or MPAN. Health also reports the
+integration link, topology, effective limits and provider checks.
 Exit codes are `0` for all green, `1` for a failed critical check, and `2`
 for other degraded results. A green report is diagnostic evidence, not an
 authority grant or live export proof.
@@ -556,6 +565,13 @@ or export skips with the same reason are folded together. Select a line to
 highlight its span on the chart, or select a half-hour to see that slot's
 prices, solar, load, SoC and actions. The plan view displays the planner's
 numbers and wording; it makes no decisions of its own.
+
+Each daytime purchase appears in the plan summary, timeline and plan lines
+with its evidence, price and reason. Refused purchases remain visible with the
+reason for refusal, including the EV or dispatch hold on a coarse-hold inverter
+such as Solis. They add no energy, cost or SoC benefit and do not shrink the
+overnight purchase. No saving figure is shown for a daytime purchase. In Observe,
+the timeline marks purchases as simulated; the plan is not proof of actuation.
 
 When the SoC reading isn't trusted, the SoC lane, SoC-derived numbers, costs and
 the charge, export, skip and V2L actions and lines are blank, and the planner's
@@ -1661,6 +1677,74 @@ for every live test.
 backtesting only. The load forecast does **not** use it. The same
 `octopus_api_key` also serves the `octopus_intelligent` tariff provider above.
 
+### Daytime cheap and free charging
+
+These are runtime settings in ha-spark's own store, not the Supervisor
+**Configuration** tab. They work independently of `tariff_provider`:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `octopus_backend_api_url` | `https://api.backend.octopus.energy/v1` | Octopus backend endpoint for Weekend Happy Hour bookings. Blank turns that source off. The endpoint is undocumented and may change without notice. |
+| `happy_hour_enabled` | `true` | Read booked Weekend Happy Hours. |
+| `free_electricity_enabled` | `true` | Read Free Electricity Sessions for an enrolled account. |
+
+Both sources are read-only and use the existing `octopus_api_key` and
+`octopus_account_number`. Happy Hour needs an existing booking and a usable
+cumulative grid-import entity, `derive_grid_import_entity`. Free Electricity
+uses the public Octopus API and counts a listed session only when the account
+is enrolled. It needs no import counter because it has no cap. ha-spark never
+books, cancels or changes an account, and uses no third-party session feed.
+Each source is polled at most every 30 minutes. A reading older than two hours
+counts as no free session; a failed read does not invent one.
+
+**Session allowance.** Each booked Happy Hour allows up to 16 kWh, less a fixed
+10% margin and the forecast house load for that hour. Grid import already
+counted against the booking reduces what remains. The counter is kept per
+booking in the add-on's SQLite store and survives restarts; adjacent bookings
+never pool their allowance. An unset, unreadable, stale, backwards or implausible
+cumulative reading falls back to the ordinary tariff. The **Happy Hour** health
+row names why the session allowance is unusable. Free Electricity has no cap.
+
+**Import-price overlay.** Each slot has one winner: holds, then Axle export
+events, then negative explicit prices, then Free Electricity, then Happy Hour.
+A held or Axle-event slot has no free session overlay. A negative price spends
+none of the Happy Hour session allowance. The plan names the winning offer and
+any offer set aside. Explicit dynamic prices below the overnight price can
+also buy; fallback, partial or projected prices cannot justify a purchase.
+A started dispatch half-hour with trusted evidence of car draw can buy at the
+off-peak rate for its remaining time. A planned dispatch or a live dispatch
+flag alone does not buy.
+
+**Daytime purchase.** The planner charges towards the target cap within the
+device, bank and site limits and the major-load reserve. The next overnight
+purchase shrinks by what was bought, not by an anticipated free session. On a
+coarse-hold inverter such as Solis, a purchase inside an EV or dispatch hold is
+kept as a refused diagnostic naming the hold. It sends no dated charge window
+and leaves the overnight purchase unchanged.
+
+**Native Solis actuation only.** On an integration-owned native Solis site in
+Optimise, the add-on sends a dated charge device intent using API version 5.
+An older integration gets no daytime window. The integration writes the charge
+half of Slot 2 and verifies it by read-back. Slot 1 (overnight charging and
+exports) and Slot 2's discharge half are untouched. Solis has one charge current
+for all slots, so it follows whichever charge window fires next. A later-day
+window is deferred until its clock time cannot fire early.
+
+No daytime window is armed in Protect, fallback, temporary manual control or
+Observe, with untrusted SoC or an untrusted inverter clock, or during a hold
+on that inverter (`hold_active`). Add-on-owned, AlphaESS and legacy Solis sites
+get no daytime window; the plan names the refusal.
+
+The window is cleared at its end, when no purchase remains and when the site
+leaves Optimise. Every clear is confirmed by five further zero reads. A failed
+clear is retried every 30 seconds and raises the Home Assistant repair
+**Daytime charge window not cleared**. The inverter may charge daily at that
+time until it is cleared. The durable record survives restarts and Re-probes,
+so the integration still clears it without the add-on.
+
+Not included: Power-ups (#684), shrinking the purchase before a session (#685)
+and live trimming of the Happy Hour session allowance (#686).
+
 ### Ollama (optional)
 
 `ollama_url` / `ollama_model` point at a remote Ollama instance (e.g. over
@@ -1691,10 +1775,11 @@ versions get a `409` version refusal, and authenticated requests in
 configuration repair get `503`. The route is not served on the agent port or
 in standalone mode. The port is not mapped to the host network.
 
-The snapshot is `api_version` 3 and may carry the site topology, the major-load
-readings and the supply guard's state. Both halves support versions 1–3, so
-either update order works. A snapshot without those blocks means the legacy
-limits, and nothing changes until you save a topology.
+The current API version is 5. Snapshots may carry the site topology, major-load
+readings and supply guard state. Dated daytime charge intents need version 5;
+an older integration receives none. A snapshot without topology blocks means
+the legacy limits, and nothing changes until you save a topology. Both halves
+support versions 1–5, so either update order works.
 
 The separate `/api/*` ingress endpoints answer only connections from Home
 Assistant's ingress proxy (`172.30.32.2`); requests from any other address get

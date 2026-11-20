@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, time
 
-from ha_spark.energy.models import ChargeIntent, ChargePlan, ExportIntent, ExportSkip, Reservation
+from ha_spark.energy.models import (
+    ChargeIntent,
+    ChargePlan,
+    DaytimePurchase,
+    ExportIntent,
+    ExportSkip,
+    Reservation,
+)
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.topology import InverterAllocation
@@ -252,6 +259,33 @@ def test_load_forecast_line_names_the_served_day() -> None:
     """The report names the day the load forecast serves, not "tomorrow" (#397)."""
     out = format_plan(_plan(), "test", forecast_date=date(2026, 1, 12))
     assert "Home load forecast 17.70 kWh for Mon 12 Jan  (test)" in out
+
+
+def test_daytime_purchases_block_shows_reasons_in_time_order() -> None:
+    p1 = DaytimePurchase(
+        slot_range=(0, 2), start=datetime(2026, 1, 12, 12, tzinfo=UTC),
+        end=datetime(2026, 1, 12, 13, tzinfo=UTC), overlay="free_electricity",
+        evidence="listed", session_id="private-id", effective_price=0.0,
+        energy_kwh=3.19,
+        reason="Buy 3.19 kWh from Free Electricity at £0/kWh using the listed session 12:00–13:00.",
+    )
+    p2 = DaytimePurchase(
+        slot_range=(2, 4), start=datetime(2026, 1, 12, 14, tzinfo=UTC),
+        end=datetime(2026, 1, 12, 15, tzinfo=UTC), overlay="happy_hour",
+        evidence="joined", session_id="private-id-2", effective_price=0.0,
+        energy_kwh=2.0, reason="Happy Hour buy 2.00 kWh 14:00–15:00.",
+    )
+    out = format_plan(_plan(daytime_purchases=(p2, p1)), "test")
+    assert "Daytime purchases:" in out
+    assert out.index("Daytime purchases:") < out.index(p1.reason) < out.index(p2.reason)
+    assert "private-id" not in out
+
+
+def test_no_daytime_purchases_block_when_empty() -> None:
+    out = format_plan(_plan(), "test")
+    assert "Daytime purchases" not in out
+    out_with_empty = format_plan(_plan(daytime_purchases=()), "test")
+    assert out == out_with_empty
 
 
 def test_load_forecast_line_without_a_date_keeps_todays_wording() -> None:

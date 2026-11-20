@@ -9,6 +9,7 @@ import pytest
 from ha_spark.energy.dispatch_evidence import (
     DispatchEvidence,
     DispatchRating,
+    draw_confirmed_dispatches,
     partition_dispatches,
     rate_dispatch,
 )
@@ -199,4 +200,57 @@ def test_power_never_rates_a_future_dispatch() -> None:
     future = DispatchSlot(NOW + timedelta(hours=1), NOW + timedelta(hours=2))
     assert rate_dispatch(future, DispatchEvidence(car_power_kw=7), NOW) is (
         DispatchRating.UNCORROBORATED
+    )
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        DispatchEvidence(live_dispatch=True),
+        DispatchEvidence(rate_adjusted=True),
+        DispatchEvidence(live_dispatch=True, rate_adjusted=True),
+        DispatchEvidence(plug_value="EV Connected"),
+        DispatchEvidence(plug_value="EV Disconnected"),
+        DispatchEvidence(),
+        DispatchEvidence(ev_status_value="Charging"),
+    ],
+    ids=["live-only", "adjusted-only", "both-flags", "corroborated", "contradicted",
+         "untrusted", "drawing-status"],
+)
+def test_draw_purchase_proof_needs_a_started_car_not_a_global_flag(evidence):
+    future = DispatchSlot(NOW + timedelta(hours=1), NOW + timedelta(hours=2))
+    expected = (
+        (DispatchSlot(NOW, NOW.replace(minute=30, second=0, microsecond=0)),)
+        if evidence.ev_status_value == "Charging" else ()
+    )
+    assert draw_confirmed_dispatches((SLOT,), evidence, NOW) == expected
+    assert draw_confirmed_dispatches((future,), evidence, NOW) == ()
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        DispatchEvidence(ev_status_value="Charging"),
+        DispatchEvidence(car_power_kw=7),
+        DispatchEvidence(grid_import_kw=4, forecast_house_kw=1),
+    ],
+    ids=["ev-status", "car-power", "grid-residual"],
+)
+def test_started_draw_confirms_purchase_evidence(evidence):
+    half_hour_end = NOW.replace(minute=30, second=0, microsecond=0)
+    assert draw_confirmed_dispatches((SLOT,), evidence, NOW) == (
+        DispatchSlot(NOW, half_hour_end),
+    )
+
+
+def test_draw_proof_is_clipped_to_the_current_started_half_hour() -> None:
+    long = DispatchSlot(NOW - timedelta(minutes=15), NOW + timedelta(hours=2, minutes=45))
+    evidence = DispatchEvidence(ev_status_value="Charging")
+    half_hour_end = NOW.replace(minute=30, second=0, microsecond=0)
+    assert draw_confirmed_dispatches((long,), evidence, NOW) == (
+        DispatchSlot(NOW, half_hour_end),
+    )
+    later = NOW + timedelta(minutes=10)
+    assert draw_confirmed_dispatches((long,), evidence, later) == (
+        DispatchSlot(later, half_hour_end),
     )

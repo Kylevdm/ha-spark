@@ -19,6 +19,15 @@ provider's dispatch/window folding exactly (dispatches sourced from the
 Octopus API instead of an HA sensor) and overlays live per-slot prices from
 the Octopus standard-unit-rates API. When that is empty or unavailable, current
 account agreement rates price the same configured window and dispatches.
+
+The import-price overlay selects one offer per slot: holds, Axle export events,
+negative explicit prices, Free Electricity, then Happy Hour. A free session is
+an enrolled Free Electricity Session or a booked Happy Hour. Free Electricity
+has no cap; each Happy Hour's session allowance is 16 kWh less a fixed 10%
+margin, forecast house load and counted grid import. An unusable counter leaves
+the ordinary tariff in force. The schedule carries the winning offer, evidence,
+price and offers set aside for the planner's daytime purchases; it grants no
+write authority.
 """
 
 from __future__ import annotations
@@ -33,10 +42,15 @@ from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.models import (
     DispatchSlot,
     FlexibilityEvent,
+    FreeSession,
     PlannerConfig,
     PlannerInputs,
     PricePoint,
+    align,
 )
+
+HAPPY_HOUR_ALLOWANCE_KWH = 16.0
+HAPPY_HOUR_MARGIN = 0.10
 
 
 def _in_overnight_window(t: time, start: time, end: time) -> bool:
@@ -166,6 +180,37 @@ def _project_prices(
     return prices
 
 
+def _fully_covered_prices(
+    starts: Sequence[datetime],
+    points: tuple[PricePoint, ...],
+    origin: datetime,
+    *,
+    absolute: bool,
+    now: datetime | None = None,
+) -> list[float | None]:
+    """Per-slot live price only where one original interval covers the slot.
+
+    Purchase evidence needs the whole remaining charge interval priced by the
+    same read: a point that merely overlaps the slot, a projection between
+    reads, or the fallback fill is never evidence (#696). ``now`` trims slot 0
+    to its part still to come.
+    """
+    prices: list[float | None] = [None] * len(starts)
+    for j, start in enumerate(starts):
+        sa = _hours_since(origin, start, absolute=absolute)
+        lo = (
+            max(sa, _hours_since(origin, now, absolute=absolute))
+            if j == 0 and now is not None else sa
+        )
+        hi = sa + 0.5
+        for pt in points:
+            a = _hours_since(origin, pt.start, absolute=absolute)
+            b = _hours_since(origin, pt.end, absolute=absolute)
+            if a <= lo + 1e-9 and b >= hi - 1e-9:
+                prices[j] = pt.price
+    return prices
+
+
 def _cycle_slot_prices(
     starts: tuple[datetime, ...],
     points: tuple[PricePoint, ...],
@@ -228,6 +273,16 @@ class TariffSchedule:
     window_hours: float
     window_start: time | None = None
     prices: tuple[float, ...] = ()
+    # Per-slot explicit live import price from a dynamic-tariff feed (#696),
+    # ``None`` where the feed gave no reading for that slot. This is
+    # provenance, not costing: ``prices`` fills an uncovered slot with the
+    # fallback standard rate, which is never purchase evidence.
+    explicit_import_prices: tuple[float | None, ...] = ()
+    # Average price the selected overnight charge slots pay (#696), including
+    # the fallback rate where that selection already used it. A live daytime
+    # slot must beat this average; ``None`` on a fixed schedule or when no
+    # slot was selected.
+    overnight_average_price: float | None = None
     cheap_fracs: tuple[float, ...] = ()
     controlled_windows: tuple[tuple[datetime, datetime], ...] = ()
     export_prices: tuple[float, ...] = ()
@@ -238,6 +293,177 @@ class TariffSchedule:
     # across a DST change; elapsed slots included). Empty on legacy,
     # window-anchored inputs — their ``cheap_fracs`` is the cycle already.
     cycle_cheap_slots: tuple[tuple[datetime, float], ...] = ()
+    battery_import_prices: tuple[float, ...] = ()
+    import_overlays: tuple[str | None, ...] = ()
+    import_allowances: tuple[float | None, ...] = ()
+    # Retains dated eligibility and identity at the schedule/planner seam.
+    import_sessions: tuple[FreeSession | None, ...] = ()
+    # Per-slot offer set aside by a higher-precedence overlay (#695): the
+    # session kind that lost to a negative price, an Axle export event or a
+    # hold. ``None`` where no offer was set aside.
+    import_overlay_losers: tuple[str | None, ...] = ()
+    # Session candidates whose slot was won by a hold or Axle export event,
+    # kept for the coarse-hold refusal display (#697). Never an overlay: the
+    # effective import price stays the hold/event/base price.
+    suppressed_import_sessions: tuple[FreeSession | None, ...] = ()
+    import_suppression_reasons: tuple[str | None, ...] = ()
+
+
+def _slot_overlap(
+    geometry: HorizonGeometry, start: datetime, end: datetime,
+) -> list[float]:
+    """Fraction of each slot's full half-hour overlapped by ``[start, end)``.
+
+    Slot 0 counts only the part still to come, so its fraction never exceeds
+    what remains of the half-hour (the session-allowance house load rule).
+    """
+    reference = geometry.horizon_start
+    a, b = align(start, reference).astimezone(UTC), align(end, reference).astimezone(UTC)
+    overlaps: list[float] = []
+    for i, slot_start in enumerate(geometry.slot_starts):
+        slot_end = slot_start.astimezone(UTC) + timedelta(minutes=30)
+        length = timedelta(
+            minutes=30 * (geometry.slot0_remaining_frac if i == 0 else 1)
+        )
+        lo = slot_end - length
+        overlaps.append(
+            max(0.0, (min(b, slot_end) - max(a, lo)).total_seconds()) / 1800.0
+        )
+    return overlaps
+
+
+def _hold_slot_flags(
+    schedule: TariffSchedule, inputs: PlannerInputs, geometry: HorizonGeometry,
+) -> tuple[bool, ...]:
+    """Slots inside a dispatch hold, plus a current EV hold's slot 0 (#695)."""
+    flags = [False] * len(geometry.slot_starts)
+    for start, end in schedule.controlled_windows:
+        for i, share in enumerate(_slot_overlap(geometry, start, end)):
+            if share > 0:
+                flags[i] = True
+    if flags and inputs.ev_hold_charging is True:
+        flags[0] = True
+    return tuple(flags)
+
+
+def _axle_export_slot_flags(
+    inputs: PlannerInputs, geometry: HorizonGeometry,
+) -> tuple[bool, ...]:
+    """Slots inside an Axle export event, scheduled or not (#695)."""
+    event = inputs.flexibility_event
+    if event is None or event.direction != "export":
+        return (False,) * len(geometry.slot_starts)
+    return tuple(share > 0 for share in _slot_overlap(geometry, event.start, event.end))
+
+
+def _negative_price_slots(schedule: TariffSchedule, n_slots: int) -> tuple[bool, ...]:
+    """Slots with an explicit negative tariff price (#695)."""
+    flags: list[bool] = []
+    for i in range(n_slots):
+        price = (schedule.explicit_import_prices[i]
+                 if i < len(schedule.explicit_import_prices) else None)
+        flags.append(price is not None and price < 0)
+    return tuple(flags)
+
+
+def apply_import_overlay(
+    schedule: TariffSchedule, inputs: PlannerInputs, cfg: PlannerConfig,
+) -> TariffSchedule:
+    """Layer the winning import offer over battery prices (#695).
+
+    Precedence is holds, Axle export events, negative explicit prices, the
+    reserved Power-up place (#684, not built), Free Electricity, then Happy
+    Hour. A held or Axle-event slot takes no session overlay; a negative price
+    beats a session and spends none of its allowance. Coverage and gross house
+    load use only the real interval still to come. Base house prices remain
+    available; the planner credits Happy Hour load only when it actually buys
+    within the session's allowance.
+    """
+    geometry = inputs.geometry_for(cfg)
+    if inputs.load_slots is None or geometry is None:
+        return schedule
+    # A schedule that does not price every horizon slot is left alone, never
+    # part-overlaid and never an error.
+    if (len(schedule.prices) != len(geometry.slot_starts)
+            or len(inputs.load_slots) != len(schedule.prices)):
+        return schedule
+    sessions: list[FreeSession | None] = [None] * len(schedule.prices)
+    allowances: list[float | None] = [None] * len(schedule.prices)
+    losers: list[str | None] = [None] * len(schedule.prices)
+    suppressed: list[FreeSession | None] = [None] * len(schedule.prices)
+    suppression_reasons: list[str | None] = [None] * len(schedule.prices)
+    n_slots = len(schedule.prices)
+    held = _hold_slot_flags(schedule, inputs, geometry)
+    axle = _axle_export_slot_flags(inputs, geometry)
+    negative = _negative_price_slots(schedule, n_slots)
+    # Precedence, highest first: holds and Axle events (above), then a
+    # negative explicit price (``negative``), then the reserved Power-up slot
+    # (#684, not built), then Free Electricity, then Happy Hour. One session
+    # overlay per slot, never stacked.
+    for session in sorted(inputs.free_sessions, key=lambda s: s.kind != "free_electricity"):
+        if (session.kind not in ("free_electricity", "happy_hour")
+                or session.start.utcoffset() is None
+                or session.end.utcoffset() is None):
+            continue
+        a, b = session.start.astimezone(UTC), session.end.astimezone(UTC)
+        if b <= a:
+            continue
+        overlaps = _slot_overlap(geometry, session.start, session.end)
+        allowance = None
+        if session.kind == "happy_hour":
+            # An absent or unusable remaining count fails closed: a booking
+            # never assumes its full allowance when the counter cannot prove it.
+            r = inputs.happy_hour_remaining_kwh.get(session.session_id)
+            if (r is None or isinstance(r, bool) or not isinstance(r, (int, float))
+                    or not math.isfinite(r) or r <= 0):
+                continue
+            # Subtract the full margin: r - 1.6 is narrower than 0.9 * r.
+            house = sum(max(0.0, load) * share for load, share in
+                        zip(inputs.load_slots, overlaps, strict=True))
+            allowance = (min(r, HAPPY_HOUR_ALLOWANCE_KWH)
+                         - HAPPY_HOUR_MARGIN * HAPPY_HOUR_ALLOWANCE_KWH - house)
+            if not math.isfinite(allowance) or allowance <= 0:
+                continue
+        for i, share in enumerate(overlaps):
+            if share <= 0:
+                continue
+            if sessions[i] is not None:
+                # A higher-precedence session already owns this slot.
+                if losers[i] is None:
+                    losers[i] = session.kind
+                continue
+            if held[i] or axle[i] or negative[i]:
+                if suppressed[i] is None:
+                    suppressed[i] = session
+                    suppression_reasons[i] = (
+                        "EV or dispatch hold" if held[i]
+                        else "Axle export event" if axle[i]
+                        else "negative tariff price"
+                    )
+                    if held[i]:
+                        # The refused diagnostic is sized with the same
+                        # allowance the admitted purchase would use (#697).
+                        allowances[i] = allowance
+                if losers[i] is None:
+                    losers[i] = session.kind
+                continue
+            sessions[i] = session
+            allowances[i] = allowance
+    if not any(sessions) and not any(suppressed) and not any(losers):
+        return schedule
+    return replace(
+        schedule,
+        battery_import_prices=tuple(0.0 if s else p for s, p in
+                                    zip(sessions, schedule.prices, strict=True)),
+        import_overlays=tuple(s.kind if s else None for s in sessions),
+        import_allowances=tuple(allowances),
+        import_sessions=tuple(sessions),
+        import_overlay_losers=tuple(losers) if any(losers) else (),
+        suppressed_import_sessions=tuple(suppressed) if any(suppressed) else (),
+        import_suppression_reasons=(
+            tuple(suppression_reasons) if any(suppressed) else ()
+        ),
+    )
 
 
 class TariffProvider(Protocol):
@@ -308,9 +534,14 @@ def fixed_schedule(inputs: PlannerInputs, cfg: PlannerConfig) -> TariffSchedule:
 
 def _slot_prices_from_points(
     n_slots: int, horizon_start: datetime | None, points: tuple[PricePoint, ...],
-    inputs: PlannerInputs, cfg: PlannerConfig,
+    inputs: PlannerInputs, cfg: PlannerConfig, *, full_coverage: bool = False,
 ) -> list[float | None]:
-    """Per-horizon-slot live price via :func:`_project_prices`; ``None`` where uncovered."""
+    """Per-horizon-slot live price; ``None`` where uncovered.
+
+    The default is the overlap projection used for costing. ``full_coverage``
+    instead requires one original price interval to cover every slot's whole
+    remaining charge interval, for purchase evidence (#696).
+    """
     prices: list[float | None] = [None] * n_slots
     if horizon_start is None or not points:
         return prices
@@ -321,6 +552,11 @@ def _slot_prices_from_points(
         [geometry.slot_starts[i] for i in range(n_slots)] if geometry is not None
         else [horizon_start + timedelta(minutes=30 * i) for i in range(n_slots)]
     )
+    if full_coverage:
+        return _fully_covered_prices(
+            starts, points, origin, absolute=absolute,
+            now=inputs.now if absolute else None,
+        )
     return _project_prices(starts, points, origin, absolute=absolute)
 
 
@@ -351,6 +587,10 @@ class DynamicTariffProvider:
         )
         if not any(p is not None for p in raw_prices):
             return self.fallback.schedule(inputs, cfg)
+        explicit_prices = _slot_prices_from_points(
+            n, inputs.horizon_start, inputs.dynamic_prices, inputs, cfg,
+            full_coverage=True,
+        )
         # ponytail: an uncovered slot (partial sensor read) costs at the
         # standard rate rather than being guessed at.
         prices = [p if p is not None else self.fallback.standard_rate for p in raw_prices]
@@ -361,6 +601,7 @@ class DynamicTariffProvider:
             # cycle, so the selection is exactly the pre-#399 one and no
             # separate cycle view is exposed.
             cheapest = set(sorted(range(n), key=lambda i: prices[i])[:n_window])
+            comparison_prices = prices
             cheap_fracs = tuple(1.0 if i in cheapest else 0.0 for i in range(n))
             cycle: tuple[tuple[datetime, float], ...] = ()
         else:
@@ -379,10 +620,15 @@ class DynamicTariffProvider:
             cheapest = set(
                 sorted(range(len(starts)), key=lambda j: cycle_prices[j])[:n_window]
             )
+            comparison_prices = cycle_prices
             cheap_fracs = tuple(_carry_cycle_marks(geometry, starts, cheapest, inputs))
             cycle = tuple(
                 (start, 1.0 if j in cheapest else 0.0) for j, start in enumerate(starts)
             )
+        overnight_average = (
+            sum(comparison_prices[i] for i in cheapest) / len(cheapest)
+            if cheapest else None
+        )
         controlled = _controlled_windows(inputs.dispatches, cfg.window_start, cfg.window_end)
         return TariffSchedule(
             cheap_rate=self.fallback.cheap_rate,
@@ -391,6 +637,8 @@ class DynamicTariffProvider:
             window_hours=cfg.window_hours,
             window_start=cfg.window_start,
             prices=tuple(prices),
+            explicit_import_prices=tuple(explicit_prices),
+            overnight_average_price=overnight_average,
             cheap_fracs=cheap_fracs,
             controlled_windows=controlled,
             cycle_cheap_slots=cycle,

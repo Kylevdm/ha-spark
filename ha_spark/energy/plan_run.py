@@ -20,7 +20,7 @@ from ha_spark.energy.models import ChargePlan, LoadForecast, PlannerConfig, Plan
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement
 from ha_spark.energy.solar_source import SolarSource
-from ha_spark.energy.sources import build_schedule, gather_inputs
+from ha_spark.energy.sources import SessionCache, build_schedule, gather_inputs
 from ha_spark.energy.tariff import TariffSchedule
 from ha_spark.energy.topology import MajorLoadObservation, effective_limits
 from ha_spark.energy.topology_record import (
@@ -75,6 +75,7 @@ async def current_plan(
     source: SolarSource,
     limits: LoadedTopology | None = None,
     major_loads: tuple[MajorLoadObservation, ...] | None = None,
+    session_cache: SessionCache | None = None,
 ) -> PlanRun:
     """Compute tonight's plan under the configured tariff provider.
 
@@ -92,6 +93,12 @@ async def current_plan(
     follow adds a display-only preview (#542). ``major_loads`` are the
     accepted snapshot's observations, by default the daemon's; without them
     every load stays in the reserve.
+
+    ``session_cache`` is the daemon's long-lived Octopus session poller, so
+    planning reads each source at most every half-hour (#692). Omitted inside
+    the daemon, the process-wide cache published by its loop is used; a
+    one-off command with no daemon cache reads once and applies the same
+    staleness and retention rules.
     """
     context = execution_context()
     if limits is None:
@@ -99,7 +106,10 @@ async def current_plan(
     if major_loads is None:
         major_loads = context.major_loads
     selection = select_limits(limits, settings)
-    inputs, cfg, forecast = await gather_inputs(settings, rest, soc=soc, source=source)
+    sessions = await (session_cache or context.session_cache or SessionCache()).poll(settings)
+    inputs, cfg, forecast = await gather_inputs(
+        settings, rest, soc=soc, source=source, sessions=sessions,
+    )
     schedule = build_schedule(settings, inputs, cfg)
     if selection.source == "unavailable":
         plan = compute_plan(inputs, cfg, schedule, limits_unavailable=selection.reason)

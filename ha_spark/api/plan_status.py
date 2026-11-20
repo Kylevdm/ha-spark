@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from ha_spark.authority import HoldRecord
 from ha_spark.energy.horizon import _window_bounds
-from ha_spark.energy.models import ChargePlan
+from ha_spark.energy.models import ChargePlan, DaytimePurchase
 
 Action = Literal["hold", "export", "charge", "idle"]
 
@@ -48,6 +48,14 @@ def _amount(value: object, unit: str, ndigits: int) -> str | None:
     return f"{number:.{ndigits}f}{unit}"
 
 
+def _purchase_reason(purchase: DaytimePurchase) -> str:
+    """Use the planner's sentence when it is wire-safe, else a fixed fallback."""
+    reason = purchase.reason
+    if isinstance(reason, str) and reason.isprintable() and 1 <= len(reason) <= 255:
+        return reason
+    return "Charging from a daytime purchase."
+
+
 def resolve(
     plan: ChargePlan, holds: Sequence[HoldRecord], now: datetime, tz: ZoneInfo,
     *, guard_limited: bool = False,
@@ -69,6 +77,15 @@ def resolve(
     needs_charge = required is not None and required > 0
     dispatch = tuple((s.astimezone(UTC), e.astimezone(UTC)) for s, e in intent.holds)
     export = intent.export
+    purchases = tuple(
+        (s.astimezone(UTC), e.astimezone(UTC), _purchase_reason(p))
+        for p in plan.daytime_purchases if not p.refused
+        for s, e in ((p.start, p.end),)
+    )
+    refusals = tuple(
+        (p.start.astimezone(UTC), p.end.astimezone(UTC), _purchase_reason(p))
+        for p in plan.daytime_purchases if p.refused
+    )
     # A record still awaiting release has no scheduled end once its end has passed.
     indefinite = any(h.cause == "ev" or h.trusted_end is not None and h.trusted_end <= now
                      for h in holds)
@@ -78,14 +95,21 @@ def resolve(
     def clock(t: datetime) -> str:
         return t.astimezone(tz).strftime("%H:%M")
 
+    def held(t: datetime, reason: str) -> tuple[Action, str]:
+        # A purchase the hold refused is named beside it while it fits the wire.
+        refusal = next((r for start, end, r in refusals if start <= t < end), None)
+        if refusal is not None and len(reason) + 1 + len(refusal) <= 255:
+            return "hold", f"{reason} {refusal}"
+        return "hold", reason
+
     def action_at(t: datetime) -> tuple[Action, str]:
         ends = [e for s, e in dispatch if s <= t < e] + [e for e in store_ends if t < e]
         if indefinite or ends:
             if any(h.cause == "ev" for h in holds):
-                return "hold", "Battery held while the EV charges."
+                return held(t, "Battery held while the EV charges.")
             # An expired record is still held; its trusted end is descriptive only.
             end = max(ends or [h.trusted_end for h in holds if h.trusted_end is not None])
-            return "hold", f"Battery held for a smart-charge dispatch until {clock(end)}."
+            return held(t, f"Battery held for a smart-charge dispatch until {clock(end)}.")
         if export is not None and (
             export.window_start.astimezone(UTC) <= t < export.window_end.astimezone(UTC)
         ):
@@ -112,6 +136,9 @@ def resolve(
             return "charge", (f"Charging {kwh or 'the battery'} to reach "
                               f"{soc or 'the target'} by {clock(end)}."
                               f"{reserve_reason}{guard_reason}")
+        for start, end, reason in purchases:
+            if start <= t < end:
+                return "charge", reason
         return "idle", "Nothing to charge, export or hold right now."
 
     action, reason = action_at(now)
@@ -119,6 +146,7 @@ def resolve(
     boundaries.update(store_ends)
     if export is not None:
         boundaries.update((export.window_start.astimezone(UTC), export.window_end.astimezone(UTC)))
+    boundaries.update(b for s, e, _ in purchases for b in (s, e))
     if not indefinite:
         for boundary in sorted(b for b in boundaries if now < b < horizon):
             next_action, next_reason = action_at(boundary)

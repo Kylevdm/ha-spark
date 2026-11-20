@@ -1,0 +1,14 @@
+{
+  "session_id": "addon-session",
+  "epoch": 7,
+  "sequence": 1,
+  "kind": "apply",
+  "payload": {
+    "intents": [
+      {"kind": "dated_charge", "inverter_id": "first", "request": "none"},
+      {"kind": "dated_charge", "inverter_id": "first", "request": "untrusted"},
+      {"kind": "dated_charge", "inverter_id": "first", "request": "window", "current_a": 40.0,
+       "start": "2026-10-24T12:00:00Z", "end": "2026-10-24T13:00:00Z"}
+    ]
+  }
+}

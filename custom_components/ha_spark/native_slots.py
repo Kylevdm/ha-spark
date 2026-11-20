@@ -48,6 +48,9 @@ class NativeSlots:
         self.discharge_check: Callable[[], WriteReason | None] | None = None
         # A charge window needs trusted SoC for every write, whatever its direction.
         self.soc_required = False
+        # Dated charge permission, rechecked before any write carrying a Slot 2
+        # charge half; without one such a write is refused.
+        self.charge_check: Callable[[], WriteReason | None] | None = None
 
     def soc_untrusted(self) -> bool:
         soc = getattr(self.boundary.coordinator, "soc", None)
@@ -92,6 +95,8 @@ class NativeSlots:
                                         cleanup=self.cleanup)
         if reason is None and address == 43143 and any(target[4:]):
             reason = self.discharge_check() if self.discharge_check is not None else "mode"
+        if reason is None and address == 43153 and any(target[:4]):
+            reason = self.charge_check() if self.charge_check is not None else "mode"
         if reason is not None:
             return IntentResult(outcome="refused", reason=reason)
         result = await self.boundary.coordinator.native.transport(self.inverter).write(
@@ -214,7 +219,10 @@ class NativeSlots:
         else:
             self.block_result = await self.clear_discharge()
             results.append(self.block_result)
-        for address in (43153, 43163):
+        # A plan carrying a dated charge intent leaves Slot 2 to that intent.
+        dated = (not self.fallback and not self.transition
+                 and self.inverter.id in self.boundary.slot2_dated)
+        for address in (43163,) if dated else (43153, 43163):
             results.append(await self.block(address, [0] * 8))
         if all(r.outcome in ("applied", "unchanged") for r in results):
             block = tuple(charge + self.planned_discharge)

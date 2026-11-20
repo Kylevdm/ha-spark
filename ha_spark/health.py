@@ -38,14 +38,25 @@ from ha_spark.energy.axle import AxleApiError, read_axle_event
 from ha_spark.energy.evidence_freshness import EvidenceFreshness
 from ha_spark.energy.forecast import intervals_from_hourly_stats, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
+from ha_spark.energy.models import FreeSession
 from ha_spark.energy.octopus import (
+    HappyHourBooking,
     OctopusApiError,
     fetch_agreement_rates,
+    fetch_free_electricity_sessions,
+    fetch_happy_hours,
     fetch_planned_dispatches,
     fetch_standard_unit_rates,
+    happy_hour_source,
 )
 from ha_spark.energy.planner import LIMITS_UNAVAILABLE_REASON
 from ha_spark.energy.profile import history_coverage
+from ha_spark.energy.session_allowance import (
+    SessionAllowanceCounter,
+    allowance_source_identity,
+    max_plausible_import_kw,
+    read_grid_import,
+)
 from ha_spark.energy.soc_integrity import SocStatus
 from ha_spark.energy.solar_source import load_solar_source_kind
 from ha_spark.energy.sources import (
@@ -464,6 +475,30 @@ async def _check_octopus_intelligent_tariff(settings: Settings) -> CheckResult:
     )
 
 
+async def check_free_electricity(settings: Settings) -> CheckResult:
+    """Report campaign eligibility and listed times without account or event identifiers."""
+    name = "Free Electricity"
+    if not settings.free_electricity_enabled:
+        return CheckResult(name, Status.OK, "disabled")
+    if not (settings.octopus_api_key and settings.octopus_account_number):
+        return CheckResult(
+            name, Status.OK, "not configured — set Octopus API key and account number",
+        )
+    result = await fetch_free_electricity_sessions(settings)
+    if result.state == "failed":
+        return CheckResult(name, Status.WARN, f"read failed ({result.reason})")
+    if result.state == "not_enrolled":
+        return CheckResult(name, Status.OK, "not enrolled")
+    # The reader returns past events too; only a session not yet over is listed.
+    times = "; ".join(
+        f"{session.start.isoformat()} to {session.end.isoformat()}"
+        for session in result.sessions if session.end > result.read_at
+    )
+    if not times:
+        return CheckResult(name, Status.OK, "no session")
+    return CheckResult(name, Status.OK, f"listed: {times}")
+
+
 async def check_export_event_provider(settings: Settings) -> CheckResult:
     """Confirm that the Axle event source can be read without exposing its token."""
     if settings.export_event_provider == "none":
@@ -486,6 +521,71 @@ async def check_export_event_provider(settings: Settings) -> CheckResult:
         Status.OK,
         f"Axle export event {event.start.isoformat()} to {event.end.isoformat()}",
     )
+
+
+async def _happy_hour_allowance_note(
+    settings: Settings, bookings: tuple[HappyHourBooking, ...], now: datetime,
+) -> str | None:
+    """Name why a booking's import allowance cannot be counted, or ``None`` if usable."""
+    sessions = tuple(
+        FreeSession("happy_hour", booking.event_id, booking.start, booking.end)
+        for booking in bookings if booking.end > now
+    )
+    if not sessions:
+        return None
+    try:
+        async with HomeAssistantRest(
+            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
+        ) as rest:
+            grid_import = await read_grid_import(settings, rest, now)
+        outcome = await SessionAllowanceCounter(
+            settings.db_path,
+            identity=allowance_source_identity(settings),
+            max_jump_kw=max_plausible_import_kw(settings),
+        ).inspect(
+            sessions, reading=grid_import.reading, reason=grid_import.reason, now=now,
+        )
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must never abort health
+        return f"allowance unusable: counter read failed ({type(exc).__name__})"
+    reason = outcome.reason or next(iter(outcome.session_reasons.values()), None)
+    return f"allowance unusable: {reason}" if reason else None
+
+
+async def check_happy_hour(settings: Settings) -> CheckResult:
+    """Report the Weekend Happy Hour booking source without exposing its credentials."""
+    source = happy_hour_source(settings)
+    if source == "disabled":
+        return CheckResult("Happy Hour", Status.OK, "disabled")
+    if source == "not_configured":
+        missing: list[str] = []
+        if not settings.octopus_api_key:
+            missing.append("the Octopus API key")
+        if not settings.octopus_account_number:
+            missing.append("the Octopus account number")
+        if not settings.octopus_backend_api_url.strip():
+            missing.append("the Octopus backend endpoint")
+        names = ", ".join(missing[:-1]) + f" and {missing[-1]}" if len(missing) > 1 else missing[0]
+        return CheckResult("Happy Hour", Status.OK, f"not configured; set {names}")
+    reading = await fetch_happy_hours(settings)
+    if reading.bookings is None:
+        return CheckResult(
+            "Happy Hour", Status.WARN,
+            "Happy Hour read failed; no Happy Hour is planned",
+        )
+    if not reading.bookings:
+        return CheckResult("Happy Hour", Status.OK, "no booking")
+    tz = load_timezone(settings.timezone)
+    times = ", ".join(
+        f"{booking.start.astimezone(tz):%Y-%m-%d %H:%M}-{booking.end.astimezone(tz):%H:%M}"
+        for booking in reading.bookings
+    )
+    detail = f"booked: {times}"
+    note = await _happy_hour_allowance_note(
+        settings, reading.bookings, datetime.now(UTC),
+    )
+    if note:
+        detail += f"; {note}"
+    return CheckResult("Happy Hour", Status.OK, detail)
 
 
 async def check_tariff_provider(settings: Settings) -> CheckResult:
@@ -976,7 +1076,9 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_limits(settings),
         check_topology_record(settings),
         check_tariff_provider(settings),
+        check_free_electricity(settings),
         check_export_event_provider(settings),
+        check_happy_hour(settings),
         check_ha_timezone(settings),
         *([check_ev_status(settings)] if settings.ev_status_entity else []),
         *(

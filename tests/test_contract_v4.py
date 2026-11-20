@@ -142,11 +142,11 @@ def test_flexibility_events_never_changes_snapshot_acceptance(client, state, cha
 
 def test_shared_versions():
     contract = fixture("contract")
-    assert API_VERSION == contract["api_version"] == 4
-    assert sorted(SUPPORTED_API_VERSIONS) == contract["supported_api_versions"] == [1, 2, 3, 4]
+    assert API_VERSION == contract["api_version"] == 5
+    assert sorted(SUPPORTED_API_VERSIONS) == contract["supported_api_versions"] == [1, 2, 3, 4, 5]
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
 @pytest.mark.parametrize("seconds,accepted", [
     (-301, False), (-300, True), (300, True), (301, False),
 ])
@@ -157,7 +157,7 @@ def test_snapshot_clock_boundary(version, seconds, accepted):
     assert snapshot_acceptable(IntegrationLink(None, None, False), snapshot, NOW) == accepted
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
 @pytest.mark.parametrize("change", ["older", "other_site", "future", "past"])
 def test_rejected_snapshot_changes_nothing(client, state, monkeypatch, version, change):
     body = fixture() | {"api_version": version}
@@ -176,7 +176,7 @@ def test_rejected_snapshot_changes_nothing(client, state, monkeypatch, version, 
     monkeypatch.setattr(server, "_heartbeat_now", lambda: NOW + timedelta(seconds=91))
     response = post(client, changed)
     assert response.status_code == 400
-    if change == "other_site" and version == 4:
+    if change == "other_site" and version >= 4:
         assert response.json() == {
             "error": "site_not_paired", "detail": site_pairing.SITE_NOT_PAIRED_TEXT,
         }
@@ -364,7 +364,7 @@ def test_incomplete_trusted_soc_is_untrusted(client, state):
     assert state.integration_link.v4.banks[0].soc is None
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
 def test_durable_pairing_applies_to_legacy_snapshots(client, state, version):
     assert post(client, fixture()).status_code == 200
     state.integration_link = IntegrationLink(None, None, False)

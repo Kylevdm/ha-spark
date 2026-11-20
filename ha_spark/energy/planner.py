@@ -51,6 +51,19 @@ buy-back can spend that protection. Events outside the horizon are skipped.
 
 Daytime dispatch slots are expressed as ``holds`` on the ``ChargeIntent``, so
 the battery holds (doesn't discharge) while cheap grid covers the house.
+
+A daytime purchase is a named charge towards the target cap, with evidence,
+price and reason. The import-price overlay supplies free session candidates
+(Free Electricity or Happy Hour, within its session allowance). Explicit dynamic
+prices below the overnight price and a started dispatch half-hour with trusted
+car-draw evidence can also buy. Purchases respect effective limits and the
+major-load reserve; the next overnight purchase shrinks by what was bought,
+not by an anticipated session. A purchase inside an EV or dispatch hold on a
+coarse-hold inverter such as Solis remains a refused diagnostic: no energy,
+cost or SoC benefit, no smaller overnight purchase and no dated charge window.
+Admitted purchases can produce a dated charge device intent; only the gated
+native Solis integration actuates it. Plan surfaces show purchase reasons and
+refusals, never a purchase saving figure.
 """
 
 from __future__ import annotations
@@ -66,6 +79,8 @@ from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.models import (
     ChargeIntent,
     ChargePlan,
+    DatedChargeWindow,
+    DaytimePurchase,
     ExportIntent,
     ExportSkip,
     FlexibilityEvent,
@@ -73,9 +88,17 @@ from ha_spark.energy.models import (
     PlannerInputs,
     Reservation,
     V2LRefill,
+    align,
 )
 from ha_spark.energy.plan_view import SocPoint, build_plan_view, v2l_refill_reason
-from ha_spark.energy.tariff import TariffSchedule, _controlled_windows
+from ha_spark.energy.tariff import (
+    TariffSchedule,
+    _axle_export_slot_flags,
+    _controlled_windows,
+    _hold_slot_flags,
+    _negative_price_slots,
+    _slot_overlap,
+)
 from ha_spark.energy.topology import (
     FIXED_EXPORT_CEILING_REFUSAL,
     FIXED_EXPORT_COMMAND_A,
@@ -88,6 +111,7 @@ from ha_spark.energy.topology import (
     MajorLoadObservation,
     Topology,
     charge_capacity_kw,
+    driver_capabilities,
     effective_limits,
     is_running,
     legacy_topology,
@@ -273,6 +297,50 @@ def _slot_reservation(
     )
 
 
+def _slot_charge_capacity(
+    inputs: PlannerInputs, cfg: PlannerConfig, limits: _PlanningLimits, efficiency: float,
+    index: int, loads: tuple[MajorLoad, ...],
+    observations: tuple[MajorLoadObservation, ...], *, without_reserve: bool = False,
+    planned_v2l_dc_kw: float = 0.0,
+) -> float:
+    """The shared overnight/daytime stored-power ceiling, including the reserve."""
+    geometry = inputs.geometry_for(cfg)
+    evidence = {observation.load_id: observation for observation in observations}
+    running: dict[str, float] = {}
+    for major in loads:
+        observation = evidence.get(major.id)
+        if (major.power_entity is not None and observation is not None and inputs.now is not None
+                and is_running(major, observation.reading_kw, observation.reported_at, inputs.now)):
+            assert observation.reading_kw is not None
+            running[major.id] = observation.reading_kw
+    slot_start = (
+        geometry.slot_starts[index] if geometry is not None
+        else inputs.horizon_start + timedelta(minutes=30 * index)
+        if inputs.horizon_start is not None else None
+    )
+    expected = {
+        major.id for major in loads if major.dispatch_driven
+        and slot_start is not None
+        and any(_overlaps(slot_start, slot_start + timedelta(minutes=30),
+                          (dispatch.start, dispatch.end)) for dispatch in inputs.dispatches)
+    }
+    active_kw = sum(
+        running[major.id] if major.id in running else major.effective_demand_kw
+        for major in loads if major.id in running or major.id in expected
+    )
+
+    def excluded(major: MajorLoad) -> bool:
+        return major.id in running or major.id in expected
+
+    reserve_kw = 0.0 if without_reserve else major_load_reserve_kw(loads, exclude=excluded)
+    assert inputs.load_slots is not None
+    return charge_capacity_kw(
+        limits.bank, limits.connection, charge_efficiency=efficiency,
+        base_load_kw=inputs.load_slots[index] * 2, active_major_loads_kw=active_kw,
+        reserve_kw=reserve_kw, planned_v2l_dc_kw=planned_v2l_dc_kw,
+    )
+
+
 def _window_charge_limit(
     inputs: PlannerInputs, cfg: PlannerConfig, limits: _PlanningLimits, efficiency: float,
     loads: tuple[MajorLoad, ...] = (),
@@ -288,18 +356,10 @@ def _window_charge_limit(
     """
     geometry = inputs.geometry_for(cfg)
     binding_id = limits.hardware_id
-    evidence = {observation.load_id: observation for observation in observations}
-    running: dict[str, float] = {}
-    for major in loads:
-        observation = evidence.get(major.id)
-        if (major.power_entity is not None and observation is not None and inputs.now is not None
-                and is_running(major, observation.reading_kw, observation.reported_at, inputs.now)):
-            assert observation.reading_kw is not None
-            running[major.id] = observation.reading_kw
     charge_capacity_kw(limits.bank, limits.connection, charge_efficiency=efficiency)
     if inputs.load_slots is not None:
         energy = 0.0
-        for i, load in enumerate(inputs.load_slots):
+        for i, _load in enumerate(inputs.load_slots):
             if geometry is not None:
                 start = max(geometry.slot_starts[i], geometry.window_start)
                 if inputs.now is not None:
@@ -317,29 +377,9 @@ def _window_charge_limit(
                 hours = max(0.0, min(0.5, cfg.window_hours - i * 0.5))
             if hours <= 0:
                 continue
-            slot_start = (
-                geometry.slot_starts[i] if geometry is not None
-                else inputs.horizon_start + timedelta(minutes=30 * i)
-                if inputs.horizon_start is not None else None
-            )
-            expected = {
-                major.id for major in loads if major.dispatch_driven
-                and slot_start is not None
-                and any(_overlaps(slot_start, slot_start + timedelta(minutes=30),
-                                  (dispatch.start, dispatch.end)) for dispatch in inputs.dispatches)
-            }
-            active_kw = sum(
-                running[major.id] if major.id in running else major.effective_demand_kw
-                for major in loads if major.id in running or major.id in expected
-            )
-            def excluded(major: MajorLoad, expected: set[str] = expected) -> bool:
-                return major.id in running or major.id in expected
-
-            reserve_kw = 0.0 if without_reserve else major_load_reserve_kw(loads, exclude=excluded)
-            capacity = charge_capacity_kw(
-                limits.bank, limits.connection, charge_efficiency=efficiency,
-                base_load_kw=load * 2, active_major_loads_kw=active_kw, reserve_kw=reserve_kw,
-                planned_v2l_dc_kw=planned_v2l_dc_kw,
+            capacity = _slot_charge_capacity(
+                inputs, cfg, limits, efficiency, i, loads, observations,
+                without_reserve=without_reserve, planned_v2l_dc_kw=planned_v2l_dc_kw,
             )
             # The connection binds only when the import term, not the bank room
             # shared with a V2L charger, is what lowered the capacity.
@@ -849,6 +889,7 @@ def _soc_path(
     cfg: PlannerConfig,
     refills: tuple[V2LRefill, ...] = (),
     solar_surplus: tuple[float, ...] = (),
+    daytime_purchases: tuple[DaytimePurchase, ...] = (),
 ) -> tuple[tuple[datetime, float], ...]:
     """Expected SoC at each slot start from the window end, if the plan holds.
 
@@ -879,6 +920,8 @@ def _soc_path(
         )
         soc = max(cfg.min_soc, soc - drain / cfg.capacity_kwh * 100.0)
         added = sum(action.kwh for action in refills if action.slot == i)
+        if daytime_purchases:
+            added += _daytime_slot_energy(daytime_purchases, i)
         added += solar_surplus[i] if solar_surplus else 0.0
         soc = min(cfg.target_cap, soc + added / cfg.capacity_kwh * 100.0)
     return tuple(path)
@@ -906,9 +949,11 @@ def _soc_series(
     window_end = geometry.window_end.astimezone(UTC)
     charge_start = max(now, window_start)
     charge_seconds = max(0.0, (window_end - charge_start).total_seconds())
+    admitted = tuple(p for p in plan.daytime_purchases if not p.refused)
     path = {at.astimezone(UTC): value for at, value in plan.soc_path}
     times = {now, *(at.astimezone(UTC) for at in geometry.slot_starts if at > now),
-             *(at for at in (window_start, window_end) if at > now)}
+             *(at for at in (window_start, window_end) if at > now),
+             *(at for p in admitted for at in (p.start, p.end) if at > now)}
     if not path:
         times = {at for at in times if at <= window_end}
     exported = dict(zip(
@@ -956,7 +1001,45 @@ def _soc_series(
             seconds = max(0.0, (min(at, window_end)
                                 - max(previous, charge_start)).total_seconds())
             added = plan.required_kwh * seconds / charge_seconds if charge_seconds else 0.0
+            for p in admitted:
+                for i in range(*p.slot_range):
+                    lo = max(p.start, geometry.slot_starts[i])
+                    hi = min(p.end, geometry.slot_starts[i] + timedelta(minutes=30))
+                    seconds = max(0.0, (hi - lo).total_seconds())
+                    overlap = max(0.0, (min(at, hi) - max(previous, lo)).total_seconds())
+                    if seconds > 0:
+                        added += _daytime_slot_energy((p,), i) * overlap / seconds
             soc = min(cfg.target_cap, max(min(soc, cfg.min_soc),
+                                         soc + (added - drain) / cfg.capacity_kwh * 100))
+        elif admitted:
+            # Partial session bounds may fall between the slot-start ledger's
+            # points. Integrate those intervals too, without discharging inside
+            # the session or applying charging losses a second time.
+            drain = added = 0.0
+            for i, start in enumerate(geometry.slot_starts):
+                lo = max(start, now, window_end)
+                hi = start + timedelta(minutes=30)
+                seconds = max(0.0, (hi - lo).total_seconds())
+                overlap = max(0.0, (min(at, hi) - max(previous, lo)).total_seconds())
+                covered_seconds = covered_overlap = 0.0
+                for p in admitted:
+                    if not p.slot_range[0] <= i < p.slot_range[1]:
+                        continue
+                    a, b = max(lo, p.start), min(hi, p.end)
+                    duration = max(0.0, (b - a).total_seconds())
+                    part = max(0.0, (min(at, b) - max(previous, a)).total_seconds())
+                    covered_seconds += duration
+                    covered_overlap += part
+                    if duration > 0:
+                        added += _daytime_slot_energy((p,), i) * part / duration
+                if seconds > covered_seconds:
+                    drain += ((1 - schedule.cheap_fracs[i]) * net[i]
+                              * (overlap - covered_overlap) / (seconds - covered_seconds))
+                if seconds > 0:
+                    drain += exported.get(start, 0.0) * overlap / 3600
+                    added += sum(r.kwh for r in plan.v2l_refills if r.slot == i) \
+                        * overlap / seconds
+            soc = min(cfg.target_cap, max(cfg.min_soc,
                                          soc + (added - drain) / cfg.capacity_kwh * 100))
         # Never feed the forecast back into soc_path or V2L sizing. At matching
         # instants that ledger is authoritative, including the window end.
@@ -1058,6 +1141,499 @@ def _v2l_refills(
     return tuple(sorted(actions, key=lambda action: action.slot)), False, saving
 
 
+_IMPORT_LABELS = {"free_electricity": "Free Electricity", "happy_hour": "Happy Hour"}
+
+
+def _coarse_hold(topology: Topology | None, cfg: PlannerConfig) -> bool:
+    """Whether an effective planned inverter refuses a charge while it holds."""
+    if topology is None or not topology.inverters:
+        # No planned inverter to ask: fall back to the configured driver
+        # rather than assuming a hold never blocks a charge.
+        return driver_capabilities(cfg.driver_kind).coarse_hold
+    return any(driver_capabilities(inverter.driver_kind).coarse_hold
+               for inverter in topology.inverters)
+
+
+def _dispatch_purchase_flags(
+    inputs: PlannerInputs, geometry: HorizonGeometry,
+) -> tuple[bool, ...]:
+    """Slots overlapping the current started half-hour of draw proof.
+
+    The planner re-clips the supplied proof as a seam defence: a caller cannot
+    turn a long dispatch into a long purchase by passing its whole interval.
+    """
+    now = (inputs.now or geometry.horizon_start).astimezone(UTC)
+    half_hour_end = now.replace(
+        minute=0 if now.minute < 30 else 30, second=0, microsecond=0
+    ) + timedelta(minutes=30)
+    flags = [False] * len(geometry.slot_starts)
+    for dispatch in inputs.dispatch_purchase_slots:
+        start = align(dispatch.start, geometry.horizon_start).astimezone(UTC)
+        end = align(dispatch.end, geometry.horizon_start).astimezone(UTC)
+        if not start <= now < end:
+            continue
+        start, end = max(start, now), min(end, half_hour_end)
+        if start >= end:
+            continue
+        for i, share in enumerate(_slot_overlap(geometry, start, end)):
+            if share > 0:
+                flags[i] = True
+    return tuple(flags)
+
+
+def _hold_slot_names(
+    schedule: TariffSchedule, inputs: PlannerInputs, geometry: HorizonGeometry,
+) -> tuple[str | None, ...]:
+    """Name the hold that owns each slot, for a refusal reason."""
+    names: list[str | None] = [None] * len(geometry.slot_starts)
+    for start, end in schedule.controlled_windows:
+        for i, share in enumerate(_slot_overlap(geometry, start, end)):
+            if share > 0:
+                names[i] = "dispatch hold"
+    if names and inputs.ev_hold_charging is True:
+        names[0] = "EV hold"
+    return tuple(names)
+
+
+def _run_slot_capacities(
+    inputs: PlannerInputs, cfg: PlannerConfig, limits: _PlanningLimits,
+    efficiency: float, geometry: HorizonGeometry, start: datetime, end: datetime,
+    first: int, last: int, loads: tuple[MajorLoad, ...],
+    observations: tuple[MajorLoadObservation, ...],
+) -> tuple[list[float], list[float]]:
+    """Per-slot stored-energy capacity and real-time share of one run."""
+    capacities: list[float] = []
+    shares: list[float] = []
+    for k in range(first, last):
+        slot_start = geometry.slot_starts[k].astimezone(UTC)
+        lo = max(start, slot_start)
+        hi = min(end, slot_start + timedelta(minutes=30))
+        hours = max(0.0, (hi - lo).total_seconds() / 3600)
+        shares.append(hours / _slot_hours(geometry, k))
+        capacities.append(_slot_charge_capacity(
+            inputs, cfg, limits, efficiency, k, loads, observations,
+        ) * hours)
+    return capacities, shares
+
+
+def _run_amount(
+    energy: float, cap: float, capacities: list[float], budget: float = float("inf"),
+) -> float:
+    """The smallest of target headroom, allowance budget and charge capacity."""
+    return min(max(0.0, cap - energy), budget, sum(capacities))
+
+
+def _delivered_amounts(amount: float, capacities: list[float]) -> tuple[float, ...]:
+    """Spread one run's stored energy across its slots, never exceeding a slot."""
+    left = amount
+    delivered: list[float] = []
+    for capacity in capacities:
+        added = min(left, capacity)
+        delivered.append(added)
+        left -= added
+    return tuple(delivered)
+
+
+def _daytime_purchases(
+    inputs: PlannerInputs, cfg: PlannerConfig, schedule: TariffSchedule,
+    geometry: HorizonGeometry, net: list[float], initial_energy: float,
+    first: int, stop: int, limits: _PlanningLimits, efficiency: float,
+    loads: tuple[MajorLoad, ...], observations: tuple[MajorLoadObservation, ...],
+    export: ExportIntent | None, coarse_hold: bool,
+) -> tuple[tuple[DaytimePurchase, ...], tuple[DatedChargeWindow, ...], list[float], float]:
+    """Greedily fill dated overlay runs and explicit cheap slots in time order,
+    never borrowing a future buy."""
+    purchases: list[DaytimePurchase] = []
+    windows: list[DatedChargeWindow] = []
+    remaining = list(net)
+    energy = max(0.0, initial_energy)
+    cap = max(0.0, cfg.capacity_kwh * (cfg.target_cap - cfg.min_soc) / 100)
+    exported = dict(zip(export.selected_slots, export.slot_export_kw, strict=True)) \
+        if export else {}
+    selected = set(exported)
+    spent: dict[str, float] = {}
+    held = _hold_slot_flags(schedule, inputs, geometry)
+    axle = _axle_export_slot_flags(inputs, geometry)
+    dispatch_purchase = _dispatch_purchase_flags(inputs, geometry)
+    hold_names = _hold_slot_names(schedule, inputs, geometry)
+    negative_price = _negative_price_slots(schedule, len(net))
+    # A hold, an Axle export event or a scheduled export wins the slot: it is
+    # never a daytime purchase, whatever session or price overlays it carries.
+    blocked = tuple(
+        held[i] or axle[i] or geometry.slot_starts[i] in selected
+        for i in range(len(net))
+    )
+
+    def loser_label(index: int) -> str | None:
+        if index >= len(schedule.import_overlay_losers):
+            return None
+        kind = schedule.import_overlay_losers[index]
+        return _IMPORT_LABELS.get(kind, kind) if kind else None
+
+    def dynamic_candidate(index: int) -> bool:
+        """An explicit live price below the selected overnight average (#696).
+
+        Shared by the admitted and refused branches so their eligibility
+        cannot diverge; the fallback-filled ``prices`` entry is never evidence.
+        """
+        live = (schedule.explicit_import_prices[index]
+                if index < len(schedule.explicit_import_prices) else None)
+        average = schedule.overnight_average_price
+        # A tolerance so float summation of the average (which differs across
+        # Python versions) never lets an equal price count as "below" it.
+        return (live is not None and average is not None and live < average - 1e-9
+                and geometry.window_fracs[index] == 0)
+
+    def refusable(index: int) -> bool:
+        """A slot that a coarse hold (not an Axle event or export) refuses."""
+        return (coarse_hold and held[index] and not axle[index]
+                and geometry.slot_starts[index] not in selected)
+
+    def drain_slot(index: int) -> None:
+        nonlocal energy
+        if geometry.slot_starts[index] in exported:
+            drain = (net[index]
+                     + exported[geometry.slot_starts[index]] * _slot_hours(geometry, index))
+        else:
+            drain = (1 - schedule.cheap_fracs[index]) * net[index]
+        energy = max(0.0, energy - drain)
+
+    i = first
+    while i < stop:
+        session = schedule.import_sessions[i] if i < len(schedule.import_sessions) else None
+        overlay = (schedule.import_overlays[i]
+                   if i < len(schedule.import_overlays) else None)
+        allowance = (schedule.import_allowances[i]
+                     if i < len(schedule.import_allowances) else None)
+        budget = (max(0.0, allowance * efficiency - spent.get(session.session_id, 0.0))
+                  if allowance is not None and session is not None else float("inf"))
+        live_price = (schedule.explicit_import_prices[i]
+                      if i < len(schedule.explicit_import_prices) else None)
+        overnight_average = schedule.overnight_average_price
+        if (dispatch_purchase[i] and not axle[i]
+                and geometry.slot_starts[i] not in selected):
+            # A started dispatch with the car drawing is a purchase, even
+            # though its own hold wins the slot. On a coarse-hold inverter the
+            # planner keeps the purchase as a refused diagnostic: it names the
+            # hold and changes no sizing, cost or SoC. The purchase is priced
+            # at the off-peak rate, matching the dispatch it tops up.
+            j = i + 1
+            while (
+                j < stop and dispatch_purchase[j]
+                and not axle[j] and geometry.slot_starts[j] not in selected
+            ):
+                j += 1
+            covering = tuple(
+                dispatch for dispatch in inputs.dispatch_purchase_slots
+                if any(_slot_overlap(geometry, dispatch.start, dispatch.end)[k] > 0
+                       for k in range(i, j))
+            )
+            slot_start = geometry.slot_starts[i].astimezone(UTC)
+            slot_end = geometry.slot_starts[j - 1].astimezone(UTC) + timedelta(minutes=30)
+            run_start = max(
+                slot_start,
+                (inputs.now or geometry.horizon_start).astimezone(UTC),
+                min(align(d.start, geometry.horizon_start).astimezone(UTC)
+                    for d in covering),
+            )
+            run_end = min(
+                slot_end,
+                max(align(d.end, geometry.horizon_start).astimezone(UTC)
+                    for d in covering),
+            )
+            capacities, _ = _run_slot_capacities(
+                inputs, cfg, limits, efficiency, geometry, run_start, run_end,
+                i, j, loads, observations,
+            )
+            amount = _run_amount(energy, cap, capacities)
+            for k in range(i, j):
+                drain_slot(k)
+            if amount > 1e-9:
+                price = schedule.cheap_rate
+                start, end = run_start, run_end
+                evidence = (f"started dispatch with the car drawing "
+                            f"{_clock(start, inputs)}–{_clock(end, inputs)}")
+                reason = (f"Buy {amount:.2f} kWh from the {evidence} at "
+                          f"£{price:g}/kWh")
+                refused = coarse_hold
+                if refused:
+                    reason += ", but the dispatch hold refuses it."
+                else:
+                    reason += "."
+                delivered = _delivered_amounts(amount, capacities)
+                if not refused:
+                    energy = min(cap, energy + amount)
+                purchases.append(DaytimePurchase(
+                    slot_range=(i, j), start=start, end=end,
+                    overlay="dispatch", evidence=evidence, session_id="",
+                    effective_price=price, energy_kwh=amount, reason=reason,
+                    slot_energy_kwh=delivered, refused=refused,
+                ))
+                if not refused:
+                    windows.append(DatedChargeWindow(
+                        start, end,
+                        min(cfg.target_cap,
+                            cfg.min_soc + energy / cfg.capacity_kwh * 100),
+                        amount,
+                    ))
+            i = j
+            continue
+        if blocked[i]:
+            suppressed = (
+                schedule.suppressed_import_sessions[i]
+                if i < len(schedule.suppressed_import_sessions) else None
+            )
+            suppressed_reason = (
+                schedule.import_suppression_reasons[i]
+                if i < len(schedule.import_suppression_reasons) else None
+            )
+            # Under a coarse hold the refusal follows the admitted precedence:
+            # a negative explicit price beats a session, then the session,
+            # then a positive explicit price below the overnight average.
+            negative_refusal = (refusable(i) and negative_price[i]
+                                and dynamic_candidate(i))
+            if (refusable(i) and not negative_refusal
+                    and suppressed is not None
+                    and suppressed_reason == "EV or dispatch hold"
+                    and geometry.window_fracs[i] == 0
+                    and not (suppressed.kind == "happy_hour" and first > 0
+                             and suppressed.start.astimezone(UTC)
+                             < geometry.window_start)):
+                # The held run of a session is refused even when another part
+                # of the same session is admitted outside the hold. The
+                # refusal is diagnostic only: it changes no energy, cost, SoC,
+                # intent or overnight sizing.
+                j = i + 1
+                while (
+                    j < stop
+                    and j < len(schedule.suppressed_import_sessions)
+                    and schedule.suppressed_import_sessions[j] == suppressed
+                    and j < len(schedule.import_suppression_reasons)
+                    and schedule.import_suppression_reasons[j] == suppressed_reason
+                    and refusable(j) and not negative_price[j]
+                    and geometry.window_fracs[j] == 0
+                ):
+                    j += 1
+                start = max(
+                    suppressed.start.astimezone(UTC),
+                    geometry.slot_starts[i].astimezone(UTC),
+                    (inputs.now or geometry.horizon_start).astimezone(UTC),
+                )
+                end = min(
+                    suppressed.end.astimezone(UTC),
+                    geometry.slot_starts[j - 1].astimezone(UTC)
+                    + timedelta(minutes=30),
+                )
+                capacities, _ = _run_slot_capacities(
+                    inputs, cfg, limits, efficiency, geometry, start, end,
+                    i, j, loads, observations,
+                )
+                refused_allowance = (
+                    schedule.import_allowances[i]
+                    if i < len(schedule.import_allowances) else None
+                )
+                refused_budget = (
+                    max(0.0, refused_allowance * efficiency
+                        - spent.get(suppressed.session_id, 0.0))
+                    if refused_allowance is not None else float("inf")
+                )
+                amount = _run_amount(energy, cap, capacities, refused_budget)
+                for k in range(i, j):
+                    drain_slot(k)
+                if amount > 1e-9:
+                    refused_label = _IMPORT_LABELS.get(
+                        suppressed.kind, suppressed.kind,
+                    )
+                    evidence_kind = (
+                        "booked hour" if suppressed.kind == "happy_hour"
+                        else "listed session"
+                    )
+                    evidence = (
+                        f"{evidence_kind} "
+                        f"{_clock(start, inputs)}–{_clock(end, inputs)}"
+                    )
+                    hold = hold_names[i] or "EV or dispatch hold"
+                    reason = (
+                        f"Would buy {amount:.2f} kWh from {refused_label} at £0/kWh "
+                        f"using the {evidence}, but the {hold} refuses it."
+                    )
+                    purchases.append(DaytimePurchase(
+                        slot_range=(i, j), start=start, end=end,
+                        overlay=suppressed.kind, evidence=evidence,
+                        session_id=suppressed.session_id, effective_price=0.0,
+                        energy_kwh=amount, reason=reason,
+                        slot_energy_kwh=_delivered_amounts(amount, capacities),
+                        refused=True,
+                    ))
+                i = j
+                continue
+            if refusable(i) and dynamic_candidate(i):
+                hours = _slot_hours(geometry, i)
+                capacities = [_slot_charge_capacity(
+                    inputs, cfg, limits, efficiency, i, loads, observations,
+                ) * hours]
+                amount = _run_amount(energy, cap, capacities)
+                drain_slot(i)
+                if amount > 1e-9:
+                    slot_start = geometry.slot_starts[i].astimezone(UTC)
+                    start = max(
+                        slot_start,
+                        (inputs.now or geometry.horizon_start).astimezone(UTC),
+                    )
+                    end = slot_start + timedelta(minutes=30)
+                    assert live_price is not None
+                    price = live_price
+                    winning = ("negative explicit tariff price" if negative_price[i]
+                               else "explicit tariff price")
+                    evidence = (
+                        f"{winning} £{price:g}/kWh for "
+                        f"{_clock(start, inputs)}–{_clock(end, inputs)}"
+                    )
+                    hold = hold_names[i] or "EV or dispatch hold"
+                    reason = (
+                        f"Would buy {amount:.2f} kWh using the {evidence}, "
+                        f"but the {hold} refuses it."
+                    )
+                    purchases.append(DaytimePurchase(
+                        slot_range=(i, i + 1), start=start, end=end,
+                        overlay="dynamic_price", evidence=evidence, session_id="",
+                        effective_price=price, energy_kwh=amount, reason=reason,
+                        slot_energy_kwh=(amount,), refused=True,
+                    ))
+                i += 1
+                continue
+            drain_slot(i)
+            i += 1
+            continue
+        negative = negative_price[i]
+        eligible = (session is not None and overlay is not None and budget > 1e-9
+                    and geometry.window_fracs[i] == 0
+                    and not negative
+                    # A booked hour straddling the overnight window buys only
+                    # before it, never spending its allowance again after it.
+                    and not (overlay == "happy_hour" and first > 0
+                             and session.start.astimezone(UTC) < geometry.window_start))
+        if not eligible:
+            # Precedence at this slot: a hold/event/export is already excluded
+            # above, then a negative explicit price (here), then the reserved
+            # Power-up slot (#684, not built), then the session overlays below.
+            # An explicit live price below the selected overnight average is
+            # top-rung evidence (#696); the fallback-filled ``prices`` entry is
+            # never evidence, hence the separate live field.
+            if dynamic_candidate(i):
+                assert live_price is not None
+                hours = _slot_hours(geometry, i)
+                capacity = _slot_charge_capacity(
+                    inputs, cfg, limits, efficiency, i, loads, observations,
+                ) * hours
+                amount = min(max(0.0, cap - energy), capacity)
+                if amount > 1e-9:
+                    slot_start = geometry.slot_starts[i].astimezone(UTC)
+                    start = max(
+                        slot_start, (inputs.now or geometry.horizon_start).astimezone(UTC)
+                    )
+                    end = slot_start + timedelta(minutes=30)
+                    drain_slot(i)
+                    energy = min(cap, energy + amount)
+                    price = live_price
+                    winning = ("negative explicit tariff price" if negative
+                               else "explicit tariff price")
+                    evidence = (f"{winning} £{price:g}/kWh for "
+                                f"{_clock(start, inputs)}–{_clock(end, inputs)}")
+                    reason = f"Buy {amount:.2f} kWh using the {evidence}"
+                    if overnight_average is not None:
+                        reason += (f", below the £{overnight_average:g}/kWh average "
+                                   f"overnight price")
+                    loser = loser_label(i)
+                    if loser is None and session is not None:
+                        loser = _IMPORT_LABELS.get(overlay or "", overlay)
+                    if loser:
+                        reason += f"; {loser} was set aside in this slot"
+                    reason += "."
+                    purchases.append(DaytimePurchase(
+                        slot_range=(i, i + 1), start=start, end=end,
+                        overlay="dynamic_price", evidence=evidence, session_id="",
+                        effective_price=price, energy_kwh=amount, reason=reason,
+                        slot_energy_kwh=(amount,),
+                    ))
+                    windows.append(DatedChargeWindow(
+                        start, end,
+                        min(cfg.target_cap,
+                            cfg.min_soc + energy / cfg.capacity_kwh * 100),
+                        amount,
+                    ))
+                    i += 1
+                    continue
+            drain_slot(i)
+            i += 1
+            continue
+        assert session is not None
+        j = i + 1
+        while (j < stop and not blocked[j] and not negative_price[j]
+               and schedule.import_sessions[j] == session
+               and geometry.window_fracs[j] == 0):
+            j += 1
+        start = max(session.start.astimezone(UTC), geometry.slot_starts[i].astimezone(UTC),
+                    (inputs.now or geometry.horizon_start).astimezone(UTC))
+        end = min(session.end.astimezone(UTC),
+                  geometry.slot_starts[j - 1].astimezone(UTC) + timedelta(minutes=30))
+        capacities, shares = _run_slot_capacities(
+            inputs, cfg, limits, efficiency, geometry, start, end,
+            i, j, loads, observations,
+        )
+        bounds = (max(0.0, cap - energy), budget, sum(capacities))
+        amount = min(bounds)
+        if overlay == "happy_hour" and amount <= 1e-9:
+            # No buy means no tariff or discharge change for this run.
+            for k in range(i, j):
+                energy = max(0.0, energy - (1 - schedule.cheap_fracs[k]) * net[k])
+            i = j
+            continue
+        for k, share in zip(range(i, j), shares, strict=True):
+            remaining[k] *= 1 - share
+        spent[session.session_id] = spent.get(session.session_id, 0.0) + amount
+        delivered = _delivered_amounts(amount, capacities)
+        for k, added in zip(range(i, j), delivered, strict=True):
+            energy = min(cap, max(0.0, energy - (1 - schedule.cheap_fracs[k]) * remaining[k])
+                         + added)
+        if amount > 1e-9:
+            price = schedule.battery_import_prices[i]
+            evidence = (f"{'booked hour' if overlay == 'happy_hour' else 'listed session'} "
+                        f"{_clock(session.start, inputs)}–{_clock(session.end, inputs)}")
+            label = _IMPORT_LABELS.get(overlay or "", overlay)
+            reason = (f"Buy {amount:.2f} kWh from {label} at £{price:g}/kWh using the "
+                      f"{evidence}")
+            if overlay == "happy_hour":
+                bound = ("the headroom to the target cap", "the Happy Hour allowance",
+                         "the charge rate")[bounds.index(amount)]
+                reason += f"; limited by {bound}"
+            set_aside: list[str] = []
+            for k in range(i, j):
+                other = loser_label(k)
+                if other and other != label and other not in set_aside:
+                    set_aside.append(other)
+            if set_aside:
+                reason += f"; {' and '.join(set_aside)} set aside by precedence"
+            reason += "."
+            purchases.append(DaytimePurchase(
+                slot_range=(i, j), start=start, end=end, overlay=overlay or "",
+                evidence=evidence, session_id=session.session_id, effective_price=price,
+                energy_kwh=amount, reason=reason, slot_energy_kwh=delivered,
+            ))
+            windows.append(DatedChargeWindow(
+                start, end, min(cfg.target_cap, cfg.min_soc + energy / cfg.capacity_kwh * 100),
+                amount,
+            ))
+        i = j
+    return tuple(purchases), tuple(windows), remaining, energy
+
+
+def _daytime_slot_energy(purchases: tuple[DaytimePurchase, ...], index: int) -> float:
+    """Stored energy assigned to one slot, without reapplying efficiency."""
+    return sum(p.slot_energy_kwh[index - p.slot_range[0]] for p in purchases
+               if not p.refused and p.slot_range[0] <= index < p.slot_range[1])
+
+
 def compute_plan(
     inputs: PlannerInputs, cfg: PlannerConfig, schedule: TariffSchedule,
     *, topology: Topology | None = None, limits: EffectiveLimits | None = None,
@@ -1156,6 +1732,7 @@ def compute_plan(
                        bank_charge_kw=0, discharge_kw=0),
             ConnectionLimits(id="", import_kw=0, site_export_kw=0), True, "",
         )
+    coarse_hold = _coarse_hold(topology, cfg)
     pre_window_outflow = inputs.pre_window_drain_kwh
     window_first = geometry.window_slot_range[0] if geometry is not None else 0
     if inputs.load_slots is not None:
@@ -1256,7 +1833,55 @@ def compute_plan(
         else 0.0
     )
     pre_window_outflow += pre_window_export_kwh
-    usable_at_window = usable_now - pre_window_outflow
+    daytime_purchases: tuple[DaytimePurchase, ...] = ()
+    daytime_windows: tuple[DatedChargeWindow, ...] = ()
+    slots_ready = inputs.load_slots is not None and geometry is not None
+    sessions_ready = (
+        slots_ready
+        and len(schedule.import_sessions) == len(schedule.import_overlays)
+        == len(schedule.battery_import_prices) == len(schedule.import_allowances)
+        == len(net) and bool(schedule.import_sessions)
+    )
+    # Live-price provenance must cover the horizon before it can buy anything;
+    # an uncovered slot is ``None`` and never evidence.
+    dynamic_ready = (
+        slots_ready
+        and len(schedule.explicit_import_prices) == len(net)
+        and any(price is not None for price in schedule.explicit_import_prices)
+    )
+    dispatch_ready = slots_ready and bool(inputs.dispatch_purchase_slots)
+    daytime_enabled = (inputs.load_slots is not None and geometry is not None
+                       and (sessions_ready or dynamic_ready or dispatch_ready)
+                       and limits_reason is None and inputs.soc.ok and cfg.capacity_kwh > 0)
+    daytime_balance = None
+    if daytime_enabled and geometry is not None:
+        before, windows, daytime_net, balance = _daytime_purchases(
+            inputs, cfg, schedule, geometry, net,
+            usable_now - inputs.pre_window_drain_kwh, 0, window_first,
+            planning_limits, efficiency, loads, major_loads, export, coarse_hold,
+        )
+        admitted_before = tuple(purchase for purchase in before if not purchase.refused)
+        if admitted_before:
+            daytime_purchases, daytime_windows = before, windows
+            net = daytime_net
+            pre_window_outflow = inputs.pre_window_drain_kwh + sum(
+                (1 - schedule.cheap_fracs[i]) * net[i] for i in range(window_first)
+            ) + straddle + pre_window_export_kwh
+            # The walk above already spent the exports in the slots it
+            # covered; only an export outside them is still to subtract.
+            walked_export_kwh = sum(
+                power * _slot_hours(geometry, geometry.slot_starts.index(start))
+                for start, power in zip(export.selected_slots, export.slot_export_kw, strict=True)
+                if start in geometry.slot_starts[:window_first]
+            ) if export is not None else 0.0
+            daytime_balance = max(0.0, balance - straddle - max(
+                0.0, pre_window_export_kwh - walked_export_kwh))
+        else:
+            # Refused purchases are diagnostics only: their slots stay exactly
+            # as the ordinary hold made them, so tonight's sizing is unchanged.
+            daytime_purchases = before
+    usable_at_window = (daytime_balance if daytime_balance is not None
+                        else usable_now - pre_window_outflow)
     # Explicit current-slot geometry uses the window-start balance. Legacy
     # inputs and the daily fallback retain their original numbers.
     if inputs.load_slots is not None and inputs.geometry is not None:
@@ -1350,7 +1975,7 @@ def compute_plan(
         # (soc_now + required) already prices in the drain. Never above the
         # observed SoC: a battery below min_soc sizes from what it holds.
         expected_window_start_soc = min(
-            inputs.soc_now,
+            cfg.target_cap if daytime_balance is not None else inputs.soc_now,
             cfg.min_soc + max(0.0, usable_at_window) / cfg.capacity_kwh * 100.0,
         )
         if window_first > 0 and export_overlaps_charge:
@@ -1360,7 +1985,7 @@ def compute_plan(
             target_soc = expected_window_start_soc
         elif window_first > 0:
             target_energy = usable_at_window + required
-            if pre_window_outflow > 0 and required == 0:
+            if pre_window_outflow > 0 and required == 0 and daytime_balance is None:
                 target_energy = obligation
             target_soc = min(
                 cfg.target_cap, cfg.min_soc + target_energy / cfg.capacity_kwh * 100.0
@@ -1373,6 +1998,17 @@ def compute_plan(
             target_soc,
             expected_window_start_soc if expected_window_start_soc is not None else inputs.soc_now,
         )
+
+    if daytime_enabled and geometry is not None:
+        after, windows, daytime_net, _ = _daytime_purchases(
+            inputs, cfg, schedule, geometry, net, usable_at_window + required,
+            geometry.window_slot_range[1], len(net), planning_limits, efficiency,
+            loads, major_loads, export, coarse_hold,
+        )
+        if after:
+            daytime_purchases += after
+            daytime_windows += windows
+            net = daytime_net
 
     refills, v2l_unavailable, v2l_saving = _v2l_refills(
         inputs, cfg, schedule, reservations, usable_at_window + required, export
@@ -1402,8 +2038,53 @@ def compute_plan(
             ) if refills or inputs.geometry is not None else target_soc
         )
         soc_path = _soc_path(
-            geometry, net, schedule, export, path_start_soc, cfg, refills, surplus
+            geometry, net, schedule, export, path_start_soc, cfg, refills, surplus,
+            daytime_purchases,
         )
+
+    admitted_purchases = tuple(
+        purchase for purchase in daytime_purchases if not purchase.refused
+    )
+    if admitted_purchases and geometry is not None:
+        # Free Electricity covers only battery buys. Happy Hour also credits
+        # house imports inside an admitted purchase; sizing reserved gross load.
+        energy = max(0.0, usable_now - inputs.pre_window_drain_kwh)
+        house_cost = 0.0
+        original_net = [
+            max(0.0, load - solar * cfg.solar_haircut_k)
+            * (_slot0_remaining(geometry) if i == 0 else 1.0)
+            for i, (load, solar) in enumerate(zip(inputs.load_slots or (), solar_slots,
+                                                  strict=True))
+        ]
+        for i, demand in enumerate(net):
+            covered = schedule.cheap_fracs[i] * demand
+            drain = demand - covered
+            missing = max(0.0, drain - energy)
+            house_import = original_net[i] - demand + covered + missing
+            house_cost += house_import * schedule.prices[i]
+            for p in admitted_purchases:
+                if p.overlay == "happy_hour" and p.slot_range[0] <= i < p.slot_range[1]:
+                    lo = max(p.start, geometry.slot_starts[i].astimezone(UTC))
+                    hi = min(p.end, geometry.slot_starts[i].astimezone(UTC)
+                             + timedelta(minutes=30))
+                    share = max(0.0, (hi - lo).total_seconds() / 3600) / _slot_hours(geometry, i)
+                    credited = min(house_import, original_net[i] * share)
+                    house_cost -= credited * (schedule.prices[i] - p.effective_price)
+            energy = max(0.0, energy - drain)
+            energy += _daytime_slot_energy(admitted_purchases, i)
+            energy += sum(r.kwh for r in refills if r.slot == i)
+            if charge_limit > 0:
+                hours = _slot_hours(geometry, i) * geometry.window_fracs[i]
+                remaining_hours = sum(_slot_hours(geometry, k) * f
+                                      for k, f in enumerate(geometry.window_fracs))
+                if remaining_hours > 0:
+                    energy += required * hours / remaining_hours
+            energy = min(cfg.capacity_kwh * (cfg.target_cap - cfg.min_soc) / 100, energy)
+        planned_cost = house_cost + purchase * schedule.cheap_rate - (export_revenue or 0.0)
+        planned_cost += sum(p.energy_kwh / efficiency * p.effective_price
+                            for p in admitted_purchases)
+        planned_cost += sum(r.kwh * cfg.v2l_offpeak_rate_gbp / cfg.v2l_round_trip_efficiency
+                            for r in refills) if cfg.v2l_round_trip_efficiency > 0 else 0.0
 
     # This reservation is carried from now, never funded by charging or V2L.
     if inputs.load_slots is not None and pre_window_outflow > 0:
@@ -1432,10 +2113,14 @@ def compute_plan(
         soc=inputs.soc,
         window_start=cfg.window_start,
         window_end=cfg.window_end,
+        window_start_at=geometry.window_start if geometry is not None else None,
         holds=holds,
+        daytime_windows=daytime_windows,
         export=export,
         hold_trusted=inputs.dispatches_trusted,
         export_trusted=inputs.flexibility_event_trusted,
+        daytime_trusted=(inputs.free_electricity_trusted and inputs.happy_hour_trusted
+                         and inputs.dispatches_trusted),
         octopus_dispatch_reported_at=(
             octopus.own_reported_at
             if (octopus := inputs.evidence_freshness.get("octopus_dispatch")) is not None
@@ -1509,6 +2194,7 @@ def compute_plan(
             sum(abs(d.charge_in_kwh) for d in inputs.dispatches) if inputs.dispatches else None
         ),
         reservations=reservations,
+        daytime_purchases=daytime_purchases,
         charge_funded_reservations=charge_funded,
         v2l_refills=refills,
         v2l_wanted_but_unavailable=v2l_unavailable,
