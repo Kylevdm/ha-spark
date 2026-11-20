@@ -80,6 +80,18 @@ security and prefer the safe default. Hard rules:
     `stop_pending`), lasts to that export window's end across restarts and
     Re-probes, and refuses that event as `tripped` even under a new
     supervision.
+  - *Native daytime window (phase 17):* a daytime purchase reaches a native
+    Solis inverter only as a dated charge intent, armed in the charge half of
+    Slot 2 through `NativeChargeBoundary` (Slot 1 and Slot 2's discharge half
+    untouched), only in Optimise with a current epoch, trusted SoC, a trusted
+    inverter clock and no hold on that inverter (`hold_active`). Protect,
+    fallback, manual control and Observe never arm one. Its durable record is
+    saved before the write and armed only after exact read-back. It is
+    cleared at its end, on a `none` request and when the site leaves Optimise
+    (the `cancel_export` step); `untrusted` keeps only a verified resident
+    window. Every clear is zero-confirmed before the record is retired; a
+    failed clear keeps the record, is retried by the native tick and raises a
+    repair. Add-on-owned, AlphaESS and legacy Solis sites never get one.
 
   Under either authority owner, Observe, unknown authority and a failed
   authority save write nothing, with one exception: on an integration-owned
@@ -109,7 +121,8 @@ security and prefer the safe default. Hard rules:
   `transitions.py`, and in the integration `authority_store.py`,
   `ownership.py`, `native_write.py`, `native_holds.py`,
   `native_fallback_control.py`, `guard_loop.py`, `native_export.py`,
-  `native_export_write.py`, `native_export_supervision.py`, `native_tripwire.py`).
+  `native_export_write.py`, `native_export_supervision.py`, `native_tripwire.py`,
+  `native_dated_write.py`, `native_slots.py`).
 - **Parameterised SQL only**; no `eval`/`exec`/`shell=True`/shell interpolation
   of external data.
 - **Network:** outbound only to configured endpoints; any inbound network
