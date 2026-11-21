@@ -170,3 +170,21 @@ def test_no_purchase_room_without_a_captured_allowance_gets_no_credit():
     result = cost_stats(compute_stats([first], START, START + HALF_HOUR, UTC))
     assert result.slots[0].reason == "missing_happy_hour_allowance"
     assert result.priced_slots == 0
+
+
+@pytest.mark.parametrize(("provenance", "exclusions", "reason"), [
+    ("statistics_fill", (), None),
+    ("distributed", (), "untrusted_grid_import"),
+    ("statistics_fill", ("no_rate_capture",), "no_rate_capture"),
+    ("hourly_backfill", ("hourly_backfill",), "hourly_backfill"),
+])
+def test_gap_fill_and_backfill_rows_price_only_with_captured_rates(provenance, exclusions, reason):
+    filled = row()
+    filled.components["grid_import"] = ComponentFlow(kwh=3, provenance=provenance)
+    if exclusions:
+        filled = filled.model_copy(
+            update={"import_rate": None, "export_rate": None, "exclusions": exclusions},
+        )
+    [slot] = cost_stats(compute_stats([filled], START, START + HALF_HOUR, UTC)).slots
+    assert slot.reason == reason
+    assert (slot.actual_cost is None) == (reason is not None)
