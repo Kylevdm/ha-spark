@@ -52,7 +52,13 @@ from ha_spark.api.contract import (
     snapshot_acceptable,
     version_refusal,
 )
-from ha_spark.api.history import add_statistics, bucket_starts, history_payload
+from ha_spark.api.history import (
+    add_range_details,
+    add_statistics,
+    bucket_starts,
+    history_payload,
+    read_statistics_evidence,
+)
 from ha_spark.api.native_apply import snapshot_soc
 from ha_spark.api.site_pairing import load_pairing, save_pairing
 from ha_spark.api.snapshot_v4 import parse_snapshot_v4
@@ -96,7 +102,7 @@ from ha_spark.energy.solar_source import (
     parse_native_forecast,
     save_solar_source_kind,
 )
-from ha_spark.energy.stats import Resolution, summarise
+from ha_spark.energy.stats import Resolution, range_bounds, summarise
 from ha_spark.energy.topology_record import for_site, load_topology_record
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.integration_discovery import IntegrationDiscovery
@@ -910,58 +916,103 @@ def build_app(
         async def get_history(request: Request) -> JSONResponse:
             """Read-only ledger statistics, with the plan view's solar series at slot resolution."""
             params = request.query_params
+            kind = params.get("range")
             requested = params.get("resolution")
-            if requested not in ("slot", "day", "month"):
+            if kind is None and requested not in ("slot", "day", "month"):
                 return JSONResponse({"error": "unsupported resolution"}, status_code=400)
             resolution = cast(Resolution, requested)
             invalid = JSONResponse({"error": "invalid history range"}, status_code=400)
             settings = _state_of(request).settings
             tz = load_timezone(settings.timezone)
             now = datetime.now(tz).astimezone(UTC)
-            try:
-                if "from" in params:
-                    start = datetime.fromisoformat(params["from"])
-                elif resolution == "slot":
-                    # Preserve the plan view's implicit "today so far" request.
-                    start = household_midnight(now.astimezone(tz))
-                else:
-                    return invalid
-                end = datetime.fromisoformat(params["to"]) if "to" in params else now
-                if start.tzinfo is None or end.tzinfo is None:
-                    return invalid
-                start, end = start.astimezone(UTC), end.astimezone(UTC)
-                if not start <= end <= now:
-                    return invalid
-                local_start = start.astimezone(tz)
-                last_day = (end - timedelta(microseconds=1) if end > start else end
-                            ).astimezone(tz).date()
-                days = (last_day - local_start.date()).days + 1
-                if (resolution == "slot" and days > 1) or (resolution == "day" and days > 366):
-                    return invalid
-                # The household grid includes the half-hour holding `from`.
-                if start < end:
-                    midnight = household_midnight(local_start).astimezone(UTC)
-                    start = midnight + (start - midnight) // HALF_HOUR * HALF_HOUR
-            except (ValueError, OverflowError):
-                return invalid
-
+            ledger = EnergyLedger(settings.db_path)
             ledger_failed = forecast_failed = False
+            calendar = None
+            if kind is not None:
+                if (kind not in ("day", "week", "month", "year", "all")
+                        or any(key in params for key in ("resolution", "from", "to"))
+                        or len(params.getlist("range")) > 1 or len(params.getlist("at")) > 1):
+                    return invalid
+                today = now.astimezone(tz).date()
+                try:
+                    raw_at = params.get("at", today.isoformat())
+                    at = date.fromisoformat(raw_at)
+                    if at.isoformat() != raw_at or at > today:
+                        return invalid
+                    start, stop = range_bounds(kind, at, tz)
+                    # The statistics read also uses the preceding slot as pricing context.
+                    (start - HALF_HOUR).astimezone(tz)
+                    if kind == "all":  # Like the CLI, All time always ends now.
+                        at = today
+                        start, stop = range_bounds(kind, at, tz)
+                except (ValueError, OverflowError):
+                    return invalid
+                if kind == "all":
+                    try:
+                        first_slot = await ledger.first_slot()
+                        if first_slot is not None and first_slot.utcoffset() is None:
+                            raise ValueError("naive ledger instant")
+                        first, stop = range_bounds(kind, at, tz, first_slot=first_slot)
+                        (first - HALF_HOUR).astimezone(tz)
+                        start = first
+                    except Exception:  # noqa: BLE001 - fail closed on unreadable ledger bounds
+                        log.warning("Energy ledger read failed")
+                        ledger_failed = True
+                end = min(stop, now)
+                resolution = ("slot" if kind == "day" else "day" if kind in ("week", "month")
+                              else "month")
+                calendar = {
+                    "kind": kind, "at": at.isoformat(), "today": today.isoformat(),
+                    "from": start.astimezone(tz).isoformat(), "to": end.astimezone(tz).isoformat(),
+                }
+            else:
+                try:
+                    if "from" in params:
+                        start = datetime.fromisoformat(params["from"])
+                    elif resolution == "slot":
+                        # Preserve the plan view's implicit "today so far" request.
+                        start = household_midnight(now.astimezone(tz))
+                    else:
+                        return invalid
+                    end = datetime.fromisoformat(params["to"]) if "to" in params else now
+                    if start.tzinfo is None or end.tzinfo is None:
+                        return invalid
+                    start, end = start.astimezone(UTC), end.astimezone(UTC)
+                    if not start <= end <= now:
+                        return invalid
+                    local_start = start.astimezone(tz)
+                    last_day = (end - timedelta(microseconds=1) if end > start else end
+                                ).astimezone(tz).date()
+                    days = (last_day - local_start.date()).days + 1
+                    if (resolution == "slot" and days > 1) or (resolution == "day" and days > 366):
+                        return invalid
+                    # The household grid includes the half-hour holding `from`.
+                    if start < end:
+                        midnight = household_midnight(local_start).astimezone(UTC)
+                        start = midnight + (start - midnight) // HALF_HOUR * HALF_HOUR
+                except (ValueError, OverflowError):
+                    return invalid
+
+            rows: list[LedgerSlot] = []
             events: list[AxleEvent] = []
             event_rows: list[LedgerSlot] = []
-            try:
-                # One slot earlier: pricing context for a Happy Hour that started before `from`.
-                rows = await EnergyLedger(settings.db_path).slots(start - HALF_HOUR, end)
-                # Costs without the Axle credits they owe would be silently wrong: fail closed.
-                events, event_rows = await window_evidence(settings.db_path, start, end)
-            except Exception:  # noqa: BLE001 - stale or unreadable storage degrades the series
-                log.warning("Energy ledger read failed")
-                rows = []
-                ledger_failed = True
+            if not ledger_failed:
+                try:
+                    # One slot earlier is pricing context for a Happy Hour spanning `from`.
+                    rows = await ledger.slots(start - HALF_HOUR, end)
+                    # Costs without the Axle credits they owe would be wrong: fail closed.
+                    events, event_rows = await window_evidence(settings.db_path, start, end)
+                except Exception:  # noqa: BLE001 - unreadable storage degrades the series
+                    log.warning("Energy ledger read failed")
+                    rows = []
+                    ledger_failed = True
             starts = bucket_starts(start, end) if resolution == "slot" else []
             recorded: dict[datetime, float] = {}
             measured: dict[datetime, float] = {}
             measured_reason: str | None = "slot_resolution_only"
-            if resolution == "slot":
+            if resolution == "slot" and calendar is not None:
+                measured_reason = "plan_view_only"
+            elif resolution == "slot":
                 try:
                     recorded = await recorded_solar(settings.db_path, starts)
                 except Exception:  # noqa: BLE001 - the series degrades, never 500s the view
@@ -973,10 +1024,17 @@ def build_app(
             def render() -> JSONResponse:
                 payload = history_payload(starts, recorded, tz, measured_reason, measured, now)
                 stats = summarise(rows, start, end, tz, resolution, events, event_rows=event_rows)
-                return JSONResponse(add_statistics(
-                    payload, stats, resolution,
-                    ledger_failed=ledger_failed, forecast_failed=forecast_failed,
-                ), headers={"Cache-Control": "no-store"})
+                add_statistics(payload, stats, resolution, ledger_failed=ledger_failed,
+                               forecast_failed=forecast_failed, calendar=calendar is not None)
+                if calendar is not None:
+                    # The readers decode their results after SQLite returns. Keep that work,
+                    # which can span years for All time, off the daemon's loop too.
+                    evidence = asyncio.run(
+                        read_statistics_evidence(settings.db_path, start, end, tz),
+                    )
+                    payload["range"] = calendar
+                    add_range_details(payload, stats, rows, start, end, tz, resolution, evidence)
+                return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
             return await asyncio.to_thread(render)
 

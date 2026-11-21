@@ -99,7 +99,14 @@ dialog { max-width: min(36rem, 95vw); background: var(--surface); color: var(--t
 .carbon-swatch::before { content: ""; display: inline-block; width: 1rem; height: 1rem; border: 1px solid var(--border); background-color: var(--band); }
 .carbon-swatch.carbon-estimated::before { background-color: var(--muted); opacity: .4; }
 .carbon-attribution { font-size: .85rem; color: var(--muted); }
+.stats-ranges, .stats-metrics { display: flex; flex-wrap: wrap; gap: .5rem 1rem; }
+.stats-ranges button { margin: 0; }
+.stats-ranges button[aria-pressed="true"] { border-color: var(--accent); font-weight: bold; }
+.stats-metrics dt { color: var(--muted); }
+.stats-series { stroke: var(--accent); }
+.stats-bar { fill: var(--accent); }
 @media (max-width: 40rem) {
+    nav a[href="#/statistics"] { overflow-wrap: anywhere; }
     nav { width: 5rem; padding: .5rem; }
     nav strong { font-size: .8rem; }
     header, main { padding: 1rem; }
