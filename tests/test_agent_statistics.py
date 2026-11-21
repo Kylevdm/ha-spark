@@ -29,8 +29,9 @@ def _state(tmp_path: Path, **settings_kw: object) -> AppState:
     settings_kw.setdefault("db_path", str(tmp_path / "db.sqlite"))
     settings_kw.setdefault("agent_surface", "on")
     settings_kw.setdefault("agent_exposure", "read")
+    settings_kw.setdefault("ha_token", "t")
     service = seed_settings(
-        tmp_path, settings=Settings(ha_url="http://ha.test", ha_token="t", **settings_kw)
+        tmp_path, settings=Settings(ha_url="http://ha.test", **settings_kw)
     )
     return AppState(service.settings, tmp_path / "options.json", settings_service=service)
 
@@ -47,13 +48,16 @@ def _patch_ledger_and_axle(
     slot: datetime,
     exported: tuple[float, float],
     event: AxleEvent | None = None,
-) -> None:
+) -> list[tuple[str, datetime, datetime]]:
+    calls: list[tuple[str, datetime, datetime]] = []
     rows = [_export_row(slot, exported[0]), _export_row(slot + timedelta(minutes=30), exported[1])]
 
     async def slots(self, start, end):
+        calls.append(("slots", start, end))
         return rows
 
     async def evidence(db_path, start, end):
+        calls.append(("evidence", start, end))
         if event is None:
             return [], []
         return [event], []
@@ -62,6 +66,7 @@ def _patch_ledger_and_axle(
     monkeypatch.setattr("ha_spark.agent.tools.window_evidence", evidence)
     monkeypatch.setattr("ha_spark.api.server.window_evidence", evidence)
     monkeypatch.setattr("ha_spark.cli.window_evidence", evidence)
+    return calls
 
 
 def test_agent_statistics_matches_history_and_cli_for_week(
@@ -76,7 +81,7 @@ def test_agent_statistics_matches_history_and_cli_for_week(
         "accepted_at": slot - timedelta(hours=1),
         "committed_kwh": 3, "rate_gbp_kwh": 1.5,
     })
-    _patch_ledger_and_axle(monkeypatch, slot, (2, 1), event=event)
+    calls = _patch_ledger_and_axle(monkeypatch, slot, (2, 1), event=event)
     monkeypatch.setattr(cli, "load_settings", lambda **_: state.settings)
 
     with owner_client(state) as client:
@@ -100,6 +105,12 @@ def test_agent_statistics_matches_history_and_cli_for_week(
     assert agent_body["axle"]["events"][0]["outcome"] == "delivered"
     assert agent_body["axle"]["events"][0]["earnings_gbp"] == 4.5
     assert agent_body["axle"]["delivery_rate"] == 1.0
+    week_start = datetime(2026, 8, 30, 23, tzinfo=UTC)
+    week_end = datetime(2026, 9, 6, 23, tzinfo=UTC)
+    assert agent_body["start"] == week_start.isoformat()
+    assert agent_body["end"] == week_end.isoformat()
+    assert calls[-2:] == [("slots", week_start - timedelta(minutes=30), week_end),
+                          ("evidence", week_start, week_end)]
 
     assert cli.main(["stats", "--range", "week", "--at", "2026-09-01"]) == 0
     out = capsys.readouterr().out
@@ -129,18 +140,20 @@ async def test_mcp_get_statistics_absent_when_surface_off(tmp_path: Path) -> Non
     ({"range": "bad"}, "invalid statistics range"),
     ({"range": "week", "at": "not-a-date"}, "at must be a valid YYYY-MM-DD date"),
     ({"range": "week", "at": "2026-02-29"}, "at must be a valid YYYY-MM-DD date"),
+    ({"range": {"x": CANARY}}, "invalid statistics range"),
+    ({"range": "week", "at": [CANARY]}, "at must be a valid YYYY-MM-DD date"),
 ])
 async def test_mcp_get_statistics_rejects_invalid_input_without_echo(
-    tmp_path: Path, params: dict[str, str], text: str,
+    tmp_path: Path, params: dict[str, object], text: str,
 ) -> None:
     mcp = build_mcp(_state(tmp_path, agent_exposure="read"))
     with pytest.raises(ToolError) as excinfo:
         await mcp.call_tool("get_statistics", params)
     assert text in str(excinfo.value)
-    if "range" in params:
-        assert params["range"] not in str(excinfo.value)
-    if "at" in params and params["at"]:
-        assert params["at"] not in str(excinfo.value)
+    assert CANARY not in str(excinfo.value)
+    for value in params.values():
+        if isinstance(value, str) and value != "week":
+            assert value not in str(excinfo.value)
 
 
 def test_route_get_statistics_200_and_400(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -183,6 +196,7 @@ async def test_statistics_response_contains_no_secrets(
         timezone=LONDON.key,
         octopus_api_key=CANARY,
         agent_api_token=CANARY,
+        ha_token=CANARY,
     )
     slot = datetime(2026, 9, 1, 9, tzinfo=LONDON).astimezone(UTC)
     monkeypatch.setattr(EnergyLedger, "slots", AsyncMock(return_value=[priced_row(slot, 2)]))
@@ -235,3 +249,123 @@ async def test_mcp_fails_closed_on_unreadable_ledger(
     assert "statistics unavailable" in str(excinfo.value)
     assert "private-path" not in str(excinfo.value)
     assert any("Statistics read failed" in rec.message for rec in caplog.records)
+
+
+TOP_LEVEL_KEYS = {"version", "range", "at", "start", "end", "resolution", "timezone", "buckets",
+                  "range_totals", "axle"}
+
+
+def test_output_contract_is_version_1_and_matches_history_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phases 13 and 14 build on this shape: changing it needs a new version."""
+    frozen = datetime(2026, 9, 8, tzinfo=LONDON)
+    _frozen_server_clock(monkeypatch, frozen)
+    state = _state(tmp_path, timezone=LONDON.key)
+    slot = datetime(2026, 9, 1, 9, tzinfo=LONDON).astimezone(UTC)
+    event = AxleEvent.model_validate({
+        "start": slot, "end": slot + timedelta(hours=1),
+        "accepted_at": slot - timedelta(hours=1),
+        "committed_kwh": 3, "rate_gbp_kwh": 1.5,
+    })
+    _patch_ledger_and_axle(monkeypatch, slot, (2, 1), event=event)
+
+    with owner_client(state) as client:
+        day = client.get("/agent/statistics", params={"range": "day", "at": "2026-09-01"})
+        history = client.get("/api/history", params={
+            "resolution": "slot",
+            "from": "2026-08-31T23:00:00+00:00",
+            "to": "2026-09-01T23:00:00+00:00",
+        })
+        week = client.get("/agent/statistics", params={"range": "week", "at": "2026-09-01"})
+    assert day.status_code == history.status_code == week.status_code == 200
+    body, hist = day.json(), history.json()
+    assert set(body) == TOP_LEVEL_KEYS
+    assert body["version"] == 1
+    assert body["resolution"] == "slot"
+    assert body["range_totals"] == hist["range_totals"]
+    assert set(body["range_totals"]) == set(hist["range_totals"])
+    assert set(body["axle"]) == {"delivery_rate", "earnings_by_day", "events"}
+    assert set(body["axle"]["events"][0]) == {
+        "start", "end", "outcome", "delivered_kwh", "earnings_gbp"}
+    assert body["axle"]["earnings_by_day"] == [{"date": "2026-09-01", "earnings_gbp": 4.5}]
+    assert len(body["buckets"]) == len(hist["buckets"]) == 48
+    shared = ("flows", "negative_clamped", "cost_inputs")
+    for ours, theirs in zip(body["buckets"], hist["buckets"], strict=True):
+        assert set(ours) - {"cost_reason"} == (
+            set(theirs) & (set(hist["range_totals"]) | {"start", *shared}))
+        for key in shared:
+            assert ours.get(key) == theirs.get(key)
+    priced = [b for b in body["buckets"] if "cost_inputs" in b]
+    assert priced and set(priced[0]["cost_inputs"]) == set(
+        next(b for b in hist["buckets"] if "cost_inputs" in b)["cost_inputs"])
+    week_body = week.json()
+    assert set(week_body) == TOP_LEVEL_KEYS
+    assert week_body["version"] == 1
+    assert len(week_body["buckets"]) == 7
+    assert set(week_body["buckets"][0]) == {"start", *hist["range_totals"]}
+
+
+async def test_mcp_fails_closed_on_unreadable_axle_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    state = _state(tmp_path, timezone=LONDON.key)
+    slot = datetime(2026, 9, 1, 9, tzinfo=LONDON).astimezone(UTC)
+    monkeypatch.setattr(EnergyLedger, "slots", AsyncMock(return_value=[priced_row(slot, 2)]))
+
+    async def unreadable(*args: object) -> None:
+        raise OSError("private-path")
+
+    monkeypatch.setattr("ha_spark.agent.tools.window_evidence", unreadable)
+    caplog.set_level("WARNING")
+    mcp = build_mcp(state)
+    with pytest.raises(ToolError) as excinfo:
+        await mcp.call_tool("get_statistics", {"range": "week", "at": "2026-09-01"})
+    assert str(excinfo.value).endswith(": statistics unavailable")
+    assert "private-path" not in caplog.text
+
+
+@pytest.mark.parametrize("failing", ["first_slot", "summarise"])
+def test_any_later_failure_fails_closed_without_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    failing: str,
+) -> None:
+    state = _state(tmp_path, timezone=LONDON.key)
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise ValueError("private-path")
+
+    async def aboom(*args: object) -> None:
+        boom()
+
+    if failing == "first_slot":
+        monkeypatch.setattr(EnergyLedger, "first_slot", aboom)
+    else:
+        monkeypatch.setattr("ha_spark.agent.tools.summarise", boom)
+    caplog.set_level("WARNING")
+    with owner_client(state) as client:
+        resp = client.get("/agent/statistics", params={"range": "all"})
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "statistics unavailable"}
+    assert "private-path" not in caplog.text
+
+
+def test_all_range_ignores_at_except_for_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Like ``stats --range all``: first ledger slot to now, whatever ``at`` says."""
+    frozen = datetime(2026, 9, 8, 12, tzinfo=LONDON)
+    _frozen_server_clock(monkeypatch, frozen)
+    monkeypatch.setattr("ha_spark.agent.tools.datetime", type(
+        "_Clock", (datetime,), {"now": classmethod(lambda cls, tz=None: frozen.astimezone(tz))}))
+    state = _state(tmp_path, timezone=LONDON.key)
+    slot = datetime(2026, 9, 1, 9, tzinfo=LONDON).astimezone(UTC)
+    _patch_ledger_and_axle(monkeypatch, slot, (2, 1))
+    monkeypatch.setattr(EnergyLedger, "first_slot", AsyncMock(return_value=slot))
+    with owner_client(state) as client:
+        resp = client.get("/agent/statistics", params={"range": "all", "at": "2026-01-01"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["start"] == datetime(2026, 9, 1, tzinfo=LONDON).astimezone(UTC).isoformat()
+    assert body["end"] == frozen.astimezone(UTC).isoformat()
+    assert body["resolution"] == "month"

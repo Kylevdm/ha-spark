@@ -9,10 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import logging
 import math
 from datetime import UTC, date, datetime
-from typing import cast
+from zoneinfo import ZoneInfo
 
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
@@ -27,15 +26,23 @@ from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.orchestrator import orchestrate
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.publish import plan_to_payload
-from ha_spark.energy.readiness_measurements import COMPONENTS, HALF_HOUR
+from ha_spark.energy.readiness_measurements import HALF_HOUR
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.solar_source import NATIVE_PREVIEW_NOTE, solar_source_from_store
 from ha_spark.energy.sources import gather_inputs
-from ha_spark.energy.stats import RangeStats, Resolution, range_bounds, summarise
+from ha_spark.energy.stats import (
+    CostInputs,
+    RangeStats,
+    RangeTotals,
+    Resolution,
+    range_bounds,
+    summarise,
+)
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.health import run_health
+from ha_spark.logging import get_logger
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 class PlanResult(BaseModel):
@@ -89,6 +96,15 @@ class StatisticsResult(BaseModel):
     axle: dict[str, object]
 
 
+STATISTICS_RANGES = ("day", "week", "month", "year", "all")
+INVALID_RANGE = "invalid statistics range"
+INVALID_AT = "at must be a valid YYYY-MM-DD date"
+
+
+class StatisticsInputError(ValueError):
+    """Invalid ``range``/``at``; the message is one of the fixed texts above, never the input."""
+
+
 class StatisticsUnavailable(Exception):
     """Ledger or Axle history could not be read; callers fail closed."""
 
@@ -104,11 +120,8 @@ def _serialize(obj: object) -> object:
     return obj
 
 
-def _totals_payload(totals: object) -> dict[str, object]:
-    """Mirror ``api/history.py:_totals_payload`` without importing a private helper."""
-    from ha_spark.energy.stats import RangeTotals
-
-    assert isinstance(totals, RangeTotals)
+def _totals_payload(totals: RangeTotals) -> dict[str, object]:
+    """Same keys as ``api/history.py:_totals_payload`` (not imported: private helper)."""
     return {
         "components_kwh": totals.energy.components_kwh,
         "house_load_kwh": totals.energy.house_load_kwh,
@@ -125,13 +138,8 @@ def _totals_payload(totals: object) -> dict[str, object]:
     }
 
 
-def _cost_inputs_payload(cost: object) -> dict[str, object] | None:
-    from ha_spark.energy.stats import SlotCost
-
-    assert isinstance(cost, SlotCost)
-    inputs = cost.inputs
-    if inputs is None:
-        return None
+def _cost_inputs_payload(inputs: CostInputs) -> dict[str, object]:
+    """Same keys as ``api/history.py:add_statistics``'s ``cost_inputs``."""
     return {
         "import_rate": inputs.rates.import_rate,
         "export_rate": inputs.rates.export_rate,
@@ -141,10 +149,8 @@ def _cost_inputs_payload(cost: object) -> dict[str, object] | None:
         "house_load_kwh": inputs.house_load_kwh,
         "solar_kwh": inputs.solar_kwh,
         "free_import_kwh": inputs.free_import_kwh,
-        "no_battery_import_kwh": (inputs.no_battery_import_kwh
-                                  if math.isfinite(inputs.no_battery_import_kwh) else None),
-        "no_battery_export_kwh": (inputs.no_battery_export_kwh
-                                  if math.isfinite(inputs.no_battery_export_kwh) else None),
+        "no_battery_import_kwh": inputs.no_battery_import_kwh,
+        "no_battery_export_kwh": inputs.no_battery_export_kwh,
         "no_battery_free_import_kwh": inputs.no_battery_free_import_kwh,
         "axle_earnings": inputs.axle_earnings,
     }
@@ -152,12 +158,9 @@ def _cost_inputs_payload(cost: object) -> dict[str, object] | None:
 
 def _statistics_payload(
     stats: RangeStats, kind: str, at: str, start: datetime, end: datetime, resolution: Resolution,
-    tz: object,
+    tz: ZoneInfo,
 ) -> dict[str, object]:
-    """Build the JSON contract for the statistics tool."""
-    from zoneinfo import ZoneInfo
-
-    assert isinstance(tz, ZoneInfo)
+    """Build the version-1 JSON contract for the statistics tool (phases 13/14 build on it)."""
     buckets: list[dict[str, object]] = []
     for bucket in stats.buckets:
         entry: dict[str, object] = {"start": bucket.start.isoformat()}
@@ -165,14 +168,14 @@ def _statistics_payload(
         if bucket.slot is not None:
             entry["flows"] = {
                 name: {"kwh": flow.kwh, "provenance": flow.provenance}
-                for name in COMPONENTS
+                for name in bucket.totals.energy.components_kwh
                 if (flow := bucket.slot.components.get(name)) is not None
             }
             entry["negative_clamped"] = bucket.slot.negative_clamped
         if bucket.cost is not None:
             entry["cost_reason"] = bucket.cost.reason
             if bucket.cost.inputs is not None:
-                entry["cost_inputs"] = _cost_inputs_payload(bucket.cost)
+                entry["cost_inputs"] = _cost_inputs_payload(bucket.cost.inputs)
         buckets.append(entry)
     axle = stats.axle
     return {
@@ -296,43 +299,43 @@ async def run_plan(settings: Settings, *, executor: DaemonChannel | None = None)
 async def get_statistics(settings: Settings, range_: str, at: str | None) -> StatisticsResult:
     """Measured energy, cost, battery savings, Axle earnings and coverage.
 
-    Mirrors ``_cmd_stats``: household-calendar bounds, one slot of pricing
-    context, Axle evidence, and the same resolution mapping.
+    Mirrors ``cli._cmd_stats``: household-calendar bounds (``all`` runs from the
+    first ledger slot to now; ``at`` is then only validated), one slot of pricing
+    context, Axle evidence, the same resolution map. Raises
+    ``StatisticsInputError`` (fixed text) or ``StatisticsUnavailable``; never a
+    partial result.
     """
+    if range_ not in STATISTICS_RANGES:
+        raise StatisticsInputError(INVALID_RANGE)
     tz = load_timezone(settings.timezone)
-    now = datetime.now(tz) if at is None or range_ == "all" else None
-    if range_ not in ("day", "week", "month", "year", "all"):
-        raise ValueError("invalid statistics range")
+    now = datetime.now(tz)
     if at is None:
-        assert now is not None
         day = now.date()
     else:
         try:
             day = date.fromisoformat(at)
-            if day.isoformat() != at:
-                raise ValueError
-        except (ValueError, OverflowError) as exc:
-            raise ValueError("at must be a valid YYYY-MM-DD date") from exc
+        except (ValueError, OverflowError):
+            raise StatisticsInputError(INVALID_AT) from None
+        if day.isoformat() != at:
+            raise StatisticsInputError(INVALID_AT)
     try:
         start, end = range_bounds(range_, day, tz)
-    except (ValueError, OverflowError) as exc:
-        raise ValueError("at must be a valid YYYY-MM-DD date") from exc
-    ledger = EnergyLedger(settings.db_path)
-    if range_ == "all":
-        assert now is not None
-        first = await ledger.first_slot()
-        start, _ = range_bounds(range_, day, tz, first_slot=first)
-        end = now.astimezone(UTC)
+    except (ValueError, OverflowError):
+        raise StatisticsInputError(INVALID_AT) from None
     resolution: Resolution = ("slot" if range_ == "day" else "day" if range_ in ("week", "month")
                               else "month")
     try:
+        ledger = EnergyLedger(settings.db_path)
+        if range_ == "all":
+            start, _ = range_bounds(range_, now.date(), tz, first_slot=await ledger.first_slot())
+            end = now.astimezone(UTC)
         rows = await ledger.slots(start - HALF_HOUR, end)
         events, event_rows = await window_evidence(settings.db_path, start, end)
+        stats = await asyncio.to_thread(summarise, rows, start, end, tz, resolution,
+                                        events, event_rows=event_rows)
+        payload = _statistics_payload(stats, range_, at or day.isoformat(), start, end,
+                                      resolution, tz)
+        return StatisticsResult.model_validate(_serialize(payload))
     except Exception:
         log.warning("Statistics read failed")
         raise StatisticsUnavailable() from None
-    stats = await asyncio.to_thread(summarise, rows, start, end, tz, resolution,
-                                    events, event_rows=event_rows)
-    payload = _statistics_payload(stats, range_, at or day.isoformat(), start, end, resolution, tz)
-    serialised = cast(dict[str, object], _serialize(payload))
-    return StatisticsResult(**serialised)
