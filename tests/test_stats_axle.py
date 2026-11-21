@@ -33,12 +33,20 @@ def test_delivery_thresholds_and_trip_reason(export, expected, delivery_rate):
     assert summary.delivery_rate == delivery_rate
 
 
-@pytest.mark.parametrize("gap", ["missing", "absent", "distributed", "hourly_backfill", "edge"])
+@pytest.mark.parametrize("gap", [
+    "missing", "absent", "distributed", "hourly_backfill", "edge", "import", "unconfigured",
+])
 def test_incomplete_window_has_no_estimate_and_is_unpriced(gap):
     second = row(START + HALF_HOUR)
     if gap in {"absent", "distributed", "hourly_backfill"}:
         second.components["grid_export"] = ComponentFlow(
             kwh=None if gap == "absent" else 1, provenance=gap,
+        )
+    if gap == "import":  # A gap in any cost component voids the whole window.
+        second.components["grid_import"] = ComponentFlow(kwh=1, provenance="distributed")
+    if gap == "unconfigured":
+        second.components["grid_export"] = ComponentFlow(
+            kwh=None, provenance="absent", reason="not_configured",
         )
     rows = [row()] if gap == "missing" else [row(), second]
     events = [event(start=START + timedelta(minutes=5))] if gap == "edge" else [event()]
@@ -86,3 +94,11 @@ def test_missing_commitment_excludes_event_from_delivery_rate_but_not_earnings(c
     assert summary.delivery_rate is None
     assert summary.events[0].outcome == "unknown"
     assert summary.events[0].earnings_gbp == 4
+
+
+def test_unrepresentable_earnings_keep_the_measured_outcome():
+    summary = axle_outcomes([event(rate_gbp_kwh=1e308)], [row(exported=2),
+                            row(START + HALF_HOUR, exported=1)])
+    [outcome] = summary.events
+    assert (outcome.outcome, outcome.delivered_kwh, outcome.earnings_gbp) == ("delivered", 3, None)
+    assert summary.delivery_rate == 1

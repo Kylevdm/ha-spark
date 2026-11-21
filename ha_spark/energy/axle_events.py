@@ -149,10 +149,13 @@ def _accept(
     export = intent.export if intent is not None else None
     direction, start, end = identity
     committed = None
-    if export is not None and _event_id(export.event_identity) == _event_id(identity):
-        committed = sum(kw * 0.5 for _, kw in zip(
-            export.selected_slots, export.slot_export_kw, strict=True,
-        ))
+    try:
+        if export is not None and _event_id(export.event_identity) == _event_id(identity):
+            committed = sum(kw * 0.5 for _, kw in zip(
+                export.selected_slots, export.slot_export_kw, strict=True,
+            ))
+    except (TypeError, ValueError):  # Unusable commitment evidence; keep the acceptance.
+        committed = None
     return AxleEvent.model_validate({
         "direction": direction, "start": start, "end": end, "accepted_at": at,
         "committed_kwh": committed, "rate_gbp_kwh": rate,
@@ -170,20 +173,28 @@ class AxleEventRecorder:
     def __init__(self) -> None:
         self._pending: dict[tuple[str, str], _Fact] = {}
         self._recent_reads: deque[_Read] = deque(maxlen=64)
+        # Acceptances already stored, so a lingering sidecar or re-offered row costs no write.
+        self._stored: deque[str] = deque(maxlen=256)
 
     def _keep(self, kind: str, key: str, fact: _Fact) -> None:
+        if kind == "accepted" and key in self._stored:
+            return
         self._pending.setdefault((kind, key), fact)
         if len(self._pending) > 1024:  # Two full native snapshots' worth of retry evidence.
             self._pending.pop(next(iter(self._pending)))
 
     def capture_native(
         self, snapshot: SnapshotV4 | None, settings: Settings, revision: PlanRevision | None,
-    ) -> bool:
+    ) -> None:
         """Copy inert lifecycle facts before the existing notice pass can ack them."""
         if snapshot is None or snapshot.owner != "integration":
-            return False
-        rows = sorted((row for entry in snapshot.export for row in entry.transitions),
-                      key=lambda row: row.at)
+            return
+        try:
+            rows = sorted((row for entry in snapshot.export for row in entry.transitions),
+                          key=lambda row: row.at)
+        except Exception:  # Never raise into the control loop.
+            log.warning("Axle event recording failed")
+            return
         for row in rows:
             if row.event.direction != "export":
                 continue
@@ -198,7 +209,6 @@ class AxleEventRecorder:
                     self._keep("stop", event_id, _Stop(event_id, row.kind))
             except Exception:
                 log.warning("Axle event recording failed")
-        return True
 
     def capture_read(self, settings: Settings, revision: PlanRevision | None) -> None:
         """Keep only actual, trusted Axle reads, never a disabled source's None."""
@@ -219,7 +229,11 @@ class AxleEventRecorder:
     async def record_tick(
         self, settings: Settings, now: datetime, revision: PlanRevision | None, integration: bool,
     ) -> None:
-        """Read the legacy sidecar off-loop and persist queued facts in one transaction."""
+        """Read the legacy sidecar off-loop and persist queued facts in one transaction.
+
+        ``integration`` is the durable retirement marker: a retired add-on never
+        reads its leftover sidecar, whatever the snapshot says.
+        """
         try:
             if not integration:
                 await self._capture_legacy(settings, now, revision)
@@ -231,6 +245,8 @@ class AxleEventRecorder:
                 for key, fact in batch:
                     if self._pending.get(key) is fact:
                         self._pending.pop(key)
+                    if key[0] == "accepted" and key[1] not in self._stored:
+                        self._stored.append(key[1])
         except Exception:
             log.warning("Axle event recording failed")
 
@@ -246,6 +262,8 @@ class AxleEventRecorder:
             identity = (
                 direction, datetime.fromisoformat(raw_start), datetime.fromisoformat(raw_end),
             )
+            if now >= identity[2]:  # A leftover sidecar after its window is not an acceptance.
+                return
             accepted_at = max(now, revision.issued_at) if revision is not None else now
             self._keep("accepted", _event_id(identity), _accept(
                 identity, accepted_at, settings.axle_event_rate_gbp_kwh, revision,

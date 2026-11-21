@@ -99,10 +99,11 @@ class AxleSummary:
 
 
 def axle_outcomes(events: Iterable[AxleEvent], rows: Iterable[LedgerSlot]) -> AxleSummary:
-    """Score accepted windows from complete measured grid export, including any later fills.
+    """Score accepted windows from complete measured slots, including any later fills.
 
-    Ledger rows represent closed slots. A partial edge or a single missing or
-    lower-provenance slot makes the entire window ineligible for an estimate.
+    Ledger rows represent closed slots. A partial edge, a missing slot or any
+    unmeasured cost component in one slot makes the whole window ineligible
+    for an estimate (owner ruling, 2026-11-21).
     """
     by_start = {row.slot_start.astimezone(UTC): row for row in rows}
     outcomes: list[AxleOutcome] = []
@@ -116,13 +117,15 @@ def axle_outcomes(events: Iterable[AxleEvent], rows: Iterable[LedgerSlot]) -> Ax
         if not edge and count <= len(by_start):
             for i in range(count):
                 row = by_start.get(start + i * HALF_HOUR)
+                # A gap in any measured component, not only grid export, leaves no estimate.
+                values = _measured(row) if row is not None else "missing_slot"
                 export = row.components.get("grid_export") if row is not None else None
-                if export is None or export.kwh is None or export.provenance not in PRICEABLE:
+                # An unconfigured export meter prices as 0 kWh but is no delivery evidence.
+                if isinstance(values, str) or export is None or export.provenance not in PRICEABLE:
                     break
-                delivered += export.kwh
+                delivered += values["grid_export"]
             else:
-                earnings = delivered * event.rate_gbp_kwh
-                if math.isfinite(earnings):
+                if math.isfinite(delivered):
                     outcome: AxleStatus = "unknown"
                     if event.committed_kwh:
                         fraction = delivered / event.committed_kwh
@@ -133,7 +136,10 @@ def axle_outcomes(events: Iterable[AxleEvent], rows: Iterable[LedgerSlot]) -> Ax
                             outcome = "partial"
                         else:
                             outcome = "missed"
-                    outcomes.append(AxleOutcome(event, outcome, delivered, earnings))
+                    earnings = delivered * event.rate_gbp_kwh
+                    outcomes.append(AxleOutcome(
+                        event, outcome, delivered, earnings if math.isfinite(earnings) else None,
+                    ))
                     continue
         outcomes.append(AxleOutcome(event))
     return AxleSummary(tuple(outcomes))
@@ -178,6 +184,23 @@ class CostResult:
         return self.priced_slots / len(self.slots) if self.slots else 0.0
 
 
+def _measured(row: LedgerSlot) -> dict[str, float] | str:
+    """The cost components of a slot, or the reason one is a ledger gap."""
+    values: dict[str, float] = {}
+    for name in COMPONENTS:
+        if name == "v2l":  # Not used to derive house load.
+            continue
+        flow = row.components.get(name)
+        if flow is not None and flow.kwh is not None and flow.provenance in PRICEABLE:
+            values[name] = flow.kwh
+        elif (flow is not None and flow.kwh is None and flow.provenance == "absent"
+              and flow.reason == "not_configured"):
+            values[name] = 0.0
+        else:
+            return f"untrusted_{name}"
+    return values
+
+
 def _price_slot(bucket: StatsBucket, previous: SlotCost | None, axle: float | None) -> SlotCost:
     row = bucket.slot
     start = bucket.start
@@ -192,18 +215,9 @@ def _price_slot(bucket: StatsBucket, previous: SlotCost | None, axle: float | No
     if house is None:
         return SlotCost(start, reason="missing_house_load")
 
-    values: dict[str, float] = {}
-    for name in COMPONENTS:
-        if name == "v2l":  # Not used to derive house load.
-            continue
-        flow = row.components.get(name)
-        if flow is not None and flow.kwh is not None and flow.provenance in PRICEABLE:
-            values[name] = flow.kwh
-        elif (flow is not None and flow.kwh is None and flow.provenance == "absent"
-              and flow.reason == "not_configured"):
-            values[name] = 0.0
-        else:
-            return SlotCost(start, reason=f"untrusted_{name}")
+    values = _measured(row)
+    if isinstance(values, str):
+        return SlotCost(start, reason=values)
     imported, exported = values["grid_import"], values["grid_export"]
     solar = values["solar_generation"]
     baseline_import, baseline_export = max(0.0, house - solar), max(0.0, solar - house)

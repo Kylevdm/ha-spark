@@ -55,9 +55,8 @@ async def test_sources_record_the_same_acceptance_and_freeze_rate_and_commitment
             await ExportEventStore(settings.db_path).save(IDENTITY, END)
         for rate, rev in [(1.75, plan_revision()), (5.0, plan_revision(kw=(7, 8)))]:
             settings = settings.model_copy(update={"axle_event_rate_gbp_kwh": rate})
-            integration = recorder.capture_native(snapshot("accepted") if native else None,
-                                                  settings, rev)
-            await recorder.record_tick(settings, ACCEPTED, rev, integration)
+            recorder.capture_native(snapshot("accepted") if native else None, settings, rev)
+            await recorder.record_tick(settings, ACCEPTED, rev, native)
         [event] = await AxleEventStore(settings.db_path).events(START, END)
         assert (event.rate_gbp_kwh, event.committed_kwh, event.accepted_at) == (1.75, 3, ACCEPTED)
         records.append(event)
@@ -68,7 +67,7 @@ async def test_tripped_is_preserved_and_only_a_later_trusted_read_cancels(tmp_pa
     settings = settings_for(tmp_path).model_copy(update={"export_event_provider": "axle"})
     recorder = AxleEventRecorder()
     rev = plan_revision(matching=False)
-    assert recorder.capture_native(snapshot("accepted", "tripped", "aborted"), settings, rev)
+    recorder.capture_native(snapshot("accepted", "tripped", "aborted"), settings, rev)
     store = AxleEventStore(settings.db_path)
     recorder.capture_read(settings, plan_revision(issued=ACCEPTED))
     recorder.capture_read(settings, plan_revision(issued=START, trusted=False))
@@ -152,3 +151,59 @@ async def test_missing_store_is_not_created(tmp_path):
     path = tmp_path / "missing.db"
     assert await AxleEventStore(str(path)).events(START, END) == []
     assert not path.exists()
+
+
+async def test_stored_acceptance_is_not_rewritten_each_tick(tmp_path, monkeypatch):
+    settings = settings_for(tmp_path)
+    await ExportEventStore(settings.db_path).save(IDENTITY, END)
+    recorder = AxleEventRecorder()
+    rev = plan_revision()
+    await recorder.record_tick(settings, ACCEPTED, rev, False)
+    writes = []
+    original = AxleEventStore._record
+
+    async def counted(self, facts, reads):
+        writes.append(facts)
+        await original(self, facts, reads)
+
+    monkeypatch.setattr(AxleEventStore, "_record", counted)
+    await recorder.record_tick(settings, START, rev, False)
+    recorder.capture_native(snapshot("accepted"), settings, rev)
+    await recorder.record_tick(settings, START, rev, True)
+    assert writes == []
+    [event] = await AxleEventStore(settings.db_path).events(START, END)
+    assert event.accepted_at == ACCEPTED
+
+
+def test_malformed_snapshot_never_raises_into_the_control_loop():
+    class Broken:
+        owner = "integration"
+
+        @property
+        def export(self):
+            raise RuntimeError("boom")
+
+    AxleEventRecorder().capture_native(Broken(), None, None)
+
+
+async def test_retired_site_and_ended_sidecar_never_record_a_legacy_acceptance(tmp_path):
+    settings = settings_for(tmp_path)
+    await ExportEventStore(settings.db_path).save(IDENTITY, END)
+    recorder = AxleEventRecorder()
+    await recorder.record_tick(settings, ACCEPTED, plan_revision(), True)  # Retired add-on.
+    await recorder.record_tick(settings, END, plan_revision(), False)  # Window already over.
+    assert await AxleEventStore(settings.db_path).events(START, END) == []
+
+
+async def test_unusable_commitment_keeps_the_acceptance(tmp_path):
+    settings = settings_for(tmp_path)
+    rev = plan_revision()
+    export = rev.run.plan.charge_intent.export
+    broken = replace(export, slot_export_kw=(2,))
+    plan = replace(rev.run.plan, charge_intent=replace(rev.run.plan.charge_intent, export=broken))
+    rev = replace(rev, run=replace(rev.run, plan=plan))
+    recorder = AxleEventRecorder()
+    recorder.capture_native(snapshot("accepted"), settings, rev)
+    await recorder.record_tick(settings, ACCEPTED, rev, True)
+    [event] = await AxleEventStore(settings.db_path).events(START, END)
+    assert (event.committed_kwh, event.rate_gbp_kwh) == (None, 1)

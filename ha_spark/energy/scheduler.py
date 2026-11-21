@@ -2158,9 +2158,7 @@ async def _run_paired(
         while True:
             settings = state.settings  # hot-reloaded by POST /api/config
             # Retain lifecycle facts before the notice pass can acknowledge them.
-            axle_integration_source = axle_recorder.capture_native(
-                state.integration_link.v4, settings, last_revision,
-            )
+            axle_recorder.capture_native(state.integration_link.v4, settings, last_revision)
             # Capture with the settings snapshot, before any I/O can accept a save.
             context.planned_generation.set(context.config_generation)
             # The accepted limits this tick plans under, captured with their key so
@@ -2603,7 +2601,7 @@ async def _run_paired(
                 axle_recorder.capture_read(settings, last_revision)
             if axle_task is None or axle_task.done():
                 axle_task = asyncio.create_task(axle_recorder.record_tick(
-                    settings, now, last_revision, axle_integration_source,
+                    settings, now, last_revision, retired,
                 ))
             # The real clock: tests replace this module's ``datetime`` to script ``now``.
             state.loop_tick = utc_datetime.now(UTC)
