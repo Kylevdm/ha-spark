@@ -24,6 +24,7 @@ from ha_spark.energy.derived_base_load import (
 from ha_spark.energy.readiness_ledger import BOUNDARY_TOLERANCE, slot_start
 from ha_spark.energy.readiness_measurements import COMPONENTS, HALF_HOUR
 from ha_spark.energy.session_allowance import CounterResult, read_counter
+from ha_spark.energy.tariff import HAPPY_HOUR_ALLOWANCE_KWH, HAPPY_HOUR_MARGIN, _slot_overlap
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.logging import get_logger
 
@@ -60,7 +61,7 @@ class ComponentFlow(BaseModel):
 
 
 class RateEvidence(BaseModel):
-    """Prices and the winning import-price overlay as they were at slot close."""
+    """Supplier prices and trusted import-session evidence at slot close."""
 
     model_config = ConfigDict(frozen=True, allow_inf_nan=False)
     import_rate: float | None = None
@@ -70,6 +71,8 @@ class RateEvidence(BaseModel):
     session_id: str | None = None
     session_start: AwareDatetime | None = None
     session_end: AwareDatetime | None = None
+    session_suppressed_by: Literal["hold", "axle_export", "no_purchase_room"] | None = None
+    session_remaining_kwh: float | None = Field(default=None, gt=0, le=HAPPY_HOUR_ALLOWANCE_KWH)
     exclusions: tuple[str, ...] = ()
 
 
@@ -110,6 +113,42 @@ def capture_rates(settings: Settings, now: datetime, revision: PlanRevision | No
     import_session: ImportSession | None = (
         "free_electricity" if overlay == "free_electricity" else "happy_hour" if booking else None
     )
+    suppressed_by: Literal["hold", "axle_export", "no_purchase_room"] | None = None
+    remaining = None
+    explicit = schedule.explicit_import_prices
+    live_import = explicit[i] if i < len(explicit) else None
+    if overlay is None:
+        suppressed = schedule.suppressed_import_sessions
+        reasons = schedule.import_suppression_reasons
+        candidate = suppressed[i] if i < len(suppressed) else None
+        reason = reasons[i] if i < len(reasons) else None
+        if candidate is not None and reason in ("EV or dispatch hold", "Axle export event"):
+            booking, import_session = candidate, candidate.kind
+            suppressed_by = "hold" if reason == "EV or dispatch hold" else "axle_export"
+        elif candidate is None and not (live_import is not None and live_import < 0):
+            # A trusted booking can run out of room for a battery purchase after
+            # the planning deductions and still cover measured house import.
+            loads = run.inputs.load_slots
+            if loads is not None and len(loads) == len(starts) == len(schedule.prices):
+                for candidate in run.inputs.free_sessions:
+                    if (candidate.kind != "happy_hour" or candidate.start.utcoffset() is None
+                            or candidate.end.utcoffset() is None):
+                        continue
+                    r = run.inputs.happy_hour_remaining_kwh.get(candidate.session_id)
+                    if (r is None or isinstance(r, bool) or not isinstance(r, (float, int))
+                            or not math.isfinite(r) or r <= 0):
+                        continue
+                    shares = _slot_overlap(geometry, candidate.start, candidate.end)
+                    if shares[i] <= 0:
+                        continue
+                    house = sum(max(0.0, load) * share for load, share in
+                                zip(loads, shares, strict=True))
+                    cap = min(r, HAPPY_HOUR_ALLOWANCE_KWH)
+                    allowance = cap - HAPPY_HOUR_MARGIN * HAPPY_HOUR_ALLOWANCE_KWH - house
+                    if math.isfinite(allowance) and allowance <= 0:
+                        booking, import_session = candidate, "happy_hour"
+                        suppressed_by, remaining = "no_purchase_room", cap
+                        break
     event = run.inputs.flexibility_event
     in_export_event = (
         event is not None and event.direction == "export"
@@ -120,7 +159,6 @@ def capture_rates(settings: Settings, now: datetime, revision: PlanRevision | No
         schedule.export_prices[i]
         if not in_export_event and i < len(schedule.export_prices) else schedule.export_rate
     )
-    explicit = schedule.explicit_import_prices
     provider = settings.tariff_provider
     exclusions: tuple[str, ...] = ()
     if (
@@ -138,6 +176,8 @@ def capture_rates(settings: Settings, now: datetime, revision: PlanRevision | No
         session_id=booking.session_id if booking else None,
         session_start=booking.start.astimezone(UTC) if booking else None,
         session_end=booking.end.astimezone(UTC) if booking else None,
+        session_suppressed_by=suppressed_by,
+        session_remaining_kwh=remaining,
         exclusions=exclusions,
     )
 
