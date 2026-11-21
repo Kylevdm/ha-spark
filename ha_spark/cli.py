@@ -77,6 +77,7 @@ from ha_spark.energy.stats import (
     StatsResult,
     compute_stats,
     load_accuracy,
+    provenance_counts,
     solar_accuracy,
 )
 from ha_spark.energy.store import ConsumptionStore
@@ -289,6 +290,12 @@ async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
     print(
         f"Coverage: {result.covered_slots}/{len(result.buckets)} slots "
         f"({result.energy_coverage:.1%})"
+    )
+    counts = provenance_counts(result)
+    gaps = counts.get("gap", 0) + counts.get("absent", 0)
+    print(
+        f"Grid import: filled {counts.get('statistics_fill', 0)} (statistics_fill), "
+        f"distributed {counts.get('distributed', 0)}, gaps {gaps}"
     )
     forecast_days = sorted({bucket.start.astimezone(tz).date() for bucket in result.buckets})
     try:

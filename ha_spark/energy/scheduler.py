@@ -77,6 +77,7 @@ Readiness captures the revision and rates in force on each boundary tick, in
 all modes, and separate read-only guard evidence in Observe. Missed boundaries
 stay gaps; mid-slot requests never rewrite a slot. A separate background energy
 ledger records closed-slot flows and rates from before the boundary replan.
+Another background task fills settled ledger gaps from recorder statistics.
 Recording failures are isolated.
 """
 
@@ -139,7 +140,12 @@ from ha_spark.energy.derived_base_load import (
 )
 from ha_spark.energy.dispatch_evidence import partition_dispatches
 from ha_spark.energy.dst_clock_sync import DstClockSync
-from ha_spark.energy.energy_ledger import EnergyLedger, RateEvidence, capture_rates
+from ha_spark.energy.energy_ledger import (
+    EnergyLedger,
+    RateEvidence,
+    capture_rates,
+    fill_closed_days,
+)
 from ha_spark.energy.evening_forecast import EveningForecastStore
 from ha_spark.energy.evidence_freshness import EvidenceFreshness, check_report_time
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
@@ -2097,6 +2103,7 @@ async def _run_paired(
     readiness_evaluated: date | None = None
     readiness_task: asyncio.Task[None] | None = None
     ledger_task: asyncio.Task[None] | None = None
+    ledger_fill_task: asyncio.Task[None] | None = None
     carbon = CarbonRefresher(settings.db_path, lambda: state.settings.carbon_region)
 
     async def record_readiness(tick_settings: Settings, tick_now: datetime) -> None:
@@ -2567,6 +2574,8 @@ async def _run_paired(
                 ledger_task = asyncio.create_task(
                     EnergyLedger(settings.db_path).record_boundary(settings, now, ledger_rates)
                 )
+            if ledger_fill_task is None or ledger_fill_task.done():
+                ledger_fill_task = asyncio.create_task(fill_closed_days(settings, now))
             # The real clock: tests replace this module's ``datetime`` to script ``now``.
             state.loop_tick = utc_datetime.now(UTC)
             await asyncio.sleep(poll_seconds)
@@ -2576,11 +2585,15 @@ async def _run_paired(
             await discovery.cancel_announcement()
         if ledger_task is not None:
             ledger_task.cancel()
+        if ledger_fill_task is not None:
+            ledger_fill_task.cancel()
         if readiness_task is not None:
             readiness_task.cancel()
             await asyncio.gather(readiness_task, return_exceptions=True)
         if ledger_task is not None:
             await asyncio.gather(ledger_task, return_exceptions=True)
+        if ledger_fill_task is not None:
+            await asyncio.gather(ledger_fill_task, return_exceptions=True)
         state.executor = None
         if pending is not None and not pending.future.done():
             pending.future.set_result(Reply(error="daemon stopped during request"))
