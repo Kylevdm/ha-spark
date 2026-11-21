@@ -672,6 +672,20 @@ cost figures, captured rates). Statistics always state their coverage;
 missing half-hours are left out, never filled from a forecast.
 (Decision: #309, 2026-10-14.)
 
+**Energy ledger**:
+The permanent half-hour record of measured household energy flows, derived
+house load and base load, and the rates and import-session evidence captured
+at slot close. Measurements carry their provenance; missing measurements
+stay gaps, and historical rates are never repriced.
+(Decision: #607, 2026-11-04.)
+
+**Evening-plan forecast**:
+The per-slot solar forecast (P10, P50 and P90 where available) for the next
+household day used by the last plan issued before the overnight cheap window
+started. It is kept for accuracy scoring, not as a replacement for measured
+solar or the plan view's in-force forecast.
+(Decision: #607, 2026-11-04.)
+
 **Assistant**:
 ha-spark's own chat on its page: an agent that reads the plan and the
 household's state through the same tools as outside agents, and may record

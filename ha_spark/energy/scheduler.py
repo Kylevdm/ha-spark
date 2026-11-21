@@ -75,7 +75,11 @@ fallback, clock sync and the supply guard; the daemon never replays those writes
 
 Readiness captures the revision and rates in force on each boundary tick, in
 all modes, and separate read-only guard evidence in Observe. Missed boundaries
-stay gaps; mid-slot requests never rewrite a slot. Recording failures are isolated.
+stay gaps; mid-slot requests never rewrite a slot. A separate background energy
+ledger records closed-slot flows and rates from before the boundary replan.
+Another background task fills settled ledger gaps from recorder statistics.
+A separate meter-history task pulls Octopus grid import for reconciliation only.
+Recording failures are isolated.
 """
 
 from __future__ import annotations
@@ -137,23 +141,39 @@ from ha_spark.energy.derived_base_load import (
 )
 from ha_spark.energy.dispatch_evidence import partition_dispatches
 from ha_spark.energy.dst_clock_sync import DstClockSync
+from ha_spark.energy.energy_ledger import (
+    EnergyLedger,
+    RateEvidence,
+    capture_rates,
+    fill_closed_days,
+)
+from ha_spark.energy.evening_forecast import EveningForecastStore
 from ha_spark.energy.evidence_freshness import EvidenceFreshness, check_report_time
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.ledger import ForecastLedger
+from ha_spark.energy.ledger_backfill import backfill_energy_ledger
+from ha_spark.energy.meter_pull import MeterPullOutcome, pull_meter_history
 from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
 from ha_spark.energy.native_export_notices import notify_export_transitions
 from ha_spark.energy.plan_run import PlanRun, StoredPlanRun, current_plan
 from ha_spark.energy.publish import plan_to_payload
 from ha_spark.energy.readiness import readiness_tick
-from ha_spark.energy.readiness_ledger import PlanRevision, record_guard, record_slot, slot_start
-from ha_spark.energy.readiness_measurements import record_closed_days
+from ha_spark.energy.readiness_ledger import (
+    BOUNDARY_TOLERANCE,
+    PlanRevision,
+    record_guard,
+    record_slot,
+    slot_start,
+)
+from ha_spark.energy.readiness_measurements import RETRY_DELAY, record_closed_days
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor, SocMonitorSnapshot, observe_soc
 from ha_spark.energy.solar_forecasts import SolarForecastStore
 from ha_spark.energy.solar_source import SolarSource
 from ha_spark.energy.sources import (
+    NATIVE_MAX_AGE,
     SessionCache,
     ev_hold_status_from_read,
     parse_time,
@@ -393,6 +413,27 @@ async def _record_solar_forecasts(settings: Settings, run: PlanRun) -> None:
         log.warning("Recording solar forecast failed")
 
 
+_evening_forecast_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _record_evening_forecast(settings: Settings, run: PlanRun, source: SolarSource) -> None:
+    """Record the plan's evidence in the background, without delaying the next tick."""
+    try:
+        forecast = source.forecast
+        native_slots = (
+            forecast.slots
+            if source.kind == "native" and forecast is not None and forecast.fetched_at is not None
+            and timedelta(0) <= source.now - forecast.fetched_at <= NATIVE_MAX_AGE
+            else ()
+        )
+        await EveningForecastStore(settings.db_path).record(
+            run.inputs, run.cfg, run.tz or load_timezone(settings.timezone),
+            native_slots=native_slots,
+        )
+    except Exception:
+        log.warning("Recording evening-plan solar forecast failed")
+
+
 async def run_once(
     settings: Settings,
     *,
@@ -577,6 +618,9 @@ async def run_once(
                 log.warning("V2L top-up request failed", exc_info=True)
     await _record_forecast(settings, plan, run.forecast, getattr(run.inputs, "geometry", None))
     await _record_solar_forecasts(settings, run)
+    evening_task = asyncio.create_task(_record_evening_forecast(settings, run, source))
+    _evening_forecast_tasks.add(evening_task)
+    evening_task.add_done_callback(_evening_forecast_tasks.discard)
     await _run_derived_rerive(settings)
     return RunResult(
         plan, applied_plan, tuple(apply_lines),
@@ -2061,6 +2105,11 @@ async def _run_paired(
     last_readiness_slot: datetime | None = None
     readiness_evaluated: date | None = None
     readiness_task: asyncio.Task[None] | None = None
+    ledger_task: asyncio.Task[None] | None = None
+    backfill_task: asyncio.Task[bool] | None = None
+    backfill_retry_at: datetime | None = None
+    ledger_fill_task: asyncio.Task[None] | None = None
+    meter_task: asyncio.Task[MeterPullOutcome] | None = None
     carbon = CarbonRefresher(settings.db_path, lambda: state.settings.carbon_region)
 
     async def record_readiness(tick_settings: Settings, tick_now: datetime) -> None:
@@ -2148,6 +2197,8 @@ async def _run_paired(
                 last_trusted_holds = None
                 target_w = None
                 last_settings = settings
+            # This tick's new plan starts at the boundary, after the slot that closed.
+            closed_slot_revision = last_revision
             tz = load_timezone(settings.timezone)
             window_start = parse_time(settings.charge_window_start)
             window_end = parse_time(settings.charge_window_end)
@@ -2462,8 +2513,19 @@ async def _run_paired(
                     )
                 last_reconcile_lines, last_trusted_holds = reconciled[:2]
                 reapply = reapply or reconciled.relinquished
+            ledger_rates: RateEvidence | None = None
             if slot_start(now) != last_readiness_slot:
                 last_readiness_slot = slot_start(now)
+                if (
+                    now.astimezone(UTC) - last_readiness_slot < BOUNDARY_TOLERANCE
+                    and (ledger_task is None or ledger_task.done())
+                ):
+                    try:
+                        ledger_rates = capture_rates(settings, now, closed_slot_revision)
+                    except Exception:
+                        # Still record the flows (and this boundary's readings), unpriced.
+                        log.warning("Energy ledger recording failed")
+                        ledger_rates = RateEvidence(exclusions=("rate_capture_failed",))
                 await record_slot(
                     settings.db_path, now, last_revision,
                     authority.state.committed_mode
@@ -2514,6 +2576,21 @@ async def _run_paired(
                     await run_v2l_tick(settings, now)
                 except Exception:
                     log.exception("V2L tick failed; will retry next tick")
+            if ledger_rates is not None:
+                ledger_task = asyncio.create_task(
+                    EnergyLedger(settings.db_path).record_boundary(settings, now, ledger_rates)
+                )
+            if backfill_task is not None and backfill_task.done() and not backfill_task.result():
+                backfill_task = None
+                backfill_retry_at = now.astimezone(UTC) + RETRY_DELAY
+            if backfill_task is None and (
+                backfill_retry_at is None or now.astimezone(UTC) >= backfill_retry_at
+            ):
+                backfill_task = asyncio.create_task(backfill_energy_ledger(settings))
+            if ledger_fill_task is None or ledger_fill_task.done():
+                ledger_fill_task = asyncio.create_task(fill_closed_days(settings, now))
+            if meter_task is None or meter_task.done():
+                meter_task = asyncio.create_task(pull_meter_history(settings, now))
             # The real clock: tests replace this module's ``datetime`` to script ``now``.
             state.loop_tick = utc_datetime.now(UTC)
             await asyncio.sleep(poll_seconds)
@@ -2521,9 +2598,25 @@ async def _run_paired(
         await carbon.close()
         if discovery is not None:
             await discovery.cancel_announcement()
+        if ledger_task is not None:
+            ledger_task.cancel()
+        if backfill_task is not None:
+            backfill_task.cancel()
+        if ledger_fill_task is not None:
+            ledger_fill_task.cancel()
+        if meter_task is not None:
+            meter_task.cancel()
         if readiness_task is not None:
             readiness_task.cancel()
             await asyncio.gather(readiness_task, return_exceptions=True)
+        if ledger_task is not None:
+            await asyncio.gather(ledger_task, return_exceptions=True)
+        if backfill_task is not None:
+            await asyncio.gather(backfill_task, return_exceptions=True)
+        if ledger_fill_task is not None:
+            await asyncio.gather(ledger_fill_task, return_exceptions=True)
+        if meter_task is not None:
+            await asyncio.gather(meter_task, return_exceptions=True)
         state.executor = None
         if pending is not None and not pending.future.done():
             pending.future.set_result(Reply(error="daemon stopped during request"))

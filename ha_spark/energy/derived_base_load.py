@@ -114,6 +114,21 @@ class DeriveResult:
     coverage: dict[str, tuple[datetime | None, datetime | None]] = field(default_factory=dict)
 
 
+def base_load_balance(
+    grid_import: float,
+    grid_export: float,
+    solar_generation: float,
+    battery_discharge: float,
+    battery_charge: float,
+    ev_charge: float,
+) -> float:
+    """Unclamped energy balance for one interval, in canonical direction."""
+    return (
+        grid_import - grid_export + solar_generation + battery_discharge
+        - battery_charge - ev_charge
+    )
+
+
 def derive_base_load(
     grid_import: ComponentSeries,
     *,
@@ -173,7 +188,7 @@ def derive_base_load(
         bd = battery_discharge.hourly.get(start, 0.0) if battery_discharge else 0.0
         bc = battery_charge.hourly.get(start, 0.0) if battery_charge else 0.0
         ev = ev_charge.hourly.get(start, 0.0) if ev_charge else 0.0
-        raw = gi - ge + sol + bd - bc - ev
+        raw = base_load_balance(gi, ge, sol, bd, bc, ev)
         if raw < 0:
             negative_clamped += 1
             raw = 0.0
