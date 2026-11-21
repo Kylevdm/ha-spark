@@ -50,6 +50,7 @@ from ha_spark.energy.derived_base_load import (
 )
 from ha_spark.energy.energy_ledger import EnergyLedger
 from ha_spark.energy.eval import actual_kwh_by_date, evaluate, format_eval
+from ha_spark.energy.evening_forecast import EveningForecastStore
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.models import ConsumptionInterval
@@ -69,7 +70,7 @@ from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever
 from ha_spark.energy.solar_source import NATIVE_PREVIEW_NOTE, solar_source_from_store
 from ha_spark.energy.sources import _to_float
-from ha_spark.energy.stats import compute_stats
+from ha_spark.energy.stats import StatsResult, compute_stats, solar_accuracy
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.energy.v2l import delivered_fraction, load_session, savings
 from ha_spark.ha.models import StateChangedEvent
@@ -91,6 +92,42 @@ from ha_spark.onboarding_discover import FieldProposal, propose
 from ha_spark.presets import get_preset, preset_names
 from ha_spark.router import route_message
 from ha_spark.settings_service import ConfigurationRepair, SettingsService
+
+
+async def _print_solar_accuracy(settings: Settings, day: date, stats: StatsResult) -> None:
+    try:
+        forecast = await EveningForecastStore(settings.db_path).slots(day, day + timedelta(days=1))
+    except Exception:
+        print("Solar coverage: unavailable (could not read evening-plan forecast)")
+        return
+    accuracy = solar_accuracy(stats, forecast)
+
+    def energy(kwh: float | None) -> str:
+        return "—" if kwh is None else f"{kwh:g} kWh"
+
+    if forecast:
+        print("Evening-plan solar forecast vs measured:")
+        for slot in accuracy.slots:
+            if slot.forecast is None:
+                continue
+            band = (
+                "" if slot.band_hit is None else f"; P10–P90 {'hit' if slot.band_hit else 'miss'}"
+            )
+            print(
+                f"{slot.start.isoformat(timespec='minutes')} "
+                f"P10={energy(slot.forecast.p10_kwh)} P50={energy(slot.forecast.p50_kwh)} "
+                f"P90={energy(slot.forecast.p90_kwh)} measured={energy(slot.measured_kwh)} "
+                f"error={energy(slot.error_kwh)}{band}"
+            )
+    print(
+        f"Solar accuracy: MAE={energy(accuracy.mae_kwh)}; "
+        f"bias (forecast − measured)={energy(accuracy.bias_kwh)}"
+    )
+    reason = f"; {accuracy.reason}" if accuracy.reason else ""
+    print(
+        f"Solar coverage: {accuracy.scored_slots}/{len(accuracy.slots)} slots "
+        f"({accuracy.coverage:.1%}){reason}"
+    )
 
 
 async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
@@ -148,6 +185,7 @@ async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
         f"Coverage: {result.covered_slots}/{len(result.buckets)} slots "
         f"({result.energy_coverage:.1%})"
     )
+    await _print_solar_accuracy(settings, day, result)
     return 0
 
 
