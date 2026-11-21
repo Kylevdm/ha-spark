@@ -76,6 +76,7 @@ from ha_spark.energy.stats import (
     LoadAccuracy,
     StatsResult,
     compute_stats,
+    cost_stats,
     load_accuracy,
     meter_reconciliation,
     provenance_counts,
@@ -313,6 +314,7 @@ async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
     else:
         _print_load_accuracy(load_accuracy(result, forecasts, tz))
     await _print_solar_accuracy(settings, day, result)
+    _print_costs(result)
     try:
         meter_intervals = await read_consumption(settings.db_path, start, end)
     except Exception:
@@ -330,6 +332,60 @@ async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
             f"({reconciliation.covered_days}/{len(reconciliation.by_day)} days covered)"
         )
     return 0
+
+
+def _print_costs(result: StatsResult) -> None:
+    costs = cost_stats(result)
+
+    def money(cost: float | None) -> str:
+        return "unknown" if cost is None else f"{cost:.2f} GBP"
+
+    print("Slot costs:")
+    for slot in costs.slots:
+        instant = slot.start.isoformat(timespec="minutes")
+        inputs = slot.inputs
+        if inputs is None:
+            print(f"{instant} unpriced ({slot.reason})")
+            continue
+        rates = inputs.rates
+        session = {"free_electricity": "Free Electricity", "happy_hour": "Happy Hour"}.get(
+            rates.import_session or "", "none",
+        )
+        if rates.session_suppressed_by is not None:
+            session += " (" + {
+                "hold": "hold", "axle_export": "Axle event", "no_purchase_room": "no purchase room",
+            }[rates.session_suppressed_by] + ")"
+        if rates.session_remaining_kwh is not None:
+            session += f", captured remaining allowance={rates.session_remaining_kwh:g} kWh"
+        print(
+            f"{instant} import={inputs.grid_import_kwh:g} kWh; "
+            f"export={inputs.grid_export_kwh:g} kWh; house={inputs.house_load_kwh:g} kWh; "
+            f"solar={inputs.solar_kwh:g} kWh; import_rate={rates.import_rate:g} GBP/kWh; "
+            f"export_rate={rates.export_rate:g} GBP/kWh; session={session}; "
+            f"free import={inputs.free_import_kwh:g} kWh; "
+            f"no-battery import={inputs.no_battery_import_kwh:g} kWh; "
+            f"no-battery export={inputs.no_battery_export_kwh:g} kWh; "
+            f"no-battery free import={inputs.no_battery_free_import_kwh:g} kWh; "
+            f"Axle earnings (estimated)={inputs.axle_earnings:g} GBP; "
+            f"Actual cost={money(slot.actual_cost)}; "
+            f"No-battery cost={money(slot.no_battery_cost)}; "
+            f"Battery savings={money(slot.battery_savings)}"
+        )
+    print("Actual cost = (import - free import) × import rate - export × export rate "
+          "- Axle earnings (estimated)")
+    print("No-battery cost = (max(0, house - solar) - no-battery free import) × import rate "
+          "- max(0, solar - house) × export rate")
+    print("Battery savings = no-battery cost - actual cost (the battery and ha-spark together)")
+    print("Standing charges excluded. Free Electricity covers all import; Happy Hour covers up to "
+          "16 kWh per booked hour, tracked separately for actual and no-battery import.")
+    print(
+        f"Cost totals: Actual cost={money(costs.actual_cost)}; "
+        f"No-battery cost={money(costs.no_battery_cost)}; "
+        f"Battery savings={money(costs.battery_savings)}"
+    )
+    print(
+        f"Cost coverage: {costs.priced_slots}/{len(costs.slots)} slots ({costs.cost_coverage:.1%})"
+    )
 
 
 async def _cmd_readiness_show(settings: Settings) -> int:
