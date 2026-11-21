@@ -137,6 +137,27 @@ class GridImportResult:
 
 
 @dataclass(frozen=True)
+class CounterResult:
+    """A cumulative energy reading or a fixed exclusion code."""
+
+    reading: GridImport | None
+    reason: str | None = None
+
+
+_GRID_IMPORT_REASONS = {
+    "not_configured": "grid import entity is unset",
+    "unreadable": "grid import entity is unreadable",
+    "unavailable": "grid import reading is unavailable",
+    "not_finite": "grid import reading is not a finite number",
+    "not_a_counter": "grid import unit is unsupported",
+    "invalid_kwh": "grid import reading is negative or not finite",
+    "missing_report_time": "grid import report time is missing",
+    "future_report_time": "grid import report time is in the future",
+    "stale": "grid import reading is stale",
+}
+
+
+@dataclass(frozen=True)
 class AllowanceOutcome:
     """Remaining Happy Hour allowance per booking, plus any unusable reason.
 
@@ -190,43 +211,53 @@ async def read_grid_import(
     returned as a reason so the counter can remove the allowance and health can
     name it.
     """
-    entity_id = settings.derive_grid_import_entity.strip()
+    result = await read_counter(rest, settings.derive_grid_import_entity, now, assume_kwh=True)
+    return GridImportResult(
+        result.reading, _GRID_IMPORT_REASONS[result.reason] if result.reason is not None else None,
+    )
+
+
+async def read_counter(
+    rest: HomeAssistantRest | None, entity_id: str, now: datetime, *, assume_kwh: bool = False,
+) -> CounterResult:
+    """Read one validated cumulative energy counter; only allowance assumes kWh."""
+    entity_id = entity_id.strip()
     if not entity_id:
-        return GridImportResult(None, "grid import entity is unset")
+        return CounterResult(None, "not_configured")
     if rest is None:
-        return GridImportResult(None, "grid import entity is unreadable")
+        return CounterResult(None, "unreadable")
     try:
         state = await rest.get_state(entity_id)
-    except Exception:  # noqa: BLE001 - a missing entity only removes the allowance
-        return GridImportResult(None, "grid import entity is unreadable")
-    return _grid_import_from_state(state, now)
+    except Exception:  # noqa: BLE001 - an unreadable entity is not a measurement
+        return CounterResult(None, "unreadable")
+    return _counter_from_state(state, now, assume_kwh=assume_kwh)
 
 
-def _grid_import_from_state(state: EntityState, now: datetime) -> GridImportResult:
+def _counter_from_state(state: EntityState, now: datetime, *, assume_kwh: bool) -> CounterResult:
     raw = str(state.state).strip()
     if raw.lower() in ("", "unknown", "unavailable"):
-        return GridImportResult(None, "grid import reading is unavailable")
+        return CounterResult(None, "unavailable")
     value = _opt_float(raw)
     if value is None:
-        return GridImportResult(None, "grid import reading is not a finite number")
-    unit = str(state.attributes.get("unit_of_measurement") or "kWh").strip()
+        return CounterResult(None, "not_finite")
+    unit = str(state.attributes.get("unit_of_measurement") or ("kWh" if assume_kwh else "")).strip()
     factors = {"kWh": 1.0, "Wh": 0.001, "MWh": 1000.0}
     factor = factors.get(unit)
     if factor is None:
-        return GridImportResult(None, "grid import unit is unsupported")
+        return CounterResult(None, "not_a_counter")
     kwh = value * factor
     if not math.isfinite(kwh) or kwh < 0:
-        return GridImportResult(None, "grid import reading is negative or not finite")
+        return CounterResult(None, "invalid_kwh")
     reported = state.last_reported
     if reported is None or reported.utcoffset() is None:
-        return GridImportResult(None, "grid import report time is missing")
+        return CounterResult(None, "missing_report_time")
     reported = reported.astimezone(UTC)
     age = (now.astimezone(UTC) - reported).total_seconds()
     if age < 0:
-        return GridImportResult(None, "grid import report time is in the future")
+        return CounterResult(None, "future_report_time")
     if age > GRID_IMPORT_MAX_AGE.total_seconds():
-        return GridImportResult(None, "grid import reading is stale")
-    return GridImportResult(GridImport(kwh, reported))
+        return CounterResult(None, "stale")
+    return CounterResult(GridImport(kwh, reported))
 
 
 def max_plausible_import_kw(settings: Settings) -> float:
