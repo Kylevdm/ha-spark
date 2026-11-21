@@ -64,3 +64,16 @@ def compute_stats(
         base_load_kwh=_total(row.base_load_kwh for row in covered),
     )
     return StatsResult(tuple(buckets), totals, len(covered))
+
+
+def provenance_counts(result: StatsResult) -> dict[str, int]:
+    """Count slots by grid import provenance, distinguishing missing rows."""
+    counts: dict[str, int] = {}
+    for bucket in result.buckets:
+        if bucket.slot is None:
+            key = "gap"
+        else:
+            flow = bucket.slot.components.get("grid_import")
+            key = flow.provenance if flow is not None else "absent"
+        counts[key] = counts.get(key, 0) + 1
+    return counts

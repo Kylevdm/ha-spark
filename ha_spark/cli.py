@@ -69,7 +69,7 @@ from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever
 from ha_spark.energy.solar_source import NATIVE_PREVIEW_NOTE, solar_source_from_store
 from ha_spark.energy.sources import _to_float
-from ha_spark.energy.stats import compute_stats
+from ha_spark.energy.stats import compute_stats, provenance_counts
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.energy.v2l import delivered_fraction, load_session, savings
 from ha_spark.ha.models import StateChangedEvent
@@ -147,6 +147,12 @@ async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
     print(
         f"Coverage: {result.covered_slots}/{len(result.buckets)} slots "
         f"({result.energy_coverage:.1%})"
+    )
+    counts = provenance_counts(result)
+    gaps = counts.get("gap", 0) + counts.get("absent", 0)
+    print(
+        f"Grid import: filled {counts.get('statistics_fill', 0)} (statistics_fill), "
+        f"distributed {counts.get('distributed', 0)}, gaps {gaps}"
     )
     return 0
 
