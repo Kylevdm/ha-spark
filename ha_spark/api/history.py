@@ -20,6 +20,7 @@ from ha_spark.energy.stats import (
     RangeStats,
     RangeTotals,
     Resolution,
+    StatsResult,
     compute_stats,
     load_accuracy,
     meter_reconciliation,
@@ -181,8 +182,12 @@ def add_range_details(
     evidence: StatisticsEvidence,
 ) -> None:
     result = compute_stats(rows, start, end, tz)
-    payload["provenance_counts"] = provenance_counts(result)
+    if resolution == "slot":
+        # The calendar Day view never reads the plan view's recorded forecast.
+        payload["totals"] = {"solar_forecast_kwh": None, "solar_measured_kwh": None}
     if "statistics" not in payload["unavailable"]:
+        # After a failed read the empty rows are not evidence of gaps.
+        payload["provenance_counts"] = provenance_counts(result)
         payload["axle"] = {
             "delivery_rate": stats.axle.delivery_rate,
             "earnings_by_day": [
@@ -190,17 +195,42 @@ def add_range_details(
                 for day, earnings in stats.axle_earnings_by_day
             ],
             "events": [
-                {"start": outcome.event.start.isoformat(), "end": outcome.event.end.isoformat(),
+                {"start": outcome.event.start.astimezone(tz).isoformat(),
+                 "end": outcome.event.end.astimezone(tz).isoformat(),
                  "outcome": outcome.outcome, "delivered_kwh": outcome.delivered_kwh,
                  "earnings_gbp": outcome.earnings_gbp}
                 for outcome in stats.axle.events
             ],
         }
     unavailable = payload["unavailable"]
-    if evidence.evening is None:
+    try:
+        _add_solar(payload, result, resolution, evidence.evening)
+    except Exception:  # noqa: BLE001 - a malformed stored series loses only its own block
+        payload.pop("solar_accuracy", None)
+        log.warning("Evening-plan forecast read failed")
         unavailable["solar_accuracy"] = "evening_forecast_unreadable"
+    try:
+        _add_load(payload, result, tz, evidence.forecasts)
+    except Exception:  # noqa: BLE001 - a malformed stored series loses only its own block
+        payload.pop("load_accuracy", None)
+        log.warning("Load forecast history read failed")
+        unavailable["load_accuracy"] = "forecast_history_unreadable"
+    try:
+        _add_meter(payload, result, tz, evidence.meter)
+    except Exception:  # noqa: BLE001 - a malformed stored series loses only its own block
+        payload.pop("meter_reconciliation", None)
+        log.warning("Meter history read failed")
+        unavailable["meter_reconciliation"] = "meter_history_unreadable"
+
+
+def _add_solar(
+    payload: dict[str, Any], result: StatsResult, resolution: Resolution,
+    evening: list[SolarForecastSlot] | None,
+) -> None:
+    if evening is None:
+        payload["unavailable"]["solar_accuracy"] = "evening_forecast_unreadable"
     else:
-        solar = solar_accuracy(result, evidence.evening)
+        solar = solar_accuracy(result, evening)
         payload["solar_accuracy"] = {
             "mae_kwh": solar.mae_kwh, "bias_kwh": solar.bias_kwh,
             "scored_slots": solar.scored_slots, "total": len(solar.slots),
@@ -216,19 +246,31 @@ def add_range_details(
                  "band_hit": slot.band_hit}
                 for slot in solar.slots
             ]
-    if evidence.forecasts is None:
-        unavailable["load_accuracy"] = "forecast_history_unreadable"
+
+
+def _add_load(
+    payload: dict[str, Any], result: StatsResult, tz: tzinfo,
+    forecasts: list[ForecastHistoryRecord] | None,
+) -> None:
+    if forecasts is None:
+        payload["unavailable"]["load_accuracy"] = "forecast_history_unreadable"
     else:
-        accuracy = load_accuracy(result, evidence.forecasts, tz)
+        accuracy = load_accuracy(result, forecasts, tz)
         payload["load_accuracy"] = {
             "days": [_finite_fields({**asdict(day), "day": day.day.isoformat()})
                      for day in accuracy.days],
             "models": [_finite_fields(asdict(model)) for model in accuracy.models],
         }
-    if evidence.meter is None:
-        unavailable["meter_reconciliation"] = "meter_history_unreadable"
+
+
+def _add_meter(
+    payload: dict[str, Any], result: StatsResult, tz: tzinfo,
+    meter_rows: list[ConsumptionInterval] | None,
+) -> None:
+    if meter_rows is None:
+        payload["unavailable"]["meter_reconciliation"] = "meter_history_unreadable"
     else:
-        meter = meter_reconciliation(result, evidence.meter, tz)
+        meter = meter_reconciliation(result, meter_rows, tz)
         payload["meter_reconciliation"] = {
             "by_day": {day.isoformat(): fraction for day, fraction in meter.by_day.items()},
             "range_fraction": meter.range_fraction, "covered_days": meter.covered_days,

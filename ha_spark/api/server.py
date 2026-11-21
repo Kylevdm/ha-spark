@@ -921,7 +921,8 @@ def build_app(
             calendar = None
             if kind is not None:
                 if (kind not in ("day", "week", "month", "year", "all")
-                        or any(key in params for key in ("resolution", "from", "to"))):
+                        or any(key in params for key in ("resolution", "from", "to"))
+                        or len(params.getlist("range")) > 1 or len(params.getlist("at")) > 1):
                     return invalid
                 today = now.astimezone(tz).date()
                 try:
@@ -929,11 +930,12 @@ def build_app(
                     at = date.fromisoformat(raw_at)
                     if at.isoformat() != raw_at or at > today:
                         return invalid
-                    if kind == "all":  # Like the CLI, All time always ends now.
-                        at = today
                     start, stop = range_bounds(kind, at, tz)
                     # The statistics read also uses the preceding slot as pricing context.
                     (start - HALF_HOUR).astimezone(tz)
+                    if kind == "all":  # Like the CLI, All time always ends now.
+                        at = today
+                        start, stop = range_bounds(kind, at, tz)
                 except (ValueError, OverflowError):
                     return invalid
                 if kind == "all":

@@ -52,7 +52,9 @@ def test_statistics_calendar(tmp_path, monkeypatch, kind, anchor, start, end, re
     {"range": "day", "at": "20261025"}, {"range": "year", "at": "9999-01-01"},
     {"range": "day", "at": "0001-01-01"}, {"range": "day", "at": "2026-02-30"},
     {"range": "day", "resolution": "slot"}, {"range": "day", "from": "private"},
-    {"range": "day", "to": "private"},
+    {"range": "day", "to": "private"}, [("range", "private"), ("range", "day")],
+    [("range", "day"), ("at", "private"), ("at", "2026-10-01")],
+    {"range": "all", "at": "0001-01-01"},
 ])
 def test_statistics_invalid_calendar(tmp_path, monkeypatch, params):
     _frozen_server_clock(monkeypatch, datetime(2026, 10, 25, 12, tzinfo=UTC))
@@ -222,3 +224,45 @@ def test_statistics_keeps_ingress_and_repair_gates(tmp_path, status, peer, token
             "Authorization": "Bearer TOKEN", "X-Forwarded-For": peer, "X-Remote-User-Id": "owner",
         })
     assert response.status_code == status
+
+
+def test_statistics_calendar_day_carries_no_forecast_total(tmp_path, monkeypatch):
+    _frozen_server_clock(monkeypatch, datetime(2026, 9, 2, tzinfo=UTC))
+    with owner_client(_state(tmp_path, timezone=LONDON.key)) as client:
+        body = client.get("/api/history", params={"range": "day", "at": "2026-09-01"}).json()
+    assert body["totals"] == {"solar_forecast_kwh": None, "solar_measured_kwh": None}
+    assert all(bucket["solar_forecast_kwh"] is None for bucket in body["buckets"])
+
+
+def test_statistics_failed_ledger_reports_no_provenance(tmp_path, monkeypatch):
+    _frozen_server_clock(monkeypatch, datetime(2026, 9, 2, tzinfo=UTC))
+    monkeypatch.setattr(server, "window_evidence", AsyncMock(side_effect=OSError("x")))
+    with owner_client(_state(tmp_path, timezone=LONDON.key)) as client:
+        body = client.get("/api/history", params={"range": "day", "at": "2026-09-01"}).json()
+    assert body["unavailable"]["statistics"] == "ledger_unreadable"
+    assert "provenance_counts" not in body
+
+
+def test_statistics_axle_event_times_are_household(tmp_path, monkeypatch):
+    _frozen_server_clock(monkeypatch, datetime(2026, 9, 2, tzinfo=UTC))
+    at = datetime(2026, 9, 1, 7, tzinfo=UTC)
+    event = AxleEvent(start=at, end=at + timedelta(minutes=30),
+                      accepted_at=at - timedelta(hours=1), committed_kwh=1, rate_gbp_kwh=1.5)
+    monkeypatch.setattr(server, "window_evidence", AsyncMock(return_value=([event], [])))
+    with owner_client(_state(tmp_path, timezone=LONDON.key)) as client:
+        body = client.get("/api/history", params={"range": "day", "at": "2026-09-01"}).json()
+    assert body["axle"]["events"][0]["start"] == "2026-09-01T08:00:00+01:00"
+
+
+def test_statistics_failed_block_computation_degrades_alone(tmp_path, monkeypatch, caplog):
+    _frozen_server_clock(monkeypatch, datetime(2026, 9, 2, tzinfo=UTC))
+    monkeypatch.setattr(history, "meter_reconciliation", lambda *_: 1 / 0)
+    with owner_client(_state(tmp_path, timezone=LONDON.key)) as client:
+        response = client.get("/api/history", params={"range": "day", "at": "2026-09-01"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["unavailable"]["meter_reconciliation"] == "meter_history_unreadable"
+    assert "meter_reconciliation" not in body
+    assert {"solar_accuracy", "load_accuracy"} <= body.keys()
+    assert [r.getMessage() for r in caplog.records if r.name == history.__name__] == [
+        "Meter history read failed"]

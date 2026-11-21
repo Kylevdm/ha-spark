@@ -56,7 +56,10 @@ function Coverage({totals, soFar = false}) {
 
 function valueAt(bucket, field, day = false) {
     if (Object.hasOwn(flows, field)) {
-        return day ? bucket.flows?.[field]?.kwh : bucket.components_kwh[field];
+        const flow = bucket.flows?.[field];
+        // An absent flow is a gap, whatever a stored kWh says.
+        return day ? (flow?.provenance === "absent" ? null : flow?.kwh)
+            : bucket.components_kwh[field];
     }
     return bucket[field];
 }
@@ -263,9 +266,10 @@ function Results({payload, changeRange}) {
         <p>Household clock · ${clock(range.from)} to ${clock(range.to)}</p>
         <${Coverage} totals=${totals} soFar=${range.kind === "all" || stepDate(range, 1) > range.today}/>
         ${payload.unavailable.statistics ? html`<p>Energy ledger statistics unavailable.</p>` : null}
-        <p>Grid import provenance · Statistics fill: ${counts.statistics_fill ?? 0} ·
+        ${counts ? html`<p>Grid import provenance · Statistics fill: ${counts.statistics_fill ?? 0} ·
             Distributed: ${counts.distributed ?? 0} · Lower resolution (hourly):
-            ${counts.hourly_backfill ?? 0} · Gaps: ${(counts.gap ?? 0) + (counts.absent ?? 0)}</p>
+            ${counts.hourly_backfill ?? 0} · Gaps: ${(counts.gap ?? 0) + (counts.absent ?? 0)}</p>`
+            : html`<p>Grid import provenance unavailable.</p>`}
         <h2>Energy flows</h2>
         <${Metrics} entries=${flowEntries(totals)} cards=${true}/>
         <h2>Costs</h2>
