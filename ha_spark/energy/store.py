@@ -1,13 +1,16 @@
 """SQLite store for half-hourly Octopus meter history (aiosqlite).
 
 Octopus consumption is grid *import*, not house load — the battery/solar shape
-it, so it must not feed the load model (see forecast.py). It is retained for
-cost backtesting: what was actually bought from the grid, and when.
+it, so it must not feed the load model (see forecast.py). It is retained to
+reconcile what was bought from the grid against the energy ledger, and for the
+legacy cost backtest.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import asyncio
+from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
@@ -48,6 +51,39 @@ def _parse(raw: str) -> datetime:
     return datetime.fromisoformat(raw)
 
 
+@asynccontextmanager
+async def open_meter_db(db_path: str) -> AsyncIterator[aiosqlite.Connection | None]:
+    """Open the household DB without creating or modifying it."""
+    path = Path(db_path)
+    if not await asyncio.to_thread(path.exists):
+        yield None
+        return
+    resolved = await asyncio.to_thread(path.resolve)
+    async with aiosqlite.connect(resolved.as_uri() + "?mode=ro", uri=True) as db:
+        yield db
+
+
+async def has_meter_table(db: aiosqlite.Connection, name: str) -> bool:
+    async with db.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (name,)) as cursor:
+        return await cursor.fetchone() is not None
+
+
+async def read_consumption(
+    db_path: str, start: datetime, end: datetime,
+) -> list[ConsumptionInterval]:
+    """Read meter intervals starting in [start, end); a missing store is empty."""
+    async with open_meter_db(db_path) as db:
+        if db is None or not await has_meter_table(db, "consumption"):
+            return []
+        async with db.execute(
+            "SELECT interval_start, interval_end, kwh FROM consumption "
+            "WHERE interval_start >= ? AND interval_start < ? ORDER BY interval_start",
+            (_iso(start), _iso(end)),
+        ) as cursor:
+            return [ConsumptionInterval(_parse(s), _parse(e), float(k))
+                    for s, e, k in await cursor.fetchall()]
+
+
 class ConsumptionStore:
     """Async context manager over the consumption table; idempotent upserts."""
 
@@ -56,10 +92,15 @@ class ConsumptionStore:
         self._db: aiosqlite.Connection | None = None
 
     async def __aenter__(self) -> ConsumptionStore:
-        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(self._db_path)
-        await self._db.execute(_SCHEMA)
-        await self._db.commit()
+        await asyncio.to_thread(Path(self._db_path).parent.mkdir, parents=True, exist_ok=True)
+        db = await aiosqlite.connect(self._db_path)
+        try:
+            await db.execute(_SCHEMA)
+            await db.commit()
+        except BaseException:
+            await db.close()
+            raise
+        self._db = db
         return self
 
     async def __aexit__(
@@ -78,15 +119,17 @@ class ConsumptionStore:
             raise RuntimeError("ConsumptionStore used outside 'async with'")
         return self._db
 
-    async def upsert(self, rows: Iterable[ConsumptionInterval], source: str) -> int:
+    async def upsert(
+        self, rows: Iterable[ConsumptionInterval], source: str, *, now: datetime | None = None,
+    ) -> int:
         """Write intervals; return how many rows were actually new or changed."""
         db = self._conn
-        imported_at = datetime.now(UTC).isoformat()
+        imported_at = _iso(now or datetime.now(UTC))
         before = db.total_changes
-        for row in rows:
-            await db.execute(
-                _UPSERT, (_iso(row.start), _iso(row.end), row.kwh, source, imported_at)
-            )
+        await db.executemany(
+            _UPSERT,
+            ((_iso(row.start), _iso(row.end), row.kwh, source, imported_at) for row in rows),
+        )
         await db.commit()
         return db.total_changes - before
 
