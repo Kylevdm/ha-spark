@@ -102,6 +102,18 @@ def build_mcp(state: AppState) -> FastMCP:
         return (await tools.get_health(state.settings)).model_dump()
 
     @mcp.tool()
+    async def get_statistics(range: str, at: str | None = None) -> dict[str, object]:
+        """Measured energy, cost, battery savings, Axle earnings and coverage
+        for a household calendar range (day|week|month|year|all; at = YYYY-MM-DD, default today)."""
+        try:
+            result = await tools.get_statistics(state.settings, range, at)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+        except tools.StatisticsUnavailable:
+            raise ToolError("statistics unavailable") from None
+        return result.model_dump()
+
+    @mcp.tool()
     async def get_context() -> dict[str, object]:
         """Stored household context facts."""
         return (await tools.get_context(state.settings)).model_dump()

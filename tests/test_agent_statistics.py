@@ -1,0 +1,237 @@
+"""`get_statistics` agent tool: read-only, same figures as ``stats`` and ``/api/history``."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+from fastapi.testclient import TestClient
+from mcp.server.fastmcp.exceptions import ToolError
+
+from ha_spark import cli
+from ha_spark.agent.mcp_server import build_mcp
+from ha_spark.api.server import AppState, build_app
+from ha_spark.config import Settings
+from ha_spark.energy.axle_events import AxleEvent
+from ha_spark.energy.energy_ledger import ComponentFlow, EnergyLedger, LedgerSlot
+from ha_spark.energy.readiness_measurements import COMPONENTS
+from tests.api_helpers import owner_client
+from tests.authority_helpers import seed_settings
+from tests.test_api_history import _frozen_server_clock
+from tests.test_stats_ranges import LONDON, priced_row
+
+CANARY = "SECRET-SWEEP-617-DO-NOT-ECHO"
+
+
+def _state(tmp_path: Path, **settings_kw: object) -> AppState:
+    settings_kw.setdefault("db_path", str(tmp_path / "db.sqlite"))
+    settings_kw.setdefault("agent_surface", "on")
+    settings_kw.setdefault("agent_exposure", "read")
+    service = seed_settings(
+        tmp_path, settings=Settings(ha_url="http://ha.test", ha_token="t", **settings_kw)
+    )
+    return AppState(service.settings, tmp_path / "options.json", settings_service=service)
+
+
+def _export_row(start: datetime, exported: float) -> LedgerSlot:
+    base = priced_row(start, 0)
+    components = {name: ComponentFlow(kwh=0, provenance="boundary") for name in COMPONENTS}
+    components["grid_export"] = ComponentFlow(kwh=exported, provenance="boundary")
+    return base.model_copy(update={"components": components})
+
+
+def _patch_ledger_and_axle(
+    monkeypatch: pytest.MonkeyPatch,
+    slot: datetime,
+    exported: tuple[float, float],
+    event: AxleEvent | None = None,
+) -> None:
+    rows = [_export_row(slot, exported[0]), _export_row(slot + timedelta(minutes=30), exported[1])]
+
+    async def slots(self, start, end):
+        return rows
+
+    async def evidence(db_path, start, end):
+        if event is None:
+            return [], []
+        return [event], []
+
+    monkeypatch.setattr(EnergyLedger, "slots", slots)
+    monkeypatch.setattr("ha_spark.agent.tools.window_evidence", evidence)
+    monkeypatch.setattr("ha_spark.api.server.window_evidence", evidence)
+    monkeypatch.setattr("ha_spark.cli.window_evidence", evidence)
+
+
+def test_agent_statistics_matches_history_and_cli_for_week(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    frozen = datetime(2026, 9, 8, tzinfo=LONDON)
+    _frozen_server_clock(monkeypatch, frozen)
+    state = _state(tmp_path, timezone=LONDON.key)
+    slot = datetime(2026, 9, 1, 9, tzinfo=LONDON).astimezone(UTC)
+    event = AxleEvent.model_validate({
+        "start": slot, "end": slot + timedelta(hours=1),
+        "accepted_at": slot - timedelta(hours=1),
+        "committed_kwh": 3, "rate_gbp_kwh": 1.5,
+    })
+    _patch_ledger_and_axle(monkeypatch, slot, (2, 1), event=event)
+    monkeypatch.setattr(cli, "load_settings", lambda **_: state.settings)
+
+    with owner_client(state) as client:
+        history = client.get("/api/history", params={
+            "resolution": "day",
+            "from": "2026-08-30T23:00:00+00:00",
+            "to": "2026-09-06T23:00:00+00:00",
+        })
+    assert history.status_code == 200
+    history_totals = history.json()["range_totals"]
+
+    with owner_client(state) as client:
+        agent = client.get("/agent/statistics", params={"range": "week", "at": "2026-09-01"})
+    assert agent.status_code == 200
+    agent_body = agent.json()
+    assert agent_body["range"] == "week"
+    assert agent_body["at"] == "2026-09-01"
+    assert agent_body["resolution"] == "day"
+    assert agent_body["timezone"] == LONDON.key
+    assert agent_body["range_totals"] == history_totals
+    assert agent_body["axle"]["events"][0]["outcome"] == "delivered"
+    assert agent_body["axle"]["events"][0]["earnings_gbp"] == 4.5
+    assert agent_body["axle"]["delivery_rate"] == 1.0
+
+    assert cli.main(["stats", "--range", "week", "--at", "2026-09-01"]) == 0
+    out = capsys.readouterr().out
+    totals = history_totals
+    assert f'Actual cost={totals["actual_cost"]:.2f} GBP' in out
+    assert f'No-battery cost={totals["no_battery_cost"]:.2f} GBP' in out
+    assert f'Battery savings={totals["battery_savings"]:.2f} GBP' in out
+    assert f'Coverage: {totals["covered_slots"]}/{totals["total_slots"]} slots' in out
+    assert "Axle delivery rate" in out
+    assert "Axle earnings" in out
+
+
+async def test_mcp_get_statistics_lists_at_read_and_above(tmp_path: Path) -> None:
+    for exposure in ("read", "read_act", "read_write"):
+        mcp = build_mcp(_state(tmp_path, agent_exposure=exposure))
+        assert "get_statistics" in {t.name for t in await mcp.list_tools()}
+
+
+async def test_mcp_get_statistics_absent_when_surface_off(tmp_path: Path) -> None:
+    mcp = build_mcp(_state(tmp_path, agent_exposure="read_write", agent_surface="off"))
+    assert "get_statistics" not in {t.name for t in await mcp.list_tools()}
+    with pytest.raises(ToolError):
+        await mcp.call_tool("get_statistics", {"range": "week"})
+
+
+@pytest.mark.parametrize(("params", "text"), [
+    ({"range": "bad"}, "invalid statistics range"),
+    ({"range": "week", "at": "not-a-date"}, "at must be a valid YYYY-MM-DD date"),
+    ({"range": "week", "at": "2026-02-29"}, "at must be a valid YYYY-MM-DD date"),
+])
+async def test_mcp_get_statistics_rejects_invalid_input_without_echo(
+    tmp_path: Path, params: dict[str, str], text: str,
+) -> None:
+    mcp = build_mcp(_state(tmp_path, agent_exposure="read"))
+    with pytest.raises(ToolError) as excinfo:
+        await mcp.call_tool("get_statistics", params)
+    assert text in str(excinfo.value)
+    if "range" in params:
+        assert params["range"] not in str(excinfo.value)
+    if "at" in params and params["at"]:
+        assert params["at"] not in str(excinfo.value)
+
+
+def test_route_get_statistics_200_and_400(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    frozen = datetime(2026, 9, 8, tzinfo=LONDON)
+    _frozen_server_clock(monkeypatch, frozen)
+    state = _state(tmp_path, timezone=LONDON.key)
+    slot = datetime(2026, 9, 1, 9, tzinfo=LONDON).astimezone(UTC)
+    monkeypatch.setattr(EnergyLedger, "slots", AsyncMock(return_value=[priced_row(slot, 2)]))
+
+    with owner_client(state) as client:
+        ok = client.get("/agent/statistics", params={"range": "week", "at": "2026-09-01"})
+    assert ok.status_code == 200
+    assert ok.json()["range_totals"]["components_kwh"]["grid_import"] == 2
+
+    with owner_client(state) as client:
+        bad_range = client.get("/agent/statistics", params={"range": "bad"})
+    assert bad_range.status_code == 400
+    assert bad_range.json()["detail"] == "invalid statistics range"
+
+    with owner_client(state) as client:
+        bad_date = client.get("/agent/statistics", params={"range": "week", "at": "not-a-date"})
+    assert bad_date.status_code == 400
+    assert bad_date.json()["detail"] == "at must be a valid YYYY-MM-DD date"
+    assert "not-a-date" not in bad_date.text
+
+
+def test_route_get_statistics_404_when_surface_off(tmp_path: Path) -> None:
+    state = _state(tmp_path, agent_surface="off")
+    with TestClient(build_app(state)) as client:
+        assert client.get("/agent/statistics", params={"range": "week"}).status_code == 404
+
+
+async def test_statistics_response_contains_no_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frozen = datetime(2026, 9, 8, tzinfo=LONDON)
+    _frozen_server_clock(monkeypatch, frozen)
+    state = _state(
+        tmp_path,
+        timezone=LONDON.key,
+        octopus_api_key=CANARY,
+        agent_api_token=CANARY,
+    )
+    slot = datetime(2026, 9, 1, 9, tzinfo=LONDON).astimezone(UTC)
+    monkeypatch.setattr(EnergyLedger, "slots", AsyncMock(return_value=[priced_row(slot, 2)]))
+
+    with owner_client(state) as client:
+        route = client.get("/agent/statistics", params={"range": "week", "at": "2026-09-01"})
+    assert route.status_code == 200
+    assert CANARY not in route.text
+
+    mcp = build_mcp(state)
+    _content, payload = await mcp.call_tool("get_statistics", {"range": "week", "at": "2026-09-01"})
+    assert CANARY not in str(payload)
+
+
+def test_route_fails_closed_on_unreadable_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    frozen = datetime(2026, 9, 8, tzinfo=LONDON)
+    _frozen_server_clock(monkeypatch, frozen)
+    state = _state(tmp_path, timezone=LONDON.key)
+
+    async def unreadable(*args):
+        raise OSError("private-path")
+
+    monkeypatch.setattr(EnergyLedger, "slots", unreadable)
+    caplog.set_level("WARNING")
+    with owner_client(state) as client:
+        resp = client.get("/agent/statistics", params={"range": "week", "at": "2026-09-01"})
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "statistics unavailable"
+    assert "private-path" not in resp.text
+    assert any("Statistics read failed" in rec.message for rec in caplog.records)
+
+
+async def test_mcp_fails_closed_on_unreadable_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    frozen = datetime(2026, 9, 8, tzinfo=LONDON)
+    _frozen_server_clock(monkeypatch, frozen)
+    state = _state(tmp_path, timezone=LONDON.key)
+
+    async def unreadable(*args):
+        raise OSError("private-path")
+
+    monkeypatch.setattr(EnergyLedger, "slots", unreadable)
+    caplog.set_level("WARNING")
+    mcp = build_mcp(state)
+    with pytest.raises(ToolError) as excinfo:
+        await mcp.call_tool("get_statistics", {"range": "week", "at": "2026-09-01"})
+    assert "statistics unavailable" in str(excinfo.value)
+    assert "private-path" not in str(excinfo.value)
+    assert any("Statistics read failed" in rec.message for rec in caplog.records)

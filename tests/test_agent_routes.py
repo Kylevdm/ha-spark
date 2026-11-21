@@ -168,6 +168,7 @@ def test_read_write_advertises_the_full_surface_in_schema(tmp_path: Path) -> Non
         "/agent/forecast": {"get"},
         "/agent/predictions": {"get"},
         "/agent/health": {"get"},
+        "/agent/statistics": {"get"},
         "/agent/context": {"get", "post"},
         "/agent/run": {"post"},
         "/agent/config": {"post"},

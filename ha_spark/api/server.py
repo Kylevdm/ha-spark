@@ -563,6 +563,19 @@ def _agent_router(state: AppState) -> APIRouter:
     async def health_() -> tools.HealthResult:
         return await tools.get_health(state.settings)
 
+    @router.get("/statistics", dependencies=[Depends(_Gate(state, "get_statistics"))])
+    async def statistics(range: str, at: str | None = None) -> tools.StatisticsResult:
+        try:
+            return await tools.get_statistics(state.settings, range, at)
+        except ValueError as exc:
+            detail = str(exc)
+            if detail not in ("invalid statistics range", "at must be a valid YYYY-MM-DD date"):
+                detail = "invalid statistics range"
+            raise HTTPException(status_code=400, detail=detail) from exc
+        except tools.StatisticsUnavailable:
+            log.warning("Statistics read failed")
+            raise HTTPException(status_code=503, detail="statistics unavailable") from None
+
     @router.get("/context", dependencies=[Depends(_Gate(state, "get_context"))])
     async def context() -> tools.ContextResult:
         return await tools.get_context(state.settings)

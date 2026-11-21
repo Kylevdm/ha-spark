@@ -34,6 +34,7 @@ OPERATION_TIERS: dict[str, Tier] = {
     "get_forecast": "read",
     "get_predictions": "read",
     "get_health": "read",
+    "get_statistics": "read",
     "get_context": "read",
     "add_context": "act",
     "run_plan": "act",
