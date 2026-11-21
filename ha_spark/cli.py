@@ -43,6 +43,7 @@ from ha_spark.dashboard import build_dashboard
 from ha_spark.devices import get_device
 from ha_spark.devices.inverters.solis_clock import clock_entity, clock_error, describe_error
 from ha_spark.energy import habits
+from ha_spark.energy.axle_events import window_evidence
 from ha_spark.energy.backtest import backtest_cost, format_backtest
 from ha_spark.energy.context import KINDS, ContextStore
 from ha_spark.energy.derived_base_load import (
@@ -329,7 +330,12 @@ async def _cmd_stats(settings: Settings, *, kind: str, at: str | None) -> int:
         return 1
     resolution: Resolution = ("slot" if kind == "day" else "day" if kind in ("week", "month")
                               else "month")
-    stats = summarise(rows, start, end, tz, resolution)
+    try:
+        events, event_rows = await window_evidence(settings.db_path, start, end)
+    except Exception:
+        print("Could not read Axle event history", file=sys.stderr)
+        return 1
+    stats = summarise(rows, start, end, tz, resolution, events, event_rows=event_rows)
     if resolution == "slot":
         _print_slot_flows(stats, tz)
     else:
@@ -432,6 +438,12 @@ def _print_costs(stats: RangeStats, *, show_slots: bool) -> None:
         f"Cost coverage: {totals.priced_slots}/{totals.total_slots} slots "
         f"({totals.cost_coverage:.1%})"
     )
+    for day, earnings in stats.axle_earnings_by_day:
+        if earnings == 0:  # Only days an event touched.
+            continue
+        print(f"Axle earnings (estimated) {day}: {_stats_money(earnings)}")
+    rate = stats.axle.delivery_rate
+    print("Axle delivery rate: " + ("unknown" if rate is None else f"{rate:.1%}"))
 
 
 async def _cmd_readiness_show(settings: Settings) -> int:

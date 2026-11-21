@@ -347,3 +347,48 @@ def test_overflowing_measured_total_is_unknown_not_a_500():
     assert payload["totals"]["solar_measured_kwh"] is None
     assert [b["solar_measured_kwh"] for b in payload["buckets"]] == [6e307] * 4
     _json.dumps(payload, allow_nan=False)
+
+
+def _axle_history(tmp_path, monkeypatch, evidence):
+    from ha_spark.energy.axle_events import AxleEvent
+    from tests.test_stats_cost import row
+
+    frozen = datetime(2026, 5, 1, 12, tzinfo=LONDON)
+    _frozen_server_clock(monkeypatch, frozen)
+    slot = _midnight(frozen).astimezone(UTC) + timedelta(hours=9)
+
+    async def slots(self, start, end):
+        return [row(slot, exported=2), row(slot + timedelta(minutes=30), exported=1)]
+
+    async def window_evidence(db_path, start, end):
+        return evidence([AxleEvent.model_validate({
+            "start": slot, "end": slot + timedelta(hours=1),
+            "accepted_at": slot - timedelta(hours=1),
+            "committed_kwh": 3, "rate_gbp_kwh": 1.5,
+        })])
+
+    monkeypatch.setattr(EnergyLedger, "slots", slots)
+    monkeypatch.setattr("ha_spark.api.server.window_evidence", window_evidence)
+    with owner_client(_state(tmp_path)) as client:
+        response = client.get("/api/history?resolution=slot")
+    assert response.status_code == 200
+    return slot, response.json()
+
+
+def test_history_credits_axle_events_in_actual_cost(tmp_path, monkeypatch):
+    slot, body = _axle_history(tmp_path, monkeypatch, lambda events: (events, []))
+    by_start = {datetime.fromisoformat(b["start"]): b for b in body["buckets"]}
+    first = by_start[slot]
+    second = by_start[slot + timedelta(minutes=30)]
+    credits = [bucket["cost_inputs"]["axle_earnings"] for bucket in (first, second)]
+    assert credits == [3, 1.5]
+    assert first["actual_cost"] == 0.75 - 0.25 - 3
+
+
+def test_history_fails_closed_when_axle_history_is_unreadable(tmp_path, monkeypatch):
+    def unreadable(events):
+        raise OSError("private-path")
+
+    _, body = _axle_history(tmp_path, monkeypatch, unreadable)
+    assert body["unavailable"]["statistics"] == "ledger_unreadable"
+    assert body["range_totals"]["actual_cost"] is None

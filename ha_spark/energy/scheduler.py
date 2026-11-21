@@ -79,6 +79,7 @@ stay gaps; mid-slot requests never rewrite a slot. A separate background energy
 ledger records closed-slot flows and rates from before the boundary replan.
 Another background task fills settled ledger gaps from recorder statistics.
 A separate meter-history task pulls Octopus grid import for reconciliation only.
+Axle event history retains lifecycle evidence independently of the notice queue.
 Recording failures are isolated.
 """
 
@@ -132,6 +133,7 @@ from ha_spark.devices.inverters.solis import (
     validated_fallback_current_a,
 )
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome, is_verified, legacy_action_line
+from ha_spark.energy.axle_events import AxleEventRecorder
 from ha_spark.energy.carbon import CarbonRefresher
 from ha_spark.energy.derived_base_load import (
     BACKFILL_NAME,
@@ -2110,6 +2112,8 @@ async def _run_paired(
     backfill_retry_at: datetime | None = None
     ledger_fill_task: asyncio.Task[None] | None = None
     meter_task: asyncio.Task[MeterPullOutcome] | None = None
+    axle_task: asyncio.Task[None] | None = None
+    axle_recorder = AxleEventRecorder()
     carbon = CarbonRefresher(settings.db_path, lambda: state.settings.carbon_region)
 
     async def record_readiness(tick_settings: Settings, tick_now: datetime) -> None:
@@ -2153,6 +2157,8 @@ async def _run_paired(
     try:
         while True:
             settings = state.settings  # hot-reloaded by POST /api/config
+            # Retain lifecycle facts before the notice pass can acknowledge them.
+            axle_recorder.capture_native(state.integration_link.v4, settings, last_revision)
             # Capture with the settings snapshot, before any I/O can accept a save.
             context.planned_generation.set(context.config_generation)
             # The accepted limits this tick plans under, captured with their key so
@@ -2591,6 +2597,12 @@ async def _run_paired(
                 ledger_fill_task = asyncio.create_task(fill_closed_days(settings, now))
             if meter_task is None or meter_task.done():
                 meter_task = asyncio.create_task(pull_meter_history(settings, now))
+            if replanned:
+                axle_recorder.capture_read(settings, last_revision)
+            if axle_task is None or axle_task.done():
+                axle_task = asyncio.create_task(axle_recorder.record_tick(
+                    settings, now, last_revision, retired,
+                ))
             # The real clock: tests replace this module's ``datetime`` to script ``now``.
             state.loop_tick = utc_datetime.now(UTC)
             await asyncio.sleep(poll_seconds)
@@ -2606,6 +2618,8 @@ async def _run_paired(
             ledger_fill_task.cancel()
         if meter_task is not None:
             meter_task.cancel()
+        if axle_task is not None:
+            axle_task.cancel()
         if readiness_task is not None:
             readiness_task.cancel()
             await asyncio.gather(readiness_task, return_exceptions=True)
@@ -2617,6 +2631,8 @@ async def _run_paired(
             await asyncio.gather(ledger_fill_task, return_exceptions=True)
         if meter_task is not None:
             await asyncio.gather(meter_task, return_exceptions=True)
+        if axle_task is not None:
+            await asyncio.gather(axle_task, return_exceptions=True)
         state.executor = None
         if pending is not None and not pending.future.done():
             pending.future.set_result(Reply(error="daemon stopped during request"))

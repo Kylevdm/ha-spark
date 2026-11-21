@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
-from dataclasses import dataclass
+from bisect import bisect_left
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
+from itertools import chain
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
 
@@ -15,6 +17,7 @@ from ha_spark.energy.readiness_measurements import COMPONENTS, HALF_HOUR, day_bo
 from ha_spark.energy.tariff import HAPPY_HOUR_ALLOWANCE_KWH
 
 if TYPE_CHECKING:
+    from ha_spark.energy.axle_events import AxleEvent
     from ha_spark.energy.evening_forecast import SolarForecastSlot
 
 
@@ -78,6 +81,77 @@ PRICEABLE = frozenset({"boundary", "statistics_fill"})
 _HOUR = timedelta(hours=1)
 
 
+AxleStatus = Literal["unknown", "cancelled", "delivered", "partial", "missed"]
+
+
+@dataclass(frozen=True)
+class AxleOutcome:
+    event: AxleEvent
+    outcome: AxleStatus = "unknown"
+    delivered_kwh: float | None = None
+    earnings_gbp: float | None = None
+
+
+@dataclass(frozen=True)
+class AxleSummary:
+    events: tuple[AxleOutcome, ...]
+
+    @property
+    def delivery_rate(self) -> float | None:
+        scored = [row for row in self.events if row.outcome in ("delivered", "partial", "missed")]
+        return sum(row.outcome == "delivered" for row in scored) / len(scored) if scored else None
+
+
+_NO_AXLE = AxleSummary(())
+
+
+def axle_outcomes(events: Iterable[AxleEvent], rows: Iterable[LedgerSlot]) -> AxleSummary:
+    """Score accepted windows from complete measured slots, including any later fills.
+
+    Ledger rows represent closed slots. A partial edge, a missing slot or any
+    unmeasured cost component in one slot makes the whole window ineligible
+    for an estimate (owner ruling, 2026-11-21).
+    """
+    by_start = {row.slot_start.astimezone(UTC): row for row in rows}
+    outcomes: list[AxleOutcome] = []
+    for event in events:
+        if event.cancelled_at is not None:
+            outcomes.append(AxleOutcome(event, "cancelled", earnings_gbp=0.0))
+            continue
+        start, end = event.start.astimezone(UTC), event.end.astimezone(UTC)
+        count, edge = divmod(end - start, HALF_HOUR)
+        delivered = 0.0
+        if not edge and count <= len(by_start):
+            for i in range(count):
+                row = by_start.get(start + i * HALF_HOUR)
+                # A gap in any measured component, not only grid export, leaves no estimate.
+                values = _measured(row) if row is not None else "missing_slot"
+                export = row.components.get("grid_export") if row is not None else None
+                # An unconfigured export meter prices as 0 kWh but is no delivery evidence.
+                if isinstance(values, str) or export is None or export.provenance not in PRICEABLE:
+                    break
+                delivered += values["grid_export"]
+            else:
+                if math.isfinite(delivered):
+                    outcome: AxleStatus = "unknown"
+                    if event.committed_kwh:
+                        fraction = delivered / event.committed_kwh
+                        # Decimal kWh readings can land one float rounding step below a threshold.
+                        if fraction >= math.nextafter(0.9, 0.0):
+                            outcome = "delivered"
+                        elif fraction >= math.nextafter(0.1, 0.0):
+                            outcome = "partial"
+                        else:
+                            outcome = "missed"
+                    earnings = delivered * event.rate_gbp_kwh
+                    outcomes.append(AxleOutcome(
+                        event, outcome, delivered, earnings if math.isfinite(earnings) else None,
+                    ))
+                    continue
+        outcomes.append(AxleOutcome(event))
+    return AxleSummary(tuple(outcomes))
+
+
 @dataclass(frozen=True)
 class CostInputs:
     rates: RateEvidence
@@ -100,6 +174,8 @@ class SlotCost:
     actual_cost: float | None = None
     no_battery_cost: float | None = None
     battery_savings: float | None = None
+    # The slot's Axle credit, priced or not; None means its event has no estimate.
+    axle_credit: float | None = 0.0
 
 
 @dataclass(frozen=True)
@@ -109,24 +185,23 @@ class CostResult:
     actual_cost: float | None
     no_battery_cost: float | None
     battery_savings: float | None
+    axle: AxleSummary = _NO_AXLE
+
+    @property
+    def axle_earnings_by_day(self) -> dict[date, float | None]:
+        """Each household day's estimated Axle credit; unknown when any slot lacks an estimate."""
+        by_day: dict[date, list[float | None]] = {}
+        for slot in self.slots:
+            by_day.setdefault(slot.start.date(), []).append(slot.axle_credit)
+        return {day: None if None in values else _total(values) for day, values in by_day.items()}
 
     @property
     def cost_coverage(self) -> float:
         return self.priced_slots / len(self.slots) if self.slots else 0.0
 
 
-def _price_slot(bucket: StatsBucket, previous: SlotCost | None) -> SlotCost:
-    row = bucket.slot
-    start = bucket.start
-    if row is None:
-        return SlotCost(start, reason="missing_slot")
-    import_rate, export_rate = row.import_rate, row.export_rate
-    if import_rate is None or export_rate is None:
-        return SlotCost(start, reason=row.exclusions[0] if row.exclusions else "rate_not_captured")
-    house = row.house_load_kwh
-    if house is None:
-        return SlotCost(start, reason="missing_house_load")
-
+def _measured(row: LedgerSlot) -> dict[str, float] | str:
+    """The cost components of a slot, or the reason one is a ledger gap."""
     values: dict[str, float] = {}
     for name in COMPONENTS:
         if name == "v2l":  # Not used to derive house load.
@@ -138,7 +213,27 @@ def _price_slot(bucket: StatsBucket, previous: SlotCost | None) -> SlotCost:
               and flow.reason == "not_configured"):
             values[name] = 0.0
         else:
-            return SlotCost(start, reason=f"untrusted_{name}")
+            return f"untrusted_{name}"
+    return values
+
+
+def _price_slot(bucket: StatsBucket, previous: SlotCost | None, axle: float | None) -> SlotCost:
+    row = bucket.slot
+    start = bucket.start
+    if axle is None:
+        return SlotCost(start, reason="axle_no_estimate")
+    if row is None:
+        return SlotCost(start, reason="missing_slot")
+    import_rate, export_rate = row.import_rate, row.export_rate
+    if import_rate is None or export_rate is None:
+        return SlotCost(start, reason=row.exclusions[0] if row.exclusions else "rate_not_captured")
+    house = row.house_load_kwh
+    if house is None:
+        return SlotCost(start, reason="missing_house_load")
+
+    values = _measured(row)
+    if isinstance(values, str):
+        return SlotCost(start, reason=values)
     imported, exported = values["grid_import"], values["grid_export"]
     solar = values["solar_generation"]
     baseline_import, baseline_export = max(0.0, house - solar), max(0.0, solar - house)
@@ -173,7 +268,6 @@ def _price_slot(bucket: StatsBucket, previous: SlotCost | None) -> SlotCost:
         free = min(imported, max(0.0, remaining))
         baseline_free = min(baseline_import, max(0.0, baseline_remaining))
 
-    axle = 0.0
     actual = (imported - free) * import_rate - exported * export_rate - axle
     baseline = (baseline_import - baseline_free) * import_rate - baseline_export * export_rate
     inputs = CostInputs(
@@ -188,15 +282,41 @@ def _price_slot(bucket: StatsBucket, previous: SlotCost | None) -> SlotCost:
     )
 
 
-def cost_stats(result: StatsResult) -> CostResult:
-    """Price measured half-hours at captured rates, excluding standing charges."""
+def cost_stats(
+    result: StatsResult, events: Sequence[AxleEvent] = (), *, event_rows: Iterable[LedgerSlot] = (),
+) -> CostResult:
+    """Price measured half-hours, with supplemental rows for events crossing the range edges."""
+    starts = [bucket.start.astimezone(UTC) for bucket in result.buckets]
+    credits: list[float | None] = [0.0] * len(starts)
+    rows = (bucket.slot for bucket in result.buckets if bucket.slot is not None)
+    axle = axle_outcomes(events, chain(event_rows, rows)) if events else _NO_AXLE
+    for outcome in axle.events:
+        if outcome.outcome == "cancelled":
+            continue
+        event = outcome.event
+        start, end = event.start.astimezone(UTC), event.end.astimezone(UTC)
+        first = bisect_left(starts, start)
+        if first and start - starts[first - 1] < HALF_HOUR:
+            first -= 1  # Include a partial leading edge in the unpriced span.
+        for i in range(first, bisect_left(starts, end)):
+            if outcome.earnings_gbp is None:
+                credits[i] = None
+            elif (credit := credits[i]) is not None:
+                row = result.buckets[i].slot
+                export = row.components.get("grid_export") if row is not None else None
+                credits[i] = (
+                    _total((credit + export.kwh * event.rate_gbp_kwh,))
+                    if export is not None and export.kwh is not None else None
+                )
+
     slots: list[SlotCost] = []
-    for bucket in result.buckets:
-        slots.append(_price_slot(bucket, slots[-1] if slots else None))
-    return _sum_costs(tuple(slots))
+    for bucket, credit in zip(result.buckets, credits, strict=True):
+        cost = _price_slot(bucket, slots[-1] if slots else None, credit)
+        slots.append(replace(cost, axle_credit=credit))
+    return _sum_costs(tuple(slots), axle)
 
 
-def _sum_costs(slots: tuple[SlotCost, ...]) -> CostResult:
+def _sum_costs(slots: tuple[SlotCost, ...], axle: AxleSummary = _NO_AXLE) -> CostResult:
     priced = [slot for slot in slots if slot.inputs is not None]
 
     def total(values: list[float | None]) -> float | None:
@@ -206,7 +326,7 @@ def _sum_costs(slots: tuple[SlotCost, ...]) -> CostResult:
     return CostResult(
         slots, len(priced), total([slot.actual_cost for slot in priced]),
         total([slot.no_battery_cost for slot in priced]),
-        total([slot.battery_savings for slot in priced]),
+        total([slot.battery_savings for slot in priced]), axle,
     )
 
 
@@ -271,6 +391,8 @@ class RangeBucket:
 class RangeStats:
     buckets: tuple[RangeBucket, ...]
     totals: RangeTotals
+    axle: AxleSummary = _NO_AXLE
+    axle_earnings_by_day: tuple[tuple[date, float | None], ...] = ()
 
 
 def _range_totals(energy: StatsResult, costs: CostResult, count: int) -> RangeTotals:
@@ -284,7 +406,8 @@ def _range_totals(energy: StatsResult, costs: CostResult, count: int) -> RangeTo
 
 def summarise(
     rows: Iterable[LedgerSlot], start: datetime, end: datetime, tz: tzinfo,
-    resolution: Resolution,
+    resolution: Resolution, events: Sequence[AxleEvent] = (), *,
+    event_rows: Iterable[LedgerSlot] = (),
 ) -> RangeStats:
     """Summarise an aligned span [start, end) on the household half-hour grid.
 
@@ -316,12 +439,12 @@ def summarise(
                     by_start[at] = StatsBucket(local, row)
         energy = _energise(tuple(by_start[at] for at in sorted(by_start)))
     if context is None:
-        costs = cost_stats(energy)
+        costs = cost_stats(energy, events, event_rows=event_rows)
     else:
         lead = StatsBucket(before.astimezone(tz), context)
         priced = cost_stats(StatsResult((lead, *energy.buckets), energy.totals,
-                                        energy.covered_slots))
-        costs = _sum_costs(priced.slots[1:])
+                                        energy.covered_slots), events, event_rows=event_rows)
+        costs = _sum_costs(priced.slots[1:], priced.axle)
     buckets: list[RangeBucket] = []
     if resolution == "slot":
         for bucket, cost in zip(energy.buckets, costs.slots, strict=True):
@@ -347,7 +470,10 @@ def summarise(
                                    _sum_costs(costs.slots[left:right]), index(stop) - index(cursor))
             buckets.append(RangeBucket(label, totals))
             cursor, left = stop, right
-    return RangeStats(tuple(buckets), _range_totals(energy, costs, max(0, index(end))))
+    return RangeStats(
+        tuple(buckets), _range_totals(energy, costs, max(0, index(end))), costs.axle,
+        tuple(costs.axle_earnings_by_day.items()),
+    )
 
 
 def provenance_counts(result: StatsResult) -> dict[str, int]:

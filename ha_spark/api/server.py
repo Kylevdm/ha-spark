@@ -79,8 +79,9 @@ from ha_spark.daemon_channel import Request as DaemonRequest
 from ha_spark.devices.execution import execution_context
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 from ha_spark.energy import v2l
+from ha_spark.energy.axle_events import AxleEvent, window_evidence
 from ha_spark.energy.carbon import carbon_payload
-from ha_spark.energy.energy_ledger import EnergyLedger
+from ha_spark.energy.energy_ledger import EnergyLedger, LedgerSlot
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.models import ChargePlan, ExportIntent
 from ha_spark.energy.plan_run import StoredPlanRun
@@ -936,9 +937,13 @@ def build_app(
                 return invalid
 
             ledger_failed = forecast_failed = False
+            events: list[AxleEvent] = []
+            event_rows: list[LedgerSlot] = []
             try:
                 # One slot earlier: pricing context for a Happy Hour that started before `from`.
                 rows = await EnergyLedger(settings.db_path).slots(start - HALF_HOUR, end)
+                # Costs without the Axle credits they owe would be silently wrong: fail closed.
+                events, event_rows = await window_evidence(settings.db_path, start, end)
             except Exception:  # noqa: BLE001 - stale or unreadable storage degrades the series
                 log.warning("Energy ledger read failed")
                 rows = []
@@ -958,7 +963,7 @@ def build_app(
 
             def render() -> JSONResponse:
                 payload = history_payload(starts, recorded, tz, measured_reason, measured, now)
-                stats = summarise(rows, start, end, tz, resolution)
+                stats = summarise(rows, start, end, tz, resolution, events, event_rows=event_rows)
                 return JSONResponse(add_statistics(
                     payload, stats, resolution,
                     ledger_failed=ledger_failed, forecast_failed=forecast_failed,
