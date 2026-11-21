@@ -184,3 +184,16 @@ async def test_scheduler_hook_failure_logs_fixed_text_and_never_raises(
     )
     assert "Recording evening-plan solar forecast failed" in caplog.text
     assert "secret-payload" not in caplog.text
+
+
+async def test_native_median_is_stored_whatever_the_planning_percentile(tmp_path):
+    store = EveningForecastStore(str(tmp_path / "household.db"))
+    start = datetime.combine(DAY, time.min, TZ).astimezone(UTC)
+    # Planned at P90 (3 kWh); the stored P50 is still the native median.
+    await store.record(
+        inputs_at(datetime(2026, 1, 1, 23, tzinfo=TZ), 3), CFG, TZ,
+        native_slots=((start, 2, 4, 6),),
+    )
+    slots = await store.slots(DAY, DAY + timedelta(days=1))
+    assert (slots[0].p10_kwh, slots[0].p50_kwh, slots[0].p90_kwh) == (1, 2, 3)
+    assert slots[1].p50_kwh == 3  # No native slot: the planning input stands.

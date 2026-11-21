@@ -89,22 +89,27 @@ class EveningForecastStore:
             and len(solar) == len(known) == len(geometry.slot_starts)
         ):
             # Match the plan view: use the raw planning input even when the
-            # selected solar percentile isn't 50.
+            # selected solar percentile isn't 50 (native slots replace it below).
             p50_by_start = {
                 start.astimezone(UTC): kwh
                 for start, kwh, exists in zip(geometry.slot_starts, solar, known, strict=True)
                 if exists
             }
-        bands = {start.astimezone(UTC): (p10 / 2, p90 / 2)
-                 for start, p10, _, p90 in native_slots}
+        bands = {start.astimezone(UTC): (p10 / 2, p50 / 2, p90 / 2)
+                 for start, p10, p50, p90 in native_slots}
         slots: list[SolarForecastSlot] = []
         start = datetime.combine(day, time.min, tz).astimezone(UTC)
         end = datetime.combine(day + _DAY, time.min, tz).astimezone(UTC)
         while start < end:
             # A native date the planner didn't trust must not supply bands.
-            p10, p90 = bands.get(start, (None, None)) if start in p50_by_start else (None, None)
+            # Where it did, store the native median rather than the planning
+            # percentile.
+            p50 = p50_by_start.get(start)
+            p10 = p90 = None
+            if p50 is not None and start in bands:
+                p10, p50, p90 = bands[start]
             slots.append(SolarForecastSlot(
-                start=start, p10_kwh=p10, p50_kwh=p50_by_start.get(start), p90_kwh=p90,
+                start=start, p10_kwh=p10, p50_kwh=p50, p90_kwh=p90,
             ))
             start += _HALF_HOUR
 
