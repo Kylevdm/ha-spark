@@ -276,10 +276,15 @@ async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
                 f" [{row.session_start.astimezone(tz).isoformat(timespec='minutes')}, "
                 f"{row.session_end.astimezone(tz).isoformat(timespec='minutes')})"
             )
+        resolution = (
+            "; lower resolution (hourly)"
+            if any(flow.provenance == "hourly_backfill" for flow in row.components.values())
+            else ""
+        )
         print(
             f"{instant} {'; '.join(flows)}; house_load={energy(row.house_load_kwh)}; "
             f"base_load={energy(row.base_load_kwh)}{' (clamped)' if row.negative_clamped else ''}; "
-            f"{rates}; session={session}"
+            f"{rates}; session={session}{resolution}"
         )
     totals = result.totals
     flows_text = "; ".join(f"{name}={energy(kwh)}" for name, kwh in totals.components_kwh.items())

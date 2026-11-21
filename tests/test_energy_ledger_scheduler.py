@@ -33,6 +33,7 @@ def stub_control(monkeypatch):
     monkeypatch.setattr(scheduler, "_run_derived_rerive", AsyncMock())
     monkeypatch.setattr(scheduler, "record_closed_days", AsyncMock())
     monkeypatch.setattr(scheduler, "readiness_tick", AsyncMock())
+    monkeypatch.setattr(scheduler, "backfill_energy_ledger", AsyncMock(return_value=True))
     respx.get(url__regex=r"http://ha.test/api/states/.*").respond(404)
     respx.post(url__regex=r"http://ha.test/api/states/.*").respond(200, json={})
 
