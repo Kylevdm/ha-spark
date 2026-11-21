@@ -23,7 +23,7 @@ from ha_spark.energy.derived_base_load import (
     derive_specs_from_settings,
 )
 from ha_spark.energy.forecast import load_timezone
-from ha_spark.energy.onboarding import statistic_unit
+from ha_spark.energy.onboarding import POWER_FACTORS, statistic_unit
 from ha_spark.energy.readiness_ledger import BOUNDARY_TOLERANCE, slot_start
 from ha_spark.energy.readiness_measurements import (
     COMPONENTS,
@@ -210,6 +210,21 @@ async def _merge_slot(
     )
 
 
+def _valid_interval(row: object, field: str, invert: bool) -> bool:
+    # Reject each bad five-minute interval before readiness's reader sums six:
+    # a negative interval must never cancel into a plausible half-hour.
+    if not isinstance(row, dict):
+        return False
+    value = row.get(field)
+    if isinstance(value, bool):
+        return False
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and (-number if invert else number) >= 0
+
+
 class EnergyLedger:
     """Add-on-side recorder and read-only history reader."""
 
@@ -288,7 +303,13 @@ class EnergyLedger:
                     while instant < start:
                         distributed.setdefault(instant, {})[name] = flow
                         instant += HALF_HOUR
-            missing = {name: ComponentFlow(reason="missed_boundary") for name in COMPONENTS}
+            missing = {
+                name: ComponentFlow(
+                    reason="not_configured" if flows[name].reason == "not_configured"
+                    else "missed_boundary",
+                )
+                for name in COMPONENTS
+            }
             for instant, changes in distributed.items():
                 await _merge_slot(db, instant, changes, ("absent",), missing)
             house, base, clamped = _derive_loads(flows)
@@ -340,9 +361,13 @@ class EnergyLedger:
                 continue
             fine = await statistics_during_period(url, token, entity, start,
                                                   period="5minute", timeout=timeout)
+            unit = statistic_unit(meta)
+            field = "mean" if unit in POWER_FACTORS else "change"
             try:
-                series = measurement_series([r for r in fine if isinstance(r, dict)], [],
-                                            statistic_unit(meta), spec.invert, settings.timezone)
+                series = measurement_series(
+                    [r for r in fine if _valid_interval(r, field, spec.invert)], [],
+                    unit, spec.invert, settings.timezone,
+                )
             except ValueError:
                 continue
             for instant, measured in series.items():

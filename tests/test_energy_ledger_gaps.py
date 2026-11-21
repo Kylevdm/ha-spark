@@ -59,6 +59,20 @@ async def test_distribution_updates_gap_but_preserves_other_boundary_flows(tmp_p
         assert (row.import_rate, row.export_rate, row.revision_id) == (0.2, 0.05, "A")
 
 
+@respx.mock
+async def test_inserted_distributed_row_keeps_unconfigured_components_and_loads(tmp_path):
+    settings = settings_for(tmp_path)
+    ledger = EnergyLedger(settings.db_path)
+    tick = CLOSE + HALF_HOUR
+    counter("sensor.grid_import", ("10", START), ("16", tick))
+    for boundary in (START, tick):
+        await ledger.record_boundary(settings, boundary, RATES)
+    inserted, closed = await ledger.slots(START, tick)
+    assert inserted.components["grid_export"].reason == "not_configured"
+    assert inserted.exclusions == ("no_rate_capture",)
+    assert inserted.house_load_kwh == closed.house_load_kwh == 3
+
+
 def five_minutes(start, *, count=6, **values):
     return [
         {"start": (start + timedelta(minutes=5 * i)).timestamp() * 1000, **values}
@@ -136,6 +150,20 @@ async def test_invalid_statistics_do_not_create_a_measurement(tmp_path, monkeypa
     fake_recorder(
         monkeypatch, {"sensor.grid_import": unit},
         lambda entity, start: five_minutes(START, change=change) if start == START else [],
+    )
+    await energy_ledger.fill_closed_days(settings, SETTLED)
+    assert await EnergyLedger(settings.db_path).slots(START, END) == []
+
+
+@pytest.mark.parametrize("bad", [-5, True])
+async def test_one_invalid_interval_blocks_the_half_hour_fill(tmp_path, monkeypatch, bad):
+    settings = settings_for(tmp_path, timezone="UTC")
+    rows = five_minutes(START, count=5, change=1) + [
+        {"start": (START + timedelta(minutes=25)).timestamp() * 1000, "change": bad},
+    ]
+    fake_recorder(
+        monkeypatch, {"sensor.grid_import": "kWh"},
+        lambda entity, start: rows if start == START else [],
     )
     await energy_ledger.fill_closed_days(settings, SETTLED)
     assert await EnergyLedger(settings.db_path).slots(START, END) == []
