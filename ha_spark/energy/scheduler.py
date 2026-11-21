@@ -78,6 +78,7 @@ all modes, and separate read-only guard evidence in Observe. Missed boundaries
 stay gaps; mid-slot requests never rewrite a slot. A separate background energy
 ledger records closed-slot flows and rates from before the boundary replan.
 Another background task fills settled ledger gaps from recorder statistics.
+A separate meter-history task pulls Octopus grid import for reconciliation only.
 Recording failures are isolated.
 """
 
@@ -152,6 +153,7 @@ from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.ledger_backfill import backfill_energy_ledger
+from ha_spark.energy.meter_pull import MeterPullOutcome, pull_meter_history
 from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
 from ha_spark.energy.native_export_notices import notify_export_transitions
 from ha_spark.energy.plan_run import PlanRun, StoredPlanRun, current_plan
@@ -2107,6 +2109,7 @@ async def _run_paired(
     backfill_task: asyncio.Task[bool] | None = None
     backfill_retry_at: datetime | None = None
     ledger_fill_task: asyncio.Task[None] | None = None
+    meter_task: asyncio.Task[MeterPullOutcome] | None = None
     carbon = CarbonRefresher(settings.db_path, lambda: state.settings.carbon_region)
 
     async def record_readiness(tick_settings: Settings, tick_now: datetime) -> None:
@@ -2586,6 +2589,8 @@ async def _run_paired(
                 backfill_task = asyncio.create_task(backfill_energy_ledger(settings))
             if ledger_fill_task is None or ledger_fill_task.done():
                 ledger_fill_task = asyncio.create_task(fill_closed_days(settings, now))
+            if meter_task is None or meter_task.done():
+                meter_task = asyncio.create_task(pull_meter_history(settings, now))
             # The real clock: tests replace this module's ``datetime`` to script ``now``.
             state.loop_tick = utc_datetime.now(UTC)
             await asyncio.sleep(poll_seconds)
@@ -2599,6 +2604,8 @@ async def _run_paired(
             backfill_task.cancel()
         if ledger_fill_task is not None:
             ledger_fill_task.cancel()
+        if meter_task is not None:
+            meter_task.cancel()
         if readiness_task is not None:
             readiness_task.cancel()
             await asyncio.gather(readiness_task, return_exceptions=True)
@@ -2608,6 +2615,8 @@ async def _run_paired(
             await asyncio.gather(backfill_task, return_exceptions=True)
         if ledger_fill_task is not None:
             await asyncio.gather(ledger_fill_task, return_exceptions=True)
+        if meter_task is not None:
+            await asyncio.gather(meter_task, return_exceptions=True)
         state.executor = None
         if pending is not None and not pending.future.done():
             pending.future.set_result(Reply(error="daemon stopped during request"))
