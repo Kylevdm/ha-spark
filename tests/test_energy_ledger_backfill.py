@@ -8,12 +8,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
+import aiosqlite
 import pytest
 import respx
 
 from ha_spark.config import Settings
 from ha_spark.energy import ledger_backfill, scheduler
-from ha_spark.energy.energy_ledger import EnergyLedger, RateEvidence
+from ha_spark.energy.energy_ledger import ComponentFlow, EnergyLedger, LedgerSlot, RateEvidence
 from ha_spark.energy.stats import compute_stats
 from tests.authority_helpers import run_daemon, seed_authority
 from tests.test_authority_gate import daemon_ticks
@@ -225,3 +226,30 @@ async def test_daemon_backfill_never_delays_guard_and_retries_failure_after_an_h
     assert guard.await_count == len(offsets)
     assert len(calls) == 2
     assert started.is_set() and cancelled.is_set()
+
+
+async def test_backfill_stops_before_day_close_fill_rows_and_leaves_them_unchanged(
+    tmp_path, monkeypatch,
+):
+    settings = settings_for(tmp_path)
+    await record_first_slot(settings, START + 3 * HOUR)
+    filled = {
+        START + HOUR: ComponentFlow(kwh=3, provenance="statistics_fill"),
+        START + HOUR + HALF_HOUR: ComponentFlow(kwh=3, provenance="distributed"),
+    }
+    async with aiosqlite.connect(settings.db_path) as db:
+        for instant, flow in filled.items():
+            row = LedgerSlot(slot_start=instant, components={"grid_import": flow},
+                             exclusions=("no_rate_capture",))
+            await db.execute("INSERT INTO energy_ledger_slots VALUES (?, ?)",
+                             (instant.isoformat(), row.model_dump_json()))
+        await db.commit()
+    ledger = EnergyLedger(settings.db_path)
+    before = await ledger.slots(START + HOUR, START + 4 * HOUR)
+    changes = [hour(START + i * HOUR, change=2) for i in range(4)]
+    fake_recorder(monkeypatch, {"sensor.grid_import": ("kWh", changes)})
+    assert await ledger_backfill.backfill_energy_ledger(settings)
+    rows = await ledger.slots(START, START + 4 * HOUR)
+    assert [row.slot_start for row in rows[:2]] == [START, START + HALF_HOUR]
+    assert all(row.exclusions == ("hourly_backfill",) for row in rows[:2])
+    assert rows[2:] == before
