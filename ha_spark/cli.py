@@ -69,8 +69,8 @@ from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever
 from ha_spark.energy.solar_source import NATIVE_PREVIEW_NOTE, solar_source_from_store
 from ha_spark.energy.sources import _to_float
-from ha_spark.energy.stats import compute_stats
-from ha_spark.energy.store import ConsumptionStore
+from ha_spark.energy.stats import compute_stats, meter_reconciliation
+from ha_spark.energy.store import ConsumptionStore, read_consumption
 from ha_spark.energy.v2l import delivered_fraction, load_session, savings
 from ha_spark.ha.models import StateChangedEvent
 from ha_spark.ha.rest import HomeAssistantRest, HomeAssistantRestError, notify
@@ -148,6 +148,22 @@ async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
         f"Coverage: {result.covered_slots}/{len(result.buckets)} slots "
         f"({result.energy_coverage:.1%})"
     )
+    try:
+        meter_intervals = await read_consumption(settings.db_path, start, end)
+    except Exception:
+        print("Meter reconciliation: unavailable (could not read meter history)")
+    else:
+        reconciliation = meter_reconciliation(result, meter_intervals, tz)
+
+        def percent(fraction: float | None) -> str:
+            return "unknown" if fraction is None else f"{fraction:.1%}"
+
+        for local_day, fraction in reconciliation.by_day.items():
+            print(f"Meter reconciliation {local_day}: {percent(fraction)}")
+        print(
+            f"Meter reconciliation for range: {percent(reconciliation.range_fraction)} "
+            f"({reconciliation.covered_days}/{len(reconciliation.by_day)} days covered)"
+        )
     return 0
 
 
@@ -711,9 +727,14 @@ def _cmd_import_csv(settings: Settings, paths: list[str]) -> int:
     intervals: list[ConsumptionInterval] = []
     for path in paths:
         try:
-            intervals.extend(parse_octopus_csv(Path(path).read_text(encoding="utf-8-sig")))
-        except (OSError, ValueError) as exc:
-            print(f"Could not import {path}: {exc}", file=sys.stderr)
+            text = Path(path).read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError):
+            print("Could not import: unreadable CSV file", file=sys.stderr)
+            return 2
+        try:
+            intervals.extend(parse_octopus_csv(text))
+        except ValueError as exc:
+            print(f"Could not import: {exc}", file=sys.stderr)
             return 2
     return asyncio.run(_store_and_report(settings, intervals, "csv"))
 

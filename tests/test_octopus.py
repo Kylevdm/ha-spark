@@ -338,16 +338,21 @@ def test_csv_tolerates_header_variants_and_bom() -> None:
     assert intervals[0].start == datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
 
 
-def test_csv_skips_bad_rows() -> None:
+@pytest.mark.parametrize("bad_row", [
+    "not-a-number,2026-06-01T00:30:00Z,2026-06-01T01:00:00Z",
+    "0.5,garbage,2026-06-01T01:00:00Z",
+    "0.5,2026-06-01T01:00:00Z,2026-06-01T00:30:00Z",
+    "nan,2026-06-01T00:30:00Z,2026-06-01T01:00:00Z",
+    "-1,2026-06-01T00:30:00Z,2026-06-01T01:00:00Z",
+])
+def test_csv_rejects_bad_rows(bad_row: str) -> None:
     text = (
         "Consumption (kwh),Start,End\n"
-        "not-a-number,2026-06-01T00:00:00Z,2026-06-01T00:30:00Z\n"
-        "0.5,garbage,2026-06-01T01:00:00Z\n"
-        "0.7,2026-06-01T01:00:00Z,2026-06-01T01:30:00Z\n"
+        "0.7,2026-06-01T00:00:00Z,2026-06-01T00:30:00Z\n"
+        f"{bad_row}\n"
     )
-    intervals = parse_octopus_csv(text)
-    assert len(intervals) == 1
-    assert intervals[0].kwh == 0.7
+    with pytest.raises(ValueError, match=r"^Unrecognized Octopus CSV row 3$"):
+        parse_octopus_csv(text)
 
 
 def test_csv_rejects_unrecognized_header() -> None:

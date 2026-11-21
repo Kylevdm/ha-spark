@@ -38,6 +38,7 @@ from ha_spark.energy.axle import AxleApiError, read_axle_event
 from ha_spark.energy.evidence_freshness import EvidenceFreshness
 from ha_spark.energy.forecast import intervals_from_hourly_stats, load_timezone
 from ha_spark.energy.ledger import ForecastLedger
+from ha_spark.energy.meter_pull import meter_history_configured, read_meter_history
 from ha_spark.energy.models import FreeSession
 from ha_spark.energy.octopus import (
     HappyHourBooking,
@@ -588,6 +589,35 @@ async def check_happy_hour(settings: Settings) -> CheckResult:
     return CheckResult("Happy Hour", Status.OK, detail)
 
 
+async def check_meter_history(settings: Settings) -> CheckResult:
+    """Report local meter history and the daemon's last pull; no supplier request."""
+    name = "Meter history"
+    configured = meter_history_configured(settings)
+    try:
+        history = await read_meter_history(settings.db_path)
+    except Exception:
+        if not configured:
+            return CheckResult(name, Status.OK, "not configured")
+        return CheckResult(name, Status.WARN, "store_unavailable")
+
+    def stamp(value: datetime) -> str:
+        return f"{value.astimezone(UTC):%Y-%m-%d %H:%M} UTC"
+
+    details = [] if configured else ["not configured"]
+    if history.first_start is not None and history.latest_end is not None:
+        details.append(f"stored range: {stamp(history.first_start)} to {stamp(history.latest_end)}")
+    else:
+        details.append("no stored intervals")
+    if history.last_attempt is not None and history.outcome is not None:
+        details.append(f"last pull: {stamp(history.last_attempt)} ({history.outcome.value})")
+    else:
+        details.append("no pull yet")
+    if history.last_success is not None:
+        details.append(f"last successful pull: {stamp(history.last_success)}")
+    status = Status.WARN if configured and history.outcome and history.outcome.failed else Status.OK
+    return CheckResult(name, status, "; ".join(details))
+
+
 async def check_tariff_provider(settings: Settings) -> CheckResult:
     """Confirm the configured tariff provider reads end-to-end (`fixed` needs no live read)."""
     if settings.tariff_provider == "dynamic":
@@ -1079,6 +1109,7 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_free_electricity(settings),
         check_export_event_provider(settings),
         check_happy_hour(settings),
+        check_meter_history(settings),
         check_ha_timezone(settings),
         *([check_ev_status(settings)] if settings.ev_status_entity else []),
         *(
