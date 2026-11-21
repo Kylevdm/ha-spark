@@ -48,6 +48,7 @@ from ha_spark.energy.derived_base_load import (
     backfill_derived_load,
     derive_specs_from_settings,
 )
+from ha_spark.energy.energy_ledger import EnergyLedger
 from ha_spark.energy.eval import actual_kwh_by_date, evaluate, format_eval
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
@@ -63,11 +64,12 @@ from ha_spark.energy.onboarding import (
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.readiness import load_readiness
 from ha_spark.energy.readiness_ledger import ReadinessLedger, slot_start
-from ha_spark.energy.readiness_measurements import COMPONENTS, ReadinessDays
+from ha_spark.energy.readiness_measurements import COMPONENTS, ReadinessDays, day_bounds
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever
 from ha_spark.energy.solar_source import NATIVE_PREVIEW_NOTE, solar_source_from_store
 from ha_spark.energy.sources import _to_float
+from ha_spark.energy.stats import compute_stats
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.energy.v2l import delivered_fraction, load_session, savings
 from ha_spark.ha.models import StateChangedEvent
@@ -89,6 +91,64 @@ from ha_spark.onboarding_discover import FieldProposal, propose
 from ha_spark.presets import get_preset, preset_names
 from ha_spark.router import route_message
 from ha_spark.settings_service import ConfigurationRepair, SettingsService
+
+
+async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
+    tz = load_timezone(settings.timezone)
+    try:
+        day = date.fromisoformat(at) if at is not None else datetime.now(tz).date()
+        if at is not None and day.isoformat() != at:
+            raise ValueError
+        start, end = day_bounds(day, settings.timezone)
+    except (ValueError, OverflowError):
+        print("--at must be a valid YYYY-MM-DD date", file=sys.stderr)
+        return 2
+    try:
+        rows = await EnergyLedger(settings.db_path).slots(start, end)
+    except Exception:
+        print("Could not read energy ledger", file=sys.stderr)
+        return 1
+    result = compute_stats(rows, start, end, tz)
+
+    def energy(kwh: float | None) -> str:
+        return "—" if kwh is None else f"{kwh:g} kWh"
+
+    for bucket in result.buckets:
+        instant = bucket.start.isoformat(timespec="minutes")
+        row = bucket.slot
+        if row is None:
+            print(f"{instant} gap")
+            continue
+        flows = [
+            f"{name}={energy(flow.kwh)} ({flow.provenance})"
+            if (flow := row.components.get(name)) is not None else f"{name}=— (absent)"
+            for name in COMPONENTS
+        ]
+        rates = "unpriced"
+        if row.import_rate is not None and row.export_rate is not None:
+            rates = f"import={row.import_rate:g} export={row.export_rate:g} GBP/kWh"
+        session: str = row.import_session or "none"
+        if row.session_start is not None and row.session_end is not None:
+            session += (
+                f" [{row.session_start.astimezone(tz).isoformat(timespec='minutes')}, "
+                f"{row.session_end.astimezone(tz).isoformat(timespec='minutes')})"
+            )
+        print(
+            f"{instant} {'; '.join(flows)}; house_load={energy(row.house_load_kwh)}; "
+            f"base_load={energy(row.base_load_kwh)}{' (clamped)' if row.negative_clamped else ''}; "
+            f"{rates}; session={session}"
+        )
+    totals = result.totals
+    flows_text = "; ".join(f"{name}={energy(kwh)}" for name, kwh in totals.components_kwh.items())
+    print(
+        f"Totals: {flows_text}; house_load={energy(totals.house_load_kwh)}; "
+        f"base_load={energy(totals.base_load_kwh)}"
+    )
+    print(
+        f"Coverage: {result.covered_slots}/{len(result.buckets)} slots "
+        f"({result.energy_coverage:.1%})"
+    )
+    return 0
 
 
 async def _cmd_readiness_show(settings: Settings) -> int:
@@ -878,6 +938,10 @@ def build_parser() -> argparse.ArgumentParser:
     slots = readiness_sub.add_parser("slots", help="list recorded slots and gaps")
     slots.add_argument("--days", type=int, default=7, help="household-local days (default: 7)")
 
+    stats = sub.add_parser("stats", help="show measured flows and coverage (read-only)")
+    stats.add_argument("--range", choices=("day",), required=True)
+    stats.add_argument("--at", metavar="YYYY-MM-DD", help="household date (default: today)")
+
     p_inverter = sub.add_parser("inverter", help="Read model identity and resident schedule")
     p_inverter.add_subparsers(dest="inverter_command", required=True).add_parser("show")
 
@@ -1432,15 +1496,18 @@ def main(argv: list[str] | None = None) -> int:
             print("[REFUSED] set-secret requires a secret field; value comes from stdin")
             return 2
     parser = build_parser()
-    if argv[:1] == ["config"]:
-        # argparse errors echo the offending arguments; config input may be secret.
+    if argv and argv[0] in {"config", "stats"}:
+        # argparse errors echo the offending arguments, which can contain secrets.
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 args = parser.parse_args(argv)
         except SystemExit as exc:
             if exc.code == 0:
                 raise
-            print("[REFUSED] invalid config command; see `ha-spark config --help`")
+            if argv[0] == "stats":
+                print("Invalid stats command; see `ha-spark stats --help`", file=sys.stderr)
+            else:
+                print("[REFUSED] invalid config command; see `ha-spark config --help`")
             return 2
     else:
         args = parser.parse_args(argv)
@@ -1451,6 +1518,14 @@ def main(argv: list[str] | None = None) -> int:
         except (ConfigError, ValueError, OSError, EOFError):
             print("[REFUSED] configuration command failed")
             return 2
+
+    if args.command == "stats":
+        try:
+            settings = load_settings(validate=False)
+        except (ConfigurationRepair, ConfigError):
+            print("Could not read settings", file=sys.stderr)
+            return 2
+        return asyncio.run(_cmd_stats(settings, at=args.at))
 
     # Diagnostic paths use the settings service's read-only load (a seed preview
     # before the initialisation marker), which never writes. Skip credential and
