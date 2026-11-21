@@ -20,7 +20,7 @@ async def test_stats_shows_daily_axle_earnings_and_delivery_rate(tmp_path, monke
     monkeypatch.setattr(EnergyLedger, "slots", AsyncMock(return_value=[
         row(exported=2), row(START + HALF_HOUR, exported=1),
     ]))
-    assert await _cmd_stats(settings, at=START.date().isoformat()) == 0
+    assert await _cmd_stats(settings, kind="day", at=START.date().isoformat()) == 0
     text = capsys.readouterr().out
     assert f"Axle earnings (estimated) {START.date()}: 3.00 GBP" in text
     assert "Axle delivery rate: 100.0%" in text

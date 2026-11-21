@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Self
 import aiosqlite
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
+from ha_spark.energy.energy_ledger import EnergyLedger, LedgerSlot
 from ha_spark.energy.export_store import ExportEventStore
 from ha_spark.logging import get_logger
 
@@ -140,6 +141,23 @@ class AxleEventStore:
                 "ORDER BY start, end", (_key(end), _key(start)),
             ) as cursor:
                 return [AxleEvent.model_validate(dict(row)) for row in await cursor.fetchall()]
+
+
+async def window_evidence(
+    db_path: str, start: datetime, end: datetime,
+) -> tuple[list[AxleEvent], list[LedgerSlot]]:
+    """Events overlapping [start, end) plus the ledger rows their windows need outside it.
+
+    Read-only. Raises when either store is unreadable, so callers fail closed.
+    """
+    events = await AxleEventStore(db_path).events(start, end)
+    active = [event for event in events if event.cancelled_at is None]
+    first = min((event.start for event in active), default=start)
+    last = max((event.end for event in active), default=end)
+    ledger = EnergyLedger(db_path)
+    earlier = await ledger.slots(first, start) if first < start else []
+    later = await ledger.slots(end, last) if last > end else []
+    return events, [*earlier, *later]
 
 
 def _accept(

@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from ha_spark.api.server import INGRESS_PROXY_IP, AppState, build_app
 from ha_spark.config import Settings
+from ha_spark.energy.energy_ledger import EnergyLedger
 from ha_spark.energy.solar_forecasts import SolarForecastStore
 from tests.api_helpers import owner_client
 from tests.authority_helpers import seed_settings
@@ -49,7 +50,7 @@ def _midnight(now: datetime) -> datetime:
     ("params", "error"),
     [
         ({"to": "2026-01-12T15:10:00+00:00"}, "unsupported resolution"),  # no resolution
-        ({"resolution": "day", "from": "x", "to": "x"}, "unsupported resolution"),
+        ({"resolution": "day", "from": "x", "to": "x"}, "invalid history range"),
         # Naive from, no to.
         ({"resolution": "slot", "from": "2026-01-12T00:00:00"}, "invalid history range"),
         # Parseable but unrepresentable in UTC: a 400, never a 500.
@@ -88,7 +89,7 @@ def test_history_rejects_ranges_outside_today(tmp_path, monkeypatch, from_iso, t
             "resolution": "slot", "from": from_iso, "to": to_iso,
         })
     assert response.status_code == 400
-    assert response.json() == {"error": "history range must be inside today"}
+    assert response.json() == {"error": "invalid history range"}
 
 
 def test_history_serves_a_range_inside_today_with_any_zone_offset(tmp_path, monkeypatch):
@@ -270,6 +271,69 @@ def test_measured_history_totals_coverage_and_repeat(tmp_path, monkeypatch, minu
         pytest.approx(.6) if minutes >= 30 else None)
 
 
+@pytest.mark.parametrize(("resolution", "start", "end", "count"), [
+    ("slot", "2026-03-29T00:00:00+00:00", "2026-03-30T00:00:00+01:00", 46),
+    ("day", "2026-03-28T00:00:00+00:00", "2026-03-30T00:00:00+01:00", 2),
+    ("month", "2023-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", 36),
+])
+def test_history_serves_resolutions(tmp_path, monkeypatch, resolution, start, end, count):
+    _frozen_server_clock(monkeypatch, datetime(2026, 5, 1, tzinfo=LONDON))
+    state = _state(tmp_path, timezone=LONDON.key)
+    with owner_client(state) as client:
+        response = client.get("/api/history", params={"resolution": resolution,
+                                                      "from": start, "to": end})
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    body = response.json()
+    assert body["resolution"] == resolution
+    assert len(body["buckets"]) == count
+    assert body["buckets"][0]["start"] == start
+    assert body["range_totals"]["energy_coverage"] == 0
+    assert body["range_totals"]["actual_cost"] is None
+    if resolution != "slot":
+        assert body["unavailable"]["solar_forecast"] == "slot_resolution_only"
+        # No solar series at this resolution: unknown, never zero.
+        assert body["totals"] == {"solar_forecast_kwh": None, "solar_measured_kwh": None}
+    assert not (tmp_path / "db.sqlite").exists()
+
+
+@pytest.mark.parametrize("params", [
+    {"resolution": "hour"},
+    {"resolution": "day"},
+    {"resolution": "month"},
+    {"resolution": "month", "from": "2026-01-01T00:00:00"},
+    {"resolution": "day", "from": "2024-01-01T00:00:00+00:00"},
+    {"resolution": "month", "from": "2025-01-01T00:00:00+00:00",
+     "to": "2027-01-01T00:00:00+00:00"},
+])
+def test_history_checks_bounds_at_every_resolution(tmp_path, monkeypatch, params):
+    _frozen_server_clock(monkeypatch, datetime(2026, 5, 1, tzinfo=LONDON))
+    with owner_client(_state(tmp_path)) as client:
+        assert client.get("/api/history", params=params).status_code == 400
+
+
+def test_history_degrades_failed_ledger_read(tmp_path, monkeypatch):
+    async def unreadable(*args):
+        raise OSError("private-path")
+
+    monkeypatch.setattr(EnergyLedger, "slots", unreadable)
+    _frozen_server_clock(monkeypatch, datetime(2026, 5, 1, 12, tzinfo=LONDON))
+    with owner_client(_state(tmp_path)) as client:
+        response = client.get("/api/history?resolution=slot")
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json()["unavailable"]["statistics"] == "ledger_unreadable"
+    assert response.json()["range_totals"]["actual_cost"] is None
+    assert "private-path" not in response.text
+
+
+def test_history_unavailable_in_repair(tmp_path):
+    state = _state(tmp_path)
+    state.settings_service.repair = ["invalid configuration"]
+    with TestClient(build_app(state, ingress_peer="testclient")) as client:
+        assert client.get("/api/history?resolution=month").status_code == 503
+
+
 def test_overflowing_measured_total_is_unknown_not_a_500():
     import json as _json
     from datetime import UTC, datetime, timedelta
@@ -283,3 +347,48 @@ def test_overflowing_measured_total_is_unknown_not_a_500():
     assert payload["totals"]["solar_measured_kwh"] is None
     assert [b["solar_measured_kwh"] for b in payload["buckets"]] == [6e307] * 4
     _json.dumps(payload, allow_nan=False)
+
+
+def _axle_history(tmp_path, monkeypatch, evidence):
+    from ha_spark.energy.axle_events import AxleEvent
+    from tests.test_stats_cost import row
+
+    frozen = datetime(2026, 5, 1, 12, tzinfo=LONDON)
+    _frozen_server_clock(monkeypatch, frozen)
+    slot = _midnight(frozen).astimezone(UTC) + timedelta(hours=9)
+
+    async def slots(self, start, end):
+        return [row(slot, exported=2), row(slot + timedelta(minutes=30), exported=1)]
+
+    async def window_evidence(db_path, start, end):
+        return evidence([AxleEvent.model_validate({
+            "start": slot, "end": slot + timedelta(hours=1),
+            "accepted_at": slot - timedelta(hours=1),
+            "committed_kwh": 3, "rate_gbp_kwh": 1.5,
+        })])
+
+    monkeypatch.setattr(EnergyLedger, "slots", slots)
+    monkeypatch.setattr("ha_spark.api.server.window_evidence", window_evidence)
+    with owner_client(_state(tmp_path)) as client:
+        response = client.get("/api/history?resolution=slot")
+    assert response.status_code == 200
+    return slot, response.json()
+
+
+def test_history_credits_axle_events_in_actual_cost(tmp_path, monkeypatch):
+    slot, body = _axle_history(tmp_path, monkeypatch, lambda events: (events, []))
+    by_start = {datetime.fromisoformat(b["start"]): b for b in body["buckets"]}
+    first = by_start[slot]
+    second = by_start[slot + timedelta(minutes=30)]
+    credits = [bucket["cost_inputs"]["axle_earnings"] for bucket in (first, second)]
+    assert credits == [3, 1.5]
+    assert first["actual_cost"] == 0.75 - 0.25 - 3
+
+
+def test_history_fails_closed_when_axle_history_is_unreadable(tmp_path, monkeypatch):
+    def unreadable(events):
+        raise OSError("private-path")
+
+    _, body = _axle_history(tmp_path, monkeypatch, unreadable)
+    assert body["unavailable"]["statistics"] == "ledger_unreadable"
+    assert body["range_totals"]["actual_cost"] is None

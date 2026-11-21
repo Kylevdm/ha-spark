@@ -390,7 +390,24 @@ class EnergyLedger:
                 "ORDER BY slot_start",
                 (start.astimezone(UTC).isoformat(), end.astimezone(UTC).isoformat()),
             ) as cursor:
-                return [LedgerSlot.model_validate_json(row[0]) for row in await cursor.fetchall()]
+                rows = await cursor.fetchall()
+        return await asyncio.to_thread(lambda: [LedgerSlot.model_validate_json(row[0])
+                                                for row in rows])
+
+    async def first_slot(self) -> datetime | None:
+        """Find the earliest row, including hourly backfill, without creating the store."""
+        if not await asyncio.to_thread(Path(self.db_path).exists):
+            return None
+        path = await asyncio.to_thread(Path(self.db_path).resolve)
+        async with aiosqlite.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+            async with db.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'energy_ledger_slots'",
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return None
+            async with db.execute("SELECT MIN(slot_start) FROM energy_ledger_slots") as cursor:
+                row = await cursor.fetchone()
+                return datetime.fromisoformat(row[0]) if row and row[0] is not None else None
 
     async def first_recorder_slot(self) -> datetime | None:
         """Find the first live or day-close row without creating the store."""

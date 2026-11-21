@@ -102,3 +102,16 @@ def test_unrepresentable_earnings_keep_the_measured_outcome():
     [outcome] = summary.events
     assert (outcome.outcome, outcome.delivered_kwh, outcome.earnings_gbp) == ("delivered", 3, None)
     assert summary.delivery_rate == 1
+
+
+@pytest.mark.parametrize("resolution", ["slot", "day"])
+def test_ranges_carry_axle_credit_daily_earnings_and_delivery_rate(resolution):
+    from ha_spark.energy.stats import summarise
+
+    rows = [row(exported=2), row(START + HALF_HOUR, exported=1)]
+    stats = summarise(rows, START, START + timedelta(days=1), UTC, resolution, [event()])
+    assert stats.axle_earnings_by_day == ((START.date(), 6),)
+    assert stats.axle.delivery_rate == 1
+    plain = summarise(rows, START, START + timedelta(days=1), UTC, resolution)
+    assert stats.totals.actual_cost == plain.totals.actual_cost - 6
+    assert stats.totals.no_battery_cost == plain.totals.no_battery_cost
