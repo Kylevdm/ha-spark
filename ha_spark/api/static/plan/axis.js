@@ -12,6 +12,32 @@ export function number(value, digits = 2) {
     return value == null ? "—" : Number(value).toFixed(digits);
 }
 
+export function slotGrid(start, end, duration) {
+    const width = Math.max(960, (end - start) / duration * 24 + 140);
+    const left = 130;
+    const right = width - 20;
+    const xMs = ms => left + (ms - start) / (end - start) * (right - left);
+    const x = at => xMs(Date.parse(at));
+    const slotWidth = duration / (end - start) * (right - left);
+    const cells = [];
+    for (let at = start; at < end; at += duration) cells.push(at);
+    return {width, left, right, xMs, x, slotWidth, cells};
+}
+
+export function SlotGridLines({grid, labels, top, bottom, labelY}) {
+    return grid.cells.map((at, i) => {
+        const label = labels.get(at);
+        const x = grid.xMs(at);
+        return html`<g key=${at}>
+            <line class="slot-grid" x1=${x} x2=${x} y1=${top} y2=${bottom}/>
+            ${i % 6 === 0 && label ? html`<text class="axis-label" x=${x} y=${labelY}>
+                <tspan x=${x}>${label.slice(11, 16)} ${label.slice(19)}</tspan>
+                <tspan x=${x} dy="16">${label.slice(0, 10)}</tspan>
+            </text>` : null}
+        </g>`;
+    });
+}
+
 export function Axis({timeline, selectedLine, history, carbon}) {
     const [selected, setSelected] = useState(null);
     const slots = timeline.slots;
@@ -21,14 +47,8 @@ export function Axis({timeline, selectedLine, history, carbon}) {
     const start = today < horizon ? today : horizon;
     const duration = timeline.slot_minutes * 60000;
     const end = Date.parse(slots[slots.length - 1].start) + duration;
-    const width = Math.max(960, (end - start) / duration * 24 + 140);
-    const left = 130;
-    const right = width - 20;
-    const xMs = ms => left + (ms - start) / (end - start) * (right - left);
-    const x = at => xMs(Date.parse(at));
-    const slotWidth = duration / (end - start) * (right - left);
-    const cells = [];
-    for (let at = start; at < end; at += duration) cells.push(at);
+    const grid = slotGrid(start, end, duration);
+    const {width, left, right, xMs, x, slotWidth, cells} = grid;
     const labels = new Map([...(history?.buckets ?? []), ...slots]
         .map(slot => [Date.parse(slot.start), slot.start]));
     const rows = new Map((carbon?.rows ?? []).map(row => [Date.parse(row.start), row]));
@@ -41,16 +61,7 @@ export function Axis({timeline, selectedLine, history, carbon}) {
         <div class="chart-scroll" tabindex="0" aria-label="Scrollable plan chart">
             <svg viewBox=${`0 0 ${width} 730`} width=${width} height="730"
                  role="group" aria-label="Half-hour plan forecast">
-                ${cells.map((at, i) => {
-                    const label = labels.get(at);
-                    return html`<g key=${at}>
-                        <line class="slot-grid" x1=${xMs(at)} x2=${xMs(at)} y1="35" y2="675"/>
-                        ${i % 6 === 0 && label ? html`<text class="axis-label" x=${xMs(at)} y="695">
-                            <tspan x=${xMs(at)}>${label.slice(11, 16)} ${label.slice(19)}</tspan>
-                            <tspan x=${xMs(at)} dy="16">${label.slice(0, 10)}</tspan>
-                        </text>` : null}
-                    </g>`;
-                })}
+                <${SlotGridLines} grid=${grid} labels=${labels} top=${35} bottom=${675} labelY=${695}/>
                 ${selectedLine ? html`<rect class="line-span"
                     x=${Math.max(xMs(horizon), x(selectedLine.start))} y="35"
                     width=${Math.max(0, Math.min(right, x(selectedLine.end))

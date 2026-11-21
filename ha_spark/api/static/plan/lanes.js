@@ -3,7 +3,7 @@ import {html} from "../vendor/htm-3.1.1-preact-standalone.module.js";
 const actions = ["charge", "hold", "export", "skip", "v2l"];
 
 // Step geometry only. Gaps break paths; horizon slot 0 starts at "now".
-function steps(slots, field, x, slotWidth, y, now) {
+export function steps(slots, field, x, slotWidth, y, now) {
     const path = [];
     let previousEnd = null;
     for (const slot of slots) {

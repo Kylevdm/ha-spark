@@ -13,7 +13,6 @@ import asyncio
 import contextlib
 import io
 import json
-import math
 import signal
 import sys
 from dataclasses import asdict
@@ -23,7 +22,6 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-import aiosqlite
 import yaml
 
 from ha_spark.api.site_pairing import REPLACE_TEXT
@@ -56,7 +54,8 @@ from ha_spark.energy.eval import actual_kwh_by_date
 from ha_spark.energy.evening_forecast import EveningForecastStore
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
-from ha_spark.energy.models import ConsumptionInterval, ForecastHistoryRecord
+from ha_spark.energy.ledger import read_forecast_history as _read_forecast_history
+from ha_spark.energy.models import ConsumptionInterval
 from ha_spark.energy.octopus import OctopusApiError, fetch_consumption, parse_octopus_csv
 from ha_spark.energy.onboarding import (
     BACKFILL_LOOKBACK_DAYS,
@@ -108,74 +107,6 @@ from ha_spark.onboarding_discover import FieldProposal, propose
 from ha_spark.presets import get_preset, preset_names
 from ha_spark.router import route_message
 from ha_spark.settings_service import ConfigurationRepair, SettingsService
-
-
-async def _read_forecast_history(
-    db_path: str, since: date, until: date,
-) -> list[ForecastHistoryRecord]:
-    """Read forecast revisions without creating the database or its schema."""
-    if not await asyncio.to_thread(Path(db_path).exists):
-        return []
-    path = await asyncio.to_thread(Path(db_path).resolve)
-    async with aiosqlite.connect(path.as_uri() + "?mode=ro", uri=True) as db:
-        async with db.execute(
-            "SELECT name FROM sqlite_master WHERE name = 'forecasts'"
-        ) as cursor:
-            if await cursor.fetchone() is None:
-                return []
-        async with db.execute("PRAGMA table_info(forecasts)") as cursor:
-            columns = {row[1] for row in await cursor.fetchall()}
-        required = {
-            "id", "issued_at", "target_date", "model", "total_kwh", "slots_json", "drove_plan",
-            "median_total_kwh", "median_slots_json",
-        }
-        if not required <= columns:
-            return []
-        async with db.execute(
-            "SELECT issued_at, target_date, model, total_kwh, slots_json, "
-            "median_total_kwh, median_slots_json, drove_plan FROM forecasts "
-            "WHERE target_date >= ? AND target_date <= ? ORDER BY julianday(issued_at), id",
-            (since.isoformat(), until.isoformat()),
-        ) as cursor:
-            rows = await cursor.fetchall()
-
-    def finite(value: object) -> float:
-        if isinstance(value, bool) or not isinstance(value, int | float):
-            raise ValueError("not a number")
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValueError("not finite")
-        return number
-
-    def series(raw: object) -> tuple[float, ...] | None:
-        # A malformed slot series drops only that series, never the revision, so
-        # selection still matches readiness (which reads the totals alone).
-        try:
-            values = json.loads(raw) if isinstance(raw, str) and raw else None
-            if not isinstance(values, list):
-                return None
-            return tuple(finite(v) for v in values)
-        except (TypeError, ValueError, OverflowError):
-            return None
-
-    result = []
-    for issued, target, model, total, slots_json, median, median_json, drove in rows:
-        # A malformed stored row is skipped, never scored or allowed to crash the report.
-        try:
-            made_at = datetime.fromisoformat(issued)
-            if made_at.tzinfo is None:
-                continue
-            made_at.astimezone(UTC)
-            result.append(ForecastHistoryRecord(
-                made_at=made_at, target_date=date.fromisoformat(target), model=str(model),
-                total_kwh=finite(total), slots=series(slots_json), source="ledger",
-                drove_plan=drove == 1,
-                median_total_kwh=None if median is None else finite(median),
-                median_slots=series(median_json),
-            ))
-        except (TypeError, ValueError, OverflowError):
-            continue
-    return result
 
 
 def _print_load_accuracy(accuracy: LoadAccuracy) -> None:

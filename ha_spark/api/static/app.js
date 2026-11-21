@@ -4,9 +4,13 @@ import {mountMode} from "./mode.js";
 import {Controls} from "./plan/controls.js";
 import {PlanParts} from "./plan/registry.js";
 import {number} from "./plan/axis.js";
+import {Statistics} from "./statistics.js";
+
+const screens = ["plan", "mode", "statistics"];
 
 function screenFromHash() {
-    return location.hash === "#/mode" ? "mode" : "plan";
+    const screen = location.hash.slice(2);
+    return location.hash === `#/${screen}` && screens.includes(screen) ? screen : "plan";
 }
 
 function Mode({health, refresh}) {
@@ -93,7 +97,7 @@ function App() {
         }
     }, []);
     useEffect(() => {
-        if (!location.hash || !["#/plan", "#/mode"].includes(location.hash)) {
+        if (!screens.some(screen => location.hash === `#/${screen}`)) {
             location.replace("#/plan");
         }
         const navigate = () => { setScreen(screenFromHash()); void refresh(); };
@@ -107,6 +111,7 @@ function App() {
             <strong>ha-spark</strong>
             <a href="#/plan" aria-current=${screen === "plan" ? "page" : null}>Plan</a>
             <a href="#/mode" aria-current=${screen === "mode" ? "page" : null}>Mode</a>
+            <a href="#/statistics" aria-current=${screen === "statistics" ? "page" : null}>Statistics</a>
         </nav>
         <div class="workspace">
             <header aria-live="polite">
@@ -123,7 +128,9 @@ function App() {
             </header>
             <main>${!failed && health ? screen === "mode"
                 ? html`<${Mode} health=${health} refresh=${refresh}/>`
-                : html`<${Plan} health=${health}/>` : null}</main>
+                : screen === "statistics" ? html`<${Statistics}
+                    repair=${health.configuration?.status === "configuration_repair"}/>`
+                    : html`<${Plan} health=${health}/>` : null}</main>
         </div>
     </div>`;
 }
