@@ -75,3 +75,26 @@ async def test_no_purchase_room_captures_only_trusted_remaining_allowance(
     assert row.import_session == ("happy_hour" if expected else None)
     assert row.session_suppressed_by == ("no_purchase_room" if expected else None)
     assert row.session_remaining_kwh == expected
+
+
+@pytest.mark.parametrize(("kind", "winner"), [
+    ("free_electricity", None), ("happy_hour", None), ("free_electricity", "hold"),
+])
+@respx.mock
+async def test_session_edge_inside_the_closed_slot_leaves_it_unpriced(tmp_path, kind, winner):
+    settings = settings_for(tmp_path)
+    rev = revision()
+    session = FreeSession(kind, "booking", START + HALF_HOUR / 2, CLOSE + HALF_HOUR)
+    inputs = replace(
+        rev.run.inputs, free_sessions=(session,), happy_hour_remaining_kwh={"booking": 16},
+        ev_hold_charging=winner == "hold",
+    )
+    schedule = apply_import_overlay(rev.run.schedule, inputs, rev.run.cfg)
+    rev = replace(rev, run=replace(rev.run, inputs=inputs, schedule=schedule))
+    ledger = EnergyLedger(settings.db_path)
+    counter("sensor.grid_import", ("12", CLOSE))
+    await ledger.record_boundary(settings, CLOSE, capture_rates(settings, CLOSE, rev))
+    [row] = await ledger.slots(START, CLOSE)
+    assert row.import_session == kind
+    assert row.import_rate is row.export_rate is None
+    assert row.exclusions == ("partial_session_slot",)

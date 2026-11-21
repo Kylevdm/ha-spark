@@ -168,6 +168,12 @@ def capture_rates(settings: Settings, now: datetime, revision: PlanRevision | No
         exclusions = ("provider_rate_unavailable",)
     elif not (math.isfinite(import_rate) and math.isfinite(export_rate)):
         exclusions = ("invalid_tariff_rate",)
+    elif import_session is not None and (
+        (cover := booking or (session if overlay == "free_electricity" else None)) is not None
+        and not (cover.start <= start and cover.end >= boundary)
+    ):
+        # Measured flows cannot be split at a session edge inside the slot.
+        exclusions = ("partial_session_slot",)
     return RateEvidence(
         revision_id=revision_id,
         import_rate=None if exclusions else import_rate,

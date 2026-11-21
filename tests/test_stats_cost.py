@@ -146,3 +146,27 @@ def test_no_purchase_room_credits_only_the_captured_remaining_allowance():
                 **happy_hour(session_suppressed_by="no_purchase_room", session_remaining_kwh=5))
     result = cost_stats(compute_stats([first], START, START + HALF_HOUR, UTC))
     assert (result.actual_cost, result.no_battery_cost, result.battery_savings) == (0.75, 1.25, 0.5)
+
+
+def test_not_configured_counts_zero_only_when_absent():
+    second = row(START + HALF_HOUR)
+    second.components["solar_generation"] = ComponentFlow(
+        provenance="hourly_backfill", reason="not_configured",
+    )
+    result = cost_stats(compute_stats([row(), second], START, START + 2 * HALF_HOUR, UTC))
+    assert result.slots[1].reason == "untrusted_solar_generation"
+    assert result.priced_slots == 1
+
+
+def test_partial_session_slot_is_unpriced_with_its_exclusion():
+    unpriced = row(import_rate=None, export_rate=None, exclusions=("partial_session_slot",))
+    [slot] = cost_stats(compute_stats([unpriced], START, START + HALF_HOUR, UTC)).slots
+    assert slot.reason == "partial_session_slot"
+
+
+def test_no_purchase_room_without_a_captured_allowance_gets_no_credit():
+    first = row(imported=8, house=10, solar=0, exported=0,
+                **happy_hour(session_suppressed_by="no_purchase_room"))
+    result = cost_stats(compute_stats([first], START, START + HALF_HOUR, UTC))
+    assert result.slots[0].reason == "missing_happy_hour_allowance"
+    assert result.priced_slots == 0

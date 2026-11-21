@@ -115,9 +115,7 @@ def _price_slot(bucket: StatsBucket, previous: SlotCost | None) -> SlotCost:
         return SlotCost(start, reason="missing_slot")
     import_rate, export_rate = row.import_rate, row.export_rate
     if import_rate is None or export_rate is None:
-        reason = ("provider_rate_unavailable" if "provider_rate_unavailable" in row.exclusions
-                  else "rate_not_captured")
-        return SlotCost(start, reason=reason)
+        return SlotCost(start, reason=row.exclusions[0] if row.exclusions else "rate_not_captured")
     house = row.house_load_kwh
     if house is None:
         return SlotCost(start, reason="missing_house_load")
@@ -129,7 +127,8 @@ def _price_slot(bucket: StatsBucket, previous: SlotCost | None) -> SlotCost:
         flow = row.components.get(name)
         if flow is not None and flow.kwh is not None and flow.provenance in PRICEABLE:
             values[name] = flow.kwh
-        elif flow is not None and flow.kwh is None and flow.reason == "not_configured":
+        elif (flow is not None and flow.kwh is None and flow.provenance == "absent"
+              and flow.reason == "not_configured"):
             values[name] = 0.0
         else:
             return SlotCost(start, reason=f"untrusted_{name}")
@@ -144,6 +143,8 @@ def _price_slot(bucket: StatsBucket, previous: SlotCost | None) -> SlotCost:
         instant = start.astimezone(UTC)
         if not row.session_id or row.session_start is None or row.session_end is None:
             return SlotCost(start, reason="missing_happy_hour_booking")
+        if row.session_suppressed_by == "no_purchase_room" and row.session_remaining_kwh is None:
+            return SlotCost(start, reason="missing_happy_hour_allowance")
         elapsed = instant - row.session_start.astimezone(UTC)
         within_hour = elapsed % _HOUR
         if (elapsed < timedelta(0) or instant + HALF_HOUR > row.session_end.astimezone(UTC)
