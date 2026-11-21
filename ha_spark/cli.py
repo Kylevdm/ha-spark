@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import io
 import json
+import math
 import signal
 import sys
 from dataclasses import asdict
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import aiosqlite
 import yaml
 
 from ha_spark.api.site_pairing import REPLACE_TEXT
@@ -49,11 +51,11 @@ from ha_spark.energy.derived_base_load import (
     derive_specs_from_settings,
 )
 from ha_spark.energy.energy_ledger import EnergyLedger
-from ha_spark.energy.eval import actual_kwh_by_date, evaluate, format_eval
+from ha_spark.energy.eval import actual_kwh_by_date
 from ha_spark.energy.evening_forecast import EveningForecastStore
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
-from ha_spark.energy.models import ConsumptionInterval
+from ha_spark.energy.models import ConsumptionInterval, ForecastHistoryRecord
 from ha_spark.energy.octopus import OctopusApiError, fetch_consumption, parse_octopus_csv
 from ha_spark.energy.onboarding import (
     BACKFILL_LOOKBACK_DAYS,
@@ -70,7 +72,13 @@ from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever
 from ha_spark.energy.solar_source import NATIVE_PREVIEW_NOTE, solar_source_from_store
 from ha_spark.energy.sources import _to_float
-from ha_spark.energy.stats import StatsResult, compute_stats, solar_accuracy
+from ha_spark.energy.stats import (
+    LoadAccuracy,
+    StatsResult,
+    compute_stats,
+    load_accuracy,
+    solar_accuracy,
+)
 from ha_spark.energy.store import ConsumptionStore
 from ha_spark.energy.v2l import delivered_fraction, load_session, savings
 from ha_spark.ha.models import StateChangedEvent
@@ -92,6 +100,103 @@ from ha_spark.onboarding_discover import FieldProposal, propose
 from ha_spark.presets import get_preset, preset_names
 from ha_spark.router import route_message
 from ha_spark.settings_service import ConfigurationRepair, SettingsService
+
+
+async def _read_forecast_history(
+    db_path: str, since: date, until: date,
+) -> list[ForecastHistoryRecord]:
+    """Read forecast revisions without creating the database or its schema."""
+    if not await asyncio.to_thread(Path(db_path).exists):
+        return []
+    path = await asyncio.to_thread(Path(db_path).resolve)
+    async with aiosqlite.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+        async with db.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'forecasts'"
+        ) as cursor:
+            if await cursor.fetchone() is None:
+                return []
+        async with db.execute("PRAGMA table_info(forecasts)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+        required = {
+            "id", "issued_at", "target_date", "model", "total_kwh", "slots_json", "drove_plan",
+            "median_total_kwh", "median_slots_json",
+        }
+        if not required <= columns:
+            return []
+        async with db.execute(
+            "SELECT issued_at, target_date, model, total_kwh, slots_json, "
+            "median_total_kwh, median_slots_json, drove_plan FROM forecasts "
+            "WHERE target_date >= ? AND target_date <= ? ORDER BY julianday(issued_at), id",
+            (since.isoformat(), until.isoformat()),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    def finite(value: object) -> float:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError("not a number")
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("not finite")
+        return number
+
+    def series(raw: object) -> tuple[float, ...] | None:
+        # A malformed slot series drops only that series, never the revision, so
+        # selection still matches readiness (which reads the totals alone).
+        try:
+            values = json.loads(raw) if isinstance(raw, str) and raw else None
+            if not isinstance(values, list):
+                return None
+            return tuple(finite(v) for v in values)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    result = []
+    for issued, target, model, total, slots_json, median, median_json, drove in rows:
+        # A malformed stored row is skipped, never scored or allowed to crash the report.
+        try:
+            made_at = datetime.fromisoformat(issued)
+            if made_at.tzinfo is None:
+                continue
+            made_at.astimezone(UTC)
+            result.append(ForecastHistoryRecord(
+                made_at=made_at, target_date=date.fromisoformat(target), model=str(model),
+                total_kwh=finite(total), slots=series(slots_json), source="ledger",
+                drove_plan=drove == 1,
+                median_total_kwh=None if median is None else finite(median),
+                median_slots=series(median_json),
+            ))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return result
+
+
+def _print_load_accuracy(accuracy: LoadAccuracy) -> None:
+    print("Load accuracy (vs derived base load):")
+    if not accuracy.days:
+        print("  no recorded forecasts")
+        return
+    for day in accuracy.days:
+        if day.error_kwh is None:
+            print(
+                f"  {day.day} {day.model}: no daily score "
+                f"({day.covered_slots}/{day.total_slots} slots covered)"
+            )
+        else:
+            median = (
+                "—" if day.median_error_kwh is None
+                else f"{day.median_error_kwh:.2f} kWh"
+            )
+            print(
+                f"  {day.day} {day.model}: daily error {day.error_kwh:.2f} kWh; "
+                f"median {median}"
+            )
+    for model in accuracy.models:
+        daily = "—" if model.daily_mae_kwh is None else f"{model.daily_mae_kwh:.2f} kWh"
+        shape = "—" if model.shape_mae_kwh is None else f"{model.shape_mae_kwh:.3f} kWh"
+        print(
+            f"  {model.model}: daily MAE {daily} over {model.days} day(s); "
+            f"shape MAE {shape} over {model.shape_slots} slot(s)"
+        )
 
 
 async def _print_solar_accuracy(settings: Settings, day: date, stats: StatsResult) -> None:
@@ -185,6 +290,15 @@ async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
         f"Coverage: {result.covered_slots}/{len(result.buckets)} slots "
         f"({result.energy_coverage:.1%})"
     )
+    forecast_days = sorted({bucket.start.astimezone(tz).date() for bucket in result.buckets})
+    try:
+        forecasts = await _read_forecast_history(
+            settings.db_path, forecast_days[0], forecast_days[-1],
+        )
+    except Exception:
+        print("Load accuracy: unavailable")
+    else:
+        _print_load_accuracy(load_accuracy(result, forecasts, tz))
     await _print_solar_accuracy(settings, day, result)
     return 0
 
@@ -786,28 +900,13 @@ async def _cmd_backtest(settings: Settings, *, days: int) -> int:
     return 0
 
 
-async def _cmd_forecast_eval(settings: Settings, *, days: int) -> int:
-    """Score recorded load forecasts against actual consumption (MAE/MAPE per model)."""
-    since = (datetime.now(UTC) - timedelta(days=days)).date()
-    async with ForecastLedger(settings.db_path) as ledger:
-        forecasts = await ledger.forecasts_since(since)
-    if not forecasts:
-        print(
-            "No recorded forecasts yet; the daemon writes one nightly (`ha-spark run`).",
-            file=sys.stderr,
-        )
-        return 2
-    rows = await statistics_during_period(
-        settings.ha_websocket_url,
-        settings.auth_token,
-        settings.consumption_energy_entity,
-        datetime.combine(since, datetime.min.time(), tzinfo=UTC),
-        period="day",
-        timeout=settings.ha_timeout,
+def _cmd_forecast_eval() -> int:
+    """Retired: point old invocations at the statistics command."""
+    print(
+        "forecast-eval has been retired; use `ha-spark stats --range day`.",
+        file=sys.stderr,
     )
-    results = evaluate(forecasts, actual_kwh_by_date(rows))
-    print(format_eval(results, days))
-    return 0
+    return 2
 
 
 async def _cmd_learn_factors(settings: Settings) -> int:
@@ -950,7 +1049,7 @@ examples:
   ha-spark import-csv export.csv           import an Octopus dashboard CSV (cost data)
   ha-spark pull-consumption --days 60      pull grid import from the Octopus API
   ha-spark backtest --days 30              rate stored grid import under the tariff
-  ha-spark forecast-eval --days 14         score recorded forecasts vs actual load
+  ha-spark stats --range day               measured flows, coverage and load accuracy
   ha-spark learn-factors                   show learned away factor + occupancy
   ha-spark context add away --from 2026-07-01 --to 2026-07-14   record a holiday
   ha-spark context list                    show stored context facts
@@ -1210,18 +1309,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_fe = sub.add_parser(
         "forecast-eval",
-        help="Score recorded load forecasts against actual consumption",
-        description="Join forecasts recorded nightly by the daemon (`ha-spark run`) "
-        "against actual daily consumption from HA statistics, and report MAE/MAPE "
-        "per model. A model must beat the `median` baseline here before "
-        "LOAD_MODEL=auto can use it.",
+        help="Retired: use `stats`",
+        description="Retired. Use `ha-spark stats --range day` to report load "
+        "accuracy against the energy ledger's derived base load.",
     )
     p_fe.add_argument(
         "--days",
         type=int,
         default=14,
         metavar="N",
-        help="How many days of recorded forecasts to score (default: 14)",
+        help="Ignored; kept so old invocations parse",
     )
 
     sub.add_parser(
@@ -1634,6 +1731,10 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_repair_health(suspended))
         return asyncio.run(_cmd_health(settings))
 
+    if args.command == "forecast-eval":
+        # Retired: point at `stats` without loading settings or touching anything.
+        return _cmd_forecast_eval()
+
     try:
         settings = load_settings()
     except ConfigurationRepair as repair:
@@ -1703,9 +1804,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "backtest":
         return asyncio.run(_cmd_backtest(settings, days=args.days))
-
-    if args.command == "forecast-eval":
-        return asyncio.run(_cmd_forecast_eval(settings, days=args.days))
 
     if args.command == "learn-factors":
         return asyncio.run(_cmd_learn_factors(settings))
