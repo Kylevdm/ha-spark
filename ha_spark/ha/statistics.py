@@ -45,23 +45,23 @@ async def statistics_during_period(
     *,
     period: str = "day",
     timeout: float = 15.0,  # noqa: ASYNC109 - ergonomic; wraps asyncio.timeout
+    end_time: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Return long-term statistics rows for one statistic since ``start_time``.
 
     Each row is a dict with keys such as ``start``, ``sum``, ``state``, and
     ``change`` (availability depends on HA version). Empty list if none.
+    Without ``end_time`` HA reads up to now.
     """
-    result = await _command(
-        ws_url,
-        token,
-        {
-            "type": "recorder/statistics_during_period",
-            "start_time": start_time.isoformat(),
-            "statistic_ids": [statistic_id],
-            "period": period,
-        },
-        timeout,
-    )
+    payload: dict[str, Any] = {
+        "type": "recorder/statistics_during_period",
+        "start_time": start_time.isoformat(),
+        "statistic_ids": [statistic_id],
+        "period": period,
+    }
+    if end_time is not None:
+        payload["end_time"] = end_time.isoformat()
+    result = await _command(ws_url, token, payload, timeout)
     return list((result or {}).get(statistic_id, []))
 
 

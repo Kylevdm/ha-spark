@@ -50,6 +50,19 @@ async def test_statistics_during_period_returns_rows() -> None:
     assert requests[0]["statistic_ids"] == ["sensor.load"]
 
 
+async def test_statistics_during_period_sends_end_time_when_given() -> None:
+    requests: list[dict[str, Any]] = []
+    handler = _handler(lambda req: {"success": True, "result": {}}, requests)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = datetime(2026, 1, 2, tzinfo=UTC)
+    async with serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        assert await statistics_during_period(
+            f"ws://127.0.0.1:{port}", "tok", "sensor.load", start, period="hour", end_time=end
+        ) == []
+    assert requests[0]["end_time"] == end.isoformat()
+
+
 async def test_list_statistic_ids_returns_metadata() -> None:
     metas = [{"statistic_id": "sensor.zappi", "statistics_unit_of_measurement": "W"}]
     requests: list[dict[str, Any]] = []

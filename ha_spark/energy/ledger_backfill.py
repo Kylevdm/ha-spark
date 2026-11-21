@@ -75,8 +75,10 @@ async def backfill_energy_ledger(settings: Settings) -> bool:
                 if unit not in SUPPORTED_UNITS:
                     reason = "unsupported_unit"
                 else:
+                    # Bounded at the cutoff: the read stays ~BACKFILL_DAYS on old installs.
                     rows = await statistics_during_period(
                         url, token, entity, start, period="hour", timeout=timeout,
+                        end_time=cutoff,
                     )
                     series[name] = await asyncio.to_thread(
                         _hourly_series, rows, unit, spec.invert, start, cutoff, settings.timezone,
