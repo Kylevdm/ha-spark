@@ -238,13 +238,14 @@ async def test_reading_a_missing_ledger_does_not_create_it(tmp_path):
     assert not path.exists()
 
 
-@pytest.mark.parametrize("name", ["energy_ledger", "stats"])
+@pytest.mark.parametrize("name", ["energy_ledger", "stats", "axle_events"])
 def test_statistics_modules_have_no_write_path(name):
     path = Path(energy_ledger.__file__).with_name(f"{name}.py")
     forbidden = (
         "ha_spark.devices", "ha_spark.authority", "ha_spark.transitions",
         "ha_spark.mode_preconditions", "ha_spark.daemon_channel", "ha_spark.api.commands",
-        "ha_spark.api.native_apply", "ha_spark.energy.supply_guard", "ha_spark.energy.soc_monitor",
+        "ha_spark.api.native_apply", "ha_spark.api.contract", "ha_spark.energy.supply_guard",
+        "ha_spark.energy.soc_monitor",
         "ha_spark.energy.v2l", "ha_spark.energy.scheduler",
     )
     if name == "stats":

@@ -43,6 +43,7 @@ from ha_spark.dashboard import build_dashboard
 from ha_spark.devices import get_device
 from ha_spark.devices.inverters.solis_clock import clock_entity, clock_error, describe_error
 from ha_spark.energy import habits
+from ha_spark.energy.axle_events import AxleEventStore
 from ha_spark.energy.backtest import backtest_cost, format_backtest
 from ha_spark.energy.context import KINDS, ContextStore
 from ha_spark.energy.derived_base_load import (
@@ -73,6 +74,7 @@ from ha_spark.energy.scheduler import run_forever
 from ha_spark.energy.solar_source import NATIVE_PREVIEW_NOTE, solar_source_from_store
 from ha_spark.energy.sources import _to_float
 from ha_spark.energy.stats import (
+    CostResult,
     LoadAccuracy,
     StatsResult,
     compute_stats,
@@ -248,8 +250,9 @@ async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
     except (ValueError, OverflowError):
         print("--at must be a valid YYYY-MM-DD date", file=sys.stderr)
         return 2
+    ledger = EnergyLedger(settings.db_path)
     try:
-        rows = await EnergyLedger(settings.db_path).slots(start, end)
+        rows = await ledger.slots(start, end)
     except Exception:
         print("Could not read energy ledger", file=sys.stderr)
         return 1
@@ -314,7 +317,17 @@ async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
     else:
         _print_load_accuracy(load_accuracy(result, forecasts, tz))
     await _print_solar_accuracy(settings, day, result)
-    _print_costs(result)
+    try:
+        events = await AxleEventStore(settings.db_path).events(start, end)
+        active = [event for event in events if event.cancelled_at is None]
+        first = min((event.start for event in active), default=start)
+        last = max((event.end for event in active), default=end)
+        earlier = await ledger.slots(first, start) if first < start else []
+        later = await ledger.slots(end, last) if last > end else []
+    except Exception:
+        print("Cost and Axle earnings: unavailable (could not read Axle event evidence)")
+    else:
+        _print_costs(cost_stats(result, events, event_rows=earlier + later))
     try:
         meter_intervals = await read_consumption(settings.db_path, start, end)
     except Exception:
@@ -334,9 +347,7 @@ async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
     return 0
 
 
-def _print_costs(result: StatsResult) -> None:
-    costs = cost_stats(result)
-
+def _print_costs(costs: CostResult) -> None:
     def money(cost: float | None) -> str:
         return "unknown" if cost is None else f"{cost:.2f} GBP"
 
@@ -386,6 +397,10 @@ def _print_costs(result: StatsResult) -> None:
     print(
         f"Cost coverage: {costs.priced_slots}/{len(costs.slots)} slots ({costs.cost_coverage:.1%})"
     )
+    for day, earnings in costs.axle_earnings_by_day.items():
+        print(f"Axle earnings (estimated) {day}: {money(earnings)}")
+    rate = costs.axle.delivery_rate
+    print("Axle delivery rate: " + ("unknown" if rate is None else f"{rate:.1%}"))
 
 
 async def _cmd_readiness_show(settings: Settings) -> int:
