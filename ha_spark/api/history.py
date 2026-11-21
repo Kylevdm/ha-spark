@@ -84,6 +84,7 @@ def add_statistics(
     if resolution != "slot":
         payload["buckets"] = [{"start": bucket.start.isoformat()} for bucket in stats.buckets]
         payload["unavailable"]["solar_forecast"] = "slot_resolution_only"
+        payload["totals"] = {"solar_forecast_kwh": None, "solar_measured_kwh": None}
     if ledger_failed:
         payload["unavailable"]["statistics"] = "ledger_unreadable"
     if forecast_failed:

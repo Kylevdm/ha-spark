@@ -323,7 +323,7 @@ async def _cmd_stats(settings: Settings, *, kind: str, at: str | None) -> int:
         if kind == "all" and now is not None:
             start, _ = range_bounds(kind, now.date(), tz, first_slot=await ledger.first_slot())
             end = now.astimezone(UTC)
-        rows = await ledger.slots(start, end)
+        rows = await ledger.slots(start - timedelta(minutes=30), end)  # + pricing context
     except Exception:
         print("Could not read energy ledger", file=sys.stderr)
         return 1

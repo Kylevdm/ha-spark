@@ -78,3 +78,31 @@ def test_bucket_and_range_totals_sum_covered_slots(resolution):
     assert aggregate.totals.energy_coverage == 3 / 50
     assert aggregate.totals.cost_coverage == 2 / 50
     assert aggregate.buckets[1].totals.lower_resolution
+
+
+def test_happy_hour_before_the_range_prices_its_second_half_hour_alike():
+    # A booking 23:30-00:30 (winter, so household time is UTC): a request starting at
+    # midnight prices 00:00 as the wider request does, without counting 23:30.
+    session = datetime(2026, 1, 11, 23, 30, tzinfo=UTC)
+    rows = [priced_row(session + i * timedelta(minutes=30), 10).model_copy(update={
+        "import_session": "happy_hour", "session_id": "hh", "session_start": session,
+        "session_end": session + timedelta(hours=1),
+    }) for i in range(2)]
+    midnight = session + timedelta(minutes=30)
+    end = midnight + timedelta(minutes=30)
+    wide = summarise(rows, session, end, LONDON, "slot")
+    for resolution in ("slot", "day", "month"):
+        narrow = summarise(rows, midnight, end, LONDON, resolution)
+        assert narrow.totals.total_slots == 1
+        assert narrow.totals.priced_slots == 1
+        assert narrow.totals.energy.components_kwh["grid_import"] == 10
+        assert narrow.totals.actual_cost == wide.buckets[1].totals.actual_cost
+
+
+def test_rollback_across_midnight_never_gives_a_negative_bucket():
+    # Newfoundland's 1988 double-daylight rollback at 00:01 repeated part of 29 October.
+    tz = ZoneInfo("America/St_Johns")
+    start = datetime(1988, 10, 30, 2, tzinfo=UTC)
+    stats = summarise([], start, start + timedelta(minutes=30), tz, "day")
+    assert [b.totals.total_slots for b in stats.buckets] == [1]
+    assert stats.buckets[0].start.date() == date(1988, 10, 29)

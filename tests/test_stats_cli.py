@@ -29,7 +29,8 @@ def test_stats_cli_prints_result(monkeypatch, capsys, at):
     monkeypatch.setattr(EnergyLedger, "slots", reader)
     args = ["stats", "--range", "day"] + (["--at", at] if at else [])
     assert cli.main(args) == 0
-    reader.assert_awaited_once_with(START, START + timedelta(days=1))
+    # One half-hour early: Happy Hour pricing context, never counted (#612).
+    reader.assert_awaited_once_with(START - timedelta(minutes=30), START + timedelta(days=1))
     out = capsys.readouterr().out
     assert "grid_import=1.5 kWh (boundary)" in out
     assert "unpriced" in out

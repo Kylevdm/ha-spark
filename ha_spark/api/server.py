@@ -937,7 +937,8 @@ def build_app(
 
             ledger_failed = forecast_failed = False
             try:
-                rows = await EnergyLedger(settings.db_path).slots(start, end)
+                # One slot earlier: pricing context for a Happy Hour that started before `from`.
+                rows = await EnergyLedger(settings.db_path).slots(start - HALF_HOUR, end)
             except Exception:  # noqa: BLE001 - stale or unreadable storage degrades the series
                 log.warning("Energy ledger read failed")
                 rows = []

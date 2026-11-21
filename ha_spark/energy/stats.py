@@ -292,6 +292,11 @@ def summarise(
     For calendar buckets count missing slots without materialising them.
     """
     start, end = start.astimezone(UTC), end.astimezone(UTC)
+    rows = list(rows)
+    # The slot before `start` is pricing context only (a Happy Hour's first half-hour),
+    # so a narrower request prices a slot as a wider one does. It is never counted.
+    before = start - HALF_HOUR
+    context = next((row for row in rows if row.slot_start.astimezone(UTC) == before), None)
 
     def index(at: datetime) -> int:
         return -((start - at) // HALF_HOUR)  # Round up to the next slot on the grid.
@@ -310,7 +315,13 @@ def summarise(
                 if not (at - midnight) % HALF_HOUR:
                     by_start[at] = StatsBucket(local, row)
         energy = _energise(tuple(by_start[at] for at in sorted(by_start)))
-    costs = cost_stats(energy)
+    if context is None:
+        costs = cost_stats(energy)
+    else:
+        lead = StatsBucket(before.astimezone(tz), context)
+        priced = cost_stats(StatsResult((lead, *energy.buckets), energy.totals,
+                                        energy.covered_slots))
+        costs = _sum_costs(priced.slots[1:])
     buckets: list[RangeBucket] = []
     if resolution == "slot":
         for bucket, cost in zip(energy.buckets, costs.slots, strict=True):
@@ -324,7 +335,11 @@ def summarise(
                 day = day.replace(day=1)
             label = datetime.combine(day, time.min, tz)
             next_day = day + timedelta(days=1) if resolution == "day" else _next_month(day)
-            stop = min(end, datetime.combine(next_day, time.min, tz).astimezone(UTC))
+            stop = datetime.combine(next_day, time.min, tz).astimezone(UTC)
+            if stop <= cursor:
+                # A rollback across midnight repeats the day: end at the later midnight.
+                stop = datetime.combine(next_day, time.min, tz).replace(fold=1).astimezone(UTC)
+            stop = min(end, stop)
             right = left
             while right < len(energy.buckets) and costs.slots[right].start.astimezone(UTC) < stop:
                 right += 1

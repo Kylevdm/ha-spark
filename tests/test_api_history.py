@@ -292,6 +292,8 @@ def test_history_serves_resolutions(tmp_path, monkeypatch, resolution, start, en
     assert body["range_totals"]["actual_cost"] is None
     if resolution != "slot":
         assert body["unavailable"]["solar_forecast"] == "slot_resolution_only"
+        # No solar series at this resolution: unknown, never zero.
+        assert body["totals"] == {"solar_forecast_kwh": None, "solar_measured_kwh": None}
     assert not (tmp_path / "db.sqlite").exists()
 
 
