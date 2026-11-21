@@ -171,8 +171,10 @@ as Optimise with side effects suppressed (`[SIMULATE]`).
 - **Phase-per-branch/PR**, each ending runnable. Status lives in the GitHub
   milestones/issues + CHANGELOG.md, not here.
 - **Add-on packaging per phase:** bump `ha_spark_addon/config.yaml` `version`,
-  add a changelog fragment, update DOCS.md + schema. Keep `config.yaml`
-  `options`/`schema` and `config.py` `_OPTION_KEYS` in sync (test-enforced).
+  add a changelog fragment, update DOCS.md. A new setting is a `Settings`
+  field annotated with `_metadata(owner, reload, secret=...)` (as
+  `happy_hour_enabled` is); `config.yaml` holds only `log_level`, and
+  `_OPTION_KEYS` is the frozen 0.24 legacy seed list: don't add to either.
 - **Release procedure (two things must agree):** the Supervisor build runs
   `pip install "...@v${BUILD_VERSION}"` where `BUILD_VERSION` = the `config.yaml`
   `version` **on `master`** (the store reads the default branch), and the
