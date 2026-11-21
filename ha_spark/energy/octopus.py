@@ -286,10 +286,8 @@ def parse_octopus_csv(text: str) -> list[ConsumptionInterval]:
         raise ValueError("Unrecognized Octopus CSV header (expected Consumption/Start/End)")
 
     intervals: list[ConsumptionInterval] = []
-    line = 1
     try:
         for row in reader:
-            line += 1
             if None in row or None in row.values():
                 raise ValueError
             reading = _ConsumptionReading(
@@ -298,10 +296,9 @@ def parse_octopus_csv(text: str) -> list[ConsumptionInterval]:
                 consumption=row[kwh_col],
             ).interval()
             intervals.append(reading)
-    except (KeyError, TypeError, ValueError, OverflowError):
-        raise ValueError(f"Unrecognized Octopus CSV row {line}") from None
-    except csv.Error:
-        raise ValueError(f"Unrecognized Octopus CSV row {line + 1}") from None
+    except (KeyError, TypeError, ValueError, OverflowError, csv.Error):
+        # The physical line, so blank lines and quoted line breaks don't shift it.
+        raise ValueError(f"Unrecognized Octopus CSV row {reader.line_num}") from None
     return intervals
 
 
@@ -343,14 +340,25 @@ class ConsumptionReadError(OctopusApiError):
         super().__init__(f"Octopus consumption {reason.replace('_', ' ')}")
 
 
-def _consumption_page(payload: object) -> tuple[list[ConsumptionInterval], str | None]:
+# 1500 half-hours a page covers decades of history; a cursor that never ends stops here.
+_MAX_CONSUMPTION_PAGES = 500
+
+
+def _consumption_page(
+    payload: object, *, strict: bool,
+) -> tuple[list[ConsumptionInterval], str | None]:
     if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
         raise ValueError
     rows = []
     for item in payload["results"]:
-        row = _ConsumptionReading.model_validate(item).interval()
-        if row.end - row.start != timedelta(minutes=30):
-            raise ValueError
+        try:
+            row = _ConsumptionReading.model_validate(item).interval()
+            if row.end - row.start != timedelta(minutes=30):
+                raise ValueError
+        except (ValueError, OverflowError):
+            if strict:
+                raise
+            continue  # The `pull-consumption` CLI keeps skipping bad items.
         rows.append(row)
     next_url = payload.get("next")
     if next_url is not None and (not isinstance(next_url, str) or not next_url):
@@ -359,9 +367,13 @@ def _consumption_page(payload: object) -> tuple[list[ConsumptionInterval], str |
 
 
 async def fetch_consumption(
-    settings: Settings, *, period_from: datetime, period_to: datetime | None = None
+    settings: Settings, *, period_from: datetime, period_to: datetime | None = None,
+    strict: bool = False,
 ) -> list[ConsumptionInterval]:
-    """Pull half-hourly consumption from the Octopus REST API (paginated)."""
+    """Pull half-hourly consumption from the Octopus REST API (paginated).
+
+    ``strict`` rejects the whole pull if any item is invalid; otherwise bad items are skipped.
+    """
     if not (settings.octopus_api_key and settings.octopus_mpan and settings.octopus_meter_serial):
         raise OctopusApiError(
             "Octopus API not configured: set OCTOPUS_API_KEY, OCTOPUS_MPAN and "
@@ -395,7 +407,7 @@ async def fetch_consumption(
     ) as client:
         url = url.copy_merge_params(params)
         visited: set[httpx.URL] = set()
-        while url not in visited:
+        while url not in visited and len(visited) < _MAX_CONSUMPTION_PAGES:
             visited.add(url)
             try:
                 response = await client.get(url)
@@ -403,7 +415,7 @@ async def fetch_consumption(
             except (httpx.HTTPError, httpx.InvalidURL):
                 raise ConsumptionReadError("request_failed") from None
             try:
-                rows, next_url = _consumption_page(response.json())
+                rows, next_url = _consumption_page(response.json(), strict=strict)
             except (ValueError, OverflowError, RecursionError):
                 raise ConsumptionReadError("invalid_payload") from None
             intervals.extend(rows)
@@ -419,9 +431,10 @@ async def fetch_consumption(
                 or url.userinfo or url.fragment or not url.path.startswith(prefix)
                 or {".", ".."}.intersection(url.path.split("/"))
                 or "\\" in url.path or "%" in url.path
+                or b"%" in url.raw_path.partition(b"?")[0]
             ):
                 raise ConsumptionReadError("offsite_next_url")
-    raise ConsumptionReadError("invalid_payload")  # Repeated pagination cursor.
+    raise ConsumptionReadError("invalid_payload")  # Repeated cursor or too many pages.
 
 
 def _parse_rate_results(results: Any) -> list[PricePoint]:

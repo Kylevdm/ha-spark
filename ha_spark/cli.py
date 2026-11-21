@@ -729,12 +729,12 @@ def _cmd_import_csv(settings: Settings, paths: list[str]) -> int:
         try:
             text = Path(path).read_text(encoding="utf-8-sig")
         except (OSError, UnicodeError):
-            print("Could not import: unreadable CSV file", file=sys.stderr)
+            print(f"Could not import {path}: unreadable CSV file", file=sys.stderr)
             return 2
         try:
             intervals.extend(parse_octopus_csv(text))
         except ValueError as exc:
-            print(f"Could not import: {exc}", file=sys.stderr)
+            print(f"Could not import {path}: {exc}", file=sys.stderr)
             return 2
     return asyncio.run(_store_and_report(settings, intervals, "csv"))
 

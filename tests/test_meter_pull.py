@@ -211,3 +211,36 @@ def test_meter_pull_has_no_route_to_device_writes() -> None:
             assert node.attr != "call_service"
         elif isinstance(node, ast.Name):
             assert node.id != "call_service"
+
+
+@respx.mock
+async def test_encoded_separator_in_next_path_is_refused(settings: Settings) -> None:
+    respx.get(URL).mock(return_value=page(
+        reading(MIDNIGHT - SLOT), next_url=f"{API}/electricity-meter-points%2Fother/?page=2",
+    ))
+    assert await pull_meter_history(settings, NOW) == MeterPullOutcome.OFFSITE_NEXT_URL
+    assert len(respx.calls) == 1
+
+
+@respx.mock
+async def test_endless_distinct_cursors_stop_at_the_page_cap(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ha_spark.energy import octopus
+
+    monkeypatch.setattr(octopus, "_MAX_CONSUMPTION_PAGES", 3)
+    respx.get(URL).mock(side_effect=[
+        page(reading(MIDNIGHT - SLOT), next_url=f"{URL}?page={n}") for n in range(2, 6)
+    ])
+    assert await pull_meter_history(settings, NOW) == MeterPullOutcome.INVALID_PAYLOAD
+    assert len(respx.calls) == 3
+    assert await read_consumption(settings.db_path, MIDNIGHT - timedelta(days=1), MIDNIGHT) == []
+
+
+@respx.mock
+async def test_cli_fetch_still_skips_bad_items(settings: Settings) -> None:
+    respx.get(URL).mock(return_value=page(
+        reading(MIDNIGHT - SLOT), reading(MIDNIGHT - 2 * SLOT) | {"consumption": "NaN"},
+    ))
+    rows = await fetch_consumption(settings, period_from=MIDNIGHT - timedelta(days=1))
+    assert rows == [ConsumptionInterval(MIDNIGHT - SLOT, MIDNIGHT, 1.0)]

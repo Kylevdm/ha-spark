@@ -355,6 +355,16 @@ def test_csv_rejects_bad_rows(bad_row: str) -> None:
         parse_octopus_csv(text)
 
 
+def test_csv_row_number_counts_physical_lines() -> None:
+    text = (
+        "Consumption (kwh),Start,End\n"
+        "\n"
+        "-1,2026-06-01T00:30:00Z,2026-06-01T01:00:00Z\n"
+    )
+    with pytest.raises(ValueError, match=r"^Unrecognized Octopus CSV row 3$"):
+        parse_octopus_csv(text)
+
+
 def test_csv_rejects_unrecognized_header() -> None:
     with pytest.raises(ValueError, match="Unrecognized"):
         parse_octopus_csv("foo,bar\n1,2\n")

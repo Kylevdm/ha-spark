@@ -38,4 +38,4 @@ def test_malformed_csv_rejects_entire_import_without_writing_any_rows(
     )
     assert cli.main(["import-csv", str(file)]) == 2
     assert not db.exists()
-    assert capsys.readouterr().err == "Could not import: Unrecognized Octopus CSV row 3\n"
+    assert capsys.readouterr().err == f"Could not import {file}: Unrecognized Octopus CSV row 3\n"

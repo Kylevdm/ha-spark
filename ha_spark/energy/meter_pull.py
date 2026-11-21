@@ -128,7 +128,9 @@ async def pull_meter_history(settings: Settings, now: datetime) -> MeterPullOutc
         # A restart or cancelled request must not bypass the retry interval.
         await _save_status(settings.db_path, now, MeterPullOutcome.STARTED, start)
         try:
-            rows = await fetch_consumption(settings, period_from=start, period_to=midnight)
+            rows = await fetch_consumption(
+                settings, period_from=start, period_to=midnight, strict=True,
+            )
         except ConsumptionReadError as exc:
             outcome = MeterPullOutcome(exc.reason)
         except Exception:
