@@ -1826,10 +1826,14 @@ ha-spark's data and, optionally, trigger a few gated actions.
 - `agent_surface` (`off` | `on`): the master switch, off by default.
 - `agent_exposure` (`read` | `read_act` | `read_write`, default `read_act`):
   how much is exposed. `read` is data only (states, plan, forecast,
-  predictions, health). `read_act` adds `add_context` and `run_plan`.
+  predictions, health, statistics). `read_act` adds `add_context` and `run_plan`.
   `read_write` adds `set_config`, which in this version refuses every change
   with `unavailable`: agents can't change configuration until owner-approved
   config proposals exist in phase 14.
+- `get_statistics(range, at)`: measured energy, cost, battery savings, Axle
+  earnings and coverage for a household calendar range (`day|week|month|year|all`;
+  `at` = `YYYY-MM-DD`, default today). Read-only; same figures as `stats` and
+  `/api/history`.
 - `agent_api_token`: bearer token for the published port. If you leave it
   blank, the add-on generates one on first start and saves it to
   `/data/agent_token` in the add-on container (read it from the add-on shell
