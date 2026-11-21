@@ -1,14 +1,15 @@
 """Durable half-hourly measurements and captured tariff evidence, independent of control.
 
-Boundary snapshots and their closed slots are committed together. The ledger
-never revises a boundary row or substitutes forecasts for missing measurements.
+Boundary snapshots and their closed slots are committed together. Rows can gain
+fills, but boundary values and captured rate evidence never change. Forecasts
+are never substituted for missing measurements.
 """
 
 from __future__ import annotations
 
 import asyncio
 import math
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -21,11 +22,22 @@ from ha_spark.energy.derived_base_load import (
     base_load_balance,
     derive_specs_from_settings,
 )
+from ha_spark.energy.forecast import load_timezone
+from ha_spark.energy.onboarding import POWER_FACTORS, statistic_unit
 from ha_spark.energy.readiness_ledger import BOUNDARY_TOLERANCE, slot_start
-from ha_spark.energy.readiness_measurements import COMPONENTS, HALF_HOUR
+from ha_spark.energy.readiness_measurements import (
+    COMPONENTS,
+    HALF_HOUR,
+    RETRY_DELAY,
+    SETTLE_DELAY,
+    STATS_RETENTION,
+    day_bounds,
+    measurement_series,
+)
 from ha_spark.energy.session_allowance import CounterResult, read_counter
 from ha_spark.energy.tariff import HAPPY_HOUR_ALLOWANCE_KWH, HAPPY_HOUR_MARGIN, _slot_overlap
 from ha_spark.ha.rest import HomeAssistantRest
+from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.logging import get_logger
 
 if TYPE_CHECKING:
@@ -207,8 +219,60 @@ def _derive_loads(flows: dict[str, ComponentFlow]) -> tuple[float | None, float 
     return (house, base, raw < 0) if math.isfinite(house) else (None, None, False)
 
 
+def _configured_components(settings: Settings) -> dict[str, ComponentSpec]:
+    specs = derive_specs_from_settings(settings)
+    specs["v2l"] = ComponentSpec(settings.v2l_power_entity)
+    return {name: spec for name, spec in specs.items() if spec.entity_id.strip()}
+
+
+async def _merge_slot(
+    db: aiosqlite.Connection, start: datetime, changes: dict[str, ComponentFlow],
+    replace: tuple[Provenance, ...], missing: dict[str, ComponentFlow],
+) -> None:
+    # Read inside the caller's write transaction: a concurrently captured
+    # boundary value takes precedence over either kind of fill.
+    key = start.isoformat()
+    async with db.execute(
+        "SELECT payload FROM energy_ledger_slots WHERE slot_start = ?", (key,),
+    ) as cursor:
+        existing = await cursor.fetchone()
+    row = LedgerSlot.model_validate_json(existing[0]) if existing else LedgerSlot(
+        slot_start=start, components=missing, exclusions=("no_rate_capture",),
+    )
+    updates = {name: flow for name, flow in changes.items()
+               if row.components[name].provenance in replace}
+    if not updates:
+        return
+    components = row.components | updates
+    house, base, clamped = _derive_loads(components)
+    updated = row.model_copy(update={
+        "components": components, "house_load_kwh": house, "base_load_kwh": base,
+        "negative_clamped": clamped,
+    })
+    await db.execute(
+        "INSERT INTO energy_ledger_slots VALUES (?, ?) "
+        "ON CONFLICT(slot_start) DO UPDATE SET payload = excluded.payload",
+        (key, updated.model_dump_json()),
+    )
+
+
+def _valid_interval(row: object, field: str, invert: bool) -> bool:
+    # Reject each bad five-minute interval before readiness's reader sums six:
+    # a negative interval must never cancel into a plausible half-hour.
+    if not isinstance(row, dict):
+        return False
+    value = row.get(field)
+    if isinstance(value, bool):
+        return False
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and (-number if invert else number) >= 0
+
+
 class EnergyLedger:
-    """Add-on-side boundary recorder and read-only history reader."""
+    """Add-on-side recorder and read-only history reader."""
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -219,11 +283,9 @@ class EnergyLedger:
             boundary = slot_start(now)
             if now.astimezone(UTC) - boundary >= BOUNDARY_TOLERANCE:
                 return
-            specs = derive_specs_from_settings(settings)
-            specs["v2l"] = ComponentSpec(settings.v2l_power_entity)
             readings: dict[str, tuple[str, bool, float]] = {}
             flows = {name: ComponentFlow(reason="not_configured") for name in COMPONENTS}
-            configured = {name: spec for name, spec in specs.items() if spec.entity_id.strip()}
+            configured = _configured_components(settings)
             if configured:
                 async with HomeAssistantRest(
                     settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout,
@@ -257,6 +319,7 @@ class EnergyLedger:
             ) as cursor:
                 if await cursor.fetchone() is not None:
                     return
+            distributed: dict[datetime, dict[str, ComponentFlow]] = {}
             for name, (entity_id, invert, kwh) in readings.items():
                 async with db.execute(
                     "SELECT boundary, entity_id, invert, kwh FROM energy_ledger_readings "
@@ -266,16 +329,35 @@ class EnergyLedger:
                     previous = await cursor.fetchone()
                 if previous is None:
                     flows[name] = ComponentFlow(reason="no_previous_reading")
-                elif previous[0] != start_key:
-                    flows[name] = ComponentFlow(reason="missed_boundary")
-                elif (previous[1], previous[2]) != (entity_id, invert):
+                    continue
+                if (previous[1], previous[2]) != (entity_id, invert):
                     flows[name] = ComponentFlow(reason="source_changed")
+                    continue
+                delta = previous[3] - kwh if invert else kwh - previous[3]
+                if delta < 0:
+                    flows[name] = ComponentFlow(reason="counter_reset")
+                    continue
+                instant = datetime.fromisoformat(previous[0])
+                slots = (boundary - instant) // HALF_HOUR
+                if slots == 1:
+                    flows[name] = ComponentFlow(kwh=delta, provenance="boundary")
                 else:
-                    delta = previous[3] - kwh if invert else kwh - previous[3]
-                    flows[name] = (
-                        ComponentFlow(reason="counter_reset") if delta < 0
-                        else ComponentFlow(kwh=delta, provenance="boundary")
-                    )
+                    # Keep any captured rates for a later statistics fill;
+                    # distributed provenance makes this estimate unpriceable.
+                    flow = ComponentFlow(kwh=delta / slots, provenance="distributed")
+                    flows[name] = flow
+                    while instant < start:
+                        distributed.setdefault(instant, {})[name] = flow
+                        instant += HALF_HOUR
+            missing = {
+                name: ComponentFlow(
+                    reason="not_configured" if flows[name].reason == "not_configured"
+                    else "missed_boundary",
+                )
+                for name in COMPONENTS
+            }
+            for instant, changes in distributed.items():
+                await _merge_slot(db, instant, changes, ("absent",), missing)
             house, base, clamped = _derive_loads(flows)
             row = LedgerSlot(
                 **rates.model_dump(), slot_start=start,
@@ -309,3 +391,142 @@ class EnergyLedger:
                 (start.astimezone(UTC).isoformat(), end.astimezone(UTC).isoformat()),
             ) as cursor:
                 return [LedgerSlot.model_validate_json(row[0]) for row in await cursor.fetchall()]
+
+    async def first_recorder_slot(self) -> datetime | None:
+        """Find the first live or day-close row without creating the store."""
+        if not await asyncio.to_thread(Path(self.db_path).exists):
+            return None
+        path = await asyncio.to_thread(Path(self.db_path).resolve)
+        async with aiosqlite.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+            async with db.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'energy_ledger_slots'",
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return None
+            cutoff = await self._first_recorder_key(db)
+            return datetime.fromisoformat(cutoff) if cutoff is not None else None
+
+    @staticmethod
+    async def _first_recorder_key(db: aiosqlite.Connection) -> str | None:
+        async with db.execute(
+            "SELECT slot_start FROM energy_ledger_slots WHERE NOT EXISTS ("
+            "SELECT 1 FROM json_each(payload, '$.exclusions') WHERE value = ?"
+            ") ORDER BY slot_start LIMIT 1",
+            ("hourly_backfill",),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return str(row[0]) if row is not None else None
+
+    async def record_hourly_backfill(
+        self, flows_by_slot: dict[datetime, dict[str, ComponentFlow]],
+    ) -> None:
+        """Insert unpriced history without changing any existing slot."""
+        if not flows_by_slot:
+            return
+
+        def encode() -> list[tuple[str, str]]:
+            rows = []
+            for start, flows in flows_by_slot.items():
+                house, base, clamped = _derive_loads(flows)
+                row = LedgerSlot(
+                    slot_start=start, components=flows, exclusions=("hourly_backfill",),
+                    house_load_kwh=house, base_load_kwh=base, negative_clamped=clamped,
+                )
+                rows.append((start.astimezone(UTC).isoformat(), row.model_dump_json()))
+            return rows
+
+        rows = await asyncio.to_thread(encode)
+        path = await asyncio.to_thread(Path(self.db_path).resolve)
+        async with aiosqlite.connect(path.as_uri() + "?mode=rw", uri=True) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            # Day-close recording may have moved the cutoff while HA was being read.
+            cutoff = await self._first_recorder_key(db)
+            if cutoff is None:
+                return
+            await db.executemany(
+                "INSERT INTO energy_ledger_slots VALUES (?, ?) ON CONFLICT(slot_start) DO NOTHING",
+                [(key, payload) for key, payload in rows if key < cutoff],
+            )
+            await db.commit()
+
+    async def _fill_day(
+        self, settings: Settings, start: datetime, end: datetime,
+        configured: dict[str, ComponentSpec],
+    ) -> None:
+        url, token, timeout = settings.ha_websocket_url, settings.auth_token, settings.ha_timeout
+        metas = await list_statistic_ids(url, token, timeout=timeout)
+        fills: dict[datetime, dict[str, ComponentFlow]] = {}
+        for name, spec in configured.items():
+            entity = spec.entity_id.strip()
+            meta = next((m for m in metas if isinstance(m, dict) and
+                         m.get("statistic_id") == entity), None)
+            if meta is None:
+                continue
+            fine = await statistics_during_period(url, token, entity, start,
+                                                  period="5minute", timeout=timeout)
+            unit = statistic_unit(meta)
+            field = "mean" if unit in POWER_FACTORS else "change"
+            try:
+                series = measurement_series(
+                    [r for r in fine if _valid_interval(r, field, spec.invert)], [],
+                    unit, spec.invert, settings.timezone,
+                )
+            except ValueError:
+                continue
+            for instant, measured in series.items():
+                if (start <= instant < end and measured.provenance == "measured"
+                        and math.isfinite(measured.kwh) and measured.kwh >= 0):
+                    fills.setdefault(instant, {})[name] = ComponentFlow(
+                        kwh=measured.kwh, provenance="statistics_fill",
+                    )
+        if not fills:
+            return
+        missing = {name: ComponentFlow(reason="missed_boundary" if name in configured
+                                       else "not_configured") for name in COMPONENTS}
+        await asyncio.to_thread(Path(self.db_path).parent.mkdir, parents=True, exist_ok=True)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.executescript(_SCHEMA)
+            await db.execute("BEGIN IMMEDIATE")
+            for instant, changes in fills.items():
+                await _merge_slot(db, instant, changes, ("absent", "distributed"), missing)
+            await db.commit()
+
+
+# None marks a completed day; failed days carry their next attempt time.
+_fill_attempts: dict[tuple[str, datetime], datetime | None] = {}
+
+
+async def fill_closed_days(settings: Settings, now: datetime) -> None:
+    """Reconcile settled days within recorder retention, as background work only."""
+    try:
+        configured = _configured_components(settings)
+        if not configured:
+            return
+        now = now.astimezone(UTC)
+        oldest = now - STATS_RETENTION
+        for key in list(_fill_attempts):
+            if key[1] < oldest:
+                del _fill_attempts[key]
+        ledger = EnergyLedger(settings.db_path)
+        tz = load_timezone(settings.timezone)
+        day = now.astimezone(tz).date()
+        while True:
+            day -= timedelta(days=1)
+            start, end = day_bounds(day, settings.timezone)
+            if start < oldest:
+                break
+            if now < end + SETTLE_DELAY:
+                continue
+            key = (settings.db_path, start)
+            due = _fill_attempts.get(key, now)
+            if due is None or now < due:
+                continue
+            try:
+                await ledger._fill_day(settings, start, end, configured)
+            except Exception:
+                _fill_attempts[key] = now + RETRY_DELAY
+                log.warning("Energy ledger fill failed")
+            else:
+                _fill_attempts[key] = None
+    except Exception:
+        log.warning("Energy ledger fill failed")

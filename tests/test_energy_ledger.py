@@ -89,7 +89,7 @@ async def test_unusable_counter_is_absent_not_zero(tmp_path, value, when, unit, 
 
 
 @respx.mock
-async def test_missed_boundary_does_not_distribute_but_next_slot_uses_reading(tmp_path):
+async def test_missed_boundary_distributes_and_next_slot_uses_reading(tmp_path):
     settings = settings_for(tmp_path)
     ticks = (START, START + 2 * HALF_HOUR, START + 3 * HALF_HOUR)
     counter("sensor.grid_import", ("5", ticks[0]), ("10", ticks[1]), ("11", ticks[2]))
@@ -98,9 +98,14 @@ async def test_missed_boundary_does_not_distribute_but_next_slot_uses_reading(tm
             settings, tick, capture_rates(settings, tick, revision()),
         )
     rows = await EnergyLedger(settings.db_path).slots(START, ticks[-1])
-    assert [r.slot_start for r in rows] == [CLOSE, ticks[1]]
-    assert rows[0].components["grid_import"].reason == "missed_boundary"
-    assert rows[1].components["grid_import"].kwh == 1
+    assert [r.slot_start for r in rows] == [START, CLOSE, ticks[1]]
+    for row in rows[:2]:
+        flow = row.components["grid_import"]
+        assert (flow.kwh, flow.provenance) == (2.5, "distributed")
+    assert rows[0].import_rate is rows[0].export_rate is None
+    assert rows[0].exclusions == ("no_rate_capture",)
+    assert rows[1].import_rate == 0.1  # Captured at close, usable only after a fill.
+    assert rows[2].components["grid_import"].kwh == 1
 
 
 @pytest.mark.parametrize("provider", ["dynamic", "octopus_intelligent"])
