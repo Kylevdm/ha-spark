@@ -51,6 +51,9 @@ async def read_statistics(settings: Settings, start: datetime) -> tuple[
     rows = await statistics_during_period(
         settings.ha_websocket_url, settings.auth_token, entity, start,
         period="5minute", timeout=settings.ha_timeout,
+        # History asks for at most one household day. Bound old requests too;
+        # otherwise HA would return every retained row from start through now.
+        end_time=start + timedelta(days=2),
     )
     return unit, rows
 

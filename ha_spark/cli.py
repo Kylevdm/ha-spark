@@ -17,7 +17,7 @@ import math
 import signal
 import sys
 from dataclasses import asdict
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from getpass import getpass
 from pathlib import Path
 from typing import Any
@@ -67,20 +67,24 @@ from ha_spark.energy.onboarding import (
 from ha_spark.energy.plan_run import current_plan
 from ha_spark.energy.readiness import load_readiness
 from ha_spark.energy.readiness_ledger import ReadinessLedger, slot_start
-from ha_spark.energy.readiness_measurements import COMPONENTS, ReadinessDays, day_bounds
+from ha_spark.energy.readiness_measurements import COMPONENTS, ReadinessDays
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.scheduler import run_forever
 from ha_spark.energy.solar_source import NATIVE_PREVIEW_NOTE, solar_source_from_store
 from ha_spark.energy.sources import _to_float
 from ha_spark.energy.stats import (
     LoadAccuracy,
+    RangeStats,
+    RangeTotals,
+    Resolution,
     StatsResult,
     compute_stats,
-    cost_stats,
     load_accuracy,
     meter_reconciliation,
     provenance_counts,
+    range_bounds,
     solar_accuracy,
+    summarise,
 )
 from ha_spark.energy.store import ConsumptionStore, read_consumption
 from ha_spark.energy.v2l import delivered_fraction, load_session, savings
@@ -202,18 +206,24 @@ def _print_load_accuracy(accuracy: LoadAccuracy) -> None:
         )
 
 
-async def _print_solar_accuracy(settings: Settings, day: date, stats: StatsResult) -> None:
+async def _print_solar_accuracy(
+    settings: Settings, first: date, last: date, stats: StatsResult, *, show_slots: bool,
+) -> None:
     try:
-        forecast = await EveningForecastStore(settings.db_path).slots(day, day + timedelta(days=1))
+        forecast = await EveningForecastStore(settings.db_path).slots(
+            first, last + timedelta(days=1),
+        )
     except Exception:
         print("Solar coverage: unavailable (could not read evening-plan forecast)")
         return
+    # Sum the same individual errors as the daily scores, rather than comparing
+    # forecast and measured range totals (where positive and negative errors cancel).
     accuracy = solar_accuracy(stats, forecast)
 
     def energy(kwh: float | None) -> str:
         return "—" if kwh is None else f"{kwh:g} kWh"
 
-    if forecast:
+    if forecast and show_slots:
         print("Evening-plan solar forecast vs measured:")
         for slot in accuracy.slots:
             if slot.forecast is None:
@@ -238,34 +248,19 @@ async def _print_solar_accuracy(settings: Settings, day: date, stats: StatsResul
     )
 
 
-async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
-    tz = load_timezone(settings.timezone)
-    try:
-        day = date.fromisoformat(at) if at is not None else datetime.now(tz).date()
-        if at is not None and day.isoformat() != at:
-            raise ValueError
-        start, end = day_bounds(day, settings.timezone)
-    except (ValueError, OverflowError):
-        print("--at must be a valid YYYY-MM-DD date", file=sys.stderr)
-        return 2
-    try:
-        rows = await EnergyLedger(settings.db_path).slots(start, end)
-    except Exception:
-        print("Could not read energy ledger", file=sys.stderr)
-        return 1
-    result = compute_stats(rows, start, end, tz)
+def _stats_energy(kwh: float | None) -> str:
+    return "—" if kwh is None else f"{kwh:g} kWh"
 
-    def energy(kwh: float | None) -> str:
-        return "—" if kwh is None else f"{kwh:g} kWh"
 
-    for bucket in result.buckets:
+def _print_slot_flows(stats: RangeStats, tz: tzinfo) -> None:
+    for bucket in stats.buckets:
         instant = bucket.start.isoformat(timespec="minutes")
         row = bucket.slot
         if row is None:
             print(f"{instant} gap")
             continue
         flows = [
-            f"{name}={energy(flow.kwh)} ({flow.provenance})"
+            f"{name}={_stats_energy(flow.kwh)} ({flow.provenance})"
             if (flow := row.components.get(name)) is not None else f"{name}=— (absent)"
             for name in COMPONENTS
         ]
@@ -284,37 +279,91 @@ async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
             else ""
         )
         print(
-            f"{instant} {'; '.join(flows)}; house_load={energy(row.house_load_kwh)}; "
-            f"base_load={energy(row.base_load_kwh)}{' (clamped)' if row.negative_clamped else ''}; "
+            f"{instant} {'; '.join(flows)}; house_load={_stats_energy(row.house_load_kwh)}; "
+            f"base_load={_stats_energy(row.base_load_kwh)}"
+            f"{' (clamped)' if row.negative_clamped else ''}; "
             f"{rates}; session={session}{resolution}"
         )
-    totals = result.totals
-    flows_text = "; ".join(f"{name}={energy(kwh)}" for name, kwh in totals.components_kwh.items())
+
+
+def _stats_flows(totals: RangeTotals) -> str:
+    energy = totals.energy
+    flows = "; ".join(f"{name}={_stats_energy(kwh)}" for name, kwh in energy.components_kwh.items())
+    return (f"{flows}; house_load={_stats_energy(energy.house_load_kwh)}; "
+            f"base_load={_stats_energy(energy.base_load_kwh)}")
+
+
+def _stats_money(cost: float | None) -> str:
+    return "unknown" if cost is None else f"{cost:.2f} GBP"
+
+
+def _stats_cost_totals(totals: RangeTotals) -> str:
+    return (f"Actual cost={_stats_money(totals.actual_cost)}; "
+            f"No-battery cost={_stats_money(totals.no_battery_cost)}; "
+            f"Battery savings={_stats_money(totals.battery_savings)}")
+
+
+async def _cmd_stats(settings: Settings, *, kind: str, at: str | None) -> int:
+    tz = load_timezone(settings.timezone)
+    now = datetime.now(tz) if at is None or kind == "all" else None
+    try:
+        if at is None:
+            assert now is not None
+            day = now.date()
+        else:
+            day = date.fromisoformat(at)
+            if day.isoformat() != at:
+                raise ValueError
+        start, end = range_bounds(kind, day, tz)
+    except (ValueError, OverflowError):
+        print("--at must be a valid YYYY-MM-DD date", file=sys.stderr)
+        return 2
+    ledger = EnergyLedger(settings.db_path)
+    try:
+        if kind == "all" and now is not None:
+            start, _ = range_bounds(kind, now.date(), tz, first_slot=await ledger.first_slot())
+            end = now.astimezone(UTC)
+        rows = await ledger.slots(start - timedelta(minutes=30), end)  # + pricing context
+    except Exception:
+        print("Could not read energy ledger", file=sys.stderr)
+        return 1
+    resolution: Resolution = ("slot" if kind == "day" else "day" if kind in ("week", "month")
+                              else "month")
+    stats = summarise(rows, start, end, tz, resolution)
+    if resolution == "slot":
+        _print_slot_flows(stats, tz)
+    else:
+        for bucket in stats.buckets:
+            totals = bucket.totals
+            hourly = "; lower resolution (hourly)" if totals.lower_resolution else ""
+            print(
+                f"{bucket.start.date()} {_stats_flows(totals)}; {_stats_cost_totals(totals)}; "
+                f"energy coverage={totals.energy_coverage:.1%}; "
+                f"cost coverage={totals.cost_coverage:.1%}{hourly}"
+            )
+    print(f"Totals: {_stats_flows(stats.totals)}")
     print(
-        f"Totals: {flows_text}; house_load={energy(totals.house_load_kwh)}; "
-        f"base_load={energy(totals.base_load_kwh)}"
+        f"Coverage: {stats.totals.covered_slots}/{stats.totals.total_slots} slots "
+        f"({stats.totals.energy_coverage:.1%})"
     )
-    print(
-        f"Coverage: {result.covered_slots}/{len(result.buckets)} slots "
-        f"({result.energy_coverage:.1%})"
-    )
+    result = compute_stats(rows, start, end, tz)
     counts = provenance_counts(result)
     gaps = counts.get("gap", 0) + counts.get("absent", 0)
     print(
         f"Grid import: filled {counts.get('statistics_fill', 0)} (statistics_fill), "
         f"distributed {counts.get('distributed', 0)}, gaps {gaps}"
     )
-    forecast_days = sorted({bucket.start.astimezone(tz).date() for bucket in result.buckets})
-    try:
-        forecasts = await _read_forecast_history(
-            settings.db_path, forecast_days[0], forecast_days[-1],
-        )
-    except Exception:
-        print("Load accuracy: unavailable")
-    else:
-        _print_load_accuracy(load_accuracy(result, forecasts, tz))
-    await _print_solar_accuracy(settings, day, result)
-    _print_costs(result)
+    if result.buckets:
+        first = result.buckets[0].start.date()
+        last = result.buckets[-1].start.date()
+        try:
+            forecasts = await _read_forecast_history(settings.db_path, first, last)
+        except Exception:
+            print("Load accuracy: unavailable")
+        else:
+            _print_load_accuracy(load_accuracy(result, forecasts, tz))
+        await _print_solar_accuracy(settings, first, last, result, show_slots=resolution == "slot")
+    _print_costs(stats, show_slots=resolution == "slot")
     try:
         meter_intervals = await read_consumption(settings.db_path, start, end)
     except Exception:
@@ -334,14 +383,13 @@ async def _cmd_stats(settings: Settings, *, at: str | None) -> int:
     return 0
 
 
-def _print_costs(result: StatsResult) -> None:
-    costs = cost_stats(result)
-
-    def money(cost: float | None) -> str:
-        return "unknown" if cost is None else f"{cost:.2f} GBP"
-
-    print("Slot costs:")
-    for slot in costs.slots:
+def _print_costs(stats: RangeStats, *, show_slots: bool) -> None:
+    if show_slots:
+        print("Slot costs:")
+    for bucket in stats.buckets if show_slots else ():
+        slot = bucket.cost
+        if slot is None:
+            continue
         instant = slot.start.isoformat(timespec="minutes")
         inputs = slot.inputs
         if inputs is None:
@@ -367,9 +415,9 @@ def _print_costs(result: StatsResult) -> None:
             f"no-battery export={inputs.no_battery_export_kwh:g} kWh; "
             f"no-battery free import={inputs.no_battery_free_import_kwh:g} kWh; "
             f"Axle earnings (estimated)={inputs.axle_earnings:g} GBP; "
-            f"Actual cost={money(slot.actual_cost)}; "
-            f"No-battery cost={money(slot.no_battery_cost)}; "
-            f"Battery savings={money(slot.battery_savings)}"
+            f"Actual cost={_stats_money(slot.actual_cost)}; "
+            f"No-battery cost={_stats_money(slot.no_battery_cost)}; "
+            f"Battery savings={_stats_money(slot.battery_savings)}"
         )
     print("Actual cost = (import - free import) × import rate - export × export rate "
           "- Axle earnings (estimated)")
@@ -378,13 +426,11 @@ def _print_costs(result: StatsResult) -> None:
     print("Battery savings = no-battery cost - actual cost (the battery and ha-spark together)")
     print("Standing charges excluded. Free Electricity covers all import; Happy Hour covers up to "
           "16 kWh per booked hour, tracked separately for actual and no-battery import.")
+    totals = stats.totals
+    print(f"Cost totals: {_stats_cost_totals(totals)}")
     print(
-        f"Cost totals: Actual cost={money(costs.actual_cost)}; "
-        f"No-battery cost={money(costs.no_battery_cost)}; "
-        f"Battery savings={money(costs.battery_savings)}"
-    )
-    print(
-        f"Cost coverage: {costs.priced_slots}/{len(costs.slots)} slots ({costs.cost_coverage:.1%})"
+        f"Cost coverage: {totals.priced_slots}/{totals.total_slots} slots "
+        f"({totals.cost_coverage:.1%})"
     )
 
 
@@ -1139,7 +1185,7 @@ examples:
   ha-spark import-csv export.csv           import an Octopus dashboard CSV (cost data)
   ha-spark pull-consumption --days 60      pull grid import from the Octopus API
   ha-spark backtest --days 30              rate stored grid import under the tariff
-  ha-spark stats --range day               measured flows, coverage and load accuracy
+  ha-spark stats --range week              measured flows, costs, coverage and accuracy
   ha-spark learn-factors                   show learned away factor + occupancy
   ha-spark context add away --from 2026-07-01 --to 2026-07-14   record a holiday
   ha-spark context list                    show stored context facts
@@ -1166,8 +1212,10 @@ def build_parser() -> argparse.ArgumentParser:
     slots.add_argument("--days", type=int, default=7, help="household-local days (default: 7)")
 
     stats = sub.add_parser("stats", help="show measured flows and coverage (read-only)")
-    stats.add_argument("--range", choices=("day",), required=True)
-    stats.add_argument("--at", metavar="YYYY-MM-DD", help="household date (default: today)")
+    stats.add_argument("--range", choices=("day", "week", "month", "year", "all"), required=True,
+                       help="household calendar range (weeks start on Monday)")
+    stats.add_argument("--at", metavar="YYYY-MM-DD",
+                       help="household date (default: today); all always runs through now")
 
     p_inverter = sub.add_parser("inverter", help="Read model identity and resident schedule")
     p_inverter.add_subparsers(dest="inverter_command", required=True).add_parser("show")
@@ -1750,7 +1798,7 @@ def main(argv: list[str] | None = None) -> int:
         except (ConfigurationRepair, ConfigError):
             print("Could not read settings", file=sys.stderr)
             return 2
-        return asyncio.run(_cmd_stats(settings, at=args.at))
+        return asyncio.run(_cmd_stats(settings, kind=args.range, at=args.at))
 
     # Diagnostic paths use the settings service's read-only load (a seed preview
     # before the initialisation marker), which never writes. Skip credential and

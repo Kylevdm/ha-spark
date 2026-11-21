@@ -6,11 +6,12 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
+from zoneinfo import ZoneInfo
 
 from ha_spark.energy.energy_ledger import LedgerSlot, RateEvidence
 from ha_spark.energy.models import ConsumptionInterval, ForecastHistoryRecord
-from ha_spark.energy.readiness_measurements import COMPONENTS, HALF_HOUR
+from ha_spark.energy.readiness_measurements import COMPONENTS, HALF_HOUR, day_bounds
 from ha_spark.energy.tariff import HAPPY_HOUR_ALLOWANCE_KWH
 
 if TYPE_CHECKING:
@@ -54,14 +55,15 @@ def compute_stats(
     cursor, end = start.astimezone(UTC), end.astimezone(UTC)
     by_start = {row.slot_start.astimezone(UTC): row for row in rows}
     buckets: list[StatsBucket] = []
-    covered: list[LedgerSlot] = []
     while cursor < end:
-        row = by_start.get(cursor)
-        buckets.append(StatsBucket(cursor.astimezone(tz), row))
-        if row is not None and row.house_load_kwh is not None and row.base_load_kwh is not None:
-            covered.append(row)
+        buckets.append(StatsBucket(cursor.astimezone(tz), by_start.get(cursor)))
         cursor += HALF_HOUR
+    return _energise(tuple(buckets))
 
+
+def _energise(buckets: tuple[StatsBucket, ...]) -> StatsResult:
+    covered = [row for bucket in buckets if (row := bucket.slot) is not None
+               and row.house_load_kwh is not None and row.base_load_kwh is not None]
     totals = EnergyTotals(
         components_kwh={name: _total(
             row.components[name].kwh for row in covered if name in row.components
@@ -69,7 +71,7 @@ def compute_stats(
         house_load_kwh=_total(row.house_load_kwh for row in covered),
         base_load_kwh=_total(row.base_load_kwh for row in covered),
     )
-    return StatsResult(tuple(buckets), totals, len(covered))
+    return StatsResult(buckets, totals, len(covered))
 
 
 PRICEABLE = frozenset({"boundary", "statistics_fill"})
@@ -191,6 +193,10 @@ def cost_stats(result: StatsResult) -> CostResult:
     slots: list[SlotCost] = []
     for bucket in result.buckets:
         slots.append(_price_slot(bucket, slots[-1] if slots else None))
+    return _sum_costs(tuple(slots))
+
+
+def _sum_costs(slots: tuple[SlotCost, ...]) -> CostResult:
     priced = [slot for slot in slots if slot.inputs is not None]
 
     def total(values: list[float | None]) -> float | None:
@@ -198,10 +204,150 @@ def cost_stats(result: StatsResult) -> CostResult:
         return None if None in values else _total(values)
 
     return CostResult(
-        tuple(slots), len(priced), total([slot.actual_cost for slot in priced]),
+        slots, len(priced), total([slot.actual_cost for slot in priced]),
         total([slot.no_battery_cost for slot in priced]),
         total([slot.battery_savings for slot in priced]),
     )
+
+
+Resolution = Literal["slot", "day", "month"]
+
+
+def _next_month(day: date) -> date:
+    return day.replace(day=1, month=day.month + 1) if day.month < 12 else date(day.year + 1, 1, 1)
+
+
+def range_bounds(
+    kind: str, at: date, tz: ZoneInfo, *, first_slot: datetime | None = None,
+) -> tuple[datetime, datetime]:
+    """UTC calendar bounds; weeks start on Monday. All ends after the anchor day."""
+    if kind == "day":
+        return day_bounds(at, tz.key)
+    if kind == "week":
+        first = at - timedelta(days=at.weekday())
+        stop = first + timedelta(days=7)
+    elif kind == "month":
+        first, stop = at.replace(day=1), _next_month(at)
+    elif kind == "year":
+        first, stop = date(at.year, 1, 1), date(at.year + 1, 1, 1)
+    elif kind == "all":
+        earliest = first_slot.astimezone(tz).date() if first_slot is not None else at
+        first, stop = min(earliest, at).replace(day=1), at + timedelta(days=1)
+    else:
+        raise ValueError("unknown statistics range")
+    return (datetime.combine(first, time.min, tz).astimezone(UTC),
+            datetime.combine(stop, time.min, tz).astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class RangeTotals:
+    energy: EnergyTotals
+    actual_cost: float | None
+    no_battery_cost: float | None
+    battery_savings: float | None
+    covered_slots: int
+    priced_slots: int
+    total_slots: int
+    lower_resolution: bool
+
+    @property
+    def energy_coverage(self) -> float:
+        return self.covered_slots / self.total_slots if self.total_slots else 0.0
+
+    @property
+    def cost_coverage(self) -> float:
+        return self.priced_slots / self.total_slots if self.total_slots else 0.0
+
+
+@dataclass(frozen=True)
+class RangeBucket:
+    start: datetime
+    totals: RangeTotals
+    slot: LedgerSlot | None = None
+    cost: SlotCost | None = None
+
+
+@dataclass(frozen=True)
+class RangeStats:
+    buckets: tuple[RangeBucket, ...]
+    totals: RangeTotals
+
+
+def _range_totals(energy: StatsResult, costs: CostResult, count: int) -> RangeTotals:
+    return RangeTotals(
+        energy.totals, costs.actual_cost, costs.no_battery_cost, costs.battery_savings,
+        energy.covered_slots, costs.priced_slots, count,
+        any(flow.provenance == "hourly_backfill" for b in energy.buckets if b.slot is not None
+            for flow in b.slot.components.values()),
+    )
+
+
+def summarise(
+    rows: Iterable[LedgerSlot], start: datetime, end: datetime, tz: tzinfo,
+    resolution: Resolution,
+) -> RangeStats:
+    """Summarise an aligned span [start, end) on the household half-hour grid.
+
+    Price before grouping, so a Happy Hour is not restarted at a bucket boundary.
+    For calendar buckets count missing slots without materialising them.
+    """
+    start, end = start.astimezone(UTC), end.astimezone(UTC)
+    rows = list(rows)
+    # The slot before `start` is pricing context only (a Happy Hour's first half-hour),
+    # so a narrower request prices a slot as a wider one does. It is never counted.
+    before = start - HALF_HOUR
+    context = next((row for row in rows if row.slot_start.astimezone(UTC) == before), None)
+
+    def index(at: datetime) -> int:
+        return -((start - at) // HALF_HOUR)  # Round up to the next slot on the grid.
+
+    if resolution == "slot":
+        energy = compute_stats(rows, start, end, tz)
+    else:
+        by_start: dict[datetime, StatsBucket] = {}
+        for row in rows:
+            at = row.slot_start.astimezone(UTC)
+            if start <= at < end:
+                local = at.astimezone(tz)
+                midnight = datetime.combine(local.date(), time.min, tz).astimezone(UTC)
+                # Anchor on the row's household day: a historical offset change
+                # need not be a multiple of half an hour.
+                if not (at - midnight) % HALF_HOUR:
+                    by_start[at] = StatsBucket(local, row)
+        energy = _energise(tuple(by_start[at] for at in sorted(by_start)))
+    if context is None:
+        costs = cost_stats(energy)
+    else:
+        lead = StatsBucket(before.astimezone(tz), context)
+        priced = cost_stats(StatsResult((lead, *energy.buckets), energy.totals,
+                                        energy.covered_slots))
+        costs = _sum_costs(priced.slots[1:])
+    buckets: list[RangeBucket] = []
+    if resolution == "slot":
+        for bucket, cost in zip(energy.buckets, costs.slots, strict=True):
+            totals = _range_totals(_energise((bucket,)), _sum_costs((cost,)), 1)
+            buckets.append(RangeBucket(bucket.start, totals, bucket.slot, cost))
+    else:
+        cursor, left = start, 0
+        while cursor < end:
+            day = cursor.astimezone(tz).date()
+            if resolution == "month":
+                day = day.replace(day=1)
+            label = datetime.combine(day, time.min, tz)
+            next_day = day + timedelta(days=1) if resolution == "day" else _next_month(day)
+            stop = datetime.combine(next_day, time.min, tz).astimezone(UTC)
+            if stop <= cursor:
+                # A rollback across midnight repeats the day: end at the later midnight.
+                stop = datetime.combine(next_day, time.min, tz).replace(fold=1).astimezone(UTC)
+            stop = min(end, stop)
+            right = left
+            while right < len(energy.buckets) and costs.slots[right].start.astimezone(UTC) < stop:
+                right += 1
+            totals = _range_totals(_energise(energy.buckets[left:right]),
+                                   _sum_costs(costs.slots[left:right]), index(stop) - index(cursor))
+            buckets.append(RangeBucket(label, totals))
+            cursor, left = stop, right
+    return RangeStats(tuple(buckets), _range_totals(energy, costs, max(0, index(end))))
 
 
 def provenance_counts(result: StatsResult) -> dict[str, int]:
