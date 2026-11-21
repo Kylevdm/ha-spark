@@ -144,6 +144,7 @@ from ha_spark.energy.evidence_freshness import EvidenceFreshness, check_report_t
 from ha_spark.energy.forecast import forecast_model_tag, load_timezone
 from ha_spark.energy.horizon import HorizonGeometry
 from ha_spark.energy.ledger import ForecastLedger
+from ha_spark.energy.ledger_backfill import backfill_energy_ledger
 from ha_spark.energy.models import ChargeIntent, ChargePlan, DispatchSlot, LoadForecast
 from ha_spark.energy.native_export_notices import notify_export_transitions
 from ha_spark.energy.plan_run import PlanRun, StoredPlanRun, current_plan
@@ -156,7 +157,7 @@ from ha_spark.energy.readiness_ledger import (
     record_slot,
     slot_start,
 )
-from ha_spark.energy.readiness_measurements import record_closed_days
+from ha_spark.energy.readiness_measurements import RETRY_DELAY, record_closed_days
 from ha_spark.energy.report import format_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.soc_monitor import SocMonitor, SocMonitorSnapshot, observe_soc
@@ -2071,6 +2072,8 @@ async def _run_paired(
     readiness_evaluated: date | None = None
     readiness_task: asyncio.Task[None] | None = None
     ledger_task: asyncio.Task[None] | None = None
+    backfill_task: asyncio.Task[bool] | None = None
+    backfill_retry_at: datetime | None = None
     carbon = CarbonRefresher(settings.db_path, lambda: state.settings.carbon_region)
 
     async def record_readiness(tick_settings: Settings, tick_now: datetime) -> None:
@@ -2541,6 +2544,13 @@ async def _run_paired(
                 ledger_task = asyncio.create_task(
                     EnergyLedger(settings.db_path).record_boundary(settings, now, ledger_rates)
                 )
+            if backfill_task is not None and backfill_task.done() and not backfill_task.result():
+                backfill_task = None
+                backfill_retry_at = now.astimezone(UTC) + RETRY_DELAY
+            if backfill_task is None and (
+                backfill_retry_at is None or now.astimezone(UTC) >= backfill_retry_at
+            ):
+                backfill_task = asyncio.create_task(backfill_energy_ledger(settings))
             # The real clock: tests replace this module's ``datetime`` to script ``now``.
             state.loop_tick = utc_datetime.now(UTC)
             await asyncio.sleep(poll_seconds)
@@ -2550,11 +2560,15 @@ async def _run_paired(
             await discovery.cancel_announcement()
         if ledger_task is not None:
             ledger_task.cancel()
+        if backfill_task is not None:
+            backfill_task.cancel()
         if readiness_task is not None:
             readiness_task.cancel()
             await asyncio.gather(readiness_task, return_exceptions=True)
         if ledger_task is not None:
             await asyncio.gather(ledger_task, return_exceptions=True)
+        if backfill_task is not None:
+            await asyncio.gather(backfill_task, return_exceptions=True)
         state.executor = None
         if pending is not None and not pending.future.done():
             pending.future.set_result(Reply(error="daemon stopped during request"))

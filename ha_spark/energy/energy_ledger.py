@@ -263,3 +263,60 @@ class EnergyLedger:
                 (start.astimezone(UTC).isoformat(), end.astimezone(UTC).isoformat()),
             ) as cursor:
                 return [LedgerSlot.model_validate_json(row[0]) for row in await cursor.fetchall()]
+
+    async def first_recorder_slot(self) -> datetime | None:
+        """Find the first live or day-close row without creating the store."""
+        if not await asyncio.to_thread(Path(self.db_path).exists):
+            return None
+        path = await asyncio.to_thread(Path(self.db_path).resolve)
+        async with aiosqlite.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+            async with db.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'energy_ledger_slots'",
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return None
+            cutoff = await self._first_recorder_key(db)
+            return datetime.fromisoformat(cutoff) if cutoff is not None else None
+
+    @staticmethod
+    async def _first_recorder_key(db: aiosqlite.Connection) -> str | None:
+        async with db.execute(
+            "SELECT slot_start FROM energy_ledger_slots WHERE NOT EXISTS ("
+            "SELECT 1 FROM json_each(payload, '$.exclusions') WHERE value = ?"
+            ") ORDER BY slot_start LIMIT 1",
+            ("hourly_backfill",),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return str(row[0]) if row is not None else None
+
+    async def record_hourly_backfill(
+        self, flows_by_slot: dict[datetime, dict[str, ComponentFlow]],
+    ) -> None:
+        """Insert unpriced history without changing any existing slot."""
+        if not flows_by_slot:
+            return
+
+        def encode() -> list[tuple[str, str]]:
+            rows = []
+            for start, flows in flows_by_slot.items():
+                house, base, clamped = _derive_loads(flows)
+                row = LedgerSlot(
+                    slot_start=start, components=flows, exclusions=("hourly_backfill",),
+                    house_load_kwh=house, base_load_kwh=base, negative_clamped=clamped,
+                )
+                rows.append((start.astimezone(UTC).isoformat(), row.model_dump_json()))
+            return rows
+
+        rows = await asyncio.to_thread(encode)
+        path = await asyncio.to_thread(Path(self.db_path).resolve)
+        async with aiosqlite.connect(path.as_uri() + "?mode=rw", uri=True) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            # Day-close recording may have moved the cutoff while HA was being read.
+            cutoff = await self._first_recorder_key(db)
+            if cutoff is None:
+                return
+            await db.executemany(
+                "INSERT INTO energy_ledger_slots VALUES (?, ?) ON CONFLICT(slot_start) DO NOTHING",
+                [(key, payload) for key, payload in rows if key < cutoff],
+            )
+            await db.commit()
