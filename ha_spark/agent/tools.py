@@ -35,6 +35,7 @@ from ha_spark.energy.stats import (
     RangeStats,
     RangeTotals,
     Resolution,
+    clamp_end,
     range_bounds,
     summarise,
 )
@@ -322,6 +323,7 @@ async def get_statistics(settings: Settings, range_: str, at: str | None) -> Sta
         start, end = range_bounds(range_, day, tz)
     except (ValueError, OverflowError):
         raise StatisticsInputError(INVALID_AT) from None
+    end = clamp_end(start, end, now)
     resolution: Resolution = ("slot" if range_ == "day" else "day" if range_ in ("week", "month")
                               else "month")
     try:

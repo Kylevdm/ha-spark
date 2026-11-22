@@ -152,53 +152,26 @@ def test_notify_test_without_target_exits_nonzero(
     assert "notify_service" in capsys.readouterr().err
 
 
-async def test_backtest_rates_seeded_store(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_backtest_points_to_stats_and_does_nothing_else(
+    capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from datetime import UTC, datetime, time, timedelta
-    from types import SimpleNamespace
-
-    from ha_spark.energy.models import ConsumptionInterval
-    from ha_spark.energy.store import ConsumptionStore
-    from ha_spark.energy.tariff import TariffSchedule
-
-    settings = Settings(db_path=str(tmp_path / "test.db"), timezone="UTC")
-    start = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) - timedelta(days=1)
-    async with ConsumptionStore(settings.db_path) as store:
-        await store.upsert(
-            [ConsumptionInterval(start, start + timedelta(minutes=30), 2.0)], "test"
-        )
-
-    # The backtest costs stored import against the *live* plan schedule (the
-    # dynamic cheap pattern can't be reconstructed from stored kWh alone).
-    schedule = TariffSchedule(
-        cheap_rate=0.10,
-        standard_rate=0.30,
-        export_rate=0.0,
-        window_hours=6.0,
-        window_start=time(23, 30),
+    assert _cmd_backtest() == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "backtest has been retired; use `ha-spark stats --range day`.\n"
     )
 
-    async def fake_current_plan(
-        _settings: Settings, _rest: object, **_kw: object
-    ) -> object:
-        return SimpleNamespace(schedule=schedule)
 
-    monkeypatch.setattr(cli, "current_plan", fake_current_plan)
-
-    assert await _cmd_backtest(settings, days=7) == 0
-    out = capsys.readouterr().out
-    assert "Grid import backtest" in out
-    assert "2.00 kWh" in out
-
-
-async def test_backtest_empty_store_errors(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_backtest_command_still_parses_days_without_loading_settings(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # An empty store short-circuits before any live HA read.
-    settings = Settings(db_path=str(tmp_path / "empty.db"))
-    assert await _cmd_backtest(settings, days=7) == 2
-    assert "No stored consumption" in capsys.readouterr().err
+    def no_settings(**_: object) -> Settings:
+        raise AssertionError("backtest must not load settings")
+
+    monkeypatch.setattr(cli, "load_settings", no_settings)
+    assert cli.main(["backtest", "--days", "7"]) == 2
+    assert "ha-spark stats --range day" in capsys.readouterr().err
 
 
 def test_forecast_eval_points_to_stats_and_does_nothing_else(

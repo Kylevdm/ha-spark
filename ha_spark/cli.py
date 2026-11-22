@@ -42,7 +42,6 @@ from ha_spark.devices import get_device
 from ha_spark.devices.inverters.solis_clock import clock_entity, clock_error, describe_error
 from ha_spark.energy import habits
 from ha_spark.energy.axle_events import window_evidence
-from ha_spark.energy.backtest import backtest_cost, format_backtest
 from ha_spark.energy.context import KINDS, ContextStore
 from ha_spark.energy.derived_base_load import (
     BACKFILL_NAME,
@@ -78,6 +77,7 @@ from ha_spark.energy.stats import (
     RangeTotals,
     Resolution,
     StatsResult,
+    clamp_end,
     compute_stats,
     load_accuracy,
     meter_reconciliation,
@@ -237,10 +237,9 @@ def _stats_cost_totals(totals: RangeTotals) -> str:
 
 async def _cmd_stats(settings: Settings, *, kind: str, at: str | None) -> int:
     tz = load_timezone(settings.timezone)
-    now = datetime.now(tz) if at is None or kind == "all" else None
+    now = datetime.now(tz)
     try:
         if at is None:
-            assert now is not None
             day = now.date()
         else:
             day = date.fromisoformat(at)
@@ -252,9 +251,11 @@ async def _cmd_stats(settings: Settings, *, kind: str, at: str | None) -> int:
         return 2
     ledger = EnergyLedger(settings.db_path)
     try:
-        if kind == "all" and now is not None:
+        if kind == "all":
             start, _ = range_bounds(kind, now.date(), tz, first_slot=await ledger.first_slot())
             end = now.astimezone(UTC)
+        else:
+            end = clamp_end(start, end, now)
         rows = await ledger.slots(start - timedelta(minutes=30), end)  # + pricing context
     except Exception:
         print("Could not read energy ledger", file=sys.stderr)
@@ -949,34 +950,13 @@ def _cmd_import_csv(settings: Settings, paths: list[str]) -> int:
     return asyncio.run(_store_and_report(settings, intervals, "csv"))
 
 
-async def _cmd_backtest(settings: Settings, *, days: int) -> int:
-    """Rate stored grid import under the current tariff schedule and print the summary."""
-    since = datetime.now(UTC) - timedelta(days=days)
-    async with ConsumptionStore(settings.db_path) as store:
-        intervals = await store.load_since(since)
-    if not intervals:
-        print(
-            "No stored consumption in the window; run `import-csv` or "
-            "`pull-consumption` first.",
-            file=sys.stderr,
-        )
-        return 2
-    # Cost against the same schedule the planner runs on (the dynamic/intelligent
-    # cheap pattern isn't in the stored kWh) — a fixed install degrades to the
-    # two flat rates, exactly as before.
-    async with HomeAssistantRest(
-        settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
-    ) as rest:
-        source = solar_source_from_store(settings)
-        run = await current_plan(settings, rest, source=source)
-    if source.kind == "native":
-        print(NATIVE_PREVIEW_NOTE)
-    summary = backtest_cost(
-        intervals, schedule=run.schedule, tz=load_timezone(settings.timezone)
+def _cmd_backtest() -> int:
+    """Retired: point old invocations at the statistics command."""
+    print(
+        "backtest has been retired; use `ha-spark stats --range day`.",
+        file=sys.stderr,
     )
-    assert summary is not None  # intervals is non-empty
-    print(format_backtest(summary))
-    return 0
+    return 2
 
 
 def _cmd_forecast_eval() -> int:
@@ -1125,9 +1105,8 @@ examples:
   ha-spark run --once                      plan + apply immediately, then exit
   ha-spark backfill-load --list            show statistics usable as a load source
   ha-spark backfill-load --from sensor.x   rebuild house-load history from sensor.x
-  ha-spark import-csv export.csv           import an Octopus dashboard CSV (cost data)
+  ha-spark import-csv export.csv           import an Octopus dashboard CSV (meter history)
   ha-spark pull-consumption --days 60      pull grid import from the Octopus API
-  ha-spark backtest --days 30              rate stored grid import under the tariff
   ha-spark stats --range week              measured flows, costs, coverage and accuracy
   ha-spark learn-factors                   show learned away factor + occupancy
   ha-spark context add away --from 2026-07-01 --to 2026-07-14   record a holiday
@@ -1366,19 +1345,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_csv = sub.add_parser(
         "import-csv",
-        help="Import Octopus grid-import CSV export(s) into the cost store",
+        help="Import Octopus grid-import CSV export(s) into the meter history store",
         description="Parse half-hourly consumption CSV(s) exported from the Octopus "
-        "dashboard into the local store. This is grid *import* (cost/backtest data) — "
-        "it does not feed the load forecast.",
+        "dashboard into the meter history store. This is grid *import* used for "
+        "reconciliation in `stats`; it does not feed the load forecast.",
     )
     p_csv.add_argument("paths", nargs="+", metavar="PATH", help="CSV file(s) to import")
 
     p_pull = sub.add_parser(
         "pull-consumption",
-        help="Pull grid import from the Octopus API into the cost store",
+        help="Pull grid import from the Octopus API into the meter history store",
         description="Fetch half-hourly grid import from the Octopus REST API "
         "(needs OCTOPUS_API_KEY, OCTOPUS_MPAN, OCTOPUS_METER_SERIAL). Incremental: "
-        "resumes from the newest stored interval.",
+        "resumes from the newest stored interval; used for reconciliation in `stats`.",
     )
     p_pull.add_argument(
         "--days",
@@ -1456,17 +1435,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_bt = sub.add_parser(
         "backtest",
-        help="Rate stored grid import under the configured two-rate tariff",
-        description="Summarise what the stored half-hourly grid import cost under "
-        "RATE_OFFPEAK/RATE_PEAK, classifying each interval by the fixed charge window. "
-        "Populate the store with `import-csv` or `pull-consumption` first.",
+        help="Retired: use `stats`",
+        description="Retired. Use `ha-spark stats --range day` to see measured costs, "
+        "battery savings and meter reconciliation.",
     )
     p_bt.add_argument(
         "--days",
         type=int,
         default=30,
         metavar="N",
-        help="How far back to rate stored intervals (default: 30)",
+        help="Ignored; kept so old invocations parse",
     )
 
     return parser
@@ -1816,6 +1794,10 @@ def main(argv: list[str] | None = None) -> int:
         # Retired: point at `stats` without loading settings or touching anything.
         return _cmd_forecast_eval()
 
+    if args.command == "backtest":
+        # Retired: point at `stats` without loading settings or touching anything.
+        return _cmd_backtest()
+
     try:
         settings = load_settings()
     except ConfigurationRepair as repair:
@@ -1882,9 +1864,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "pull-consumption":
         return asyncio.run(_cmd_pull_consumption(settings, days=args.days))
-
-    if args.command == "backtest":
-        return asyncio.run(_cmd_backtest(settings, days=args.days))
 
     if args.command == "learn-factors":
         return asyncio.run(_cmd_learn_factors(settings))

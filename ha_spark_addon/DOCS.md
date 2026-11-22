@@ -380,9 +380,11 @@ household clock. A booked hour can add `allowance unusable: <reason>` when
 the session allowance counter cannot be used; the booking then uses the ordinary
 tariff. **Free Electricity** reports `disabled`, `not configured` (set the
 Octopus API key and account number), `read failed (<reason>)`, `not enrolled`,
-`no session`, or `listed:` with session start and end timestamps. These rows
-never print a token, key, account number or MPAN. Health also reports the
-integration link, topology, effective limits and provider checks.
+`no session`, or `listed:` with session start and end timestamps. **Meter
+history** reports the newest stored Octopus interval and any background pull
+failure; missing credentials are not a failure. These rows never print a token,
+key, account number or MPAN. Health also reports the integration link,
+topology, effective limits and provider checks.
 Exit codes are `0` for all green, `1` for a failed critical check, and `2`
 for other degraded results. A green report is diagnostic evidence, not an
 authority grant or live export proof.
@@ -1341,10 +1343,11 @@ demand), day of week and season, recent load, recorded occupancy, and UK bank
 holidays.
 
 - `load_model`: `median` (profile only), `ml` (use the model whenever it can
-  run), or `auto` (default), which uses ML only while `ha-spark forecast-eval`
-  shows it beating the median over the trailing 14 days. ha-spark records both
+  run), or `auto` (default), which uses ML only while ha-spark's own forecast
+  evaluation shows it beating the median over the trailing 14 days, scored
+  against actual consumption from HA statistics. ha-spark records both
   forecasts, so `auto` switches to ML when it wins and back to the median when
-  it stops winning.
+  it stops winning. `ha-spark stats` shows load accuracy for you to read.
 - `buffer_mode`: `fixed` keeps `charge_buffer_pct`; `quantile` replaces it
   with the model's own uncertainty, (P90 − P50)/P50, whenever the ML forecast
   drives the plan, so days with a narrow forecast range buy less margin.
@@ -1482,10 +1485,11 @@ planner reads live SoC at plan time, so it already sees the effect of V2L.
 ### Forecast ledger
 
 Every plan run records its forecast for tomorrow (model, total kWh, per-slot
-breakdown), replacing the earlier record for that date and model.
-`ha-spark forecast-eval [--days N]` compares those recorded forecasts with
-actual consumption and reports MAE/MAPE per model. `load_model: auto` uses that
-comparison to decide whether the ML model drives plans.
+breakdown), replacing the earlier record for that date and model. `ha-spark
+stats` compares those recorded forecasts with the energy ledger's derived base
+load and reports daily error and per-slot shape error per model. `load_model:
+auto` makes its own comparison against actual consumption from HA statistics to
+decide whether the ML model drives plans.
 
 A signal sampler also runs every 30 minutes and records these household
 signals: `occupancy_home_frac` (from `person_entities`), `heatpump_kwh` (from
@@ -1569,10 +1573,133 @@ only a failing evaluation re-arms it, not insufficient evidence. Delivery or
 recording failures are isolated. Readiness is a recommendation: it never changes
 the operating mode, authority epoch, holds or hardware behaviour.
 
+### Statistics
+
+The `stats` command, the Statistics screen, the `get_statistics` agent tool and
+`/api/history` show what happened, what it cost, and what the battery and
+ha-spark saved together. All of them read the same durable energy ledger and
+use the same pure statistics function, so they give the same figures and the
+same coverage for the same range.
+
+#### `ha-spark stats --range day|week|month|year|all [--at YYYY-MM-DD]`
+
+Read-only. `day` shows half-hour slots; `week` and `month` show days;
+`year` and `all` show months. Weeks start on Monday. `all` runs from the first
+ledger month through now. `--at` defaults to today on the household clock.
+
+The output lists flows with provenance, totals, energy coverage, grid-import
+fill counts, load accuracy (vs derived base load, beside `median`), evening-plan
+solar accuracy (P10/P50/P90), slot costs (day only), the cost formulas,
+cost totals and coverage, estimated Axle earnings per day, the event delivery
+rate and meter reconciliation. Bad `--at` exits 2; an unreadable ledger or
+Axle history exits 1.
+
+#### Energy ledger
+
+The ledger stores one row per half-hour slot, forever. Each row holds measured
+grid import, grid export, solar generation, battery charge, battery discharge,
+EV charge and V2L, plus derived house load and derived base load. It also holds
+the import and export rates captured at slot close, the Free Electricity or
+Happy Hour session evidence from that revision, and a provenance label per
+component. Rows are never repriced and never pruned.
+
+The boundary tick is the source of record: the daemon reads each component's
+cumulative counter and stores the delta from the previous boundary. A reset or
+untrusted reading excludes that component for the slot. Slots the boundary tick
+missed are filled after day close from HA's five-minute statistics (about ten
+days of retention) and marked `statistics_fill`; boundary values are never
+overwritten. Pre-install history is backfilled once from hourly HA long-term
+statistics, up to 400 days back, split across each hour's two slots and marked
+`hourly_backfill` (a failed attempt is retried until it completes);
+those rows count toward energy totals but have no captured rates and so are
+unpriced. Missed boundaries with valid readings on both sides are distributed
+across the gap and marked `distributed`; distributed slots are left unpriced.
+A slot never fills from a forecast.
+
+#### Coverage
+
+Energy coverage is the share of half-hours with trustworthy measurements for
+both house load and base load. Cost coverage is the share of trustworthy
+half-hours that also have captured import and export rates. Totals sum only
+covered slots. A gap, reset, non-finite or wrong-unit reading is marked and
+left out, never presented as zero. Unpriced reasons include missing rates,
+missing slots, distributed energy and Axle events whose window contains a gap.
+
+Every surface counts a period only up to now: a day, week, month or year that
+contains the current time ends at the current time, whichever date in it you
+ask for, so its coverage is "so far". A past period is counted whole. `all`
+always runs to now.
+
+#### Battery savings
+
+For each priced half-hour:
+
+```text
+Actual cost = (import - free import) × import rate
+              - export × export rate
+              - Axle earnings (estimated)
+
+No-battery cost = (max(0, house - solar) - no-battery free import) × import rate
+                  - max(0, solar - house) × export rate
+
+Battery savings = no-battery cost - actual cost
+```
+
+Battery savings credits the battery and ha-spark together. Standing charges are
+excluded. Free Electricity covers all import in the session; Happy Hour covers
+up to 16 kWh per booked hour, tracked separately for actual and no-battery
+import. A hold or Axle event that stopped the plan using the session does not
+remove the credit.
+
+#### Axle earnings and delivery rate
+
+Accepted export events are recorded on add-on-owned and integration-owned sites
+with their window, direction, committed energy, event rate and lifecycle state.
+Once the window closes, outcome and delivered energy are filled from the
+ledger. Estimated earnings = grid export measured in the window × the event
+rate ha-spark recorded. This is a credit in actual cost and battery savings;
+it is not Axle's settlement figure.
+
+Outcome is `delivered` at 90% or more of committed energy, `partial` at 10% or
+more, `missed` below 10%, `cancelled` if the event was cancelled, and `unknown`
+when no committed energy was recorded. A gap in any cost component anywhere in
+the event's window leaves the event without an estimate and its slots unpriced.
+Delivery rate = delivered / (delivered + partial + missed); it is `unknown` if
+none of those outcomes occurred.
+
+#### Statistics screen
+
+The ingress app adds **Statistics** (`#/statistics`) beside Plan and Mode. It
+shows Day/Week/Month/Year/All time with Previous/Next stepping, aligned to the
+household clock. The Day view is the same half-hour grid as the plan view.
+Flows, costs and Battery savings show the formula. Coverage and gap markers use
+the legend G (gap), F (statistics fill), D (distributed), H (lower resolution,
+hourly) and U (unpriced). Opening a half-hour shows captured rates, session
+credit and cost inputs. Axle earnings (estimated) and event outcomes, forecast
+accuracy and meter reconciliation each show "unavailable" on their own when
+their evidence can't be read. Coverage follows the rule above, so every period
+matches `stats` exactly.
+
+#### Meter history
+
+The background Octopus pull fetches the previous day's grid-import intervals
+once they are published, using the configured credentials, and resumes from the
+newest stored interval. A failure shows as a `Meter history` row in `health`
+and retries hourly. The store is used only for reconciliation in `stats`; it
+does not feed the load forecast. `import-csv` rejects the whole file on any
+invalid row. `pull-consumption` still works.
+
+#### Agent tool
+
+`get_statistics(range, at)` at the `read` level returns the same buckets,
+totals, Axle delivery rate and event outcomes as `stats` and `/api/history`,
+with the same coverage rule.
+
 ### Tariff
 
 `rate_offpeak_gbp_kwh`, `rate_peak_gbp_kwh`, `rate_export_gbp_kwh`: the rates
-for the cost projection printed with each plan and for `ha-spark backtest`.
+for the cost projection printed with each plan. `stats` prices history with the
+rates captured at slot close, never repriced later.
 
 `tariff_provider` selects how ha-spark prices plans. `fixed` (the default) uses
 the rates above and the charge window. `dynamic` prices each half-hour slot at
@@ -1673,9 +1800,11 @@ for every live test.
 ### Octopus API (optional)
 
 `octopus_api_key`, `octopus_mpan`, and `octopus_meter_serial` enable
-`ha-spark pull-consumption`, which downloads grid-import history for cost
-backtesting only. The load forecast does **not** use it. The same
-`octopus_api_key` also serves the `octopus_intelligent` tariff provider above.
+`ha-spark pull-consumption`, which downloads grid-import meter history for
+reconciliation in `stats`. The daemon also pulls the previous day's intervals
+in the background once Octopus publishes them. The load forecast does **not**
+use it. The same `octopus_api_key` also serves the `octopus_intelligent`
+tariff provider above.
 
 ### Daytime cheap and free charging
 
@@ -1791,8 +1920,15 @@ standalone/dev mode (`ha_url` + `ha_token`) the listener binds only to
   integration link (state, site id, integration release and API versions, snapshot time and age)
 - `GET /api/plan`: the latest plan as sensor-style rows used by the API and agent,
   plus the plan view's `timeline` on ingress
-- `GET /api/history?resolution=slot[&from=&to=]`: recorded solar forecast and
-  measured solar for today so far; values outside today are a 400
+- `GET /api/history?range=day|week|month|year|all[&at=YYYY-MM-DD]` (the
+  Statistics screen): ledger buckets, totals and coverage for a household
+  calendar range, counted up to now as in `### Statistics`; future, malformed,
+  repeated `at`, or mixing with `resolution`/`from`/`to` is a 400.
+- `GET /api/history?resolution=slot|day|month[&from=&to=]` (slot = one
+  household day, default today so far for the plan view; day ≤ 366 days;
+  month unbounded): ledger buckets, totals and coverage; naive, inverted or
+  future bounds are a 400; an unreadable ledger still returns 200 with
+  `unavailable.statistics`. Both forms set `Cache-Control: no-store`.
 - `GET /api/carbon`: the cached NESO regional carbon rows for the selected region
 - `POST /api/replan`: ask the daemon for a fresh plan. It requires the ingress
   proxy's valid `X-Remote-User-Id`, `X-HA-Spark-Request: replan` and
@@ -1831,9 +1967,10 @@ ha-spark's data and, optionally, trigger a few gated actions.
   with `unavailable`: agents can't change configuration until owner-approved
   config proposals exist in phase 14.
 - `get_statistics(range, at)`: measured energy, cost, battery savings, Axle
-  earnings and coverage for a household calendar range (`day|week|month|year|all`;
-  `at` = `YYYY-MM-DD`, default today). Read-only; same figures as `stats` and
-  `/api/history`.
+  earnings, delivery rate and event outcomes for a household calendar range
+  (`day|week|month|year|all`; `at` = `YYYY-MM-DD`, default today). The current
+  period is counted up to now. Read-only; same figures and coverage as `stats`
+  and `/api/history` (see `### Statistics`).
 - `agent_api_token`: bearer token for the published port. If you leave it
   blank, the add-on generates one on first start and saves it to
   `/data/agent_token` in the add-on container (read it from the add-on shell

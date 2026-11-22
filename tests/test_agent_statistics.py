@@ -123,6 +123,96 @@ def test_agent_statistics_matches_history_and_cli_for_week(
     assert "Axle earnings" in out
 
 
+def _freeze_tools_clock(monkeypatch: pytest.MonkeyPatch, frozen: datetime) -> None:
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> _Clock:
+            at = frozen.astimezone(tz) if tz is not None else frozen.replace(tzinfo=None)
+            return cls.fromtimestamp(at.timestamp(), at.tzinfo)
+
+    monkeypatch.setattr("ha_spark.api.server.datetime", _Clock)
+    monkeypatch.setattr("ha_spark.agent.tools.datetime", _Clock)
+    monkeypatch.setattr(cli, "datetime", _Clock)
+
+
+def test_agent_statistics_clamps_current_day_to_now(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The current period ends at ``now`` for agent, CLI and ``/api/history`` alike."""
+    frozen = datetime(2026, 9, 1, 12, tzinfo=LONDON)
+    _freeze_tools_clock(monkeypatch, frozen)
+    state = _state(tmp_path, timezone=LONDON.key)
+    slot = datetime(2026, 9, 1, 9, tzinfo=LONDON).astimezone(UTC)
+    calls = _patch_ledger_and_axle(monkeypatch, slot, (2, 1))
+    monkeypatch.setattr(cli, "load_settings", lambda **_: state.settings)
+
+    with owner_client(state) as client:
+        history = client.get("/api/history", params={"range": "day", "at": "2026-09-01"})
+    assert history.status_code == 200
+    history_totals = history.json()["range_totals"]
+
+    with owner_client(state) as client:
+        agent = client.get("/agent/statistics", params={"range": "day", "at": "2026-09-01"})
+    assert agent.status_code == 200
+    agent_body = agent.json()
+    assert agent_body["range_totals"] == history_totals
+    expected_end = frozen.astimezone(UTC)
+    assert agent_body["end"] == expected_end.isoformat()
+    day_start = datetime(2026, 8, 31, 23, tzinfo=UTC)
+    assert calls[-2:] == [
+        ("slots", day_start - timedelta(minutes=30), expected_end),
+        ("evidence", day_start, expected_end),
+    ]
+
+    assert cli.main(["stats", "--range", "day", "--at", "2026-09-01"]) == 0
+    out = capsys.readouterr().out
+    assert (
+        f'Coverage: {history_totals["covered_slots"]}/{history_totals["total_slots"]} slots'
+        in out
+    )
+
+
+@pytest.mark.parametrize(("at", "current"), [
+    ("2026-09-02", True),  # yesterday, inside the current week
+    ("2026-08-25", False),  # a past week stays whole
+])
+def test_statistics_coverage_is_one_rule_across_surfaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    at: str, current: bool,
+) -> None:
+    """CLI, agent and ``/api/history`` clamp a period to now whatever ``at`` falls in it."""
+    frozen = datetime(2026, 9, 3, 12, tzinfo=LONDON)
+    _freeze_tools_clock(monkeypatch, frozen)
+    state = _state(tmp_path, timezone=LONDON.key)
+    week_start = (datetime(2026, 8, 31, tzinfo=LONDON) if current
+                  else datetime(2026, 8, 24, tzinfo=LONDON)).astimezone(UTC)
+    week_end = week_start + timedelta(days=7)
+    calls = _patch_ledger_and_axle(monkeypatch, week_start + timedelta(hours=9), (2, 1))
+    monkeypatch.setattr(cli, "load_settings", lambda **_: state.settings)
+
+    with owner_client(state) as client:
+        history = client.get("/api/history", params={"range": "week", "at": at})
+        agent = client.get("/agent/statistics", params={"range": "week", "at": at})
+    assert history.status_code == agent.status_code == 200
+    history_totals = history.json()["range_totals"]
+    agent_body = agent.json()
+    expected_end = frozen.astimezone(UTC) if current else week_end
+    assert agent_body["end"] == expected_end.isoformat()
+    assert agent_body["range_totals"] == history_totals
+    assert history_totals["total_slots"] == (expected_end - week_start) // timedelta(minutes=30)
+    assert calls[-2:] == [("slots", week_start - timedelta(minutes=30), expected_end),
+                          ("evidence", week_start, expected_end)]
+
+    assert cli.main(["stats", "--range", "week", "--at", at]) == 0
+    assert calls[-2:] == [("slots", week_start - timedelta(minutes=30), expected_end),
+                          ("evidence", week_start, expected_end)]
+    out = capsys.readouterr().out
+    assert (
+        f'Coverage: {history_totals["covered_slots"]}/{history_totals["total_slots"]} slots'
+        in out
+    )
+
+
 async def test_mcp_get_statistics_lists_at_read_and_above(tmp_path: Path) -> None:
     for exposure in ("read", "read_act", "read_write"):
         mcp = build_mcp(_state(tmp_path, agent_exposure=exposure))

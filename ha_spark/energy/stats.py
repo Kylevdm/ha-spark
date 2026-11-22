@@ -337,6 +337,18 @@ def _next_month(day: date) -> date:
     return day.replace(day=1, month=day.month + 1) if day.month < 12 else date(day.year + 1, 1, 1)
 
 
+def clamp_end(start: datetime, end: datetime, now: datetime) -> datetime:
+    """Return ``end`` capped at ``now`` (all timezone-aware), in UTC.
+
+    Every statistics surface shows a period only up to now, as ``/api/history``
+    does with ``min(stop, now)``: a period containing now ends there, whatever
+    date in it was asked for, and a past period is unchanged. A period that has
+    not started keeps its end (``/api/history`` rejects it before this point).
+    """
+    end = end.astimezone(UTC)
+    return min(end, now.astimezone(UTC)) if start < now else end
+
+
 def range_bounds(
     kind: str, at: date, tz: ZoneInfo, *, first_slot: datetime | None = None,
 ) -> tuple[datetime, datetime]:

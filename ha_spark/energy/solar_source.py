@@ -5,8 +5,8 @@ always states its solar source explicitly instead of silently reading the
 forecast entities (``solar_today_entity``/``solar_tomorrow_entity``), which any
 token holder can forge over REST (#322). The daemon builds one context per plan
 from its last accepted integration snapshot; callers without daemon state (the
-CLI's direct plan, agent previews, the backtest) read the persisted kind from
-the add-on's data dir, so a restart cannot fall back to the entities either.
+CLI's direct plan and agent previews) read the persisted kind from the add-on's
+data dir, so a restart cannot fall back to the entities either.
 
 The kind is persisted as one small JSON file beside the other data-dir files.
 The daemon is its only writer; a fresh install — and any missing, unreadable or

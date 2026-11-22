@@ -7,9 +7,9 @@ implementation detail.
 
 **The plan**:
 The *current* plan, recomputed every half-hourly tariff slot, not "tonight's
-plan" computed once a day. Observe logs, the savings backtest, and
-copilot explanations all refer to the latest revision. Drivers write only when
-a recomputation changes a setpoint.
+plan" computed once a day. Observe logs, the energy ledger's captured rates,
+and copilot explanations all refer to the latest revision. Drivers write only
+when a recomputation changes a setpoint.
 (Decision: Q7, 2026-07-12.)
 
 **Competitive MVP**:
