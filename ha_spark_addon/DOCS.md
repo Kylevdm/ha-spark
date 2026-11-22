@@ -1578,8 +1578,12 @@ the operating mode, authority epoch, holds or hardware behaviour.
 The `stats` command, the Statistics screen, the `get_statistics` agent tool and
 `/api/history` show what happened, what it cost, and what the battery and
 ha-spark saved together. All of them read the same durable energy ledger and
-use the same pure statistics function, so they give the same figures and the
-same coverage for the same range.
+use the same pure statistics function, so for any range `/api/history`
+accepts they compute the same figures and the same coverage. They differ in
+what they show (the CLI prints daily Axle earnings and the delivery rate, not
+each event's outcome) and in failure handling: when the ledger or Axle history
+can't be read, `stats` exits 1 and `get_statistics` fails the request, while
+`/api/history` returns 200 and marks the statistics unavailable.
 
 #### `ha-spark stats --range day|week|month|year|all [--at YYYY-MM-DD]`
 
@@ -1589,7 +1593,8 @@ ledger month through now. `--at` defaults to today on the household clock.
 
 The output lists flows with provenance, totals, energy coverage, grid-import
 fill counts, load accuracy (vs derived base load, beside `median`), evening-plan
-solar accuracy (P10/P50/P90), slot costs (day only), the cost formulas,
+solar accuracy (per-slot P10/P50/P90 for `day`, totals otherwise), slot costs
+(day only), the cost formulas,
 cost totals and coverage, estimated Axle earnings per day, the event delivery
 rate and meter reconciliation. Bad `--at` exits 2; an unreadable ledger or
 Axle history exits 1.
@@ -1610,7 +1615,8 @@ missed are filled after day close from HA's five-minute statistics (about ten
 days of retention) and marked `statistics_fill`; boundary values are never
 overwritten. Pre-install history is backfilled once from hourly HA long-term
 statistics, up to 400 days back, split across each hour's two slots and marked
-`hourly_backfill` (a failed attempt is retried until it completes);
+`hourly_backfill`. It runs when the daemon starts, is retried until it
+completes, and never overwrites a slot the ledger already holds;
 those rows count toward energy totals but have no captured rates and so are
 unpriced. Missed boundaries with valid readings on both sides are distributed
 across the gap and marked `distributed`; distributed slots are left unpriced.
@@ -1619,8 +1625,9 @@ A slot never fills from a forecast.
 #### Coverage
 
 Energy coverage is the share of half-hours with trustworthy measurements for
-both house load and base load. Cost coverage is the share of trustworthy
-half-hours that also have captured import and export rates. Totals sum only
+both house load and base load. Cost coverage is the share of all half-hours in
+the range that were priced: a priced half-hour needs trustworthy measurements,
+captured import and export rates and no unpriced reason. Totals sum only
 covered slots. A gap, reset, non-finite or wrong-unit reading is marked and
 left out, never presented as zero. Unpriced reasons include missing rates,
 missing slots, distributed energy and Axle events whose window contains a gap.
@@ -1628,7 +1635,8 @@ missing slots, distributed energy and Axle events whose window contains a gap.
 Every surface counts a period only up to now: a day, week, month or year that
 contains the current time ends at the current time, whichever date in it you
 ask for, so its coverage is "so far". A past period is counted whole. `all`
-always runs to now.
+always runs to now. A future period is a 400 from `/api/history`; `stats` and
+`get_statistics` count it whole, as gaps.
 
 #### Battery savings
 
@@ -1655,15 +1663,16 @@ remove the credit.
 
 Accepted export events are recorded on add-on-owned and integration-owned sites
 with their window, direction, committed energy, event rate and lifecycle state.
-Once the window closes, outcome and delivered energy are filled from the
-ledger. Estimated earnings = grid export measured in the window × the event
+Outcome and delivered energy are worked out from the ledger each time
+statistics are read, so a later fill can change them. Estimated earnings = grid export measured in the window × the event
 rate ha-spark recorded. This is a credit in actual cost and battery savings;
 it is not Axle's settlement figure.
 
 Outcome is `delivered` at 90% or more of committed energy, `partial` at 10% or
 more, `missed` below 10%, `cancelled` if the event was cancelled, and `unknown`
-when no committed energy was recorded. A gap in any cost component anywhere in
-the event's window leaves the event without an estimate and its slots unpriced.
+when no committed energy was recorded or the window's evidence is incomplete.
+A gap in any cost component anywhere in the event's window leaves the event
+`unknown`, without an estimate, and its slots unpriced.
 Delivery rate = delivered / (delivered + partial + missed); it is `unknown` if
 none of those outcomes occurred.
 
@@ -1924,11 +1933,13 @@ standalone/dev mode (`ha_url` + `ha_token`) the listener binds only to
   Statistics screen): ledger buckets, totals and coverage for a household
   calendar range, counted up to now as in `### Statistics`; future, malformed,
   repeated `at`, or mixing with `resolution`/`from`/`to` is a 400.
-- `GET /api/history?resolution=slot|day|month[&from=&to=]` (slot = one
-  household day, default today so far for the plan view; day ≤ 366 days;
-  month unbounded): ledger buckets, totals and coverage; naive, inverted or
-  future bounds are a 400; an unreadable ledger still returns 200 with
-  `unavailable.statistics`. Both forms set `Cache-Control: no-store`.
+- `GET /api/history?resolution=slot|day|month&from=...[&to=...]` (`to`
+  defaults to now; `slot` covers one household day and may omit `from`, giving
+  today so far for the plan view; `day` ≤ 366 days; `month` unbounded): ledger
+  buckets, totals and coverage; a missing `from` (except `slot`) or naive,
+  inverted or future bounds are a 400; an unreadable ledger still returns 200
+  with `unavailable.statistics`. Successful responses in both forms set
+  `Cache-Control: no-store`.
 - `GET /api/carbon`: the cached NESO regional carbon rows for the selected region
 - `POST /api/replan`: ask the daemon for a fresh plan. It requires the ingress
   proxy's valid `X-Remote-User-Id`, `X-HA-Spark-Request: replan` and

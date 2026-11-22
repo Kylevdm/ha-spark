@@ -343,10 +343,11 @@ def clamp_end(start: datetime, end: datetime, now: datetime) -> datetime:
     Every statistics surface shows a period only up to now, as ``/api/history``
     does with ``min(stop, now)``: a period containing now ends there, whatever
     date in it was asked for, and a past period is unchanged. A period that has
-    not started keeps its end (``/api/history`` rejects it before this point).
+    not started keeps its end (``/api/history`` rejects it before this point);
+    one starting exactly now is empty, as it is there.
     """
     end = end.astimezone(UTC)
-    return min(end, now.astimezone(UTC)) if start < now else end
+    return min(end, now.astimezone(UTC)) if start <= now else end
 
 
 def range_bounds(

@@ -7,7 +7,7 @@ import pytest
 
 from ha_spark.energy.energy_ledger import ComponentFlow, LedgerSlot
 from ha_spark.energy.readiness_measurements import COMPONENTS
-from ha_spark.energy.stats import range_bounds, summarise
+from ha_spark.energy.stats import clamp_end, range_bounds, summarise
 
 LONDON = ZoneInfo("Europe/London")
 
@@ -106,3 +106,14 @@ def test_rollback_across_midnight_never_gives_a_negative_bucket():
     stats = summarise([], start, start + timedelta(minutes=30), tz, "day")
     assert [b.totals.total_slots for b in stats.buckets] == [1]
     assert stats.buckets[0].start.date() == date(1988, 10, 29)
+
+
+def test_clamp_end_matches_history_at_every_edge() -> None:
+    """``min(stop, now)`` as ``/api/history`` does, once the period has started (#620)."""
+    start = datetime(2026, 9, 1, tzinfo=LONDON)
+    end = datetime(2026, 9, 2, tzinfo=LONDON)
+    noon = datetime(2026, 9, 1, 12, tzinfo=LONDON)
+    assert clamp_end(start, end, noon) == noon.astimezone(UTC)
+    assert clamp_end(start, end, start) == start.astimezone(UTC)  # starts now: empty
+    assert clamp_end(start, end, end + timedelta(days=3)) == end.astimezone(UTC)  # past
+    assert clamp_end(start, end, start - timedelta(hours=1)) == end.astimezone(UTC)  # future
