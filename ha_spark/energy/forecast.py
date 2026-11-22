@@ -14,12 +14,12 @@
 
 Whenever the ML model runs, both its forecast and the median forecast are
 shadow-recorded in the ledger regardless of which one drives the plan, so
-`forecast-eval` accumulates a fair comparison from day one.
+the `load_model: auto` evaluation and `stats` get a fair comparison from day one.
 
 The Octopus consumption store deliberately does NOT feed this model: Octopus
 meter data is grid *import*, which the battery/solar have shaped for the whole
 history — training on it teaches the planner "what the battery already did".
-The store is kept for cost backtesting instead.
+The store is kept for meter reconciliation instead.
 """
 
 from __future__ import annotations
@@ -306,7 +306,7 @@ def _daily_actuals(intervals: list[ConsumptionInterval], tz: ZoneInfo) -> dict[d
 async def _record_shadow_forecasts(
     settings: Settings, target: date, *forecasts: LoadForecast
 ) -> None:
-    """Record every candidate forecast so `forecast-eval` compares them fairly."""
+    """Record every candidate forecast so `auto` and `stats` compare them fairly."""
     try:
         async with ForecastLedger(settings.db_path) as ledger:
             for f in forecasts:

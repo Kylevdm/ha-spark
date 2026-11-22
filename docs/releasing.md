@@ -127,7 +127,8 @@ available there. No bypass is granted either way.
 ### MVP
 
 - [ ] Derived base load repairs the battery-polluted history, and forecast
-      error materially improves on the clean series.
+      error materially improves on the clean series (see
+      `tests/test_load_gate.py`).
 - [ ] Half-hourly replanning absorbs a same-day event or plug-in with no new
       trigger logic; unchanged setpoints produce zero writes.
 - [ ] Reservations trace every plan line to a one-sentence reason.

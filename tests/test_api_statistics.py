@@ -103,6 +103,8 @@ def test_statistics_today_is_on_the_household_clock(tmp_path, monkeypatch):
 @pytest.mark.parametrize("kind", ["week", "month", "year"])
 def test_statistics_matches_cli_with_axle(tmp_path, monkeypatch, capsys, kind):
     _frozen_server_clock(monkeypatch, datetime(2027, 1, 2, tzinfo=UTC))
+    # The CLI counts a period only up to now (#620): give it the server's clock.
+    monkeypatch.setattr(cli, "datetime", server.datetime)
     state = _state(tmp_path, timezone=LONDON.key)
     monkeypatch.setattr(cli, "load_settings", lambda **_: state.settings)
     at = datetime(2026, 9, 1, 8, tzinfo=LONDON)

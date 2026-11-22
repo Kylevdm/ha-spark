@@ -2,8 +2,7 @@
 
 Octopus consumption is grid *import*, not house load — the battery/solar shape
 it, so it must not feed the load model (see forecast.py). It is retained to
-reconcile what was bought from the grid against the energy ledger, and for the
-legacy cost backtest.
+reconcile what was bought from the grid against the energy ledger.
 """
 
 from __future__ import annotations

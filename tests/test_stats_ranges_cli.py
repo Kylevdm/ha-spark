@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from ha_spark import cli
+from ha_spark.api import server as server_module
 from ha_spark.energy.energy_ledger import EnergyLedger, RateEvidence
 from tests.api_helpers import owner_client
 from tests.test_api_history import _frozen_server_clock, _state
@@ -20,6 +21,8 @@ from tests.test_stats_ranges import LONDON, priced_row
 ])
 def test_stats_cli_and_history_agree(tmp_path, monkeypatch, capsys, kind, resolution, first, stop):
     _frozen_server_clock(monkeypatch, datetime(2027, 1, 2, tzinfo=UTC))
+    # The CLI counts a period only up to now (#620): give it the server's clock.
+    monkeypatch.setattr(cli, "datetime", server_module.datetime)
     state = _state(tmp_path, timezone=LONDON.key)
     monkeypatch.setattr(cli, "load_settings", lambda **_: state.settings)
     when = datetime(2026, 9, 1, tzinfo=LONDON)

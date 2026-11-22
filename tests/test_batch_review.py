@@ -1,9 +1,8 @@
-"""Whole-batch source-store, backtest and daemon source-bridge regressions."""
+"""Whole-batch source-store and daemon source-bridge regressions."""
 
 import json
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
@@ -11,20 +10,13 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
-from ha_spark import cli
 from ha_spark.api import server
 from ha_spark.api.server import AppState, build_app
 from ha_spark.config import Settings
 from ha_spark.energy import scheduler, sources
-from ha_spark.energy.models import ConsumptionInterval, LoadForecast
+from ha_spark.energy.models import LoadForecast
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
-from ha_spark.energy.solar_source import (
-    NATIVE_PREVIEW_NOTE,
-    load_solar_source_kind,
-    save_solar_source_kind,
-)
-from ha_spark.energy.store import ConsumptionStore
-from ha_spark.energy.tariff import TariffSchedule
+from ha_spark.energy.solar_source import load_solar_source_kind, save_solar_source_kind
 from ha_spark.ha.rest import HomeAssistantRest
 from tests.test_integration_route import discovery as discovery
 from tests.test_integration_route import state as state
@@ -38,33 +30,6 @@ def test_oversized_kind_store_is_corrupt(tmp_path: Path) -> None:
     path = tmp_path / "ha_spark_solar_source.json"
     path.write_bytes(b'{"kind":"native"}' + b" " * (2048 - len(b'{"kind":"native"}')))
     assert load_solar_source_kind(settings) == "entities"
-
-
-@pytest.mark.parametrize("kind", ["native", "entities"])
-async def test_backtest_explains_native_source_only(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], kind: str,
-) -> None:
-    monkeypatch.setattr(cli, "datetime", _frozen_clock(NOW))
-    settings = Settings(db_path=str(tmp_path / "test.db"), timezone="UTC")
-    save_solar_source_kind(settings, kind)  # type: ignore[arg-type]
-    async with ConsumptionStore(settings.db_path) as store:
-        await store.upsert([ConsumptionInterval(NOW - timedelta(minutes=30), NOW, 2)], "test")
-    schedule = TariffSchedule(
-        cheap_rate=0.1, standard_rate=0.3, export_rate=0,
-        window_hours=6, window_start=time(23, 30),
-    )
-    monkeypatch.setattr(cli, "current_plan", AsyncMock(return_value=SimpleNamespace(
-        schedule=schedule,
-    )))
-    assert await cli._cmd_backtest(settings, days=7) == 0
-    output = capsys.readouterr().out
-    assert "Grid import backtest" in output
-    assert (NATIVE_PREVIEW_NOTE in output) == (kind == "native")
-    if kind == "entities":
-        assert output == cli.format_backtest(cli.backtest_cost(
-            [ConsumptionInterval(NOW - timedelta(minutes=30), NOW, 2)],
-            schedule=schedule, tz=UTC,
-        )) + "\n"
 
 
 @respx.mock

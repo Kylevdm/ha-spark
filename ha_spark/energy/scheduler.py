@@ -354,7 +354,7 @@ async def _record_forecast(
     settings: Settings, plan: ChargePlan, forecast: LoadForecast,
     geometry: HorizonGeometry | None = None,
 ) -> None:
-    """Log the plan's load forecast for its served day so `forecast-eval` can
+    """Log the plan's load forecast for its served day so `stats` can
     score it later.
 
     Records the forecast's own unrotated day-order ``slots`` and its served

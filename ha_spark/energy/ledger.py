@@ -2,7 +2,7 @@
 
 ``forecasts`` appends every forecast revision, including paired baselines.
 The compatibility reader selects the latest issue per (target_date, model),
-so ``forecast-eval`` can later join against actual
+so ``eval.py`` can later join against actual
 consumption and report MAE/MAPE per model — the referee later ML phases
 (6B+) must beat before they drive plans.
 
