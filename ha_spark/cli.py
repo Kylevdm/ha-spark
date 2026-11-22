@@ -54,6 +54,7 @@ from ha_spark.energy.evening_forecast import EveningForecastStore
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger import ForecastLedger
 from ha_spark.energy.ledger import read_forecast_history as _read_forecast_history
+from ha_spark.energy.ledger_repair import claim_repair, run_ledger_repair
 from ha_spark.energy.models import ConsumptionInterval
 from ha_spark.energy.octopus import OctopusApiError, fetch_consumption, parse_octopus_csv
 from ha_spark.energy.onboarding import (
@@ -481,6 +482,22 @@ async def _cmd_v2l(settings: Settings) -> int:
     print(f"Avoided import: GBP {avoided:.2f}")
     print(f"Refill cost:    GBP {refill:.2f}")
     print(f"Net benefit:    GBP {net:.2f}")
+    return 0
+
+
+async def _cmd_repair_stats(settings: Settings) -> int:
+    """Run the ledger repair inline: re-check history, re-fill gaps, report counts."""
+    now = datetime.now(UTC)
+    repair_id = await claim_repair(settings.db_path, now)
+    if repair_id is None:
+        print("[REFUSED] a statistics repair is already running", file=sys.stderr)
+        return 1
+    run = await run_ledger_repair(settings, repair_id, now)
+    if run.status == "failed":
+        print("Statistics repair failed", file=sys.stderr)
+        return 1
+    print(f"checked {run.checked_days} days, fixed {run.fixed_slots} slots, "
+          f"{run.still_gaps} still gaps")
     return 0
 
 
@@ -1108,6 +1125,7 @@ examples:
   ha-spark import-csv export.csv           import an Octopus dashboard CSV (meter history)
   ha-spark pull-consumption --days 60      pull grid import from the Octopus API
   ha-spark stats --range week              measured flows, costs, coverage and accuracy
+  ha-spark repair-stats                   re-check and re-fill stored energy statistics
   ha-spark learn-factors                   show learned away factor + occupancy
   ha-spark context add away --from 2026-07-01 --to 2026-07-14   record a holiday
   ha-spark context list                    show stored context facts
@@ -1221,6 +1239,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "notify-test",
         help="Send one test notification and ask for delivery confirmation",
+    )
+
+    sub.add_parser(
+        "repair-stats",
+        help="Re-check and re-fill stored energy-ledger history (writes the ledger only)",
+        description="Owner-run repair of the stored energy ledger: re-check every stored "
+            "day against the plausibility rule, clear values that fail it as rejected "
+            "gaps, and re-fill gaps from Home Assistant statistics (five-minute where "
+            "retained, hourly otherwise) without touching values that pass. One run at "
+            "a time; reports checked days, fixed slots and remaining gaps.",
     )
 
     p_onboard = sub.add_parser(
@@ -1822,6 +1850,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "v2l":
         return asyncio.run(_cmd_v2l(settings))
+
+    if args.command == "repair-stats":
+        return asyncio.run(_cmd_repair_stats(settings))
 
     if args.command == "plan":
         return asyncio.run(_cmd_plan(settings, apply=args.apply))

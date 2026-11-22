@@ -4,9 +4,10 @@ import {mountMode} from "./mode.js";
 import {Controls} from "./plan/controls.js";
 import {PlanParts} from "./plan/registry.js";
 import {number} from "./plan/axis.js";
+import {SettingsScreen} from "./settings.js";
 import {Statistics} from "./statistics.js";
 
-const screens = ["plan", "mode", "statistics"];
+const screens = ["plan", "mode", "statistics", "settings"];
 
 function screenFromHash() {
     const screen = location.hash.slice(2);
@@ -112,6 +113,7 @@ function App() {
             <a href="#/plan" aria-current=${screen === "plan" ? "page" : null}>Plan</a>
             <a href="#/mode" aria-current=${screen === "mode" ? "page" : null}>Mode</a>
             <a href="#/statistics" aria-current=${screen === "statistics" ? "page" : null}>Statistics</a>
+            <a href="#/settings" aria-current=${screen === "settings" ? "page" : null}>Settings</a>
         </nav>
         <div class="workspace">
             <header aria-live="polite">
@@ -129,6 +131,8 @@ function App() {
             <main>${!failed && health ? screen === "mode"
                 ? html`<${Mode} health=${health} refresh=${refresh}/>`
                 : screen === "statistics" ? html`<${Statistics}
+                    repair=${health.configuration?.status === "configuration_repair"}/>`
+                : screen === "settings" ? html`<${SettingsScreen}
                     repair=${health.configuration?.status === "configuration_repair"}/>`
                     : html`<${Plan} health=${health}/>` : null}</main>
         </div>

@@ -6,7 +6,9 @@ import argparse
 import asyncio
 import os
 import signal
+from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -29,8 +31,11 @@ from ha_spark.cli import (
 )
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import Op, Reply, action_lines
+from ha_spark.energy.ledger_repair import RepairRun
 from ha_spark.health import CheckResult, Status
 from ha_spark.router import RouterResult
+
+REPAIR_NOW = datetime(2026, 1, 1, 12, tzinfo=UTC)
 
 _CSV = (
     " Consumption (kwh), Start, End\n"
@@ -805,3 +810,46 @@ async def test_solis_sync_clock_without_a_daemon_only_reads_the_clock(
     assert "inverter clock: unreadable" in out
     assert "[REFUSED]" in out
     assert reads.called and not writes.called
+
+
+async def test_repair_stats_prints_the_result_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Thin: the command surfaces the repair job's own counts, nothing more."""
+    settings = Settings(db_path=str(tmp_path / "repair.db"))
+    monkeypatch.setattr(cli, "claim_repair", AsyncMock(return_value=7))
+    monkeypatch.setattr(
+        cli, "run_ledger_repair", AsyncMock(return_value=RepairRun(
+            status="done", started_at=REPAIR_NOW, finished_at=REPAIR_NOW,
+            checked_days=3, fixed_slots=5, still_gaps=2,
+        )),
+    )
+    assert await cli._cmd_repair_stats(settings) == 0
+    out = capsys.readouterr().out
+    assert "checked 3 days, fixed 5 slots, 2 still gaps" in out
+
+
+async def test_repair_stats_refuses_while_another_run_holds_the_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = Settings(db_path=str(tmp_path / "repair.db"))
+    run = AsyncMock()
+    monkeypatch.setattr(cli, "claim_repair", AsyncMock(return_value=None))
+    monkeypatch.setattr(cli, "run_ledger_repair", run)
+    assert await cli._cmd_repair_stats(settings) == 1
+    assert "already running" in capsys.readouterr().err
+    run.assert_not_called()
+
+
+async def test_repair_stats_reports_a_failed_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = Settings(db_path=str(tmp_path / "repair.db"))
+    monkeypatch.setattr(cli, "claim_repair", AsyncMock(return_value=1))
+    monkeypatch.setattr(
+        cli, "run_ledger_repair", AsyncMock(return_value=RepairRun(
+            status="failed", started_at=REPAIR_NOW, finished_at=REPAIR_NOW,
+        )),
+    )
+    assert await cli._cmd_repair_stats(settings) == 1
+    assert "Statistics repair failed" in capsys.readouterr().err

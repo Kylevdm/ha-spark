@@ -319,6 +319,15 @@ async def _merge_slot(
     )
 
 
+async def _claim_held(db: aiosqlite.Connection, repair_id: int) -> bool:
+    """True while the ledger-repair claim still runs; fenced per write transaction."""
+    async with db.execute(
+        "SELECT 1 FROM energy_ledger_repairs WHERE id = ? AND status = 'running'",
+        (repair_id,),
+    ) as cursor:
+        return await cursor.fetchone() is not None
+
+
 def _valid_interval(row: object, field: str, invert: bool) -> bool:
     # Reject each bad five-minute interval before readiness's reader sums six:
     # a negative interval must never cancel into a plausible half-hour.
@@ -618,7 +627,7 @@ class EnergyLedger:
 
     async def _fill_day(
         self, settings: Settings, start: datetime, end: datetime,
-        configured: dict[str, ComponentSpec],
+        configured: dict[str, ComponentSpec], *, claim: int | None = None,
     ) -> None:
         url, token, timeout = settings.ha_websocket_url, settings.auth_token, settings.ha_timeout
         metas = await list_statistic_ids(url, token, timeout=timeout)
@@ -692,6 +701,11 @@ class EnergyLedger:
         async with aiosqlite.connect(self.db_path) as db:
             await db.executescript(_SCHEMA)
             await db.execute("BEGIN IMMEDIATE")
+            if claim is not None and not await _claim_held(db, claim):
+                # A repair's fill is void once another process reclaimed its
+                # claim; the day-close path passes no claim and is unaffected.
+                await db.rollback()
+                return
             partial = await _partly_filled_runs(db, start, end, fills)
             for instant, changes in fills.items():
                 # A distributed run's shares sum to its counter delta: replace them
