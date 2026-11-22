@@ -83,6 +83,29 @@ def test_day_and_hour_buckets_mark_partial_coverage():
         assert stats.buckets[0].totals.partial
 
 
+def test_an_open_half_hour_is_not_a_missing_measurement():
+    # At 12:10 with all 24 closed slots covered, today's bar is usage so far:
+    # neither its day bucket nor its open hour bucket is partial (#753 review).
+    midnight = datetime(2026, 9, 1, tzinfo=LONDON).astimezone(UTC)
+    now = midnight + timedelta(hours=12, minutes=10)
+    step = timedelta(minutes=30)
+    rows = [priced_row(midnight + i * step, 2) for i in range(24)]
+    day = summarise(rows, midnight, now, LONDON, "day")
+    assert [bucket.totals.total_slots for bucket in day.buckets] == [24]
+    assert day.buckets[0].totals.covered_slots == 24
+    assert not day.buckets[0].totals.partial
+    assert day.buckets[0].totals.cost_coverage == 1  # today is priced so far, no U
+    # The range still spans up to now, open half-hour included.
+    assert day.totals.total_slots == 25
+    hours = summarise(rows, midnight, now, LONDON, "hour")
+    assert hours.buckets[-1].totals.total_slots == 0  # the open hour is no gap
+    assert not hours.buckets[-1].totals.partial
+    # A genuinely missing closed slot still marks the day partial.
+    gap = summarise(rows[:23], midnight, now, LONDON, "day")
+    assert gap.buckets[0].totals.covered_slots == 23
+    assert gap.buckets[0].totals.partial
+
+
 def priced_row(start, imported, provenance="boundary"):
     return LedgerSlot(
         slot_start=start, house_load_kwh=1, base_load_kwh=1, import_rate=.25, export_rate=.125,

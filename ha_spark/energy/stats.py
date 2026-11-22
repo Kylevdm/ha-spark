@@ -409,7 +409,11 @@ class RangeTotals:
 
     @property
     def partial(self) -> bool:
-        """True when an elapsed slot in the bucket is not covered (a gap or rejection)."""
+        """True when a completed slot in the bucket is not covered (a gap or rejection).
+
+        Only fully elapsed half-hours are expected measurements: the open slot
+        at a period's edge is usage so far, not a missing measurement.
+        """
         return self.covered_slots < self.total_slots
 
 
@@ -512,8 +516,11 @@ def summarise(
             right = left
             while right < len(energy.buckets) and costs.slots[right].start.astimezone(UTC) < stop:
                 right += 1
+            # Only fully elapsed half-hours are expected: the bucket's open slot
+            # is usage so far, not a gap in its coverage.
             totals = _range_totals(_energise(energy.buckets[left:right]),
-                                   _sum_costs(costs.slots[left:right]), index(stop) - index(cursor))
+                                   _sum_costs(costs.slots[left:right]),
+                                   (stop - cursor) // HALF_HOUR)
             buckets.append(RangeBucket(label, totals))
             cursor, left = stop, right
     earnings = costs.axle_earnings_by_day
@@ -555,6 +562,18 @@ def provenance_counts(result: StatsResult) -> dict[str, int]:
                 key = flow.provenance
         counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def rejected_slots(result: StatsResult) -> int:
+    """Count half-hours with any plausibility-rejected component, each once.
+
+    Rejection is not limited to grid import: the coverage line reports one
+    number for the whole ledger, separate from the grid-import breakdown.
+    """
+    return sum(
+        any(flow.reason == "rejected" for flow in bucket.slot.components.values())
+        for bucket in result.buckets if bucket.slot is not None
+    )
 
 
 @dataclass(frozen=True)

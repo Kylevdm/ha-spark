@@ -94,27 +94,35 @@ function slotMarks(bucket) {
         bucket.actual_cost == null && "U"].filter(Boolean);
 }
 
-// A calendar bucket with an uncovered elapsed slot: a gap or a rejected interval.
+// A calendar bucket with an uncovered completed slot: a gap or a rejected interval.
 function dayMarks(bucket) {
-    return [bucket.partial && "P", bucket.actual_cost == null && "U"].filter(Boolean);
+    // Unpriced covers a fully unpriced day and one with any unpriced slot.
+    return [bucket.partial && "P", bucket.cost_coverage < 1 && "U"].filter(Boolean);
 }
 
 // The per-day row the Week/Month/Year views answer "how much did we use" with.
-function usageRow(bucket) {
+function usageRow(bucket, soFar = false) {
+    const cost = bucket.actual_cost == null ? ""
+        : bucket.priced_slots < bucket.total_slots
+            ? `Cost subtotal ${money(bucket.actual_cost)} `
+                + `(${bucket.priced_slots}/${bucket.total_slots} slots priced)`
+            : `Cost ${money(bucket.actual_cost)}`;
     return [
         `House ${energy(bucket.house_load_kwh)}`,
         `Import ${energy(valueAt(bucket, "grid_import"))}`,
         `Export ${energy(valueAt(bucket, "grid_export"))}`,
         `Solar ${energy(valueAt(bucket, "solar_generation"))}`,
-        bucket.actual_cost == null ? "" : `Cost ${money(bucket.actual_cost)}`,
+        cost,
         bucket.partial ? "Partial" : "",
+        soFar ? "Usage so far" : "",
     ].filter(Boolean);
 }
 
 function HistoryChart({payload, field, selected, select}) {
-    const {buckets, resolution} = payload;
+    const {buckets, resolution, range} = payload;
     if (!buckets.length) return html`<p>No half-hours in this period yet.</p>`;
     const day = resolution === "slot";
+    const today = range?.today;
     const data = buckets.map(bucket => ({start: bucket.start, value: valueAt(bucket, field, day)}));
     const grid = day ? slotGrid(Date.parse(data[0].start),
         Date.parse(data.at(-1).start) + halfHour, halfHour) : null;
@@ -149,7 +157,8 @@ function HistoryChart({payload, field, selected, select}) {
                 const marks = day ? slotMarks(bucket)
                     : resolution === "day" ? dayMarks(bucket) : [];
                 const description = [label, value == null ? "Gap" : formatValue(field, value),
-                    ...(day ? [session(bucket)] : usageRow(bucket))].filter(Boolean).join(" · ");
+                    ...(day ? [session(bucket)]
+                        : usageRow(bucket, start.slice(0, 10) === today))].filter(Boolean).join(" · ");
                 return html`<g key=${start}>
                     ${!day && value != null ? html`<rect class="stats-bar"
                         x=${at + slotWidth * .18} width=${slotWidth * .64}
@@ -157,8 +166,9 @@ function HistoryChart({payload, field, selected, select}) {
                         : null}
                     ${!day && i % Math.max(1, Math.ceil(78 / slotWidth)) === 0
                         ? html`<text class="axis-label" x=${at} y="180">${label}</text>` : null}
-                    ${marks.map(mark => html`<text class="axis-label" x=${at + 5}
-                        y=${166 + (day ? "GFDHU" : "PU").indexOf(mark) * 12}>${mark}</text>`)}
+                    ${marks.map((mark, j) => html`<text class="axis-label"
+                        x=${at + 5 + (day ? 0 : j * 10)}
+                        y=${166 + (day ? "GFDHU".indexOf(mark) * 12 : 0)}>${mark}</text>`)}
                     <rect class=${selected === i ? "slot-hit selected" : "slot-hit"}
                         x=${at} y="24" width=${slotWidth} height=${day ? 198 : 136}
                         tabindex="0" role="button" aria-label=${description} aria-pressed=${selected === i}
@@ -212,11 +222,12 @@ function DaySlots({buckets, solar}) {
     </details>`;
 }
 
-function DailyList({buckets}) {
+function DailyList({buckets, today}) {
     return html`<details>
         <summary>Daily usage: house load with import, export, solar and cost</summary>
         <ul>${buckets.map(bucket => html`<li key=${bucket.start}>
-            ${[bucket.start.slice(0, 10), ...usageRow(bucket)].join(" · ")}
+            ${[bucket.start.slice(0, 10), ...usageRow(bucket, bucket.start.slice(0, 10) === today)]
+                .join(" · ")}
         </li>`)}</ul>
     </details>`;
 }
@@ -310,7 +321,8 @@ function Accuracy({solar, load, meter}) {
 }
 
 function Results({payload, changeRange}) {
-    const {range, resolution, range_totals: totals, buckets, provenance_counts: counts} = payload;
+    const {range, resolution, range_totals: totals, buckets, provenance_counts: counts,
+        rejected_slots: rejected} = payload;
     const [field, setField] = useState(
         resolution === "day" ? "house_load_kwh" : "grid_import");
     const [selected, select] = useState(null);
@@ -322,8 +334,9 @@ function Results({payload, changeRange}) {
         ${payload.unavailable.statistics ? html`<p>Energy ledger statistics unavailable.</p>` : null}
         ${counts ? html`<p>Grid import provenance · Statistics fill: ${counts.statistics_fill ?? 0} ·
             Distributed: ${counts.distributed ?? 0} · Lower resolution (hourly):
-            ${counts.hourly_backfill ?? 0} · Rejected: ${counts.rejected ?? 0} · Gaps:
-            ${(counts.gap ?? 0) + (counts.absent ?? 0)}</p>`
+            ${counts.hourly_backfill ?? 0} · Gaps:
+            ${(counts.gap ?? 0) + (counts.absent ?? 0) + (counts.rejected ?? 0)}</p>
+            <p>Rejected intervals: ${rejected ?? 0} · any component, each half-hour counted once</p>`
             : html`<p>Grid import provenance unavailable.</p>`}
         <h2>Energy flows</h2>
         <${Metrics} entries=${flowEntries(totals)} cards=${true}/>
@@ -338,16 +351,19 @@ function Results({payload, changeRange}) {
         </select></label>
         <p>Select a ${day ? "half-hour" : "bar"} for its numbers. A dash means unavailable, not zero.</p>
         ${day ? html`<p>G: gap · F: statistics fill · D: distributed · H: lower resolution (hourly) · U: unpriced</p>`
-            : resolution === "day" ? html`<p>P: partial day · U: unpriced</p>` : null}
+            : resolution === "day" ? html`<p>P: partial day · U: unpriced (fully or partly) ·
+                Today's bar shows usage so far</p>` : null}
         <${HistoryChart} payload=${payload} field=${field} selected=${selected} select=${select}/>
         ${bucket ? html`<section aria-live="polite">
             <h3>${day || resolution === "hour" ? clock(bucket.start)
                 : bucket.start.slice(0, resolution === "month" ? 7 : 10)}</h3>
             <${BucketDetails} bucket=${bucket} day=${day} solar=${payload.solar_accuracy?.slots?.[selected]}
-                drill=${() => changeRange(resolution === "month" ? "month" : "day", bucket.start.slice(0, 10))}/>
+                drill=${resolution === "hour" ? null  // it would reopen the same day
+                    : () => changeRange(resolution === "month" ? "month" : "day",
+                        bucket.start.slice(0, 10))}/>
         </section>` : null}
         ${day ? html`<${DaySlots} buckets=${buckets} solar=${payload.solar_accuracy}/>` : null}
-        ${resolution === "day" ? html`<${DailyList} buckets=${buckets}/>` : null}
+        ${resolution === "day" ? html`<${DailyList} buckets=${buckets} today=${range.today}/>` : null}
         <${Axle} axle=${payload.axle}/>
         <${Accuracy} solar=${payload.solar_accuracy} load=${payload.load_accuracy}
             meter=${payload.meter_reconciliation}/>`;

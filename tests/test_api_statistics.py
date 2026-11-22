@@ -252,6 +252,24 @@ def test_statistics_daily_buckets_mark_partial_days_and_count_rejected(tmp_path,
     assert second["actual_cost"] is None
 
 
+def test_statistics_counts_rejected_intervals_in_any_component(tmp_path, monkeypatch):
+    # Solar rejected while grid import has a boundary reading: the payload's
+    # rejected count still sees the half-hour (#749 review finding 3).
+    start = datetime(2026, 8, 30, 23, tzinfo=UTC)  # household Monday 31 August
+    _frozen_server_clock(monkeypatch, datetime(2026, 9, 8, 12, tzinfo=UTC))
+    half_hour = timedelta(minutes=30)
+    rows = [priced_row(start + i * half_hour, 2) for i in range(48)]
+    rows.append(LedgerSlot(slot_start=start + 48 * half_hour, components={
+        "grid_import": ComponentFlow(kwh=2, provenance="boundary"),
+        "solar_generation": ComponentFlow(reason="rejected"),
+    }))
+    monkeypatch.setattr(EnergyLedger, "slots", AsyncMock(return_value=rows))
+    with owner_client(_state(tmp_path, timezone=LONDON.key)) as client:
+        body = client.get("/api/history", params={"range": "week", "at": "2026-09-01"}).json()
+    assert body["rejected_slots"] == 1
+    assert "rejected" not in body["provenance_counts"]
+
+
 def test_statistics_year_shows_one_bar_per_day(tmp_path, monkeypatch):
     _frozen_server_clock(monkeypatch, datetime(2027, 1, 2, 12, tzinfo=UTC))
     with owner_client(_state(tmp_path, timezone=LONDON.key)) as client:
