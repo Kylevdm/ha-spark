@@ -12,6 +12,7 @@ across the daemon and the CLI through the shared database file.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -32,6 +33,7 @@ from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.ledger_backfill import _hourly_series
 from ha_spark.energy.onboarding import SUPPORTED_UNITS, statistic_unit
 from ha_spark.energy.plausibility import plausible, plausible_kw
+from ha_spark.energy.readiness_ledger import slot_start
 from ha_spark.energy.readiness_measurements import HALF_HOUR, STATS_RETENTION, day_bounds
 from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.logging import get_logger
@@ -100,8 +102,13 @@ async def claim_repair(db_path: str, now: datetime) -> int | None:
         return int(row[0]) if row is not None and row[0] is not None else None
 
 
-async def last_repair(db_path: str) -> RepairRun | None:
-    """The newest run record, read-only; None with no database or table."""
+async def last_repair(db_path: str, *, now: datetime | None = None) -> RepairRun | None:
+    """The newest run record, read-only; None with no database or table.
+
+    A claim still marked running past the stale window is presented as
+    failed: its process died mid-run, and the owner may retry immediately.
+    The row itself is left untouched for the next claim to reclaim.
+    """
     if not await asyncio.to_thread(Path(db_path).exists):
         return None
     path = await asyncio.to_thread(Path(db_path).resolve)
@@ -118,7 +125,7 @@ async def last_repair(db_path: str) -> RepairRun | None:
             row = await cursor.fetchone()
     if row is None:
         return None
-    return RepairRun(
+    run = RepairRun(
         started_at=datetime.fromisoformat(str(row[0])),
         finished_at=datetime.fromisoformat(str(row[1])) if row[1] is not None else None,
         status=str(row[2]),
@@ -126,28 +133,43 @@ async def last_repair(db_path: str) -> RepairRun | None:
         fixed_slots=None if row[4] is None else int(row[4]),
         still_gaps=None if row[5] is None else int(row[5]),
     )
+    at = datetime.now(UTC) if now is None else now
+    if run.status == "running" and run.started_at <= at - REPAIR_STALE_AFTER:
+        return run.model_copy(update={"status": "failed"})
+    return run
 
 
-async def run_ledger_repair(settings: Settings, repair_id: int, now: datetime) -> RepairRun:
+async def run_ledger_repair(
+    settings: Settings, repair_id: int, now: datetime, *, finished_at: datetime | None = None,
+) -> RepairRun:
     """Run one claimed repair to completion; never raises into a caller.
 
     A failed HA read leaves the gaps it could not fill and the run ends
-    ``done`` with them counted; any unexpected error ends the run ``failed``.
+    ``done`` with them counted. A storage failure or a finalization that did
+    not persist ends the run ``failed``: an outcome is never reported as
+    done unless the database holds it.
     """
     status: Literal["done", "failed"] = "done"
     checked_days = fixed_slots = still_gaps = 0
     try:
-        checked_days, fixed_slots, still_gaps = await _repair_history(settings, now)
+        checked_days, fixed_slots, still_gaps = await _repair_history(settings, now, repair_id)
     except Exception:  # noqa: BLE001 - recorded as a failed run, never surfaced raw
         log.warning("Statistics repair failed")
         status = "failed"
+    # Captured after the history pass, not at the claim: the run's own duration.
+    finished = finished_at if finished_at is not None else datetime.now(UTC)
+    applied = False
     try:
-        await _finish_repair(settings.db_path, repair_id, status, now,
-                            checked_days, fixed_slots, still_gaps)
+        applied = await _finish_repair(settings.db_path, repair_id, status, finished,
+                                       checked_days, fixed_slots, still_gaps)
     except Exception:  # noqa: BLE001 - the run record degrades, never the caller
         log.warning("Statistics repair failed")
+    if not applied:
+        # Another process reclaimed the claim, or the record never persisted.
+        log.warning("Statistics repair was superseded")
+        status = "failed"
     return RepairRun(
-        status=status, started_at=now, finished_at=now,
+        status=status, started_at=now, finished_at=finished,
         checked_days=checked_days, fixed_slots=fixed_slots, still_gaps=still_gaps,
     )
 
@@ -159,20 +181,45 @@ def _gap_names(row: LedgerSlot, configured: dict[str, ComponentSpec]) -> set[str
     }
 
 
-def _retention_floor(now: datetime, timezone: str) -> datetime:
-    """The start of the oldest local day whose five-minute statistics may exist."""
-    day = (now - STATS_RETENTION).astimezone(load_timezone(timezone)).date()
-    while day_bounds(day, timezone)[0] < now - STATS_RETENTION:
-        day += timedelta(days=1)
-    return day_bounds(day, timezone)[0]
+def _implausible(rows: list[LedgerSlot], bound_kw: float) -> dict[datetime, set[str]]:
+    """(slot, names) of stored numeric flows failing the rule, configured or not.
+
+    A sensor removed after a spike was recorded is still checked: the stored
+    history is validated in full, and current configuration only decides what
+    can be re-filled and what counts toward the remaining gaps.
+    """
+    seconds = HALF_HOUR.total_seconds()
+    candidates: dict[datetime, set[str]] = {}
+    for row in rows:
+        for name, flow in row.components.items():
+            if flow.kwh is not None and not plausible(flow.kwh, seconds, bound_kw):
+                candidates.setdefault(row.slot_start, set()).add(name)
+    return candidates
 
 
-async def _repair_history(settings: Settings, now: datetime) -> tuple[int, int, int]:
+def _day_ranges(
+    days: set[date], cutoff: datetime, timezone: str,
+) -> list[tuple[datetime, datetime]]:
+    """Contiguous local-day [start, end) ranges, each capped at the retention edge."""
+    ranges: list[tuple[datetime, datetime]] = []
+    for day in sorted(days):
+        start = day_bounds(day, timezone)[0]
+        end = min(day_bounds(day, timezone)[1], cutoff)
+        if ranges and start == ranges[-1][1]:
+            ranges[-1] = (ranges[-1][0], end)
+        else:
+            ranges.append((start, end))
+    return ranges
+
+
+async def _repair_history(
+    settings: Settings, now: datetime, repair_id: int,
+) -> tuple[int, int, int]:
     """(checked_days, fixed_slots, still_gaps) over every stored closed day."""
     ledger = EnergyLedger(settings.db_path)
     configured = _configured_components(settings)
     first = await ledger.first_slot()
-    if first is None or not configured:
+    if first is None:
         return (0, 0, 0)
     tz = load_timezone(settings.timezone)
     now = now.astimezone(UTC)
@@ -186,27 +233,53 @@ async def _repair_history(settings: Settings, now: datetime) -> tuple[int, int, 
     rows = await ledger.slots(start, end)
     if not rows:
         return (0, 0, 0)
-    await _reject_implausible(settings.db_path, rows, configured, bound_kw)
+    await _reject_implausible(
+        settings.db_path, _implausible(rows, bound_kw), bound_kw, repair_id,
+    )
     rows = await ledger.slots(start, end)
     days: dict[date, list[LedgerSlot]] = {}
     for row in rows:
         days.setdefault(row.slot_start.astimezone(tz).date(), []).append(row)
+    checked = len(days)
+    if not configured:
+        # Without a configured source nothing can be re-filled; the re-check
+        # above still covered every stored flow, spikes of removed sensors too.
+        return (checked, 0, 0)
     gaps = {row.slot_start: names for row in rows if (names := _gap_names(row, configured))}
-    floor = _retention_floor(now, settings.timezone)
+    if not gaps:
+        return (checked, 0, 0)
+    # Five-minute evidence exists for slots starting at or after the retention
+    # edge, so the day the edge falls inside is served per slot, not discarded.
+    edge = now - STATS_RETENTION
+    cutoff = slot_start(edge)
+    if cutoff < edge:
+        cutoff += HALF_HOUR
+    hourly_days: set[date] = set()
     for day in sorted(days):
-        if not any(gaps.get(row.slot_start) for row in days[day]):
+        day_gaps = [row for row in days[day] if row.slot_start in gaps]
+        if not day_gaps:
             continue
         day_start, day_end = day_bounds(day, settings.timezone)
-        if day_start < floor:
-            continue
+        if any(row.slot_start >= cutoff for row in day_gaps):
+            try:
+                # The existing day-close fill: 5-minute rows, gaps only.
+                await ledger._fill_day(
+                    settings, max(day_start, cutoff), day_end, configured, claim=repair_id,
+                )
+            except sqlite3.Error:
+                raise  # Storage, not a missing source: never report such a run as done.
+            except Exception:  # noqa: BLE001 - the day keeps its gaps, the run goes on
+                log.warning("Statistics repair fill failed")
+        if any(row.slot_start < cutoff for row in day_gaps):
+            hourly_days.add(day)
+    # Only days with gaps are read, in bounded contiguous ranges: an old ledger
+    # never holds one write transaction over its whole history.
+    ranges = _day_ranges(hourly_days, cutoff, settings.timezone)
+    if ranges:
         try:
-            # The existing day-close fill: 5-minute rows, gaps only.
-            await ledger._fill_day(settings, day_start, day_end, configured)
-        except Exception:  # noqa: BLE001 - the day keeps its gaps, the run goes on
-            log.warning("Statistics repair fill failed")
-    if any(day_bounds(day, settings.timezone)[0] < floor for day in days):
-        try:
-            await _refill_hourly(settings, start, min(floor, end), configured, bound_kw)
+            await _refill_hourly(settings, ranges, configured, bound_kw, repair_id)
+        except sqlite3.Error:
+            raise  # Storage, not a missing source: never report such a run as done.
         except Exception:  # noqa: BLE001 - those days keep their gaps, the run goes on
             log.warning("Statistics repair fill failed")
     final = await ledger.slots(start, end)
@@ -217,37 +290,54 @@ async def _repair_history(settings: Settings, now: datetime) -> tuple[int, int, 
             still += 1
         if gaps.get(row.slot_start) and any(name not in current for name in gaps[row.slot_start]):
             fixed += 1
-    return (len(days), fixed, still)
+    return (checked, fixed, still)
+
+
+async def _claim_running(db: aiosqlite.Connection, repair_id: int) -> bool:
+    """True while the given claim is the running one; a reclaimed run writes nothing."""
+    async with db.execute(
+        "SELECT 1 FROM energy_ledger_repairs WHERE id = ? AND status = 'running'",
+        (repair_id,),
+    ) as cursor:
+        return await cursor.fetchone() is not None
 
 
 async def _reject_implausible(
-    db_path: str, rows: list[LedgerSlot],
-    configured: dict[str, ComponentSpec], bound_kw: float,
+    db_path: str, candidates: dict[datetime, set[str]], bound_kw: float, repair_id: int,
 ) -> None:
     # The one rule exception: a stored value that fails the plausibility rule
     # becomes a rejected gap, whatever its provenance, so the re-fill can retry.
-    seconds = HALF_HOUR.total_seconds()
-    changes: dict[datetime, dict[str, ComponentFlow]] = {}
-    for row in rows:
-        for name in configured:
-            flow = row.components.get(name)
-            if flow is None or flow.kwh is None:
-                continue
-            if not plausible(flow.kwh, seconds, bound_kw):
-                changes.setdefault(row.slot_start, {})[name] = ComponentFlow(reason="rejected")
-    if not changes:
+    if not candidates:
         return
-    log.warning("Statistics repair rejected an implausible interval")
+    seconds = HALF_HOUR.total_seconds()
     async with aiosqlite.connect(db_path) as db:
         await db.execute("BEGIN IMMEDIATE")
-        for instant, updates in changes.items():
-            await _store_flows(db, instant, updates)
+        if not await _claim_running(db, repair_id):
+            await db.rollback()
+            return
+        rejected = False
+        for instant, names in candidates.items():
+            row = await _stored_slot(db, instant)
+            if row is None:
+                continue
+            # Re-check the current value: a boundary capture that replaced the
+            # spike after the scan wins; a value that passes is never touched.
+            updates = {
+                name: ComponentFlow(reason="rejected") for name in names
+                if (flow := row.components.get(name)) is not None
+                and flow.kwh is not None and not plausible(flow.kwh, seconds, bound_kw)
+            }
+            if updates:
+                rejected = True
+                await _store_updates(db, instant, row, updates)
+        if rejected:
+            log.warning("Statistics repair rejected an implausible interval")
         await db.commit()
 
 
 async def _refill_hourly(
-    settings: Settings, start: datetime, cutoff: datetime,
-    configured: dict[str, ComponentSpec], bound_kw: float,
+    settings: Settings, ranges: list[tuple[datetime, datetime]],
+    configured: dict[str, ComponentSpec], bound_kw: float, repair_id: int,
 ) -> None:
     """Fill gaps from hourly long-term statistics; passing values are never replaced."""
     url, token, timeout = settings.ha_websocket_url, settings.auth_token, settings.ha_timeout
@@ -257,36 +347,42 @@ async def _refill_hourly(
         for meta in metas
         if isinstance(meta, dict) and isinstance(meta.get("statistic_id"), str)
     }
-    fills: dict[datetime, dict[str, ComponentFlow]] = {}
-    rejected = False
-    for name, spec in configured.items():
-        entity = spec.entity_id.strip()
-        unit = units.get(entity)
-        if unit is None or unit not in SUPPORTED_UNITS:
+    for start, end in ranges:
+        # One bounded range at a time: neither the read nor the write holds a
+        # transaction over the whole stored history.
+        fills: dict[datetime, dict[str, ComponentFlow]] = {}
+        rejected = False
+        for name, spec in configured.items():
+            entity = spec.entity_id.strip()
+            unit = units.get(entity)
+            if unit is None or unit not in SUPPORTED_UNITS:
+                continue
+            try:
+                rows = await statistics_during_period(
+                    url, token, entity, start, period="hour", timeout=timeout, end_time=end,
+                )
+                series = await asyncio.to_thread(
+                    _hourly_series, rows, unit, spec.invert, start, end,
+                    settings.timezone, bound_kw,
+                )
+            except Exception:  # noqa: BLE001 - one component's read never fails the rest
+                log.warning("Statistics repair fill failed")
+                continue
+            for instant, flow in series.items():
+                fills.setdefault(instant, {})[name] = flow
+                rejected |= flow.reason == "rejected"
+        if rejected:
+            log.warning("Energy ledger rejected an implausible interval")
+        if not fills:
             continue
-        try:
-            rows = await statistics_during_period(
-                url, token, entity, start, period="hour", timeout=timeout, end_time=cutoff,
-            )
-            series = await asyncio.to_thread(
-                _hourly_series, rows, unit, spec.invert, start, cutoff,
-                settings.timezone, bound_kw,
-            )
-        except Exception:  # noqa: BLE001 - one component's read never fails the rest
-            log.warning("Statistics repair fill failed")
-            continue
-        for instant, flow in series.items():
-            fills.setdefault(instant, {})[name] = flow
-            rejected |= flow.reason == "rejected"
-    if rejected:
-        log.warning("Energy ledger rejected an implausible interval")
-    if not fills:
-        return
-    async with aiosqlite.connect(settings.db_path) as db:
-        await db.execute("BEGIN IMMEDIATE")
-        for instant, changes in fills.items():
-            await _merge_gaps(db, instant, changes)
-        await db.commit()
+        async with aiosqlite.connect(settings.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            if await _claim_running(db, repair_id):
+                for instant, changes in fills.items():
+                    await _merge_gaps(db, instant, changes)
+                await db.commit()
+            else:
+                await db.rollback()
 
 
 async def _merge_gaps(
@@ -301,14 +397,6 @@ async def _merge_gaps(
         if (current := row.components.get(name)) is not None and current.provenance == "absent"
     }
     await _store_updates(db, instant, row, updates)
-
-
-async def _store_flows(
-    db: aiosqlite.Connection, instant: datetime, updates: dict[str, ComponentFlow],
-) -> None:
-    row = await _stored_slot(db, instant)
-    if row is not None:
-        await _store_updates(db, instant, row, updates)
 
 
 async def _stored_slot(db: aiosqlite.Connection, instant: datetime) -> LedgerSlot | None:
@@ -340,14 +428,16 @@ async def _store_updates(
 
 
 async def _finish_repair(
-    db_path: str, repair_id: int, status: str, now: datetime,
+    db_path: str, repair_id: int, status: str, finished_at: datetime,
     checked_days: int, fixed_slots: int, still_gaps: int,
-) -> None:
+) -> bool:
+    """Persist one run's outcome; False when its claim is no longer the running one."""
     async with aiosqlite.connect(db_path) as db:
-        await db.execute(
+        cursor = await db.execute(
             "UPDATE energy_ledger_repairs SET finished_at = ?, status = ?, checked_days = ?, "
-            "fixed_slots = ?, still_gaps = ? WHERE id = ?",
-            (now.astimezone(UTC).isoformat(), status, checked_days, fixed_slots, still_gaps,
-             repair_id),
+            "fixed_slots = ?, still_gaps = ? WHERE id = ? AND status = 'running'",
+            (finished_at.astimezone(UTC).isoformat(), status, checked_days, fixed_slots,
+             still_gaps, repair_id),
         )
         await db.commit()
+        return cursor.rowcount == 1

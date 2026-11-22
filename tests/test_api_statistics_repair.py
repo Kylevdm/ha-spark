@@ -137,6 +137,78 @@ async def test_repair_get_returns_the_last_run(tmp_path):
     }}
 
 
+async def test_a_failed_status_read_reports_unavailable(tmp_path, monkeypatch):
+    # An unreadable run table is a fixed-text failure, not a silent "never run",
+    # so Settings shows that the status is unavailable instead of inventing it.
+    state = ingress_state(tmp_path)
+
+    async def broken(db_path, **kwargs):
+        raise RuntimeError("private storage detail")
+
+    monkeypatch.setattr(server, "last_repair", broken)
+    app = build_app(state, ingress_peer="testclient")
+    with TestClient(app) as client:
+        response = client.get("/api/statistics/repair")
+    assert response.status_code == 503
+    assert response.json() == {"error": "repair status unavailable"}
+    assert response.headers["Cache-Control"] == "no-store"
+    assert "private storage detail" not in response.text
+
+
+async def test_started_and_refused_posts_are_never_cached(tmp_path, monkeypatch):
+    # A successful start and a concurrent refusal both carry no-store.
+    state = ingress_state(tmp_path)
+    release = asyncio.Event()
+
+    async def slow_run(settings: Settings, repair_id: int, now: datetime) -> RepairRun:
+        await release.wait()
+        await _finish_repair(settings.db_path, repair_id, "done", now, 3, 5, 2)
+        return done_run()
+
+    monkeypatch.setattr(server, "run_ledger_repair", slow_run)
+    app = build_app(state, ingress_peer="testclient")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, client=("testclient", 1)),
+        base_url="http://local",
+    ) as client:
+        first = await client.post("/api/statistics/repair", json={}, headers=OWNER)
+        assert first.status_code == 202
+        assert first.headers["Cache-Control"] == "no-store"
+        second = await client.post("/api/statistics/repair", json={}, headers=OWNER)
+        assert second.status_code == 409
+        assert second.headers["Cache-Control"] == "no-store"
+        release.set()
+        await state.statistics_repair_task
+
+
+@pytest.mark.parametrize("headers,status", [
+    ({}, 403),
+    ({"X-HA-Spark-Request": "repair_stats"}, 415),
+])
+def test_owner_gate_refusals_are_never_cached(tmp_path, headers, status):
+    state = ingress_state(tmp_path)
+    app = build_app(state, ingress_peer="testclient")
+    with TestClient(app) as client:
+        response = client.post("/api/statistics/repair", content=b"{}",
+                               headers={"X-Remote-User-Id": "owner", **headers})
+    assert response.status_code == status
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_a_claim_failure_refusal_is_never_cached(tmp_path, monkeypatch):
+    state = ingress_state(tmp_path)
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("private claim detail")
+
+    monkeypatch.setattr(server, "claim_repair", broken)
+    app = build_app(state, ingress_peer="testclient")
+    with TestClient(app) as client:
+        response = client.post("/api/statistics/repair", json={}, headers=OWNER)
+    assert response.status_code == 500
+    assert response.headers["Cache-Control"] == "no-store"
+
+
 async def test_repair_get_without_history_shows_none(tmp_path):
     app = build_app(ingress_state(tmp_path), ingress_peer="testclient")
     with TestClient(app) as client:

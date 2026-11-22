@@ -853,8 +853,13 @@ def build_app(
             try:
                 run = await last_repair(_state_of(request).settings.db_path)
             except Exception:  # noqa: BLE001 - fixed text; the view degrades, never 500s
+                # Unreadable history must not read as "never run": the section
+                # shows the failure instead of asserting no run occurred.
                 log.warning("Statistics repair read failed")
-                run = None
+                return JSONResponse(
+                    {"error": "repair status unavailable"}, status_code=503,
+                    headers={"Cache-Control": "no-store"},
+                )
             payload = None if run is None else {
                 "status": run.status, "started_at": _iso(run.started_at),
                 "finished_at": _iso(run.finished_at), "checked_days": run.checked_days,
@@ -867,6 +872,7 @@ def build_app(
             """Start the owner's ledger repair as background work; one run at a time."""
             user = _owner_request(request, "repair_stats")
             if isinstance(user, JSONResponse):
+                user.headers["Cache-Control"] = "no-store"
                 return user
             st = _state_of(request)
             now = datetime.now(UTC)
@@ -876,16 +882,25 @@ def build_app(
                 repair_id = await claim_repair(st.settings.db_path, now)
             except Exception:  # noqa: BLE001 - fixed text; never the exception's own
                 log.warning("Statistics repair could not start")
-                return JSONResponse({"error": "repair failed"}, status_code=500)
+                return JSONResponse(
+                    {"error": "repair failed"}, status_code=500,
+                    headers={"Cache-Control": "no-store"},
+                )
             if repair_id is None:
-                return JSONResponse({"error": "repair already running"}, status_code=409)
+                return JSONResponse(
+                    {"error": "repair already running"}, status_code=409,
+                    headers={"Cache-Control": "no-store"},
+                )
             # Never the control loop and never the daemon command channel: the
             # job runs as its own task, its I/O never delays a tick.
             async def _job() -> None:
                 await run_ledger_repair(st.settings, repair_id, now)
 
             st.statistics_repair_task = asyncio.create_task(_job())
-            return JSONResponse({"status": "running"}, status_code=202)
+            return JSONResponse(
+                {"status": "running"}, status_code=202,
+                headers={"Cache-Control": "no-store"},
+            )
 
         @app.get("/api/config")
         async def get_config(request: Request) -> dict[str, Any]:
