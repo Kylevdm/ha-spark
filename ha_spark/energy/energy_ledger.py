@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
@@ -24,7 +24,7 @@ from ha_spark.energy.derived_base_load import (
     derive_specs_from_settings,
 )
 from ha_spark.energy.forecast import load_timezone
-from ha_spark.energy.horizon import _window_bounds
+from ha_spark.energy.horizon import _window_bounds, parse_time
 from ha_spark.energy.onboarding import ENERGY_FACTORS, POWER_FACTORS, statistic_unit
 from ha_spark.energy.plausibility import plausible, plausible_kw
 from ha_spark.energy.readiness_ledger import BOUNDARY_TOLERANCE, slot_start
@@ -101,21 +101,18 @@ class LedgerSlot(RateEvidence):
     negative_clamped: bool = False
 
 
-def _parse_hhmm(hhmm: str) -> time:
-    """Parse a validated ``HH:MM`` config value (FixedTariffConfig has checked the shape)."""
-    h, m = hhmm.split(":")
-    return time(int(h), int(m))
-
-
 def _fixed_daily_rates(
     settings: Settings, start: datetime, revision_id: str,
 ) -> RateEvidence | None:
     """Capture the fixed supplier's flat rates when the daily model has no slot geometry.
 
     The import rate is the time-weighted blend of the two rates over the
-    slot's real overlap with the configured cheap window — half-open on
-    absolute instants, the horizon geometry's fold=0 semantics — so a slot
-    straddling an edge is blended and the slot after the window end is peak.
+    union of the slot's real overlaps with the configured cheap window —
+    half-open on absolute instants, the horizon geometry's fold=0 semantics —
+    so a slot straddling an edge is blended, the slot after the window end is
+    peak, and a slot shared by two daily instances (a 24 h window) counts
+    both halves. Consecutive instances at most tile the day, so summing
+    their overlaps never double-counts a minute.
     """
     try:
         tariff = FixedTariffConfig(
@@ -130,14 +127,17 @@ def _fixed_daily_rates(
             return None
         tz = ZoneInfo(settings.timezone)
         local_day = start.astimezone(tz).date()
-        window_start = _parse_hhmm(tariff.window_start)
-        window_end = _parse_hhmm(tariff.window_end)
-        frac = 0.0
+        window_start = parse_time(tariff.window_start)
+        window_end = parse_time(tariff.window_end)
+        end = start + HALF_HOUR
+        covered = timedelta(0)
         for offset in (-1, 0, 1):
             day = local_day + timedelta(days=offset)
             bounds = _window_bounds(day, window_start, window_end, tz)
-            overlap = min(bounds[1], start + HALF_HOUR) - max(bounds[0], start)
-            frac = max(frac, overlap / HALF_HOUR)
+            overlap = min(bounds[1], end) - max(bounds[0], start)
+            if overlap > timedelta(0):
+                covered += overlap
+        frac = min(covered / HALF_HOUR, 1.0)
         import_rate = tariff.rate_offpeak * frac + tariff.rate_peak * (1.0 - frac)
         return RateEvidence(
             revision_id=revision_id,

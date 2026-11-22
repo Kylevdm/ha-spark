@@ -166,6 +166,26 @@ def test_fixed_daily_window_ends_at_the_first_dst_occurrence(tmp_path, utc_start
     assert rates.exclusions == ()
 
 
+@pytest.mark.parametrize(("window_start", "window_end", "expected"), [
+    ("00:15", "00:15", 0.10),  # Equal endpoints are a 24 h window: wholly off-peak.
+    ("00:20", "00:10", 0.20),  # Both window edges fall inside the slot; both halves count.
+])
+def test_fixed_daily_slot_overlapping_two_window_instances(
+    tmp_path, window_start, window_end, expected,
+):
+    """A slot straddling two daily window instances blends over their union."""
+    settings = settings_for(
+        tmp_path, tariff_provider="fixed", timezone="Europe/London",
+        charge_window_start=window_start, charge_window_end=window_end,
+        rate_offpeak_gbp_kwh=0.10, rate_peak_gbp_kwh=0.40, rate_export_gbp_kwh=0.02,
+    )
+    start = datetime.fromisoformat("2026-11-20 00:00").replace(tzinfo=UTC)
+    rates = capture_rates(settings, start + HALF_HOUR, daily_revision())
+    assert rates.import_rate == pytest.approx(expected)
+    assert rates.export_rate == 0.02
+    assert rates.exclusions == ()
+
+
 @pytest.mark.parametrize(("value", "when", "unit", "reason"), [
     ("9", CLOSE, "kWh", "counter_reset"),
     ("nan", CLOSE, "kWh", "not_finite"),
@@ -444,6 +464,22 @@ def test_statistics_modules_have_no_write_path(name):
         assert not any(module.split(".")[-1] == "call_service" for module in imports)
         assert not (isinstance(node, ast.Attribute) and node.attr == "call_service")
         assert not (isinstance(node, ast.Name) and node.id == "call_service")
+
+
+def test_fixed_daily_rates_reuse_the_shared_hhmm_parser():
+    """No second window parser: the ledger imports horizon's, never sources'."""
+    horizon_names: set[str] = set()
+    for node in ast.walk(ast.parse(Path(energy_ledger.__file__).read_text())):
+        if isinstance(node, ast.ImportFrom):
+            assert node.module != "ha_spark.energy.sources"
+            if node.module == "ha_spark.energy.horizon":
+                horizon_names.update(alias.name for alias in node.names)
+        else:
+            assert not (
+                isinstance(node, ast.Import)
+                and any(alias.name == "ha_spark.energy.sources" for alias in node.names)
+            )
+    assert "parse_time" in horizon_names
 
 
 def test_revision_stamped_after_boundary_still_prices_the_slot_its_horizon_covers(tmp_path):
