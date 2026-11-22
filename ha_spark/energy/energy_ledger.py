@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
@@ -550,6 +550,72 @@ class EnergyLedger:
             )
             await db.commit()
 
+    async def _sweep(self, start: datetime, end: datetime, bound_kw: float) -> set[datetime]:
+        """Retire implausible stored flows as rejected gaps; changed slot starts.
+
+        One transaction: rows that pass keep their byte-identical payload, and
+        captured rates and session evidence are never touched. A bad payload
+        degrades to an untouched row, never an aborted sweep.
+        """
+        if not await asyncio.to_thread(Path(self.db_path).exists):
+            return set()
+        path = await asyncio.to_thread(Path(self.db_path).resolve)
+        async with aiosqlite.connect(path.as_uri() + "?mode=rw", uri=True) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'energy_ledger_slots'",
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return set()
+            async with db.execute(
+                "SELECT slot_start, payload FROM energy_ledger_slots "
+                "WHERE slot_start >= ? AND slot_start < ? ORDER BY slot_start",
+                (start.astimezone(UTC).isoformat(), end.astimezone(UTC).isoformat()),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+            def recheck() -> tuple[list[tuple[str, str]], set[datetime], int]:
+                updates: list[tuple[str, str]] = []
+                changed: set[datetime] = set()
+                rejected = 0
+                for key, payload in rows:
+                    try:
+                        row = LedgerSlot.model_validate_json(payload)
+                        # Every stored share covers half an hour, whether a
+                        # boundary tick, a statistics fill or an hourly
+                        # backfill wrote it: one bound for all of them.
+                        flows = {
+                            name: (ComponentFlow(reason="rejected")
+                                   if flow.kwh is not None and not plausible(
+                                       flow.kwh, HALF_HOUR.total_seconds(), bound_kw)
+                                   else flow)
+                            for name, flow in row.components.items()
+                        }
+                        if flows == row.components:
+                            continue
+                        rejected += 1
+                        house, base, clamped = _derive_loads(flows)
+                        updated = row.model_copy(update={
+                            "components": flows, "house_load_kwh": house,
+                            "base_load_kwh": base, "negative_clamped": clamped,
+                        })
+                        updates.append((updated.model_dump_json(), key))
+                        changed.add(row.slot_start)
+                    except (ValueError, KeyError):
+                        continue
+                return updates, changed, rejected
+
+            updates, changed, rejected = await asyncio.to_thread(recheck)
+            if updates:
+                await db.executemany(
+                    "UPDATE energy_ledger_slots SET payload = ? WHERE slot_start = ?",
+                    updates,
+                )
+            await db.commit()
+        if rejected:
+            log.warning("Energy ledger sweep rejected %d implausible intervals", rejected)
+        return changed
+
     async def _fill_day(
         self, settings: Settings, start: datetime, end: datetime,
         configured: dict[str, ComponentSpec],
@@ -684,10 +750,39 @@ async def _partly_filled_runs(
 # None marks a completed day; failed days carry their next attempt time.
 _fill_attempts: dict[tuple[str, datetime], datetime | None] = {}
 
+# The daily sweep re-checks one stored week: a bound tightened since a slot was
+# written, or an older release without the rule, must not keep a spike in it.
+SWEEP_DAYS = 7
+# In memory only: a restart sweeps again, which changes nothing.
+_swept_days: dict[str, date] = {}
+
+
+async def sweep_closed_days(settings: Settings, now: datetime) -> None:
+    """Re-check the last stored week against the plausibility rule, as background work only."""
+    try:
+        tz = load_timezone(settings.timezone)
+        today = now.astimezone(tz).date()
+        if _swept_days.get(settings.db_path) == today:
+            return
+        # The last seven closed local days; this run's fills then retry any
+        # day the pass below turned into gaps.
+        start, _ = day_bounds(today - timedelta(days=SWEEP_DAYS), settings.timezone)
+        _, end = day_bounds(today - timedelta(days=1), settings.timezone)
+        changed = await EnergyLedger(settings.db_path)._sweep(start, end, plausible_kw(settings))
+        _swept_days[settings.db_path] = today
+        for slot in changed:
+            day_start, _ = day_bounds(slot.astimezone(tz).date(), settings.timezone)
+            # A done marker would keep the new gaps from ever being retried.
+            _fill_attempts.pop((settings.db_path, day_start), None)
+    except Exception:
+        log.warning("Energy ledger sweep failed")
+
 
 async def fill_closed_days(settings: Settings, now: datetime) -> None:
     """Reconcile settled days within recorder retention, as background work only."""
     try:
+        # The sweep runs before this call's fills so they retry the new gaps.
+        await sweep_closed_days(settings, now)
         configured = _configured_components(settings)
         if not configured:
             return
