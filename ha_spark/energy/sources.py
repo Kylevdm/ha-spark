@@ -31,6 +31,7 @@ from ha_spark.energy.evidence_freshness import (
 )
 from ha_spark.energy.forecast import load_timezone, predict_home_load
 from ha_spark.energy.horizon import compute_horizon_geometry
+from ha_spark.energy.horizon import parse_time as parse_time  # re-exported for callers
 from ha_spark.energy.models import (
     SLOTS_PER_DAY,
     DispatchSlot,
@@ -335,11 +336,6 @@ def _opt_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-def parse_time(hhmm: str) -> time:
-    h, m = hhmm.split(":")
-    return time(int(h), int(m))
 
 
 def _parse_dispatches(raw: Any) -> tuple[DispatchSlot, ...]:

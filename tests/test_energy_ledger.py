@@ -2,8 +2,9 @@
 
 import ast
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 import respx
@@ -12,6 +13,7 @@ from ha_spark.config import Settings
 from ha_spark.energy import energy_ledger
 from ha_spark.energy.energy_ledger import EnergyLedger, capture_rates
 from ha_spark.energy.models import FlexibilityEvent, FreeSession, PricePoint
+from ha_spark.energy.stats import summarise
 from tests.test_readiness_ledger import START, revision
 
 HALF_HOUR = timedelta(minutes=30)
@@ -62,6 +64,126 @@ async def test_boundary_delta_and_inverted_export_are_write_once(tmp_path):
     assert row.house_load_kwh == 3
     assert not row.negative_clamped
     assert (row.import_rate, row.export_rate, row.revision_id) == (0.1, 0.05, "A")
+
+
+def daily_revision():
+    rev = revision()
+    inputs = replace(rev.run.inputs, load_slots=None, horizon_start=None)
+    schedule = replace(rev.run.schedule, prices=(), cheap_fracs=())
+    return replace(rev, run=replace(rev.run, inputs=inputs, schedule=schedule))
+
+
+@pytest.mark.parametrize(("offset", "window_start", "window_end", "rate"), [
+    (-3, "23:30", "01:00", 0.125),  # Window opens at 23:30 on the household clock.
+    (0, "23:30", "01:00", 0.25),  # After midnight: past the half-open window end.
+    (1, "23:30", "01:00", 0.25),
+    (2, "02:00", "03:00", 0.125),  # A window that doesn't wrap.
+])
+@respx.mock
+async def test_fixed_daily_tariff_prices_closed_slots(
+    tmp_path, offset, window_start, window_end, rate,
+):
+    start = START + offset * HALF_HOUR
+    close = start + HALF_HOUR
+    settings = settings_for(
+        tmp_path, tariff_provider="fixed", timezone="Europe/London",
+        charge_window_start=window_start, charge_window_end=window_end,
+        rate_offpeak_gbp_kwh=0.125, rate_peak_gbp_kwh=0.25, rate_export_gbp_kwh=0.0625,
+        derive_grid_export_entity="sensor.grid_export",
+    )
+    ledger = EnergyLedger(settings.db_path)
+    rev = daily_revision()
+    counter("sensor.grid_import", ("10", start), ("13", close), ("13", close))
+    counter("sensor.grid_export", ("2", start), ("3", close), ("3", close))
+    await ledger.record_boundary(settings, start, capture_rates(settings, start, None))
+    await ledger.record_boundary(settings, close, capture_rates(settings, close, rev))
+    changed = settings.model_copy(update={"rate_export_gbp_kwh": 0.5})
+    await ledger.record_boundary(changed, close, capture_rates(changed, close, rev))
+
+    [row] = await ledger.slots(start, close)
+    assert (row.import_rate, row.export_rate, row.revision_id) == (rate, 0.0625, "A")
+    assert row.exclusions == ()
+    assert row.import_session is row.session_id is None
+    [day] = summarise([row], start, close, ZoneInfo(settings.timezone), "day").buckets
+    assert day.totals.cost_coverage == 1
+    assert day.totals.actual_cost == 3 * rate - 0.0625
+    assert day.totals.no_battery_cost == 2 * rate
+    assert day.totals.battery_savings == 0.0625 - rate
+
+
+@pytest.mark.parametrize("overrides", [
+    {"tariff_provider": "dynamic"},
+    {"tariff_provider": "octopus_intelligent"},
+    {"charge_window_end": "25:00"},
+    {"timezone": "not/a/timezone"},
+    {"timezone": "foo/" * 900 + "x"},  # ZoneInfo raises RecursionError on a pathological key.
+    {"rate_export_gbp_kwh": -0.1},
+    {"rate_peak_gbp_kwh": float("inf")},
+])
+def test_daily_tariff_leaves_non_fixed_or_invalid_rates_unpriced(tmp_path, overrides):
+    settings = settings_for(tmp_path, **({"tariff_provider": "fixed"} | overrides))
+    rates = capture_rates(settings, CLOSE, daily_revision())
+    assert rates.import_rate is rates.export_rate is None
+    assert rates.revision_id == "A"
+    assert rates.exclusions == ("no_tariff_geometry",)
+
+
+@pytest.mark.parametrize(("utc_start", "expected"), [
+    ("2026-11-20 02:00", 0.10),  # Wholly inside the cheap window: off-peak.
+    ("2026-11-20 23:30", 0.25),  # Straddles the 23:45 open: half blended, half peak.
+    ("2026-11-21 05:30", 0.40),  # The slot after the half-open window end: peak.
+])
+def test_fixed_daily_window_blends_straddling_slots(tmp_path, utc_start, expected):
+    """The closed slot's rate is time-weighted over its real window overlap."""
+    settings = settings_for(
+        tmp_path, tariff_provider="fixed", timezone="Europe/London",
+        charge_window_start="23:45", charge_window_end="05:30",
+        rate_offpeak_gbp_kwh=0.10, rate_peak_gbp_kwh=0.40, rate_export_gbp_kwh=0.02,
+    )
+    start = datetime.fromisoformat(utc_start).replace(tzinfo=UTC)
+    rates = capture_rates(settings, start + HALF_HOUR, daily_revision())
+    assert rates.import_rate == pytest.approx(expected)
+    assert rates.export_rate == 0.02
+    assert rates.exclusions == ()
+
+
+@pytest.mark.parametrize(("utc_start", "expected"), [
+    ("2026-10-24 23:00", 0.10),  # 00:00 BST: inside the window that opened at midnight.
+    ("2026-10-25 00:00", 0.10),  # The first 01:00 BST, still before the window end.
+    ("2026-10-25 00:30", 0.40),  # The clock fell back; the window ended at 01:30 BST.
+    ("2026-10-25 01:00", 0.40),  # The repeated 01:00 GMT: past the (fold=0) window end.
+])
+def test_fixed_daily_window_ends_at_the_first_dst_occurrence(tmp_path, utc_start, expected):
+    """On a fall-back night the window ends at its first (fold=0) occurrence."""
+    settings = settings_for(
+        tmp_path, tariff_provider="fixed", timezone="Europe/London",
+        charge_window_start="00:00", charge_window_end="01:30",
+        rate_offpeak_gbp_kwh=0.10, rate_peak_gbp_kwh=0.40, rate_export_gbp_kwh=0.02,
+    )
+    start = datetime.fromisoformat(utc_start).replace(tzinfo=UTC)
+    rates = capture_rates(settings, start + HALF_HOUR, daily_revision())
+    assert rates.import_rate == pytest.approx(expected)
+    assert rates.exclusions == ()
+
+
+@pytest.mark.parametrize(("window_start", "window_end", "expected"), [
+    ("00:15", "00:15", 0.10),  # Equal endpoints are a 24 h window: wholly off-peak.
+    ("00:20", "00:10", 0.20),  # Both window edges fall inside the slot; both halves count.
+])
+def test_fixed_daily_slot_overlapping_two_window_instances(
+    tmp_path, window_start, window_end, expected,
+):
+    """A slot straddling two daily window instances blends over their union."""
+    settings = settings_for(
+        tmp_path, tariff_provider="fixed", timezone="Europe/London",
+        charge_window_start=window_start, charge_window_end=window_end,
+        rate_offpeak_gbp_kwh=0.10, rate_peak_gbp_kwh=0.40, rate_export_gbp_kwh=0.02,
+    )
+    start = datetime.fromisoformat("2026-11-20 00:00").replace(tzinfo=UTC)
+    rates = capture_rates(settings, start + HALF_HOUR, daily_revision())
+    assert rates.import_rate == pytest.approx(expected)
+    assert rates.export_rate == 0.02
+    assert rates.exclusions == ()
 
 
 @pytest.mark.parametrize(("value", "when", "unit", "reason"), [
@@ -342,6 +464,22 @@ def test_statistics_modules_have_no_write_path(name):
         assert not any(module.split(".")[-1] == "call_service" for module in imports)
         assert not (isinstance(node, ast.Attribute) and node.attr == "call_service")
         assert not (isinstance(node, ast.Name) and node.id == "call_service")
+
+
+def test_fixed_daily_rates_reuse_the_shared_hhmm_parser():
+    """No second window parser: the ledger imports horizon's, never sources'."""
+    horizon_names: set[str] = set()
+    for node in ast.walk(ast.parse(Path(energy_ledger.__file__).read_text())):
+        if isinstance(node, ast.ImportFrom):
+            assert node.module != "ha_spark.energy.sources"
+            if node.module == "ha_spark.energy.horizon":
+                horizon_names.update(alias.name for alias in node.names)
+        else:
+            assert not (
+                isinstance(node, ast.Import)
+                and any(alias.name == "ha_spark.energy.sources" for alias in node.names)
+            )
+    assert "parse_time" in horizon_names
 
 
 def test_revision_stamped_after_boundary_still_prices_the_slot_its_horizon_covers(tmp_path):

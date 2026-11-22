@@ -14,6 +14,8 @@ exist on a DST day (the spring-forward gap) resolves forward, and an ambiguous
 one (the fall-back repeat) takes its first occurrence — both are PEP 495
 ``fold=0`` semantics. ``tariff._in_overnight_window`` keeps its own legacy
 (end-inclusive) clock-membership rule for non-geometry callers.
+``parse_time`` is the one ``HH:MM`` parser for validated config values,
+shared by the fixed tariff provider and the energy ledger.
 
 :func:`legacy_geometry` reproduces today's 48-slot layout for hand-built
 inputs (``horizon_start`` at a window start, no geometry): the window covers
@@ -60,6 +62,12 @@ class HorizonGeometry:
     # Local date on which the running-or-next window ends: the day the charge
     # serves (its load forecast is the plan's day).
     served_day: date
+
+
+def parse_time(hhmm: str) -> time:
+    """Parse a validated ``HH:MM`` config value (``FixedTariffConfig`` has checked the shape)."""
+    h, m = hhmm.split(":")
+    return time(int(h), int(m))
 
 
 def _at(day: date, t: time, tz: ZoneInfo) -> datetime:
