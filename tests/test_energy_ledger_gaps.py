@@ -200,11 +200,38 @@ async def test_boundary_committed_during_statistics_read_keeps_precedence(tmp_pa
     assert row.import_rate == RATES.import_rate
 
 
+async def test_implausible_five_minute_row_rejects_its_half_hour(
+    tmp_path, monkeypatch, caplog,
+):
+    # A counter reset's recovery is one five-minute row the size of the
+    # lifetime reading: the half-hour becomes a rejected gap, never a
+    # partially summed value.
+    settings = settings_for(tmp_path, timezone="UTC")
+    spike = five_minutes(START, count=5, change="1000") + [
+        {"start": (START + timedelta(minutes=25)).timestamp() * 1000, "change": "27800"},
+    ]
+    rows = spike + five_minutes(START + HALF_HOUR, change="1000")
+    fake_recorder(
+        monkeypatch, {"sensor.grid_import": "Wh"},
+        lambda entity, start: rows if start == START else [],
+    )
+    await energy_ledger.fill_closed_days(settings, SETTLED)
+    first, second = await EnergyLedger(settings.db_path).slots(START, END)
+    flow = first.components["grid_import"]
+    assert (flow.kwh, flow.provenance, flow.reason) == (None, "absent", "rejected")
+    assert first.house_load_kwh is None
+    assert (second.components["grid_import"].kwh,
+            second.components["grid_import"].provenance) == (6, "statistics_fill")
+    assert caplog.messages == ["Energy ledger rejected an implausible interval"]
+    assert "27800" not in caplog.text
+
+
 @pytest.mark.parametrize("complete", [True, False])
 async def test_failed_day_read_retries_only_within_retention(
     tmp_path, monkeypatch, caplog, complete,
 ):
-    settings = settings_for(tmp_path, timezone="UTC")
+    # 12 kWh in one half-hour needs a 30 kW site bound to stay plausible data.
+    settings = settings_for(tmp_path, timezone="UTC", supply_max_current_a=100)
     ledger = EnergyLedger(settings.db_path)
     fail = True
 

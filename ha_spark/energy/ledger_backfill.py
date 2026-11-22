@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from ha_spark.config import Settings
 from ha_spark.energy.derived_base_load import ComponentSpec, derive_specs_from_settings
 from ha_spark.energy.energy_ledger import ComponentFlow, EnergyLedger
-from ha_spark.energy.onboarding import POWER_FACTORS, SUPPORTED_UNITS, statistic_unit
+from ha_spark.energy.forecast import load_timezone
+from ha_spark.energy.onboarding import (
+    ENERGY_FACTORS,
+    POWER_FACTORS,
+    SUPPORTED_UNITS,
+    statistic_unit,
+)
+from ha_spark.energy.plausibility import plausible, plausible_kw
+from ha_spark.energy.readiness_ledger import slot_start
 from ha_spark.energy.readiness_measurements import COMPONENTS, measurement_series
 from ha_spark.energy.session_allowance import _opt_float
 from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
@@ -21,11 +29,15 @@ BACKFILL_DAYS = 400
 
 def _hourly_series(
     rows: Sequence[object], unit: str, invert: bool,
-    start: datetime, cutoff: datetime, timezone: str,
+    start: datetime, cutoff: datetime, timezone: str, bound_kw: float,
 ) -> dict[datetime, ComponentFlow]:
     lower, upper = start.timestamp() * 1000, cutoff.timestamp() * 1000
-    key = "mean" if unit in POWER_FACTORS else "change"
+    power = unit in POWER_FACTORS
+    key = "mean" if power else "change"
+    factor = (POWER_FACTORS if power else ENERGY_FACTORS)[unit] * (-1 if invert else 1)
+    tz = load_timezone(timezone)
     hours: list[dict[str, object]] = []
+    rejected: set[datetime] = set()
     for row in rows:
         if not isinstance(row, dict) or isinstance(row.get(key), bool):
             continue
@@ -34,14 +46,24 @@ def _hourly_series(
         except OverflowError:
             continue
         # Validate before spreading: a negative hour must not blend into a valid slot.
-        if (instant is not None and lower <= instant < upper and instant % 3_600_000 == 0
+        if not (instant is not None and lower <= instant < upper and instant % 3_600_000 == 0
                 and value is not None and (-value if invert else value) >= 0):
-            hours.append({"start": instant, key: value})
-    return {
+            continue
+        if not plausible(value * factor, 3600.0, bound_kw):
+            # A rejected hour is never spread: every half-hour it touches
+            # becomes a gap, not a partial share of the spike.
+            hour = datetime.fromtimestamp(instant / 1000, UTC)
+            ticks = {slot_start((hour + timedelta(minutes=5 * i)).astimezone(tz))
+                     for i in range(12)}
+            rejected.update(slot for slot in ticks if start <= slot < cutoff)
+            continue
+        hours.append({"start": instant, key: value})
+    spread = {
         slot: ComponentFlow(kwh=measurement.kwh, provenance="hourly_backfill")
         for slot, measurement in measurement_series([], hours, unit, invert, timezone).items()
         if start <= slot < cutoff and measurement.provenance == "hourly_spread"
     }
+    return spread | {slot: ComponentFlow(reason="rejected") for slot in rejected}
 
 
 async def backfill_energy_ledger(settings: Settings) -> bool:
@@ -54,6 +76,7 @@ async def backfill_energy_ledger(settings: Settings) -> bool:
         cutoff = await ledger.first_recorder_slot()
         if cutoff is None:
             return False
+        bound_kw = plausible_kw(settings)
         specs["v2l"] = ComponentSpec(settings.v2l_power_entity)
         start = cutoff - timedelta(days=BACKFILL_DAYS)
         url, token, timeout = settings.ha_websocket_url, settings.auth_token, settings.ha_timeout
@@ -81,7 +104,8 @@ async def backfill_energy_ledger(settings: Settings) -> bool:
                         end_time=cutoff,
                     )
                     series[name] = await asyncio.to_thread(
-                        _hourly_series, rows, unit, spec.invert, start, cutoff, settings.timezone,
+                        _hourly_series, rows, unit, spec.invert, start, cutoff,
+                        settings.timezone, bound_kw,
                     )
             missing[name] = ComponentFlow(reason=reason)
 
@@ -89,6 +113,8 @@ async def backfill_energy_ledger(settings: Settings) -> bool:
             slot: {name: series[name].get(slot, missing[name]) for name in COMPONENTS}
             for slot in series["grid_import"]
         }
+        if any(flow.reason == "rejected" for slots in series.values() for flow in slots.values()):
+            log.warning("Energy ledger rejected an implausible interval")
         await ledger.record_hourly_backfill(flows)
         return True
     except Exception:
