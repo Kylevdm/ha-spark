@@ -2577,7 +2577,8 @@ async def _run_paired(
                         await clock_sync.run(settings, rest, now)
                 except Exception:
                     log.exception("Clock-change sync failed; will retry next tick")
-            if not native and settings.v2l_power_entity:
+            # Read, tally and notify only (no hardware), so it runs on native sites too.
+            if settings.v2l_power_entity:
                 try:
                     await run_v2l_tick(settings, now)
                 except Exception:

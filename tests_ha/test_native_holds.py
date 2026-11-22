@@ -692,3 +692,60 @@ async def test_resume_into_protect_records_no_window(
         TransitionRequest(target="resume"), now=datetime.now(UTC), zone=ZoneInfo("UTC"))
     assert decision.state is not None and decision.state.committed_mode == "protect"
     assert inverter.id not in c.writes.verified_windows
+
+
+async def test_resume_from_handed_over_session_reasserts_hold_on_next_tick(
+    held_site: SparkCoordinator, native_transport: FakeSolisDevice, freezer: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#768: a dispatch with the car drawing, a no-protection session, then resume."""
+    from custom_components.ha_spark import native_write
+    async def sleep(seconds: float) -> None:
+        pass
+    monkeypatch.setattr(native_write, "verify_sleep", sleep)
+    c = held_site
+    c.control.grace_until = datetime.now(UTC)
+    state = c.authority.state
+    assert state is not None
+    await c.authority.async_save(state.model_copy(update={"committed_mode": "optimise"}))
+    _dispatch_site(c, datetime.now(UTC))
+    c.hass.states.async_set("sensor.ev", "charging")
+    await tick(c)
+    assert native_transport.holding[43007] == 222
+    zone = ZoneInfo("UTC")
+    manual = await c.control.async_request(TransitionRequest(
+        target="manual", keep_protection=False), now=datetime.now(UTC), zone=zone)
+    assert manual.refusal is None
+    assert native_transport.holding[43007] == 190
+    freezer.tick(timedelta(seconds=30))
+    c.hass.states.async_set("sensor.ev", "charging", force_update=True)
+    c.hass.states.async_set("binary_sensor.dispatch", "on", {"planned_dispatches": [{
+        "start": (datetime.now(UTC) - timedelta(seconds=30)).isoformat(),
+        "end": (datetime.now(UTC) + timedelta(minutes=30)).isoformat()}]}, force_update=True)
+    resumed = await c.control.async_request(
+        TransitionRequest(target="resume"), now=datetime.now(UTC), zone=zone)
+    assert resumed.state is not None and resumed.state.transition is not None
+    # No fresh plan yet: activation is still open, but protection does not wait for it.
+    await tick(c)
+    assert native_transport.holding[43007] == 222
+    state = c.authority.state
+    assert state is not None and {h.cause for h in state.holds} == {"ev", "dispatch"}
+
+
+@pytest.mark.parametrize("override", [False, True])
+async def test_manual_session_snapshot_matches_the_addon_contract(
+    held_site: SparkCoordinator, aioclient_mock: AiohttpClientMocker, override: bool,
+) -> None:
+    """#768: every manual-session key the integration sends is in the add-on's golden."""
+    from tests_ha.test_polling import fixture
+    c = held_site
+    state = c.authority.state
+    assert state is not None
+    await c.authority.async_save(state.model_copy(update={
+        "committed_mode": "optimise", "manual_session": ManualSession(
+            return_to="optimise", keep_protection=False, override_soc_trust=override)}))
+    await c.async_refresh()
+    sent = aioclient_mock.mock_calls[-1][2]["authority"]["manual_session"]
+    golden = fixture("site_snapshot_v4_max")["authority"]["manual_session"]
+    assert set(sent) == set(golden)
+    assert sent["override_soc_trust"] is override

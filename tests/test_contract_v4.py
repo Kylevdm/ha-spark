@@ -348,6 +348,25 @@ def test_max_v4_fits_and_is_accepted(client, state):
     assert client.post("/integration/heartbeat", content=b" " * (64 * 1024 + 1)).status_code == 400
 
 
+@pytest.mark.usefixtures("retired_addon")
+@pytest.mark.parametrize("override", [False, True])
+def test_manual_session_soc_override_is_accepted(client, state, override):
+    # #768: the integration sends the #766 field in every manual session;
+    # refusing it lost the link for the whole session.
+    body = fixture("site_snapshot_v4_max")
+    body["authority"]["manual_session"].update(keep_protection=False,
+                                               override_soc_trust=override)
+    assert post(client, body).status_code == 200
+    manual = state.integration_link.v4.authority.manual_session
+    assert manual.override_soc_trust is override
+
+
+def test_manual_session_override_is_strict(client):
+    body = fixture("site_snapshot_v4_max")
+    body["authority"]["manual_session"]["override_soc_trust"] = "true"
+    assert post(client, body).status_code == 400
+
+
 @pytest.mark.parametrize("bad_time", [0, True, "2026-10-24T12:00:00",
                                       "0001-01-01T00:00:00+14:00"])
 def test_invalid_native_timestamp_rejects(client, bad_time):

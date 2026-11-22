@@ -330,3 +330,64 @@ async def test_failed_day_read_retries_only_within_retention(
         assert row.house_load_kwh == row.base_load_kwh == 12
     else:
         assert rows == []
+
+
+@respx.mock
+async def test_boundary_after_a_fill_replaces_it_and_keeps_its_reading(tmp_path, monkeypatch):
+    # The fill reached the slot before its boundary did: the boundary value
+    # replaces the fill, and its counter reading still becomes the next
+    # baseline, so the following slot is a one-slot boundary delta.
+    settings = settings_for(tmp_path, timezone="UTC")
+    ledger = EnergyLedger(settings.db_path)
+    tick = CLOSE + HALF_HOUR
+    counter("sensor.grid_import", ("10", START), ("13", CLOSE), ("15", tick))
+    await ledger.record_boundary(settings, START, RATES)
+    fake_recorder(
+        monkeypatch, {"sensor.grid_import": "Wh"},
+        lambda entity, start: five_minutes(START, change="400") if start == START else [],
+    )
+    await energy_ledger.fill_closed_days(settings, SETTLED)
+    for boundary in (CLOSE, tick):
+        await ledger.record_boundary(settings, boundary, RATES)
+    first, second = await ledger.slots(START, tick)
+    assert (first.components["grid_import"].kwh,
+            first.components["grid_import"].provenance) == (3, "boundary")
+    assert first.house_load_kwh == 3
+    # The boundary's captured rates make the replaced slot priceable again.
+    assert (first.import_rate, first.export_rate, first.revision_id) == (0.2, 0.05, "A")
+    assert first.exclusions == ()
+    assert (second.components["grid_import"].kwh,
+            second.components["grid_import"].provenance) == (2, "boundary")
+
+
+@pytest.mark.parametrize(("reading", "third_flow"), [
+    ("16", (1.5, "distributed", None)),
+    ("14", (None, "absent", "rejected")),
+])
+@respx.mock
+async def test_a_gap_closing_after_a_fill_spreads_only_the_unfilled_energy(
+    tmp_path, monkeypatch, reading, third_flow,
+):
+    # A fill covered two slots of a still-open three-slot gap with 4.5 kWh: the
+    # closing boundary spreads only what is left of the counter delta, and a
+    # delta smaller than the fill already stored rejects the rest of the run.
+    settings = settings_for(tmp_path, timezone="UTC")
+    ledger = EnergyLedger(settings.db_path)
+    third = CLOSE + HALF_HOUR
+    tick = third + HALF_HOUR
+    counter("sensor.grid_import", ("10", START), (reading, tick))
+    await ledger.record_boundary(settings, START, RATES)
+    rows = five_minutes(START, change="0.5") + five_minutes(CLOSE, change="0.25")
+    fake_recorder(
+        monkeypatch, {"sensor.grid_import": "kWh"},
+        lambda entity, start: rows if start == START else [],
+    )
+    await energy_ledger.fill_closed_days(settings, SETTLED)
+    await ledger.record_boundary(settings, tick, RATES)
+    first, second, last = await ledger.slots(START, tick)
+    assert (first.components["grid_import"].kwh,
+            first.components["grid_import"].provenance) == (3, "statistics_fill")
+    assert (second.components["grid_import"].kwh,
+            second.components["grid_import"].provenance) == (1.5, "statistics_fill")
+    flow = last.components["grid_import"]
+    assert (flow.kwh, flow.provenance, flow.reason) == third_flow

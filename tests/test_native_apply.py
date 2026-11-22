@@ -268,7 +268,8 @@ async def test_daemon_replans_stale_authority_once_on_next_tick(tmp_path, monkey
     from tests.test_scheduler import _patch_loop, _plan_at
 
     settings = Settings(ha_url="http://ha.test", ha_token="test", db_path=str(tmp_path / "db"),
-                        grid_power_entity="sensor.grid", inverter_clock_dst_sync=True)
+                        grid_power_entity="sensor.grid", inverter_clock_dst_sync=True,
+                        v2l_power_entity="sensor.v2l")
     store = AuthorityStore(settings)
     store.initialise()
     assert store.handover("pending_integration") == "retired"
@@ -309,6 +310,8 @@ async def test_daemon_replans_stale_authority_once_on_next_tick(tmp_path, monkey
     for name in ("_record_forecast", "_record_solar_forecasts", "_run_derived_rerive",
                  "sample_signals", "record_slot", "readiness_tick"):
         monkeypatch.setattr(scheduler, name, AsyncMock())
+    v2l_tick = AsyncMock()  # read, tally and notify only: runs on native sites too (#763)
+    monkeypatch.setattr(scheduler, "run_v2l_tick", v2l_tick)
     forbidden = {}
     for name in ("soc_monitor_tick", "guard_tick", "reconcile_tick"):
         forbidden[name] = AsyncMock(side_effect=AssertionError("legacy I/O"))
@@ -322,6 +325,7 @@ async def test_daemon_replans_stale_authority_once_on_next_tick(tmp_path, monkey
         execution_context().planned_epoch.set(None)
         execution_context().planned_generation.set(None)
     assert epochs == [7, 8]
+    v2l_tick.assert_awaited()
     for method in forbidden.values():
         method.assert_not_awaited()
 

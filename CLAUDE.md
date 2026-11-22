@@ -57,7 +57,8 @@ security and prefer the safe default. Hard rules:
     write-time `WriteGate.recheck` (`devices/execution.py`).
   - *Integration-owned sites:* the add-on's store carries the retirement
     marker, `WriteGate` refuses every direct write, and the daemon's supply
-    guard, hold reconcile, SoC monitor, clock sync and V2L do nothing. The
+    guard, hold reconcile, SoC monitor and clock sync do nothing (the V2L
+    tick still reads, tallies and notifies; it writes no hardware). The
     add-on writes no hardware itself: a plan reaches devices only as typed
     device intents sent as `apply` commands stamped with the plan epoch, and
     owner requests travel the same command channel. The integration's authority store (`authority_store.py`) is the

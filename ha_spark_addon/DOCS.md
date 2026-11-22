@@ -84,7 +84,8 @@ legacy overlay or another Modbus client.
 On an integration-owned site the integration's authority store is the write
 gate. The add-on sends typed device intents with the authority epoch; it never
 writes hardware directly. Its own supply guard, hold reconcile, SoC monitor,
-clock sync and V2L actuation do not run for that site. Native charge writes,
+and clock sync do not run for that site. The V2L tally and notifications still
+run; they write no hardware. Native charge writes,
 including fallback and guard changes, share the same limit checks and exact
 read-back. A read-only device prevents entry to Protect or Optimise. Optimise
 also needs a live add-on session, trusted and recovered SoC, and valid fallback.

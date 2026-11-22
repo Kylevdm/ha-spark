@@ -291,6 +291,7 @@ def _configured_components(settings: Settings) -> dict[str, ComponentSpec]:
 async def _merge_slot(
     db: aiosqlite.Connection, start: datetime, changes: dict[str, ComponentFlow],
     replace: tuple[Provenance, ...], missing: dict[str, ComponentFlow],
+    rates: RateEvidence | None = None,
 ) -> None:
     # Read inside the caller's write transaction: a concurrently captured
     # boundary value takes precedence over either kind of fill.
@@ -308,10 +309,15 @@ async def _merge_slot(
         return
     components = row.components | updates
     house, base, clamped = _derive_loads(components)
-    updated = row.model_copy(update={
+    update: dict[str, object] = {
         "components": components, "house_load_kwh": house, "base_load_kwh": base,
         "negative_clamped": clamped,
-    })
+    }
+    if rates is not None and "no_rate_capture" in row.exclusions:
+        # A boundary value replaced a fill: its captured rates price the slot,
+        # but never overwrite rates captured earlier.
+        update |= rates.model_dump()
+    updated = row.model_copy(update=update)
     await db.execute(
         "INSERT INTO energy_ledger_slots VALUES (?, ?) "
         "ON CONFLICT(slot_start) DO UPDATE SET payload = excluded.payload",
@@ -395,8 +401,7 @@ class EnergyLedger:
             async with db.execute(
                 "SELECT 1 FROM energy_ledger_slots WHERE slot_start = ?", (start_key,),
             ) as cursor:
-                if await cursor.fetchone() is not None:
-                    return
+                exists = await cursor.fetchone() is not None
             distributed: dict[datetime, dict[str, ComponentFlow]] = {}
             rejected = False
             for name, (entity_id, invert, kwh) in readings.items():
@@ -432,14 +437,46 @@ class EnergyLedger:
                 slots = (boundary - instant) // HALF_HOUR
                 if slots == 1:
                     flows[name] = ComponentFlow(kwh=delta, provenance="boundary")
-                else:
+                    continue
+                # A fill may already hold part of this still-open run: spread
+                # only the rest of the delta over the slots it left open.
+                filled, unfilled = 0.0, []
+                at = instant
+                while at <= start:
+                    async with db.execute(
+                        "SELECT payload FROM energy_ledger_slots WHERE slot_start = ?",
+                        (at.isoformat(),),
+                    ) as cursor:
+                        stored = await cursor.fetchone()
+                    kwh_stored = (LedgerSlot.model_validate_json(stored[0]).components[name].kwh
+                                  if stored is not None else None)
+                    if kwh_stored is None:
+                        unfilled.append(at)
+                    else:
+                        filled += kwh_stored
+                    at += HALF_HOUR
+                remainder = delta - filled
+                if remainder < 0 and not math.isclose(delta, filled):
+                    rejected = True
+                    flows[name] = ComponentFlow(reason="rejected")
+                    while instant < start:
+                        distributed.setdefault(instant, {})[name] = ComponentFlow(
+                            reason="rejected",
+                        )
+                        instant += HALF_HOUR
+                    continue
+                flows[name] = ComponentFlow(reason="missed_boundary")
+                if unfilled:
                     # Keep any captured rates for a later statistics fill;
                     # distributed provenance makes this estimate unpriceable.
-                    flow = ComponentFlow(kwh=delta / slots, provenance="distributed")
-                    flows[name] = flow
-                    while instant < start:
-                        distributed.setdefault(instant, {})[name] = flow
-                        instant += HALF_HOUR
+                    flow = ComponentFlow(
+                        kwh=max(remainder, 0.0) / len(unfilled), provenance="distributed",
+                    )
+                    for at in unfilled:
+                        if at == start:
+                            flows[name] = flow
+                        else:
+                            distributed.setdefault(at, {})[name] = flow
             missing = {
                 name: ComponentFlow(
                     reason="not_configured" if flows[name].reason == "not_configured"
@@ -451,18 +488,35 @@ class EnergyLedger:
                 log.warning("Energy ledger rejected an implausible interval")
             for instant, changes in distributed.items():
                 await _merge_slot(db, instant, changes, ("absent",), missing)
-            house, base, clamped = _derive_loads(flows)
-            row = LedgerSlot(
-                **rates.model_dump(), slot_start=start,
-                components={name: flows[name] for name in COMPONENTS},
-                house_load_kwh=house, base_load_kwh=base, negative_clamped=clamped,
-            )
-            await db.execute(
-                "INSERT INTO energy_ledger_slots VALUES (?, ?) ON CONFLICT(slot_start) DO NOTHING",
-                (start_key, row.model_dump_json()),
-            )
+            if exists:
+                # A fill reached this slot first: the boundary value replaces
+                # a fill or a gap, never another boundary value.
+                merges: tuple[
+                    tuple[Provenance, tuple[Provenance, ...], RateEvidence | None], ...
+                ] = (
+                    ("boundary", ("absent", "statistics_fill"), rates),
+                    ("distributed", ("absent",), None),
+                )
+                for provenance, replace, evidence in merges:
+                    changes = {name: flow for name, flow in flows.items()
+                               if flow.provenance == provenance}
+                    if changes:
+                        await _merge_slot(db, start, changes, replace, missing, evidence)
+            else:
+                house, base, clamped = _derive_loads(flows)
+                row = LedgerSlot(
+                    **rates.model_dump(), slot_start=start,
+                    components={name: flows[name] for name in COMPONENTS},
+                    house_load_kwh=house, base_load_kwh=base, negative_clamped=clamped,
+                )
+                await db.execute(
+                    "INSERT INTO energy_ledger_slots VALUES (?, ?) "
+                    "ON CONFLICT(slot_start) DO NOTHING",
+                    (start_key, row.model_dump_json()),
+                )
             await db.executemany(
-                "INSERT INTO energy_ledger_readings VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO energy_ledger_readings VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(component, boundary) DO NOTHING",
                 [(name, boundary.isoformat(), *reading) for name, reading in readings.items()],
             )
             await db.commit()
