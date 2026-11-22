@@ -310,3 +310,17 @@ closed and point back to this section. Multi-inverter sites, also listed in
   which path (an existing HA integration, a direct CAN/RS485 link, or the
   inverter's BMS pass-through registers), and whether it cross-checks the
   inverter SoC or replaces it. Trigger: none yet.
+
+### Energy statistics resolution (from #755 owner check, 2026-11-22)
+
+- **Half-hourly statistics are whole-kWh when the ledger reads Solis lifetime
+  counters.** The Solis grid import/export and battery charge/discharge total
+  energy sensors step in 1 kWh, and the ledger takes each slot as the counter's
+  change, so slots are 0, 1 or 2 kWh and every total is whole (shown as
+  `151.000 kWh` by `ha_spark/api/static/statistics.js:36`). No ha-spark code
+  rounds. Unsharp: whether to steer owners to finer counters (a smart-meter
+  total at 0.001 kWh for grid, Solis daily counters at 0.1 kWh for the
+  battery), flag a ≥1 kWh-step counter as unfit in onboarding or health, or
+  both; Repair data can then rebuild history from HA long-term statistics.
+  Seen during the 0.42.0 owner check; briefly ticketed as #762 and moved here.
+  Trigger: none yet.
