@@ -431,14 +431,46 @@ class EnergyLedger:
                 slots = (boundary - instant) // HALF_HOUR
                 if slots == 1:
                     flows[name] = ComponentFlow(kwh=delta, provenance="boundary")
-                else:
+                    continue
+                # A fill may already hold part of this still-open run: spread
+                # only the rest of the delta over the slots it left open.
+                filled, unfilled = 0.0, []
+                at = instant
+                while at <= start:
+                    async with db.execute(
+                        "SELECT payload FROM energy_ledger_slots WHERE slot_start = ?",
+                        (at.isoformat(),),
+                    ) as cursor:
+                        stored = await cursor.fetchone()
+                    kwh_stored = (LedgerSlot.model_validate_json(stored[0]).components[name].kwh
+                                  if stored is not None else None)
+                    if kwh_stored is None:
+                        unfilled.append(at)
+                    else:
+                        filled += kwh_stored
+                    at += HALF_HOUR
+                remainder = delta - filled
+                if remainder < 0 and not math.isclose(delta, filled):
+                    rejected = True
+                    flows[name] = ComponentFlow(reason="rejected")
+                    while instant < start:
+                        distributed.setdefault(instant, {})[name] = ComponentFlow(
+                            reason="rejected",
+                        )
+                        instant += HALF_HOUR
+                    continue
+                flows[name] = ComponentFlow(reason="missed_boundary")
+                if unfilled:
                     # Keep any captured rates for a later statistics fill;
                     # distributed provenance makes this estimate unpriceable.
-                    flow = ComponentFlow(kwh=delta / slots, provenance="distributed")
-                    flows[name] = flow
-                    while instant < start:
-                        distributed.setdefault(instant, {})[name] = flow
-                        instant += HALF_HOUR
+                    flow = ComponentFlow(
+                        kwh=max(remainder, 0.0) / len(unfilled), provenance="distributed",
+                    )
+                    for at in unfilled:
+                        if at == start:
+                            flows[name] = flow
+                        else:
+                            distributed.setdefault(at, {})[name] = flow
             missing = {
                 name: ComponentFlow(
                     reason="not_configured" if flows[name].reason == "not_configured"

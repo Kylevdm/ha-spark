@@ -355,3 +355,36 @@ async def test_boundary_after_a_fill_replaces_it_and_keeps_its_reading(tmp_path,
     assert first.house_load_kwh == 3
     assert (second.components["grid_import"].kwh,
             second.components["grid_import"].provenance) == (2, "boundary")
+
+
+@pytest.mark.parametrize(("reading", "third_flow"), [
+    ("16", (1.5, "distributed", None)),
+    ("14", (None, "absent", "rejected")),
+])
+@respx.mock
+async def test_a_gap_closing_after_a_fill_spreads_only_the_unfilled_energy(
+    tmp_path, monkeypatch, reading, third_flow,
+):
+    # A fill covered two slots of a still-open three-slot gap with 4.5 kWh: the
+    # closing boundary spreads only what is left of the counter delta, and a
+    # delta smaller than the fill already stored rejects the rest of the run.
+    settings = settings_for(tmp_path, timezone="UTC")
+    ledger = EnergyLedger(settings.db_path)
+    third = CLOSE + HALF_HOUR
+    tick = third + HALF_HOUR
+    counter("sensor.grid_import", ("10", START), (reading, tick))
+    await ledger.record_boundary(settings, START, RATES)
+    rows = five_minutes(START, change="0.5") + five_minutes(CLOSE, change="0.25")
+    fake_recorder(
+        monkeypatch, {"sensor.grid_import": "kWh"},
+        lambda entity, start: rows if start == START else [],
+    )
+    await energy_ledger.fill_closed_days(settings, SETTLED)
+    await ledger.record_boundary(settings, tick, RATES)
+    first, second, last = await ledger.slots(START, tick)
+    assert (first.components["grid_import"].kwh,
+            first.components["grid_import"].provenance) == (3, "statistics_fill")
+    assert (second.components["grid_import"].kwh,
+            second.components["grid_import"].provenance) == (1.5, "statistics_fill")
+    flow = last.components["grid_import"]
+    assert (flow.kwh, flow.provenance, flow.reason) == third_flow
