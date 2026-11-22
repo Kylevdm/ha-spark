@@ -102,6 +102,13 @@ class NativeChargeBoundary(NativeDatedChargeWrites):
             async with self.coordinator.native.lock:
                 pass
 
+    def _owner_soc_override(self, entity_control: str | None) -> bool:
+        """An owner charge edit in a handed-over manual session that opted out of SoC trust."""
+        state = self.coordinator.authority.state
+        manual = state.manual_session if state is not None else None
+        return (entity_control == "charge" and manual is not None
+                and manual.override_soc_trust and not manual.keep_protection)
+
     def _refusal(self, inverter: Inverter, epoch: int, *,
                  guard_write: bool = False,
                  entity_control: str | None = None,
@@ -710,7 +717,8 @@ class NativeChargeBoundary(NativeDatedChargeWrites):
         target = current_word(current)
         def untrusted() -> bool:
             soc = getattr(self.coordinator, "soc", None)
-            return (not soc_exempt and (target > resident or soc_required)
+            return (not soc_exempt and not self._owner_soc_override(entity_control)
+                    and (target > resident or soc_required)
                     and (soc is None or not soc.increases_allowed(inverter.bank_id)))
 
         if untrusted():

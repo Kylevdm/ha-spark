@@ -28,6 +28,10 @@ start_manual_control:
       default: true
       selector:
         boolean:
+    override_soc_trust:
+      default: false
+      selector:
+        boolean:
 resume_control:
   name: Resume control
   description: End manual control using current conditions, never an old plan.

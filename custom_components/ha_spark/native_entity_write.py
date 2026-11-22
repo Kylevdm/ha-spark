@@ -65,7 +65,8 @@ async def async_entity(boundary: "NativeChargeBoundary", inverter_id: str, contr
                                                                              strict=True))
                             or half[:2] == half[2:] and any(half)):
                         return IntentResult(outcome="refused", reason="invalid_intent")
-                    if control == "charge" and slots.soc_untrusted():
+                    if (control == "charge" and slots.soc_untrusted()
+                            and not boundary._owner_soc_override(control)):
                         return IntentResult(outcome="refused", reason="untrusted_soc")
 
                 if control == "charge" and offset is None:
@@ -131,7 +132,8 @@ async def words(boundary: "NativeChargeBoundary", inverter: Inverter, epoch: int
     reason = boundary._refusal(inverter, epoch, entity_control=control)
     if reason:
         return IntentResult(outcome="refused", reason=reason)
-    if control == "charge" and not boundary.coordinator.soc.increases_allowed(inverter.bank_id):
+    if (control == "charge" and not boundary.coordinator.soc.increases_allowed(inverter.bank_id)
+            and not boundary._owner_soc_override(control)):
         return IntentResult(outcome="refused", reason="untrusted_soc")
     result = await transport.write(address, target, device_id=inverter.gateway_unit_id)
     if not result.ok:

@@ -21,6 +21,7 @@
     "authority_unknown": {"message": "Authority is unknown. Confirm Observe through the repair before writing."},
     "transition_in_progress": {"message": "An authority transition is still in progress."},
     "no_manual_session": {"message": "There is no manual session to resume."},
+    "soc_override_needs_handover": {"message": "Overriding SoC trust needs manual control with Keep protection off."},
     "not_in_active_mode": {"message": "Manual control requires Protect or Optimise and no existing manual session."},
     "invalid_household_zone": {"message": "Configure a valid household time zone before choosing until tomorrow."},
     "not_admin": {"message": "Only a non-system Home Assistant administrator may do that."},
@@ -35,7 +36,8 @@
       "name": "Start manual control", "description": "Temporarily hand over controls to the owner.",
       "fields": {
         "duration": {"name": "Duration", "description": "One hour, next household-clock morning, or until resumed."},
-        "keep_protection": {"name": "Keep protection", "description": "Keep battery-to-car protection during manual control."}
+        "keep_protection": {"name": "Keep protection", "description": "Keep battery-to-car protection during manual control."},
+        "override_soc_trust": {"name": "Override SoC trust", "description": "Allow your own charge edits while battery SoC is untrusted. Needs Keep protection off; the battery's own limits still apply."}
       }
     },
     "resume_control": {"name": "Resume control", "description": "End manual control using current conditions."},

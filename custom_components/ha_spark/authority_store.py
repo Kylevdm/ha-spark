@@ -87,6 +87,9 @@ class ManualSession(Record):
     deadline: AwareDatetime | None = None
     return_to: Literal["protect", "optimise"]
     keep_protection: bool = Field(default=True, strict=True)
+    # Owner opt-in (#766): owner charge edits skip the SoC-trust check. Needs
+    # keep_protection off; plan, fallback and dated writes still need trusted SoC.
+    override_soc_trust: bool = Field(default=False, strict=True)
 
     @model_validator(mode="after")
     def validate_utc(self) -> Self:

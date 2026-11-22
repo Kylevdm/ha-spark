@@ -375,3 +375,38 @@ async def test_entity_classes_raise_on_refusal_and_failure(
         await NativeCurrent(c, inverter, False).async_set_native_value(20)
     assert not isinstance(raised.value, ServiceValidationError)
     assert [t.address for t in native_transport.traffic if t.op == "write"] == [43141]
+
+
+# --- #766: owner SoC-trust override -----------------------------------------
+
+@pytest.mark.parametrize(("keep", "override", "allowed"), [
+    (False, False, False),
+    (True, True, False),
+    (False, True, True),
+])
+async def test_soc_override_lets_only_a_handed_over_owner_raise_charging(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice,
+    monkeypatch: pytest.MonkeyPatch, keep: bool, override: bool, allowed: bool,
+) -> None:
+    """Untrusted SoC refuses owner charge edits unless the session opted out with protection off."""
+    await mode(writer, "manual", keep)
+    c = writer
+    state = c.authority.state
+    assert state is not None and state.manual_session is not None
+    assert await c.authority.async_save(state.model_copy(update={
+        "manual_session": state.manual_session.model_copy(
+            update={"override_soc_trust": override})}))
+    monkeypatch.setattr(c.soc, "increases_allowed", lambda bank: False)
+    native_transport.set_holding(43141, [0])
+    native_transport.set_holding(43143, [23, 30, 5, 30, 0, 0, 0, 0])
+
+    current = await _async_entity(c, "charge", 15)
+    window = await _async_entity(c, "charge", [22, 15], offset=0)
+    if allowed:
+        assert (current.outcome, window.outcome) == ("applied", "applied")
+        assert native_transport.holding[43141] == 150
+        assert native_transport.holding[43143] == 22
+    else:
+        assert (current.reason, window.reason) == ("untrusted_soc", "untrusted_soc")
+        assert native_transport.holding[43141] == 0
+        assert native_transport.holding[43143] == 23

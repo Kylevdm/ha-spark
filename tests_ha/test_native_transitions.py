@@ -98,3 +98,14 @@ def test_in_progress_only_observe_or_manual_may_supersede() -> None:
     stale = propose_transition(active, TransitionRequest(target="observe", expected_epoch=2),
                                Preconditions(), now=NOW)
     assert stale.state is None and stale.refusal == "stale_epoch"
+
+
+def test_soc_override_needs_protection_handed_over() -> None:
+    refused = propose_transition(state("optimise"), TransitionRequest(
+        target="manual", override_soc_trust=True), Preconditions(), now=NOW)
+    assert refused.refusal == "soc_override_needs_handover"
+    granted = propose_transition(state("optimise"), TransitionRequest(
+        target="manual", keep_protection=False, override_soc_trust=True),
+        Preconditions(), now=NOW).state
+    assert granted is not None and granted.manual_session is not None
+    assert granted.manual_session.override_soc_trust
