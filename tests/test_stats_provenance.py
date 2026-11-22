@@ -30,6 +30,55 @@ def test_statistics_fill_counts_toward_energy_coverage_and_provenance_totals():
     assert counts == {"statistics_fill": 1, "distributed": 1, "absent": 1, "boundary": 1, "gap": 1}
 
 
+def test_rejected_gaps_count_by_their_own_reason():
+    start = datetime(2026, 11, 19, tzinfo=UTC)
+    step = timedelta(minutes=30)
+    rows = [
+        LedgerSlot(slot_start=start, components={
+            "grid_import": ComponentFlow(reason="rejected"),
+        }),
+        LedgerSlot(slot_start=start + step, components={
+            "grid_import": ComponentFlow(kwh=1, provenance="boundary"),
+        }),
+    ]
+    result = compute_stats(rows, start, start + 2 * step, UTC)
+    assert stats.provenance_counts(result) == {"rejected": 1, "boundary": 1}
+
+
+def test_rejected_slots_count_any_component_once():
+    # A rejected solar half-hour is a rejected interval even when grid import
+    # has a valid boundary reading: the coverage line counts the whole ledger.
+    start = datetime(2026, 11, 19, tzinfo=UTC)
+    step = timedelta(minutes=30)
+    rows = [
+        LedgerSlot(slot_start=start, components={
+            "grid_import": ComponentFlow(kwh=1, provenance="boundary"),
+            "solar_generation": ComponentFlow(reason="rejected"),
+        }),
+        LedgerSlot(slot_start=start + step, components={
+            "grid_import": ComponentFlow(kwh=1, provenance="boundary"),
+            "solar_generation": ComponentFlow(kwh=1, provenance="boundary"),
+        }),
+        LedgerSlot(slot_start=start + 2 * step, components={
+            "grid_import": ComponentFlow(reason="rejected"),
+            "solar_generation": ComponentFlow(reason="rejected"),
+        }),
+    ]
+    result = compute_stats(rows, start, start + 3 * step, UTC)
+    assert stats.rejected_slots(result) == 2  # the third half-hour counted once
+    assert stats.provenance_counts(result) == {"boundary": 2, "rejected": 1}
+
+
+def test_stats_cli_counts_a_rejected_gap_among_gaps(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "load_settings", lambda **_: Settings(timezone="UTC"))
+    monkeypatch.setattr(EnergyLedger, "slots", AsyncMock(return_value=[LedgerSlot(
+        slot_start=datetime(2026, 10, 20, tzinfo=UTC),
+        components={"grid_import": ComponentFlow(reason="rejected")},
+    )]))
+    assert cli.main(["stats", "--range", "day", "--at", "2026-10-20"]) == 0
+    assert "gaps 48" in capsys.readouterr().out
+
+
 def test_stats_cli_renders_provenance_counts(monkeypatch, capsys):
     monkeypatch.setattr(cli, "load_settings", lambda **_: Settings(timezone="UTC"))
     monkeypatch.setattr(EnergyLedger, "slots", AsyncMock(return_value=[LedgerSlot(

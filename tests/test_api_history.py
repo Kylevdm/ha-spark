@@ -226,6 +226,58 @@ def test_history_omitted_bounds_mean_today_so_far(tmp_path, monkeypatch):
     assert len(upto["buckets"]) == 5
 
 
+def test_history_day_range_serves_hourly_by_default_and_half_hourly_on_request(
+        tmp_path, monkeypatch):
+    frozen = datetime(2026, 1, 12, 12, tzinfo=LONDON)  # winter: the household clock is UTC
+    _frozen_server_clock(monkeypatch, frozen)
+    with owner_client(_state(tmp_path)) as client:
+        default = client.get("/api/history", params={"range": "day"}).json()
+        hourly = client.get("/api/history", params={
+            "range": "day", "resolution": "hour"}).json()
+        half_hourly = client.get("/api/history", params={
+            "range": "day", "resolution": "slot"}).json()
+    assert default["resolution"] == hourly["resolution"] == "hour"
+    assert default["buckets"] == hourly["buckets"]
+    assert [b["start"] for b in default["buckets"]] == [
+        f"2026-01-12T{hour:02d}:00:00+00:00" for hour in range(12)
+    ]
+    assert half_hourly["resolution"] == "slot"
+    assert len(half_hourly["buckets"]) == 24
+    assert half_hourly["buckets"][0]["start"] == "2026-01-12T00:00:00+00:00"
+    assert half_hourly["unavailable"]["solar_measured"] == "plan_view_only"
+    assert default["unavailable"]["solar_forecast"] == "slot_resolution_only"
+
+
+@pytest.mark.parametrize("params", [
+    {"range": "day", "resolution": "day"},
+    {"range": "day", "resolution": "month"},
+    {"range": "day", "resolution": "private"},
+    {"range": "week", "resolution": "hour"},
+    {"range": "year", "resolution": "slot"},
+    {"range": "day", "resolution": "hour", "at": "2026-01-12", "from": "x"},
+    [("range", "day"), ("resolution", "hour"), ("resolution", "slot")],
+])
+def test_history_day_range_rejects_any_other_resolution(tmp_path, monkeypatch, params):
+    _frozen_server_clock(monkeypatch, datetime(2026, 1, 12, 12, tzinfo=LONDON))
+    with owner_client(_state(tmp_path)) as client:
+        response = client.get("/api/history", params=params)
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid history range"}
+
+
+def test_history_day_range_hour_buckets_keep_dst_days_real(tmp_path, monkeypatch):
+    # The fall-back day repeats the 01:00 hour: both occurrences get a bucket.
+    _frozen_server_clock(monkeypatch, datetime(2026, 10, 26, 2, 10, tzinfo=LONDON))
+    with owner_client(_state(tmp_path, timezone=LONDON.key)) as client:
+        body = client.get("/api/history", params={
+            "range": "day", "resolution": "hour", "at": "2026-10-25"}).json()
+    assert body["resolution"] == "hour"
+    starts = [bucket["start"] for bucket in body["buckets"]]
+    assert starts.count("2026-10-25T01:00:00+00:00") == 1
+    assert starts.count("2026-10-25T01:00:00+01:00") == 1
+    assert len(starts) == 25
+
+
 def test_history_repeated_midnight_starts_at_the_first_one(tmp_path, monkeypatch):
     havana = ZoneInfo("America/Havana")
     # 00:40 in the second occurrence of the repeated midnight hour.

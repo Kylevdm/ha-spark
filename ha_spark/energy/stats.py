@@ -346,7 +346,7 @@ def _sum_costs(slots: tuple[SlotCost, ...], axle: AxleSummary = _NO_AXLE) -> Cos
     )
 
 
-Resolution = Literal["slot", "day", "month"]
+Resolution = Literal["slot", "hour", "day", "month"]
 
 
 def _next_month(day: date) -> date:
@@ -406,6 +406,15 @@ class RangeTotals:
     @property
     def cost_coverage(self) -> float:
         return self.priced_slots / self.total_slots if self.total_slots else 0.0
+
+    @property
+    def partial(self) -> bool:
+        """True when a completed slot in the bucket is not covered (a gap or rejection).
+
+        Only fully elapsed half-hours are expected measurements: the open slot
+        at a period's edge is usage so far, not a missing measurement.
+        """
+        return self.covered_slots < self.total_slots
 
 
 @dataclass(frozen=True)
@@ -484,21 +493,34 @@ def summarise(
     else:
         cursor, left = start, 0
         while cursor < end:
-            day = cursor.astimezone(tz).date()
-            if resolution == "month":
-                day = day.replace(day=1)
-            label = datetime.combine(day, time.min, tz)
-            next_day = day + timedelta(days=1) if resolution == "day" else _next_month(day)
-            stop = datetime.combine(next_day, time.min, tz).astimezone(UTC)
-            if stop <= cursor:
-                # A rollback across midnight repeats the day: end at the later midnight.
-                stop = datetime.combine(next_day, time.min, tz).replace(fold=1).astimezone(UTC)
+            if resolution == "hour":
+                label = cursor.astimezone(tz).replace(minute=0, second=0, microsecond=0)
+                # One real hour from the label's instant: across a clock change the
+                # bucket ends at the transition, and the repeated hour is its own
+                # bucket, distinct by offset.
+                stop = label.astimezone(UTC) + _HOUR
+                if stop <= cursor:  # a rollback inside the hour still advances
+                    stop = cursor + HALF_HOUR
+            else:
+                day = cursor.astimezone(tz).date()
+                if resolution == "month":
+                    day = day.replace(day=1)
+                label = datetime.combine(day, time.min, tz)
+                next_day = day + timedelta(days=1) if resolution != "month" else _next_month(day)
+                next_label = datetime.combine(next_day, time.min, tz)
+                stop = next_label.astimezone(UTC)
+                if stop <= cursor:
+                    # A rollback across midnight repeats the day: end at the later midnight.
+                    stop = next_label.replace(fold=1).astimezone(UTC)
             stop = min(end, stop)
             right = left
             while right < len(energy.buckets) and costs.slots[right].start.astimezone(UTC) < stop:
                 right += 1
+            # Only fully elapsed half-hours are expected: the bucket's open slot
+            # is usage so far, not a gap in its coverage.
             totals = _range_totals(_energise(energy.buckets[left:right]),
-                                   _sum_costs(costs.slots[left:right]), index(stop) - index(cursor))
+                                   _sum_costs(costs.slots[left:right]),
+                                   (stop - cursor) // HALF_HOUR)
             buckets.append(RangeBucket(label, totals))
             cursor, left = stop, right
     earnings = costs.axle_earnings_by_day
@@ -531,9 +553,27 @@ def provenance_counts(result: StatsResult) -> dict[str, int]:
             key = "gap"
         else:
             flow = bucket.slot.components.get("grid_import")
-            key = flow.provenance if flow is not None else "absent"
+            if flow is None:
+                key = "absent"
+            elif flow.reason == "rejected":
+                # A plausibility-rejected interval is its own kind of gap (#750).
+                key = "rejected"
+            else:
+                key = flow.provenance
         counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def rejected_slots(result: StatsResult) -> int:
+    """Count half-hours with any plausibility-rejected component, each once.
+
+    Rejection is not limited to grid import: the coverage line reports one
+    number for the whole ledger, separate from the grid-import breakdown.
+    """
+    return sum(
+        any(flow.reason == "rejected" for flow in bucket.slot.components.values())
+        for bucket in result.buckets if bucket.slot is not None
+    )
 
 
 @dataclass(frozen=True)

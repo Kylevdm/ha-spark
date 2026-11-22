@@ -40,6 +40,72 @@ def test_range_buckets_keep_real_dst_slots(day, count):
     assert summarise([], start, end, LONDON, "month").totals.total_slots == count
 
 
+@pytest.mark.parametrize(("day", "count", "slots"), [
+    (date(2026, 3, 29), 23, 46), (date(2026, 10, 25), 25, 50),
+])
+def test_hour_buckets_follow_the_household_clock(day, count, slots):
+    start, end = range_bounds("day", day, LONDON)
+    hours = summarise([], start, end, LONDON, "hour")
+    assert len(hours.buckets) == count
+    assert hours.totals.total_slots == slots
+    labels = [bucket.start.isoformat() for bucket in hours.buckets]
+    assert len(set(labels)) == count  # the repeated hour labels twice, distinctly
+    if day == date(2026, 10, 25):  # the repeated hour appears with both offsets
+        assert "2026-10-25T01:00:00+01:00" in labels
+        assert "2026-10-25T01:00:00+00:00" in labels
+    else:  # the skipped hour never appears
+        assert "2026-03-29T01:00:00+00:00" not in labels
+
+
+def test_hour_buckets_price_and_total_like_slot_resolution():
+    start = datetime(2026, 3, 30, 23, tzinfo=UTC)  # March 31 on the household clock
+    end = start + timedelta(hours=1)
+    rows = [priced_row(start, 2), priced_row(start + timedelta(minutes=30), 3)]
+    hours = summarise(rows, start, end, LONDON, "hour")
+    assert hours.totals == summarise(rows, start, end, LONDON, "slot").totals
+    assert len(hours.buckets) == 1
+    hour = hours.buckets[0]
+    assert hour.start == datetime(2026, 3, 31, 0, tzinfo=LONDON)
+    assert hour.totals.energy.components_kwh["grid_import"] == 5
+    assert hour.totals.covered_slots == 2
+    assert hour.totals.actual_cost == 1.25
+    assert not hour.totals.partial
+
+
+def test_day_and_hour_buckets_mark_partial_coverage():
+    start = datetime(2026, 3, 30, 23, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    rows = [priced_row(start, 2)]  # one of the range's two half-hours
+    for resolution in ("hour", "day"):
+        stats = summarise(rows, start, end, LONDON, resolution)
+        assert stats.buckets[0].totals.covered_slots == 1
+        assert stats.buckets[0].totals.total_slots == 2
+        assert stats.buckets[0].totals.partial
+
+
+def test_an_open_half_hour_is_not_a_missing_measurement():
+    # At 12:10 with all 24 closed slots covered, today's bar is usage so far:
+    # neither its day bucket nor its open hour bucket is partial (#753 review).
+    midnight = datetime(2026, 9, 1, tzinfo=LONDON).astimezone(UTC)
+    now = midnight + timedelta(hours=12, minutes=10)
+    step = timedelta(minutes=30)
+    rows = [priced_row(midnight + i * step, 2) for i in range(24)]
+    day = summarise(rows, midnight, now, LONDON, "day")
+    assert [bucket.totals.total_slots for bucket in day.buckets] == [24]
+    assert day.buckets[0].totals.covered_slots == 24
+    assert not day.buckets[0].totals.partial
+    assert day.buckets[0].totals.cost_coverage == 1  # today is priced so far, no U
+    # The range still spans up to now, open half-hour included.
+    assert day.totals.total_slots == 25
+    hours = summarise(rows, midnight, now, LONDON, "hour")
+    assert hours.buckets[-1].totals.total_slots == 0  # the open hour is no gap
+    assert not hours.buckets[-1].totals.partial
+    # A genuinely missing closed slot still marks the day partial.
+    gap = summarise(rows[:23], midnight, now, LONDON, "day")
+    assert gap.buckets[0].totals.covered_slots == 23
+    assert gap.buckets[0].totals.partial
+
+
 def priced_row(start, imported, provenance="boundary"):
     return LedgerSlot(
         slot_start=start, house_load_kwh=1, base_load_kwh=1, import_rate=.25, export_rate=.125,

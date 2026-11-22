@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from ha_spark import cli
 from ha_spark.api import history, server
 from ha_spark.energy.axle_events import AxleEvent
-from ha_spark.energy.energy_ledger import EnergyLedger
+from ha_spark.energy.energy_ledger import ComponentFlow, EnergyLedger, LedgerSlot
 from ha_spark.energy.evening_forecast import EveningForecastStore, SolarForecastSlot
 from ha_spark.energy.models import ConsumptionInterval
 from tests.api_helpers import owner_client
@@ -20,11 +20,11 @@ from tests.test_stats_ranges import LONDON, priced_row
 
 
 @pytest.mark.parametrize(("kind", "anchor", "start", "end", "resolution", "slots"), [
-    ("day", "2026-03-29", "2026-03-29T00:00", "2026-03-29T23:00", "slot", 46),
-    ("day", "2026-10-25", "2026-10-24T23:00", "2026-10-26T00:00", "slot", 50),
+    ("day", "2026-03-29", "2026-03-29T00:00", "2026-03-29T23:00", "hour", 46),
+    ("day", "2026-10-25", "2026-10-24T23:00", "2026-10-26T00:00", "hour", 50),
     ("week", "2026-10-25", "2026-10-18T23:00", "2026-10-26T00:00", "day", 338),
     ("month", "2026-10-25", "2026-09-30T23:00", "2026-11-01T00:00", "day", 1490),
-    ("year", "2026-10-25", "2026-01-01T00:00", "2027-01-01T00:00", "month", 17520),
+    ("year", "2026-10-25", "2026-01-01T00:00", "2027-01-01T00:00", "day", 17520),
     ("all", None, "2026-07-31T23:00", "2027-01-02T12:00", "month", 7418),
 ])
 def test_statistics_calendar(tmp_path, monkeypatch, kind, anchor, start, end, resolution, slots):
@@ -51,7 +51,8 @@ def test_statistics_calendar(tmp_path, monkeypatch, kind, anchor, start, end, re
     {"range": "private"}, {"range": "day", "at": "private"},
     {"range": "day", "at": "20261025"}, {"range": "year", "at": "9999-01-01"},
     {"range": "day", "at": "0001-01-01"}, {"range": "day", "at": "2026-02-30"},
-    {"range": "day", "resolution": "slot"}, {"range": "day", "from": "private"},
+    {"range": "day", "resolution": "day"}, {"range": "week", "resolution": "hour"},
+    {"range": "day", "from": "private"},
     {"range": "day", "to": "private"}, [("range", "private"), ("range", "day")],
     [("range", "day"), ("at", "private"), ("at", "2026-10-01")],
     {"range": "all", "at": "0001-01-01"},
@@ -72,7 +73,7 @@ def test_statistics_current_day_preserves_gaps_and_unpriced_measurements(tmp_pat
         priced_row(start + timedelta(hours=1), 1, "hourly_backfill"),
     ]))
     with owner_client(_state(tmp_path, timezone=LONDON.key)) as client:
-        response = client.get("/api/history?range=day")
+        response = client.get("/api/history", params={"range": "day", "resolution": "slot"})
     assert response.status_code == 200
     body = response.json()
     assert body["range_totals"]["total_slots"] == 3
@@ -154,7 +155,10 @@ def test_statistics_exposes_accuracy_reconciliation_and_session(tmp_path, monkey
     ]))
     state = _state(tmp_path, timezone=LONDON.key)
     with owner_client(state) as client:
-        response = client.get("/api/history", params={"range": kind, "at": "2026-09-01"})
+        params = {"range": kind, "at": "2026-09-01"}
+        if kind == "day":  # The Day view's half-hourly toggle (#753).
+            params["resolution"] = "slot"
+        response = client.get("/api/history", params=params)
     assert response.status_code == 200
     body = response.json()
     solar = body["solar_accuracy"]
@@ -228,12 +232,63 @@ def test_statistics_keeps_ingress_and_repair_gates(tmp_path, status, peer, token
     assert response.status_code == status
 
 
+def test_statistics_daily_buckets_mark_partial_days_and_count_rejected(tmp_path, monkeypatch):
+    start = datetime(2026, 8, 30, 23, tzinfo=UTC)  # household Monday 31 August
+    _frozen_server_clock(monkeypatch, datetime(2026, 9, 8, 12, tzinfo=UTC))
+    half_hour = timedelta(minutes=30)
+    rows = [priced_row(start + i * half_hour, 2) for i in range(48)]
+    rows.append(LedgerSlot(slot_start=start + 48 * half_hour, components={
+        "grid_import": ComponentFlow(reason="rejected"),
+    }))
+    monkeypatch.setattr(EnergyLedger, "slots", AsyncMock(return_value=rows))
+    with owner_client(_state(tmp_path, timezone=LONDON.key)) as client:
+        body = client.get("/api/history", params={"range": "week", "at": "2026-09-01"}).json()
+    assert body["resolution"] == "day"
+    assert [bucket["partial"] for bucket in body["buckets"]] == (
+        [False, True, True, True, True, True, True])
+    assert body["provenance_counts"]["rejected"] == 1
+    first, second = body["buckets"][:2]
+    assert first["actual_cost"] == 24  # 48 measured half-hours at the captured rates
+    assert second["actual_cost"] is None
+
+
+def test_statistics_counts_rejected_intervals_in_any_component(tmp_path, monkeypatch):
+    # Solar rejected while grid import has a boundary reading: the payload's
+    # rejected count still sees the half-hour (#749 review finding 3).
+    start = datetime(2026, 8, 30, 23, tzinfo=UTC)  # household Monday 31 August
+    _frozen_server_clock(monkeypatch, datetime(2026, 9, 8, 12, tzinfo=UTC))
+    half_hour = timedelta(minutes=30)
+    rows = [priced_row(start + i * half_hour, 2) for i in range(48)]
+    rows.append(LedgerSlot(slot_start=start + 48 * half_hour, components={
+        "grid_import": ComponentFlow(kwh=2, provenance="boundary"),
+        "solar_generation": ComponentFlow(reason="rejected"),
+    }))
+    monkeypatch.setattr(EnergyLedger, "slots", AsyncMock(return_value=rows))
+    with owner_client(_state(tmp_path, timezone=LONDON.key)) as client:
+        body = client.get("/api/history", params={"range": "week", "at": "2026-09-01"}).json()
+    assert body["rejected_slots"] == 1
+    assert "rejected" not in body["provenance_counts"]
+
+
+def test_statistics_year_shows_one_bar_per_day(tmp_path, monkeypatch):
+    _frozen_server_clock(monkeypatch, datetime(2027, 1, 2, 12, tzinfo=UTC))
+    with owner_client(_state(tmp_path, timezone=LONDON.key)) as client:
+        body = client.get("/api/history", params={"range": "year", "at": "2026-06-01"}).json()
+    assert body["resolution"] == "day"
+    starts = [bucket["start"] for bucket in body["buckets"]]
+    assert len(starts) == 365  # 2026 is not a leap year
+    assert len(set(starts)) == 365
+    assert starts[0].startswith("2026-01-01") and starts[-1].startswith("2026-12-31")
+
+
 def test_statistics_calendar_day_carries_no_forecast_total(tmp_path, monkeypatch):
     _frozen_server_clock(monkeypatch, datetime(2026, 9, 2, tzinfo=UTC))
     with owner_client(_state(tmp_path, timezone=LONDON.key)) as client:
         body = client.get("/api/history", params={"range": "day", "at": "2026-09-01"}).json()
     assert body["totals"] == {"solar_forecast_kwh": None, "solar_measured_kwh": None}
-    assert all(bucket["solar_forecast_kwh"] is None for bucket in body["buckets"])
+    assert body["unavailable"]["solar_forecast"] == "slot_resolution_only"
+    # Hourly ledger buckets never carry the plan view's solar series.
+    assert all("solar_forecast_kwh" not in bucket for bucket in body["buckets"])
 
 
 def test_statistics_failed_ledger_reports_no_provenance(tmp_path, monkeypatch):

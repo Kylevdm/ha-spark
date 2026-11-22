@@ -987,9 +987,16 @@ def build_app(
             ledger_failed = forecast_failed = False
             calendar = None
             if kind is not None:
+                # Only the Day view sends a resolution: hourly by default, half-hourly on
+                # request. Any other range keeps the rule that rejects stray params.
+                stray = ("from", "to") if kind == "day" else ("resolution", "from", "to")
                 if (kind not in ("day", "week", "month", "year", "all")
-                        or any(key in params for key in ("resolution", "from", "to"))
+                        or any(key in params for key in stray)
                         or len(params.getlist("range")) > 1 or len(params.getlist("at")) > 1):
+                    return invalid
+                if kind == "day" and "resolution" in params and (
+                        requested not in ("hour", "slot")
+                        or len(params.getlist("resolution")) > 1):
                     return invalid
                 today = now.astimezone(tz).date()
                 try:
@@ -1017,8 +1024,10 @@ def build_app(
                         log.warning("Energy ledger read failed")
                         ledger_failed = True
                 end = min(stop, now)
-                resolution = ("slot" if kind == "day" else "day" if kind in ("week", "month")
-                              else "month")
+                if kind == "day":
+                    resolution = "slot" if requested == "slot" else "hour"
+                else:
+                    resolution = "day" if kind in ("week", "month", "year") else "month"
                 calendar = {
                     "kind": kind, "at": at.isoformat(), "today": today.isoformat(),
                     "from": start.astimezone(tz).isoformat(), "to": end.astimezone(tz).isoformat(),

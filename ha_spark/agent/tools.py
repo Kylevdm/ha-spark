@@ -136,6 +136,7 @@ def _totals_payload(totals: RangeTotals) -> dict[str, object]:
         "lower_resolution": totals.lower_resolution,
         "energy_coverage": totals.energy_coverage,
         "cost_coverage": totals.cost_coverage,
+        "partial": totals.partial,
     }
 
 

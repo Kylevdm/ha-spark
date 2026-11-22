@@ -261,7 +261,8 @@ async def _cmd_stats(settings: Settings, *, kind: str, at: str | None) -> int:
     except Exception:
         print("Could not read energy ledger", file=sys.stderr)
         return 1
-    resolution: Resolution = ("slot" if kind == "day" else "day" if kind in ("week", "month")
+    resolution: Resolution = ("slot" if kind == "day"
+                              else "day" if kind in ("week", "month", "year")
                               else "month")
     try:
         events, event_rows = await window_evidence(settings.db_path, start, end)
@@ -287,7 +288,7 @@ async def _cmd_stats(settings: Settings, *, kind: str, at: str | None) -> int:
     )
     result = compute_stats(rows, start, end, tz)
     counts = provenance_counts(result)
-    gaps = counts.get("gap", 0) + counts.get("absent", 0)
+    gaps = counts.get("gap", 0) + counts.get("absent", 0) + counts.get("rejected", 0)
     print(
         f"Grid import: filled {counts.get('statistics_fill', 0)} (statistics_fill), "
         f"distributed {counts.get('distributed', 0)}, gaps {gaps}"
