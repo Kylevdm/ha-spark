@@ -501,7 +501,8 @@ class EnergyLedger:
                     house_load_kwh=house, base_load_kwh=base, negative_clamped=clamped,
                 )
                 await db.execute(
-                    "INSERT INTO energy_ledger_slots VALUES (?, ?)",
+                    "INSERT INTO energy_ledger_slots VALUES (?, ?) "
+                    "ON CONFLICT(slot_start) DO NOTHING",
                     (start_key, row.model_dump_json()),
                 )
             await db.executemany(
