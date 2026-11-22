@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import math
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
@@ -24,6 +24,7 @@ from ha_spark.energy.derived_base_load import (
     derive_specs_from_settings,
 )
 from ha_spark.energy.forecast import load_timezone
+from ha_spark.energy.horizon import _window_bounds
 from ha_spark.energy.onboarding import ENERGY_FACTORS, POWER_FACTORS, statistic_unit
 from ha_spark.energy.plausibility import plausible, plausible_kw
 from ha_spark.energy.readiness_ledger import BOUNDARY_TOLERANCE, slot_start
@@ -37,13 +38,7 @@ from ha_spark.energy.readiness_measurements import (
     measurement_series,
 )
 from ha_spark.energy.session_allowance import CounterResult, read_counter
-from ha_spark.energy.sources import parse_time
-from ha_spark.energy.tariff import (
-    HAPPY_HOUR_ALLOWANCE_KWH,
-    HAPPY_HOUR_MARGIN,
-    _in_overnight_window,
-    _slot_overlap,
-)
+from ha_spark.energy.tariff import HAPPY_HOUR_ALLOWANCE_KWH, HAPPY_HOUR_MARGIN, _slot_overlap
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.logging import get_logger
@@ -106,10 +101,22 @@ class LedgerSlot(RateEvidence):
     negative_clamped: bool = False
 
 
+def _parse_hhmm(hhmm: str) -> time:
+    """Parse a validated ``HH:MM`` config value (FixedTariffConfig has checked the shape)."""
+    h, m = hhmm.split(":")
+    return time(int(h), int(m))
+
+
 def _fixed_daily_rates(
     settings: Settings, start: datetime, revision_id: str,
 ) -> RateEvidence | None:
-    """Capture the fixed supplier's flat rates when the daily model has no slot geometry."""
+    """Capture the fixed supplier's flat rates when the daily model has no slot geometry.
+
+    The import rate is the time-weighted blend of the two rates over the
+    slot's real overlap with the configured cheap window — half-open on
+    absolute instants, the horizon geometry's fold=0 semantics — so a slot
+    straddling an edge is blended and the slot after the window end is peak.
+    """
     try:
         tariff = FixedTariffConfig(
             rate_offpeak=settings.rate_offpeak_gbp_kwh,
@@ -118,20 +125,27 @@ def _fixed_daily_rates(
             window_start=settings.charge_window_start,
             window_end=settings.charge_window_end,
         )
-        local_start = start.astimezone(ZoneInfo(settings.timezone)).time()
-    except (ValueError, ZoneInfoNotFoundError):
+        rates = (tariff.rate_offpeak, tariff.rate_peak, tariff.rate_export)
+        if not all(map(math.isfinite, rates)):
+            return None
+        tz = ZoneInfo(settings.timezone)
+        local_day = start.astimezone(tz).date()
+        window_start = _parse_hhmm(tariff.window_start)
+        window_end = _parse_hhmm(tariff.window_end)
+        frac = 0.0
+        for offset in (-1, 0, 1):
+            day = local_day + timedelta(days=offset)
+            bounds = _window_bounds(day, window_start, window_end, tz)
+            overlap = min(bounds[1], start + HALF_HOUR) - max(bounds[0], start)
+            frac = max(frac, overlap / HALF_HOUR)
+        import_rate = tariff.rate_offpeak * frac + tariff.rate_peak * (1.0 - frac)
+        return RateEvidence(
+            revision_id=revision_id,
+            import_rate=import_rate,
+            export_rate=tariff.rate_export,
+        )
+    except Exception:  # a pathological timezone or value leaves the slot unpriced
         return None
-    rates = (tariff.rate_offpeak, tariff.rate_peak, tariff.rate_export)
-    if not all(map(math.isfinite, rates)):
-        return None
-    offpeak = _in_overnight_window(
-        local_start, parse_time(tariff.window_start), parse_time(tariff.window_end),
-    )
-    return RateEvidence(
-        revision_id=revision_id,
-        import_rate=tariff.rate_offpeak if offpeak else tariff.rate_peak,
-        export_rate=tariff.rate_export,
-    )
 
 
 def capture_rates(settings: Settings, now: datetime, revision: PlanRevision | None) -> RateEvidence:
