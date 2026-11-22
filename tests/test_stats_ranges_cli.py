@@ -17,7 +17,7 @@ from tests.test_stats_ranges import LONDON, priced_row
 @pytest.mark.parametrize(("kind", "resolution", "first", "stop"), [
     ("week", "day", "2026-08-30T23:00:00+00:00", "2026-09-06T23:00:00+00:00"),
     ("month", "day", "2026-08-31T23:00:00+00:00", "2026-09-30T23:00:00+00:00"),
-    ("year", "month", "2026-01-01T00:00:00+00:00", "2027-01-01T00:00:00+00:00"),
+    ("year", "day", "2026-01-01T00:00:00+00:00", "2027-01-01T00:00:00+00:00"),
 ])
 def test_stats_cli_and_history_agree(tmp_path, monkeypatch, capsys, kind, resolution, first, stop):
     _frozen_server_clock(monkeypatch, datetime(2027, 1, 2, tzinfo=UTC))

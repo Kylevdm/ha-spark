@@ -92,7 +92,7 @@ def history_payload(
 def _totals_payload(totals: RangeTotals) -> dict[str, Any]:
     payload = asdict(totals)
     return {**payload.pop("energy"), **payload, "energy_coverage": totals.energy_coverage,
-            "cost_coverage": totals.cost_coverage}
+            "cost_coverage": totals.cost_coverage, "partial": totals.partial}
 
 
 def add_statistics(

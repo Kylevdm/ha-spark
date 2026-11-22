@@ -346,7 +346,7 @@ def _sum_costs(slots: tuple[SlotCost, ...], axle: AxleSummary = _NO_AXLE) -> Cos
     )
 
 
-Resolution = Literal["slot", "day", "month"]
+Resolution = Literal["slot", "hour", "day", "month"]
 
 
 def _next_month(day: date) -> date:
@@ -406,6 +406,11 @@ class RangeTotals:
     @property
     def cost_coverage(self) -> float:
         return self.priced_slots / self.total_slots if self.total_slots else 0.0
+
+    @property
+    def partial(self) -> bool:
+        """True when an elapsed slot in the bucket is not covered (a gap or rejection)."""
+        return self.covered_slots < self.total_slots
 
 
 @dataclass(frozen=True)
@@ -484,15 +489,25 @@ def summarise(
     else:
         cursor, left = start, 0
         while cursor < end:
-            day = cursor.astimezone(tz).date()
-            if resolution == "month":
-                day = day.replace(day=1)
-            label = datetime.combine(day, time.min, tz)
-            next_day = day + timedelta(days=1) if resolution == "day" else _next_month(day)
-            stop = datetime.combine(next_day, time.min, tz).astimezone(UTC)
-            if stop <= cursor:
-                # A rollback across midnight repeats the day: end at the later midnight.
-                stop = datetime.combine(next_day, time.min, tz).replace(fold=1).astimezone(UTC)
+            if resolution == "hour":
+                label = cursor.astimezone(tz).replace(minute=0, second=0, microsecond=0)
+                # One real hour from the label's instant: across a clock change the
+                # bucket ends at the transition, and the repeated hour is its own
+                # bucket, distinct by offset.
+                stop = label.astimezone(UTC) + _HOUR
+                if stop <= cursor:  # a rollback inside the hour still advances
+                    stop = cursor + HALF_HOUR
+            else:
+                day = cursor.astimezone(tz).date()
+                if resolution == "month":
+                    day = day.replace(day=1)
+                label = datetime.combine(day, time.min, tz)
+                next_day = day + timedelta(days=1) if resolution != "month" else _next_month(day)
+                next_label = datetime.combine(next_day, time.min, tz)
+                stop = next_label.astimezone(UTC)
+                if stop <= cursor:
+                    # A rollback across midnight repeats the day: end at the later midnight.
+                    stop = next_label.replace(fold=1).astimezone(UTC)
             stop = min(end, stop)
             right = left
             while right < len(energy.buckets) and costs.slots[right].start.astimezone(UTC) < stop:
@@ -531,7 +546,13 @@ def provenance_counts(result: StatsResult) -> dict[str, int]:
             key = "gap"
         else:
             flow = bucket.slot.components.get("grid_import")
-            key = flow.provenance if flow is not None else "absent"
+            if flow is None:
+                key = "absent"
+            elif flow.reason == "rejected":
+                # A plausibility-rejected interval is its own kind of gap (#750).
+                key = "rejected"
+            else:
+                key = flow.provenance
         counts[key] = counts.get(key, 0) + 1
     return counts
 

@@ -22,6 +22,17 @@ const provenance = {
 const sessions = {free_electricity: "Free Electricity", happy_hour: "Happy Hour"};
 const halfHour = 30 * 60000;
 
+// One remembered Day-view choice per device (#753). Every read and write is
+// guarded: a browser that blocks storage still gets the toggle for the visit.
+const DAY_RESOLUTION_KEY = "statistics.day.resolution";
+const storedDayResolution = () => {
+    try {
+        return window.localStorage?.getItem(DAY_RESOLUTION_KEY) === "slot" ? "slot" : "hour";
+    } catch {
+        return "hour";
+    }
+};
+
 const energy = value => value == null ? "—" : `${number(value, 3)} kWh`;
 const money = value => value == null ? "—" : `£${number(value)}`;
 const percent = value => value == null ? "—" : `${number(value * 100, 1)}%`;
@@ -83,6 +94,23 @@ function slotMarks(bucket) {
         bucket.actual_cost == null && "U"].filter(Boolean);
 }
 
+// A calendar bucket with an uncovered elapsed slot: a gap or a rejected interval.
+function dayMarks(bucket) {
+    return [bucket.partial && "P", bucket.actual_cost == null && "U"].filter(Boolean);
+}
+
+// The per-day row the Week/Month/Year views answer "how much did we use" with.
+function usageRow(bucket) {
+    return [
+        `House ${energy(bucket.house_load_kwh)}`,
+        `Import ${energy(valueAt(bucket, "grid_import"))}`,
+        `Export ${energy(valueAt(bucket, "grid_export"))}`,
+        `Solar ${energy(valueAt(bucket, "solar_generation"))}`,
+        bucket.actual_cost == null ? "" : `Cost ${money(bucket.actual_cost)}`,
+        bucket.partial ? "Partial" : "",
+    ].filter(Boolean);
+}
+
 function HistoryChart({payload, field, selected, select}) {
     const {buckets, resolution} = payload;
     if (!buckets.length) return html`<p>No half-hours in this period yet.</p>`;
@@ -114,12 +142,14 @@ function HistoryChart({payload, field, selected, select}) {
             ${day ? html`<path class="series stats-series"
                 d=${steps(data, "value", grid.x, slotWidth, y)}/>` : null}
             ${data.map(({start, value}, i) => {
-                const label = day ? clock(start) : start.slice(0, resolution === "month" ? 7 : 10);
+                const label = day || resolution === "hour" ? clock(start)
+                    : start.slice(0, resolution === "month" ? 7 : 10);
                 const bucket = buckets[i];
                 const at = x(start, i);
-                const marks = day ? slotMarks(bucket) : [];
+                const marks = day ? slotMarks(bucket)
+                    : resolution === "day" ? dayMarks(bucket) : [];
                 const description = [label, value == null ? "Gap" : formatValue(field, value),
-                    session(bucket)].filter(Boolean).join(" · ");
+                    ...(day ? [session(bucket)] : usageRow(bucket))].filter(Boolean).join(" · ");
                 return html`<g key=${start}>
                     ${!day && value != null ? html`<rect class="stats-bar"
                         x=${at + slotWidth * .18} width=${slotWidth * .64}
@@ -128,7 +158,7 @@ function HistoryChart({payload, field, selected, select}) {
                     ${!day && i % Math.max(1, Math.ceil(78 / slotWidth)) === 0
                         ? html`<text class="axis-label" x=${at} y="180">${label}</text>` : null}
                     ${marks.map(mark => html`<text class="axis-label" x=${at + 5}
-                        y=${166 + "GFDHU".indexOf(mark) * 12}>${mark}</text>`)}
+                        y=${166 + (day ? "GFDHU" : "PU").indexOf(mark) * 12}>${mark}</text>`)}
                     <rect class=${selected === i ? "slot-hit selected" : "slot-hit"}
                         x=${at} y="24" width=${slotWidth} height=${day ? 198 : 136}
                         tabindex="0" role="button" aria-label=${description} aria-pressed=${selected === i}
@@ -179,6 +209,15 @@ function DaySlots({buckets, solar}) {
                 ${bucket.actual_cost == null ? " · Unpriced" : ""}</summary>
             <${BucketDetails} bucket=${bucket} day=${true} solar=${solar?.slots?.[i]}/>
         </details>`)}
+    </details>`;
+}
+
+function DailyList({buckets}) {
+    return html`<details>
+        <summary>Daily usage: house load with import, export, solar and cost</summary>
+        <ul>${buckets.map(bucket => html`<li key=${bucket.start}>
+            ${[bucket.start.slice(0, 10), ...usageRow(bucket)].join(" · ")}
+        </li>`)}</ul>
     </details>`;
 }
 
@@ -271,9 +310,10 @@ function Accuracy({solar, load, meter}) {
 }
 
 function Results({payload, changeRange}) {
-    const [field, setField] = useState("grid_import");
-    const [selected, select] = useState(null);
     const {range, resolution, range_totals: totals, buckets, provenance_counts: counts} = payload;
+    const [field, setField] = useState(
+        resolution === "day" ? "house_load_kwh" : "grid_import");
+    const [selected, select] = useState(null);
     const day = resolution === "slot";
     const bucket = buckets[selected];
     return html`
@@ -282,7 +322,8 @@ function Results({payload, changeRange}) {
         ${payload.unavailable.statistics ? html`<p>Energy ledger statistics unavailable.</p>` : null}
         ${counts ? html`<p>Grid import provenance · Statistics fill: ${counts.statistics_fill ?? 0} ·
             Distributed: ${counts.distributed ?? 0} · Lower resolution (hourly):
-            ${counts.hourly_backfill ?? 0} · Gaps: ${(counts.gap ?? 0) + (counts.absent ?? 0)}</p>`
+            ${counts.hourly_backfill ?? 0} · Rejected: ${counts.rejected ?? 0} · Gaps:
+            ${(counts.gap ?? 0) + (counts.absent ?? 0)}</p>`
             : html`<p>Grid import provenance unavailable.</p>`}
         <h2>Energy flows</h2>
         <${Metrics} entries=${flowEntries(totals)} cards=${true}/>
@@ -290,19 +331,23 @@ function Results({payload, changeRange}) {
         <${Metrics} entries=${costEntries(totals)} cards=${true}/>
         <p>Battery savings credit the battery and ha-spark together.</p>
         <${Costs}/>
-        <h2>${day ? "Half-hour history" : resolution === "day" ? "Daily history" : "Monthly history"}</h2>
+        <h2>${day ? "Half-hour history" : resolution === "hour" ? "Hourly history"
+            : resolution === "day" ? "Daily history" : "Monthly history"}</h2>
         <label>Show <select value=${field} onChange=${event => setField(event.currentTarget.value)}>
             ${Object.entries(series).map(([key, label]) => html`<option key=${key} value=${key}>${label}</option>`)}
         </select></label>
         <p>Select a ${day ? "half-hour" : "bar"} for its numbers. A dash means unavailable, not zero.</p>
-        ${day ? html`<p>G: gap · F: statistics fill · D: distributed · H: lower resolution (hourly) · U: unpriced</p>` : null}
+        ${day ? html`<p>G: gap · F: statistics fill · D: distributed · H: lower resolution (hourly) · U: unpriced</p>`
+            : resolution === "day" ? html`<p>P: partial day · U: unpriced</p>` : null}
         <${HistoryChart} payload=${payload} field=${field} selected=${selected} select=${select}/>
         ${bucket ? html`<section aria-live="polite">
-            <h3>${day ? clock(bucket.start) : bucket.start.slice(0, resolution === "month" ? 7 : 10)}</h3>
+            <h3>${day || resolution === "hour" ? clock(bucket.start)
+                : bucket.start.slice(0, resolution === "month" ? 7 : 10)}</h3>
             <${BucketDetails} bucket=${bucket} day=${day} solar=${payload.solar_accuracy?.slots?.[selected]}
                 drill=${() => changeRange(resolution === "month" ? "month" : "day", bucket.start.slice(0, 10))}/>
         </section>` : null}
         ${day ? html`<${DaySlots} buckets=${buckets} solar=${payload.solar_accuracy}/>` : null}
+        ${resolution === "day" ? html`<${DailyList} buckets=${buckets}/>` : null}
         <${Axle} axle=${payload.axle}/>
         <${Accuracy} solar=${payload.solar_accuracy} load=${payload.load_accuracy}
             meter=${payload.meter_reconciliation}/>`;
@@ -310,15 +355,25 @@ function Results({payload, changeRange}) {
 
 export function Statistics({repair}) {
     const [query, setQuery] = useState({kind: "day", at: null});
+    const [dayResolution, setDayResolution] = useState(storedDayResolution);
     const [result, setResult] = useState(null);
     const [failed, setFailed] = useState(null);
     const [retry, setRetry] = useState(0);
     const changeRange = (kind, at = null) => setQuery({kind, at});
+    const changeDayResolution = resolution => {
+        setDayResolution(resolution);
+        try {
+            window.localStorage?.setItem(DAY_RESOLUTION_KEY, resolution);
+        } catch {
+            // Not remembered; the toggle still applies for this visit.
+        }
+    };
     useEffect(() => {
         if (repair) return;
         const controller = new AbortController();
         const params = new URLSearchParams({range: query.kind});
         if (query.at) params.set("at", query.at);
+        if (query.kind === "day") params.set("resolution", dayResolution);
         async function load() {
             try {
                 const response = await fetch(`api/history?${params}`, {
@@ -326,17 +381,18 @@ export function Statistics({repair}) {
                 });
                 if (!response.ok) throw new Error("statistics unavailable");
                 const payload = await response.json();
-                if (!controller.signal.aborted) setResult({query, retry, payload});
+                if (!controller.signal.aborted) setResult({query, dayResolution, retry, payload});
             } catch {
-                if (!controller.signal.aborted) setFailed({query, retry});
+                if (!controller.signal.aborted) setFailed({query, dayResolution, retry});
             }
         }
         void load();
         return () => controller.abort();
-    }, [repair, query, retry]);
+    }, [repair, query, dayResolution, retry]);
     if (repair) return html`<section><h1>Statistics</h1><p>Configuration needs repair. Import a valid
         configuration with the CLI: <code>ha-spark config import FILE</code>.</p></section>`;
-    const payload = result?.query === query && result.retry === retry ? result.payload : null;
+    const payload = (result?.query === query && result.dayResolution === dayResolution
+        && result.retry === retry) ? result.payload : null;
     const range = payload?.range;
     const next = range && range.kind !== "all" ? stepDate(range, 1) : null;
     return html`<section>
@@ -345,15 +401,23 @@ export function Statistics({repair}) {
             ${Object.entries(ranges).map(([kind, label]) => html`<button key=${kind}
                 aria-pressed=${query.kind === kind} onClick=${() => changeRange(kind)}>${label}</button>`)}
         </div>
+        ${query.kind === "day" ? html`<div class="stats-ranges" role="group"
+            aria-label="Day view resolution">
+            <button aria-pressed=${dayResolution === "hour"}
+                onClick=${() => changeDayResolution("hour")}>Hourly</button>
+            <button aria-pressed=${dayResolution === "slot"}
+                onClick=${() => changeDayResolution("slot")}>Half-hourly</button>
+        </div>` : null}
         ${query.kind === "all" ? null : html`<div role="group" aria-label="Step through periods">
             <button disabled=${!range || range.from.slice(0, 4) === "0001"}
                 onClick=${() => changeRange(query.kind, stepDate(range, -1))}>Previous</button>
             <button disabled=${!next || next > range.today}
                 onClick=${() => changeRange(query.kind, next)}>Next</button>
         </div>`}
-        ${payload ? html`<${Results} key=${`${query.kind}:${query.at}:${retry}`}
+        ${payload ? html`<${Results} key=${`${query.kind}:${query.at}:${dayResolution}:${retry}`}
             payload=${payload} changeRange=${changeRange}/>`
-            : failed?.query === query && failed.retry === retry ? html`<p role="status">
+            : failed?.query === query && failed.dayResolution === dayResolution
+            && failed.retry === retry ? html`<p role="status">
                 Statistics unavailable. <button onClick=${() => setRetry(retry + 1)}>Try again</button></p>`
                 : html`<p role="status">Loading statistics…</p>`}
     </section>`;
