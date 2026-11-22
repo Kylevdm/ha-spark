@@ -156,7 +156,8 @@ async def test_hourly_refill_beyond_retention_fills_gaps_only(tmp_path, monkeypa
     first, second = await EnergyLedger(settings.db_path).slots(OLD_DAY, OLD_DAY + 2 * HALF)
     assert (first.components["grid_import"].kwh,
             first.components["grid_import"].provenance) == (pytest.approx(1.0), "hourly_backfill")
-    assert first.house_load_kwh == first.base_load_kwh == 1
+    assert first.house_load_kwh == pytest.approx(1)
+    assert first.base_load_kwh == pytest.approx(1)
     # A passing value is never overwritten, and no row is created for absent slots.
     assert (second.components["grid_import"].kwh,
             second.components["grid_import"].provenance) == (pytest.approx(1.0), "hourly_backfill")
