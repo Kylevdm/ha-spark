@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.42.2
+
+- The energy ledger no longer loses a half-hour's live meter reading when the recorder fill reached that slot first: the live value replaces the fill, the slot takes the rates captured at that boundary so it can be priced again, and the next slot is measured normally (#757).
+- The energy ledger no longer double counts a meter gap that the recorder fill partly covered before the gap closed: only the energy the fill did not account for is spread over the remaining slots, and a gap smaller than the fill is rejected (#758).
+- The V2L energy and net-saving sensors and V2L notifications now work on integration-owned sites (#763).
+- Fixed: on 0.42.1 the add-on refused every integration heartbeat while a
+  manual-control session was open, so the integration showed the add-on as
+  disconnected, no plan reached the inverter and resuming waited until the
+  session ended. Update the add-on and the integration together (#768).
+- For the V2L sensors, set the add-on setting `v2l_power_entity` to your V2L power sensor;
+  without it they stay unavailable.
+
 ## 0.42.1
 
 - Manual control can now override SoC trust: start it with Keep protection off
