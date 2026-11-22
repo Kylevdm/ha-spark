@@ -207,8 +207,22 @@ function Costs() {
     </details>`;
 }
 
+// Days with earnings, or touched by a priced (not cancelled) event even at £0; unknown stays shown.
+export function shownEarnings(axle) {
+    const priced = new Set();
+    for (const event of axle.events) {
+        if (event.outcome === "cancelled" || event.earnings_gbp == null) continue;
+        // Household dates from the server's local times; an end at midnight closes the day before.
+        let day = event.start.slice(0, 10);
+        const end = event.end.slice(0, 10);
+        const last = event.end.slice(11, 19) === "00:00:00" ? stepDate({kind: "day", at: end}, -1) : end;
+        for (; day <= last; day = stepDate({kind: "day", at: day}, 1)) priced.add(day);
+    }
+    return axle.earnings_by_day.filter(day => day.earnings_gbp !== 0 || priced.has(day.date));
+}
+
 function Axle({axle}) {
-    const earnings = axle?.earnings_by_day.filter(day => day.earnings_gbp !== 0) ?? [];
+    const earnings = axle ? shownEarnings(axle) : [];
     return html`<section>
         <h2>Axle</h2>
         ${!axle ? html`<p>Axle history unavailable.</p>` : html`

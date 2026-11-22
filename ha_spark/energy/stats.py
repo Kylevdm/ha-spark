@@ -422,6 +422,8 @@ class RangeStats:
     totals: RangeTotals
     axle: AxleSummary = _NO_AXLE
     axle_earnings_by_day: tuple[tuple[date, float | None], ...] = ()
+    # Days a priced (not cancelled) Axle event touched: their earnings show even at 0.
+    axle_event_days: frozenset[date] = frozenset()
 
 
 def _range_totals(energy: StatsResult, costs: CostResult, count: int) -> RangeTotals:
@@ -500,17 +502,24 @@ def summarise(
             buckets.append(RangeBucket(label, totals))
             cursor, left = stop, right
     earnings = costs.axle_earnings_by_day
+    priced_days: set[date] = set()
     for outcome in costs.axle.events:
-        # Calendar buckets hold only recorded rows: a window without rows is still unknown.
-        if outcome.outcome != "cancelled" and outcome.earnings_gbp is None:
-            at = max(start, outcome.event.start.astimezone(UTC))
-            last = min(end, outcome.event.end.astimezone(UTC))
-            while at < last:
-                earnings[at.astimezone(tz).date()] = None
-                at += HALF_HOUR
+        if outcome.outcome == "cancelled":
+            continue
+        days: set[date] = set()
+        at = max(start, outcome.event.start.astimezone(UTC))
+        last = min(end, outcome.event.end.astimezone(UTC))
+        while at < last:
+            days.add(at.astimezone(tz).date())
+            at += HALF_HOUR
+        if outcome.earnings_gbp is None:
+            # Calendar buckets hold only recorded rows: a window without rows is still unknown.
+            earnings.update(dict.fromkeys(days))
+        else:
+            priced_days |= days
     return RangeStats(
         tuple(buckets), _range_totals(energy, costs, max(0, index(end))), costs.axle,
-        tuple(sorted(earnings.items())),
+        tuple(sorted(earnings.items())), frozenset(priced_days),
     )
 
 

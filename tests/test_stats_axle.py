@@ -125,3 +125,19 @@ def test_an_event_window_without_rows_is_unknown_at_every_resolution(resolution)
     rows = [row(START + 6 * HALF_HOUR, exported=1)]
     stats = summarise(rows, START, START + timedelta(days=1), UTC, resolution, [event()])
     assert stats.axle_earnings_by_day == ((START.date(), None),)
+
+
+def test_ranges_mark_days_a_priced_event_touched():
+    from ha_spark.energy.stats import summarise
+
+    rows = [row(exported=0), row(START + HALF_HOUR, exported=0)]
+    day = START + timedelta(days=1)
+    stats = summarise(rows, START, day, UTC, "day", [event()])
+    assert stats.axle_earnings_by_day == ((START.date(), 0),)
+    assert stats.axle_event_days == {START.date()}
+    assert summarise(rows, START, day, UTC, "day").axle_event_days == set()
+    assert summarise(rows, START, day, UTC, "day", [event(cancelled_at=START)]).axle_event_days \
+        == set()
+    unpriced = summarise(rows[:1], START, day, UTC, "day", [event()])
+    assert unpriced.axle_earnings_by_day == ((START.date(), None),)
+    assert unpriced.axle_event_days == set()

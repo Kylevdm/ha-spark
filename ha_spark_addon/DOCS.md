@@ -1491,6 +1491,12 @@ load and reports daily error and per-slot shape error per model. `load_model:
 auto` makes its own comparison against actual consumption from HA statistics to
 decide whether the ML model drives plans.
 
+The load MAE in `stats` and the forecast MAE in readiness read different
+sources: `stats` compares against base load from the energy ledger, readiness
+against base load from HA's recorder statistics. Both pick the same forecast for
+a day, but the measured actuals can differ slightly, so the two MAEs for the
+same days can differ slightly too.
+
 A signal sampler also runs every 30 minutes and records these household
 signals: `occupancy_home_frac` (from `person_entities`), `heatpump_kwh` (from
 `heatpump_energy_entity`), and `temp_out_c` (from `outdoor_weather_entity`).
@@ -1632,6 +1638,12 @@ covered slots. A gap, reset, non-finite or wrong-unit reading is marked and
 left out, never presented as zero. Unpriced reasons include missing rates,
 missing slots, distributed energy and Axle events whose window contains a gap.
 
+Rates are captured from the plan's half-hour tariff layout. When the load
+forecast is a daily total with no half-hour shape (the daily load model), a plan
+has no such layout, so no rates are captured and every slot stays unpriced as
+`no_tariff_geometry`, even on a fixed tariff. Energy totals and coverage are not
+affected; only cost and Battery savings are left out.
+
 Every surface counts a period only up to now: a day, week, month or year that
 contains the current time ends at the current time, whichever date in it you
 ask for, so its coverage is "so far". A past period is counted whole. `all`
@@ -1666,7 +1678,9 @@ with their window, direction, committed energy, event rate and lifecycle state.
 Outcome and delivered energy are worked out from the ledger each time
 statistics are read, so a later fill can change them. Estimated earnings = grid export measured in the window × the event
 rate ha-spark recorded. This is a credit in actual cost and battery savings;
-it is not Axle's settlement figure.
+it is not Axle's settlement figure. A day with at least one event that has an
+estimate shows its earnings, £0 included; a day with no events shows no
+earnings line, and a day whose event has no estimate shows `unknown`, never £0.
 
 Outcome is `delivered` at 90% or more of committed energy, `partial` at 10% or
 more, `missed` below 10%, `cancelled` if the event was cancelled, and `unknown`

@@ -371,7 +371,7 @@ def _print_costs(stats: RangeStats, *, show_slots: bool) -> None:
         f"({totals.cost_coverage:.1%})"
     )
     for day, earnings in stats.axle_earnings_by_day:
-        if earnings == 0:  # Only days an event touched.
+        if earnings == 0 and day not in stats.axle_event_days:  # Only days an event touched.
             continue
         print(f"Axle earnings (estimated) {day}: {_stats_money(earnings)}")
     rate = stats.axle.delivery_rate
