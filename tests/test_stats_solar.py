@@ -93,3 +93,15 @@ def test_non_finite_range_error_is_unknown():
     result = solar_accuracy(compute_stats(rows, start, start + 2 * HALF_HOUR, TZ), forecasts)
     assert result.coverage == 1
     assert result.mae_kwh is result.bias_kwh is None
+
+
+def test_a_distributed_gap_share_is_not_scored_as_measured_solar():
+    start, _ = day_bounds(date(2026, 1, 2), TZ.key)
+    rows = [LedgerSlot(slot_start=start, components={
+        "solar_generation": ComponentFlow(kwh=2, provenance="distributed"),
+    })]
+    forecast = [SolarForecastSlot(start=start, p50_kwh=2, p10_kwh=1, p90_kwh=3)]
+    result = solar_accuracy(compute_stats(rows, start, start + HALF_HOUR, TZ), forecast)
+    [slot] = result.slots
+    assert slot.measured_kwh is slot.error_kwh is slot.band_hit is None
+    assert result.scored_slots == 0

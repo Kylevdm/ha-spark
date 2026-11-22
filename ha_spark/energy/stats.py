@@ -67,10 +67,18 @@ def compute_stats(
 def _energise(buckets: tuple[StatsBucket, ...]) -> StatsResult:
     covered = [row for bucket in buckets if (row := bucket.slot) is not None
                and row.house_load_kwh is not None and row.base_load_kwh is not None]
+
+    def component(name: str) -> float | None:
+        # V2L is outside the load balance: a covered slot can lack it, and then
+        # the range has no V2L total rather than a partial one.
+        flows = [row.components.get(name) for row in covered]
+        if any(flow is None or flow.kwh is None and flow.reason != "not_configured"
+               for flow in flows):
+            return None
+        return _total(flow.kwh for flow in flows if flow is not None)
+
     totals = EnergyTotals(
-        components_kwh={name: _total(
-            row.components[name].kwh for row in covered if name in row.components
-        ) for name in COMPONENTS},
+        components_kwh={name: component(name) for name in COMPONENTS},
         house_load_kwh=_total(row.house_load_kwh for row in covered),
         base_load_kwh=_total(row.base_load_kwh for row in covered),
     )
@@ -262,9 +270,17 @@ def _price_slot(bucket: StatsBucket, previous: SlotCost | None, axle: float | No
             baseline_remaining -= previous.inputs.no_battery_import_kwh
         cap = row.session_remaining_kwh
         if cap is not None:
-            # The snapshot may already account for prior slots; cap, don't subtract again.
+            # A later snapshot already accounts for prior slots; cap, don't subtract again.
+            baseline_cap = cap
+            prior = previous.inputs if within_hour and previous is not None else None
+            if (prior is not None and prior.rates.revision_id == row.revision_id
+                    and prior.rates.session_id == row.session_id
+                    and prior.rates.session_remaining_kwh == cap):
+                # The same snapshot priced the first half: spend its balance once.
+                cap -= prior.free_import_kwh
+                baseline_cap -= prior.no_battery_free_import_kwh
             remaining = min(remaining, cap)
-            baseline_remaining = min(baseline_remaining, cap)
+            baseline_remaining = min(baseline_remaining, baseline_cap)
         free = min(imported, max(0.0, remaining))
         baseline_free = min(baseline_import, max(0.0, baseline_remaining))
 
@@ -483,9 +499,18 @@ def summarise(
                                    _sum_costs(costs.slots[left:right]), index(stop) - index(cursor))
             buckets.append(RangeBucket(label, totals))
             cursor, left = stop, right
+    earnings = costs.axle_earnings_by_day
+    for outcome in costs.axle.events:
+        # Calendar buckets hold only recorded rows: a window without rows is still unknown.
+        if outcome.outcome != "cancelled" and outcome.earnings_gbp is None:
+            at = max(start, outcome.event.start.astimezone(UTC))
+            last = min(end, outcome.event.end.astimezone(UTC))
+            while at < last:
+                earnings[at.astimezone(tz).date()] = None
+                at += HALF_HOUR
     return RangeStats(
         tuple(buckets), _range_totals(energy, costs, max(0, index(end))), costs.axle,
-        tuple(costs.axle_earnings_by_day.items()),
+        tuple(sorted(earnings.items())),
     )
 
 
@@ -609,7 +634,8 @@ def load_accuracy(
             actual_kwh=actual if complete else None, error_kwh=error,
             median_forecast_kwh=forecast.median_total_kwh,
             median_error_kwh=median_error, covered_slots=len(covered),
-            total_slots=len(expected),
+            # Coverage counts only the part of the day the range reaches (up to now).
+            total_slots=sum(instant in by_instant for instant in expected),
         ))
         daily_errors.setdefault(forecast.model, [])
         shape_errors.setdefault(forecast.model, [])
@@ -693,7 +719,9 @@ def solar_accuracy(
     for bucket in result.buckets:
         forecast = by_start.get(bucket.start.astimezone(UTC))
         flow = bucket.slot.components.get("solar_generation") if bucket.slot is not None else None
-        measured = flow.kwh if flow is not None and flow.provenance != "absent" else None
+        # An even split of a gap's delta is not a measured half-hour shape.
+        measured = (flow.kwh if flow is not None
+                    and flow.provenance not in ("absent", "distributed") else None)
         if measured is not None and not math.isfinite(measured):
             measured = None
         error = None

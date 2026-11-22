@@ -392,3 +392,12 @@ def test_history_fails_closed_when_axle_history_is_unreadable(tmp_path, monkeypa
     _, body = _axle_history(tmp_path, monkeypatch, unreadable)
     assert body["unavailable"]["statistics"] == "ledger_unreadable"
     assert body["range_totals"]["actual_cost"] is None
+
+
+def test_history_pricing_context_before_the_first_instant_is_a_400_not_a_500(tmp_path):
+    params = {"resolution": "month", "from": "0001-01-01T00:00:00+00:00",
+              "to": "0001-02-01T00:00:00+00:00"}
+    with owner_client(_state(tmp_path, timezone="UTC")) as client:
+        response = client.get("/api/history", params=params)
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid history range"}

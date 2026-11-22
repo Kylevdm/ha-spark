@@ -990,6 +990,8 @@ def build_app(
                     if start < end:
                         midnight = household_midnight(local_start).astimezone(UTC)
                         start = midnight + (start - midnight) // HALF_HOUR * HALF_HOUR
+                    # The statistics read also uses the preceding slot as pricing context.
+                    (start - HALF_HOUR).astimezone(tz)
                 except (ValueError, OverflowError):
                     return invalid
 

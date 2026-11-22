@@ -344,6 +344,7 @@ def test_csv_tolerates_header_variants_and_bom() -> None:
     "0.5,2026-06-01T01:00:00Z,2026-06-01T00:30:00Z",
     "nan,2026-06-01T00:30:00Z,2026-06-01T01:00:00Z",
     "-1,2026-06-01T00:30:00Z,2026-06-01T01:00:00Z",
+    "0.5,2026-06-01T00:30:00Z,2026-06-02T00:30:00Z",  # not a half-hour
 ])
 def test_csv_rejects_bad_rows(bad_row: str) -> None:
     text = (

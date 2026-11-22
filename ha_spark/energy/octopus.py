@@ -295,6 +295,9 @@ def parse_octopus_csv(text: str) -> list[ConsumptionInterval]:
                 interval_end=_to_utc(row[end_col]).isoformat(),
                 consumption=row[kwh_col],
             ).interval()
+            # Meter history is half-hourly; any other span is a malformed row.
+            if reading.end - reading.start != timedelta(minutes=30):
+                raise ValueError
             intervals.append(reading)
     except (KeyError, TypeError, ValueError, OverflowError, csv.Error):
         # The physical line, so blank lines and quoted line breaks don't shift it.

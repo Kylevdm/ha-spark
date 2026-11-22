@@ -149,3 +149,13 @@ def test_missing_or_future_forecast_is_not_scored():
     assert load_accuracy(result, [], TZ).days == ()
     future = forecast(day, issued=datetime.combine(day, time(12), TZ))
     assert load_accuracy(result, [future], TZ).days == ()
+
+
+def test_current_day_load_coverage_counts_only_the_elapsed_slots():
+    day = date(2026, 6, 1)
+    rows, start, _ = rows_for(day, TZ)
+    now = start + 10 * HALF_HOUR  # The range is clamped to now, as on every surface.
+    accuracy = load_accuracy(compute_stats(rows, start, now, TZ), [forecast(day)], TZ)
+    [scored] = accuracy.days
+    assert scored.covered_slots == scored.total_slots == 10
+    assert scored.actual_kwh is scored.error_kwh is None  # A daily error needs the whole day.

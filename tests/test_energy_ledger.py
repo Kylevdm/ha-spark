@@ -11,7 +11,7 @@ import respx
 from ha_spark.config import Settings
 from ha_spark.energy import energy_ledger
 from ha_spark.energy.energy_ledger import EnergyLedger, capture_rates
-from ha_spark.energy.models import FlexibilityEvent, FreeSession
+from ha_spark.energy.models import FlexibilityEvent, FreeSession, PricePoint
 from tests.test_readiness_ledger import START, revision
 
 HALF_HOUR = timedelta(minutes=30)
@@ -72,7 +72,8 @@ async def test_boundary_delta_and_inverted_export_are_write_once(tmp_path):
     ("12", START, "kWh", "stale"),
     ("12", CLOSE, "W", "not_a_counter"),
     ("12", CLOSE, None, "not_a_counter"),
-    ("12", CLOSE + timedelta(seconds=1), "kWh", "future_report_time"),
+    # Reported after the boundary's sampling window: too late for this slot.
+    ("12", CLOSE + timedelta(minutes=5, seconds=1), "kWh", "future_report_time"),
     ("-1", CLOSE, "kWh", "invalid_kwh"),
 ])
 @respx.mock
@@ -108,6 +109,20 @@ async def test_missed_boundary_distributes_and_next_slot_uses_reading(tmp_path):
     assert rows[2].components["grid_import"].kwh == 1
 
 
+
+@respx.mock
+async def test_report_during_the_ticks_control_work_is_still_the_boundary_reading(tmp_path):
+    # The ledger reads after replan and control steps; a sensor that reported in
+    # between is inside the boundary's sampling window, not from the future.
+    settings = settings_for(tmp_path)
+    ledger = EnergyLedger(settings.db_path)
+    counter("sensor.grid_import", ("10", START), ("12", CLOSE + timedelta(seconds=20)))
+    for tick in (START, CLOSE):
+        await ledger.record_boundary(settings, tick, capture_rates(settings, tick, revision()))
+    [row] = await ledger.slots(START, CLOSE)
+    assert (row.components["grid_import"].kwh, row.components["grid_import"].provenance) == (
+        2, "boundary")
+
 @pytest.mark.parametrize("provider", ["dynamic", "octopus_intelligent"])
 @respx.mock
 async def test_provider_fallback_is_not_history(tmp_path, provider):
@@ -119,6 +134,31 @@ async def test_provider_fallback_is_not_history(tmp_path, provider):
     assert row.import_rate is row.export_rate is None
     assert "provider_rate_unavailable" in row.exclusions
 
+
+@pytest.mark.parametrize(("points", "priced"), [
+    (((START, CLOSE),), True),
+    (((START - HALF_HOUR, CLOSE + HALF_HOUR),), True),
+    (((START + timedelta(minutes=10), CLOSE),), False),
+    (((START, START + timedelta(minutes=15)), (START + timedelta(minutes=15), CLOSE)), False),
+])
+@respx.mock
+async def test_intelligent_unit_rates_price_only_a_wholly_covered_slot(tmp_path, points, priced):
+    settings = settings_for(tmp_path, tariff_provider="octopus_intelligent")
+    rev = revision()
+    inputs = replace(rev.run.inputs, dynamic_prices=tuple(
+        PricePoint(start, end, 0.1) if i == 0 else PricePoint(start, end, 0.3)
+        for i, (start, end) in enumerate(points)
+    ))
+    rev = replace(rev, run=replace(rev.run, inputs=inputs))
+    ledger = EnergyLedger(settings.db_path)
+    counter("sensor.grid_import", ("10", CLOSE))
+    await ledger.record_boundary(settings, CLOSE, capture_rates(settings, CLOSE, rev))
+    [row] = await ledger.slots(START, CLOSE)
+    if priced:
+        assert (row.import_rate, row.exclusions) == (0.1, ())
+    else:
+        assert row.import_rate is row.export_rate is None
+        assert row.exclusions == ("provider_rate_unavailable",)
 
 @pytest.mark.parametrize("kind", ["free_electricity", "happy_hour"])
 @respx.mock

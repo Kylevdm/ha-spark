@@ -219,8 +219,13 @@ async def read_grid_import(
 
 async def read_counter(
     rest: HomeAssistantRest | None, entity_id: str, now: datetime, *, assume_kwh: bool = False,
+    future_limit: datetime | None = None,
 ) -> CounterResult:
-    """Read one validated cumulative energy counter; only allowance assumes kWh."""
+    """Read one validated cumulative energy counter; only allowance assumes kWh.
+
+    ``future_limit`` (default ``now``) is the latest report time accepted, for a
+    caller that samples within a window after ``now``.
+    """
     entity_id = entity_id.strip()
     if not entity_id:
         return CounterResult(None, "not_configured")
@@ -230,10 +235,12 @@ async def read_counter(
         state = await rest.get_state(entity_id)
     except Exception:  # noqa: BLE001 - an unreadable entity is not a measurement
         return CounterResult(None, "unreadable")
-    return _counter_from_state(state, now, assume_kwh=assume_kwh)
+    return _counter_from_state(state, now, assume_kwh=assume_kwh, future_limit=future_limit)
 
 
-def _counter_from_state(state: EntityState, now: datetime, *, assume_kwh: bool) -> CounterResult:
+def _counter_from_state(
+    state: EntityState, now: datetime, *, assume_kwh: bool, future_limit: datetime | None = None,
+) -> CounterResult:
     raw = str(state.state).strip()
     if raw.lower() in ("", "unknown", "unavailable"):
         return CounterResult(None, "unavailable")
@@ -253,7 +260,7 @@ def _counter_from_state(state: EntityState, now: datetime, *, assume_kwh: bool) 
         return CounterResult(None, "missing_report_time")
     reported = reported.astimezone(UTC)
     age = (now.astimezone(UTC) - reported).total_seconds()
-    if age < 0:
+    if reported > (future_limit or now).astimezone(UTC):
         return CounterResult(None, "future_report_time")
     if age > GRID_IMPORT_MAX_AGE.total_seconds():
         return CounterResult(None, "stale")

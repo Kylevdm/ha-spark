@@ -188,3 +188,18 @@ def test_gap_fill_and_backfill_rows_price_only_with_captured_rates(provenance, e
     [slot] = cost_stats(compute_stats([filled], START, START + HALF_HOUR, UTC)).slots
     assert slot.reason == reason
     assert (slot.actual_cost is None) == (reason is not None)
+
+
+def test_one_remaining_snapshot_is_spent_once_across_the_booking_hour():
+    # Both halves were captured from the same revision with r = 4 kWh left.
+    rates = happy_hour(session_suppressed_by="no_purchase_room", session_remaining_kwh=4)
+    rows = [
+        row(imported=3, house=3, solar=0, exported=0, **rates),
+        row(START + HALF_HOUR, imported=4, house=4, solar=0, exported=0, **rates),
+    ]
+    result = cost_stats(compute_stats(rows, START, START + 2 * HALF_HOUR, UTC))
+    first, second = result.slots
+    assert first.inputs is not None and second.inputs is not None
+    assert first.inputs.free_import_kwh + second.inputs.free_import_kwh == 4
+    assert (first.inputs.no_battery_free_import_kwh
+            + second.inputs.no_battery_free_import_kwh) == 4

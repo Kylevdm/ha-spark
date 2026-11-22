@@ -136,9 +136,12 @@ async def test_day_close_fills_gaps_without_overwriting_boundary_or_rates(tmp_pa
     assert second.components["grid_export"].provenance == "distributed"
     assert second.import_rate is second.export_rate is None
     assert second.exclusions == ("no_rate_capture",)
-    assert last.components["grid_export"].kwh == 3
-    assert last.components["grid_export"].provenance == "statistics_fill"
-    assert last.house_load_kwh == last.base_load_kwh == 3
+    # The export gap's fill covers only one of its two slots: both keep their
+    # distributed shares, which still sum to the counter's 2 kWh delta.
+    assert last.components["grid_export"].kwh == 1
+    assert last.components["grid_export"].provenance == "distributed"
+    assert second.components["grid_export"].kwh + last.components["grid_export"].kwh == 2
+    assert last.house_load_kwh == last.base_load_kwh == 5
     assert (last.import_rate, last.export_rate, last.revision_id) == (0.2, 0.05, "A")
 
 

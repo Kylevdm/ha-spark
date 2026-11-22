@@ -172,10 +172,20 @@ def capture_rates(settings: Settings, now: datetime, revision: PlanRevision | No
         if not in_export_event and i < len(schedule.export_prices) else schedule.export_rate
     )
     provider = settings.tariff_provider
+    # One live price interval must cover the whole closed slot: a mid-slot
+    # revision's explicit price may cover only its remaining minutes.
+    overlapping = [p for p in run.inputs.dynamic_prices if p.start < boundary and p.end > start]
+    covered = bool(overlapping) and len({p.price for p in overlapping}) == 1 and all(
+        p.start <= start and p.end >= boundary for p in overlapping
+    )
+    whole_slot = run.inputs.now is None or run.inputs.now <= start
     exclusions: tuple[str, ...] = ()
     if (
-        provider == "dynamic" and (i >= len(explicit) or explicit[i] is None)
-        or provider == "octopus_intelligent" and run.inputs.live_rates is None
+        provider == "dynamic" and (
+            i >= len(explicit) or explicit[i] is None or not (whole_slot or covered)
+        )
+        # Intelligent prices come from the unit-rate feed, else from agreement rates.
+        or provider == "octopus_intelligent" and not covered and run.inputs.live_rates is None
     ):
         exclusions = ("provider_rate_unavailable",)
     elif not (math.isfinite(import_rate) and math.isfinite(export_rate)):
@@ -293,7 +303,12 @@ class EnergyLedger:
                     for name, spec in configured.items():
                         entity_id = spec.entity_id.strip()
                         try:
-                            result = await read_counter(rest, entity_id, now)
+                            # The read runs after the tick's control work: accept a
+                            # report from the boundary's sampling window, not later.
+                            result = await read_counter(
+                                rest, entity_id, now,
+                                future_limit=boundary + BOUNDARY_TOLERANCE,
+                            )
                         except Exception:  # noqa: BLE001 - e.g. an unconvertible report time
                             result = CounterResult(None, "unreadable")
                         if result.reading is None:
@@ -480,7 +495,8 @@ class EnergyLedger:
             if meta is None:
                 continue
             fine = await statistics_during_period(url, token, entity, start,
-                                                  period="5minute", timeout=timeout)
+                                                  period="5minute", timeout=timeout,
+                                                  end_time=end)
             unit = statistic_unit(meta)
             field = "mean" if unit in POWER_FACTORS else "change"
             try:
@@ -504,9 +520,51 @@ class EnergyLedger:
         async with aiosqlite.connect(self.db_path) as db:
             await db.executescript(_SCHEMA)
             await db.execute("BEGIN IMMEDIATE")
+            partial = await _partly_filled_runs(db, start, end, fills)
             for instant, changes in fills.items():
-                await _merge_slot(db, instant, changes, ("absent", "distributed"), missing)
+                # A distributed run's shares sum to its counter delta: replace them
+                # all or none, so a partial fill never double counts the gap.
+                keep = {name: flow for name, flow in changes.items()
+                        if (name, instant) in partial}
+                full = {name: flow for name, flow in changes.items() if name not in keep}
+                if full:
+                    await _merge_slot(db, instant, full, ("absent", "distributed"), missing)
+                if keep:
+                    await _merge_slot(db, instant, keep, ("absent",), missing)
             await db.commit()
+
+
+async def _partly_filled_runs(
+    db: aiosqlite.Connection, start: datetime, end: datetime,
+    fills: dict[datetime, dict[str, ComponentFlow]],
+) -> set[tuple[str, datetime]]:
+    """(component, slot) pairs in a multi-slot reading gap the fill does not wholly cover."""
+    partial: set[tuple[str, datetime]] = set()
+    for name in {name for changes in fills.values() for name in changes}:
+        async with db.execute(
+            "SELECT boundary FROM energy_ledger_readings WHERE component = ? AND boundary <= ? "
+            "ORDER BY boundary DESC LIMIT 1", (name, start.astimezone(UTC).isoformat()),
+        ) as cursor:
+            first = await cursor.fetchone()
+        async with db.execute(
+            "SELECT boundary FROM energy_ledger_readings WHERE component = ? AND boundary > ? "
+            "ORDER BY boundary", (name, start.astimezone(UTC).isoformat()),
+        ) as cursor:
+            previous = datetime.fromisoformat(first[0]) if first is not None else None
+            async for (key,) in cursor:
+                boundary = datetime.fromisoformat(key)
+                if previous is not None and boundary - previous > HALF_HOUR:
+                    run = []
+                    at = previous
+                    while at < boundary:
+                        run.append(at)
+                        at += HALF_HOUR
+                    if not all(name in fills.get(slot, {}) for slot in run):
+                        partial.update((name, slot) for slot in run)
+                if boundary >= end:
+                    break
+                previous = boundary
+    return partial
 
 
 # None marks a completed day; failed days carry their next attempt time.

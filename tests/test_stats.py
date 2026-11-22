@@ -52,3 +52,19 @@ def test_totals_only_use_covered_slots_and_reject_overflow(values, expected):
     assert result.totals.base_load_kwh == expected
     assert result.totals.components_kwh["grid_import"] == expected
     assert result.totals.components_kwh["grid_export"] is None
+
+
+def test_v2l_total_is_unknown_when_a_covered_slot_lacks_it():
+    def slot(i, v2l):
+        return LedgerSlot(
+            slot_start=START + i * HALF_HOUR,
+            components={"grid_import": ComponentFlow(kwh=1, provenance="boundary"), "v2l": v2l},
+            house_load_kwh=1, base_load_kwh=1,
+        )
+
+    rows = [slot(0, ComponentFlow(kwh=2, provenance="boundary")),
+            slot(1, ComponentFlow(reason="unavailable"))]
+    result = compute_stats(rows, START, START + 2 * HALF_HOUR, TZ)
+    assert result.energy_coverage == 1
+    assert result.totals.components_kwh["grid_import"] == 2
+    assert result.totals.components_kwh["v2l"] is None
