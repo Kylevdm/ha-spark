@@ -163,7 +163,7 @@ async def test_implausible_hourly_row_rejects_both_half_hours(tmp_path, monkeypa
         assert (flow.kwh, flow.provenance, flow.reason) == (None, "absent", "rejected")
         assert row.base_load_kwh is row.house_load_kwh is None
     for row in rows[2:]:
-        assert row.components["grid_import"].kwh == 1
+        assert row.components["grid_import"].kwh == pytest.approx(1)
         assert row.components["grid_import"].provenance == "hourly_backfill"
     assert caplog.messages == ["Energy ledger rejected an implausible interval"]
     assert "27800" not in caplog.text

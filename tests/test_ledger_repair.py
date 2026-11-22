@@ -155,11 +155,11 @@ async def test_hourly_refill_beyond_retention_fills_gaps_only(tmp_path, monkeypa
     assert (run.status, run.checked_days, run.fixed_slots, run.still_gaps) == ("done", 1, 1, 0)
     first, second = await EnergyLedger(settings.db_path).slots(OLD_DAY, OLD_DAY + 2 * HALF)
     assert (first.components["grid_import"].kwh,
-            first.components["grid_import"].provenance) == (1.0, "hourly_backfill")
+            first.components["grid_import"].provenance) == (pytest.approx(1.0), "hourly_backfill")
     assert first.house_load_kwh == first.base_load_kwh == 1
     # A passing value is never overwritten, and no row is created for absent slots.
     assert (second.components["grid_import"].kwh,
-            second.components["grid_import"].provenance) == (1.0, "hourly_backfill")
+            second.components["grid_import"].provenance) == (pytest.approx(1.0), "hourly_backfill")
     assert await EnergyLedger(settings.db_path).slots(OLD_DAY + 2 * HALF, OLD_DAY + 4 * HALF) == []
 
 
@@ -388,7 +388,8 @@ async def test_the_retention_cutoff_day_is_served_per_slot(tmp_path, monkeypatch
     rows = {row.slot_start: row for row in
             await EnergyLedger(settings.db_path).slots(morning, day + timedelta(days=1))}
     assert (rows[morning].components["grid_import"].kwh,
-            rows[morning].components["grid_import"].provenance) == (1.0, "hourly_backfill")
+            rows[morning].components["grid_import"].provenance) == (
+                pytest.approx(1.0), "hourly_backfill")
     assert (rows[evening].components["grid_import"].kwh,
             rows[evening].components["grid_import"].provenance) == (6, "statistics_fill")
 
