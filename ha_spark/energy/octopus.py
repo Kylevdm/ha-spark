@@ -31,6 +31,7 @@ import httpx
 from pydantic import (
     AwareDatetime,
     BaseModel,
+    ConfigDict,
     Field,
     StrictBool,
     StrictStr,
@@ -271,69 +272,129 @@ def parse_octopus_csv(text: str) -> list[ConsumptionInterval]:
 
     Header names drift across export vintages (`` Consumption (kwh)`` vs
     ``Consumption (kWh)``, leading spaces, ordering), so columns are matched by
-    normalized prefix. Unparsable rows are skipped (counted in a warning).
+    normalized prefix. One invalid row rejects the whole export.
     """
-    reader = csv.DictReader(io.StringIO(text.lstrip("﻿")))
-    fieldnames = list(reader.fieldnames or [])
+    reader = csv.DictReader(io.StringIO(text.lstrip("﻿")), strict=True)
+    try:
+        fieldnames = list(reader.fieldnames or [])
+    except csv.Error:
+        raise ValueError("Unrecognized Octopus CSV header") from None
     kwh_col = _find_column(fieldnames, "consumption")
     start_col = _find_column(fieldnames, "start")
     end_col = _find_column(fieldnames, "end")
     if not (kwh_col and start_col and end_col):
-        raise ValueError(
-            f"Unrecognized Octopus CSV header: {fieldnames!r} "
-            "(expected Consumption/Start/End columns)"
-        )
+        raise ValueError("Unrecognized Octopus CSV header (expected Consumption/Start/End)")
 
     intervals: list[ConsumptionInterval] = []
-    skipped = 0
-    for row in reader:
-        try:
-            intervals.append(
-                ConsumptionInterval(
-                    start=_to_utc(str(row[start_col])),
-                    end=_to_utc(str(row[end_col])),
-                    kwh=float(str(row[kwh_col]).strip()),
-                )
-            )
-        except (KeyError, TypeError, ValueError):
-            skipped += 1
-    if skipped:
-        log.warning("Skipped %d unparsable CSV row(s)", skipped)
+    try:
+        for row in reader:
+            if None in row or None in row.values():
+                raise ValueError
+            reading = _ConsumptionReading(
+                interval_start=_to_utc(row[start_col]).isoformat(),
+                interval_end=_to_utc(row[end_col]).isoformat(),
+                consumption=row[kwh_col],
+            ).interval()
+            # Meter history is half-hourly; any other span is a malformed row.
+            if reading.end - reading.start != timedelta(minutes=30):
+                raise ValueError
+            intervals.append(reading)
+    except (KeyError, TypeError, ValueError, OverflowError, csv.Error):
+        # The physical line, so blank lines and quoted line breaks don't shift it.
+        raise ValueError(f"Unrecognized Octopus CSV row {reader.line_num}") from None
     return intervals
 
 
-def _parse_api_results(results: Any) -> list[ConsumptionInterval]:
-    intervals: list[ConsumptionInterval] = []
-    for item in results or []:
-        if not isinstance(item, dict):
-            continue
+class _ConsumptionReading(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+    start: AwareDatetime = Field(validation_alias="interval_start")
+    end: AwareDatetime = Field(validation_alias="interval_end")
+    kwh: float = Field(validation_alias="consumption", ge=0)
+
+    @field_validator("start", "end", mode="before")
+    @classmethod
+    def _iso_time(cls, value: object) -> datetime:
+        if not isinstance(value, str):
+            raise ValueError("time must be ISO text")
+        return datetime.fromisoformat(value)
+
+    @field_validator("kwh", mode="before")
+    @classmethod
+    def _not_boolean(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("consumption must be numeric")
+        return value
+
+    def interval(self) -> ConsumptionInterval:
+        start, end = self.start.astimezone(UTC), self.end.astimezone(UTC)
+        if end <= start:
+            raise ValueError("invalid interval")
+        return ConsumptionInterval(start, end, self.kwh)
+
+
+ConsumptionReadReason = Literal["request_failed", "invalid_payload", "offsite_next_url"]
+
+
+class ConsumptionReadError(OctopusApiError):
+    """A fixed reason that can be carried into meter history health."""
+
+    def __init__(self, reason: ConsumptionReadReason) -> None:
+        self.reason = reason
+        super().__init__(f"Octopus consumption {reason.replace('_', ' ')}")
+
+
+# 1500 half-hours a page covers decades of history; a cursor that never ends stops here.
+_MAX_CONSUMPTION_PAGES = 500
+
+
+def _consumption_page(
+    payload: object, *, strict: bool,
+) -> tuple[list[ConsumptionInterval], str | None]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        raise ValueError
+    rows = []
+    for item in payload["results"]:
         try:
-            intervals.append(
-                ConsumptionInterval(
-                    start=_to_utc(str(item["interval_start"])),
-                    end=_to_utc(str(item["interval_end"])),
-                    kwh=float(item["consumption"]),
-                )
-            )
-        except (KeyError, TypeError, ValueError):
-            continue
-    return intervals
+            row = _ConsumptionReading.model_validate(item).interval()
+            if row.end - row.start != timedelta(minutes=30):
+                raise ValueError
+        except (ValueError, OverflowError):
+            if strict:
+                raise
+            continue  # The `pull-consumption` CLI keeps skipping bad items.
+        rows.append(row)
+    next_url = payload.get("next")
+    if next_url is not None and (not isinstance(next_url, str) or not next_url):
+        raise ValueError
+    return rows, next_url
 
 
 async def fetch_consumption(
-    settings: Settings, *, period_from: datetime, period_to: datetime | None = None
+    settings: Settings, *, period_from: datetime, period_to: datetime | None = None,
+    strict: bool = False,
 ) -> list[ConsumptionInterval]:
-    """Pull half-hourly consumption from the Octopus REST API (paginated)."""
+    """Pull half-hourly consumption from the Octopus REST API (paginated).
+
+    ``strict`` rejects the whole pull if any item is invalid; otherwise bad items are skipped.
+    """
     if not (settings.octopus_api_key and settings.octopus_mpan and settings.octopus_meter_serial):
         raise OctopusApiError(
             "Octopus API not configured: set OCTOPUS_API_KEY, OCTOPUS_MPAN and "
             "OCTOPUS_METER_SERIAL"
         )
 
-    url = (
-        f"{settings.octopus_api_url.rstrip('/')}/electricity-meter-points/"
-        f"{settings.octopus_mpan}/meters/{settings.octopus_meter_serial}/consumption/"
-    )
+    try:
+        base = httpx.URL(settings.octopus_api_url)
+        if base.scheme not in {"http", "https"} or not base.host or base.userinfo:
+            raise ValueError
+        prefix = base.path.rstrip("/") + "/"
+        url = base.copy_with(
+            path=(f"{prefix}electricity-meter-points/{settings.octopus_mpan}/"
+                  f"meters/{settings.octopus_meter_serial}/consumption/"),
+            query=None, fragment=None,
+        )
+    except (httpx.InvalidURL, ValueError):
+        raise ConsumptionReadError("request_failed") from None
     params: dict[str, str] = {
         "period_from": period_from.astimezone(UTC).isoformat(),
         "page_size": "1500",
@@ -344,21 +405,39 @@ async def fetch_consumption(
 
     intervals: list[ConsumptionInterval] = []
     auth = httpx.BasicAuth(settings.octopus_api_key, "")
-    async with httpx.AsyncClient(auth=auth, timeout=settings.ha_timeout) as client:
-        next_url: str | None = url
-        next_params: dict[str, str] | None = params
-        while next_url:
+    async with httpx.AsyncClient(
+        auth=auth, timeout=settings.ha_timeout, trust_env=False,
+    ) as client:
+        url = url.copy_merge_params(params)
+        visited: set[httpx.URL] = set()
+        while url not in visited and len(visited) < _MAX_CONSUMPTION_PAGES:
+            visited.add(url)
             try:
-                response = await client.get(next_url, params=next_params)
+                response = await client.get(url)
                 response.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise OctopusApiError(f"Octopus API request failed: {exc}") from exc
-            payload = response.json()
-            intervals.extend(_parse_api_results(payload.get("results")))
-            # `next` is an absolute URL carrying the cursor; params ride along once.
-            next_url = payload.get("next")
-            next_params = None
-    return intervals
+            except (httpx.HTTPError, httpx.InvalidURL):
+                raise ConsumptionReadError("request_failed") from None
+            try:
+                rows, next_url = _consumption_page(response.json(), strict=strict)
+            except (ValueError, OverflowError, RecursionError):
+                raise ConsumptionReadError("invalid_payload") from None
+            intervals.extend(rows)
+            if next_url is None:
+                return intervals
+            # Never send Basic Auth to an origin or path chosen by the response.
+            try:
+                url = httpx.URL(next_url)
+            except httpx.InvalidURL:
+                raise ConsumptionReadError("offsite_next_url") from None
+            if (
+                (url.scheme, url.host, url.port) != (base.scheme, base.host, base.port)
+                or url.userinfo or url.fragment or not url.path.startswith(prefix)
+                or {".", ".."}.intersection(url.path.split("/"))
+                or "\\" in url.path or "%" in url.path
+                or b"%" in url.raw_path.partition(b"?")[0]
+            ):
+                raise ConsumptionReadError("offsite_next_url")
+    raise ConsumptionReadError("invalid_payload")  # Repeated cursor or too many pages.
 
 
 def _parse_rate_results(results: Any) -> list[PricePoint]:

@@ -1,7 +1,7 @@
 """Slot-of-day load profile: median kWh per local half-hour slot, weekday/weekend.
 
 Pure functions — the deterministic v2 load model, and the baseline the ML
-model (ml.py) must beat in `forecast-eval` before `load_model: auto` uses it.
+model (ml.py) must beat in `energy/eval.py` before `load_model: auto` uses it.
 """
 
 from __future__ import annotations

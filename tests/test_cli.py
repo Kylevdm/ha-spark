@@ -152,125 +152,48 @@ def test_notify_test_without_target_exits_nonzero(
     assert "notify_service" in capsys.readouterr().err
 
 
-async def test_backtest_rates_seeded_store(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_backtest_points_to_stats_and_does_nothing_else(
+    capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from datetime import UTC, datetime, time, timedelta
-    from types import SimpleNamespace
-
-    from ha_spark.energy.models import ConsumptionInterval
-    from ha_spark.energy.store import ConsumptionStore
-    from ha_spark.energy.tariff import TariffSchedule
-
-    settings = Settings(db_path=str(tmp_path / "test.db"), timezone="UTC")
-    start = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) - timedelta(days=1)
-    async with ConsumptionStore(settings.db_path) as store:
-        await store.upsert(
-            [ConsumptionInterval(start, start + timedelta(minutes=30), 2.0)], "test"
-        )
-
-    # The backtest costs stored import against the *live* plan schedule (the
-    # dynamic cheap pattern can't be reconstructed from stored kWh alone).
-    schedule = TariffSchedule(
-        cheap_rate=0.10,
-        standard_rate=0.30,
-        export_rate=0.0,
-        window_hours=6.0,
-        window_start=time(23, 30),
+    assert _cmd_backtest() == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "backtest has been retired; use `ha-spark stats --range day`.\n"
     )
 
-    async def fake_current_plan(
-        _settings: Settings, _rest: object, **_kw: object
-    ) -> object:
-        return SimpleNamespace(schedule=schedule)
 
-    monkeypatch.setattr(cli, "current_plan", fake_current_plan)
-
-    assert await _cmd_backtest(settings, days=7) == 0
-    out = capsys.readouterr().out
-    assert "Grid import backtest" in out
-    assert "2.00 kWh" in out
-
-
-async def test_backtest_empty_store_errors(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_backtest_command_still_parses_days_without_loading_settings(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # An empty store short-circuits before any live HA read.
-    settings = Settings(db_path=str(tmp_path / "empty.db"))
-    assert await _cmd_backtest(settings, days=7) == 2
-    assert "No stored consumption" in capsys.readouterr().err
+    def no_settings(**_: object) -> Settings:
+        raise AssertionError("backtest must not load settings")
+
+    monkeypatch.setattr(cli, "load_settings", no_settings)
+    assert cli.main(["backtest", "--days", "7"]) == 2
+    assert "ha-spark stats --range day" in capsys.readouterr().err
 
 
-async def test_forecast_eval_no_recorded_forecasts_errors(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_forecast_eval_points_to_stats_and_does_nothing_else(
+    capsys: pytest.CaptureFixture[str]
 ) -> None:
-    settings = Settings(ha_url="http://ha.test", ha_token="t", db_path=str(tmp_path / "empty.db"))
-    assert await _cmd_forecast_eval(settings, days=14) == 2
-    assert "No recorded forecasts" in capsys.readouterr().err
-
-
-async def test_forecast_eval_reports_accuracy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    from datetime import UTC, datetime, timedelta
-
-    from ha_spark.energy.ledger import ForecastLedger
-
-    # Relative to now so the forecast stays inside the rolling --days window.
-    target = (datetime.now(UTC) - timedelta(days=2)).date()
-    run_at = datetime.now(UTC) - timedelta(days=3)
-    target_midnight = datetime(target.year, target.month, target.day, tzinfo=UTC)
-    target_start_ms = int(target_midnight.timestamp() * 1000)
-
-    settings = Settings(ha_url="http://ha.test", ha_token="t", db_path=str(tmp_path / "test.db"))
-    async with ForecastLedger(settings.db_path) as ledger:
-        await ledger.record_forecast(run_at, target, "median", 20.0, None, "median of 7d")
-
-    async def fake_stats(*args: object, **kwargs: object) -> list[dict[str, object]]:
-        return [{"start": target_start_ms, "change": 22.0}]
-
-    monkeypatch.setattr(cli, "statistics_during_period", fake_stats)
-    assert await _cmd_forecast_eval(settings, days=14) == 0
-    out = capsys.readouterr().out
-    assert "median" in out
-    assert "MAE" in out
-
-
-def test_forecast_eval_legacy_database_output_unchanged(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    import sqlite3
-    from datetime import UTC, datetime, timedelta
-
-    from ha_spark.energy.eval import evaluate, format_eval
-    from ha_spark.energy.models import ForecastRecord
-
-    issued = datetime.now(UTC) - timedelta(days=3)
-    target = (issued + timedelta(days=1)).date()
-    midnight = datetime.combine(target, datetime.min.time(), tzinfo=UTC)
-    settings = Settings(
-        ha_url="http://ha.test", ha_token="t", timezone="UTC",
-        db_path=str(tmp_path / "legacy.db"),
+    assert _cmd_forecast_eval() == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "forecast-eval has been retired; use `ha-spark stats --range day`.\n"
     )
-    with sqlite3.connect(settings.db_path) as conn:
-        conn.execute(
-            "CREATE TABLE forecasts (made_at TEXT NOT NULL, target_date TEXT NOT NULL, "
-            "model TEXT NOT NULL, total_kwh REAL NOT NULL, slots_json TEXT, "
-            "source TEXT NOT NULL, PRIMARY KEY (target_date, model))"
-        )
-        conn.execute("INSERT INTO forecasts VALUES (?, ?, ?, ?, ?, ?)",
-                     (issued.isoformat(), target.isoformat(), "median", 20.0, None, "old"))
-    legacy = [ForecastRecord(issued, target, "median", 20.0, None, "old")]
-    expected = format_eval(evaluate(legacy, {target: 22.0}), 14) + "\n"
 
-    async def stats(*args: object, **kwargs: object) -> list[dict[str, object]]:
-        return [{"start": midnight.timestamp() * 1000, "change": 22.0}]
 
-    monkeypatch.setattr(cli, "statistics_during_period", stats)
-    monkeypatch.setattr(cli, "load_settings", lambda: settings)
-    for _ in range(2):
-        assert cli.main(["forecast-eval", "--days", "14"]) == 0
-        assert capsys.readouterr().out == expected
+def test_forecast_eval_command_still_parses_days_without_loading_settings(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def no_settings(**_: object) -> Settings:
+        raise AssertionError("forecast-eval must not load settings")
+
+    monkeypatch.setattr(cli, "load_settings", no_settings)
+    assert cli.main(["forecast-eval", "--days", "99"]) == 2
+    assert "ha-spark stats --range day" in capsys.readouterr().err
 
 
 def _ctx_args(**kw: object) -> argparse.Namespace:

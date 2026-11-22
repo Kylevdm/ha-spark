@@ -66,7 +66,7 @@ them.
 >   less than grid import (scheduling it waits on plugged-in sensing), and
 >   ha-spark asks you to start V2L when an Axle export slot would otherwise go
 >   unfunded. ha-spark never switches V2L itself.
-> - Observe plan previews, readiness evidence and savings backtests
+> - Observe plan previews, readiness evidence and measured battery savings
 > - onboarding, the NL copilot, and an optional API that external agents can
 >   use to read data and trigger gated actions (`agent_surface`)
 > - a read-only companion integration (0.26.0). It shows the plan, the plan
@@ -179,12 +179,11 @@ back costs £0.83/kWh and the planner skips the slot. The plan then reports
 the SoC the event would need at its start to fund every slot
 ([#214](https://github.com/Kylevdm/ha-spark/issues/214)).
 
-ha-spark doesn't yet record what each event earned. In v1 it will estimate
-each event's earnings from its own measurements, as the grid export measured
-during the event times the event rate. The estimate will count as a credit in
-the day's cost and in battery savings
-([#373](https://github.com/Kylevdm/ha-spark/issues/373)). Until then, the
-savings backtest covers grid import under your tariff, not Axle payments.
+ha-spark records each accepted Axle event and estimates its earnings from its
+own measurements, as the grid export measured during the event times the event
+rate. The estimate counts as a credit in the day's cost and in battery savings
+([#373](https://github.com/Kylevdm/ha-spark/issues/373)); it is not Axle's own
+settlement figure.
 
 ### Axle roadmap
 
@@ -211,9 +210,7 @@ Open work on the feature itself:
 - per-inverter current limits in place of one hard-coded model limit
   ([#241](https://github.com/Kylevdm/ha-spark/issues/241));
 - counting a V2L refill from the car when funding an event
-  ([#188](https://github.com/Kylevdm/ha-spark/issues/188));
-- estimating what each event earned and counting it in the day's cost
-  ([#373](https://github.com/Kylevdm/ha-spark/issues/373)).
+  ([#188](https://github.com/Kylevdm/ha-spark/issues/188)).
 
 ## Road to v1.0.0
 
@@ -271,14 +268,15 @@ statistics ledger (12), chat (13), the API for other apps (14), Solis parity
    parser, so it needs no cloud service and cannot issue a hardware command.
 2. **You choose the operating mode when you're ready.** ha-spark starts in
    Observe, which plans and logs `[SIMULATE]` writes without touching hardware.
-   `ha-spark backtest` prices your recorded grid import under your tariff, and
-   the plan report can show your existing charge-needed template sensor next
-   to ha-spark's figure. Protect owns only battery-to-car holds and optional
-   clock-change sync; Optimise runs the full plan, including the supply guard,
-   fallback charging schedule and supervised Axle export. Only an owner can
-   change modes, from the ingress mode page or with `ha-spark mode set protect`
-   or `ha-spark mode set optimise`, with the daemon running. Settings and
-   agents cannot change it; standalone/dev mode changes are CLI-only.
+   `ha-spark stats --range day` shows measured costs and battery savings from
+   the energy ledger, and the plan report can show your existing charge-needed
+   template sensor next to ha-spark's figure. Protect owns only battery-to-car
+   holds and optional clock-change sync; Optimise runs the full plan,
+   including the supply guard, fallback charging schedule and supervised Axle
+   export. Only an owner can change modes, from the ingress mode page or with
+   `ha-spark mode set protect` or `ha-spark mode set optimise`, with the daemon
+   running. Settings and agents cannot change it; standalone/dev mode changes
+   are CLI-only.
 
 ## How it compares
 
@@ -294,7 +292,7 @@ made each decision, without configuring an optimization framework.
 | Actuates hardware itself | ❌ user wires automations | ✅ | ✅ with guard rails (SoC validity, read-back, failure isolation) |
 | Setup effort | YAML + sensor templates + REST commands | YAML; docs assume HA/file-editing fluency | add-on + `ha-spark onboard` proposes entity mappings |
 | Explains decisions in plain language | ❌ | ❌ | ✅ local LLM over the deterministic plan |
-| Try-before-trust mode | ❌ | partial (read-only mode) | ✅ Observe mode + savings backtest |
+| Try-before-trust mode | ❌ | partial (read-only mode) | ✅ Observe mode + measured battery savings |
 | Cloud dependence | none | none (paid cloud version exists) | none, by design |
 
 ## Non-goals
@@ -374,13 +372,12 @@ python -m ha_spark ask "why is it charging to 80% tonight?"
 
 Other commands: `onboard` (propose entity mappings), `generate-dashboard`,
 `backfill-load` (import or derive load history), `import-csv` and
-`pull-consumption` (load grid-import history for backtests), `backtest`,
-`forecast-eval`, `context`, `learn-factors`, `v2l`, `solis sync-clock`, and
+`pull-consumption` (load grid-import meter history for reconciliation in
+`stats`), `stats`, `context`, `learn-factors`, `v2l`, `solis sync-clock`, and
 `run` (the daemon). ha-spark reads its configuration from environment variables
 or `.env` (see `.env.example`). The add-on reads `/data/options.json` instead.
 
-In v1, `backtest` and `forecast-eval` fold into a new `stats` command,
-`plan --apply` is retired, `run` becomes the replan request (today's
+In v1, `plan --apply` is retired, `run` becomes the replan request (today's
 `run --once`; the bare daemon becomes the add-on's entry point), and
 `solis sync-clock` becomes a device-generic `clock sync`
 ([#364](https://github.com/Kylevdm/ha-spark/issues/364#issuecomment-6241994831)).

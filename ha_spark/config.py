@@ -693,7 +693,7 @@ class Settings(BaseSettings):
 
     # Weather-aware ML load model (Phase 6B; needs the [habits] extra).
     # "median" = slot-profile only; "ml" = always prefer the ML model when it can
-    # run; "auto" = use ML only once forecast-eval shows it beating the median
+    # run; "auto" = use ML only once energy/eval.py shows it beating the median
     # over the trailing 14 days (safe default: degrades to median until then).
     load_model: Annotated[Literal["median", "ml", "auto"], _metadata("addon")] = Field(
         default="auto"

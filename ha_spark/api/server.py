@@ -52,7 +52,13 @@ from ha_spark.api.contract import (
     snapshot_acceptable,
     version_refusal,
 )
-from ha_spark.api.history import bucket_starts, history_payload
+from ha_spark.api.history import (
+    add_range_details,
+    add_statistics,
+    bucket_starts,
+    history_payload,
+    read_statistics_evidence,
+)
 from ha_spark.api.native_apply import snapshot_soc
 from ha_spark.api.site_pairing import load_pairing, save_pairing
 from ha_spark.api.snapshot_v4 import parse_snapshot_v4
@@ -79,11 +85,14 @@ from ha_spark.daemon_channel import Request as DaemonRequest
 from ha_spark.devices.execution import execution_context
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome
 from ha_spark.energy import v2l
+from ha_spark.energy.axle_events import AxleEvent, window_evidence
 from ha_spark.energy.carbon import carbon_payload
+from ha_spark.energy.energy_ledger import EnergyLedger, LedgerSlot
 from ha_spark.energy.forecast import load_timezone
 from ha_spark.energy.models import ChargePlan, ExportIntent
 from ha_spark.energy.plan_run import StoredPlanRun
 from ha_spark.energy.publish import plan_to_payload
+from ha_spark.energy.readiness_measurements import HALF_HOUR
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.solar_forecasts import recorded_solar
 from ha_spark.energy.solar_measured import MeasuredSolar
@@ -93,6 +102,7 @@ from ha_spark.energy.solar_source import (
     parse_native_forecast,
     save_solar_source_kind,
 )
+from ha_spark.energy.stats import Resolution, range_bounds, summarise
 from ha_spark.energy.topology_record import for_site, load_topology_record
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.integration_discovery import IntegrationDiscovery
@@ -559,6 +569,15 @@ def _agent_router(state: AppState) -> APIRouter:
     async def health_() -> tools.HealthResult:
         return await tools.get_health(state.settings)
 
+    @router.get("/statistics", dependencies=[Depends(_Gate(state, "get_statistics"))])
+    async def statistics(range: str, at: str | None = None) -> tools.StatisticsResult:
+        try:
+            return await tools.get_statistics(state.settings, range, at)
+        except tools.StatisticsInputError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        except tools.StatisticsUnavailable:
+            raise HTTPException(status_code=503, detail="statistics unavailable") from None
+
     @router.get("/context", dependencies=[Depends(_Gate(state, "get_context"))])
     async def context() -> tools.ContextResult:
         return await tools.get_context(state.settings)
@@ -895,44 +914,131 @@ def build_app(
 
         @app.get("/api/history")
         async def get_history(request: Request) -> JSONResponse:
-            """Recorded and measured solar: `slot`, today only, display-only."""
+            """Read-only ledger statistics, with the plan view's solar series at slot resolution."""
             params = request.query_params
-            if params.get("resolution") != "slot":
+            kind = params.get("range")
+            requested = params.get("resolution")
+            if kind is None and requested not in ("slot", "day", "month"):
                 return JSONResponse({"error": "unsupported resolution"}, status_code=400)
+            resolution = cast(Resolution, requested)
             invalid = JSONResponse({"error": "invalid history range"}, status_code=400)
-            st = _state_of(request)
-            tz = load_timezone(st.settings.timezone)
-            now = datetime.now(tz)
-            midnight = household_midnight(now).astimezone(UTC)
-            # Omitted bounds mean "today so far", so the browser never has to
-            # work out the household's midnight offset itself.
-            try:
-                start = (datetime.fromisoformat(params["from"]) if "from" in params
-                         else midnight)
-                end = datetime.fromisoformat(params["to"]) if "to" in params else now
-                if start.tzinfo is None or end.tzinfo is None:
-                    return invalid  # an instant needs its offset; naive times are refused
-                start, end = start.astimezone(UTC), end.astimezone(UTC)
-            except (ValueError, OverflowError):
-                return invalid
-            if start < midnight or end > now.astimezone(UTC) or start > end:
-                return JSONResponse(
-                    {"error": "history range must be inside today"}, status_code=400
-                )
-            # The midnight grid, from the half-hour holding `from`.
-            starts = [at for at in bucket_starts(midnight, end)
-                      if at + timedelta(minutes=30) > start]
-            try:
-                recorded = await recorded_solar(st.settings.db_path, starts)
-            except Exception:  # noqa: BLE001 - the series degrades, never 500s the view
-                log.warning("Recorded solar forecast read failed")
-                recorded = {}
-            measured = await solar_reader.read(
-                st.settings, starts[0] if starts else start, end,
-            )
-            return JSONResponse(history_payload(
-                starts, recorded, tz, measured.reason, measured.values, now.astimezone(UTC),
-            ), headers={"Cache-Control": "no-store"})
+            settings = _state_of(request).settings
+            tz = load_timezone(settings.timezone)
+            now = datetime.now(tz).astimezone(UTC)
+            ledger = EnergyLedger(settings.db_path)
+            ledger_failed = forecast_failed = False
+            calendar = None
+            if kind is not None:
+                if (kind not in ("day", "week", "month", "year", "all")
+                        or any(key in params for key in ("resolution", "from", "to"))
+                        or len(params.getlist("range")) > 1 or len(params.getlist("at")) > 1):
+                    return invalid
+                today = now.astimezone(tz).date()
+                try:
+                    raw_at = params.get("at", today.isoformat())
+                    at = date.fromisoformat(raw_at)
+                    if at.isoformat() != raw_at or at > today:
+                        return invalid
+                    start, stop = range_bounds(kind, at, tz)
+                    # The statistics read also uses the preceding slot as pricing context.
+                    (start - HALF_HOUR).astimezone(tz)
+                    if kind == "all":  # Like the CLI, All time always ends now.
+                        at = today
+                        start, stop = range_bounds(kind, at, tz)
+                except (ValueError, OverflowError):
+                    return invalid
+                if kind == "all":
+                    try:
+                        first_slot = await ledger.first_slot()
+                        if first_slot is not None and first_slot.utcoffset() is None:
+                            raise ValueError("naive ledger instant")
+                        first, stop = range_bounds(kind, at, tz, first_slot=first_slot)
+                        (first - HALF_HOUR).astimezone(tz)
+                        start = first
+                    except Exception:  # noqa: BLE001 - fail closed on unreadable ledger bounds
+                        log.warning("Energy ledger read failed")
+                        ledger_failed = True
+                end = min(stop, now)
+                resolution = ("slot" if kind == "day" else "day" if kind in ("week", "month")
+                              else "month")
+                calendar = {
+                    "kind": kind, "at": at.isoformat(), "today": today.isoformat(),
+                    "from": start.astimezone(tz).isoformat(), "to": end.astimezone(tz).isoformat(),
+                }
+            else:
+                try:
+                    if "from" in params:
+                        start = datetime.fromisoformat(params["from"])
+                    elif resolution == "slot":
+                        # Preserve the plan view's implicit "today so far" request.
+                        start = household_midnight(now.astimezone(tz))
+                    else:
+                        return invalid
+                    end = datetime.fromisoformat(params["to"]) if "to" in params else now
+                    if start.tzinfo is None or end.tzinfo is None:
+                        return invalid
+                    start, end = start.astimezone(UTC), end.astimezone(UTC)
+                    if not start <= end <= now:
+                        return invalid
+                    local_start = start.astimezone(tz)
+                    last_day = (end - timedelta(microseconds=1) if end > start else end
+                                ).astimezone(tz).date()
+                    days = (last_day - local_start.date()).days + 1
+                    if (resolution == "slot" and days > 1) or (resolution == "day" and days > 366):
+                        return invalid
+                    # The household grid includes the half-hour holding `from`.
+                    if start < end:
+                        midnight = household_midnight(local_start).astimezone(UTC)
+                        start = midnight + (start - midnight) // HALF_HOUR * HALF_HOUR
+                    # The statistics read also uses the preceding slot as pricing context.
+                    (start - HALF_HOUR).astimezone(tz)
+                except (ValueError, OverflowError):
+                    return invalid
+
+            rows: list[LedgerSlot] = []
+            events: list[AxleEvent] = []
+            event_rows: list[LedgerSlot] = []
+            if not ledger_failed:
+                try:
+                    # One slot earlier is pricing context for a Happy Hour spanning `from`.
+                    rows = await ledger.slots(start - HALF_HOUR, end)
+                    # Costs without the Axle credits they owe would be wrong: fail closed.
+                    events, event_rows = await window_evidence(settings.db_path, start, end)
+                except Exception:  # noqa: BLE001 - unreadable storage degrades the series
+                    log.warning("Energy ledger read failed")
+                    rows = []
+                    ledger_failed = True
+            starts = bucket_starts(start, end) if resolution == "slot" else []
+            recorded: dict[datetime, float] = {}
+            measured: dict[datetime, float] = {}
+            measured_reason: str | None = "slot_resolution_only"
+            if resolution == "slot" and calendar is not None:
+                measured_reason = "plan_view_only"
+            elif resolution == "slot":
+                try:
+                    recorded = await recorded_solar(settings.db_path, starts)
+                except Exception:  # noqa: BLE001 - the series degrades, never 500s the view
+                    log.warning("Recorded solar forecast read failed")
+                    forecast_failed = True
+                solar = await solar_reader.read(settings, start, end)
+                measured, measured_reason = solar.values, solar.reason
+
+            def render() -> JSONResponse:
+                payload = history_payload(starts, recorded, tz, measured_reason, measured, now)
+                stats = summarise(rows, start, end, tz, resolution, events, event_rows=event_rows)
+                add_statistics(payload, stats, resolution, ledger_failed=ledger_failed,
+                               forecast_failed=forecast_failed, calendar=calendar is not None)
+                if calendar is not None:
+                    # The readers decode their results after SQLite returns. Keep that work,
+                    # which can span years for All time, off the daemon's loop too.
+                    evidence = asyncio.run(
+                        read_statistics_evidence(settings.db_path, start, end, tz),
+                    )
+                    payload["range"] = calendar
+                    add_range_details(payload, stats, rows, start, end, tz, resolution, evidence)
+                return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+            return await asyncio.to_thread(render)
 
     @app.get("/api/health")
     async def health(request: Request) -> dict[str, Any]:
