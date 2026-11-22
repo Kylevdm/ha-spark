@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.42.0
+
+- **Implausible energy intervals are rejected (#750).** Every energy-ledger
+  write — boundary readings, the daily statistics fill and the hourly backfill
+  — rejects an interval whose energy exceeds the site's import/export limit
+  (plus 25%, or a fixed 30 kW with no limit set) times the interval's length.
+  A rejected interval is stored as a gap marked `rejected`, so a counter
+  reset's recovery spike no longer distorts daily or weekly statistics, and a
+  later fill can still recover the gap. Normal intervals are untouched.
+
+- **Daily energy-ledger sweep (#751).** Once a day ha-spark re-checks the last
+  seven stored days against the plausibility rule. Any stored interval a
+  counter reset's recovery spike slipped into — including history written
+  before the rule existed — becomes a gap marked `rejected`, so the daily
+  statistics fill retries it and daily or weekly statistics stop reporting the
+  spike. Intervals that pass are never touched, and the sweep is idempotent.
+
+- **Statistics data repair (#752).** Settings → Statistics data adds an
+  owner-only "Repair data" button, and `ha-spark repair-stats` runs the same
+  job from the CLI. One run at a time (a second request is refused while one
+  runs), it re-checks all stored ledger history against the plausibility
+  rule, clears values that fail it as rejected gaps, and re-fills gaps from
+  Home Assistant statistics — five-minute where retained, hourly otherwise —
+  without touching values that pass or any captured rate. Each run reports
+  "checked X days, fixed Y slots, Z still gaps", and the section shows the
+  last run's time and result. The job writes only the stored statistics,
+  never hardware.
+
+- **Daily usage bars and a Day-view resolution toggle (#753).** Week, Month
+  and Year statistics show one bar per day — house load with import, export,
+  solar and the day's cost alongside — and the Year view switches from
+  monthly to daily bars. A day with any unmeasured completed half-hour is
+  marked partial, today's bar shows usage so far, and the coverage line counts
+  rejected intervals in any component; a partly priced day shows its cost as a
+  subtotal with its pricing coverage. The Day view gains an hourly/half-hourly
+  toggle, hourly by default and remembered per device. All time keeps its
+  monthly buckets.
+
+- **Costs for fixed tariffs with the daily load model (#754).** The energy
+  ledger captures peak, off-peak and export rates as slots close, so daily
+  statistics can show costs and battery savings. Previously recorded slots
+  are not repriced.
+
 ## 0.41.0
 
 - **Daily energy statistics (#608).** The add-on keeps a half-hourly energy

@@ -1703,6 +1703,20 @@ accuracy and meter reconciliation each show "unavailable" on their own when
 their evidence can't be read. Coverage follows the rule above, so every period
 matches `stats` exactly.
 
+#### Repair data
+
+Settings → **Statistics data** (`#/settings`) holds the owner-only "Repair
+data" button, and `ha-spark repair-stats` runs the same job from the CLI. One
+run at a time, in the background: it re-checks every stored closed day against
+the plausibility rule, turns a value that fails it into a rejected gap, and
+re-fills gaps (rejected included) from Home Assistant statistics — five-minute
+rows within retention, hourly rows beyond it. Values that pass the rule,
+captured rates and session evidence are never touched, and the job writes only
+the ledger, never hardware. The section shows the last run's time and result
+("checked X days, fixed Y slots, Z still gaps"); a failed statistics read
+ends the run with those gaps still counted, and a stale run older than six
+hours counts as failed so a new one can start.
+
 #### Meter history
 
 The background Octopus pull fetches the previous day's grid-import intervals

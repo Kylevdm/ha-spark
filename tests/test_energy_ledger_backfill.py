@@ -147,6 +147,28 @@ async def test_invalid_component_leaves_both_slots_absent_and_grid_gap_skips_hou
         assert row.base_load_kwh is row.house_load_kwh is None
 
 
+async def test_implausible_hourly_row_rejects_both_half_hours(tmp_path, monkeypatch, caplog):
+    settings = settings_for(tmp_path)
+    await record_first_slot(settings, START + 2 * HOUR)
+    fake_recorder(monkeypatch, {
+        "sensor.grid_import": ("kWh", [hour(START, change="27800"), hour(START + HOUR, change=2)]),
+    })
+    assert await ledger_backfill.backfill_energy_ledger(settings)
+    rows = await EnergyLedger(settings.db_path).slots(START, START + 2 * HOUR)
+    assert [row.slot_start for row in rows] == [
+        START, START + HALF_HOUR, START + HOUR, START + HOUR + HALF_HOUR,
+    ]
+    for row in rows[:2]:
+        flow = row.components["grid_import"]
+        assert (flow.kwh, flow.provenance, flow.reason) == (None, "absent", "rejected")
+        assert row.base_load_kwh is row.house_load_kwh is None
+    for row in rows[2:]:
+        assert row.components["grid_import"].kwh == pytest.approx(1)
+        assert row.components["grid_import"].provenance == "hourly_backfill"
+    assert caplog.messages == ["Energy ledger rejected an implausible interval"]
+    assert "27800" not in caplog.text
+
+
 async def test_no_recorder_row_leaves_database_uncreated(tmp_path, monkeypatch):
     settings = settings_for(tmp_path)
 

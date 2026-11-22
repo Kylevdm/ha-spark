@@ -19,6 +19,7 @@ from ha_spark.energy.horizon import (
     HorizonGeometry,
     compute_horizon_geometry,
     legacy_geometry,
+    parse_time,
 )
 from ha_spark.energy.models import PlannerConfig, PlannerInputs
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
@@ -342,3 +343,16 @@ def test_legacy_geometry_object_is_a_horizon_geometry() -> None:
     horizon = datetime(2026, 1, 15, 23, 30, tzinfo=UTC)
     geom = legacy_geometry(horizon, golden_cfg())
     assert isinstance(geom, HorizonGeometry)
+
+
+def test_parse_time_reads_a_validated_hhmm_config_value() -> None:
+    """The one HH:MM parser, shared by the fixed provider and the ledger."""
+    assert parse_time("23:45") == time(23, 45)
+    assert parse_time("00:00") == time(0, 0)
+
+
+def test_parse_time_has_one_definition() -> None:
+    """sources re-exports the horizon parser; there is no second copy."""
+    from ha_spark.energy import horizon, sources
+
+    assert sources.parse_time is horizon.parse_time

@@ -9,21 +9,24 @@ from __future__ import annotations
 
 import asyncio
 import math
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
-from ha_spark.config import Settings
+from ha_spark.config import FixedTariffConfig, Settings
 from ha_spark.energy.derived_base_load import (
     ComponentSpec,
     base_load_balance,
     derive_specs_from_settings,
 )
 from ha_spark.energy.forecast import load_timezone
-from ha_spark.energy.onboarding import POWER_FACTORS, statistic_unit
+from ha_spark.energy.horizon import _window_bounds, parse_time
+from ha_spark.energy.onboarding import ENERGY_FACTORS, POWER_FACTORS, statistic_unit
+from ha_spark.energy.plausibility import plausible, plausible_kw
 from ha_spark.energy.readiness_ledger import BOUNDARY_TOLERANCE, slot_start
 from ha_spark.energy.readiness_measurements import (
     COMPONENTS,
@@ -98,8 +101,55 @@ class LedgerSlot(RateEvidence):
     negative_clamped: bool = False
 
 
+def _fixed_daily_rates(
+    settings: Settings, start: datetime, revision_id: str,
+) -> RateEvidence | None:
+    """Capture the fixed supplier's flat rates when the daily model has no slot geometry.
+
+    The import rate is the time-weighted blend of the two rates over the
+    union of the slot's real overlaps with the configured cheap window —
+    half-open on absolute instants, the horizon geometry's fold=0 semantics —
+    so a slot straddling an edge is blended, the slot after the window end is
+    peak, and a slot shared by two daily instances (a 24 h window) counts
+    both halves. Consecutive instances at most tile the day, so summing
+    their overlaps never double-counts a minute.
+    """
+    try:
+        tariff = FixedTariffConfig(
+            rate_offpeak=settings.rate_offpeak_gbp_kwh,
+            rate_peak=settings.rate_peak_gbp_kwh,
+            rate_export=settings.rate_export_gbp_kwh,
+            window_start=settings.charge_window_start,
+            window_end=settings.charge_window_end,
+        )
+        rates = (tariff.rate_offpeak, tariff.rate_peak, tariff.rate_export)
+        if not all(map(math.isfinite, rates)):
+            return None
+        tz = ZoneInfo(settings.timezone)
+        local_day = start.astimezone(tz).date()
+        window_start = parse_time(tariff.window_start)
+        window_end = parse_time(tariff.window_end)
+        end = start + HALF_HOUR
+        covered = timedelta(0)
+        for offset in (-1, 0, 1):
+            day = local_day + timedelta(days=offset)
+            bounds = _window_bounds(day, window_start, window_end, tz)
+            overlap = min(bounds[1], end) - max(bounds[0], start)
+            if overlap > timedelta(0):
+                covered += overlap
+        frac = min(covered / HALF_HOUR, 1.0)
+        import_rate = tariff.rate_offpeak * frac + tariff.rate_peak * (1.0 - frac)
+        return RateEvidence(
+            revision_id=revision_id,
+            import_rate=import_rate,
+            export_rate=tariff.rate_export,
+        )
+    except Exception:  # a pathological timezone or value leaves the slot unpriced
+        return None
+
+
 def capture_rates(settings: Settings, now: datetime, revision: PlanRevision | None) -> RateEvidence:
-    """Read only the revision held before the boundary tick replans.
+    """Read the revision held before the boundary tick replans, or fixed daily rates.
 
     The horizon check below is the fence: a revision stamped just after the
     boundary by a tick that began before it still prices the closed slot.
@@ -112,6 +162,9 @@ def capture_rates(settings: Settings, now: datetime, revision: PlanRevision | No
     geometry = run.inputs.geometry_for(run.cfg)
     revision_id = revision.revision_id
     if geometry is None:
+        if settings.tariff_provider == "fixed":
+            if (rates := _fixed_daily_rates(settings, start, revision_id)) is not None:
+                return rates
         return RateEvidence(revision_id=revision_id, exclusions=("no_tariff_geometry",))
     starts = tuple(t.astimezone(UTC) for t in geometry.slot_starts)
     if start not in starts or (i := starts.index(start)) >= len(run.schedule.prices):
@@ -266,6 +319,15 @@ async def _merge_slot(
     )
 
 
+async def _claim_held(db: aiosqlite.Connection, repair_id: int) -> bool:
+    """True while the ledger-repair claim still runs; fenced per write transaction."""
+    async with db.execute(
+        "SELECT 1 FROM energy_ledger_repairs WHERE id = ? AND status = 'running'",
+        (repair_id,),
+    ) as cursor:
+        return await cursor.fetchone() is not None
+
+
 def _valid_interval(row: object, field: str, invert: bool) -> bool:
     # Reject each bad five-minute interval before readiness's reader sums six:
     # a negative interval must never cancel into a plausible half-hour.
@@ -315,13 +377,14 @@ class EnergyLedger:
                             flows[name] = ComponentFlow(reason=result.reason)
                         else:
                             readings[name] = (entity_id, spec.invert, result.reading.kwh)
-            await self._record(boundary, flows, readings, rates)
+            bound_kw = plausible_kw(settings)
+            await self._record(boundary, flows, readings, rates, bound_kw)
         except Exception:
             log.warning("Energy ledger recording failed")
 
     async def _record(
         self, boundary: datetime, flows: dict[str, ComponentFlow],
-        readings: dict[str, tuple[str, bool, float]], rates: RateEvidence,
+        readings: dict[str, tuple[str, bool, float]], rates: RateEvidence, bound_kw: float,
     ) -> None:
         start = boundary - HALF_HOUR
         start_key = start.isoformat()
@@ -335,6 +398,7 @@ class EnergyLedger:
                 if await cursor.fetchone() is not None:
                     return
             distributed: dict[datetime, dict[str, ComponentFlow]] = {}
+            rejected = False
             for name, (entity_id, invert, kwh) in readings.items():
                 async with db.execute(
                     "SELECT boundary, entity_id, invert, kwh FROM energy_ledger_readings "
@@ -353,6 +417,18 @@ class EnergyLedger:
                     flows[name] = ComponentFlow(reason="counter_reset")
                     continue
                 instant = datetime.fromisoformat(previous[0])
+                # A recovered counter reset is one delta near the lifetime
+                # reading: the reading stays the next baseline, but every slot
+                # it covers becomes a rejected gap.
+                if not plausible(delta, (boundary - instant).total_seconds(), bound_kw):
+                    rejected = True
+                    flows[name] = ComponentFlow(reason="rejected")
+                    while instant < start:
+                        distributed.setdefault(instant, {})[name] = ComponentFlow(
+                            reason="rejected",
+                        )
+                        instant += HALF_HOUR
+                    continue
                 slots = (boundary - instant) // HALF_HOUR
                 if slots == 1:
                     flows[name] = ComponentFlow(kwh=delta, provenance="boundary")
@@ -371,6 +447,8 @@ class EnergyLedger:
                 )
                 for name in COMPONENTS
             }
+            if rejected:
+                log.warning("Energy ledger rejected an implausible interval")
             for instant, changes in distributed.items():
                 await _merge_slot(db, instant, changes, ("absent",), missing)
             house, base, clamped = _derive_loads(flows)
@@ -481,13 +559,82 @@ class EnergyLedger:
             )
             await db.commit()
 
+    async def _sweep(self, start: datetime, end: datetime, bound_kw: float) -> set[datetime]:
+        """Retire implausible stored flows as rejected gaps; changed slot starts.
+
+        One transaction: rows that pass keep their byte-identical payload, and
+        captured rates and session evidence are never touched. A bad payload
+        degrades to an untouched row, never an aborted sweep.
+        """
+        if not await asyncio.to_thread(Path(self.db_path).exists):
+            return set()
+        path = await asyncio.to_thread(Path(self.db_path).resolve)
+        async with aiosqlite.connect(path.as_uri() + "?mode=rw", uri=True) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'energy_ledger_slots'",
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return set()
+            async with db.execute(
+                "SELECT slot_start, payload FROM energy_ledger_slots "
+                "WHERE slot_start >= ? AND slot_start < ? ORDER BY slot_start",
+                (start.astimezone(UTC).isoformat(), end.astimezone(UTC).isoformat()),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+            def recheck() -> tuple[list[tuple[str, str]], set[datetime], int]:
+                updates: list[tuple[str, str]] = []
+                changed: set[datetime] = set()
+                rejected = 0
+                for key, payload in rows:
+                    try:
+                        row = LedgerSlot.model_validate_json(payload)
+                        # Every stored share covers half an hour, whether a
+                        # boundary tick, a statistics fill or an hourly
+                        # backfill wrote it: one bound for all of them.
+                        flows = {
+                            name: (ComponentFlow(reason="rejected")
+                                   if flow.kwh is not None and not plausible(
+                                       flow.kwh, HALF_HOUR.total_seconds(), bound_kw)
+                                   else flow)
+                            for name, flow in row.components.items()
+                        }
+                        if flows == row.components:
+                            continue
+                        rejected += 1
+                        house, base, clamped = _derive_loads(flows)
+                        updated = row.model_copy(update={
+                            "components": flows, "house_load_kwh": house,
+                            "base_load_kwh": base, "negative_clamped": clamped,
+                        })
+                        updates.append((updated.model_dump_json(), key))
+                        changed.add(row.slot_start)
+                    except (ValueError, KeyError):
+                        continue
+                return updates, changed, rejected
+
+            updates, changed, rejected = await asyncio.to_thread(recheck)
+            if updates:
+                await db.executemany(
+                    "UPDATE energy_ledger_slots SET payload = ? WHERE slot_start = ?",
+                    updates,
+                )
+            await db.commit()
+        if rejected:
+            log.warning("Energy ledger sweep rejected %d implausible intervals", rejected)
+        return changed
+
     async def _fill_day(
         self, settings: Settings, start: datetime, end: datetime,
-        configured: dict[str, ComponentSpec],
+        configured: dict[str, ComponentSpec], *, claim: int | None = None,
     ) -> None:
         url, token, timeout = settings.ha_websocket_url, settings.auth_token, settings.ha_timeout
         metas = await list_statistic_ids(url, token, timeout=timeout)
+        bound_kw = plausible_kw(settings)
+        tz = load_timezone(settings.timezone)
         fills: dict[datetime, dict[str, ComponentFlow]] = {}
+        rejected_any = False
         for name, spec in configured.items():
             entity = spec.entity_id.strip()
             meta = next((m for m in metas if isinstance(m, dict) and
@@ -498,12 +645,40 @@ class EnergyLedger:
                                                   period="5minute", timeout=timeout,
                                                   end_time=end)
             unit = statistic_unit(meta)
-            field = "mean" if unit in POWER_FACTORS else "change"
+            if unit not in POWER_FACTORS and unit not in ENERGY_FACTORS:
+                # measurement_series refuses the unit; nothing can be measured.
+                continue
+            power = unit in POWER_FACTORS
+            field = "mean" if power else "change"
+            factor = (POWER_FACTORS if power else ENERGY_FACTORS)[unit] * (
+                -1 if spec.invert else 1
+            )
+            checked: list[dict[str, object]] = []
+            rejected_slots: set[datetime] = set()
+            for row in fine:
+                if not _valid_interval(row, field, spec.invert) or not isinstance(row, dict):
+                    continue
+                try:
+                    # The same conversion measurement_series applies, per row: an
+                    # implausible five-minute change must never be summed into
+                    # an otherwise plausible half-hour.
+                    kwh = float(row[field]) * factor * (1 / 12 if power else 1)
+                    tick = datetime.fromtimestamp(float(row["start"]) / 1000, UTC)
+                except (KeyError, TypeError, ValueError, OverflowError, OSError):
+                    checked.append(row)
+                    continue
+                if plausible(kwh, 300.0, bound_kw):
+                    checked.append(row)
+                else:
+                    # Only a row on one of the six ticks the slot's measurement
+                    # sums can reject it; an off-tick row never contributes.
+                    slot = slot_start(tick.astimezone(tz))
+                    offset = tick - slot.astimezone(UTC)
+                    tick_aligned = offset % timedelta(minutes=5) == timedelta(0)
+                    if HALF_HOUR > offset >= timedelta(0) and tick_aligned:
+                        rejected_slots.add(slot)
             try:
-                series = measurement_series(
-                    [r for r in fine if _valid_interval(r, field, spec.invert)], [],
-                    unit, spec.invert, settings.timezone,
-                )
+                series = measurement_series(checked, [], unit, spec.invert, settings.timezone)
             except ValueError:
                 continue
             for instant, measured in series.items():
@@ -512,6 +687,12 @@ class EnergyLedger:
                     fills.setdefault(instant, {})[name] = ComponentFlow(
                         kwh=measured.kwh, provenance="statistics_fill",
                     )
+            for instant in rejected_slots:
+                if start <= instant < end:
+                    rejected_any = True
+                    fills.setdefault(instant, {})[name] = ComponentFlow(reason="rejected")
+        if rejected_any:
+            log.warning("Energy ledger rejected an implausible interval")
         if not fills:
             return
         missing = {name: ComponentFlow(reason="missed_boundary" if name in configured
@@ -520,6 +701,11 @@ class EnergyLedger:
         async with aiosqlite.connect(self.db_path) as db:
             await db.executescript(_SCHEMA)
             await db.execute("BEGIN IMMEDIATE")
+            if claim is not None and not await _claim_held(db, claim):
+                # A repair's fill is void once another process reclaimed its
+                # claim; the day-close path passes no claim and is unaffected.
+                await db.rollback()
+                return
             partial = await _partly_filled_runs(db, start, end, fills)
             for instant, changes in fills.items():
                 # A distributed run's shares sum to its counter delta: replace them
@@ -539,6 +725,14 @@ async def _partly_filled_runs(
     fills: dict[datetime, dict[str, ComponentFlow]],
 ) -> set[tuple[str, datetime]]:
     """(component, slot) pairs in a multi-slot reading gap the fill does not wholly cover."""
+    # A rejected half-hour is a gap, not a measurement: only a passing fill
+    # counts as covering a distributed run.
+    covering = {
+        (name, instant)
+        for instant, changes in fills.items()
+        for name, flow in changes.items()
+        if flow.provenance == "statistics_fill"
+    }
     partial: set[tuple[str, datetime]] = set()
     for name in {name for changes in fills.values() for name in changes}:
         async with db.execute(
@@ -559,7 +753,7 @@ async def _partly_filled_runs(
                     while at < boundary:
                         run.append(at)
                         at += HALF_HOUR
-                    if not all(name in fills.get(slot, {}) for slot in run):
+                    if not all((name, slot) in covering for slot in run):
                         partial.update((name, slot) for slot in run)
                 if boundary >= end:
                     break
@@ -570,10 +764,39 @@ async def _partly_filled_runs(
 # None marks a completed day; failed days carry their next attempt time.
 _fill_attempts: dict[tuple[str, datetime], datetime | None] = {}
 
+# The daily sweep re-checks one stored week: a bound tightened since a slot was
+# written, or an older release without the rule, must not keep a spike in it.
+SWEEP_DAYS = 7
+# In memory only: a restart sweeps again, which changes nothing.
+_swept_days: dict[str, date] = {}
+
+
+async def sweep_closed_days(settings: Settings, now: datetime) -> None:
+    """Re-check the last stored week against the plausibility rule, as background work only."""
+    try:
+        tz = load_timezone(settings.timezone)
+        today = now.astimezone(tz).date()
+        if _swept_days.get(settings.db_path) == today:
+            return
+        # The last seven closed local days; this run's fills then retry any
+        # day the pass below turned into gaps.
+        start, _ = day_bounds(today - timedelta(days=SWEEP_DAYS), settings.timezone)
+        _, end = day_bounds(today - timedelta(days=1), settings.timezone)
+        changed = await EnergyLedger(settings.db_path)._sweep(start, end, plausible_kw(settings))
+        _swept_days[settings.db_path] = today
+        for slot in changed:
+            day_start, _ = day_bounds(slot.astimezone(tz).date(), settings.timezone)
+            # A done marker would keep the new gaps from ever being retried.
+            _fill_attempts.pop((settings.db_path, day_start), None)
+    except Exception:
+        log.warning("Energy ledger sweep failed")
+
 
 async def fill_closed_days(settings: Settings, now: datetime) -> None:
     """Reconcile settled days within recorder retention, as background work only."""
     try:
+        # The sweep runs before this call's fills so they retry the new gaps.
+        await sweep_closed_days(settings, now)
         configured = _configured_components(settings)
         if not configured:
             return

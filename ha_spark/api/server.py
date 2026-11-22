@@ -89,6 +89,7 @@ from ha_spark.energy.axle_events import AxleEvent, window_evidence
 from ha_spark.energy.carbon import carbon_payload
 from ha_spark.energy.energy_ledger import EnergyLedger, LedgerSlot
 from ha_spark.energy.forecast import load_timezone
+from ha_spark.energy.ledger_repair import claim_repair, last_repair, run_ledger_repair
 from ha_spark.energy.models import ChargePlan, ExportIntent
 from ha_spark.energy.plan_run import StoredPlanRun
 from ha_spark.energy.publish import plan_to_payload
@@ -214,6 +215,8 @@ class AppState:
         self.commands = CommandQueue("")
         self.loop_tick: datetime | None = None
         self.soc_observation_ok: bool = False
+        # The running owner repair job, held so it is never garbage-collected.
+        self.statistics_repair_task: asyncio.Task[None] | None = None
         # Ids of export transitions already notified (or knowingly left unsent).
         self.acknowledged_exports: set[str] = set()
         if executor is not None:
@@ -844,6 +847,61 @@ def build_app(
                 "lines": [line.text for line in reply.lines],
             })
 
+        @app.get("/api/statistics/repair")
+        async def get_statistics_repair(request: Request) -> JSONResponse:
+            """The last repair run's status and counts, read-only."""
+            try:
+                run = await last_repair(_state_of(request).settings.db_path)
+            except Exception:  # noqa: BLE001 - fixed text; the view degrades, never 500s
+                # Unreadable history must not read as "never run": the section
+                # shows the failure instead of asserting no run occurred.
+                log.warning("Statistics repair read failed")
+                return JSONResponse(
+                    {"error": "repair status unavailable"}, status_code=503,
+                    headers={"Cache-Control": "no-store"},
+                )
+            payload = None if run is None else {
+                "status": run.status, "started_at": _iso(run.started_at),
+                "finished_at": _iso(run.finished_at), "checked_days": run.checked_days,
+                "fixed_slots": run.fixed_slots, "still_gaps": run.still_gaps,
+            }
+            return JSONResponse({"last_run": payload}, headers={"Cache-Control": "no-store"})
+
+        @app.post("/api/statistics/repair")
+        async def post_statistics_repair(request: Request) -> JSONResponse:
+            """Start the owner's ledger repair as background work; one run at a time."""
+            user = _owner_request(request, "repair_stats")
+            if isinstance(user, JSONResponse):
+                user.headers["Cache-Control"] = "no-store"
+                return user
+            st = _state_of(request)
+            now = datetime.now(UTC)
+            try:
+                # The claim is one immediate local transaction: bounded, and a
+                # second request is refused here rather than racing the job.
+                repair_id = await claim_repair(st.settings.db_path, now)
+            except Exception:  # noqa: BLE001 - fixed text; never the exception's own
+                log.warning("Statistics repair could not start")
+                return JSONResponse(
+                    {"error": "repair failed"}, status_code=500,
+                    headers={"Cache-Control": "no-store"},
+                )
+            if repair_id is None:
+                return JSONResponse(
+                    {"error": "repair already running"}, status_code=409,
+                    headers={"Cache-Control": "no-store"},
+                )
+            # Never the control loop and never the daemon command channel: the
+            # job runs as its own task, its I/O never delays a tick.
+            async def _job() -> None:
+                await run_ledger_repair(st.settings, repair_id, now)
+
+            st.statistics_repair_task = asyncio.create_task(_job())
+            return JSONResponse(
+                {"status": "running"}, status_code=202,
+                headers={"Cache-Control": "no-store"},
+            )
+
         @app.get("/api/config")
         async def get_config(request: Request) -> dict[str, Any]:
             """Current user options."""
@@ -929,9 +987,16 @@ def build_app(
             ledger_failed = forecast_failed = False
             calendar = None
             if kind is not None:
+                # Only the Day view sends a resolution: hourly by default, half-hourly on
+                # request. Any other range keeps the rule that rejects stray params.
+                stray = ("from", "to") if kind == "day" else ("resolution", "from", "to")
                 if (kind not in ("day", "week", "month", "year", "all")
-                        or any(key in params for key in ("resolution", "from", "to"))
+                        or any(key in params for key in stray)
                         or len(params.getlist("range")) > 1 or len(params.getlist("at")) > 1):
+                    return invalid
+                if kind == "day" and "resolution" in params and (
+                        requested not in ("hour", "slot")
+                        or len(params.getlist("resolution")) > 1):
                     return invalid
                 today = now.astimezone(tz).date()
                 try:
@@ -959,8 +1024,10 @@ def build_app(
                         log.warning("Energy ledger read failed")
                         ledger_failed = True
                 end = min(stop, now)
-                resolution = ("slot" if kind == "day" else "day" if kind in ("week", "month")
-                              else "month")
+                if kind == "day":
+                    resolution = "slot" if requested == "slot" else "hour"
+                else:
+                    resolution = "day" if kind in ("week", "month", "year") else "month"
                 calendar = {
                     "kind": kind, "at": at.isoformat(), "today": today.isoformat(),
                     "from": start.astimezone(tz).isoformat(), "to": end.astimezone(tz).isoformat(),

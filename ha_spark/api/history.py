@@ -25,6 +25,7 @@ from ha_spark.energy.stats import (
     load_accuracy,
     meter_reconciliation,
     provenance_counts,
+    rejected_slots,
     solar_accuracy,
 )
 from ha_spark.energy.store import read_consumption
@@ -92,7 +93,7 @@ def history_payload(
 def _totals_payload(totals: RangeTotals) -> dict[str, Any]:
     payload = asdict(totals)
     return {**payload.pop("energy"), **payload, "energy_coverage": totals.energy_coverage,
-            "cost_coverage": totals.cost_coverage}
+            "cost_coverage": totals.cost_coverage, "partial": totals.partial}
 
 
 def add_statistics(
@@ -188,6 +189,7 @@ def add_range_details(
     if "statistics" not in payload["unavailable"]:
         # After a failed read the empty rows are not evidence of gaps.
         payload["provenance_counts"] = provenance_counts(result)
+        payload["rejected_slots"] = rejected_slots(result)
         payload["axle"] = {
             "delivery_rate": stats.axle.delivery_rate,
             "earnings_by_day": [
