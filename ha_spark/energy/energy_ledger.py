@@ -12,11 +12,12 @@ import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiosqlite
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
-from ha_spark.config import Settings
+from ha_spark.config import FixedTariffConfig, Settings
 from ha_spark.energy.derived_base_load import (
     ComponentSpec,
     base_load_balance,
@@ -35,7 +36,13 @@ from ha_spark.energy.readiness_measurements import (
     measurement_series,
 )
 from ha_spark.energy.session_allowance import CounterResult, read_counter
-from ha_spark.energy.tariff import HAPPY_HOUR_ALLOWANCE_KWH, HAPPY_HOUR_MARGIN, _slot_overlap
+from ha_spark.energy.sources import parse_time
+from ha_spark.energy.tariff import (
+    HAPPY_HOUR_ALLOWANCE_KWH,
+    HAPPY_HOUR_MARGIN,
+    _in_overnight_window,
+    _slot_overlap,
+)
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.ha.statistics import list_statistic_ids, statistics_during_period
 from ha_spark.logging import get_logger
@@ -98,8 +105,36 @@ class LedgerSlot(RateEvidence):
     negative_clamped: bool = False
 
 
+def _fixed_daily_rates(
+    settings: Settings, start: datetime, revision_id: str,
+) -> RateEvidence | None:
+    """Capture the fixed supplier's flat rates when the daily model has no slot geometry."""
+    try:
+        tariff = FixedTariffConfig(
+            rate_offpeak=settings.rate_offpeak_gbp_kwh,
+            rate_peak=settings.rate_peak_gbp_kwh,
+            rate_export=settings.rate_export_gbp_kwh,
+            window_start=settings.charge_window_start,
+            window_end=settings.charge_window_end,
+        )
+        local_start = start.astimezone(ZoneInfo(settings.timezone)).time()
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+    rates = (tariff.rate_offpeak, tariff.rate_peak, tariff.rate_export)
+    if not all(map(math.isfinite, rates)):
+        return None
+    offpeak = _in_overnight_window(
+        local_start, parse_time(tariff.window_start), parse_time(tariff.window_end),
+    )
+    return RateEvidence(
+        revision_id=revision_id,
+        import_rate=tariff.rate_offpeak if offpeak else tariff.rate_peak,
+        export_rate=tariff.rate_export,
+    )
+
+
 def capture_rates(settings: Settings, now: datetime, revision: PlanRevision | None) -> RateEvidence:
-    """Read only the revision held before the boundary tick replans.
+    """Read the revision held before the boundary tick replans, or fixed daily rates.
 
     The horizon check below is the fence: a revision stamped just after the
     boundary by a tick that began before it still prices the closed slot.
@@ -112,6 +147,9 @@ def capture_rates(settings: Settings, now: datetime, revision: PlanRevision | No
     geometry = run.inputs.geometry_for(run.cfg)
     revision_id = revision.revision_id
     if geometry is None:
+        if settings.tariff_provider == "fixed":
+            if (rates := _fixed_daily_rates(settings, start, revision_id)) is not None:
+                return rates
         return RateEvidence(revision_id=revision_id, exclusions=("no_tariff_geometry",))
     starts = tuple(t.astimezone(UTC) for t in geometry.slot_starts)
     if start not in starts or (i := starts.index(start)) >= len(run.schedule.prices):

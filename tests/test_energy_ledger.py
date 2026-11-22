@@ -4,6 +4,7 @@ import ast
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 import respx
@@ -12,6 +13,7 @@ from ha_spark.config import Settings
 from ha_spark.energy import energy_ledger
 from ha_spark.energy.energy_ledger import EnergyLedger, capture_rates
 from ha_spark.energy.models import FlexibilityEvent, FreeSession, PricePoint
+from ha_spark.energy.stats import summarise
 from tests.test_readiness_ledger import START, revision
 
 HALF_HOUR = timedelta(minutes=30)
@@ -62,6 +64,67 @@ async def test_boundary_delta_and_inverted_export_are_write_once(tmp_path):
     assert row.house_load_kwh == 3
     assert not row.negative_clamped
     assert (row.import_rate, row.export_rate, row.revision_id) == (0.1, 0.05, "A")
+
+
+def daily_revision():
+    rev = revision()
+    inputs = replace(rev.run.inputs, load_slots=None, horizon_start=None)
+    schedule = replace(rev.run.schedule, prices=(), cheap_fracs=())
+    return replace(rev, run=replace(rev.run, inputs=inputs, schedule=schedule))
+
+
+@pytest.mark.parametrize(("offset", "window_start", "window_end", "rate"), [
+    (-3, "23:30", "01:00", 0.125),  # Window opens at 23:30 on the household clock.
+    (0, "23:30", "01:00", 0.125),  # After midnight, at the inclusive window end.
+    (1, "23:30", "01:00", 0.25),
+    (2, "02:00", "03:00", 0.125),  # A window that doesn't wrap.
+])
+@respx.mock
+async def test_fixed_daily_tariff_prices_closed_slots(
+    tmp_path, offset, window_start, window_end, rate,
+):
+    start = START + offset * HALF_HOUR
+    close = start + HALF_HOUR
+    settings = settings_for(
+        tmp_path, tariff_provider="fixed", timezone="Europe/London",
+        charge_window_start=window_start, charge_window_end=window_end,
+        rate_offpeak_gbp_kwh=0.125, rate_peak_gbp_kwh=0.25, rate_export_gbp_kwh=0.0625,
+        derive_grid_export_entity="sensor.grid_export",
+    )
+    ledger = EnergyLedger(settings.db_path)
+    rev = daily_revision()
+    counter("sensor.grid_import", ("10", start), ("13", close), ("13", close))
+    counter("sensor.grid_export", ("2", start), ("3", close), ("3", close))
+    await ledger.record_boundary(settings, start, capture_rates(settings, start, None))
+    await ledger.record_boundary(settings, close, capture_rates(settings, close, rev))
+    changed = settings.model_copy(update={"rate_export_gbp_kwh": 0.5})
+    await ledger.record_boundary(changed, close, capture_rates(changed, close, rev))
+
+    [row] = await ledger.slots(start, close)
+    assert (row.import_rate, row.export_rate, row.revision_id) == (rate, 0.0625, "A")
+    assert row.exclusions == ()
+    assert row.import_session is row.session_id is None
+    [day] = summarise([row], start, close, ZoneInfo(settings.timezone), "day").buckets
+    assert day.totals.cost_coverage == 1
+    assert day.totals.actual_cost == 3 * rate - 0.0625
+    assert day.totals.no_battery_cost == 2 * rate
+    assert day.totals.battery_savings == 0.0625 - rate
+
+
+@pytest.mark.parametrize("overrides", [
+    {"tariff_provider": "dynamic"},
+    {"tariff_provider": "octopus_intelligent"},
+    {"charge_window_end": "25:00"},
+    {"timezone": "not/a/timezone"},
+    {"rate_export_gbp_kwh": -0.1},
+    {"rate_peak_gbp_kwh": float("inf")},
+])
+def test_daily_tariff_leaves_non_fixed_or_invalid_rates_unpriced(tmp_path, overrides):
+    settings = settings_for(tmp_path, **({"tariff_provider": "fixed"} | overrides))
+    rates = capture_rates(settings, CLOSE, daily_revision())
+    assert rates.import_rate is rates.export_rate is None
+    assert rates.revision_id == "A"
+    assert rates.exclusions == ("no_tariff_geometry",)
 
 
 @pytest.mark.parametrize(("value", "when", "unit", "reason"), [
