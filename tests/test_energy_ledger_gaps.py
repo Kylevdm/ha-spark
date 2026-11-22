@@ -200,11 +200,105 @@ async def test_boundary_committed_during_statistics_read_keeps_precedence(tmp_pa
     assert row.import_rate == RATES.import_rate
 
 
+async def test_implausible_five_minute_row_rejects_its_half_hour(
+    tmp_path, monkeypatch, caplog,
+):
+    # A counter reset's recovery is one five-minute row the size of the
+    # lifetime reading: the half-hour becomes a rejected gap, never a
+    # partially summed value.
+    settings = settings_for(tmp_path, timezone="UTC")
+    spike = five_minutes(START, count=5, change="1000") + [
+        {"start": (START + timedelta(minutes=25)).timestamp() * 1000, "change": "27800"},
+    ]
+    rows = spike + five_minutes(START + HALF_HOUR, change="1000")
+    fake_recorder(
+        monkeypatch, {"sensor.grid_import": "Wh"},
+        lambda entity, start: rows if start == START else [],
+    )
+    await energy_ledger.fill_closed_days(settings, SETTLED)
+    first, second = await EnergyLedger(settings.db_path).slots(START, END)
+    flow = first.components["grid_import"]
+    assert (flow.kwh, flow.provenance, flow.reason) == (None, "absent", "rejected")
+    assert first.house_load_kwh is None
+    assert (second.components["grid_import"].kwh,
+            second.components["grid_import"].provenance) == (6, "statistics_fill")
+    assert caplog.messages == ["Energy ledger rejected an implausible interval"]
+    assert "27800" not in caplog.text
+
+
+async def test_an_off_tick_implausible_row_does_not_reject_its_half_hour(
+    tmp_path, monkeypatch, caplog,
+):
+    # measurement_series sums only the six aligned ticks: a huge row at :01
+    # never contributes to the half-hour, so it must not reject it either.
+    settings = settings_for(tmp_path, timezone="UTC")
+    rows = five_minutes(START, change="1000") + [
+        {"start": (START + timedelta(minutes=1)).timestamp() * 1000, "change": "27800"},
+    ]
+    fake_recorder(
+        monkeypatch, {"sensor.grid_import": "Wh"},
+        lambda entity, start: rows if start == START else [],
+    )
+    await energy_ledger.fill_closed_days(settings, SETTLED)
+    [row] = await EnergyLedger(settings.db_path).slots(START, END)
+    flow = row.components["grid_import"]
+    assert (flow.kwh, flow.provenance) == (6, "statistics_fill")
+    assert caplog.messages == []
+
+
+@respx.mock
+async def test_a_rejected_fill_keeps_every_share_of_a_distributed_run(tmp_path, monkeypatch):
+    # A rejected half-hour is a gap, not a measurement: the run it sits in is
+    # not wholly covered, so both distributed shares stay, summing to the
+    # counter's 4 kWh delta rather than mixing one fill with one share.
+    settings = settings_for(tmp_path, timezone="UTC")
+    ledger = EnergyLedger(settings.db_path)
+    late = START + 2 * HALF_HOUR
+    counter("sensor.grid_import", ("10", START), ("14", late))
+    for tick in (START, late):
+        await ledger.record_boundary(settings, tick, RATES)
+    rows = (
+        five_minutes(START, change="1000")
+        + five_minutes(CLOSE, count=5, change="1000")
+        + [{"start": (CLOSE + timedelta(minutes=25)).timestamp() * 1000,
+            "change": "27800"}]
+    )
+    fake_recorder(
+        monkeypatch, {"sensor.grid_import": "Wh"},
+        lambda entity, start: rows if start == START else [],
+    )
+    await energy_ledger.fill_closed_days(settings, SETTLED)
+    first, second = await ledger.slots(START, late)
+    for row in (first, second):
+        flow = row.components["grid_import"]
+        assert (flow.kwh, flow.provenance) == (2, "distributed")
+        assert row.house_load_kwh == row.base_load_kwh == 2
+
+
+async def test_a_five_minute_mean_exactly_at_the_bound_is_filled(tmp_path, monkeypatch):
+    # 28 A x 230 V = 6.44 kW import with the export limit below it: the bound
+    # is 8.05 kW, and a mean of exactly 8.05 kW must be filled, not rejected
+    # by float rounding on either side of the comparison.
+    settings = settings_for(
+        tmp_path, timezone="UTC", supply_max_current_a=28, supply_voltage_v=230,
+    )
+    fake_recorder(
+        monkeypatch, {"sensor.grid_import": "kW"},
+        lambda entity, start: five_minutes(START, mean="8.05") if start == START else [],
+    )
+    await energy_ledger.fill_closed_days(settings, SETTLED)
+    [row] = await EnergyLedger(settings.db_path).slots(START, END)
+    flow = row.components["grid_import"]
+    assert flow.provenance == "statistics_fill"
+    assert flow.kwh == pytest.approx(8.05 / 2)
+
+
 @pytest.mark.parametrize("complete", [True, False])
 async def test_failed_day_read_retries_only_within_retention(
     tmp_path, monkeypatch, caplog, complete,
 ):
-    settings = settings_for(tmp_path, timezone="UTC")
+    # 12 kWh in one half-hour needs a 30 kW site bound to stay plausible data.
+    settings = settings_for(tmp_path, timezone="UTC", supply_max_current_a=100)
     ledger = EnergyLedger(settings.db_path)
     fail = True
 

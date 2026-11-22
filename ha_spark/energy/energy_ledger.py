@@ -23,7 +23,8 @@ from ha_spark.energy.derived_base_load import (
     derive_specs_from_settings,
 )
 from ha_spark.energy.forecast import load_timezone
-from ha_spark.energy.onboarding import POWER_FACTORS, statistic_unit
+from ha_spark.energy.onboarding import ENERGY_FACTORS, POWER_FACTORS, statistic_unit
+from ha_spark.energy.plausibility import plausible, plausible_kw
 from ha_spark.energy.readiness_ledger import BOUNDARY_TOLERANCE, slot_start
 from ha_spark.energy.readiness_measurements import (
     COMPONENTS,
@@ -315,13 +316,14 @@ class EnergyLedger:
                             flows[name] = ComponentFlow(reason=result.reason)
                         else:
                             readings[name] = (entity_id, spec.invert, result.reading.kwh)
-            await self._record(boundary, flows, readings, rates)
+            bound_kw = plausible_kw(settings)
+            await self._record(boundary, flows, readings, rates, bound_kw)
         except Exception:
             log.warning("Energy ledger recording failed")
 
     async def _record(
         self, boundary: datetime, flows: dict[str, ComponentFlow],
-        readings: dict[str, tuple[str, bool, float]], rates: RateEvidence,
+        readings: dict[str, tuple[str, bool, float]], rates: RateEvidence, bound_kw: float,
     ) -> None:
         start = boundary - HALF_HOUR
         start_key = start.isoformat()
@@ -335,6 +337,7 @@ class EnergyLedger:
                 if await cursor.fetchone() is not None:
                     return
             distributed: dict[datetime, dict[str, ComponentFlow]] = {}
+            rejected = False
             for name, (entity_id, invert, kwh) in readings.items():
                 async with db.execute(
                     "SELECT boundary, entity_id, invert, kwh FROM energy_ledger_readings "
@@ -353,6 +356,18 @@ class EnergyLedger:
                     flows[name] = ComponentFlow(reason="counter_reset")
                     continue
                 instant = datetime.fromisoformat(previous[0])
+                # A recovered counter reset is one delta near the lifetime
+                # reading: the reading stays the next baseline, but every slot
+                # it covers becomes a rejected gap.
+                if not plausible(delta, (boundary - instant).total_seconds(), bound_kw):
+                    rejected = True
+                    flows[name] = ComponentFlow(reason="rejected")
+                    while instant < start:
+                        distributed.setdefault(instant, {})[name] = ComponentFlow(
+                            reason="rejected",
+                        )
+                        instant += HALF_HOUR
+                    continue
                 slots = (boundary - instant) // HALF_HOUR
                 if slots == 1:
                     flows[name] = ComponentFlow(kwh=delta, provenance="boundary")
@@ -371,6 +386,8 @@ class EnergyLedger:
                 )
                 for name in COMPONENTS
             }
+            if rejected:
+                log.warning("Energy ledger rejected an implausible interval")
             for instant, changes in distributed.items():
                 await _merge_slot(db, instant, changes, ("absent",), missing)
             house, base, clamped = _derive_loads(flows)
@@ -487,7 +504,10 @@ class EnergyLedger:
     ) -> None:
         url, token, timeout = settings.ha_websocket_url, settings.auth_token, settings.ha_timeout
         metas = await list_statistic_ids(url, token, timeout=timeout)
+        bound_kw = plausible_kw(settings)
+        tz = load_timezone(settings.timezone)
         fills: dict[datetime, dict[str, ComponentFlow]] = {}
+        rejected_any = False
         for name, spec in configured.items():
             entity = spec.entity_id.strip()
             meta = next((m for m in metas if isinstance(m, dict) and
@@ -498,12 +518,40 @@ class EnergyLedger:
                                                   period="5minute", timeout=timeout,
                                                   end_time=end)
             unit = statistic_unit(meta)
-            field = "mean" if unit in POWER_FACTORS else "change"
+            if unit not in POWER_FACTORS and unit not in ENERGY_FACTORS:
+                # measurement_series refuses the unit; nothing can be measured.
+                continue
+            power = unit in POWER_FACTORS
+            field = "mean" if power else "change"
+            factor = (POWER_FACTORS if power else ENERGY_FACTORS)[unit] * (
+                -1 if spec.invert else 1
+            )
+            checked: list[dict[str, object]] = []
+            rejected_slots: set[datetime] = set()
+            for row in fine:
+                if not _valid_interval(row, field, spec.invert) or not isinstance(row, dict):
+                    continue
+                try:
+                    # The same conversion measurement_series applies, per row: an
+                    # implausible five-minute change must never be summed into
+                    # an otherwise plausible half-hour.
+                    kwh = float(row[field]) * factor * (1 / 12 if power else 1)
+                    tick = datetime.fromtimestamp(float(row["start"]) / 1000, UTC)
+                except (KeyError, TypeError, ValueError, OverflowError, OSError):
+                    checked.append(row)
+                    continue
+                if plausible(kwh, 300.0, bound_kw):
+                    checked.append(row)
+                else:
+                    # Only a row on one of the six ticks the slot's measurement
+                    # sums can reject it; an off-tick row never contributes.
+                    slot = slot_start(tick.astimezone(tz))
+                    offset = tick - slot.astimezone(UTC)
+                    tick_aligned = offset % timedelta(minutes=5) == timedelta(0)
+                    if HALF_HOUR > offset >= timedelta(0) and tick_aligned:
+                        rejected_slots.add(slot)
             try:
-                series = measurement_series(
-                    [r for r in fine if _valid_interval(r, field, spec.invert)], [],
-                    unit, spec.invert, settings.timezone,
-                )
+                series = measurement_series(checked, [], unit, spec.invert, settings.timezone)
             except ValueError:
                 continue
             for instant, measured in series.items():
@@ -512,6 +560,12 @@ class EnergyLedger:
                     fills.setdefault(instant, {})[name] = ComponentFlow(
                         kwh=measured.kwh, provenance="statistics_fill",
                     )
+            for instant in rejected_slots:
+                if start <= instant < end:
+                    rejected_any = True
+                    fills.setdefault(instant, {})[name] = ComponentFlow(reason="rejected")
+        if rejected_any:
+            log.warning("Energy ledger rejected an implausible interval")
         if not fills:
             return
         missing = {name: ComponentFlow(reason="missed_boundary" if name in configured
@@ -539,6 +593,14 @@ async def _partly_filled_runs(
     fills: dict[datetime, dict[str, ComponentFlow]],
 ) -> set[tuple[str, datetime]]:
     """(component, slot) pairs in a multi-slot reading gap the fill does not wholly cover."""
+    # A rejected half-hour is a gap, not a measurement: only a passing fill
+    # counts as covering a distributed run.
+    covering = {
+        (name, instant)
+        for instant, changes in fills.items()
+        for name, flow in changes.items()
+        if flow.provenance == "statistics_fill"
+    }
     partial: set[tuple[str, datetime]] = set()
     for name in {name for changes in fills.values() for name in changes}:
         async with db.execute(
@@ -559,7 +621,7 @@ async def _partly_filled_runs(
                     while at < boundary:
                         run.append(at)
                         at += HALF_HOUR
-                    if not all(name in fills.get(slot, {}) for slot in run):
+                    if not all((name, slot) in covering for slot in run):
                         partial.update((name, slot) for slot in run)
                 if boundary >= end:
                     break
