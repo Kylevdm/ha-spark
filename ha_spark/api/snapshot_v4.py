@@ -57,6 +57,8 @@ class ManualSession(FrozenModel):
     deadline: Instant | None
     return_to: Mode
     keep_protection: bool = Field(strict=True)
+    # The integration sends its #766 opt-in in every manual session (#768).
+    override_soc_trust: bool = Field(default=False, strict=True)
 
 
 class Fallback(FrozenModel):

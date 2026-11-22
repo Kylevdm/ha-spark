@@ -1200,7 +1200,8 @@
     "manual_session": {
       "deadline": "2026-10-25T06:00:00Z",
       "return_to": "optimise",
-      "keep_protection": true
+      "keep_protection": true,
+      "override_soc_trust": false
     },
     "fallback": {
       "active": true,
