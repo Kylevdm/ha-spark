@@ -291,6 +291,7 @@ def _configured_components(settings: Settings) -> dict[str, ComponentSpec]:
 async def _merge_slot(
     db: aiosqlite.Connection, start: datetime, changes: dict[str, ComponentFlow],
     replace: tuple[Provenance, ...], missing: dict[str, ComponentFlow],
+    rates: RateEvidence | None = None,
 ) -> None:
     # Read inside the caller's write transaction: a concurrently captured
     # boundary value takes precedence over either kind of fill.
@@ -308,10 +309,15 @@ async def _merge_slot(
         return
     components = row.components | updates
     house, base, clamped = _derive_loads(components)
-    updated = row.model_copy(update={
+    update: dict[str, object] = {
         "components": components, "house_load_kwh": house, "base_load_kwh": base,
         "negative_clamped": clamped,
-    })
+    }
+    if rates is not None and "no_rate_capture" in row.exclusions:
+        # A boundary value replaced a fill: its captured rates price the slot,
+        # but never overwrite rates captured earlier.
+        update |= rates.model_dump()
+    updated = row.model_copy(update=update)
     await db.execute(
         "INSERT INTO energy_ledger_slots VALUES (?, ?) "
         "ON CONFLICT(slot_start) DO UPDATE SET payload = excluded.payload",
@@ -485,14 +491,17 @@ class EnergyLedger:
             if exists:
                 # A fill reached this slot first: the boundary value replaces
                 # a fill or a gap, never another boundary value.
-                merges: tuple[tuple[Provenance, tuple[Provenance, ...]], ...] = (
-                    ("boundary", ("absent", "statistics_fill")), ("distributed", ("absent",)),
+                merges: tuple[
+                    tuple[Provenance, tuple[Provenance, ...], RateEvidence | None], ...
+                ] = (
+                    ("boundary", ("absent", "statistics_fill"), rates),
+                    ("distributed", ("absent",), None),
                 )
-                for provenance, replace in merges:
+                for provenance, replace, evidence in merges:
                     changes = {name: flow for name, flow in flows.items()
                                if flow.provenance == provenance}
                     if changes:
-                        await _merge_slot(db, start, changes, replace, missing)
+                        await _merge_slot(db, start, changes, replace, missing, evidence)
             else:
                 house, base, clamped = _derive_loads(flows)
                 row = LedgerSlot(

@@ -353,6 +353,9 @@ async def test_boundary_after_a_fill_replaces_it_and_keeps_its_reading(tmp_path,
     assert (first.components["grid_import"].kwh,
             first.components["grid_import"].provenance) == (3, "boundary")
     assert first.house_load_kwh == 3
+    # The boundary's captured rates make the replaced slot priceable again.
+    assert (first.import_rate, first.export_rate, first.revision_id) == (0.2, 0.05, "A")
+    assert first.exclusions == ()
     assert (second.components["grid_import"].kwh,
             second.components["grid_import"].provenance) == (2, "boundary")
 
