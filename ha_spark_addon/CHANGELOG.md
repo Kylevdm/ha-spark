@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.41.0
+
+- **Daily energy statistics (#608).** The add-on keeps a half-hourly energy
+  ledger of measured flows, derived loads, and the tariff rates and free
+  session evidence captured at slot close. Run `ha-spark stats --range day`
+  to see a household day's flows, totals and coverage. Missing readings are
+  shown as gaps, never filled from a forecast, and missing rates stay unpriced.
+- **Battery savings in `ha-spark stats --range day` (#609).** See actual cost,
+  no-battery cost and battery savings from measured flows and captured rates,
+  with slot inputs, formulas and separate cost coverage. Trusted Octopus Free
+  Electricity and Happy Hour credits apply to both costs, even when a hold or
+  Axle event prevented the plan from using the session. Missing measurements
+  or rates leave a slot unpriced. Standing charges are excluded; the savings
+  credit the battery and ha-spark together.
+- **Energy ledger gaps can be reconciled (#610).** A counter delta across
+  missed boundaries is spread across those half-hours and left unpriced.
+  After the household day closes, complete five-minute Home Assistant
+  statistics can fill gaps or replace those estimates without changing
+  boundary measurements or captured rates. `ha-spark stats` counts filled,
+  distributed and missing grid-import slots.
+- **Energy history before installation (#611).** ha-spark backfills up to 400
+  days from Home Assistant's hourly statistics without replacing existing
+  ledger rows. `stats` marks those half-hours as lower resolution. Usable
+  measurements count toward energy coverage, but the slots remain unpriced.
+- **Statistics over household calendar ranges (#612).** `ha-spark stats`
+  shows half-hourly, daily or monthly figures for a day, week, month, year or
+  all recorded history. The ingress history endpoint uses the same ledger
+  totals for energy flows, costs and battery savings, with separate energy
+  and cost coverage. Clock-change days keep all 46 or 50 half-hours, and the
+  plan view keeps its existing solar series.
+- **Axle event history and estimated earnings (#613).** ha-spark keeps accepted
+  export events and their rates on both add-on-owned and integration-owned
+  sites. `ha-spark stats` reports estimated daily Axle earnings and the event
+  delivery rate, and `/api/history` costs include the same credit. Earnings
+  credit actual cost and battery savings without changing the no-battery cost.
+  A cancelled event earns no credit; a gap in the ledger anywhere in an event's
+  window leaves the event without an estimate and its slots unpriced. A day
+  with an estimated event shows its earnings even at £0; a day without events
+  shows none. These estimates are not Axle settlement figures.
+- **Evening-plan solar accuracy (#614).** `ha-spark stats --range day` compares
+  measured solar with the forecast used by the last plan before the configured
+  overnight cheap window. It shows per-slot forecasts and errors, mean absolute
+  error, bias and coverage. Missing readings and forecasts stay gaps. The
+  evening-plan forecast is kept permanently; the plan view's solar line is
+  unchanged.
+- **Load forecast accuracy in `stats` (#615).** `ha-spark stats --range day`
+  now reports the active load model's daily error beside the `median`
+  baseline and a per-slot shape error, scored against the energy ledger's
+  derived base load rather than battery-polluted consumption. Readiness
+  scores the same forecasts against HA's recorder statistics instead, so its
+  MAE can differ slightly.
+- **`forecast-eval` retired (#615).** The command now prints a pointer to
+  `ha-spark stats --range day` and does nothing else. `load_model: auto`
+  still selects through the same evaluator.
+- **Octopus meter history reconciles grid import (#616).** ha-spark pulls
+  published half-hour readings in the background with the configured Octopus
+  credentials. `ha-spark health` shows the stored range and last pull, and
+  `ha-spark stats` compares ledger import with billed import only for days
+  covered by both. Meter history never fills ledger gaps. `import-csv` rejects
+  the whole import if any row is invalid.
+- **Agent `get_statistics` tool (#617).** A read-only `get_statistics(range, at)`
+  tool returns the same measured energy, cost, battery savings, Axle earnings
+  and coverage as `stats` and `/api/history`, gated at the `read` level for
+  both the `/agent/statistics` route and the MCP server.
+- **Statistics in the add-on app (#619).** See measured energy, costs and
+  Battery savings in Day, Week, Month, Year and All time views on the household
+  clock. Coverage and gap markers show what's missing or unpriced. Open a
+  half-hour to see its captured rates, any Free Electricity or Happy Hour
+  credit, and the inputs behind its costs. The screen also shows estimated Axle
+  earnings and delivery rate, forecast accuracy, and billed-meter reconciliation.
+- **`backtest` retired (#620).** The command now prints a pointer to
+  `ha-spark stats --range day` and does nothing else. `import-csv` and
+  `pull-consumption` are documented as meter-history commands for
+  reconciliation in `stats`.
+- **Statistics documentation (#620).** `ha_spark_addon/DOCS.md` describes the
+  `stats` command, the Statistics ingress screen, the energy ledger, coverage,
+  battery savings, Axle earnings and meter history end to end. README no longer
+  mentions `backtest` or `forecast-eval`.
+- **One coverage rule (#620).** `stats` and `get_statistics` now count a
+  period that contains the current time only up to now, whichever date in it
+  is asked for, as the Statistics screen and `/api/history` already did, so
+  all four give the same coverage. Past periods are unchanged.
+
 ## 0.40.0
 
 - **Daytime purchases now reach native Solis (#687).** On an integration-owned
