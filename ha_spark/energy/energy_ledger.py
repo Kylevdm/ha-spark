@@ -395,8 +395,7 @@ class EnergyLedger:
             async with db.execute(
                 "SELECT 1 FROM energy_ledger_slots WHERE slot_start = ?", (start_key,),
             ) as cursor:
-                if await cursor.fetchone() is not None:
-                    return
+                exists = await cursor.fetchone() is not None
             distributed: dict[datetime, dict[str, ComponentFlow]] = {}
             rejected = False
             for name, (entity_id, invert, kwh) in readings.items():
@@ -451,18 +450,31 @@ class EnergyLedger:
                 log.warning("Energy ledger rejected an implausible interval")
             for instant, changes in distributed.items():
                 await _merge_slot(db, instant, changes, ("absent",), missing)
-            house, base, clamped = _derive_loads(flows)
-            row = LedgerSlot(
-                **rates.model_dump(), slot_start=start,
-                components={name: flows[name] for name in COMPONENTS},
-                house_load_kwh=house, base_load_kwh=base, negative_clamped=clamped,
-            )
-            await db.execute(
-                "INSERT INTO energy_ledger_slots VALUES (?, ?) ON CONFLICT(slot_start) DO NOTHING",
-                (start_key, row.model_dump_json()),
-            )
+            if exists:
+                # A fill reached this slot first: the boundary value replaces
+                # a fill or a gap, never another boundary value.
+                merges: tuple[tuple[Provenance, tuple[Provenance, ...]], ...] = (
+                    ("boundary", ("absent", "statistics_fill")), ("distributed", ("absent",)),
+                )
+                for provenance, replace in merges:
+                    changes = {name: flow for name, flow in flows.items()
+                               if flow.provenance == provenance}
+                    if changes:
+                        await _merge_slot(db, start, changes, replace, missing)
+            else:
+                house, base, clamped = _derive_loads(flows)
+                row = LedgerSlot(
+                    **rates.model_dump(), slot_start=start,
+                    components={name: flows[name] for name in COMPONENTS},
+                    house_load_kwh=house, base_load_kwh=base, negative_clamped=clamped,
+                )
+                await db.execute(
+                    "INSERT INTO energy_ledger_slots VALUES (?, ?)",
+                    (start_key, row.model_dump_json()),
+                )
             await db.executemany(
-                "INSERT INTO energy_ledger_readings VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO energy_ledger_readings VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(component, boundary) DO NOTHING",
                 [(name, boundary.isoformat(), *reading) for name, reading in readings.items()],
             )
             await db.commit()
