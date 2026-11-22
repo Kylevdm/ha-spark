@@ -41,6 +41,7 @@ class TransitionRequest(Record):
     user_id: str | None = Field(default=None, strict=True, pattern=r"^[A-Za-z0-9_-]{1,64}$")
     duration: Duration = "one_hour"
     keep_protection: bool = Field(default=True, strict=True)
+    override_soc_trust: bool = Field(default=False, strict=True)
 
 
 @dataclass(frozen=True)
@@ -101,7 +102,10 @@ def propose_transition(
     if target == "manual":
         if mode == "observe" or manual is not None:
             return TransitionDecision(refusal="not_in_active_mode")
+        if request.override_soc_trust and request.keep_protection:
+            return TransitionDecision(refusal="soc_override_needs_handover")
         manual = ManualSession(return_to=mode, keep_protection=request.keep_protection,
+                               override_soc_trust=request.override_soc_trust,
                                deadline=manual_deadline(request.duration, now, zone, at))
         steps = ("cancel_export",) if mode == "optimise" else ()
         if not manual.keep_protection:

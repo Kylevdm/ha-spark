@@ -78,7 +78,7 @@ def async_register(hass: HomeAssistant) -> None:
         if decision.refusal is not None:
             reason = decision.refusal if decision.refusal in (
                 "not_owner", "authority_unknown", "transition_in_progress",
-                "no_manual_session", "not_in_active_mode",
+                "no_manual_session", "not_in_active_mode", "soc_override_needs_handover",
             ) else "transition_in_progress"
             raise ServiceValidationError(translation_domain=DOMAIN, translation_key=reason)
         state = decision.state
@@ -105,6 +105,7 @@ def async_register(hass: HomeAssistant) -> None:
                 vol.Optional("duration", default="one_hour"): vol.In(
                     ("one_hour", "until_tomorrow", "until_resumed")),
                 vol.Optional("keep_protection", default=True): bool,
+                vol.Optional("override_soc_trust", default=False): bool,
             })
         hass.services.async_register(DOMAIN, service, handle, schema=schema,
                                      supports_response=SupportsResponse.OPTIONAL)

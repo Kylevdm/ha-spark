@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.42.1
+
+- Manual control can now override SoC trust: start it with Keep protection off
+  and Override SoC trust on, and your own charge current and charge window
+  edits go through while battery SoC is untrusted. Limits, the supply guard and
+  read-back still apply; the planner and fallback still need trusted SoC (#766).
+
 ## 0.42.0
 
 - **Implausible energy intervals are rejected (#750).** Every energy-ledger

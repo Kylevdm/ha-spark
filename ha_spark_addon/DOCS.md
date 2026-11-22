@@ -128,6 +128,11 @@ to write and does not clear a stop latch.
 
 `start_manual_control` accepts `duration: one_hour` (default),
 `until_tomorrow` or `until_resumed`, and `keep_protection: true` by default.
+With `keep_protection: false`, `override_soc_trust: true` lets your own charge
+current and charge window edits through while battery SoC is untrusted; the
+battery's own BMS limits, the site and bank limits, the supply guard and
+read-back still apply, and the planner, fallback and dated windows still refuse
+on untrusted SoC. The override ends with the session.
 **Options → Manual control deadline** sets `manual_until_time` and
 `household_time_zone`; it affects future handovers, not an existing deadline.
 `until_tomorrow` means the next occurrence of that household-clock time.
