@@ -319,6 +319,46 @@ async def test_late_tick_does_not_open_a_ledger(tmp_path):
 
 
 @respx.mock
+async def test_counter_reset_recovery_is_rejected_and_the_next_slot_recovers(
+    tmp_path, caplog,
+):
+    # A reset stores the 0 reading as the next baseline, so the recovery delta
+    # is lifetime-sized and must become a gap, not a boundary value.
+    settings = settings_for(tmp_path)
+    ledger = EnergyLedger(settings.db_path)
+    fourth = CLOSE + 2 * HALF_HOUR
+    counter("sensor.grid_import", ("27800", START), ("0", CLOSE),
+            ("27800.5", CLOSE + HALF_HOUR), ("27801.5", fourth))
+    for tick in (START, CLOSE, CLOSE + HALF_HOUR, fourth):
+        await ledger.record_boundary(settings, tick, capture_rates(settings, tick, revision()))
+    first, reset, recovery, settled = await ledger.slots(START - HALF_HOUR, fourth)
+    assert first.components["grid_import"].reason == "no_previous_reading"
+    assert reset.components["grid_import"].reason == "counter_reset"
+    flow = recovery.components["grid_import"]
+    assert (flow.kwh, flow.provenance, flow.reason) == (None, "absent", "rejected")
+    assert recovery.house_load_kwh is None
+    assert (settled.components["grid_import"].kwh,
+            settled.components["grid_import"].provenance) == (1, "boundary")
+    assert caplog.messages == ["Energy ledger rejected an implausible interval"]
+    assert "27800" not in caplog.text
+
+
+@respx.mock
+async def test_rejected_distributed_run_marks_every_slot_a_gap(tmp_path):
+    settings = settings_for(tmp_path)
+    ledger = EnergyLedger(settings.db_path)
+    late = START + 2 * HALF_HOUR
+    counter("sensor.grid_import", ("10", START), ("27800", late))
+    for tick in (START, late):
+        await ledger.record_boundary(settings, tick, capture_rates(settings, tick, revision()))
+    first, second = await ledger.slots(START, late)
+    for row in (first, second):
+        flow = row.components["grid_import"]
+        assert (flow.kwh, flow.provenance, flow.reason) == (None, "absent", "rejected")
+        assert row.house_load_kwh is row.base_load_kwh is None
+
+
+@respx.mock
 async def test_recorder_failure_leaves_gap_and_logs_no_payload(tmp_path, monkeypatch, caplog):
     settings = settings_for(tmp_path)
     ledger = EnergyLedger(settings.db_path)
