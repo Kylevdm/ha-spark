@@ -24,6 +24,16 @@ def test_legacy_settings_bound_is_the_supply_limit_plus_a_quarter(tmp_path):
     assert plausible_kw(settings) == pytest.approx(60 * 240 / 1000 * 1.25)
 
 
+def test_a_value_exactly_at_the_bound_passes(tmp_path):
+    # 28 A x 230 V = 6.44 kW import with the export limit below it, so the
+    # bound is 8.05 kW: a value exactly there must survive float rounding on
+    # either side of the comparison, while one just over still fails.
+    bound = plausible_kw(settings_for(tmp_path, supply_max_current_a=28, supply_voltage_v=230))
+    assert bound == pytest.approx(8.05)
+    assert plausible(8.05 / 12, 300.0, bound)
+    assert not plausible(8.05 / 12 * 1.001, 300.0, bound)
+
+
 def test_a_value_just_under_the_bound_passes_and_just_over_fails(tmp_path):
     bound = plausible_kw(settings_for(tmp_path, supply_max_current_a=60, supply_voltage_v=240))
     assert plausible(bound * 0.5 - 0.001, 1800.0, bound)

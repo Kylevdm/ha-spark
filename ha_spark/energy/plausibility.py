@@ -19,6 +19,9 @@ from ha_spark.energy.topology_record import load_topology_record, select_limits
 # With no usable limit the rule still rejects lifetime-sized spikes.
 DEFAULT_PLAUSIBLE_KW = 30.0
 PLAUSIBILITY_MARGIN = 1.25
+# A value exactly at the bound passes: the comparison tolerates this tiny
+# relative epsilon so float rounding on either side never rejects it.
+PLAUSIBILITY_EPSILON = 1e-9
 
 
 def plausible_kw(settings: Settings) -> float:
@@ -45,4 +48,6 @@ def plausible(kwh: float, seconds: float, bound_kw: float) -> bool:
     """True when one interval's measured energy fits under the site bound."""
     if not (math.isfinite(kwh) and math.isfinite(seconds) and seconds > 0):
         return False
-    return kwh <= bound_kw * seconds / 3600
+    # Compare the interval's mean kW to the bound kW, with a relative epsilon:
+    # products rounded on either side must not reject a value exactly at it.
+    return kwh * 3600.0 / seconds <= bound_kw * (1.0 + PLAUSIBILITY_EPSILON)

@@ -543,7 +543,13 @@ class EnergyLedger:
                 if plausible(kwh, 300.0, bound_kw):
                     checked.append(row)
                 else:
-                    rejected_slots.add(slot_start(tick.astimezone(tz)))
+                    # Only a row on one of the six ticks the slot's measurement
+                    # sums can reject it; an off-tick row never contributes.
+                    slot = slot_start(tick.astimezone(tz))
+                    offset = tick - slot.astimezone(UTC)
+                    tick_aligned = offset % timedelta(minutes=5) == timedelta(0)
+                    if HALF_HOUR > offset >= timedelta(0) and tick_aligned:
+                        rejected_slots.add(slot)
             try:
                 series = measurement_series(checked, [], unit, spec.invert, settings.timezone)
             except ValueError:
@@ -587,6 +593,14 @@ async def _partly_filled_runs(
     fills: dict[datetime, dict[str, ComponentFlow]],
 ) -> set[tuple[str, datetime]]:
     """(component, slot) pairs in a multi-slot reading gap the fill does not wholly cover."""
+    # A rejected half-hour is a gap, not a measurement: only a passing fill
+    # counts as covering a distributed run.
+    covering = {
+        (name, instant)
+        for instant, changes in fills.items()
+        for name, flow in changes.items()
+        if flow.provenance == "statistics_fill"
+    }
     partial: set[tuple[str, datetime]] = set()
     for name in {name for changes in fills.values() for name in changes}:
         async with db.execute(
@@ -607,7 +621,7 @@ async def _partly_filled_runs(
                     while at < boundary:
                         run.append(at)
                         at += HALF_HOUR
-                    if not all(name in fills.get(slot, {}) for slot in run):
+                    if not all((name, slot) in covering for slot in run):
                         partial.update((name, slot) for slot in run)
                 if boundary >= end:
                     break
