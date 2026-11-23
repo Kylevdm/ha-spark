@@ -294,6 +294,9 @@ class PlannerInputs:
     # time. Dispatches remain the full hold source; this is purchase evidence
     # only (#697), so a live/adjusted flag alone never buys.
     dispatch_purchase_slots: tuple[DispatchSlot, ...] = ()
+    # The integration's owner opt-in (#769): a coarse dispatch hold hands its
+    # switch to the purchase window, so the dispatch purchase is no longer refused.
+    dispatch_handover: bool = False
     # False when the dispatch source could not be read (the Octopus call raised,
     # or the configured entity was missing/unavailable/unknown), so an empty
     # ``dispatches`` stops meaning both "no dispatch" and "unreadable" (#143 §3).

@@ -206,6 +206,8 @@ class DatedChargeWindow(Record):
     current_a: float = Field(ge=0, le=62.5)
     start: Instant
     end: Instant
+    # api_version 6: the window's target, so a hold handover can reclaim near it (#769).
+    target_soc_pct: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def validate_window(self) -> "DatedChargeWindow":

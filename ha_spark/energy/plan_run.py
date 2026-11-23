@@ -76,6 +76,7 @@ async def current_plan(
     limits: LoadedTopology | None = None,
     major_loads: tuple[MajorLoadObservation, ...] | None = None,
     session_cache: SessionCache | None = None,
+    dispatch_handover: bool = False,
 ) -> PlanRun:
     """Compute tonight's plan under the configured tariff provider.
 
@@ -99,6 +100,9 @@ async def current_plan(
     the daemon, the process-wide cache published by its loop is used; a
     one-off command with no daemon cache reads once and applies the same
     staleness and retention rules.
+
+    ``dispatch_handover`` is the integration's owner opt-in from its last
+    snapshot (#769); without it a coarse dispatch hold refuses the purchase.
     """
     context = execution_context()
     if limits is None:
@@ -110,6 +114,7 @@ async def current_plan(
     inputs, cfg, forecast = await gather_inputs(
         settings, rest, soc=soc, source=source, sessions=sessions,
     )
+    inputs = replace(inputs, dispatch_handover=dispatch_handover)
     schedule = build_schedule(settings, inputs, cfg)
     if selection.source == "unavailable":
         plan = compute_plan(inputs, cfg, schedule, limits_unavailable=selection.reason)

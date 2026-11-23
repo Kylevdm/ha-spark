@@ -181,7 +181,7 @@ def test_dated_charge_intent_golden():
     for model, raw in zip((DatedChargeNone, DatedChargeUntrusted, DatedChargeWindow), intents,
                           strict=True):
         assert model.model_validate(raw).model_dump(mode="json") == raw
-    built = _dated(_build(_intent(_window(0, 1, 2.0))))
+    built = _dated(_build(_intent(_window(0, 1, 2.0)), api_version=6))
     assert built == [intents[2] | {"inverter_id": "inverter"}]
 
 
@@ -207,3 +207,17 @@ async def test_add_on_owned_site_names_the_refusal(monkeypatch):
         "[REFUSED] daytime purchase: dated charge windows need an integration-owned "
         "Solis site"]
     assert result.applied_plan is plan
+
+
+@pytest.mark.parametrize("api_version", [5, 6])
+def test_the_window_target_is_sent_only_from_api_version_6(api_version):
+    # #769: a v5 integration forbids unknown fields, so the target is left out.
+    intent = _intent(_window(0, 1, 2.0), models.DatedChargeWindow(
+        START + timedelta(hours=1), START + timedelta(hours=2), 90.0, 1.0))
+    [dated] = _dated(_build(intent, api_version=api_version))
+    if api_version == 5:
+        assert "target_soc_pct" not in dated
+    else:
+        # Touching windows merge into one Slot 2: the later, higher target stands.
+        assert dated["target_soc_pct"] == 90.0
+    assert DatedChargeWindow.model_validate(dated).end == START + timedelta(hours=2)

@@ -3,16 +3,22 @@
 Requests are verified on disk before Off. Only a verified owned hold can write
 On, after restoration reads under guard.lock then native.lock. Shutdown never
 releases; an explicit removal additionally needs fresh clear evidence.
+
+A hold handed over to a purchase window (#769) leaves its switch On only while
+that window is live (``native_handover``), and takes it back before any Slot 2
+change; a failed take-back retries every tick behind a repair and a notice.
 """
 import asyncio
 from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import NAMESPACE_URL, uuid5
 
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 
-from . import notify_target
+from . import native_handover, notify_target
 from .authority_store import AuthorityState, HoldRecord
+from .const import DOMAIN
 from .native_evidence import EvidenceRead, NativeEvidence
 from .native_hold import (
     DEGRADED_AFTER,
@@ -127,6 +133,67 @@ class NativeHolds:
         self.notices.pop(key, None)
         identifier = str(uuid5(NAMESPACE_URL, f"{self.coordinator.entry.entry_id}:{key}"))
         notify_target.async_dismiss(self.coordinator.hass, f"ha_spark_hold_{identifier}")
+
+    def _reclaim_issue_id(self, inverter: Inverter) -> str:
+        key = uuid5(NAMESPACE_URL, f"{self.coordinator.entry.entry_id}:{inverter.id}")
+        return f"hold_reclaim_failed_{key}"
+
+    def _taken_back(self, inverter: Inverter) -> None:
+        """Off verified: the handover is over and its window is never handed over again."""
+        writes = self.coordinator.writes
+        handover = writes.handovers.pop(inverter.id, None)
+        writes.off_owed.discard(inverter.id)
+        if handover is not None:
+            now = dt_util.utcnow()
+            writes.reclaimed[inverter.id] = {
+                end for end in writes.reclaimed.get(inverter.id, set()) if end > now
+            } | {native_handover.minute(handover.end)}
+        ir.async_delete_issue(self.coordinator.hass, DOMAIN, self._reclaim_issue_id(inverter))
+
+    def _drop_handover(self, inverter: Inverter) -> None:
+        """No hold of ours is left: the handover and any take-back owed or repair end."""
+        self.coordinator.writes.handovers.pop(inverter.id, None)
+        self.coordinator.writes.off_owed.discard(inverter.id)
+        ir.async_delete_issue(self.coordinator.hass, DOMAIN, self._reclaim_issue_id(inverter))
+
+    def _take_back_failed(self, inverter: Inverter) -> None:
+        # shortcut: in memory only, a restart drops the repair; the hold's own notice remains.
+        if inverter.id in self.coordinator.writes.handovers:
+            # Owed until an Off is verified: no later check may call the handover live.
+            self.coordinator.writes.off_owed.add(inverter.id)
+            ir.async_create_issue(
+                self.coordinator.hass, DOMAIN, self._reclaim_issue_id(inverter),
+                is_fixable=False, severity=ir.IssueSeverity.ERROR,
+                translation_key="hold_reclaim_failed",
+                data={"entry_id": self.coordinator.entry.entry_id, "inverter_id": inverter.id})
+
+    async def async_take_back_locked(self, inverter: Inverter, mismatches: set[str]) -> bool:
+        """Before a change that ends a handover's protection: Off first.
+
+        The caller holds native.lock. Writes the switch only, under the hold's own
+        refusal (never toward Observe or in manual control without protection).
+        False only when that Off failed while the hold still stands.
+        """
+        c = self.coordinator
+        state = c.authority.state
+        if inverter.id not in c.writes.handovers:
+            return True
+        if state is None or not any(h.device == hold_device(inverter) and h.owned
+                                    for h in state.holds):
+            # Released (or unknown): no hold of ours is left to take the switch back for.
+            self._drop_handover(inverter)
+            return True
+        result = await async_write_power_locked(c.native, inverter, "off", recheck=lambda:
+            self._refusal(inverter, state, release=False))
+        if result.mismatch:
+            mismatches.add(inverter.id)
+        if result.outcome in ("applied", "unchanged"):
+            self._taken_back(inverter)
+            return True
+        if result.outcome == "refused":
+            return True
+        self._take_back_failed(inverter)
+        return False
 
     def _clear_notices(self, inverter: Inverter) -> None:
         for kind in ("apply", "degraded", "release"):
@@ -244,10 +311,16 @@ class NativeHolds:
                 if self._refusal(inverter, expected, release=False) is not None:
                     return False
                 before = polled_power(c.native, inverter, now)
-                if before is None or before != "off":
+                # A handover's switch is read fresh: a cached Off may predate its On.
+                if before != "off" or inverter.id in c.writes.handovers:
                     read = await c.native.transport(inverter).read_holding(
                         43007, 1, device_id=inverter.gateway_unit_id)
                     before = decode_power(list(read.registers)) if read.error is None else None
+                handover = c.writes.handovers.get(inverter.id)
+                if handover is not None and before != "on":
+                    if before == "off":
+                        self._taken_back(inverter)
+                    handover = None
                 # An owner's Off is not our hold. Nor can an unconfirmed request
                 # be promoted by finding Off after a restart.
                 may_create = before != "off" or any(h.confirmed and h.owned for h in records)
@@ -262,6 +335,14 @@ class NativeHolds:
                                                                          "pending_release": False})
                             if old else HoldRecord(cause="dispatch", started_at=now,
                                 trusted_end=max(ends), device=hold_device(inverter)))
+                if handover is not None:
+                    checked_at = max(now, dt_util.utcnow())
+                    if native_handover.live(c, inverter, handover, checked_at,
+                                            self.evidence.read(checked_at)):
+                        # The live window stands in for Off for every wanted cause.
+                        return await self._replace(inverter, tuple(
+                            h.model_copy(update={"confirmed": True})
+                            for h in requests.values()), expected)
                 records = tuple(h.model_copy(update={"confirmed": False}) if before != "off"
                                 else h for h in requests.values())
                 if not records:
@@ -291,12 +372,20 @@ class NativeHolds:
                     confirmed = await self._replace(inverter, records, expected)
                     if confirmed:
                         self._clear_notice("apply:" + inverter.id)
+                if inverter.id in c.writes.handovers:
+                    if result.outcome in ("applied", "unchanged"):
+                        self._taken_back(inverter)
+                    else:
+                        self._take_back_failed(inverter)
             if mismatch:
                 await c.native.async_readback_mismatch(inverter.id)
             if not confirmed:
                 await self._async_notice(inverter, expected, now, "apply",
                                          "A protection hold could not be applied.")
             return confirmed
+        # No hold wanted: a handover ends with the ordinary release.
+        if inverter.id in c.writes.handovers:
+            self._drop_handover(inverter)
         return await self._release(inverter, expected, now)
 
     async def async_release(self, now: datetime, *, removal: bool = False) -> bool:

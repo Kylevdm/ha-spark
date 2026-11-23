@@ -35,8 +35,8 @@ from ha_spark.energy.topology import MajorLoadObservation
 from ha_spark.energy.topology_record import LoadedTopology
 from ha_spark.energy.v2l import V2LSession, delivered_fraction, savings
 
-API_VERSION: Final = 5
-SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3, 4, 5})
+API_VERSION: Final = 6
+SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3, 4, 5, 6})
 
 
 class SiteSnapshot(BaseModel):
@@ -52,6 +52,8 @@ class SiteSnapshot(BaseModel):
     site_id: str = Field(strict=True)
     sent_at: AwareDatetime
     solar_forecast: object = None
+    # v6 owner opt-in (#769), read only through `dispatch_handover`; any other value refuses.
+    dispatch_handover: object = None
 
     @field_validator("site_id")
     @classmethod
@@ -92,6 +94,13 @@ class IntegrationLink:
     v4: SnapshotV4 | None = None
     authority_identity: str | None = None
     authority_epoch: int | None = None
+
+
+def dispatch_handover(link: IntegrationLink | None) -> bool:
+    """The integration's owner opt-in, from a v6 snapshot only; anything else refuses."""
+    snapshot = link.snapshot if link is not None else None
+    return (snapshot is not None and snapshot.api_version >= 6
+            and snapshot.dispatch_handover is True)
 
 
 def snapshot_acceptable(

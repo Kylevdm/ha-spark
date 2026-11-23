@@ -22,7 +22,7 @@ from math import isfinite
 from typing import Final, Literal, cast
 from uuid import UUID
 
-API_VERSION: Final = 5
+API_VERSION: Final = 6
 # Display codes the add-on sends at this api_version (its planner, SoC check and fallback).
 PLAN_MODELS: Final = frozenset({"daily", "slots"})
 PLAN_STRATEGIES: Final = frozenset({"deficit", "fill"})
@@ -33,7 +33,7 @@ SOC_STATUSES: Final = frozenset({
 FALLBACK_CAUSES: Final = frozenset({"soc_integrity"})
 
 # Every `api_version` this integration can send and accept replies to.
-SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3, 4, 5})
+SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3, 4, 5, 6})
 
 
 class MalformedSummary(ValueError):
@@ -156,7 +156,7 @@ class Summary:
 def build_snapshot(
     *, site_id: str, release_version: str, sent_at: datetime, api_version: int,
     solar_forecast: object = None, topology: object = None,
-    major_loads: object = None, supply_guard: object = None,
+    major_loads: object = None, supply_guard: object = None, dispatch_handover: bool = False,
 ) -> dict[str, object]:
     """Build only fields supported by the negotiated api_version."""
     if str(UUID(site_id)) != site_id or sent_at.utcoffset() is None:
@@ -187,6 +187,10 @@ def build_snapshot(
             result["supply_guard"] = supply_guard
     if api_version >= 4:
         result["authority_owner"] = "addon"
+    if api_version >= 6:
+        # The owner's opt-in (#769): the add-on plans a dispatch purchase under a
+        # hold only when this is true; absent or false keeps its refusal.
+        result["dispatch_handover"] = dispatch_handover
     return result
 
 

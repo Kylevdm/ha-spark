@@ -24,7 +24,7 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from . import flexibility_events, wire
+from . import flexibility_events, native_handover, wire
 from .authority import AuthorityStore
 from .authority_control import AuthorityControl
 from .channel import Outcome, PollResult, async_poll
@@ -105,6 +105,8 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
         self.release_version = release_version
         self.api_version = max(wire.SUPPORTED_API_VERSIONS)
         self.addon_api_version: int | None = None
+        # The api_version both sides used on the last counted heartbeat (#769).
+        self.counted_api_version: int | None = None
         self.connected = False
         self.last_counted: datetime | None = None
         # The latest counted summary; entities show it only while connected.
@@ -400,7 +402,9 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
                                       sent_at=dt_util.utcnow(), api_version=api_version,
                                       solar_forecast=self._solar_forecast(api_version),
                                       topology=topology, major_loads=major_loads,
-                                      supply_guard=self._guard_snapshot())
+                                      supply_guard=self._guard_snapshot(),
+                                      dispatch_handover=native_handover.opted_in(
+                                          self.entry.options))
         except (KeyError, ValueError):
             # Raised text would carry the stored value; HA logs an update's exceptions.
             result = PollResult(Outcome.MALFORMED)
@@ -425,7 +429,9 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
                                                   sent_at=dt_util.utcnow(), api_version=api_version,
                                                   solar_forecast=self._solar_forecast(api_version),
                                                   topology=topology, major_loads=major_loads,
-                                                  supply_guard=self._guard_snapshot())
+                                                  supply_guard=self._guard_snapshot(),
+                                                  dispatch_handover=native_handover.opted_in(
+                                                      self.entry.options))
                     except (KeyError, ValueError):
                         result = PollResult(Outcome.MALFORMED)
                     else:
@@ -457,7 +463,12 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
         self.last_outcome = outcome
         self.last_outcome_at = now
         self.fallback.observe_outcome(outcome, now)
+        if outcome in (Outcome.VERSION_REFUSED, Outcome.VERSION_SKEW):
+            self.counted_api_version = None
         if outcome is Outcome.COUNTED:
+            # The request's version and the reply's, never one proposed and unanswered.
+            self.counted_api_version = (min(api_version, envelope.api_version)
+                                        if envelope is not None else None)
             if self.control.owned() and summary is not None:
                 await self.control.async_new_session(summary.session_id, now=now)
             ir.async_delete_issue(self.hass, DOMAIN, "api_version_skew")

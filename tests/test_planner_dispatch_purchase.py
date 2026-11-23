@@ -360,3 +360,29 @@ def test_a_low_remaining_happy_hour_refusal_uses_the_admitted_allowance_sizing()
     assert refused_plan.required_kwh == ordinary.required_kwh
     assert refused_plan.planned_cost == ordinary.planned_cost
     assert refused_plan.soc_path == ordinary.soc_path
+
+
+def test_the_owner_handover_admits_the_dispatch_purchase_under_a_coarse_hold():
+    # #769: with the integration's dispatch_handover, Solis buys like a no-hold driver.
+    config = cfg(strategy="fill", buffer_pct=0)  # Solis is coarse.
+    topology = native(config)
+    ordinary = planned(_inputs(config, proof=False), config, topology=topology)
+    plan = planned(replace(_inputs(config), dispatch_handover=True), config, topology=topology)
+
+    purchase, = plan.daytime_purchases
+    assert not purchase.refused
+    assert purchase.reason.endswith(".") and "refuses" not in purchase.reason
+    assert plan.required_kwh == pytest.approx(ordinary.required_kwh - purchase.energy_kwh)
+    window, = plan.charge_intent.daytime_windows
+    assert (window.start, window.end) == (purchase.start, purchase.end)
+    assert 0 < window.target_soc_pct <= config.target_cap
+
+
+def test_the_handover_never_admits_a_session_inside_an_ev_hold():
+    config = cfg(strategy="fill", buffer_pct=0)
+    happy = FreeSession("happy_hour", "hh", NOW, NOW + timedelta(minutes=30))
+    inputs = replace(_inputs(config, proof=False, ev_hold=True, sessions=(happy,)),
+                     dispatches=(), happy_hour_remaining_kwh={"hh": 14.4},
+                     dispatch_handover=True)
+    purchase, = planned(inputs, config).daytime_purchases
+    assert purchase.refused is True

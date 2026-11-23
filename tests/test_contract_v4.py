@@ -15,6 +15,7 @@ from ha_spark.api.contract import (
     AuthorityInputs,
     IntegrationLink,
     SiteSnapshot,
+    dispatch_handover,
     link_view,
     plan_summary,
     snapshot_acceptable,
@@ -142,11 +143,29 @@ def test_flexibility_events_never_changes_snapshot_acceptance(client, state, cha
 
 def test_shared_versions():
     contract = fixture("contract")
-    assert API_VERSION == contract["api_version"] == 5
-    assert sorted(SUPPORTED_API_VERSIONS) == contract["supported_api_versions"] == [1, 2, 3, 4, 5]
+    assert API_VERSION == contract["api_version"] == 6
+    assert sorted(SUPPORTED_API_VERSIONS) == contract["supported_api_versions"] == [
+        1, 2, 3, 4, 5, 6]
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize(("version", "value", "expected"), [
+    (6, True, True), (6, False, False), (6, "true", False), (6, None, False),
+    (5, True, False),
+])
+def test_dispatch_handover_needs_api_version_6_and_a_true_flag(version, value, expected):
+    """#769: the integration golden's flag, read only from a v6 peer; anything else refuses."""
+    golden = fixture("site_snapshot_v6")
+    assert golden["dispatch_handover"] is False
+    raw = golden | {"api_version": version, "dispatch_handover": value}
+    if value is None:
+        del raw["dispatch_handover"]
+    snapshot = SiteSnapshot.model_validate(raw)
+    link = IntegrationLink(snapshot, NOW, False)
+    assert dispatch_handover(link) is expected
+    assert dispatch_handover(None) is False
+
+
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6])
 @pytest.mark.parametrize("seconds,accepted", [
     (-301, False), (-300, True), (300, True), (301, False),
 ])
@@ -157,7 +176,7 @@ def test_snapshot_clock_boundary(version, seconds, accepted):
     assert snapshot_acceptable(IntegrationLink(None, None, False), snapshot, NOW) == accepted
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6])
 @pytest.mark.parametrize("change", ["older", "other_site", "future", "past"])
 def test_rejected_snapshot_changes_nothing(client, state, monkeypatch, version, change):
     body = fixture() | {"api_version": version}
@@ -383,7 +402,7 @@ def test_incomplete_trusted_soc_is_untrusted(client, state):
     assert state.integration_link.v4.banks[0].soc is None
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6])
 def test_durable_pairing_applies_to_legacy_snapshots(client, state, version):
     assert post(client, fixture()).status_code == 200
     state.integration_link = IntegrationLink(None, None, False)

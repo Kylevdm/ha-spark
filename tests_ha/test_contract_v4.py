@@ -101,7 +101,7 @@ async def test_v4_negotiates_to_030_and_counts(
     aioclient_mock.post(URL, side_effect=respond)
     entry = await setup(hass)
     bodies = [call[2] for call in aioclient_mock.mock_calls]
-    assert [body["api_version"] for body in bodies] == [5, 3]
+    assert [body["api_version"] for body in bodies] == [6, 3]
     assert bodies[0]["authority_owner"] == "addon"
     assert "authority_owner" not in bodies[1]
     assert state_value(hass) == "on"
@@ -112,12 +112,12 @@ async def test_v4_negotiates_to_030_and_counts(
     assert state_value(hass) == "on"
 
 
-async def test_v5_falls_back_to_a_v4_addon(
+async def test_v6_falls_back_to_a_v4_addon(
     hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
 ) -> None:
-    # A 0.33 add-on refuses v5; the v4 retry keeps the ownership projection.
+    # A 0.33 add-on refuses v6; the v4 retry keeps the ownership projection.
     async def respond(_method: str, _url: Any, data: Any) -> AiohttpClientMockResponse:
-        if data["api_version"] == 5:
+        if data["api_version"] >= 5:
             return AiohttpClientMockResponse("post", YarlURL(URL), status=409,
                                             json=fixture("version_refusal_v4"))
         return AiohttpClientMockResponse("post", YarlURL(URL), json={
@@ -127,9 +127,31 @@ async def test_v5_falls_back_to_a_v4_addon(
     aioclient_mock.post(URL, side_effect=respond)
     entry = await setup(hass)
     bodies = [call[2] for call in aioclient_mock.mock_calls]
-    assert [body["api_version"] for body in bodies] == [5, 4]
+    assert [body["api_version"] for body in bodies] == [6, 4]
     assert "authority_owner" in bodies[1]
     assert entry.runtime_data.api_version == 4
+
+
+async def test_v6_falls_back_to_a_v5_addon_without_the_handover_flag(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker,
+) -> None:
+    # A 0.42 add-on refuses v6 (#769); the v5 retry carries no dispatch_handover.
+    async def respond(_method: str, _url: Any, data: Any) -> AiohttpClientMockResponse:
+        if data["api_version"] == 6:
+            return AiohttpClientMockResponse("post", YarlURL(URL), status=409,
+                                            json=fixture("version_refusal_v5"))
+        return AiohttpClientMockResponse("post", YarlURL(URL), json={
+            **fixture("plan_summary_v4"), "api_version": 5,
+            "loop_tick": dt_util.utcnow().isoformat(),
+        })
+
+    aioclient_mock.post(URL, side_effect=respond)
+    entry = await setup(hass)
+    bodies = [call[2] for call in aioclient_mock.mock_calls]
+    assert [body["api_version"] for body in bodies] == [6, 5]
+    assert bodies[0]["dispatch_handover"] is False
+    assert "dispatch_handover" not in bodies[1]
+    assert entry.runtime_data.api_version == 5
 
 
 def test_v4_version_refusal_golden() -> None:

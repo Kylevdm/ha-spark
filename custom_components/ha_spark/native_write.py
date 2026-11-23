@@ -17,7 +17,8 @@ from typing import TYPE_CHECKING
 from homeassistant.util import dt as dt_util
 from pydantic import ValidationError
 
-from .authority_store import EventIdentity
+from . import native_handover
+from .authority_store import AuthorityState, EventIdentity
 from .clamp import DeviceIntent, clamp_intent
 from .commands import (
     ApplyPayload,
@@ -75,6 +76,8 @@ class NativeChargeBoundary(NativeDatedChargeWrites):
         self.coordinator = coordinator
         self.written_a: dict[str, float] = {}
         self.written_at: dict[str, datetime] = {}
+        # The connection a verified current was read back on (#769).
+        self.written_connection: dict[str, int] = {}
         self.verified_windows: dict[str, tuple[int, tuple[int, ...]]] = {}
         self.verified_fallback: dict[str, tuple[int, tuple[int, ...]]] = {}
         # The last exactly read-back armed Slot 2 block, per inverter.
@@ -87,6 +90,20 @@ class NativeChargeBoundary(NativeDatedChargeWrites):
         self.armed_this_session: set[str] = set()
         # The owner's own charge-current edits, per inverter: (epoch, amps) (#766).
         self.owner_currents: dict[str, tuple[int, float]] = {}
+        # In memory only (#769): a restart forgets them and the hold reasserts Off.
+        self.handovers: dict[str, native_handover.Handover] = {}
+        self.reclaimed: dict[str, set[datetime]] = {}  # window ends never handed over again
+        self.off_owed: set[str] = set()  # a failed take-back or contrary read: not live
+
+    def positive_current_verified(self, inverter: Inverter, state: AuthorityState) -> bool:
+        """A charge current above zero, read back on this connection, not since polled 0."""
+        at = self.written_at.get(inverter.id)
+        poll = self.coordinator.native.reading(inverter, CHARGE_BLOCK_FRAME)
+        return (at is not None and current_word(self.written_a.get(inverter.id, 0.0)) > 0
+                and self.written_connection.get(inverter.id)
+                == self.coordinator.native.transport(inverter).connection_epoch
+                and not (poll is not None and poll.registers and poll.read_at > at
+                         and poll.registers[0] == 0))
 
     def plan_verified(self, epoch: int, *, since: datetime) -> bool:
         """A freshly accepted plan in this epoch, judged on charge intents only."""
@@ -752,7 +769,14 @@ class NativeChargeBoundary(NativeDatedChargeWrites):
             if not changed:
                 self.written_a[inverter.id] = current
                 self.written_at[inverter.id] = dt_util.utcnow()
+                self.written_connection[inverter.id] = transport.connection_epoch
                 return IntentResult(outcome="unchanged", written_a=current)
+        if changed and target == 0:
+            # Zero current ends a handed-over window's charging: the switch goes Off first.
+            # A supply-guard cut still proceeds; a plan's zero waits for the Off.
+            if (not await self.coordinator.holds.async_take_back_locked(inverter, mismatches)
+                    and not guard_write):
+                return IntentResult(outcome="failed")
         if changed:
             # Every await above may have revoked authority or changed limits.
             # No await sits between this recheck and the write.
@@ -775,4 +799,5 @@ class NativeChargeBoundary(NativeDatedChargeWrites):
             return IntentResult(outcome="unverified", written_a=current if changed else None)
         self.written_a[inverter.id] = current
         self.written_at[inverter.id] = dt_util.utcnow()
+        self.written_connection[inverter.id] = transport.connection_epoch
         return IntentResult(outcome="applied" if changed else "unchanged", written_a=current)

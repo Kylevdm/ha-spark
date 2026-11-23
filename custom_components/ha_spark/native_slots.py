@@ -99,6 +99,16 @@ class NativeSlots:
             reason = self.charge_check() if self.charge_check is not None else "mode"
         if reason is not None:
             return IntentResult(outcome="refused", reason=reason)
+        if address == 43153:
+            # A handed-over switch goes Off before the window standing in for it changes;
+            # while that Off fails and a hold is wanted, the window stays.
+            if not await self.boundary.coordinator.holds.async_take_back_locked(
+                    self.inverter, self.mismatches):
+                return IntentResult(outcome="failed")
+            reason = self.boundary._refusal(self.inverter, self.epoch, fallback=self.fallback,
+                                            transition=self.transition, cleanup=self.cleanup)
+            if reason is not None:
+                return IntentResult(outcome="refused", reason=reason)
         result = await self.boundary.coordinator.native.transport(self.inverter).write(
             address, target, device_id=self.inverter.gateway_unit_id)
         if not result.ok:

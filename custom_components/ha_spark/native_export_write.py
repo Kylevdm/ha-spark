@@ -30,7 +30,7 @@ from .native_export import (
     site_export_limit_w,
     supervision_for,
 )
-from .native_power import POWER_SWITCH_REG, decode_power
+from .native_power import POWER_SWITCH_REG, PowerState, decode_power
 from .native_verify import confirm
 from .solis_frames import Reading
 from .solis_transport import Transport, valid_words
@@ -393,21 +393,28 @@ class NativeExportWrites:
             return True, resident[4:]
         return True, None
 
-    def _clock_refused(self, inverter: Inverter, now: datetime) -> bool:
+    def _clock_error(self, inverter: Inverter, now: datetime) -> timedelta | None:
+        """The fresh clock reading's error, or None when there is no trusted reading."""
         zone = self.coordinator.control.household_zone()
         if zone is None:
-            return True
+            return None
         reading = self.coordinator.native.reading(inverter, native_write.CLOCK_FRAME)
         if reading is None or reading.registers is None:
-            return True
+            return None
         age = now - reading.read_at
         if age > STALE_AFTER or age < timedelta(seconds=-5):
-            return True
-        error = clock_error(reading.registers, reading.read_at, zone)
+            return None
+        return clock_error(reading.registers, reading.read_at, zone)
+
+    def _clock_refused(self, inverter: Inverter, now: datetime) -> bool:
+        error = self._clock_error(inverter, now)
         return error is None or abs(error) > DRIFT_TOLERANCE
 
     async def _power_on(self, inverter: Inverter, now: datetime) -> bool:
         """Read the switch, never write it: ordinary export apply never turns it On."""
+        return await self._power_state(inverter) == "on"
+
+    async def _power_state(self, inverter: Inverter) -> PowerState | None:
         transport = self.coordinator.native.transport(inverter)
         epoch = transport.connection_epoch
         read = await transport.read_holding(
@@ -415,10 +422,10 @@ class NativeExportWrites:
         if (read.error is not None or len(read.registers) != 1
                 or not valid_words(read.registers)
                 or epoch != transport.connection_epoch):
-            return False
+            return None
         self.coordinator.native.readings.setdefault(inverter.id, {})[
             POWER_SWITCH_FRAME] = Reading(dt_util.utcnow(), tuple(read.registers), epoch)
-        return decode_power(list(read.registers)) == "on"
+        return decode_power(list(read.registers))
 
     async def _bound_reason(self, inverter: Inverter, supervision: ExportSupervision,
                             request: ExportWindow, now: datetime) -> WriteReason | None:
