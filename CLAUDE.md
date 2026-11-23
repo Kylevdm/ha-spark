@@ -106,9 +106,11 @@ security and prefer the safe default. Hard rules:
     verified positive current, the inverter clock within 60 s and inside the
     window more than two minutes from its end, trusted SoC more than 2 % below
     target, the armed record and verified face uncontradicted by a newer poll);
-    otherwise it writes Off as usual. Any Slot 2 write on a handed-over inverter
-    writes Off first under the hold's own refusal (so never toward Observe). A
-    verified Off ends the handover and that window is never handed over again;
+    otherwise it writes Off as usual. Any Slot 2 write, and a zero charge
+    current, on a handed-over inverter writes Off first under the hold's own
+    refusal (so never toward Observe); while that Off fails and the hold stands,
+    the Slot 2 write fails and the window stays. A verified or observed Off ends
+    the handover and that window is never handed over again;
     an On that may have landed keeps the Off obligation. Nothing is persisted: a
     restart forgets the handover and the hold writes Off on its next tick.
 

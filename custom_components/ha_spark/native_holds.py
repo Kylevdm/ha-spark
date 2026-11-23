@@ -143,7 +143,10 @@ class NativeHolds:
         writes = self.coordinator.writes
         handover = writes.handovers.pop(inverter.id, None)
         if handover is not None:
-            writes.reclaimed[inverter.id] = handover.end
+            now = dt_util.utcnow()
+            writes.reclaimed[inverter.id] = {
+                end for end in writes.reclaimed.get(inverter.id, set()) if end > now
+            } | {handover.end}
         ir.async_delete_issue(self.coordinator.hass, DOMAIN, self._reclaim_issue_id(inverter))
 
     def _take_back_failed(self, inverter: Inverter) -> None:
@@ -155,24 +158,33 @@ class NativeHolds:
                 translation_key="hold_reclaim_failed",
                 data={"entry_id": self.coordinator.entry.entry_id, "inverter_id": inverter.id})
 
-    async def async_take_back_locked(self, inverter: Inverter, mismatches: set[str]) -> None:
-        """Before a Slot 2 change under a handover: Off first. The caller holds native.lock.
+    async def async_take_back_locked(self, inverter: Inverter, mismatches: set[str]) -> bool:
+        """Before a change that ends a handover's protection: Off first.
 
-        Writes the switch only, under the hold's own refusal (never toward Observe or
-        in manual control without protection). A failed Off does not stop the change.
+        The caller holds native.lock. Writes the switch only, under the hold's own
+        refusal (never toward Observe or in manual control without protection).
+        False only when that Off failed while the hold still stands.
         """
         c = self.coordinator
         state = c.authority.state
-        if inverter.id not in c.writes.handovers or state is None:
-            return
+        if inverter.id not in c.writes.handovers:
+            return True
+        if state is None or not any(h.device == hold_device(inverter) and h.owned
+                                    for h in state.holds):
+            # Released (or unknown): no hold of ours is left to take the switch back for.
+            c.writes.handovers.pop(inverter.id, None)
+            return True
         result = await async_write_power_locked(c.native, inverter, "off", recheck=lambda:
             self._refusal(inverter, state, release=False))
         if result.mismatch:
             mismatches.add(inverter.id)
         if result.outcome in ("applied", "unchanged"):
             self._taken_back(inverter)
-        elif result.outcome != "refused":
-            self._take_back_failed(inverter)
+            return True
+        if result.outcome == "refused":
+            return True
+        self._take_back_failed(inverter)
+        return False
 
     def _clear_notices(self, inverter: Inverter) -> None:
         for kind in ("apply", "degraded", "release"):
@@ -290,7 +302,8 @@ class NativeHolds:
                 if self._refusal(inverter, expected, release=False) is not None:
                     return False
                 before = polled_power(c.native, inverter, now)
-                if before is None or before != "off":
+                # A handover's switch is read fresh: a cached Off may predate its On.
+                if before != "off" or inverter.id in c.writes.handovers:
                     read = await c.native.transport(inverter).read_holding(
                         43007, 1, device_id=inverter.gateway_unit_id)
                     before = decode_power(list(read.registers)) if read.error is None else None
@@ -350,10 +363,11 @@ class NativeHolds:
                     confirmed = await self._replace(inverter, records, expected)
                     if confirmed:
                         self._clear_notice("apply:" + inverter.id)
-                if result.outcome in ("applied", "unchanged"):
-                    self._taken_back(inverter)
-                else:
-                    self._take_back_failed(inverter)
+                if inverter.id in c.writes.handovers:
+                    if result.outcome in ("applied", "unchanged"):
+                        self._taken_back(inverter)
+                    else:
+                        self._take_back_failed(inverter)
             if mismatch:
                 await c.native.async_readback_mismatch(inverter.id)
             if not confirmed:

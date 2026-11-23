@@ -92,7 +92,7 @@ class NativeChargeBoundary(NativeDatedChargeWrites):
         self.owner_currents: dict[str, tuple[int, float]] = {}
         # In memory only (#769): a restart forgets them and the hold reasserts Off.
         self.handovers: dict[str, native_handover.Handover] = {}
-        self.reclaimed: dict[str, datetime] = {}  # the window end each handover ended at
+        self.reclaimed: dict[str, set[datetime]] = {}  # window ends never handed over again
 
     def positive_current_verified(self, inverter: Inverter, state: AuthorityState) -> bool:
         """A charge current above zero, read back on this connection, not since polled 0."""
@@ -770,6 +770,9 @@ class NativeChargeBoundary(NativeDatedChargeWrites):
                 self.written_at[inverter.id] = dt_util.utcnow()
                 self.written_connection[inverter.id] = transport.connection_epoch
                 return IntentResult(outcome="unchanged", written_a=current)
+        if changed and target == 0:
+            # Zero current ends a handed-over window's charging: the switch goes Off first.
+            await self.coordinator.holds.async_take_back_locked(inverter, mismatches)
         if changed:
             # Every await above may have revoked authority or changed limits.
             # No await sits between this recheck and the write.

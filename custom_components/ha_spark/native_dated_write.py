@@ -15,6 +15,7 @@ daily at that clock time.
 With the owner's opt-in (#769), a dispatch hold hands its switch On only after
 the window is armed and read back (``native_handover``).
 """
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import NAMESPACE_URL, uuid5
@@ -48,7 +49,7 @@ class NativeDatedChargeWrites(NativeExportWrites):
     if TYPE_CHECKING:
         verified_slot2: dict[str, tuple[int, tuple[int, ...]]]
         handovers: dict[str, native_handover.Handover]
-        reclaimed: dict[str, datetime]
+        reclaimed: dict[str, set[datetime]]
 
     def _dated_record(self, inverter_id: str) -> DatedChargeRecord | None:
         state = self.coordinator.authority.state
@@ -139,7 +140,7 @@ class NativeDatedChargeWrites(NativeExportWrites):
         """A held inverter's window that the hold may hand its switch to."""
         c = self.coordinator
         return (request.target_soc_pct is not None and self._hold_active(inverter)
-                and self.reclaimed.get(inverter.id) != request.end
+                and request.end not in self.reclaimed.get(inverter.id, set())
                 and native_handover.conditions(c, inverter, request.start, request.end,
                                                request.target_soc_pct, now,
                                                c.holds.evidence.read(now)))
@@ -284,6 +285,11 @@ class NativeDatedChargeWrites(NativeExportWrites):
         now = dt_util.utcnow()
         zone = c.control.household_zone()
         soc = getattr(c, "soc", None)
+        current = self.handovers.get(inverter.id)
+        if current is not None and (current.start, current.end) == (request.start, request.end):
+            # The same window under a new plan stops at the new target (none: at once).
+            self.handovers[inverter.id] = replace(
+                current, target_soc_pct=request.target_soc_pct or 0.0)
         handover = self._may_hand_over(inverter, request, now)
         reason = self._dated_write_reason(inverter, epoch, handover=handover)
         if reason is None and request.end.astimezone(UTC) <= now:
@@ -300,6 +306,12 @@ class NativeDatedChargeWrites(NativeExportWrites):
                                 now.astimezone(zone)):
             return IntentResult(outcome="deferred")
         power = await self._power_state(inverter)
+        if inverter.id in self.handovers and power == "off":
+            # An Off seen under a handover is its take-back, whoever wrote it.
+            c.holds._taken_back(inverter)
+            handover = handover and request.end not in self.reclaimed.get(inverter.id, set())
+            if not handover:
+                return IntentResult(outcome="refused", reason="hold_active")
         handed = self.handovers.get(inverter.id)
         same_handover = handed is not None and (handed.start, handed.end) == (
             request.start, request.end)

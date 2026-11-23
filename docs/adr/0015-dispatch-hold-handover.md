@@ -36,22 +36,27 @@ api_version 6; the add-on reads it only from a v6 snapshot carrying `true`.
   confirmed dispatch hold, the integration arms Slot 2 with the switch still Off
   (the usual write-ahead record and exact read-back), records the handover in
   memory, then writes On under a fresh write-time recheck. The conditions,
-  checked at the start and on every hold tick: the opt-in; a counted heartbeat
+  checked at the start and on every hold tick: a window of at most half an hour
+  (one Slot 2 occurrence); the opt-in; a counted heartbeat
   at api_version 6; Optimise with no manual session, fallback or transition; a
   live trusted dispatch; a charge current verified above zero on this connection
   and not since polled at zero; a fresh inverter clock within 60 s of the
   household clock, sampled at the same UTC offset; the window active on the
   inverter's clock and more than two minutes from its end there; trusted SoC
   more than 2 % below the target; and, once handed over, the armed record and its
-  verified Slot 2 face, with no newer charge-block poll contradicting them.
+  verified Slot 2 face, with no newer poll showing zero current, another face or
+  grid charging not permitted. The same window under a new plan takes the new
+  target at once.
 - **Take-back.** While the handover is live the hold leaves the switch On and
   keeps its records confirmed, adding any newly wanted cause. Once any
   condition fails it writes Off as for any hold. Before any Slot 2 write on a
-  handed-over inverter (a new window, a clear, fallback, a transition), the
-  switch is written Off first under the hold's own refusal; toward Observe or in
-  manual control without protection that refusal stands and the window is
-  cleared without it. A verified Off ends the handover and that window end is
-  never handed over again.
+  handed-over inverter (a new window, a clear, fallback, a transition), and
+  before a zero charge current, the switch is written Off first under the hold's
+  own refusal; toward Observe or in manual control without protection that
+  refusal stands and the change goes ahead without it. If that Off fails while
+  the hold stands, the Slot 2 change fails and the window stays: it is the only
+  protection left. A verified Off, or an Off found on the switch, ends the
+  handover, and that window end is never handed over again.
 - **Failures fail towards the hold.** A failed arm writes no On. An On refused
   or with the switch unreadable drops the handover; any other failed On keeps it,
   so the hold verifies Off. A failed take-back is retried every tick, sends the

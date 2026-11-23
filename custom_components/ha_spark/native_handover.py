@@ -45,7 +45,9 @@ def conditions(c: "SparkCoordinator", inverter: Inverter, start: datetime, end: 
                target_soc_pct: float, now: datetime, evidence: "EvidenceRead") -> bool:
     """Everything a handover needs apart from its own verified window."""
     state = c.authority.state
-    if (not opted_in(c.entry.options) or (c.counted_api_version or 0) < 6
+    # A dispatch purchase is one half-hour: Slot 2 then repeats exactly that occurrence.
+    if (end - start > timedelta(minutes=30)
+            or not opted_in(c.entry.options) or (c.counted_api_version or 0) < 6
             or state is None or state.committed_mode != "optimise"
             or state.manual_session is not None or state.fallback.active
             or state.transition is not None
@@ -86,7 +88,7 @@ def conditions(c: "SparkCoordinator", inverter: Inverter, start: datetime, end: 
 def live(c: "SparkCoordinator", inverter: Inverter, handover: Handover, now: datetime,
          evidence: "EvidenceRead") -> bool:
     """The handed-over window still stands in for the hold, on every check."""
-    from .native_write import CHARGE_BLOCK_FRAME
+    from .native_write import CHARGE_BLOCK_FRAME, GRID_CHARGE_PERMITTED_REG
     state = c.authority.state
     zone = c.control.household_zone()
     if (state is None or zone is None or state.epoch != handover.authority_epoch
@@ -100,11 +102,16 @@ def live(c: "SparkCoordinator", inverter: Inverter, handover: Handover, now: dat
             or (record.start, record.end) != (handover.start, handover.end)
             or verified is None or verified[0] != state.epoch or verified[1][:4] != face):
         return False
-    # A later charge-block poll showing zero current or another face ends the proof.
+    # A later poll showing zero current, another face or grid charging not permitted
+    # ends the proof.
     poll = c.native.reading(inverter, CHARGE_BLOCK_FRAME)
     if (poll is not None and poll.registers is not None and poll.read_at > handover.verified_at
             and (len(poll.registers) < 16 or poll.registers[0] == 0
                  or tuple(poll.registers[12:16]) != face)):
+        return False
+    battery = c.native.reading(inverter, f"input_{GRID_CHARGE_PERMITTED_REG}")
+    if (battery is not None and battery.registers and battery.read_at > handover.verified_at
+            and not battery.registers[0] & 32):
         return False
     return conditions(c, inverter, handover.start, handover.end, handover.target_soc_pct,
                       now, evidence)

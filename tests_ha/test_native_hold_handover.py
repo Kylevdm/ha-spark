@@ -244,7 +244,7 @@ async def test_the_hold_takes_back_and_never_hands_the_same_window_over_again(
     await tick(writer)
     assert switch_writes(native_transport) == [OFF]
     assert handed(writer) is None
-    assert writer.writes.reclaimed["inv1"] == END
+    assert END in writer.writes.reclaimed["inv1"]
     if cause == "target":
         # Back under target, the same window is never handed over again.
         bank.value = 50.0
@@ -456,18 +456,139 @@ async def test_a_move_to_observe_clears_slot_2_without_a_new_off(
     assert not any(native_transport.holding[reg] for reg in range(43153, 43157))
 
 
-async def test_slot_2_still_clears_if_off_fails_and_the_hold_retries(
+async def test_a_failed_take_back_keeps_slot_2_until_the_switch_is_off(
     writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # While Off fails and the hold stands, the window is its only protection.
     await held(writer, monkeypatch, native_transport)
     assert await hand_over(writer, native_transport) == "applied"
     native_transport.inject_write_fault(WriteFault("silent_noop"), address=43007)
     result = await writer._async_dispatch_command(apply_command(writer, [
         {"kind": "dated_charge", "inverter_id": "inv1", "request": "none"}], sequence=2))
-    assert result.intents[0].outcome == "applied"
+    assert result.intents[0].outcome == "failed"
     assert native_transport.holding[43007] == ON
-    assert records(writer) == []
+    assert any(native_transport.holding[reg] for reg in range(43153, 43157))
     assert len(reclaim_issues(writer)) == 1
     await tick(writer)
     assert native_transport.holding[43007] == OFF
     assert reclaim_issues(writer) == []
+    result = await writer._async_dispatch_command(apply_command(writer, [
+        {"kind": "dated_charge", "inverter_id": "inv1", "request": "none"}], sequence=3))
+    assert result.intents[0].outcome == "applied"
+    assert records(writer) == []
+
+
+async def test_an_off_seen_under_a_handover_is_its_take_back(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await held(writer, monkeypatch, native_transport)
+    assert await hand_over(writer, native_transport) == "applied"
+    native_transport.holding[43007] = OFF  # the owner turns it off before the hold tick
+    native_transport.traffic.clear()
+    assert await hand_over(writer, native_transport, sequence=2) == "refused"
+    assert switch_writes(native_transport) == []
+    assert handed(writer) is None
+
+
+async def test_the_same_window_under_a_new_plan_takes_its_new_target(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bank = await held(writer, monkeypatch, native_transport)
+    bank.value = 75.0
+    assert await hand_over(writer, native_transport) == "applied"
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [window(target_soc_pct=76.0)], sequence=2))
+    # 75 % is within 2 % of the new target: no new handover, and the live one ends.
+    assert result.intents[0].outcome == "refused"
+    assert handed(writer) == (END, 76.0)
+    native_transport.traffic.clear()
+    await tick(writer)
+    assert switch_writes(native_transport) == [OFF]
+
+
+async def test_a_released_hold_leaves_no_take_back(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await held(writer, monkeypatch, native_transport)
+    assert await hand_over(writer, native_transport) == "applied"
+    state = writer.authority.state
+    assert state is not None
+    # A transition's own release retired the records; the handover is stale.
+    assert await writer.authority.async_save(state.model_copy(update={"holds": ()}))
+    native_transport.traffic.clear()
+    result = await writer._async_dispatch_command(apply_command(writer, [
+        {"kind": "dated_charge", "inverter_id": "inv1", "request": "none"}], sequence=2))
+    assert result.intents[0].outcome == "applied"
+    assert switch_writes(native_transport) == []
+    assert handed(writer) is None
+
+
+async def test_a_zero_current_write_takes_the_switch_back_first(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await held(writer, monkeypatch, native_transport)
+    assert await hand_over(writer, native_transport) == "applied"
+    native_transport.traffic.clear()
+    await writer._async_dispatch_command(apply_command(writer, [current(0.0)], sequence=2))
+    writes = [t.address for t in native_transport.traffic if t.op == "write"]
+    assert writes.index(43007) < writes.index(43141)
+    assert native_transport.holding[43007] == OFF
+
+
+async def test_a_window_longer_than_a_half_hour_is_never_handed_over(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await held(writer, monkeypatch, native_transport)
+    result = await writer._async_dispatch_command(apply_command(writer, [dated(
+        NOW, NOW + timedelta(days=1, minutes=30), target_soc_pct=80.0)]))
+    assert (result.intents[0].outcome, result.intents[0].reason) == ("refused", "hold_active")
+    assert switch_writes(native_transport) == []
+
+
+async def test_a_poll_showing_grid_charge_not_permitted_ends_the_handover(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    await held(writer, monkeypatch, native_transport)
+    monkeypatch.setattr(writer.fallback, "async_evaluate", AsyncMock())
+    assert await hand_over(writer, native_transport) == "applied"
+    freezer.tick(timedelta(seconds=5))
+    inverter = writer.native.inverters["inv1"]
+    writer.native.readings["inv1"]["input_33132"] = Reading(
+        datetime.now(UTC), (0,) * 21, writer.native.transport(inverter).connection_epoch)
+    native_transport.traffic.clear()
+    await tick(writer)
+    assert switch_writes(native_transport) == [OFF]
+
+
+async def test_every_taken_back_window_is_remembered(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bank = await held(writer, monkeypatch, native_transport)
+    other_end = END - timedelta(minutes=10)
+    for sequence, intent in ((1, window()), (2, dated(NOW, other_end, target_soc_pct=80.0))):
+        bank.value = 50.0
+        result = await writer._async_dispatch_command(apply_command(
+            writer, [intent], sequence=sequence))
+        assert result.intents[0].outcome == "applied"
+        bank.value = 78.0
+        await tick(writer)
+        assert native_transport.holding[43007] == OFF
+    bank.value = 50.0
+    native_transport.traffic.clear()
+    assert await hand_over(writer, native_transport, sequence=3) == "refused"
+    assert switch_writes(native_transport) == []
+
+
+async def test_a_cached_off_from_before_the_on_is_not_a_take_back(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await held(writer, monkeypatch, native_transport)
+    assert await hand_over(writer, native_transport) == "applied"
+    inverter = writer.native.inverters["inv1"]
+    writer.native.readings["inv1"]["holding_43007"] = Reading(
+        datetime.now(UTC), (OFF,), writer.native.transport(inverter).connection_epoch)
+    await tick(writer)
+    # The switch was read fresh and the live handover kept.
+    assert native_transport.holding[43007] == ON
+    assert handed(writer) == (END, 80.0)
