@@ -85,6 +85,8 @@ class NativeChargeBoundary(NativeDatedChargeWrites):
         # against Slot 1; records saved in this session need no such re-read.
         self.reverified: set[str] = set()
         self.armed_this_session: set[str] = set()
+        # The owner's own charge-current edits, per inverter: (epoch, amps) (#766).
+        self.owner_currents: dict[str, tuple[int, float]] = {}
 
     def plan_verified(self, epoch: int, *, since: datetime) -> bool:
         """A freshly accepted plan in this epoch, judged on charge intents only."""
@@ -102,12 +104,23 @@ class NativeChargeBoundary(NativeDatedChargeWrites):
             async with self.coordinator.native.lock:
                 pass
 
-    def _owner_soc_override(self, entity_control: str | None) -> bool:
-        """An owner charge edit in a handed-over manual session that opted out of SoC trust."""
+    def _owner_soc_override(self, inverter_id: str, current: float | None = None) -> bool:
+        """Untrusted SoC may not block this write (#766).
+
+        Only in a handed-over manual session that opted out of SoC trust: the
+        owner's own window edit of this inverter (no ``current``), or a current
+        no higher than the owner's own edit of this inverter in this epoch. A
+        guard restore can reach that edit again; a peer's latent request cannot.
+        """
         state = self.coordinator.authority.state
         manual = state.manual_session if state is not None else None
-        return (entity_control == "charge" and manual is not None
-                and manual.override_soc_trust and not manual.keep_protection)
+        if (state is None or manual is None or not manual.override_soc_trust
+                or manual.keep_protection):
+            return False
+        if current is None:
+            return True
+        edit = self.owner_currents.get(inverter_id)
+        return edit is not None and edit[0] == state.epoch and current <= edit[1]
 
     def _refusal(self, inverter: Inverter, epoch: int, *,
                  guard_write: bool = False,
@@ -717,7 +730,7 @@ class NativeChargeBoundary(NativeDatedChargeWrites):
         target = current_word(current)
         def untrusted() -> bool:
             soc = getattr(self.coordinator, "soc", None)
-            return (not soc_exempt and not self._owner_soc_override(entity_control)
+            return (not soc_exempt and not self._owner_soc_override(inverter.id, current)
                     and (target > resident or soc_required)
                     and (soc is None or not soc.increases_allowed(inverter.bank_id)))
 

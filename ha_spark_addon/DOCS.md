@@ -133,7 +133,11 @@ With `keep_protection: false`, `override_soc_trust: true` lets your own charge
 current and charge window edits through while battery SoC is untrusted; the
 battery's own BMS limits, the site and bank limits, the supply guard and
 read-back still apply, and the planner, fallback and dated windows still refuse
-on untrusted SoC. The override ends with the session.
+on untrusted SoC. After a supply-guard cut, the guard restores your charge
+current up to the value you set in this session; a current set from the
+inverter's own app, or before a Home Assistant restart, is not restored until
+you set it again. It covers only the inverters you edit. Discharge edits never
+depend on SoC trust. The override ends with the session.
 **Options → Manual control deadline** sets `manual_until_time` and
 `household_time_zone`; it affects future handovers, not an existing deadline.
 `until_tomorrow` means the next occurrence of that household-clock time.

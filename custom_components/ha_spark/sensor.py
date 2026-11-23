@@ -265,6 +265,7 @@ class SparkSensor(SparkEntity, SensorEntity):
                     "deadline": manual.deadline.isoformat() if manual and manual.deadline else None,
                     "return_to": manual.return_to if manual else None,
                     "keep_protection": manual.keep_protection if manual else None,
+                    "override_soc_trust": manual.override_soc_trust if manual else None,
                 }
         summary = self.coordinator.summary
         attributes_fn = self.entity_description.attributes_fn

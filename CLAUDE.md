@@ -102,8 +102,10 @@ security and prefer the safe default. Hard rules:
   (`native_clock.py`); Protect writes only its holds (and enabled
   clock sync), plus, on an integration-owned site, supply-guard cuts and
   restores and the fallback schedule written as the owner's starting schedule
-  when leaving Optimise; Optimise runs the plan. An invalid SoC blocks every SoC-derived write (except owner charge edits in a
-  manual session started with protection off and `override_soc_trust`, #766);
+  when leaving Optimise; Optimise runs the plan. An invalid SoC blocks every SoC-derived write (except, in a manual session
+  started with protection off and `override_soc_trust`, the owner's own charge
+  edits and guard restores up to the owner's edited current on that inverter,
+  ADR-0014; owner discharge edits are not SoC-gated);
   always read back; isolate failures per action. A config or accepted-limits
   change between planning and the write refuses every write for that tick,
   holds and clock sync included; the next tick re-plans. Writes that don't
