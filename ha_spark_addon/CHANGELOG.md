@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.43.0
+
+- Dispatch purchase handover: a new integration option, off by default. With it
+  on, a native Solis dispatch hold turns the power switch back on for a daytime
+  charge window bought during a started dispatch with the car drawing, so the
+  battery charges instead of feeding the car. The window is armed and read back
+  before the switch goes on. The hold takes the switch back two minutes before
+  the window ends, once trusted SoC is within 2 % of the window's target, at
+  once if SoC is untrusted, and when the site leaves Optimise or the dispatch
+  ends. A failed take-back is retried every 30 seconds and raises the repair
+  **Protection hold not taken back**. Each half-hour is handed over on its own,
+  so a long dispatch turns the switch off briefly around each half-hour. The
+  add-on and integration move to API version 6: update both together; with an
+  older peer the dispatch hold keeps refusing the purchase (#769).
+
 ## 0.42.4
 
 - Native Solis: the inverter can report a false 100 % battery SoC in the first
