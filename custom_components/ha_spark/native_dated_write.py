@@ -11,6 +11,9 @@ A clear (#701) zeroes only the charge half, keeps the discharge half, and is
 confirmed by five further zero reads before the record is retired. A failed
 clear keeps the record and raises a repair: the window would otherwise recur
 daily at that clock time.
+
+With the owner's opt-in (#769), a dispatch hold hands its switch On only after
+the window is armed and read back (``native_handover``).
 """
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -19,7 +22,7 @@ from uuid import NAMESPACE_URL, uuid5
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 
-from . import native_write
+from . import native_handover, native_write
 from .authority_store import DatedChargeRecord
 from .commands import (
     DatedChargeNone,
@@ -31,6 +34,7 @@ from .commands import (
 from .const import DOMAIN
 from .native_export import clock_face, export_not_yet_armed
 from .native_export_write import SLOT2_REG, NativeExportWrites
+from .native_power import async_write_power_locked
 from .native_verify import confirm
 from .topology import Inverter
 
@@ -43,6 +47,8 @@ class NativeDatedChargeWrites(NativeExportWrites):
 
     if TYPE_CHECKING:
         verified_slot2: dict[str, tuple[int, tuple[int, ...]]]
+        handovers: dict[str, native_handover.Handover]
+        reclaimed: dict[str, datetime]
 
     def _dated_record(self, inverter_id: str) -> DatedChargeRecord | None:
         state = self.coordinator.authority.state
@@ -117,12 +123,56 @@ class NativeDatedChargeWrites(NativeExportWrites):
         return state is not None and any(
             hold.device.power_switch == inverter.id for hold in state.holds)
 
-    def _dated_write_reason(self, inverter: Inverter, epoch: int) -> WriteReason | None:
-        """Write-time permission for a Slot 2 charge half: Optimise, no hold."""
+    def _dated_write_reason(self, inverter: Inverter, epoch: int, *,
+                            handover: bool = False) -> WriteReason | None:
+        """Write-time permission for a Slot 2 charge half: Optimise, no hold.
+
+        ``handover``: the hold may hand its switch to this window (#769).
+        """
         reason = self._export_policy_reason(inverter, epoch)
-        if reason is None and self._hold_active(inverter):
+        if reason is None and self._hold_active(inverter) and not handover:
             return "hold_active"
         return reason
+
+    def _may_hand_over(self, inverter: Inverter, request: DatedChargeWindow,
+                       now: datetime) -> bool:
+        """A held inverter's window that the hold may hand its switch to."""
+        c = self.coordinator
+        return (request.target_soc_pct is not None and self._hold_active(inverter)
+                and self.reclaimed.get(inverter.id) != request.end
+                and native_handover.conditions(c, inverter, request.start, request.end,
+                                               request.target_soc_pct, now,
+                                               c.holds.evidence.read(now)))
+
+    async def _async_hand_over(self, inverter: Inverter, request: DatedChargeWindow,
+                               slots: "NativeSlots", epoch: int,
+                               result: IntentResult) -> IntentResult:
+        """Record the handover, then turn the switch On under a final fresh recheck."""
+        c = self.coordinator
+        state = c.authority.state
+        assert state is not None and request.target_soc_pct is not None
+        handover = native_handover.Handover(
+            request.start, request.end, request.target_soc_pct, state.epoch,
+            c.native.transport(inverter).connection_epoch, dt_util.utcnow())
+        # Before the write: any outcome but a clean refusal leaves the hold an Off to verify.
+        self.handovers[inverter.id] = handover
+
+        def recheck() -> str | None:
+            now = dt_util.utcnow()
+            return (self._dated_write_reason(inverter, epoch, handover=True)
+                    or c.holds._refusal(inverter, state, release=False)
+                    or (None if native_handover.live(c, inverter, handover, now,
+                                                     c.holds.evidence.read(now))
+                        else "hold_active"))
+
+        power = await async_write_power_locked(c.native, inverter, "on", recheck=recheck)
+        if power.mismatch:
+            slots.mismatch()
+        if power.outcome == "applied":
+            return result.model_copy(update={"outcome": "applied"})
+        if power.outcome in ("refused", "unreadable"):
+            self.handovers.pop(inverter.id, None)
+        return IntentResult(outcome="refused", reason="hold_active")
 
     async def async_dated(
         self, request: DatedChargeNone | DatedChargeUntrusted | DatedChargeWindow,
@@ -234,7 +284,8 @@ class NativeDatedChargeWrites(NativeExportWrites):
         now = dt_util.utcnow()
         zone = c.control.household_zone()
         soc = getattr(c, "soc", None)
-        reason = self._dated_write_reason(inverter, epoch)
+        handover = self._may_hand_over(inverter, request, now)
+        reason = self._dated_write_reason(inverter, epoch, handover=handover)
         if reason is None and request.end.astimezone(UTC) <= now:
             reason = "invalid_intent"
         if reason is None and (soc is None or not soc.increases_allowed(inverter.bank_id)):
@@ -248,8 +299,15 @@ class NativeDatedChargeWrites(NativeExportWrites):
         if export_not_yet_armed(request.start.astimezone(zone), request.end.astimezone(zone),
                                 now.astimezone(zone)):
             return IntentResult(outcome="deferred")
-        if not await self._power_on(inverter, now):
+        power = await self._power_state(inverter)
+        handed = self.handovers.get(inverter.id)
+        same_handover = handed is not None and (handed.start, handed.end) == (
+            request.start, request.end)
+        if not handover and power != "on":
             return IntentResult(outcome="refused", reason="power_switch_not_on")
+        # A hold hands over from its own Off; only its current window may find it On.
+        if handover and power != "off" and not (power == "on" and same_handover):
+            return IntentResult(outcome="refused", reason="hold_active")
         permission = await self._read(c.native.transport(inverter), inverter, input_=True)
         if permission is None or not permission & 32:
             return IntentResult(outcome="refused", reason="grid_charge_not_permitted")
@@ -274,7 +332,7 @@ class NativeDatedChargeWrites(NativeExportWrites):
                 return IntentResult(outcome="refused", reason="authority_unknown")
         assert record is not None
         slots.soc_required = True
-        slots.charge_check = lambda: self._dated_write_reason(inverter, epoch)
+        slots.charge_check = lambda: self._dated_write_reason(inverter, epoch, handover=handover)
         result = await slots.block(SLOT2_REG, target)
         if result.outcome not in ("applied", "unchanged"):
             return result
@@ -283,4 +341,6 @@ class NativeDatedChargeWrites(NativeExportWrites):
                     "state": "armed", "last_reconcile_at": now}), now):
             return IntentResult(outcome="unverified")
         self.verified_slot2[inverter.id] = (epoch, tuple(target))
+        if handover and not (power == "on" and same_handover):
+            return await self._async_hand_over(inverter, request, slots, epoch, result)
         return result

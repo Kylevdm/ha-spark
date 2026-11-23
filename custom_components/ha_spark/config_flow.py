@@ -43,7 +43,7 @@ from homeassistant.helpers.selector import (
 from homeassistant.helpers.service_info.hassio import HassioServiceInfo
 from pydantic import BaseModel, ValidationError
 
-from . import flexibility_events, native, notify_target
+from . import flexibility_events, native, native_handover, notify_target
 from .const import ADDON_SLUG, DOMAIN
 from .native_fallback import FallbackOptions, validate_fallback
 from .native_hold import SOURCES, EvidenceOptions
@@ -336,7 +336,20 @@ class HaSparkOptionsFlow(OptionsFlowWithReload):
             menu.append("evidence")
             menu.append("fallback")
             menu.append("flexibility_events")
+            menu.append("dispatch_handover")
         return self.async_show_menu(step_id="init", menu_options=menu)
+
+    async def async_step_dispatch_handover(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Owner opt-in (#769): a dispatch hold may hand its switch to a purchase window."""
+        key = native_handover.OPTION_KEY
+        if user_input is not None:
+            return self.async_create_entry(title="", data={
+                **self.config_entry.options, key: user_input.get(key) is True})
+        schema = probatio.Schema({probatio.Required(
+            key, default=native_handover.opted_in(self.config_entry.options)): BooleanSelector()})
+        return self.async_show_form(step_id="dispatch_handover", data_schema=schema)
 
     async def async_step_fallback(
         self, user_input: dict[str, Any] | None = None,

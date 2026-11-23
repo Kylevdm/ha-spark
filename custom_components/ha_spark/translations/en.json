@@ -56,6 +56,10 @@
       "title": "Site grid reading missing during an export",
       "description": "The whole-site grid power reading has been missing or stale for over two minutes while a supervised export is live. The export continues within the inverter's confirmed bound; the tripwire cannot watch the site export limit until the reading returns."
     },
+    "hold_reclaim_failed": {
+      "title": "Protection hold not taken back",
+      "description": "A dispatch hold handed the inverter power switch to a daytime charge window and could not turn it off again. Until it does, the battery may feed the car once the window ends. ha-spark retries every 30 seconds, and this repair clears itself once the switch reads off. To stop it now, turn the inverter power switch off."
+    },
     "dated_clear_failed": {
       "title": "Daytime charge window not cleared",
       "description": "A daytime charge window in the inverter's second time slot could not be cleared and confirmed zero. Until it is, the inverter may charge from the grid every day at that time. ha-spark retries the clear every 30 seconds outside Observe, and this repair clears itself once the slot reads zero. To stop it now, clear the second charge slot on the inverter."
@@ -368,6 +372,7 @@
           "evidence": "Native protection evidence",
           "fallback": "Native fallback schedule",
           "flexibility_events": "Flexibility events",
+          "dispatch_handover": "Dispatch purchase handover",
           "topology": "Site topology and limits"
         }
       },
@@ -422,6 +427,13 @@
         "title": "Flexibility events",
         "description": "Export during events is {export_state}. Enter the export rating in watts that each native inverter ({inverters}) may export during an event; the ratings are checked as a manual export supervision's are. Leave every field empty to clear them. Turn export on or off with the Set export during events action (administrator only); it supervises every export event with these ratings.",
         "data": {}
+      },
+      "dispatch_handover": {
+        "title": "Dispatch purchase handover",
+        "description": "Off by default. When on, a dispatch hold may hand the inverter power switch to a daytime charge window bought during a started dispatch with the car drawing. ha-spark arms the window first and turns the switch on only after the window reads back exactly. The hold takes the switch back two minutes before the window ends, once the battery is within 2 % of the window's target, at once if the battery reading is not trusted, and whenever the site leaves Optimise. Turning this off takes back any handover on the next check.",
+        "data": {
+          "dispatch_handover": "Hand the dispatch hold over to a purchase window"
+        }
       },
       "soc": {
         "title": "Native SoC trust policy",

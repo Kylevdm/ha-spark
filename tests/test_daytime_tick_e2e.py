@@ -114,12 +114,14 @@ def _supplier(router, kind):
     router.post(GRAPHQL).mock(side_effect=reply)
 
 
-async def _tick(settings, monkeypatch, *, native=True, mode="observe", api_version=5):
+async def _tick(settings, monkeypatch, *, native=True, mode="observe", api_version=5,
+                handover=None):
     context = ExecutionContext()
     store = seed_authority(settings, mode, context=context)
     queue = CommandQueue("test-session")
     link = native_link(settings)
-    link = replace(link, snapshot=link.snapshot.model_copy(update={"api_version": api_version}))
+    link = replace(link, snapshot=link.snapshot.model_copy(update={
+        "api_version": api_version, "dispatch_handover": handover}))
     if native:
         assert store.handover("pending_integration") == "retired"
         context.limits_record = link.topology
@@ -272,3 +274,28 @@ async def test_a_dated_charge_refusal_never_holds_optimise_activation(
                                api_version=api_version)
     [line] = [line for line in result.action_lines if "daytime purchase" in line]
     assert line.outcome not in (ActionOutcome.REFUSED, ActionOutcome.FAILED)
+
+
+@pytest.mark.parametrize(("native", "api_version", "handover", "expected"), [
+    (True, 6, True, True), (True, 6, False, False), (True, 5, True, False),
+    (False, 6, True, False),
+])
+async def test_the_tick_plans_with_the_integration_s_handover_opt_in(
+    tick_site, monkeypatch, native, api_version, handover, expected,
+):
+    # #769: only a native site's v6 snapshot carrying true lifts the dispatch refusal.
+    settings, router = tick_site
+    _supplier(router, "happy")
+    seen = []
+    plan = scheduler.current_plan
+
+    async def spy(*args, **kwargs):
+        seen.append(kwargs.get("dispatch_handover"))
+        return await plan(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler, "current_plan", spy)
+    result, _, _ = await _tick(settings, monkeypatch, native=native,
+                               mode="observe" if native else "protect",
+                               api_version=api_version, handover=handover)
+    assert seen == [expected]
+    assert result.plan_run.run.inputs.dispatch_handover is expected
