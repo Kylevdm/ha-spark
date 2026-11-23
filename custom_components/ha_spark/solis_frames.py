@@ -166,11 +166,22 @@ def decode(point: Point, words: tuple[int, ...], zone: ZoneInfo | None,
     return round(float(value) * point.scale, 6)
 
 
+SOC_ADDRESS = 33139
+# The first battery frames on a new connection can carry a default 100 % SoC
+# (#765): their SoC word is unknown, the rest of the frame stays readable.
+SOC_SETTLE_FRAMES = 3
+
+
 @dataclass(frozen=True)
 class Reading:
     read_at: datetime
     registers: tuple[int, ...] | None
     epoch: int = 0
+    settling: bool = False
+
+
+def soc_known(point: Point, reading: Reading) -> bool:
+    return point.address != SOC_ADDRESS or not reading.settling
 
 
 class Schedule:

@@ -13,6 +13,7 @@ from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClien
 from custom_components.ha_spark.native_entities import BankSoC
 from tests_ha.fake_solis import FakeSolisDevice
 from tests_ha.test_native_device import native_entry
+from tests_ha.test_native_entities import settled
 
 
 @pytest.fixture
@@ -49,6 +50,7 @@ async def test_default_soc_after_a_reconnect_is_never_published(
     native_transport.set_input(33139, [51])
     entry = await native_entry(hass, aioclient_mock)
     c = entry.runtime_data
+    settled(c.native)
     inverter = c.native.inverters["inv1"]
     bank_id = inverter.bank_id
     await c.native.async_poll(dt_util.utcnow())
@@ -64,6 +66,15 @@ async def test_default_soc_after_a_reconnect_is_never_published(
     assert BankSoC(c, bank_id).native_value != 100
     view = c.soc.bank(bank_id)
     assert view.value != 100 and not c.soc.trusted(bank_id)
+    soc = next(e for e in hass.states.async_all("sensor")
+               if e.entity_id.endswith("battery_soc") and "bank" not in e.entity_id)
+    assert soc.state == "unavailable"
+
+    # The settle window ends after three battery frames on the new connection.
+    native_transport.set_input(33139, [51])
+    for _ in range(3):
+        await _poll_battery_frame(c, freezer)
+    assert BankSoC(c, bank_id).native_value == 51
 
 
 async def test_default_soc_on_consecutive_reconnects_is_never_trusted(
@@ -74,6 +85,7 @@ async def test_default_soc_on_consecutive_reconnects_is_never_trusted(
     native_transport.set_input(33139, [51])
     entry = await native_entry(hass, aioclient_mock)
     c = entry.runtime_data
+    settled(c.native)
     bank_id = c.native.inverters["inv1"].bank_id
     await c.native.async_poll(dt_util.utcnow())
     freezer.tick(timedelta(minutes=1))

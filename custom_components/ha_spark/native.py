@@ -21,7 +21,7 @@ from homeassistant.util import dt as dt_util
 from .const import DOMAIN
 from .modbus_fence import hub_conflict
 from .native_hold import hold_identity_valid
-from .solis_frames import Reading, Schedule
+from .solis_frames import SOC_SETTLE_FRAMES, Reading, Schedule
 from .solis_identity import caching_on, identity_reason
 from .solis_transport import PymodbusTcpTransport, Transport, TransportError, valid_words
 from .topology import Inverter, Topology, validate_topology
@@ -84,6 +84,8 @@ class NativeDevices:
             isinstance(topology, Topology)) else {}
         self.schedule = Schedule(tuple(self.inverters))
         self.readings: dict[str, dict[str, Reading]] = {key: {} for key in self.inverters}
+        # Good battery frames per inverter on its current connection: (epoch, count).
+        self.battery_frames: dict[str, tuple[int, int]] = {}
         self.transports: dict[tuple[str, int], Transport] = {}
         self.probes: dict[str, Probe] = {}
         self.epochs: dict[str, int] = {}
@@ -277,8 +279,14 @@ class NativeDevices:
                 pass
             finally:
                 self.poll_task = None
+            settling = False
+            if frame.key == "input_33132" and registers is not None:
+                epoch, count = self.battery_frames.get(inverter_id, (None, 0))
+                count = count + 1 if epoch == transport.connection_epoch else 1
+                self.battery_frames[inverter_id] = (transport.connection_epoch, count)
+                settling = count <= SOC_SETTLE_FRAMES
             self.readings[inverter_id][frame.key] = Reading(
-                dt_util.utcnow(), registers, transport.connection_epoch)
+                dt_util.utcnow(), registers, transport.connection_epoch, settling)
         self.changed()
 
     def reading(self, inverter: Inverter, frame_key: str) -> Reading | None:

@@ -18,7 +18,7 @@ from custom_components.ha_spark.native_entities import BankSocTrust
 from custom_components.ha_spark.soc_trust import Policy
 from tests_ha.fake_solis import FakeSolisDevice
 from tests_ha.test_native_device import native_entry
-from tests_ha.test_native_entities import ticks
+from tests_ha.test_native_entities import settled, ticks
 from tests_ha.test_polling import fixture
 from tests_ha.test_topology_flow import STORED_TOPOLOGY
 
@@ -40,6 +40,7 @@ async def test_native_soc_snapshot_preconditions_live_fences_and_no_writes(
     native_transport.set_read_frames()
     native_transport.set_input(33139, [73])
     entry = await native_entry(hass, aioclient_mock)
+    settled(entry.runtime_data.native)
     c = entry.runtime_data
     bank_id = c.soc.topology.banks[0].id
     assert not c.soc.trusted(bank_id)
@@ -119,6 +120,7 @@ async def test_native_soc_accounts_only_for_fresh_valid_v2l_power(
     if scenario == "stale":
         freezer.tick(timedelta(minutes=10))
     entry = await native_entry(hass, aioclient_mock, topology=topology)
+    settled(entry.runtime_data.native)
     c = entry.runtime_data
     for _ in range(36):
         freezer.tick(timedelta(seconds=50))
@@ -148,6 +150,7 @@ async def test_failed_frame_ages_last_good_read_but_reconnect_never_reuses_it(
     native_transport.set_read_frames()
     native_transport.set_input(33139, [50])
     entry = await native_entry(hass, aioclient_mock)
+    settled(entry.runtime_data.native)
     c = entry.runtime_data
     bank_id = c.soc.topology.banks[0].id
     await c.native.async_poll(dt_util.utcnow())
@@ -201,6 +204,7 @@ async def test_durable_soc_cause_restarts_recovery_without_persisted_progress(
     native_transport.set_read_frames()
     native_transport.set_input(33139, [50])
     entry = await native_entry(hass, aioclient_mock)
+    settled(entry.runtime_data.native)
     c = entry.runtime_data
     state = c.authority.state
     assert state is not None
@@ -267,6 +271,7 @@ async def test_timer_observes_native_frames_and_invalid_soc_masks_trust_immediat
     native_transport.set_read_frames()
     native_transport.set_input(33139, [50])
     entry = await native_entry(hass, aioclient_mock)
+    settled(entry.runtime_data.native)
     c = entry.runtime_data
     bank_id = c.soc.topology.banks[0].id
     await ticks(hass, freezer, 61)

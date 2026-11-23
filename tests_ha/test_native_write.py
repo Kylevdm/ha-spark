@@ -15,6 +15,7 @@ from custom_components.ha_spark.commands import Command
 from custom_components.ha_spark.coordinator import SparkCoordinator
 from tests_ha.fake_solis import FakeSolisDevice, WriteFault
 from tests_ha.test_native_device import native_entry
+from tests_ha.test_native_entities import settled
 
 
 @pytest.fixture
@@ -474,6 +475,7 @@ async def test_increase_gate_uses_real_native_soc_trust(
     native_transport.set_input(33132, [32])
     native_transport.set_holding(43141, [100])
     entry = await native_entry(hass, aioclient_mock)
+    settled(entry.runtime_data.native)
     c: SparkCoordinator = entry.runtime_data
     assert isinstance(c.soc, NativeSoc)
     state = c.authority.state
