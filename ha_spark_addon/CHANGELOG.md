@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.42.3
+
+- Manual SoC-trust override: it now covers only the inverters you edit, so a
+  peer on the same connection is never raised back to an old plan current while
+  its SoC is untrusted. After a supply-guard cut, the guard restores your charge
+  current up to the value you set. The manual-session sensor shows
+  `override_soc_trust` (#766).
+
 ## 0.42.2
 
 - The energy ledger no longer loses a half-hour's live meter reading when the recorder fill reached that slot first: the live value replaces the fill, the slot takes the rates captured at that boundary so it can be priced again, and the next slot is measured normally (#757).
