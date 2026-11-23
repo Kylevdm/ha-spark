@@ -41,6 +41,11 @@ def opted_in(options: Any) -> bool:
     return options.get(OPTION_KEY) is True
 
 
+def minute(moment: datetime) -> datetime:
+    """Slot 2's resolution: ends in the same minute are one hardware occurrence."""
+    return moment.replace(second=0, microsecond=0)
+
+
 def conditions(c: "SparkCoordinator", inverter: Inverter, start: datetime, end: datetime,
                target_soc_pct: float, now: datetime, evidence: "EvidenceRead") -> bool:
     """Everything a handover needs apart from its own verified window."""
@@ -91,7 +96,8 @@ def live(c: "SparkCoordinator", inverter: Inverter, handover: Handover, now: dat
     from .native_write import CHARGE_BLOCK_FRAME, GRID_CHARGE_PERMITTED_REG
     state = c.authority.state
     zone = c.control.household_zone()
-    if (state is None or zone is None or state.epoch != handover.authority_epoch
+    if (inverter.id in c.writes.off_owed
+            or state is None or zone is None or state.epoch != handover.authority_epoch
             or c.native.transport(inverter).connection_epoch != handover.connection_epoch):
         return False
     face = tuple(clock_face(handover.start, handover.end, zone))

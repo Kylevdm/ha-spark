@@ -56,7 +56,10 @@ api_version 6; the add-on reads it only from a v6 snapshot carrying `true`.
   refusal stands and the change goes ahead without it. If that Off fails while
   the hold stands, the Slot 2 change fails and the window stays: it is the only
   protection left. A verified Off, or an Off found on the switch, ends the
-  handover, and that window end is never handed over again.
+  handover, and that window (to Slot 2's minute) is never handed over again. A
+  failed take-back, or a direct read showing grid charging not permitted, is
+  owed: the handover cannot be live again until an Off is verified. A plan's
+  zero charge current waits for a failed take-back; a supply-guard cut does not.
 - **Failures fail towards the hold.** A failed arm writes no On. An On refused
   or with the switch unreadable drops the handover; any other failed On keeps it,
   so the hold verifies Off. A failed take-back is retried every tick, sends the

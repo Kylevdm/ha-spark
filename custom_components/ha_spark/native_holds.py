@@ -142,16 +142,19 @@ class NativeHolds:
         """Off verified: the handover is over and its window is never handed over again."""
         writes = self.coordinator.writes
         handover = writes.handovers.pop(inverter.id, None)
+        writes.off_owed.discard(inverter.id)
         if handover is not None:
             now = dt_util.utcnow()
             writes.reclaimed[inverter.id] = {
                 end for end in writes.reclaimed.get(inverter.id, set()) if end > now
-            } | {handover.end}
+            } | {native_handover.minute(handover.end)}
         ir.async_delete_issue(self.coordinator.hass, DOMAIN, self._reclaim_issue_id(inverter))
 
     def _take_back_failed(self, inverter: Inverter) -> None:
         # shortcut: in memory only, a restart drops the repair; the hold's own notice remains.
         if inverter.id in self.coordinator.writes.handovers:
+            # Owed until an Off is verified: no later check may call the handover live.
+            self.coordinator.writes.off_owed.add(inverter.id)
             ir.async_create_issue(
                 self.coordinator.hass, DOMAIN, self._reclaim_issue_id(inverter),
                 is_fixable=False, severity=ir.IssueSeverity.ERROR,
@@ -173,6 +176,7 @@ class NativeHolds:
                                     for h in state.holds):
             # Released (or unknown): no hold of ours is left to take the switch back for.
             c.writes.handovers.pop(inverter.id, None)
+            c.writes.off_owed.discard(inverter.id)
             return True
         result = await async_write_power_locked(c.native, inverter, "off", recheck=lambda:
             self._refusal(inverter, state, release=False))
@@ -376,6 +380,7 @@ class NativeHolds:
             return confirmed
         # No hold wanted: a handover ends with the ordinary release.
         c.writes.handovers.pop(inverter.id, None)
+        c.writes.off_owed.discard(inverter.id)
         return await self._release(inverter, expected, now)
 
     async def async_release(self, now: datetime, *, removal: bool = False) -> bool:

@@ -50,6 +50,7 @@ class NativeDatedChargeWrites(NativeExportWrites):
         verified_slot2: dict[str, tuple[int, tuple[int, ...]]]
         handovers: dict[str, native_handover.Handover]
         reclaimed: dict[str, set[datetime]]
+        off_owed: set[str]
 
     def _dated_record(self, inverter_id: str) -> DatedChargeRecord | None:
         state = self.coordinator.authority.state
@@ -140,7 +141,8 @@ class NativeDatedChargeWrites(NativeExportWrites):
         """A held inverter's window that the hold may hand its switch to."""
         c = self.coordinator
         return (request.target_soc_pct is not None and self._hold_active(inverter)
-                and request.end not in self.reclaimed.get(inverter.id, set())
+                and native_handover.minute(request.end)
+                not in self.reclaimed.get(inverter.id, set())
                 and native_handover.conditions(c, inverter, request.start, request.end,
                                                request.target_soc_pct, now,
                                                c.holds.evidence.read(now)))
@@ -286,8 +288,9 @@ class NativeDatedChargeWrites(NativeExportWrites):
         zone = c.control.household_zone()
         soc = getattr(c, "soc", None)
         current = self.handovers.get(inverter.id)
-        if current is not None and (current.start, current.end) == (request.start, request.end):
-            # The same window under a new plan stops at the new target (none: at once).
+        if current is not None and current.end == request.end:
+            # The same purchase under a new plan (a later start is its remainder)
+            # stops at the new target; with none, at once.
             self.handovers[inverter.id] = replace(
                 current, target_soc_pct=request.target_soc_pct or 0.0)
         handover = self._may_hand_over(inverter, request, now)
@@ -309,7 +312,8 @@ class NativeDatedChargeWrites(NativeExportWrites):
         if inverter.id in self.handovers and power == "off":
             # An Off seen under a handover is its take-back, whoever wrote it.
             c.holds._taken_back(inverter)
-            handover = handover and request.end not in self.reclaimed.get(inverter.id, set())
+            handover = handover and native_handover.minute(request.end) not in (
+                self.reclaimed.get(inverter.id, set()))
             if not handover:
                 return IntentResult(outcome="refused", reason="hold_active")
         handed = self.handovers.get(inverter.id)
@@ -322,6 +326,8 @@ class NativeDatedChargeWrites(NativeExportWrites):
             return IntentResult(outcome="refused", reason="hold_active")
         permission = await self._read(c.native.transport(inverter), inverter, input_=True)
         if permission is None or not permission & 32:
+            if permission is not None and inverter.id in self.handovers:
+                self.off_owed.add(inverter.id)  # read directly: the window cannot charge
             return IntentResult(outcome="refused", reason="grid_charge_not_permitted")
         resident = await slots.read(SLOT2_REG)
         state = c.authority.state

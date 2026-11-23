@@ -592,3 +592,84 @@ async def test_a_cached_off_from_before_the_on_is_not_a_take_back(
     # The switch was read fresh and the live handover kept.
     assert native_transport.holding[43007] == ON
     assert handed(writer) == (END, 80.0)
+
+
+async def test_a_failed_take_back_is_owed_until_an_off_is_verified(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await held(writer, monkeypatch, native_transport)
+    assert await hand_over(writer, native_transport) == "applied"
+    native_transport.inject_write_fault(WriteFault("silent_noop"), address=43007)
+    result = await writer._async_dispatch_command(apply_command(writer, [
+        {"kind": "dated_charge", "inverter_id": "inv1", "request": "none"}], sequence=2))
+    assert result.intents[0].outcome == "failed"
+    # Every condition still holds, yet the failed Off is owed: the tick writes Off.
+    native_transport.traffic.clear()
+    await tick(writer)
+    assert switch_writes(native_transport) == [OFF]
+    assert handed(writer) is None
+
+
+async def test_a_plan_zero_current_waits_for_a_failed_take_back(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await held(writer, monkeypatch, native_transport)
+    assert await hand_over(writer, native_transport) == "applied"
+    native_transport.inject_write_fault(WriteFault("silent_noop"), address=43007)
+    native_transport.traffic.clear()
+    result = await writer._async_dispatch_command(apply_command(
+        writer, [current(0.0)], sequence=2))
+    assert result.intents[0].outcome == "failed"
+    assert 43141 not in [t.address for t in native_transport.traffic if t.op == "write"]
+
+
+async def test_a_later_start_for_the_same_purchase_takes_the_new_target(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    bank = await held(writer, monkeypatch, native_transport)
+    monkeypatch.setattr(writer.fallback, "async_evaluate", AsyncMock())
+    bank.value = 75.0
+    assert await hand_over(writer, native_transport) == "applied"
+    freezer.tick(timedelta(minutes=5))
+    set_clock(writer, datetime.now(UTC))
+    await writer._async_dispatch_command(apply_command(writer, [dated(
+        NOW + timedelta(minutes=5), END, target_soc_pct=76.0)], sequence=2))
+    assert handed(writer) == (END, 76.0)
+    native_transport.traffic.clear()
+    await tick(writer)
+    assert switch_writes(native_transport) == [OFF]
+
+
+async def test_a_direct_read_without_grid_charge_permission_ends_the_handover(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await held(writer, monkeypatch, native_transport)
+    assert await hand_over(writer, native_transport) == "applied"
+    native_transport.set_input(33132, [0])
+    result = await writer._async_dispatch_command(apply_command(writer, [window()], sequence=2))
+    assert result.intents[0].reason == "grid_charge_not_permitted"
+    native_transport.traffic.clear()
+    await tick(writer)
+    assert switch_writes(native_transport) == [OFF]
+
+
+async def test_the_latch_is_the_slot_2_minute_not_the_second(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    bank = await held(writer, monkeypatch, native_transport)
+    monkeypatch.setattr(writer.fallback, "async_evaluate", AsyncMock())
+    assert await hand_over(writer, native_transport) == "applied"
+    bank.value = 78.0
+    await tick(writer)
+    bank.value = 50.0
+    freezer.tick(timedelta(seconds=30))
+    set_clock(writer, datetime.now(UTC))
+    native_transport.traffic.clear()
+    # Same Slot 2 face (12:00-12:30), timestamps 30 s later.
+    shift = timedelta(seconds=30)
+    result = await writer._async_dispatch_command(apply_command(writer, [dated(
+        NOW + shift, END + shift, target_soc_pct=80.0)], sequence=2))
+    assert result.intents[0].outcome == "refused"
+    assert switch_writes(native_transport) == []
