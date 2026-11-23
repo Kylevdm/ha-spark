@@ -127,6 +127,8 @@ class DatedChargeWindow(CurrentIntent):
     request: Literal["window"] = "window"
     start: Instant
     end: Instant
+    # api_version 6 (#769): left out below 6, whose integrations forbid unknown fields.
+    target_soc_pct: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def validate_window(self) -> DatedChargeWindow:
@@ -137,26 +139,28 @@ class DatedChargeWindow(CurrentIntent):
         return self
 
 
-def _daytime_window(intent: ChargeIntent) -> tuple[datetime, datetime, float] | None:
+def _daytime_window(intent: ChargeIntent) -> tuple[datetime, datetime, float, float] | None:
     """The first dated window, merged with any that touch it (one Slot 2 to arm).
 
-    Returns its start, end and the stored kWh its purchases add.
+    Returns its start, end, the stored kWh its purchases add and the highest target.
     """
     windows = sorted(intent.daytime_windows, key=lambda w: w.start)
     if not windows:
         return None
-    start, end, energy = windows[0].start, windows[0].end, windows[0].energy_kwh
+    first = windows[0]
+    start, end, energy, target = first.start, first.end, first.energy_kwh, first.target_soc_pct
     for window in windows[1:]:
         if window.start > end:
             break
         end, energy = max(end, window.end), energy + window.energy_kwh
-    return start, end, energy
+        target = max(target, window.target_soc_pct)
+    return start, end, energy, target
 
 
-def _daytime_bank_a(window: tuple[datetime, datetime, float], settings: Settings,
+def _daytime_bank_a(window: tuple[datetime, datetime, float, float], settings: Settings,
                     voltage_v: float, limit_a: float) -> float:
     """Bank current that buys the window's energy evenly, never above the bank limit."""
-    start, end, energy = window
+    start, end, energy, _target = window
     hours = (end - start).total_seconds() / 3600
     eff = settings.charge_efficiency if settings.charge_efficiency > 0 else 1.0
     if hours <= 0 or voltage_v <= 0:
@@ -191,7 +195,8 @@ def build_intents(intent: ChargeIntent, settings: Settings, execution: Execution
                   topology: Topology, *, api_version: int) -> list[dict[str, JsonValue]]:
     """Share the planner's single-bank current without multiplying it per inverter.
 
-    `api_version` is the integration's negotiated one: dated charge needs 5.
+    `api_version` is the integration's negotiated one: dated charge needs 5, and
+    its target (for a hold handover, #769) 6.
     """
     if not intent.soc.ok:
         return []
@@ -229,14 +234,17 @@ def build_intents(intent: ChargeIntent, settings: Settings, execution: Execution
         # Slot 2 is a Solis register block; other drivers get no dated charge.
         if inverter.driver_kind == "solis" and api_version >= 5:
             if daytime is not None and day_a is not None:
-                actions.append(DatedChargeWindow(inverter_id=inverter.id, current_a=day_a,
-                                                 start=daytime[0], end=daytime[1]))
+                actions.append(DatedChargeWindow(
+                    inverter_id=inverter.id, current_a=day_a, start=daytime[0], end=daytime[1],
+                    target_soc_pct=daytime[3] if api_version >= 6 else None))
             elif not intent.daytime_trusted:
                 actions.append(DatedChargeUntrusted(inverter_id=inverter.id))
             else:
                 actions.append(DatedChargeNone(inverter_id=inverter.id))
         for action in actions:
-            intents.append(action.model_dump(mode="json"))
+            intents.append(action.model_dump(mode="json", exclude=(
+                {"target_soc_pct"} if isinstance(action, DatedChargeWindow)
+                and action.target_soc_pct is None else None)))
     return intents
 
 

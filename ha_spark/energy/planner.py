@@ -1355,7 +1355,7 @@ def _daytime_purchases(
                             f"{_clock(start, inputs)}–{_clock(end, inputs)}")
                 reason = (f"Buy {amount:.2f} kWh from the {evidence} at "
                           f"£{price:g}/kWh")
-                refused = coarse_hold
+                refused = coarse_hold and not inputs.dispatch_handover
                 if refused:
                     reason += ", but the dispatch hold refuses it."
                 else:

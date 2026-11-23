@@ -77,6 +77,7 @@ async def test_downgrade_rebuilds_version_specific_snapshot(
         *, site_id: str, release_version: str, sent_at: datetime, api_version: int,
         solar_forecast: object = None, topology: object = None,
         major_loads: object = None, supply_guard: object = None,
+        dispatch_handover: bool = False,
     ) -> dict[str, object]:
         body = wire.build_snapshot(site_id=site_id, release_version=release_version,
                                    sent_at=sent_at, api_version=api_version)
@@ -117,6 +118,7 @@ async def test_downgrade_build_failure_is_malformed(
         *, site_id: str, release_version: str, sent_at: datetime, api_version: int,
         solar_forecast: object = None, topology: object = None,
         major_loads: object = None, supply_guard: object = None,
+        dispatch_handover: bool = False,
     ) -> dict[str, object]:
         if api_version == 1:
             raise error(TOKEN)

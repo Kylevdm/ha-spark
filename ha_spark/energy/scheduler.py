@@ -99,7 +99,7 @@ import httpx
 import uvicorn
 
 from ha_spark.agent.auth import resolve_token
-from ha_spark.api.contract import IntegrationLink
+from ha_spark.api.contract import IntegrationLink, dispatch_handover
 from ha_spark.api.native_apply import NativeApply, NativeApplyArgs, build_intents, snapshot_soc
 from ha_spark.api.server import (
     AGENT_PORT,
@@ -499,6 +499,7 @@ async def run_once(
             session_cache=(
                 session_cache if session_cache is not None else context.session_cache
             ),
+            dispatch_handover=native and dispatch_handover(native_link),
         )
         plan, inputs, load_source = run.plan, run.inputs, run.load_source
         log.info(

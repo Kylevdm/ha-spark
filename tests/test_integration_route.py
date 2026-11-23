@@ -238,7 +238,7 @@ async def test_golden_envelope_and_no_mutation(state, discovery, monkeypatch, ve
     assert CANARY not in response.text
     contract = json.loads((FIXTURES / "contract.json").read_text())
     assert golden["api_version"] == version
-    assert contract["api_version"] == 5
+    assert contract["api_version"] == 6
     assert (state.current_options(), state.settings_service.revision,
             state.settings.model_dump(), state.plan, state.plan_at) == before
     assert load_authority(state.settings) == authority_before
@@ -257,7 +257,8 @@ def test_snapshot_accepted_and_unknown_fields_dropped(state, discovery, extra):
     identity = {k: v for k, v in snapshot.items() if k not in (
         "topology", "major_loads", "supply_guard",
     )}
-    assert known == identity | {"sent_at": datetime.fromisoformat(snapshot["sent_at"])}
+    assert known == identity | {"sent_at": datetime.fromisoformat(snapshot["sent_at"]),
+                                "dispatch_handover": snapshot.get("dispatch_handover")}
     assert state.integration_link.received_at is not None
     assert state.integration_link.received_at.utcoffset().total_seconds() == 0
     assert not state.integration_link.skew
@@ -279,7 +280,7 @@ def test_http_reports_loop_tick_without_refreshing(state, discovery, monkeypatch
     assert state.loop_tick == tick
 
 
-@pytest.mark.parametrize("version", [6, 99])
+@pytest.mark.parametrize("version", [7, 99])
 def test_version_skew_keeps_snapshot_and_returns_refusal(state, discovery, version):
     snapshot = json.loads((FIXTURES / "site_snapshot.json").read_text())
     with TestClient(build_app(state, ingress_peer="testclient", integration=discovery)) as client:
@@ -292,7 +293,7 @@ def test_version_skew_keeps_snapshot_and_returns_refusal(state, discovery, versi
             "api_version": version, "release_version": "1.0.0", "site_id": [],
             "sent_at": False, "v2": {"new": True}})
     assert response.status_code == 409
-    refusal = json.loads((FIXTURES / "version_refusal_v5.json").read_text())
+    refusal = json.loads((FIXTURES / "version_refusal_v6.json").read_text())
     assert response.json() == refusal
     assert refusal["api_version"] == json.loads((FIXTURES / "contract.json").read_text())[
         "api_version"]
