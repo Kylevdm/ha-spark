@@ -16,7 +16,7 @@ from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClien
 
 from custom_components.ha_spark.const import DOMAIN
 from custom_components.ha_spark.native_entities import BankSoC
-from custom_components.ha_spark.solis_frames import POINTS
+from custom_components.ha_spark.solis_frames import POINTS, SOC_SETTLE_FRAMES
 from custom_components.ha_spark.solis_transport import ReadResult
 from tests_ha.fake_solis import FakeSolisDevice
 from tests_ha.test_native_device import native_entry
@@ -30,6 +30,13 @@ def hass_storage() -> dict[str, Any]:
 @pytest.fixture
 def hass_config_dir(tmp_path: Path) -> str:
     return str(tmp_path)
+
+
+def settled(native: Any) -> None:
+    """Skip the #765 SoC settle window on each inverter's current connection."""
+    for inverter in native.inverters.values():
+        native.battery_frames[inverter.id] = (
+            native.transport(inverter).connection_epoch, SOC_SETTLE_FRAMES)
 
 
 async def ticks(hass: HomeAssistant, freezer: FrozenDateTimeFactory, count: int) -> None:
@@ -47,6 +54,7 @@ async def test_native_energy_metadata_pacing_and_failure_isolation(
     native_transport.set_input(33169, [1, 2])
     native_transport.set_input(33139, [73])
     entry = await native_entry(hass, aioclient_mock)
+    settled(entry.runtime_data.native)
     native = entry.runtime_data.native
     inverter = native.inverters["inv1"]
     prefix = f"{native.gateway_id(inverter)}_1"
@@ -240,6 +248,7 @@ async def test_readings_from_before_a_reconnect_are_not_shown(
     native_transport.set_read_frames()
     native_transport.set_input(33139, [73])
     entry = await native_entry(hass, aioclient_mock)
+    settled(entry.runtime_data.native)
     native = entry.runtime_data.native
     inverter = native.inverters["inv1"]
     await native.async_poll(dt_util.utcnow())

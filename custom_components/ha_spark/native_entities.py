@@ -18,7 +18,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import SparkCoordinator
-from .solis_frames import POINTS, Point, decode
+from .solis_frames import POINTS, Point, decode, soc_known
 from .topology import Inverter, Topology, validate_topology
 
 
@@ -77,7 +77,7 @@ class RegisterEntity(NativeEntity):
 
     def value(self) -> float | str | bool | datetime | None:
         reading = self.coordinator.native.reading(self.inverter, self.point.frame.key)
-        if reading is None or reading.registers is None:
+        if reading is None or reading.registers is None or not soc_known(self.point, reading):
             return None
         return decode(self.point, reading.registers,
                       self.coordinator.control.household_zone(), frame=True)
@@ -167,7 +167,7 @@ class BankSoC(BankEntity):
         native = self.coordinator.native
         source = self.sources[0]
         reading = native.reading(source, self.point.frame.key)
-        if reading is None or reading.registers is None:
+        if reading is None or reading.registers is None or not soc_known(self.point, reading):
             return None
         value = decode(self.point, reading.registers, None, frame=True)
         return value if isinstance(value, float) and 0 <= value <= 100 else None

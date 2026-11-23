@@ -79,7 +79,7 @@ class NativeSoc:
                 valid = False
             if not valid:
                 self._good.pop(bank.id, None)
-            elif reading is not None:
+            elif reading is not None and not reading.settling:
                 self._good[bank.id] = reading
             good = self._good.get(bank.id)
             value = power = None
@@ -108,7 +108,7 @@ class NativeSoc:
                 good is not None and good.epoch != native.transport(source).connection_epoch):
             return BankTrust(view.value, view.read_at, "untrusted", "read_failed")
         current = native.reading(source, "input_33132")
-        if current is not None and current.registers is not None:
+        if current is not None and current.registers is not None and not current.settling:
             value = decode(next(p for p in POINTS if p.address == 33139),
                            current.registers, None, frame=True)
             if value is None:

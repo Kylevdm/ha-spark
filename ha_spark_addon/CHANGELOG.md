@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.42.4
+
+- Native Solis: the inverter can report a false 100 % battery SoC in the first
+  frames after its connection comes back. For the first three battery frames on
+  every new connection (about 30 s, start and reload included) the Battery SoC
+  and Battery bank SoC sensors are unavailable and SoC trust takes no reading,
+  so the false value never reaches history or the planner (#765).
+
 ## 0.42.3
 
 - Manual SoC-trust override: it now covers only the inverters you edit, so a
