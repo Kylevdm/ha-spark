@@ -191,6 +191,7 @@ async def test_local_entities_survive_addon_loss_and_hide_unknown_state(
             assert "PRIVATE-CANARY" not in str(hass.states.get(entity))
         manual = hass.states.get("sensor.ha_spark_manual_session")
         assert manual is not None and manual.attributes["keep_protection"] is True
+        assert manual.attributes["override_soc_trust"] is False
         fallback = hass.states.get("binary_sensor.ha_spark_fallback_active")
         assert fallback is not None and fallback.attributes["causes"] == ["addon_liveness"]
         transitions: tuple[tuple[OperatingMode, str], ...] = (

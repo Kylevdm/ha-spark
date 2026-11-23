@@ -66,12 +66,14 @@ async def async_entity(boundary: "NativeChargeBoundary", inverter_id: str, contr
                             or half[:2] == half[2:] and any(half)):
                         return IntentResult(outcome="refused", reason="invalid_intent")
                     if (control == "charge" and slots.soc_untrusted()
-                            and not boundary._owner_soc_override(control)):
+                            and not boundary._owner_soc_override(inverter.id)):
                         return IntentResult(outcome="refused", reason="untrusted_soc")
 
                 if control == "charge" and offset is None:
                     # Q9(a): a time edit writes only the Slot 1 block, never 43141.
                     previous = guard.request_current(inverter.id, current)
+                    edit = boundary.owner_currents.get(inverter.id)
+                    boundary.owner_currents[inverter.id] = (epoch, current)
                     async def commit(device: Inverter, amps: float) -> IntentResult:
                         result = await boundary._async_commit(device, amps, epoch, mismatches,
                                                              entity_control="charge")
@@ -85,9 +87,11 @@ async def async_entity(boundary: "NativeChargeBoundary", inverter_id: str, contr
                             commit=commit)
                     except BaseException:
                         boundary._restore(guard, inverter.id, previous)
+                        _restore_edit(boundary, inverter.id, edit)
                         raise
                     if not attempted or result.outcome == "refused":
                         boundary._restore(guard, inverter.id, previous)
+                        _restore_edit(boundary, inverter.id, edit)
                     if result.outcome not in ("applied", "unchanged") or target is None:
                         return result
                 assert target is not None
@@ -95,6 +99,15 @@ async def async_entity(boundary: "NativeChargeBoundary", inverter_id: str, contr
     finally:
         for id_ in mismatches:
             await coordinator.native.async_readback_mismatch(id_)
+
+
+def _restore_edit(boundary: "NativeChargeBoundary", inverter_id: str,
+                  edit: tuple[int, float] | None) -> None:
+    """A refused owner edit must not become a SoC-override restore target."""
+    if edit is None:
+        boundary.owner_currents.pop(inverter_id, None)
+    else:
+        boundary.owner_currents[inverter_id] = edit
 
 
 async def words(boundary: "NativeChargeBoundary", inverter: Inverter, epoch: int,
@@ -133,7 +146,7 @@ async def words(boundary: "NativeChargeBoundary", inverter: Inverter, epoch: int
     if reason:
         return IntentResult(outcome="refused", reason=reason)
     if (control == "charge" and not boundary.coordinator.soc.increases_allowed(inverter.bank_id)
-            and not boundary._owner_soc_override(control)):
+            and not boundary._owner_soc_override(inverter.id)):
         return IntentResult(outcome="refused", reason="untrusted_soc")
     result = await transport.write(address, target, device_id=inverter.gateway_unit_id)
     if not result.ok:
