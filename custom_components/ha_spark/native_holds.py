@@ -150,6 +150,12 @@ class NativeHolds:
             } | {native_handover.minute(handover.end)}
         ir.async_delete_issue(self.coordinator.hass, DOMAIN, self._reclaim_issue_id(inverter))
 
+    def _drop_handover(self, inverter: Inverter) -> None:
+        """No hold of ours is left: the handover and any take-back owed or repair end."""
+        self.coordinator.writes.handovers.pop(inverter.id, None)
+        self.coordinator.writes.off_owed.discard(inverter.id)
+        ir.async_delete_issue(self.coordinator.hass, DOMAIN, self._reclaim_issue_id(inverter))
+
     def _take_back_failed(self, inverter: Inverter) -> None:
         # shortcut: in memory only, a restart drops the repair; the hold's own notice remains.
         if inverter.id in self.coordinator.writes.handovers:
@@ -175,8 +181,7 @@ class NativeHolds:
         if state is None or not any(h.device == hold_device(inverter) and h.owned
                                     for h in state.holds):
             # Released (or unknown): no hold of ours is left to take the switch back for.
-            c.writes.handovers.pop(inverter.id, None)
-            c.writes.off_owed.discard(inverter.id)
+            self._drop_handover(inverter)
             return True
         result = await async_write_power_locked(c.native, inverter, "off", recheck=lambda:
             self._refusal(inverter, state, release=False))
@@ -379,8 +384,8 @@ class NativeHolds:
                                          "A protection hold could not be applied.")
             return confirmed
         # No hold wanted: a handover ends with the ordinary release.
-        c.writes.handovers.pop(inverter.id, None)
-        c.writes.off_owed.discard(inverter.id)
+        if inverter.id in c.writes.handovers:
+            self._drop_handover(inverter)
         return await self._release(inverter, expected, now)
 
     async def async_release(self, now: datetime, *, removal: bool = False) -> bool:

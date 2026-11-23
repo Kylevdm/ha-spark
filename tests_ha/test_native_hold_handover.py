@@ -673,3 +673,20 @@ async def test_the_latch_is_the_slot_2_minute_not_the_second(
         NOW + shift, END + shift, target_soc_pct=80.0)], sequence=2))
     assert result.intents[0].outcome == "refused"
     assert switch_writes(native_transport) == []
+
+
+async def test_a_hold_that_ends_clears_an_outstanding_take_back_repair(
+    writer: SparkCoordinator, native_transport: FakeSolisDevice, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bank = await held(writer, monkeypatch, native_transport, causes=("dispatch",))
+    assert await hand_over(writer, native_transport) == "applied"
+    bank.trust = "untrusted"
+    native_transport.inject_write_fault(WriteFault("silent_noop"), address=43007)
+    await tick(writer)
+    assert len(reclaim_issues(writer)) == 1
+    # The dispatch ends and the car stops: no hold is left to take the switch back for.
+    report_dispatch(writer, None)
+    writer.hass.states.async_set("sensor.ev", "stopped")
+    await tick(writer)
+    assert handed(writer) is None
+    assert reclaim_issues(writer) == []
