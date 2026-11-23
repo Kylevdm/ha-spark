@@ -85,7 +85,8 @@ security and prefer the safe default. Hard rules:
     Solis inverter only as a dated charge intent, armed in the charge half of
     Slot 2 through `NativeChargeBoundary` (Slot 1 and Slot 2's discharge half
     untouched), only in Optimise with a current epoch, trusted SoC, a trusted
-    inverter clock and no hold on that inverter (`hold_active`). Protect,
+    inverter clock and no hold on that inverter (`hold_active`; the hold
+    handover below is the one exception). Protect,
     fallback, manual control and Observe never arm one. Its durable record is
     saved before the write and armed only after exact read-back. It is
     cleared at its end, on a `none` request and when the site leaves Optimise
@@ -93,6 +94,23 @@ security and prefer the safe default. Hard rules:
     window. Every clear is zero-confirmed before the record is retired; a
     failed clear keeps the record, is retried by the native tick and raises a
     repair. Add-on-owned, AlphaESS and legacy Solis sites never get one.
+  - *Hold handover (ADR-0015):* under the owner's integration opt-in
+    (`dispatch_handover`, off by default, sent to the add-on from api_version
+    6) the planner admits a started dispatch purchase on a coarse-hold
+    inverter, and its dated window (with a target) may arm under an owned,
+    confirmed dispatch hold: Slot 2 is armed with the switch still Off and read
+    back exactly, the handover is recorded in memory, and only then is On
+    written under a fresh recheck. The hold leaves the switch On only while the
+    handover is live (`native_handover.live`: counted v6 heartbeat, Optimise
+    with no manual session, fallback or transition, a live trusted dispatch,
+    verified positive current, the inverter clock within 60 s and inside the
+    window more than two minutes from its end, trusted SoC more than 2 % below
+    target, the armed record and verified face uncontradicted by a newer poll);
+    otherwise it writes Off as usual. Any Slot 2 write on a handed-over inverter
+    writes Off first under the hold's own refusal (so never toward Observe). A
+    verified Off ends the handover and that window is never handed over again;
+    an On that may have landed keeps the Off obligation. Nothing is persisted: a
+    restart forgets the handover and the hold writes Off on its next tick.
 
   Under either authority owner, Observe, unknown authority and a failed
   authority save write nothing, with one exception: on an integration-owned
@@ -126,7 +144,7 @@ security and prefer the safe default. Hard rules:
   `ownership.py`, `native_write.py`, `native_holds.py`,
   `native_fallback_control.py`, `guard_loop.py`, `native_export.py`,
   `native_export_write.py`, `native_export_supervision.py`, `native_tripwire.py`,
-  `native_dated_write.py`, `native_slots.py`).
+  `native_dated_write.py`, `native_handover.py`, `native_slots.py`).
 - **Parameterised SQL only**; no `eval`/`exec`/`shell=True`/shell interpolation
   of external data.
 - **Network:** outbound only to configured endpoints; any inbound network

@@ -622,8 +622,9 @@ below the overnight price, or a started dispatch half-hour at the off-peak
 rate. The next overnight purchase shrinks by what was bought, not by an
 anticipated session. A purchase inside an EV or dispatch hold on a coarse-hold
 inverter such as Solis remains a refused diagnostic naming the hold. It adds
-no energy or cost benefit and sends no dated charge window. A purchase has no
-saving figure.
+no energy or cost benefit and sends no dated charge window. The one exception
+is a started dispatch purchase under the owner's **hold handover** opt-in. A
+purchase has no saving figure.
 
 **Dispatch top-up**:
 Charging the house battery during a daytime Octopus dispatch, at the off-peak
@@ -632,8 +633,23 @@ window. It is a cost decision, independent of Charge when clean. The overnight
 charge is never reduced in anticipation of a dispatch; only a dispatch that
 happens tops up, and replanning shrinks the next overnight charge. On a
 coarse-hold inverter such as Solis, an EV or dispatch hold refuses the daytime
-purchase. The plan names the hold and leaves the overnight purchase unchanged.
-(Decision: #329, 2026-10-16; hold refusal #697.)
+purchase. The plan names the hold and leaves the overnight purchase unchanged,
+unless the owner has opted in to the **hold handover**.
+(Decision: #329, 2026-10-16; hold refusal #697; handover #769.)
+
+**Hold handover**:
+The owner's opt-in, off by default, letting a dispatch hold on a native Solis
+inverter turn its power switch back on for a dispatch purchase's dated charge
+window. The forced window keeps the battery charging while the car draws. The
+switch goes on only after the window is armed and read back, and only in
+Optimise. The hold **reclaims** the switch (turns it off again) two minutes
+before the window ends, once trusted SoC is within 2 % of the window's target,
+at once if SoC is untrusted, or when any condition goes, and before anything
+changes the window. A reclaimed window is never handed over again. The
+handover lives in memory only: a restart forgets it and the hold turns the
+switch off. A failed reclaim is retried every check and raises a repair.
+(Decision: #769, 2026-11-23; ADR-0015.)
+_Avoid_: hold release (a handover keeps the hold), override
 
 **Clean dispatch**:
 A daytime dispatch whose forecast grid carbon intensity is lower than that of

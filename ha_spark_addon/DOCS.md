@@ -1896,7 +1896,8 @@ device, bank and site limits and the major-load reserve. The next overnight
 purchase shrinks by what was bought, not by an anticipated free session. On a
 coarse-hold inverter such as Solis, a purchase inside an EV or dispatch hold is
 kept as a refused diagnostic naming the hold. It sends no dated charge window
-and leaves the overnight purchase unchanged.
+and leaves the overnight purchase unchanged. The one exception is a started
+dispatch purchase under the dispatch purchase handover below.
 
 **Native Solis actuation only.** On an integration-owned native Solis site in
 Optimise, the add-on sends a dated charge device intent using API version 5.
@@ -1910,6 +1911,25 @@ No daytime window is armed in Protect, fallback, temporary manual control or
 Observe, with untrusted SoC or an untrusted inverter clock, or during a hold
 on that inverter (`hold_active`). Add-on-owned, AlphaESS and legacy Solis sites
 get no daytime window; the plan names the refusal.
+
+**Dispatch purchase handover.** Off by default. Turn it on in the integration's
+**Options → Dispatch purchase handover** (native topologies only). It needs
+API version 6 on both sides; with an older add-on or integration the dispatch
+hold keeps refusing. When it is on, the plan buys from a started dispatch with
+the car drawing, as on an inverter without a coarse hold, and sends the window
+with its target SoC. The integration arms Slot 2 while the hold still has the
+power switch off, checks it by read-back, and only then turns the switch on. A forced charge window keeps the battery charging rather
+than feeding the car (#704). The hold takes the switch back two minutes before
+the window ends, once trusted SoC is within 2 % of the target, at once if SoC is
+untrusted, whenever the site leaves Optimise or the dispatch ends, and before
+anything changes the window. That window is never handed over again. Each
+half-hour's plan buys only that half-hour, so a long dispatch turns the switch
+off for a few minutes around each half-hour boundary. If arming or the
+switch write fails, the hold stays on. If taking the switch back fails, ha-spark
+retries every 30 seconds, sends the **A protection hold could not be applied**
+notice and raises the repair **Protection hold not taken back** until the switch
+reads off. A restart forgets the handover, so the hold turns the switch off on
+its first check.
 
 The window is cleared at its end, when no purchase remains and when the site
 leaves Optimise. Every clear is confirmed by five further zero reads. A failed
