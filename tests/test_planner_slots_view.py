@@ -95,33 +95,18 @@ def test_slot_view_holds_mid_slot_and_ignores_elapsed_evidence(trusted):
     assert "hold" not in plan.view.slots[0].actions
 
 
-def test_slot_view_export_skip_and_v2l_match_existing_decisions():
+def test_slot_view_export_and_skip_match_existing_decisions():
     # The planner selects two paid-export slots here (tests/test_planner.py).
     plan = _reserve_trade_plan(rate=1.0)
     assert plan.charge_intent.export is not None
     selected = plan.charge_intent.export.selected_slots
     assert selected
-    for i, slot in enumerate(plan.view.slots):
+    for slot in plan.view.slots:
         assert ("export" in slot.actions) == (slot.start in selected)
         assert ("skip" in slot.actions) == any(s.start == slot.start for s in plan.export_skips)
-        assert ("v2l" in slot.actions) == any(r.slot == i for r in plan.v2l_refills)
         # Without an export-price overlay the planner prices paid export at the event rate.
         if slot.start in selected:
             assert slot.export_price == 1.0
-
-
-def test_slot_view_v2l_refills_are_not_inferred_from_cheap_slots():
-    config = cfg(v2l_budget_kwh=15)
-    inputs = PlannerInputs(
-        soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=30,
-        load_slots=(0.0,) * 12 + (30 / 36,) * 36, car_plugged_in=True,
-        horizon_start=datetime(2026, 1, 10, 23, 30, tzinfo=UTC),
-    )
-    plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
-    assert plan.v2l_refills
-    assert {i for i, slot in enumerate(plan.view.slots) if "v2l" in slot.actions} == {
-        refill.slot for refill in plan.v2l_refills
-    }
 
 
 def test_slot_view_reads_naive_hold_bounds_on_the_household_clock():

@@ -3,8 +3,8 @@
 ha-spark reads the car's V2L discharge-power sensor (W), integrates it into the
 energy delivered this session, values it against the configured tariff (less
 conversion losses), and fires timely HA notifications. V2L is a manual physical
-adapter with no control API: this is read/observe + notify only. The planner and
-chargers are untouched.
+adapter with no control API: this is read/observe + notify only. It also
+uses the plan's shortfalls to ask for V2L when the house battery won't last.
 
 It also asks the owner for a V2L top-up when an Axle export event is
 underfunded and the charge window can't fix it (#208): the overnight charge
@@ -14,17 +14,20 @@ what the overnight plan expected. The request is a notification only.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
-from dataclasses import asdict, dataclass, field
+from collections.abc import Iterator
+from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
 from ha_spark.config import Settings
 from ha_spark.energy.forecast import load_timezone
-from ha_spark.energy.models import ChargePlan, FlexibilityEvent
+from ha_spark.energy.models import ChargePlan, FlexibilityEvent, align
+from ha_spark.energy.planner import V2L_NEEDED_KWH
 from ha_spark.energy.sources import _to_float, parse_time
 from ha_spark.ha.rest import HomeAssistantRest, notify
 from ha_spark.logging import get_logger
@@ -35,7 +38,6 @@ log = get_logger(__name__)
 # 60 s tick proves too coarse (it won't for kWh-scale tallies).
 _IDLE_W = 50.0  # power below this = V2L idle/stopped
 _DT_CLAMP_S = 300.0  # integration gap ceiling (restart-safe)
-_PLUG_IN_LEAD_MIN = 20.0  # N3 predictive lead time
 _CUTOFF_WINDOW_MIN = 120.0  # N1 fires only within this many minutes after cutoff
 _RESEND_GROWTH_KWH = 0.5  # a top-up request repeats once the shortfall grows this much
 
@@ -54,7 +56,6 @@ class V2LSession:
     active: bool = False
     notified_unplug: bool = False
     notified_plug_in: bool = False
-    notified_budget: bool = False
 
 
 def integrate(prev_kwh: float, power_w: float, dt_s: float) -> float:
@@ -192,22 +193,6 @@ def notifications(session: V2LSession, now: datetime, settings: Settings) -> lis
             )
         )
 
-    # N3 - predictive plug-in: projected to hit the V2L budget within the lead.
-    if not session.notified_budget and settings.v2l_budget_kwh > 0:
-        remaining = settings.v2l_budget_kwh - session.kwh_delivered
-        hit = remaining <= 0
-        if not hit and session.last_power_w > 0:
-            mins = (remaining / (session.last_power_w / 1000.0)) * 60.0
-            hit = mins <= _PLUG_IN_LEAD_MIN
-        if hit:
-            out.append(
-                Notice(
-                    "notified_budget",
-                    "Car nearing V2L budget",
-                    f"Car will reach your V2L budget "
-                    f"({settings.v2l_budget_kwh:.0f} kWh) soon - plan to plug in.",
-                )
-            )
     return out
 
 
@@ -268,7 +253,9 @@ def load_session(settings: Settings) -> V2LSession:
         return V2LSession(day="")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return V2LSession(**data)
+        if not isinstance(data, dict):
+            raise TypeError("Invalid V2L session")
+        return V2LSession(**{f.name: data[f.name] for f in fields(V2LSession) if f.name in data})
     except (OSError, ValueError, TypeError, RecursionError):
         log.warning("Reading V2L session failed; starting fresh", exc_info=True)
         return V2LSession(day="")
@@ -285,6 +272,99 @@ def save_session(settings: Settings, session: V2LSession) -> None:
     except OSError:
         log.warning("Caching V2L session failed", exc_info=True)
         tmp_path.unlink(missing_ok=True)
+
+
+_NEEDED_STAGES = ("morning", "evening")
+_needed_lock = asyncio.Lock()
+_needed_sent: dict[tuple[Path, str], str] = {}
+
+
+def v2l_needed(
+    plan: ChargePlan, now: datetime, settings: Settings,
+) -> tuple[str, Notice] | None:
+    """The first stage whose timing and forecast shortfall warrant a notice."""
+    return next(((stage, notice) for stage, _day, notice in _needed_notices(plan, now, settings)),
+                None)
+
+
+def _needed_notices(
+    plan: ChargePlan, now: datetime, settings: Settings,
+) -> Iterator[tuple[str, str, Notice]]:
+    """Each due stage with the local date of the window edge it belongs to.
+
+    Keyed by that edge, not by today's date, so a window opening after
+    midnight can't send its evening notice twice.
+    """
+    if (not notification_service(settings) or not plan.soc.ok
+            or plan.model != "slots" or plan.limits_reason is not None):
+        return
+    tz = load_timezone(settings.timezone)
+    now = now.replace(tzinfo=tz) if now.tzinfo is None else now.astimezone(tz)
+    instant = now.astimezone(UTC)
+    end_clock = parse_time(settings.charge_window_end)
+    end = datetime.combine(now.date(), end_clock, tz).astimezone(UTC)
+    if end > instant:
+        end = datetime.combine(now.date() - timedelta(days=1), end_clock, tz).astimezone(UTC)
+    start = plan.charge_intent.window_start_at
+    if start is None:
+        start_clock = parse_time(settings.charge_window_start)
+        start = datetime.combine(now.date(), start_clock, tz).astimezone(UTC)
+        if start < instant:
+            start = datetime.combine(now.date() + timedelta(days=1), start_clock, tz)
+    start = align(start, now).astimezone(UTC)
+
+    for stage, in_range, shortfall, run_out, wording in (
+        ("morning", end <= instant < end + timedelta(hours=2),
+         plan.shortfall_before_window_kwh, plan.run_out_before_window_at, "today"),
+        ("evening", start - timedelta(hours=3) <= instant < start,
+         plan.shortfall_after_window_kwh, plan.run_out_after_window_at, "tomorrow"),
+    ):
+        if not in_range or not math.isfinite(shortfall) or shortfall <= V2L_NEEDED_KWH:
+            continue
+        message = f"V2L needed {wording}: about {shortfall:.1f} kWh short"
+        message += " after tonight's charge." if stage == "evening" else "."
+        if run_out is not None:
+            message += f" Plug in before {align(run_out, now).astimezone(tz):%H:%M}."
+        edge = end if stage == "morning" else start
+        yield stage, edge.astimezone(tz).date().isoformat(), Notice(stage, "V2L needed", message)
+
+
+def _load_needed(path: Path) -> dict[str, str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {stage: data[stage] for stage in _NEEDED_STAGES
+                    if isinstance(data.get(stage), str)}
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, RecursionError):
+        log.warning("Reading V2L needed state failed; starting fresh", exc_info=True)
+    return {}
+
+
+async def run_v2l_needed(
+    settings: Settings, rest: HomeAssistantRest, plan: ChargePlan, now: datetime,
+) -> None:
+    """Send each stage once per household day; a failed send leaves it pending."""
+    notices = tuple(_needed_notices(plan, now, settings))
+    if not notices:
+        return
+    path = Path(settings.db_path).parent / "ha_spark_v2l_needed.json"
+    async with _needed_lock:
+        sent = _load_needed(path)
+        for stage, day, notice in notices:
+            if sent.get(stage) == day or _needed_sent.get((path, stage)) == day:
+                continue
+            await notify(rest, notification_service(settings), notice.title, notice.message)
+            # Keep the in-process marker even if the disk write fails.
+            sent[stage] = _needed_sent[path, stage] = day
+            tmp = path.with_suffix(".json.tmp")
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp.write_text(json.dumps(sent), encoding="utf-8")
+                os.replace(tmp, path)
+            finally:
+                tmp.unlink(missing_ok=True)
 
 
 # --- V2L top-up request for an underfunded Axle event (#208) ---
@@ -311,10 +391,9 @@ class TopUp:
     """One V2L top-up request: how much, how soon, and why."""
 
     shortfall_kwh: float  # battery energy missing at ``needed_at``
-    car_kwh: float  # car AC energy to draw, within the V2L budget
+    car_kwh: float  # car AC energy to draw
     needed_at: datetime
     start_by: datetime
-    budget_capped: bool
     reason: str
 
 
@@ -388,16 +467,12 @@ def topup_request(
     if shortfall_kwh <= 1e-9:
         return None
     car_kwh = shortfall_kwh / delivered
-    budget_capped = 0 < settings.v2l_budget_kwh < car_kwh
-    if budget_capped:
-        car_kwh = settings.v2l_budget_kwh
     hours = car_kwh * settings.v2l_rectifier_efficiency / settings.v2l_charge_kw
     return TopUp(
         shortfall_kwh=shortfall_kwh,
         car_kwh=car_kwh,
         needed_at=needed_at,
         start_by=needed_at - timedelta(hours=hours),
-        budget_capped=budget_capped,
         reason=reason,
     )
 
@@ -416,8 +491,6 @@ def topup_notice(topup: TopUp, event: FlexibilityEvent, now: datetime) -> Notice
         f"({topup.reason}). Start V2L {when} to draw about {topup.car_kwh:.1f} kWh "
         f"from the car before {topup.needed_at.astimezone(tz):%H:%M}."
     )
-    if topup.budget_capped:
-        message += " That is your whole V2L budget, so the event stays partly short."
     message += " Without it, ha-spark skips the unfunded slots."
     return Notice("topup", "Start V2L for the Axle event", message)
 

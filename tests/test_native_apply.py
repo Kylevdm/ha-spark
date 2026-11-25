@@ -166,11 +166,15 @@ async def test_run_once_uses_command_not_driver(tmp_path, monkeypatch, outcome, 
         monkeypatch.setattr(SolisDevice, name, AsyncMock(side_effect=AssertionError("legacy I/O")))
     for name in ("_record_forecast", "_record_solar_forecasts", "_run_derived_rerive"):
         monkeypatch.setattr(scheduler, name, AsyncMock())
+    needed = AsyncMock(side_effect=RuntimeError("notify failed"))
+    monkeypatch.setattr(scheduler, "run_v2l_needed", needed)
     result = await scheduler.run_once(
         settings, execution=context, source=SolarSource("entities", None, None, NOW),
         native_apply=apply,
         native_link=link, native_epoch=7,
     )
+    needed.assert_awaited_once_with(settings, needed.call_args.args[1], plan, NOW)
+    assert not settings.v2l_power_entity
     assert seen[0].soc_now == 42.0
     assert (result.applied_plan is plan) is accepted
     assert len(result.apply_lines) == 4
@@ -216,6 +220,48 @@ def test_charge_intent_golden():
     for model, raw in zip((ChargeWindow, ChargeCurrentLimit, ExportNone, DatedChargeNone),
                           intents, strict=True):
         assert model.model_validate(raw).model_dump() == raw
+
+
+@pytest.mark.parametrize(("full_speed", "soc_pct", "trusted", "expected"), [
+    (True, 0, True, {"inverter": 54, "second": 36}),
+    (True, 60, True, {"inverter": 0, "second": 0}),
+    # 0.1 kWh short: 4 A delivers it within one replan interval, not the 90 A bank
+    # limit; the split rounds each inverter down to whole amps.
+    (True, 59, True, {"inverter": 2, "second": 1}),
+    (False, 0, True, {"inverter": 12, "second": 8}),
+    (True, 0, False, {}),
+])
+def test_build_intents_full_speed(full_speed, soc_pct, trusted, expected):
+    from datetime import time
+
+    from ha_spark.api.native_apply import build_intents
+    from ha_spark.config import Settings
+    from ha_spark.devices.execution import ExecutionContext
+    from ha_spark.energy.models import ChargeIntent
+    from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
+    from ha_spark.energy.topology import Topology
+    from ha_spark.energy.topology_record import LoadedTopology
+    from tests.native_helpers import NOW, native_link
+
+    settings = Settings(battery_capacity_kwh=10, battery_voltage_v=50, charge_efficiency=1)
+    raw = native_link(settings).topology.topology.model_dump()
+    raw["banks"][0]["charge_limit_a"] = 90
+    first = {**raw["inverters"][0], "charge_limit_a": 60}
+    raw["inverters"] = (
+        first, {**first, "id": "second", "gateway_host": "second.test", "charge_limit_a": 40},
+    )
+    topology = Topology.model_validate(raw)
+    context = ExecutionContext()
+    context.limits_record = LoadedTopology("native", 1, topology)
+    status = SocStatus.OK if trusted else SocStatus.UNAVAILABLE
+    intent = ChargeIntent(60, SocMeasurement(status, NOW, value=soc_pct),
+                          time(23, 30), time(5, 30), full_speed=full_speed)
+    intents = build_intents(intent, settings, context, topology, api_version=5)
+    if not trusted:
+        assert intents == []
+    for kind in ("charge_window", "charge_current_limit"):
+        assert {raw["inverter_id"]: raw["current_a"] for raw in intents
+                if raw["kind"] == kind} == pytest.approx(expected)
 
 
 async def test_retired_gate_and_guard_ignore_snapshot_owner(tmp_path, monkeypatch):

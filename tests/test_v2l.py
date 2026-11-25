@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
@@ -13,6 +15,7 @@ import pytest
 import respx
 
 from ha_spark.config import Settings
+from ha_spark.energy import v2l
 from ha_spark.energy.models import ChargePlan, FlexibilityEvent, PlannerConfig, PlannerInputs
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
@@ -31,6 +34,7 @@ from ha_spark.energy.v2l import (
     notification_service,
     notifications,
     payload,
+    run_v2l_needed,
     run_v2l_tick,
     run_v2l_topup,
     save_session,
@@ -38,6 +42,7 @@ from ha_spark.energy.v2l import (
     savings,
     topup_notice,
     topup_request,
+    v2l_needed,
     warn_deprecated_notify_target,
 )
 from ha_spark.ha.rest import HomeAssistantRest, notify
@@ -229,7 +234,6 @@ def _nsettings(**kw: object) -> Settings:
     base: dict[str, object] = dict(
         v2l_notify_service="mobile_app_x",
         v2l_cutoff_time="01:00",
-        v2l_budget_kwh=0.0,
         v2l_peak_rate_gbp=0.30,
         v2l_offpeak_rate_gbp=0.07,
         v2l_round_trip_efficiency=0.85,
@@ -284,21 +288,6 @@ def test_n2_no_fire_while_active_or_zero() -> None:
     }
 
 
-def test_n3_predictive_fires_near_budget() -> None:
-    s = _nsettings(v2l_budget_kwh=5.0)
-    # 4.9 kWh delivered, 2000 W -> 0.1 kWh to go = 0.05 h = 3 min <= lead(20)
-    sess = V2LSession(day="2026-06-28", kwh_delivered=4.9, last_power_w=2000.0, active=True)
-    flags = {n.flag for n in notifications(sess, datetime(2026, 6, 28, 22, 0), s)}
-    assert "notified_budget" in flags
-
-
-def test_n3_disabled_without_budget() -> None:
-    s = _nsettings(v2l_budget_kwh=0.0)
-    sess = V2LSession(day="2026-06-28", kwh_delivered=4.9, last_power_w=2000.0, active=True)
-    flags = {n.flag for n in notifications(sess, datetime(2026, 6, 28, 22, 0), s)}
-    assert "notified_budget" not in flags
-
-
 def test_notice_carries_flag_title_message() -> None:
     s = _nsettings()
     sess = V2LSession(day="2026-06-28", kwh_delivered=2.0, active=True)
@@ -315,6 +304,17 @@ def test_session_round_trip(tmp_path: Path) -> None:
     assert back.day == "2026-06-28"
     assert back.kwh_delivered == 2.5
     assert back.notified_unplug is True
+
+
+def test_session_with_retired_budget_flag_keeps_its_tally(tmp_path: Path) -> None:
+    settings = _nsettings(db_path=str(tmp_path / "ha_spark.db"))
+    path = tmp_path / "ha_spark_v2l_session.json"
+    path.write_text(json.dumps({"day": "2026-11-24", "kwh_delivered": 12.5,
+                                "notified_budget": True, "notified_unplug": True}))
+    session = load_session(settings)
+    assert session == V2LSession(day="2026-11-24", kwh_delivered=12.5, notified_unplug=True)
+    save_session(settings, session)
+    assert "notified_budget" not in json.loads(path.read_text())
 
 
 def test_save_session_leaves_no_stray_tmp_file(tmp_path: Path) -> None:
@@ -590,6 +590,120 @@ def _overnight_plan() -> ChargePlan:
     return compute_plan(inputs, config, fixed_schedule(inputs, config))
 
 
+_MORNING = datetime(2026, 6, 8, 5, 10, tzinfo=UTC)  # 06:10 household time
+_WINDOW_START = datetime(2026, 6, 8, 23, 30, tzinfo=UTC)  # 00:30 next day
+_EVENING = _WINDOW_START - timedelta(hours=3)
+
+
+def _needed_settings(tmp_path: Path, **changes: Any) -> Settings:
+    return _topup_settings(tmp_path, **{
+        "timezone": "Europe/London", "charge_window_end": "06:10",
+        "v2l_power_entity": "", **changes,
+    })
+
+
+def _needed_plan() -> ChargePlan:
+    plan = _overnight_plan()
+    return replace(
+        plan, charge_intent=replace(plan.charge_intent, window_start_at=_WINDOW_START),
+        shortfall_before_window_kwh=2.54, shortfall_after_window_kwh=5.76,
+        run_out_before_window_at=_MORNING.replace(hour=18, minute=21),
+        run_out_after_window_at=_MORNING.replace(day=9, hour=19, minute=34),
+    )
+
+
+@pytest.mark.parametrize(("now", "stage"), [
+    (_MORNING - timedelta(seconds=1), None),
+    (_MORNING, "morning"),
+    (_MORNING + timedelta(hours=2, seconds=-1), "morning"),
+    (_MORNING + timedelta(hours=2), None),
+    (_MORNING.replace(hour=13), None),
+    (_EVENING - timedelta(seconds=1), None),
+    (_EVENING, "evening"),
+    (_WINDOW_START - timedelta(seconds=1), "evening"),
+    (_WINDOW_START, None),
+])
+def test_needed_stage_bounds_and_local_message(
+    tmp_path: Path, now: datetime, stage: str | None,
+) -> None:
+    result = v2l_needed(_needed_plan(), now, _needed_settings(tmp_path))
+    if stage is None:
+        assert result is None
+    else:
+        assert result is not None
+        actual, notice = result
+        assert actual == stage
+        assert notice.message == {
+            "morning": "V2L needed today: about 2.5 kWh short. Plug in before 19:21.",
+            "evening": "V2L needed tomorrow: about 5.8 kWh short after tonight's charge. "
+                       "Plug in before 20:34.",
+        }[stage]
+
+
+def test_needed_uses_configured_clock_without_geometry_and_omits_unknown_time(
+    tmp_path: Path,
+) -> None:
+    settings = _needed_settings(tmp_path, charge_window_start="00:30")
+    plan = _needed_plan()
+    plan = replace(plan, charge_intent=replace(plan.charge_intent, window_start_at=None),
+                   run_out_after_window_at=None)
+    assert v2l_needed(plan, _EVENING, settings) == (
+        "evening", Notice("evening", "V2L needed",
+                          "V2L needed tomorrow: about 5.8 kWh short after tonight's charge."),
+    )
+    assert v2l_needed(replace(plan, shortfall_after_window_kwh=1), _EVENING, settings) is None
+
+
+@respx.mock
+async def test_needed_once_per_stage_per_local_day_across_restart(tmp_path, monkeypatch):
+    settings, plan = _needed_settings(tmp_path), _needed_plan()
+    route = respx.post(f"{BASE}/services/notify/mobile_app_phone").respond(json=[])
+    async with HomeAssistantRest(BASE, "token") as rest:
+        await asyncio.gather(*(run_v2l_needed(settings, rest, plan, _MORNING) for _ in range(2)))
+        await run_v2l_needed(settings, rest, plan, _EVENING)
+        assert route.call_count == 2
+        path = tmp_path / "ha_spark_v2l_needed.json"
+        # Each stage is keyed by its window edge: the 00:30 window opens on the 9th.
+        assert json.loads(path.read_text()) == {"morning": "2026-06-08", "evening": "2026-06-09"}
+        await run_v2l_needed(settings, rest, plan, _WINDOW_START - timedelta(minutes=10))
+        assert route.call_count == 2
+        assert not path.with_suffix(".json.tmp").exists()
+        monkeypatch.setattr(v2l, "_needed_sent", {})
+        await run_v2l_needed(settings, rest, plan, _MORNING)
+        await run_v2l_needed(settings, rest, plan, _EVENING)
+        assert route.call_count == 2
+        await run_v2l_needed(settings, rest, plan, _MORNING + timedelta(days=1))
+        assert route.call_count == 3
+
+
+@respx.mock
+async def test_failed_needed_send_retries_within_stage(tmp_path: Path) -> None:
+    settings, plan = _needed_settings(tmp_path), _needed_plan()
+    route = respx.post(f"{BASE}/services/notify/mobile_app_phone").respond(500)
+    path = tmp_path / "ha_spark_v2l_needed.json"
+    async with HomeAssistantRest(BASE, "token") as rest:
+        with pytest.raises(httpx.HTTPError):
+            await run_v2l_needed(settings, rest, plan, _MORNING)
+        assert not path.exists()
+        path.write_text("{not valid json")
+        route.respond(json=[])
+        await run_v2l_needed(settings, rest, plan, _MORNING + timedelta(minutes=30))
+    assert route.call_count == 2
+    assert json.loads(path.read_text()) == {"morning": "2026-06-08"}
+
+
+@respx.mock
+async def test_needed_skips_no_service_daily_model_and_invalid_soc(tmp_path: Path) -> None:
+    settings, plan = _needed_settings(tmp_path), _needed_plan()
+    async with HomeAssistantRest(BASE, "token") as rest:
+        await run_v2l_needed(_needed_settings(tmp_path, notify_service=""), rest, plan, _MORNING)
+        await run_v2l_needed(settings, rest, replace(plan, model="daily"), _MORNING)
+        bad_soc = replace(plan.soc, status=SocStatus.UNAVAILABLE)
+        await run_v2l_needed(settings, rest, replace(plan, soc=bad_soc), _MORNING)
+    assert not respx.calls
+    assert not await asyncio.to_thread(lambda: list(tmp_path.iterdir()))
+
+
 def _event_day(plan: ChargePlan, soc: float) -> ChargePlan:
     """The event-day plan: same funding verdict, live SoC, a path for tomorrow."""
     return replace(plan, soc=_ok_soc(soc), soc_path=())
@@ -632,7 +746,6 @@ def test_topup_when_the_overnight_charge_was_maxed(tmp_path: Path) -> None:
     # 1.1 kWh into the battery at 2.15 kW DC.
     assert topup.start_by == _EVENT.start - timedelta(hours=1.1 / 2.15)
     assert topup.reason == "overnight charge maxed"
-    assert not topup.budget_capped
 
 
 def test_no_topup_when_the_charge_window_was_not_the_limit(tmp_path: Path) -> None:
@@ -709,23 +822,10 @@ def test_no_event_day_topup_without_an_overnight_record(tmp_path: Path) -> None:
     ) is None
 
 
-def test_topup_is_held_to_the_v2l_budget(tmp_path: Path) -> None:
-    topup = topup_request(
-        _overnight_plan(), _EVENT, TopUpRecord(event_id(_EVENT)),
-        datetime(2026, 6, 8, 21, 0, tzinfo=UTC), _topup_settings(tmp_path, v2l_budget_kwh=0.5),
-    )
-
-    assert topup is not None
-    assert topup.car_kwh == 0.5
-    assert topup.budget_capped
-    notice = topup_notice(topup, _EVENT, datetime(2026, 6, 8, 21, 0, tzinfo=UTC))
-    assert "whole V2L budget" in notice.message
-
-
 def test_topup_notice_names_shortfall_and_start_time() -> None:
     topup = TopUp(
         shortfall_kwh=1.1, car_kwh=1.17, needed_at=_EVENT.start,
-        start_by=datetime(2026, 6, 9, 16, 29, tzinfo=UTC), budget_capped=False,
+        start_by=datetime(2026, 6, 9, 16, 29, tzinfo=UTC),
         reason="overnight charge maxed",
     )
 

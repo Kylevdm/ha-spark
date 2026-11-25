@@ -5,7 +5,8 @@ from dataclasses import replace
 import pytest
 
 from ha_spark.energy.models import ChargePlan, PlannerConfig, PlannerInputs
-from ha_spark.energy.planner import compute_plan
+from ha_spark.energy.planner import V2L_NEEDED_KWH, compute_plan
+from ha_spark.energy.soc_integrity import SocStatus
 from ha_spark.energy.tariff import fixed_schedule
 from ha_spark.energy.topology import Topology
 from tests.test_planner_limits import config, inputs, native
@@ -97,46 +98,46 @@ def test_uneven_inverter_limits_split_proportionally_within_their_own() -> None:
     )
 
 
-def test_v2l_set_aside_narrows_bank_room_not_connection_import() -> None:
-    cfg = config(strategy="fill", v2l_budget_kwh=10)
-    inp = replace(inputs(), car_plugged_in=True)
-    # Bank binding: min(1.5 kW preferred, 3 kW max, 30 A x 52 V) comes off the
-    # bank's charge room, so the charge loses energy it would otherwise store.
-    bank_binding = plan_for(cfg, inp, two_inverter(cfg, bank_a=100, v2l_a=30))
-    assert bank_binding.required_kwh == pytest.approx((5.2 - 1.5) * 6)
-    without_charger = plan_for(cfg, inp, two_inverter(cfg, bank_a=100))
-    assert bank_binding.required_kwh < without_charger.required_kwh
-    # The set-aside is bank room, so the bank, not the connection, is named.
-    assert bank_binding.hardware_limit_reason == "Charging limited by hardware: legacy_bank."
-    # The inverters share only what the set-aside leaves of the 100 A bank.
-    v2l_a = 1.5 * 1000 / 52
-    shares = [allocation.charge_a or 0 for allocation in bank_binding.inverter_allocations]
-    assert shares == [35, 35]
-    assert sum(shares) + v2l_a <= 100
-    # Connection binding: the import budget is untouched by the V2L set-aside.
-    connection_binding = plan_for(cfg, inp, two_inverter(cfg, bank_a=125, import_a=20, v2l_a=30))
-    assert connection_binding.required_kwh == pytest.approx(3.04 * 6)
+@pytest.mark.parametrize(("peak_kwh", "status", "native_transport", "full_speed"), [
+    (31.0, SocStatus.OK, True, True),
+    (31.0, SocStatus.UNAVAILABLE, True, False),
+    (8.0, SocStatus.OK, True, False),
+    (16.0, SocStatus.OK, True, False),  # exactly 1 kWh short
+    (31.0, SocStatus.OK, False, False),
+])
+def test_full_speed_only_for_a_trusted_native_shortfall_over_threshold(
+    peak_kwh: float, status: SocStatus, native_transport: bool, full_speed: bool,
+) -> None:
+    cfg = config(capacity_kwh=20, target_cap=95)
+    inp = inputs()
+    inp = replace(inp, soc=replace(inp.soc, status=status),
+                  load_slots=(0.0,) * 12 + (peak_kwh / 32,) * 32 + (0.0,) * 4,
+                  car_plugged_in=True)
+    raw = two_inverter(cfg, bank_a=100, v2l_a=30).model_dump()
+    if native_transport:
+        for i, inverter in enumerate(raw["inverters"]):
+            inverter.update(transport="native", gateway_host=f"gateway-{i}.test")
+    plan = plan_for(cfg, inp, Topology.model_validate(raw))
+    expected_shortfall = max(0.0, peak_kwh - 15)
+    assert plan.shortfall_after_window_kwh == pytest.approx(expected_shortfall)
+    assert plan.charge_intent.full_speed is full_speed
+    spread = plan.required_kwh / cfg.charge_efficiency / (6 * 0.052)
+    assert spread < 100
+    assert [allocation.charge_a for allocation in plan.inverter_allocations] == [
+        50 if full_speed else int(spread / 2),
+    ] * 2
 
 
-def test_v2l_set_aside_requires_a_plugged_car_and_a_budget() -> None:
-    cfg = config(strategy="fill", v2l_budget_kwh=10)
-    topology = two_inverter(cfg, bank_a=100, v2l_a=30)
-    unplugged = plan_for(cfg, inputs(), topology)
-    assert unplugged.required_kwh == pytest.approx(5.2 * 6)
-    no_budget = plan_for(config(strategy="fill"), replace(inputs(), car_plugged_in=True), topology)
-    assert no_budget.required_kwh == pytest.approx(5.2 * 6)
-
-
-def test_legacy_plan_keeps_no_allocations_and_no_v2l_set_aside() -> None:
-    cfg = config(strategy="fill", v2l_budget_kwh=10)
+def test_legacy_plan_keeps_no_allocations_even_with_a_plugged_car() -> None:
+    cfg = config(strategy="fill")
     inp = replace(inputs(), car_plugged_in=True)
     plan = compute_plan(inp, cfg, fixed_schedule(inp, cfg))
     assert plan.inverter_allocations == ()
-    # The legacy adapter models V2L exactly as today's planner does: the
-    # in-window capacity stays 62.5 A x 52 V.
+    # The in-window capacity stays 62.5 A x 52 V.
     assert plan.required_kwh == pytest.approx(3.25 * 6)
     plain = compute_plan(inputs(), config(strategy="fill"), fixed_schedule(inputs(), cfg))
     assert plain.inverter_allocations == ()
+    assert not plan.charge_intent.full_speed
     assert plain.required_kwh == plan.required_kwh
 
 
@@ -149,4 +150,6 @@ def test_fail_closed_plan_keeps_no_allocations() -> None:
     plan = compute_plan(inp, cfg, fixed_schedule(inp, cfg), topology=topology)
     assert plan.required_kwh == 0
     assert plan.limits_reason is not None
+    assert plan.shortfall_after_window_kwh > V2L_NEEDED_KWH
+    assert not plan.charge_intent.full_speed
     assert plan.inverter_allocations == ()

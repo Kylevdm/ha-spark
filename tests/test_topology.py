@@ -248,9 +248,7 @@ def test_legacy_adapter_preserves_exact_discharge_and_v2l() -> None:
     assert limits.connections[0].site_export_kw == 3.68
     assert limits.connections[0].import_kw == 18
     assert topology.legacy_v2l is not None
-    assert topology.legacy_v2l.budget_kwh == cfg.v2l_budget_kwh
     assert topology.legacy_v2l.max_rate_kw == cfg.v2l_max_rate_kw
-    assert topology.legacy_v2l.preferred_rate_kw == cfg.v2l_preferred_rate_kw
     assert topology.legacy_v2l.round_trip_efficiency == cfg.v2l_round_trip_efficiency
     assert topology.legacy_v2l.offpeak_rate_gbp == cfg.v2l_offpeak_rate_gbp
 

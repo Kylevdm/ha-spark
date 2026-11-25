@@ -196,11 +196,9 @@ class PlannerConfig:
     charge_efficiency: float = 0.90  # round-trip AC->DC->AC; buy required/efficiency
     strategy: str = "deficit"  # "deficit" (buy the shortfall) | "fill" (to target cap)
 
-    v2l_budget_kwh: float = 0.0
     v2l_round_trip_efficiency: float = 0.85
     v2l_offpeak_rate_gbp: float = 0.07
     v2l_max_rate_kw: float = 3.0
-    v2l_preferred_rate_kw: float = 1.5
     driver_kind: DriverKind = "solis"
 
     @property
@@ -376,6 +374,10 @@ class PlannerInputs:
         return legacy_geometry(self.horizon_start, config, n_slots)
 
 
+# One replan interval: full speed delivers what is left no faster than this (#776).
+FULL_SPEED_HOURS = 0.5
+
+
 @dataclass(frozen=True)
 class ChargeIntent:
     """Inverter-agnostic charge command: reach ``target_soc_pct`` by ``window_end``.
@@ -423,6 +425,9 @@ class ChargeIntent:
     # The per-minute reconcile re-checks its age before trusting `unrated_holds`;
     # None is no evidence, never "fresh".
     octopus_dispatch_reported_at: datetime | None = None
+    # A V2L-needed night (#776): size the charge to finish within FULL_SPEED_HOURS,
+    # not over the whole window, so it never runs past the target between plans.
+    full_speed: bool = False
 
     @property
     def soc_now(self) -> float:
@@ -490,21 +495,6 @@ class Reservation:
 
 
 @dataclass(frozen=True)
-class V2LRefill:
-    """Energy stored in the house battery during a half-hour slot.
-
-    kWh and rate are delivered battery energy; a partial slot keeps the
-    preferred rate and runs for kwh / rate_kw hours.
-    """
-
-    slot: int
-    kwh: float
-    rate_kw: float
-    reason: str
-    reservation: str = ""
-
-
-@dataclass(frozen=True)
 class ChargePlan:
     """The computed plan: the numbers, plus the ChargeIntent a Charger realizes."""
 
@@ -543,8 +533,10 @@ class ChargePlan:
     # The reservations tonight's charge funds: those targeted after the window
     # start (a pre-window one is carried from now, never charged).
     charge_funded_reservations: tuple[Reservation, ...] = ()
-    v2l_refills: tuple[V2LRefill, ...] = ()
-    v2l_wanted_but_unavailable: bool = False
+    shortfall_after_window_kwh: float = 0.0
+    shortfall_before_window_kwh: float = 0.0
+    run_out_after_window_at: datetime | None = None
+    run_out_before_window_at: datetime | None = None
     # Skips are part of the plan rather than silently becoming lower-current
     # delivery: every accepted export slot is always a complete half-hour.
     export_skips: tuple[ExportSkip, ...] = ()

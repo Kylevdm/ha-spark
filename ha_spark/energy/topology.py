@@ -496,19 +496,15 @@ _LEGACY_DISCHARGE_A = 62.5
 class LegacyV2L(FrozenModel):
     """Existing V2L coefficients, not a new native bank constraint."""
 
-    budget_kwh: float
     round_trip_efficiency: float
     offpeak_rate_gbp: float
     max_rate_kw: float
-    preferred_rate_kw: float
 
 
 class LegacyTopology(Topology):
     """Local-only adapter result; native validation refuses these extra fields.
 
-    Discharge remains an exact kW value, without a current round trip. V2L
-    retains the existing planner's budget and rates; the native per-slot bank
-    constraint must not be retroactively imposed on legacy plans.
+    Discharge remains an exact kW value, without a current round trip.
     """
 
     legacy_discharge_kw: Annotated[float, Field(ge=0, allow_inf_nan=False)]
@@ -559,10 +555,8 @@ def legacy_topology(cfg: "PlannerConfig", driver_kind: DriverKind) -> LegacyTopo
         ),
         legacy_discharge_kw=cfg.battery_discharge_ceiling_kw,
         legacy_v2l=LegacyV2L(
-            budget_kwh=cfg.v2l_budget_kwh,
             round_trip_efficiency=cfg.v2l_round_trip_efficiency,
             offpeak_rate_gbp=cfg.v2l_offpeak_rate_gbp,
             max_rate_kw=cfg.v2l_max_rate_kw,
-            preferred_rate_kw=cfg.v2l_preferred_rate_kw,
         ),
     )

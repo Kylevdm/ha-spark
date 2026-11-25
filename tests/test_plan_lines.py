@@ -71,38 +71,6 @@ def test_export_lines_sum_selected_energy():
         assert line.start < line.end
 
 
-@pytest.mark.parametrize("interleaved", [False, True])
-def test_v2l_lines_fold_and_preserve_original_reasons(interleaved):
-    config = cfg(v2l_budget_kwh=15)
-    inputs = PlannerInputs(
-        soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=30,
-        load_slots=(0.0,) * 12 + (30 / 36,) * 36, car_plugged_in=True,
-        horizon_start=datetime(2026, 1, 10, 23, 30, tzinfo=UTC),
-    )
-    if interleaved:
-        # An unfundable export creates a skip inside the refill run, not a
-        # boundary at which otherwise adjacent V2L reasons should stop folding.
-        inputs = replace(inputs, flexibility_event=FlexibilityEvent(
-            start=datetime(2026, 1, 11, 20, tzinfo=UTC),
-            end=datetime(2026, 1, 11, 20, 30, tzinfo=UTC), direction="export",
-            updated_at=datetime(2026, 1, 10, 23, tzinfo=UTC), rate_gbp_kwh=0.01,
-        ))
-    plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
-    lines = [line for line in plan.view.lines if line.kind == "v2l"]
-    if interleaved:
-        skip = next(line for line in plan.view.lines if line.kind == "skip")
-        assert any(line.start < skip.start < line.end for line in lines)
-    assert lines and len(lines) < len(plan.v2l_refills)
-    assert sum(line.kwh for line in lines) == pytest.approx(sum(r.kwh for r in plan.v2l_refills))
-    for refill in plan.v2l_refills:
-        assert refill.reason == (
-            f"Refill the house battery with {refill.kwh:.2f} kWh from V2L for "
-            f"the {refill.reservation} reservation."
-        )
-    for line in lines:
-        assert f"{line.kwh:.2f} kWh" in line.text
-
-
 def test_adjacent_skips_with_different_reasons_do_not_fold():
     inputs = PlannerInputs(
         soc=_soc(56), solar_tomorrow_kwh=0, predicted_home_load_kwh=12,

@@ -5,7 +5,7 @@ from datetime import UTC, datetime, time
 
 import pytest
 
-from ha_spark.energy.models import DispatchSlot, PlannerInputs
+from ha_spark.energy.models import DispatchSlot
 from ha_spark.energy.planner import compute_plan
 from ha_spark.energy.tariff import fixed_schedule
 from tests.test_planner import (
@@ -115,19 +115,6 @@ def test_soc_forecast_export_drain_and_empty_post_window_path():
                    - plan.pre_window_drain_kwh / config.capacity_kwh * 100)
     assert values[end] == pytest.approx(expected)
     assert all(p.at <= end or p.soc_pct <= values[end] for p in plan.view.soc)
-
-
-def test_soc_forecast_post_window_matches_v2l_path():
-    config = cfg(v2l_budget_kwh=15)
-    inputs = PlannerInputs(
-        soc=_soc(20), solar_tomorrow_kwh=0, predicted_home_load_kwh=30,
-        load_slots=(0.0,) * 12 + (30 / 36,) * 36, car_plugged_in=True,
-        horizon_start=datetime(2026, 1, 10, 23, 30, tzinfo=UTC),
-    )
-    plan = compute_plan(inputs, config, fixed_schedule(inputs, config))
-    assert plan.v2l_refills
-    values = {p.at: p.soc_pct for p in plan.view.soc}
-    assert all(values[at] == soc for at, soc in plan.soc_path)
 
 
 def test_soc_forecast_window_end_mid_slot_without_soc_path():
