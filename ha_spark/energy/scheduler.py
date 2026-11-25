@@ -186,7 +186,12 @@ from ha_spark.energy.supply_guard import SupplyGuard
 from ha_spark.energy.tariff import _controlled_windows
 from ha_spark.energy.tariff import _in_overnight_window as in_window
 from ha_spark.energy.topology_record import LoadedTopology
-from ha_spark.energy.v2l import run_v2l_tick, run_v2l_topup, warn_deprecated_notify_target
+from ha_spark.energy.v2l import (
+    run_v2l_needed,
+    run_v2l_tick,
+    run_v2l_topup,
+    warn_deprecated_notify_target,
+)
 from ha_spark.ha.notifier import send_notification
 from ha_spark.ha.rest import HomeAssistantRest
 from ha_spark.integration_discovery import IntegrationDiscovery
@@ -619,6 +624,10 @@ async def run_once(
                 await run_v2l_topup(settings, rest, plan, inputs.flexibility_event, now)
             except Exception:  # noqa: BLE001 - a request never breaks a plan run
                 log.warning("V2L top-up request failed", exc_info=True)
+        try:
+            await run_v2l_needed(settings, rest, plan, now)
+        except Exception:  # noqa: BLE001 - a notice never breaks a plan run
+            log.warning("V2L needed notice failed", exc_info=True)
     await _record_forecast(settings, plan, run.forecast, getattr(run.inputs, "geometry", None))
     await _record_solar_forecasts(settings, run)
     evening_task = asyncio.create_task(_record_evening_forecast(settings, run, source))

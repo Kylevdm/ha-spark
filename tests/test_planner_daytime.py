@@ -47,6 +47,29 @@ def test_free_session_fills_cap_and_shrinks_next_overnight():
     assert max(point.soc_pct for point in plan.view.soc) == pytest.approx(config.target_cap)
 
 
+def test_morning_shortfall_uses_live_soc_not_a_planned_purchase():
+    config = cfg(capacity_kwh=20, buffer_pct=0)
+    now = datetime(2026, 1, 12, 5, 40, tzinfo=LONDON)
+    inputs = slot_inputs(now, config)
+    inputs = replace(inputs, soc=_soc(25), pre_window_drain_kwh=0.25,
+                     load_slots=(0.5,) * len(inputs.load_slots),
+                     solar_slots=(0.0,) * len(inputs.load_slots))
+    ordinary = planned(inputs, config)
+    session = FreeSession("free_electricity", "x", now, now + timedelta(hours=6))
+    with_purchase = replace(inputs, free_sessions=(session,))
+    plan = planned(with_purchase, config)
+    assert plan.charge_intent.daytime_windows
+    assert plan.pre_window_drain_kwh < ordinary.pre_window_drain_kwh
+    assert plan.shortfall_before_window_kwh == ordinary.shortfall_before_window_kwh
+    assert plan.shortfall_before_window_kwh == pytest.approx(17 + 5 / 6 - 0.75)
+    assert plan.run_out_before_window_at == ordinary.run_out_before_window_at
+    assert plan.run_out_before_window_at == now + timedelta(minutes=45)
+    # Once the purchase has happened, its stored energy is in the live reading.
+    later = planned(replace(with_purchase, soc=_soc(50)), config)
+    assert later.shortfall_before_window_kwh == pytest.approx(plan.shortfall_before_window_kwh - 5)
+    assert later.run_out_before_window_at == now + timedelta(hours=5, minutes=45)
+
+
 @pytest.mark.parametrize(("fe", "hh", "dispatch", "trusted"), [
     (True, True, True, True),
     (False, True, True, False),

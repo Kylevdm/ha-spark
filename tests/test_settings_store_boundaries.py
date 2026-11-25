@@ -18,7 +18,7 @@ from ha_spark.api.server import AppState, build_app
 from ha_spark.config import _SECRET_OPTION_KEYS, ConfigError, Settings
 from ha_spark.daemon_channel import DaemonChannel
 from ha_spark.energy import scheduler
-from ha_spark.settings_service import RevisionConflict, SettingsService
+from ha_spark.settings_service import ConfigurationRepair, RevisionConflict, SettingsService
 from tests.api_helpers import OWNER_CONFIG_HEADERS
 from tests.test_settings_store import preserve_fence as preserve_fence
 from tests.test_settings_store import store
@@ -28,7 +28,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "addon-config-0.24.yaml"
 
 
 @pytest.mark.parametrize("edited", [False, True])
-def test_legacy_fixture_seeds_equivalent_effective_settings(tmp_path, edited):
+def test_legacy_fixture_seeds_equivalent_effective_settings(tmp_path, edited, caplog):
     options = yaml.load(FIXTURE.read_text(), Loader=yaml.BaseLoader)["options"]
     options["db_path"] = str(tmp_path / "ha_spark.db")
     if edited:
@@ -56,6 +56,32 @@ def test_legacy_fixture_seeds_equivalent_effective_settings(tmp_path, edited):
         {"min_soc": 25, "inverter_power_switch_entity": "select.owner"} if edited else {}
     )
     assert CANARY not in json.dumps(document)
+    assert "v2l_budget_kwh, v2l_preferred_rate_kw" in caplog.text
+
+
+def test_saved_pair_drops_retired_v2l_options(tmp_path, caplog):
+    service = store(tmp_path)
+    service.load(writable=True)
+    path = tmp_path / "ha_spark_config.json"
+    document = json.loads(path.read_text())
+    document["settings"].update(v2l_budget_kwh=CANARY, v2l_preferred_rate_kw=1.5,
+                                v2l_max_rate_kw=1.0)
+    path.write_text(json.dumps(document))
+    service = store(tmp_path)
+    assert service.load(writable=True).v2l_max_rate_kw == 1.0
+    warning = "Ignoring deprecated options: v2l_budget_kwh, v2l_preferred_rate_kw"
+    assert warning in caplog.text
+    assert CANARY not in caplog.text
+    assert service.revision == 1
+    # Loading never writes; the retired keys go with the next save.
+    assert json.loads(path.read_text()) == document
+
+    caplog.clear()
+    service.import_document(document["settings"], 1, "import")
+    assert warning in caplog.text
+    assert json.loads(path.read_text())["settings"] == {
+        "v2l_max_rate_kw": 1.0, "solis_control_hub": "solis_control",
+    }
 
 
 def test_tariff_refusal_carries_no_input_in_its_exception_chain(tmp_path):
@@ -448,7 +474,7 @@ def test_invalid_current_pair_never_restores_previous(tmp_path, corruption, monk
     path = tmp_path / "ha_spark_config.json"
     document = json.loads(path.read_text())
     if corruption == "unknown":
-        document["settings"][CANARY] = "value"
+        document["settings"].update({CANARY: "value", "v2l_budget_kwh": 5.0})
     elif corruption == "envelope":
         document[CANARY] = "value"
     elif corruption == "revision":
@@ -464,9 +490,11 @@ def test_invalid_current_pair_never_restores_previous(tmp_path, corruption, monk
             return original(current, *args, **kwargs)
 
         monkeypatch.setattr(Path, "read_text", unreadable)
-    with pytest.raises(ConfigError) as error:
+    with pytest.raises(ConfigurationRepair) as error:
         store(tmp_path).load(writable=True)
     assert CANARY not in str(error.value)
+    if corruption == "unknown":
+        assert error.value.reasons == ["Unknown configuration fields: 1"]
     assert before == {p.name: p.read_bytes() for p in tmp_path.iterdir()}
 
 

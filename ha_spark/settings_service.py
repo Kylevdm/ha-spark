@@ -146,6 +146,16 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+_RETIRED_V2L_KEYS = ("v2l_budget_kwh", "v2l_preferred_rate_kw")
+
+
+def _drop_retired_v2l(inputs: dict[str, Any]) -> list[str]:
+    retired = [key for key in _RETIRED_V2L_KEYS if key in inputs]
+    for key in retired:
+        del inputs[key]
+    return retired
+
+
 def normalise_legacy(
     document: dict[str, Any], fixed_path: str | None = None, *, strict: bool = False,
 ) -> dict[str, Any]:
@@ -156,6 +166,7 @@ def normalise_legacy(
     retired = []
     if "proactive_mode" in raw:
         retired.append("proactive_mode")
+    retired.extend(_drop_retired_v2l(raw))
     devices = raw.get("devices")
     if isinstance(devices, list):
         if any(isinstance(device, dict) and "control" in device for device in devices):
@@ -392,6 +403,10 @@ class SettingsService:
             or not isinstance(secret_inputs, dict)
         ):
             raise ConfigError("Invalid configuration envelope")
+        # Dropped in memory only: the next save leaves them out (#776).
+        retired = _drop_retired_v2l(inputs)
+        if retired:
+            log.warning("Ignoring deprecated options: %s", ", ".join(retired))
         unknown = len(inputs.keys() - (_KEYS - _SECRET_OPTION_KEYS)) + len(
             secret_inputs.keys() - _SECRET_OPTION_KEYS
         )

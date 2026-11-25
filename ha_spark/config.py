@@ -740,14 +740,8 @@ class Settings(BaseSettings):
     v2l_cutoff_time: Annotated[str, _metadata("addon")] = Field(default="01:00")
     # HA notify.<service> target (e.g. mobile_app_x). Empty disables notifications.
     v2l_notify_service: Annotated[str, _metadata("addon")] = Field(default="")
-    # Optional V2L budget (kWh) standing in for car SoC; 0 disables the
-    # predictive plug-in warning.
-    v2l_budget_kwh: Annotated[float, _metadata("addon")] = Field(default=0.0)
     v2l_max_rate_kw: Annotated[float, _metadata("integration")] = Field(
         default=3.0, gt=0, allow_inf_nan=False
-    )
-    v2l_preferred_rate_kw: Annotated[float, _metadata("addon")] = Field(
-        default=1.5, gt=0, allow_inf_nan=False
     )
     # Rectifier AC->DC efficiency from the car into the house battery, and the
     # DC rate it charges at (measured: 10 A AC input limit) (#208).
@@ -774,12 +768,6 @@ class Settings(BaseSettings):
         if isinstance(v, str) and v.strip().isdigit():
             return int(v.strip())
         return v
-
-    @model_validator(mode="after")
-    def _validate_v2l_rates(self) -> Settings:
-        if self.v2l_preferred_rate_kw > self.v2l_max_rate_kw:
-            raise ValueError("v2l_preferred_rate_kw must not exceed v2l_max_rate_kw")
-        return self
 
     @model_validator(mode="after")
     def _synthesize_devices(self) -> Settings:

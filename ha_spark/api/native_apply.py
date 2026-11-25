@@ -14,9 +14,9 @@ from ha_spark.api.commands import CommandQueue, CommandResult, Record
 from ha_spark.api.contract import IntegrationLink
 from ha_spark.config import Settings
 from ha_spark.devices.execution import ExecutionContext
-from ha_spark.devices.inverters.solis import solis_current_a
+from ha_spark.devices.inverters.solis import charge_hours, solis_current_a
 from ha_spark.devices.outcomes import ActionLine, ActionOutcome
-from ha_spark.energy.models import ChargeIntent
+from ha_spark.energy.models import FULL_SPEED_HOURS, ChargeIntent
 from ha_spark.energy.soc_integrity import SocMeasurement, SocStatus
 from ha_spark.energy.topology import Topology, effective_limits, split_bank_allocation
 
@@ -202,7 +202,12 @@ def build_intents(intent: ChargeIntent, settings: Settings, execution: Execution
         return []
     limits = effective_limits(topology)
     bank = topology.banks[0]
-    total_a = min(solis_current_a(intent, settings, execution), limits.banks[0].charge_a)
+    sized_a = solis_current_a(intent, settings, execution)
+    hours = charge_hours(intent, settings)
+    if intent.full_speed and hours > FULL_SPEED_HOURS:
+        # The same energy within one replan interval: a target already reached sizes 0 A.
+        sized_a *= hours / FULL_SPEED_HOURS
+    total_a = min(sized_a, limits.banks[0].charge_a)
     allocations = split_bank_allocation(total_a, topology, limits, bank.id)
     daytime = _daytime_window(intent)
     daytime_a: dict[str, float | None] = {}

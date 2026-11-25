@@ -1422,20 +1422,6 @@ never write to hardware; there is no predictions sensor.
 
 ### V2L (vehicle-to-load, optional)
 
-The pure slot planner can schedule V2L refills when overnight charge and solar
-leave a named reservation short, and the car's fill price divided by
-`v2l_round_trip_efficiency` is cheaper than grid import for that shortfall.
-Refill kWh and rates describe energy delivered into the house battery. Refills
-finish before the load they fund, respect the battery's spare capacity, run at
-the preferred rate (possibly for part of a slot), and share `v2l_budget_kwh`
-across the plan.
-A zero budget disables planning. The explicit `car_plugged_in` planner input
-defaults to false; an economic, feasible refill then sets
-`v2l_wanted_but_unavailable` instead of scheduling energy. With a saved native
-topology, planned in-window V2L power comes out of its bank's charge room, never
-site import. HA plugged-in sensing and rectifier actuation are separate work;
-these actions are plan data only.
-
 V2L is a manual physical adapter with no control API, so ha-spark only reads
 it. When `v2l_power_entity` is set, each daemon tick reads the car's V2L
 discharge power (W), adds it to the kWh delivered this session, values that
@@ -1451,9 +1437,7 @@ summary.
 | `v2l_offpeak_rate_gbp` | £/kWh cheap rate used to refill the car later (default `0.07`). |
 | `v2l_cutoff_time` | Local time the cheap window starts. The unplug notification fires at or after it (default `01:00`). |
 | `v2l_notify_service` | Deprecated fallback Home Assistant notify service name without `notify.` (for example, `mobile_app_<device>`), scheduled for removal. `notify_service` takes precedence; this is used only when `notify_service` is blank. |
-| `v2l_budget_kwh` | Optional V2L budget in kWh, used in place of car SoC (the car has no HA integration, so ha-spark can't read its SoC). `0` disables refill planning and the plug-in warning. Planned refills and top-up requests never exceed this. |
-| `v2l_max_rate_kw` | Maximum planned house-battery refill rate (default `3.0` kW). |
-| `v2l_preferred_rate_kw` | Preferred planned refill rate (default `1.5` kW); must be positive and no higher than the maximum. |
+| `v2l_max_rate_kw` | Integration-owned maximum V2L rate retained in the legacy topology (default `3.0` kW); not used to schedule charging. |
 | `v2l_rectifier_efficiency` | Rectifier efficiency from the car's AC output into the house battery (default `0.94`). |
 | `v2l_charge_kw` | DC rate the rectifier charges the house battery at (default `2.15`, the measured rate at its 10 A AC input limit). Sets the "start V2L by" time. |
 | `v2l_soc_tolerance_pct` | How many SoC points below the overnight plan's expected path, on an Axle event day, count as the plan having been wrong (default `5`). |
@@ -1466,12 +1450,24 @@ import: it passes the rectifier into the house battery and then the battery's
 discharge leg, taken as the square root of `charge_efficiency`. The session tally survives restarts and
 resets at the start of a new day once the car is idle.
 
-ha-spark sends up to three notifications per session, each at most once:
+ha-spark sends two kinds of reminders per session, each at most once:
 
 - an unplug reminder at the cutoff, because the cheap window is starting and
   powering the house from the car no longer saves money;
-- a reminder to plug the car in to recharge when V2L stops;
-- a warning when you are about to reach `v2l_budget_kwh`.
+- a reminder to plug the car in to recharge when V2L stops.
+
+**V2L needed.** When the forecast shortfall exceeds 1 kWh and `notify_service` is set, ha-spark sends
+one notice in the three hours before the charge window opens and one in the
+two hours after it closes. The evening notice projects the shortfall after
+charging; the morning notice uses the actual battery level and doesn't count
+planned daytime purchases. Each gives the estimated kWh short and, when the
+forecast shows the battery reaching its floor, when to plug in. These notices
+work in every operating mode without a V2L power sensor. On nights with a
+forecast shortfall over 1 kWh, native charging sizes the overnight current to
+deliver what is still needed within half an hour (the replan interval), up to
+the bank's charge limit, instead of spreading it over the whole window. Each
+replan resizes it, so it tapers to zero at the target SoC, and the usual
+operating-mode and device safeguards apply.
 
 **Top-up request for an underfunded Axle event.** ha-spark asks you to start
 V2L when a paid export slot would still be skipped for funding, even after
