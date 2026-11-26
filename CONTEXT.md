@@ -33,6 +33,31 @@ away against 900 to 1000 W at home). ha-spark *derives* base load from
 component energy statistics (grid ± battery ± solar ± EV) and never takes it
 from a single user-supplied sensor. (Decision: Q4, 2026-07-12.)
 
+**Base-load forecast**:
+The predicted base load for the plan horizon, which the planner uses to size
+battery charge. It is learned from derived base load and household signals in
+Home Assistant, such as who is home and the outdoor temperature. It is
+distinct from **Battery calibration**, which learns battery properties rather
+than household consumption.
+
+**Plan shortfall**:
+An *observed* event: the battery reaches its minimum SoC during expensive
+slots before the next cheap window, so the house falls back to peak-rate grid
+import the plan meant to cover. It is read from the battery's behaviour, not
+from comparing the forecast with actual load, and is distinct from a
+*forecast* shortfall the plan predicts ahead of time. After a plan shortfall
+the base-load forecast is raised to at least the previous day's actual base
+load, decaying back to the model after clean days. Every use is recorded with
+its reason. (Decision: 2026-11-26.)
+
+**Forecast trust bar**:
+The measured standard the base-load forecast must meet before the owner can
+rely on deficit sizing instead of charging to the cap every night. Over a
+trailing window there are no plan shortfalls on days where the two strategies
+would differ, and no unexplained step change in the forecast. Symmetric error
+is reported but does not decide. Like the **Readiness signal**, it is a
+recommendation to the owner, never a switch. (Decision: 2026-11-26.)
+
 **Car battery (V2L)**:
 A slow refill *source for the house battery*, not a parallel battery. Energy
 flows from the car through the **V2L charger** into the house battery only,
