@@ -26,6 +26,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .coordinator import SparkCoordinator
+from .dispatch_refresh import DispatchRefresh
 from .entity import async_clear_unregistered_state
 from .guard_loop import SupplyGuardLoop
 from .owner_services import async_handover, async_register
@@ -56,10 +57,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
     async_register(hass)
     await coordinator.native.async_start()
     coordinator.clock.cleanup_repairs()
+    dispatch_refresh = DispatchRefresh(coordinator)
 
     async def native_tick(now: datetime) -> None:
         coordinator.holds.evidence.check_options()
         coordinator.holds.evidence.check_health(now)
+        dispatch_refresh.async_tick(now)
         await coordinator.native.async_check_connections()
         # Any identity change seen by a probe ends that inverter's bound.
         await coordinator.async_drop_stale_bounds(now=now)
