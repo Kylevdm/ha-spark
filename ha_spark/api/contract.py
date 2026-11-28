@@ -14,9 +14,10 @@ so neither half can move a contract version alone.
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime, time
-from typing import Final
+from datetime import UTC, datetime, time, timedelta
+from typing import TYPE_CHECKING, Final
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
@@ -34,6 +35,9 @@ from ha_spark.energy.solar_source import ParsedSolarForecast
 from ha_spark.energy.topology import MajorLoadObservation
 from ha_spark.energy.topology_record import LoadedTopology
 from ha_spark.energy.v2l import V2LSession, delivered_fraction, savings
+
+if TYPE_CHECKING:
+    from ha_spark.energy.plan_run import PlanRun
 
 API_VERSION: Final = 7
 SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3, 4, 5, 6, 7})
@@ -220,9 +224,9 @@ def plan_summary(
     soc_observation_ok: bool = False, session: V2LSession | None = None,
     settings: Settings | None = None, authority: AuthorityInputs | None = None,
     guard_limited: bool = False, topology: LoadedTopology | None = None,
-    export_acks: Iterable[str] = (),
+    export_acks: Iterable[str] = (), plan_run: "PlanRun | None" = None,
 ) -> dict[str, object]:
-    """Project the envelope and allowlisted display numbers for the request's api_version."""
+    """Project the envelope, display numbers and versioned dispatch evidence."""
     result: dict[str, object] = {
         "api_version": api_version,
         "release_version": __version__,
@@ -278,7 +282,35 @@ def plan_summary(
                              if topology is not None and topology.topology is not None else ())
         }
         result["export_acks"] = list(export_acks)
+    if api_version >= 7:
+        result["addon_dispatches"] = _addon_dispatches(settings, plan_run)
     return result
+
+
+def _addon_dispatches(settings: Settings | None, run: "PlanRun | None") -> dict[str, object] | None:
+    if settings is None or settings.tariff_provider != "octopus_intelligent" or run is None:
+        return None
+    inputs = run.inputs
+    report = inputs.evidence_freshness.get("octopus_dispatch")
+    fetched_at = _instant(report.own_reported_at) if report is not None else None
+    if not inputs.dispatches_trusted or fetched_at is None or inputs.now is None:
+        return None
+    geometry = inputs.geometry or compute_horizon_geometry(
+        inputs.now, run.cfg.window_start, run.cfg.window_end,
+        run.tz if isinstance(run.tz, ZoneInfo) else load_timezone(settings.timezone),
+    )
+    windows = [w for w in inputs.unrated_dispatches
+               if w.start < geometry.horizon_end and w.end > geometry.horizon_start]
+    # Validate the source window before clipping can hide an implausible one.
+    if any(not timedelta(0) < w.end - w.start <= timedelta(hours=12) for w in windows):
+        return None
+    clipped = sorted(
+        (max(w.start, geometry.horizon_start), min(w.end, geometry.horizon_end))
+        for w in windows
+    )[:16]
+    return {"fetched_at": fetched_at, "windows": [
+        {"start": start.isoformat(), "end": end.isoformat()} for start, end in clipped
+    ]}
 
 
 _RAW_STATE_STATUSES: Final = {

@@ -1396,9 +1396,13 @@ def _integration_app(state: AppState, integration: IntegrationDiscovery) -> Fast
             settings=state.settings, authority=authority,
             guard_limited=guard is not None and guard.limiting, topology=topology,
             export_acks=state.export_acks(),
+            plan_run=state.plan_run.run if state.plan_run else None,
         )
         if v4 is not None and v4.owner == "integration":
             summary["commands_pending"] = bool(state.commands.pending)
+        elif v4 is not None and v4.owner in ("pending_integration", "pending_addon"):
+            # An ownership handshake is not a source of protection evidence.
+            summary.pop("addon_dispatches", None)
         if handshake_failed:
             summary["addon_authority"] = {
                 "active": "active", "mode": "authority_unknown", "holds_present": False,

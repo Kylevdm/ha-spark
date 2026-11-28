@@ -62,8 +62,8 @@ def conditions(c: "SparkCoordinator", inverter: Inverter, start: datetime, end: 
                and h.confirmed and h.trusted_end is not None and now < h.trusted_end
                for h in state.holds):
         return False
-    if not evidence.dispatch_trusted or not any(
-            w.start <= now < w.end for w in evidence.dispatches):
+    live_dispatches = evidence.dispatches if evidence.dispatch_trusted else evidence.corroborated
+    if not any(w.start <= now < w.end for w in live_dispatches):
         return False
     # Judge the window on the inverter's own clock. Slot 2 has minute resolution
     # and no UTC offset, so the clock sample must share now's offset too.

@@ -2,6 +2,8 @@
 
 HA states are untrusted; only last_reported establishes entity freshness. The
 native direction default never reads an HA copy of the battery-power entity.
+A current Kraken schedule can add active windows with local corroboration,
+never supply clear evidence.
 """
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
@@ -21,6 +23,7 @@ from .native_hold import (
     EvidenceOptions,
     Freshness,
     charge_window,
+    dispatch_corroborated,
     dispatch_kept,
     fresh,
     in_window,
@@ -31,8 +34,11 @@ from .topology import Inverter
 
 if TYPE_CHECKING:
     from .coordinator import SparkCoordinator
+    from .wire import AddonDispatches
 
 EVIDENCE_REPAIR_GRACE = timedelta(minutes=15)
+KRAKEN_MAX_AGE = timedelta(minutes=45)
+KRAKEN_CLOCK_SKEW = timedelta(seconds=60)
 
 
 @dataclass(frozen=True)
@@ -43,6 +49,7 @@ class EvidenceRead:
     dispatches: tuple[DispatchWindow, ...]
     overnight: bool
     ev_via_sibling: bool = False
+    corroborated: tuple[DispatchWindow, ...] = ()
 
 
 class NativeEvidence:
@@ -162,6 +169,10 @@ class NativeEvidence:
         ev = states["ev_status"]
         charging = (ev.state.strip().lower() in ("charging", "boosting", "delivering")
                     if ev is not None else None)
+        plug = states["ev_plug"]
+        plug_value = plug.state if plug else None
+        ev_value = ev.state if ev else None
+        car_kw = power("ev_power")
         dispatch = states["live_dispatch"]
         windows: list[DispatchWindow] = []
         # Only a fresh configured report carrying its dispatch list is trusted;
@@ -187,11 +198,10 @@ class NativeEvidence:
                     grid = power("dispatch_grid_power")
                     if grid is not None and options.dispatch_grid_invert:
                         grid = -grid
-                    plug = states["ev_plug"]
                     if dispatch_kept(window, now, live=dispatch.state.strip().lower() == "on",
                         adjusted=adjusted is True or isinstance(adjusted, str)
-                        and adjusted.strip().lower() == "true", status=ev.state if ev else None,
-                        plug=plug.state if plug else None, car_kw=power("ev_power"), grid_kw=grid):
+                        and adjusted.strip().lower() == "true", status=ev_value,
+                        plug=plug_value, car_kw=car_kw, grid_kw=grid):
                         windows.append(window)
         if not trusted:
             windows = []
@@ -200,9 +210,32 @@ class NativeEvidence:
         # Match the shipped start-clock exclusion, only when
         # every inverter has a fresh readable window. Unknown retains the hold.
         windows = [w for w in windows if not all(self._covered(i, w, now) for i in inverters)]
+        addon = self._addon_dispatches(now)
+        corroborated: list[DispatchWindow] = []
+        if addon is not None:
+            for start, end in addon.windows:
+                if dispatch_corroborated(start, end, now, status=ev_value, plug=plug_value,
+                                         car_kw=car_kw):
+                    window = DispatchWindow(start=start, end=end)
+                    if not all(self._covered(i, window, now) for i in inverters):
+                        corroborated.append(window)
         via_sibling = freshness.get("ev_status", Freshness("unknown", None)).via_sibling
         return EvidenceRead(charging, ev.last_reported if ev and not via_sibling else None,
-                            trusted, tuple(windows), overnight, via_sibling)
+                            trusted, tuple(windows + corroborated), overnight, via_sibling,
+                            corroborated=tuple(corroborated))
+
+    def _addon_dispatches(self, now: datetime) -> "AddonDispatches | None":
+        c = self.coordinator
+        summary = c.summary
+        if ((c.counted_api_version or 0) < 7 or not c.connected or summary is None
+                or summary.session_id != c.entry.data.get("session_id")
+                or not fresh(c.last_counted, now, 120) or summary.loop_tick is None
+                or not -5 <= (now - summary.loop_tick).total_seconds() <= 120):
+            return None
+        addon = summary.addon_dispatches
+        if addon is None or not -KRAKEN_CLOCK_SKEW <= now - addon.fetched_at <= KRAKEN_MAX_AGE:
+            return None
+        return addon
 
     def _window(self, inverter: Inverter, now: datetime) -> tuple[time, time] | None:
         reading = self.coordinator.native.reading(inverter, "holding_43141")
