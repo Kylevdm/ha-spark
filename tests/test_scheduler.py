@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -30,12 +31,14 @@ from ha_spark.energy.models import (
     SLOTS_PER_DAY,
     ChargeIntent,
     ChargePlan,
+    DaytimePurchase,
     LoadForecast,
 )
 from ha_spark.energy.plan_run import PlanRun, StoredPlanRun
 from ha_spark.energy.scheduler import (
     SIGNAL_SAMPLE_INTERVAL,
     charge_current_changed,
+    draw_replan_due,
     guard_tick,
     run_once,
     sample_signals,
@@ -291,6 +294,42 @@ def test_should_run_runs_after_a_missed_slot_without_catching_up() -> None:
 
 def test_should_run_uses_local_slot_start() -> None:
     assert should_run(datetime(2026, 6, 11, 0, 0), datetime(2026, 6, 10, 23, 30)) is True
+
+
+def test_draw_replan_due_only_during_a_trusted_dispatch_hold() -> None:
+    start = datetime(2026, 11, 28, 8, 0, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    now = start + timedelta(minutes=2)
+    intent = replace(_INTENT, holds=((start, end),))
+    plan = _plan(intent)
+
+    assert draw_replan_due(plan, start, None)
+    assert draw_replan_due(plan, now, None)
+    assert not draw_replan_due(None, now, None)
+    assert not draw_replan_due(plan, start - timedelta(minutes=1), None)
+    assert not draw_replan_due(plan, end, None)
+    assert not draw_replan_due(_plan(replace(intent, hold_trusted=False)), now, None)
+    assert not draw_replan_due(replace(plan, ev_charging=True), now, None)
+    assert not draw_replan_due(plan, now, start)
+    assert draw_replan_due(plan, now + timedelta(minutes=30), start)
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_draw_replan_due_checks_only_dispatch_purchases_covering_now(refused: bool) -> None:
+    start = datetime(2026, 11, 28, 8, 0, tzinfo=UTC)
+    end = start + timedelta(minutes=30)
+    purchase = DaytimePurchase(
+        (0, 1), start, end, "dispatch", "started", "test", 0.08, 1.0, "test",
+        refused=refused,
+    )
+    plan = replace(
+        _plan(replace(_INTENT, holds=((start, end + timedelta(minutes=30)),))),
+        daytime_purchases=(purchase,),
+    )
+    assert not draw_replan_due(plan, start, None)
+    assert draw_replan_due(plan, end, None)
+    other_purchase = replace(plan, daytime_purchases=(replace(purchase, overlay="dynamic_price"),))
+    assert draw_replan_due(other_purchase, start, None)
 
 
 def test_setpoint_change_ignores_fresh_soc_observation() -> None:
@@ -1002,6 +1041,58 @@ def _patch_loop(
     monkeypatch.setattr(scheduler, "stop_server", fake_stop_server)
     monkeypatch.setattr(scheduler, "run_v2l_tick", noop_v2l_tick)
     return _StopLoop
+
+
+@pytest.mark.parametrize("draw_replan_fails", [False, True])
+async def test_run_forever_replans_once_when_the_car_starts_drawing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, draw_replan_fails: bool,
+) -> None:
+    settings = ConfigSettings(
+        ha_url="http://ha.test", ha_token="t", db_path=str(tmp_path / "db"),
+        ev_status_entity="sensor.ev_status",
+    )
+    assert seed_authority(settings, "observe").handover("pending_integration") == "retired"
+    start = datetime(2026, 11, 28, 8, 0, tzinfo=UTC)
+    end = start + timedelta(minutes=30)
+    plan = _plan(replace(_INTENT, holds=((start, end),)))
+    ticks = [start + timedelta(minutes=m) for m in (0, 1, 2, 3, 5, 6, 7, 30, 31)]
+    now = start
+    planned_at: list[datetime] = []
+    read_at: list[datetime] = []
+
+    def on_tick(tick: datetime) -> None:
+        nonlocal now
+        now = tick
+
+    async def fake_run_once(_s: ConfigSettings, **kwargs: object) -> scheduler.RunResult:
+        assert kwargs["native_apply"] is not None
+        planned_at.append(now)
+        if draw_replan_fails and now == ticks[4]:
+            raise RuntimeError("plan failed")
+        # Keep the same plan even after a replan, so only the slot latch can stop a retry.
+        return scheduler.RunResult(plan, None)
+
+    async def read_ev(_s: ConfigSettings, _rest: HomeAssistantRest) -> bool | None:
+        read_at.append(now)
+        if now == ticks[1]:
+            raise OSError("EV status read failed")
+        if now == ticks[2]:
+            return None
+        return now >= ticks[4]
+
+    reconcile = AsyncMock()
+    monkeypatch.setattr(scheduler, "reconcile_tick", reconcile)
+    monkeypatch.setattr(scheduler, "sample_signals", AsyncMock())
+    monkeypatch.setattr(scheduler, "run_once", fake_run_once)
+    monkeypatch.setattr(scheduler, "read_ev_hold_status", read_ev)
+    stop = _patch_loop(monkeypatch, ticks, on_tick=on_tick)
+
+    with pytest.raises(stop):
+        await run_forever(settings, poll_seconds=0)
+
+    assert planned_at == [start, ticks[4], end]
+    assert read_at == ticks[1:5]
+    reconcile.assert_not_awaited()
 
 
 async def test_run_forever_polls_session_sources_every_half_hour(
