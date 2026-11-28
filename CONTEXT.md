@@ -33,6 +33,38 @@ away against 900 to 1000 W at home). ha-spark *derives* base load from
 component energy statistics (grid ± battery ± solar ± EV) and never takes it
 from a single user-supplied sensor. (Decision: Q4, 2026-07-12.)
 
+**Away day**:
+A local day on which the house stood empty for most of the day (at least 16
+of its 24 hours), or one an owner's dated away fact covers. Short outings
+don't make one: the house still heats and runs as if occupied. Away days are
+forecast as an occupied day scaled by the away factor learned from past away
+days, and never shape the occupied-house forecast. When occupancy is unknown
+the house counts as occupied. _Avoid_: empty day, holiday.
+
+**Implausible base-load hour**:
+An hour whose derived base load is more than the site could physically have
+drawn: the grid import limit plus the battery's discharge limit, or a 100 A
+supply when those are unknown. It is almost always a meter reset or a bad
+reading, not real use. It counts as zero base load, never as the ceiling and
+never as an estimate, and is reported as a degradation. _Avoid_: spike, glitch
+hour.
+
+**Plan shortfall**:
+A cheap-window cycle in which the battery ran down to its minimum SoC and the
+house then imported from the grid in expensive slots before the next cheap
+window opened, the cycle's actual base load beat its forecast, and no other
+cause was in play (a failed or cut charge, a fallback, a manual session, a
+hold, an undelivered V2L top-up, a plan already charging to the cap, or a
+mode that doesn't run the plan). It is evidence that the base-load forecast
+was too low. A run-down with another cause in play, or one the owner
+dismisses, is recorded but is not forecast error. _Avoid_: miss, run out.
+
+**Shortfall floor**:
+After a plan shortfall, the base-load forecast's daily total is held at
+least at the actual base load of that cycle (the 24 hours before the next
+cheap window opened), then eased back to the model over the following days.
+_Avoid_: override, boost.
+
 **Car battery (V2L)**:
 A slow refill *source for the house battery*, not a parallel battery. Energy
 flows from the car through the **V2L charger** into the house battery only,
@@ -162,6 +194,12 @@ and charge/discharge limits. Multiple inverters may connect to the same bank.
 **Battery pack**:
 One battery with its own battery-management system. A battery bank is one or
 more packs operated as one store, such as packs wired in parallel.
+
+**Pack telemetry**:
+Readings of one battery pack, such as its reported SoC, voltage, current and
+health, taken from Home Assistant entities the owner maps to that pack. Its
+source is any BMS reader that publishes to Home Assistant; ha-spark never reads
+a pack bus itself.
 
 **Battery-bank current limit**:
 The maximum combined DC charge or discharge current a bank can accept or
