@@ -300,7 +300,8 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
 
     def _ownership_snapshot(self, snapshot: dict[str, object]) -> None:
         """Project local validation without granting hardware permission."""
-        if not isinstance(snapshot["api_version"], int) or snapshot["api_version"] < 4:
+        version = snapshot["api_version"]
+        if not isinstance(version, int) or version < 4:
             return
         owner = self.ownership.owner if self.ownership.verified else "pending_integration"
         snapshot["authority_owner"] = owner
@@ -362,6 +363,12 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
                 if isinstance(source, dict):
                     source.update(validity=result.validity, age_s=result.age_s,
                                   via_sibling=result.via_sibling)
+            if version >= 7:
+                sources.update(
+                    dispatch_grid_invert=evidence.dispatch_grid_invert,
+                    ev_liveness_entity=evidence.ev_liveness_entity,
+                    dispatch_liveness_entity=evidence.dispatch_liveness_entity,
+                )
             snapshot["evidence"] = sources
         snapshot["banks"] = self.soc.snapshot()
         try:
@@ -435,6 +442,7 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
                     except (KeyError, ValueError):
                         result = PollResult(Outcome.MALFORMED)
                     else:
+                        self._ownership_snapshot(snapshot)
                         result = await async_poll(
                             session, url=url, token=data["auth_token"], snapshot=snapshot,
                         )

@@ -22,7 +22,7 @@ import aiosqlite
 from pydantic import ValidationError
 
 from ha_spark.api.site_pairing import load_pairing
-from ha_spark.api.snapshot_v4 import FlexibilityEvents
+from ha_spark.api.snapshot_v4 import Evidence, FlexibilityEvents
 from ha_spark.authority import load_authority, retirement_status
 from ha_spark.config import Settings
 from ha_spark.daemon_channel import submit_socket
@@ -62,6 +62,7 @@ from ha_spark.energy.soc_integrity import SocStatus
 from ha_spark.energy.solar_source import load_solar_source_kind
 from ha_spark.energy.sources import (
     build_config,
+    evidence_settings,
     parse_time,
     read_dispatch_evidence,
     read_dispatches_and_live,
@@ -297,22 +298,64 @@ async def check_inverter_clock(settings: Settings) -> CheckResult:
     return CheckResult("Inverter clock", status, f"{refusal}; export windows are refused")
 
 
+def _evidence_options(view: dict[str, object]) -> Evidence | None:
+    try:
+        return Evidence.model_validate(view.get("evidence_options"))
+    except ValidationError:
+        return None
+
+
+async def _check_native_ev_status(settings: Settings) -> CheckResult:
+    try:
+        reply = await submit_socket(settings, "integration_link")
+    except OSError:
+        reply = None
+    view = (reply.integration_link or {}) if reply is not None and reply.error is None else {}
+    options = _evidence_options(view)
+    prefix = "from the integration"
+    fresh = False
+    if options is not None:
+        effective = evidence_settings(settings, options)
+        try:
+            async with HomeAssistantRest(
+                settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+            ) as rest:
+                read = await read_dispatch_evidence(effective, rest, (), read_all=True)
+            evidence = read.evidence
+            fresh = any(value is not None for value in (
+                evidence.ev_status_value, evidence.car_power_kw, evidence.grid_import_kw,
+            ))
+        except Exception:  # noqa: BLE001 - a failed read supplies no fresh evidence
+            pass
+    if fresh:
+        return CheckResult("EV status", Status.OK, f"{prefix}; fresh draw source available")
+    if view.get("dispatch_handover") is True:
+        return CheckResult("EV status", Status.WARN,
+                           f"{prefix}; dispatch handover enabled but no fresh draw source")
+    detail = "evidence options unavailable" if options is None else "no fresh draw source"
+    return CheckResult("EV status", Status.OK, f"{prefix}; {detail}")
+
+
 async def check_ev_status(settings: Settings) -> CheckResult:
-    """Report whether the configured EV status can provide hold evidence."""
+    """Show which evidence source is in effect and whether it can be read."""
+    if retirement_status(settings) is not None:
+        return await _check_native_ev_status(settings)
+    source = "from add-on settings"
     entity = settings.ev_status_entity
     if not entity:
-        return CheckResult("EV status", Status.OK, "not configured; EV charging holds disabled")
+        return CheckResult("EV status", Status.OK,
+                           f"{source}; not configured; EV charging holds disabled")
     try:
         async with HomeAssistantRest(
             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
         ) as rest:
             charging = await read_ev_hold_status(settings, rest)
-    except Exception as exc:  # noqa: BLE001 - health reports failures, never raises
-        return CheckResult("EV status", Status.WARN, f"{entity} unreadable: {exc!r}")
+    except Exception:  # noqa: BLE001 - health reports failures, never raises
+        charging = None
     if charging is None:
-        return CheckResult("EV status", Status.WARN, f"{entity} unreadable")
+        return CheckResult("EV status", Status.WARN, f"{source}; {entity} unreadable")
     detail = "charging hold active" if charging else "readable; no charging hold"
-    return CheckResult("EV status", Status.OK, f"{entity}: {detail}")
+    return CheckResult("EV status", Status.OK, f"{source}; {entity}: {detail}")
 
 
 _REQUIRED_ENTITY_FIELDS = (
@@ -334,7 +377,8 @@ def check_entity_config(settings: Settings) -> CheckResult:
     native_solar = load_solar_source_kind(settings) == "native"
     native = retirement_status(settings) is not None
     legacy_fields = {"soc_entity", "battery_voltage_entity", "charge_current_entity",
-                     "inverter_power_switch_entity"}
+                     "inverter_power_switch_entity", "octopus_rate_entity", "dispatch_entity",
+                     "ev_plug_entity", "ev_status_entity"}
     unset = [f for f in _REQUIRED_ENTITY_FIELDS if not getattr(settings, f)
              and not (native_solar and f == "solar_tomorrow_entity")
              and not (native and f in legacy_fields)]
@@ -891,12 +935,15 @@ async def check_evidence_freshness(settings: Settings) -> list[CheckResult]:
         # A snapshot older than the link window says nothing about current freshness.
         integration_rows = _integration_evidence_rows(
             view.get("evidence") if view and view.get("state") == "connected" else None)
+    # On a retired site the dispatch rows above are the integration's own
+    # observations. The EV status check separately probes purchase sources.
+    dispatch_settings = evidence_settings(settings, None)
     reports: dict[str, datetime | None] = {}
     async with HomeAssistantRest(
         settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
     ) as rest:
         dispatches, _trusted, live = await read_dispatches_and_live(
-            settings, rest, report_times=reports
+            dispatch_settings, rest, report_times=reports
         )
         if settings.tariff_provider == "octopus_intelligent":
             try:
@@ -905,7 +952,7 @@ async def check_evidence_freshness(settings: Settings) -> list[CheckResult]:
             except OctopusApiError:
                 pass  # Unknown, never a trusted-empty schedule.
         snapshot = await read_dispatch_evidence(
-            settings, rest, dispatches, live_dispatch=live,
+            dispatch_settings, rest, dispatches, live_dispatch=live,
             report_times=reports, read_all=True,
         )
     results = integration_rows
@@ -1111,7 +1158,9 @@ async def run_health(settings: Settings) -> list[CheckResult]:
         check_happy_hour(settings),
         check_meter_history(settings),
         check_ha_timezone(settings),
-        *([check_ev_status(settings)] if settings.ev_status_entity else []),
+        *([check_ev_status(settings)] if (
+            settings.ev_status_entity or retirement_status(settings) is not None
+        ) else []),
         *(
             check_legacy_solis_transport(settings, device.id)
             for device in settings.devices

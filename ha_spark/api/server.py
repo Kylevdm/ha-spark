@@ -46,10 +46,12 @@ from ha_spark.api.contract import (
     AuthorityInputs,
     IntegrationLink,
     SiteSnapshot,
+    dispatch_handover,
     link_view,
     major_load_observations,
     plan_summary,
     snapshot_acceptable,
+    snapshot_evidence,
     version_refusal,
 )
 from ha_spark.api.history import (
@@ -397,7 +399,7 @@ class AppState:
             ])
         return reply
 
-    def integration_link_view(self) -> dict[str, object]:
+    def integration_link_view(self, *, for_socket: bool = False) -> dict[str, object]:
         """Read the current link without affecting authority or planning."""
         now = datetime.now(UTC)
         measurement = (
@@ -405,13 +407,19 @@ class AppState:
             if self.settings_service.repair is not None
             else snapshot_soc(self.integration_link, now, self.settings)
         )
-        return {**link_view(self.integration_link, now),
+        view = {**link_view(self.integration_link, now),
                 "refused_site_id": self.refused_site,
                 "native_soc_status": measurement.status.value,
                 "native_soc_pct": measurement.value,
                 "native_soc_age_s": (
                     int(measurement.age_s) if measurement.age_s is not None else None
                 )}
+        # Health reads the source entities itself. Keep their ids off HTTP diagnostics.
+        if for_socket and retirement_status(self.settings) is not None:
+            evidence = snapshot_evidence(self.integration_link, now)
+            view["evidence_options"] = evidence.model_dump(mode="json") if evidence else None
+            view["dispatch_handover"] = dispatch_handover(self.integration_link)
+        return view
 
     @property
     def settings(self) -> Settings:

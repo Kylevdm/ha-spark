@@ -143,9 +143,29 @@ def test_flexibility_events_never_changes_snapshot_acceptance(client, state, cha
 
 def test_shared_versions():
     contract = fixture("contract")
-    assert API_VERSION == contract["api_version"] == 6
+    assert API_VERSION == contract["api_version"] == 7
     assert sorted(SUPPORTED_API_VERSIONS) == contract["supported_api_versions"] == [
-        1, 2, 3, 4, 5, 6]
+        1, 2, 3, 4, 5, 6, 7]
+
+
+@pytest.mark.usefixtures("retired_addon")
+@pytest.mark.parametrize("version", [6, 7])
+def test_v7_evidence_options_round_trip(client, state, version):
+    body = fixture("site_snapshot_v4_max")
+    raw = fixture("site_snapshot_v7")["evidence"]
+    body.update(api_version=version, evidence=raw)
+    assert post(client, body).status_code == 200
+    v4 = state.integration_link.v4
+    if version == 7:
+        assert v4.evidence.model_dump(exclude_unset=True) == raw
+        view = link_view(state.integration_link, NOW)["evidence"]
+        assert set(view) == {
+            "ev_status", "ev_plug", "ev_power", "dispatch_grid_power", "live_dispatch",
+            "adjusted_rate",
+        }
+        assert "entity_id" not in str(view)
+    else:
+        assert v4.evidence is None and v4.evidence_reason == "invalid_evidence"
 
 
 @pytest.mark.parametrize(("version", "value", "expected"), [
