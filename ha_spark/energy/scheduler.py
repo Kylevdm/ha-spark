@@ -2,11 +2,12 @@
 
 `run_once` computes and applies a single charge plan (the same path as
 `ha-spark plan --apply`). `run_forever` wakes once a minute and calls
-`run_once` once per local half-hour slot. A failed run is retried on the next
-tick because the completed slot is not recorded until the run succeeds. An
-unchanged plan is skipped only while it is known resident: a failed or blocked
-apply, or a run that raised, leaves no baseline, so the next replan applies
-again (#168).
+`run_once` once per local half-hour slot. A failed boundary run is retried on
+the next tick because the completed slot is not recorded until the run succeeds.
+During a trusted dispatch hold, the car starting to draw can trigger one extra
+plan per slot. An unchanged plan is skipped only while it is known resident:
+a failed or blocked apply, or a run that raised, leaves no baseline, so the
+next replan applies again (#168).
 
 When `grid_power_entity` is set, every tick inside the charge window also runs
 the supply guard: throttle the battery's charge-current setpoint while
@@ -181,6 +182,7 @@ from ha_spark.energy.sources import (
     parse_time,
     read_dispatch_evidence,
     read_dispatches_and_live,
+    read_ev_hold_status,
 )
 from ha_spark.energy.supply_guard import SupplyGuard
 from ha_spark.energy.tariff import _controlled_windows
@@ -233,6 +235,33 @@ def _slot_start(now: datetime) -> datetime:
 def should_run(now: datetime, last_run_slot: datetime | None) -> bool:
     """True when the current local half-hour slot has not run successfully."""
     return _slot_start(now) != last_run_slot
+
+
+def _covers(start: datetime, end: datetime, now: datetime) -> bool:
+    # HA can supply offset-free dispatch times: compare those on the wall clock.
+    if start.utcoffset() is None or end.utcoffset() is None:
+        return start <= now.replace(tzinfo=None) < end
+    return start <= now < end
+
+
+def draw_replan_due(
+    plan: ChargePlan | None, now: datetime, last_draw_replan_slot: datetime | None
+) -> bool:
+    """Whether to check for EV draw that the last plan could not see.
+
+    ``last_draw_replan_slot`` is the UTC start of the slot already rechecked, so
+    the repeated local hour at a clock change is still a separate slot.
+    """
+    return (
+        plan is not None
+        and last_draw_replan_slot != _slot_start(now).astimezone(UTC)
+        and plan.charge_intent.hold_trusted
+        and any(_covers(start, end, now) for start, end in plan.charge_intent.holds)
+        and not any(
+            purchase.overlay == "dispatch" and _covers(purchase.start, purchase.end, now)
+            for purchase in plan.daytime_purchases
+        )
+    )
 
 
 # Asymmetric deadband on the programmed charge current, in whole register amps
@@ -2112,6 +2141,7 @@ async def _run_paired(
             settings.supply_max_current_a,
         )
     last_run_slot: datetime | None = None
+    last_draw_replan_slot: datetime | None = None
     last_plan: ChargePlan | None = None
     last_revision: PlanRevision | None = None
     last_readiness_slot: datetime | None = None
@@ -2368,8 +2398,25 @@ async def _run_paired(
             native_stale = native and native_apply.consume_stale_refusal(
                 state.integration_link.authority_epoch,
             )
-            if (pending is not None or recovering or activating or native_stale
-                    or should_run(now, last_run_slot)):
+            replan = (
+                pending is not None or recovering or activating or native_stale
+                or should_run(now, last_run_slot)
+            )
+            if not replan:
+                try:
+                    if draw_replan_due(last_plan, now, last_draw_replan_slot):
+                        async with HomeAssistantRest(
+                            settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
+                        ) as rest:
+                            drawing = await read_ev_hold_status(settings, rest)
+                        # This read only schedules a plan; the plan gathers its own proof.
+                        if drawing is True:
+                            log.info("EV draw detected during a dispatch hold; replanning")
+                            last_draw_replan_slot = _slot_start(now).astimezone(UTC)
+                            replan = True
+                except Exception:
+                    log.warning("Dispatch draw replan check failed")
+            if replan:
                 try:
                     # Recovery never compares against a baseline: the resident
                     # program is the fallback, not any earlier plan.
