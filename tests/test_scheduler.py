@@ -309,9 +309,30 @@ def test_draw_replan_due_only_during_a_trusted_dispatch_hold() -> None:
     assert not draw_replan_due(plan, start - timedelta(minutes=1), None)
     assert not draw_replan_due(plan, end, None)
     assert not draw_replan_due(_plan(replace(intent, hold_trusted=False)), now, None)
-    assert not draw_replan_due(replace(plan, ev_charging=True), now, None)
+    # A boundary plan that saw the car (or Eco+ diversion) still gets its one recheck.
+    assert draw_replan_due(replace(plan, ev_charging=True), now, None)
     assert not draw_replan_due(plan, now, start)
     assert draw_replan_due(plan, now + timedelta(minutes=30), start)
+
+
+def test_draw_replan_due_compares_offset_free_holds_on_the_wall_clock() -> None:
+    london = ZoneInfo("Europe/London")
+    start = datetime(2026, 6, 28, 8, 0)
+    plan = _plan(replace(_INTENT, holds=((start, start + timedelta(minutes=30)),)))
+    assert draw_replan_due(plan, datetime(2026, 6, 28, 8, 2, tzinfo=london), None)
+    assert not draw_replan_due(plan, datetime(2026, 6, 28, 8, 32, tzinfo=london), None)
+
+
+def test_draw_replan_due_treats_the_repeated_hour_as_a_new_slot() -> None:
+    london = ZoneInfo("Europe/London")
+    first = datetime(2026, 10, 25, 1, 5, tzinfo=london)
+    second = datetime(2026, 10, 25, 1, 5, fold=1, tzinfo=london)
+    plan = _plan(replace(_INTENT, holds=(
+        (datetime(2026, 10, 25, 0, 0, tzinfo=UTC), datetime(2026, 10, 25, 2, 0, tzinfo=UTC)),
+    )))
+    latch = datetime(2026, 10, 25, 0, 0, tzinfo=UTC)  # first 01:00 local, BST
+    assert not draw_replan_due(plan, first, latch)
+    assert draw_replan_due(plan, second, latch)
 
 
 @pytest.mark.parametrize("refused", [False, True])

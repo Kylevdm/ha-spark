@@ -237,18 +237,28 @@ def should_run(now: datetime, last_run_slot: datetime | None) -> bool:
     return _slot_start(now) != last_run_slot
 
 
+def _covers(start: datetime, end: datetime, now: datetime) -> bool:
+    # HA can supply offset-free dispatch times: compare those on the wall clock.
+    if start.utcoffset() is None or end.utcoffset() is None:
+        return start <= now.replace(tzinfo=None) < end
+    return start <= now < end
+
+
 def draw_replan_due(
     plan: ChargePlan | None, now: datetime, last_draw_replan_slot: datetime | None
 ) -> bool:
-    """Whether to check for EV draw that the last plan could not see."""
+    """Whether to check for EV draw that the last plan could not see.
+
+    ``last_draw_replan_slot`` is the UTC start of the slot already rechecked, so
+    the repeated local hour at a clock change is still a separate slot.
+    """
     return (
         plan is not None
-        and not plan.ev_charging
-        and last_draw_replan_slot != _slot_start(now)
+        and last_draw_replan_slot != _slot_start(now).astimezone(UTC)
         and plan.charge_intent.hold_trusted
-        and any(start <= now < end for start, end in plan.charge_intent.holds)
+        and any(_covers(start, end, now) for start, end in plan.charge_intent.holds)
         and not any(
-            purchase.overlay == "dispatch" and purchase.start <= now < purchase.end
+            purchase.overlay == "dispatch" and _covers(purchase.start, purchase.end, now)
             for purchase in plan.daytime_purchases
         )
     )
@@ -2402,7 +2412,7 @@ async def _run_paired(
                         # This read only schedules a plan; the plan gathers its own proof.
                         if drawing is True:
                             log.info("EV draw detected during a dispatch hold; replanning")
-                            last_draw_replan_slot = _slot_start(now)
+                            last_draw_replan_slot = _slot_start(now).astimezone(UTC)
                             replan = True
                 except Exception:
                     log.warning("Dispatch draw replan check failed")
