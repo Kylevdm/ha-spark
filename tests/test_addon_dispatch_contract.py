@@ -87,3 +87,9 @@ def test_summary_clips_to_the_plan_horizon_and_keeps_the_earliest_16():
     assert len(sent) == 16
     assert sent[0] == GOLDEN["windows"][0]
     assert sent[-1]["start"] == later[14].start.isoformat()
+
+
+def test_summary_refuses_an_implausible_window_before_clipping():
+    # A 14 h source window must not reach the integration as a clipped 2 h one.
+    long_window = DispatchSlot(NOW - timedelta(hours=12), NOW + timedelta(hours=2))
+    assert summary(windows=(long_window,))["addon_dispatches"] is None

@@ -9,6 +9,8 @@ from freezegun.api import FrozenDateTimeFactory
 from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker
 
 from custom_components.ha_spark.coordinator import SparkCoordinator
+from custom_components.ha_spark.native_evidence import EvidenceRead
+from custom_components.ha_spark.native_hold import DispatchWindow
 from tests_ha.fake_solis import FakeSolisDevice
 from tests_ha.test_native_export import NOW
 from tests_ha.test_native_hold_handover import (
@@ -210,3 +212,64 @@ async def test_handover_stays_live_on_a_corroborated_kraken_dispatch(
     await tick(c)
     assert native_transport.holding[43007] == 190
     assert not switch_writes(native_transport)
+
+
+async def test_an_uncorroborated_addon_window_has_no_vote_on_release(
+    held_site: SparkCoordinator, native_transport: FakeSolisDevice,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    # An entity-formed hold, the car unplugged: an active Kraken window that
+    # fails corroboration must not keep the hold once the entity clears.
+    c = held_site
+    report_car(c, "EV Connected")
+    report_dispatch(c, datetime.fromisoformat(fixture("addon_dispatches")["windows"][0]["end"]))
+    await tick(c)
+    assert native_transport.holding[43007] == 222
+    report_car(c, "EV Disconnected")
+    await heartbeat(c, aioclient_mock, fixture("addon_dispatches"))
+    await tick(c)
+    assert native_transport.holding[43007] == 190
+    assert c.authority.state is not None and not c.authority.state.holds
+    assert not c.holds.addon_backed
+
+
+async def test_backing_extends_only_to_the_addon_window_end(
+    held_site: SparkCoordinator, native_transport: FakeSolisDevice,
+    aioclient_mock: AiohttpClientMocker, freezer: FrozenDateTimeFactory,
+) -> None:
+    # The entity corrects its end from 17:00 to 13:00 while a corroborated
+    # Kraken window runs to 14:30: the hold lasts to 14:30, not 17:00, and the
+    # entity's later empty list cannot release it before then.
+    c = held_site
+    block = fixture("addon_dispatches")
+    addon_end = datetime.fromisoformat(block["windows"][0]["end"])
+    report_car(c, "EV Connected")
+    report_dispatch(c, NOW.replace(hour=17))
+    await tick(c)
+    await heartbeat(c, aioclient_mock, block)
+    report_dispatch(c, NOW.replace(hour=13))
+    await tick(c)
+    assert c.authority.state is not None
+    (hold,) = c.authority.state.holds
+    assert hold.trusted_end == addon_end
+    freezer.move_to(NOW.replace(hour=13, minute=30))
+    report_car(c, "EV Connected")
+    report_dispatch(c, None)
+    await heartbeat(c, aioclient_mock, None)
+    await tick(c)
+    assert c.authority.state is not None and c.authority.state.holds
+    assert native_transport.holding[43007] == 222
+    freezer.move_to(addon_end)
+    report_car(c, "EV Connected")
+    report_dispatch(c, None)
+    await tick(c)
+    assert native_transport.holding[43007] == 190
+
+
+async def test_backing_needs_a_dispatch_hold(held_site: SparkCoordinator) -> None:
+    c = held_site
+    window = DispatchWindow(start=NOW, end=NOW + timedelta(hours=1))
+    evidence = EvidenceRead(None, None, False, (window,), False, corroborated=(window,))
+    inverter = next(iter(c.native.inverters.values()))
+    assert c.holds._backed_end(inverter, NOW, evidence, ()) is None
+    assert not c.holds.addon_backed

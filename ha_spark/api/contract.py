@@ -299,13 +299,15 @@ def _addon_dispatches(settings: Settings | None, run: "PlanRun | None") -> dict[
         inputs.now, run.cfg.window_start, run.cfg.window_end,
         run.tz if isinstance(run.tz, ZoneInfo) else load_timezone(settings.timezone),
     )
+    windows = [w for w in inputs.unrated_dispatches
+               if w.start < geometry.horizon_end and w.end > geometry.horizon_start]
+    # Validate the source window before clipping can hide an implausible one.
+    if any(not timedelta(0) < w.end - w.start <= timedelta(hours=12) for w in windows):
+        return None
     clipped = sorted(
         (max(w.start, geometry.horizon_start), min(w.end, geometry.horizon_end))
-        for w in inputs.unrated_dispatches
-        if w.start < geometry.horizon_end and w.end > geometry.horizon_start
+        for w in windows
     )[:16]
-    if any(not timedelta(0) < end - start <= timedelta(hours=12) for start, end in clipped):
-        return None
     return {"fetched_at": fetched_at, "windows": [
         {"start": start.isoformat(), "end": end.isoformat()} for start, end in clipped
     ]}

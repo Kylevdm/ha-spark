@@ -9,6 +9,7 @@ that window is live (``native_handover``), and takes it back before any Slot 2
 change; a failed take-back retries every tick behind a repair and a notice.
 """
 import asyncio
+from collections.abc import Iterable
 from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import NAMESPACE_URL, uuid5
@@ -257,8 +258,16 @@ class NativeHolds:
                     success = False
             return success
 
-    def _clear_blocked(self, inverter: Inverter, now: datetime, evidence: EvidenceRead) -> bool:
-        """Whether add-on evidence stops the entity's empty list from releasing."""
+    def _backed_end(self, inverter: Inverter, now: datetime, evidence: EvidenceRead,
+                    records: Iterable[HoldRecord]) -> datetime | None:
+        """The end a corroborated add-on window backs this inverter's dispatch hold to.
+
+        Only an existing dispatch hold is backed, and only to the latest active
+        corroborated window's end; the entry expires there and on a restart.
+        """
+        if not any(h.cause == "dispatch" for h in records):
+            self.addon_backed.pop(inverter.id, None)
+            return None
         ends = [w.end for w in evidence.corroborated if w.start <= now < w.end]
         if ends:
             self.addon_backed[inverter.id] = max(
@@ -267,7 +276,7 @@ class NativeHolds:
         if backed is not None and now >= backed:
             del self.addon_backed[inverter.id]
             backed = None
-        return evidence.addon_clear_blocked or backed is not None
+        return backed
 
     async def _reconcile(self, inverter: Inverter, expected: AuthorityState, now: datetime,
                          evidence: EvidenceRead) -> bool:
@@ -279,22 +288,20 @@ class NativeHolds:
         records = tuple(h for h in state.holds if h.device == hold_device(inverter))
         dispatch_end = max((w.end for w in evidence.dispatches if w.start <= now < w.end),
                            default=None)
-        clear_blocked = self._clear_blocked(inverter, now, evidence)
+        backed = self._backed_end(inverter, now, evidence, records)
         updated: list[HoldRecord] = []
         for h in records:
             h = h.model_copy(update={"remap_notified": False})
             if h.cause == "ev":
                 h = advance_ev(h, evidence.charging, evidence.ev_report)
-            elif dispatch_end is not None:
-                # Add-on evidence can extend the deadline, never shorten it.
-                end = dispatch_end
-                if clear_blocked and h.trusted_end is not None:
-                    end = max(end, h.trusted_end)
+            elif dispatch_end is not None or backed is not None:
+                # A backed hold lasts at least to its add-on window's end; the
+                # entity may still correct its own end within that.
+                end = max(e for e in (dispatch_end, backed) if e is not None)
                 h = h.model_copy(update={"pending_release": False, "trusted_end": end})
             else:
                 # Unknown evidence re-arms an unfinished release until the last trusted end.
-                h = h.model_copy(update={"pending_release": (
-                    evidence.dispatch_trusted and not clear_blocked) or (
+                h = h.model_copy(update={"pending_release": evidence.dispatch_trusted or (
                     h.trusted_end is not None and now >= h.trusted_end)})
             # A sibling vouches for liveness, not for this hold's own status:
             # a quiet own report still raises the degraded notice (#679).
@@ -353,6 +360,7 @@ class NativeHolds:
                     if dispatch_end is not None and "dispatch" not in requests:
                         requests["dispatch"] = HoldRecord(cause="dispatch", started_at=now,
                             trusted_end=dispatch_end, device=hold_device(inverter))
+                        self._backed_end(inverter, now, evidence, requests.values())
                 if handover is not None:
                     checked_at = max(now, dt_util.utcnow())
                     if native_handover.live(c, inverter, handover, checked_at,
@@ -424,13 +432,13 @@ class NativeHolds:
             success = True
             for inverter in c.native.inverters.values():
                 records = [h for h in state.holds if h.device == hold_device(inverter)]
-                clear_blocked = self._clear_blocked(inverter, now, evidence)
+                backed = self._backed_end(inverter, now, evidence, records)
                 if removal and any(
                     (evidence.charging is not False or evidence.ev_via_sibling)
                     if h.cause == "ev" else
-                    (bool(evidence.corroborated) or not (
+                    (backed is not None or not (
                         h.trusted_end is not None and now >= h.trusted_end or
-                        evidence.dispatch_trusted and not clear_blocked and not any(
+                        evidence.dispatch_trusted and not any(
                             w.start <= now < w.end for w in evidence.dispatches)))
                     for h in records
                 ):

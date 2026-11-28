@@ -50,8 +50,6 @@ class EvidenceRead:
     overnight: bool
     ev_via_sibling: bool = False
     corroborated: tuple[DispatchWindow, ...] = ()
-    # A current add-on window is running now; see NativeHolds._clear_blocked.
-    addon_clear_blocked: bool = False
 
 
 class NativeEvidence:
@@ -222,13 +220,9 @@ class NativeEvidence:
                     if not all(self._covered(i, window, now) for i in inverters):
                         corroborated.append(window)
         via_sibling = freshness.get("ev_status", Freshness("unknown", None)).via_sibling
-        # A current add-on window still running blocks the entity's clearance; an
-        # absent, stale or empty add-on list leaves release to the entity, as before.
-        clear_blocked = addon is not None and any(
-            start <= now < end for start, end in addon.windows)
         return EvidenceRead(charging, ev.last_reported if ev and not via_sibling else None,
                             trusted, tuple(windows + corroborated), overnight, via_sibling,
-                            corroborated=tuple(corroborated), addon_clear_blocked=clear_blocked)
+                            corroborated=tuple(corroborated))
 
     def _addon_dispatches(self, now: datetime) -> "AddonDispatches | None":
         c = self.coordinator
