@@ -4,7 +4,7 @@ HA states are untrusted; only last_reported establishes entity freshness. The
 native direction default never reads an HA copy of the battery-power entity.
 """
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from math import isfinite
 from typing import TYPE_CHECKING
 
@@ -32,6 +32,8 @@ from .topology import Inverter
 if TYPE_CHECKING:
     from .coordinator import SparkCoordinator
 
+EVIDENCE_REPAIR_GRACE = timedelta(minutes=15)
+
 
 @dataclass(frozen=True)
 class EvidenceRead:
@@ -46,6 +48,7 @@ class EvidenceRead:
 class NativeEvidence:
     def __init__(self, coordinator: "SparkCoordinator") -> None:
         self.coordinator = coordinator
+        self._unavailable_since: dict[str, tuple[str, datetime]] = {}
 
     def options(self) -> EvidenceOptions | None:
         try:
@@ -65,6 +68,42 @@ class NativeEvidence:
             )
         else:
             ir.async_delete_issue(c.hass, DOMAIN, issue_id)
+
+    def check_health(self, now: datetime) -> None:
+        """Warn about sustained evidence loss independently of any hold."""
+        c = self.coordinator
+        owned = c.ownership.verified and c.ownership.owner == "integration"
+        options = self.options() if owned else None
+        freshness = self.freshness(now) if options is not None else {}
+        registry = ir.async_get(c.hass)
+        for key in (*EV_GROUP, *DISPATCH_GROUP, "dispatch_grid_power"):
+            issue_id = f"evidence_source_unavailable_{c.entry.entry_id}_{key}"
+            source = getattr(options, key, None)
+            entity_id = source.entity_id if source is not None else None
+            reading = freshness.get(key)
+            if entity_id is None or reading is None or reading.validity == "fresh":
+                self._unavailable_since.pop(key, None)
+                ir.async_delete_issue(c.hass, DOMAIN, issue_id)
+                continue
+
+            placeholders = {"source_key": key, "entity_id": entity_id}
+            issue = registry.async_get_issue(DOMAIN, issue_id)
+            if issue is not None and issue.translation_placeholders != placeholders:
+                ir.async_delete_issue(c.hass, DOMAIN, issue_id)
+            if reading.validity not in ("unknown", "stale"):
+                self._unavailable_since.pop(key, None)
+                continue
+
+            previous_id, since = self._unavailable_since.get(key, (entity_id, now))
+            if previous_id != entity_id or now < since:
+                since = now
+            self._unavailable_since[key] = (entity_id, since)
+            if now - since >= EVIDENCE_REPAIR_GRACE:
+                ir.async_create_issue(
+                    c.hass, DOMAIN, issue_id, is_fixable=False, severity=ir.IssueSeverity.WARNING,
+                    translation_key="evidence_source_unavailable",
+                    translation_placeholders=placeholders,
+                )
 
     @property
     def configured(self) -> bool:

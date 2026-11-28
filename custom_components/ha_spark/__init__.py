@@ -59,6 +59,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SparkConfigEntry) -> boo
 
     async def native_tick(now: datetime) -> None:
         coordinator.holds.evidence.check_options()
+        coordinator.holds.evidence.check_health(now)
         await coordinator.native.async_check_connections()
         # Any identity change seen by a probe ends that inverter's bound.
         await coordinator.async_drop_stale_bounds(now=now)

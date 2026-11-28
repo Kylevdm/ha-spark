@@ -52,6 +52,10 @@
       "title": "Protection evidence options need saving again",
       "description": "The stored native protection evidence settings are invalid, for example an entity source without a maximum age. Open the integration options, choose Native protection evidence, check every source and its maximum age, then continue to Site topology and Save. Until then no new protection hold starts, and an existing hold is kept until its last trusted dispatch end or an explicit handover."
     },
+    "evidence_source_unavailable": {
+      "title": "Protection evidence unavailable: {source_key}",
+      "description": "The configured protection evidence source `{source_key}` (`{entity_id}`) has been unavailable or stale for at least 15 minutes. Check that the entity is still reporting, or update its mapping in Native protection evidence in the integration options. This repair clears when the source is fresh again or is removed from the options."
+    },
     "export_reading_missing": {
       "title": "Site grid reading missing during an export",
       "description": "The whole-site grid power reading has been missing or stale for over two minutes while a supervised export is live. The export continues within the inverter's confirmed bound; the tripwire cannot watch the site export limit until the reading returns."
