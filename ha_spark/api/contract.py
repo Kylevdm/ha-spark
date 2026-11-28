@@ -22,7 +22,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validato
 
 from ha_spark import __version__
 from ha_spark.api.plan_status import PlanStatus, resolve
-from ha_spark.api.snapshot_v4 import SnapshotV4
+from ha_spark.api.snapshot_v4 import EVIDENCE_SOURCES, Evidence, SnapshotV4
 from ha_spark.api.topology_intake import MajorLoadReading, SupplyGuardBlock
 from ha_spark.authority import AuthorityState, HoldRecord
 from ha_spark.config import Settings
@@ -35,8 +35,8 @@ from ha_spark.energy.topology import MajorLoadObservation
 from ha_spark.energy.topology_record import LoadedTopology
 from ha_spark.energy.v2l import V2LSession, delivered_fraction, savings
 
-API_VERSION: Final = 6
-SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3, 4, 5, 6})
+API_VERSION: Final = 7
+SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3, 4, 5, 6, 7})
 
 
 class SiteSnapshot(BaseModel):
@@ -103,6 +103,16 @@ def dispatch_handover(link: IntegrationLink | None) -> bool:
             and snapshot.dispatch_handover is True)
 
 
+def snapshot_evidence(link: IntegrationLink | None, now: datetime) -> Evidence | None:
+    """Read evidence options only from a current integration-owned v7 snapshot."""
+    if (link is None or link.skew or link.snapshot is None or link.snapshot.api_version < 7
+            or link.received_at is None or not 0 <= (now - link.received_at).total_seconds() <= 90
+            or abs((now - link.snapshot.sent_at).total_seconds()) > 300
+            or link.v4 is None or link.v4.owner != "integration" or link.v4.evidence_reason):
+        return None
+    return link.v4.evidence
+
+
 def snapshot_acceptable(
     previous: IntegrationLink, snapshot: SiteSnapshot, now: datetime,
     *, paired_site: str | None = None, v4: SnapshotV4 | None = None,
@@ -162,7 +172,7 @@ def link_view(link: IntegrationLink, now: datetime) -> dict[str, object]:
         "evidence": {
             key: {"validity": source.validity, "age_s": source.age_s,
                   "max_age_s": source.max_age_s, "via_sibling": source.via_sibling}
-            for key in type(link.v4.evidence).model_fields
+            for key in EVIDENCE_SOURCES
             if (source := getattr(link.v4.evidence, key)) is not None
             and source.source == "entity"
         } if (link.v4 is not None and link.v4.owner == "integration"

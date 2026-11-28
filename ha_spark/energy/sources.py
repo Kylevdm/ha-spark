@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 from zoneinfo import ZoneInfo
 
+from ha_spark.api.snapshot_v4 import Evidence
 from ha_spark.authority import retirement_status
 from ha_spark.config import Settings
 from ha_spark.energy.axle import AxleApiError, read_axle_event
@@ -617,6 +618,39 @@ def build_schedule(
     return apply_import_overlay(provider.schedule(inputs, cfg), inputs, cfg)
 
 
+def evidence_settings(
+    settings: Settings, evidence: Evidence | None, *, retired: bool | None = None,
+) -> Settings:
+    """Project only dispatch evidence options, never falling back on a retired site.
+
+    A caller that has already established retirement passes ``retired`` so a
+    second, transiently failing marker read cannot downgrade it to legacy.
+    """
+    if not (retired if retired is not None else retirement_status(settings) is not None):
+        return settings
+    updates: dict[str, object] = {
+        "dispatch_grid_power_invert": bool(evidence and evidence.dispatch_grid_invert),
+        "ev_liveness_entity": (evidence.ev_liveness_entity or "") if evidence else "",
+        "dispatch_liveness_entity": (evidence.dispatch_liveness_entity or "") if evidence else "",
+    }
+    for key, entity_option in (
+        ("ev_status", "ev_status_entity"), ("ev_plug", "ev_plug_entity"),
+        ("ev_power", "ev_power_entity"), ("live_dispatch", "dispatch_entity"),
+        ("adjusted_rate", "octopus_rate_entity"),
+        ("dispatch_grid_power", "dispatch_grid_power_entity"),
+    ):
+        source = getattr(evidence, key) if evidence is not None else None
+        updates[entity_option] = (source.entity_id or "") if source else ""
+        age_option = f"{key}_max_age_seconds"
+        updates[age_option] = (
+            source.max_age_s if source else Settings.model_fields[age_option].default
+        )
+    # A grid reading without an explicit polarity proves nothing.
+    if evidence is None or evidence.dispatch_grid_invert is None:
+        updates["dispatch_grid_power_entity"] = ""
+    return settings.model_copy(update=updates)
+
+
 async def read_dispatches(
     settings: Settings, rest: HomeAssistantRest
 ) -> tuple[tuple[DispatchSlot, ...], bool]:
@@ -653,8 +687,8 @@ async def read_dispatches_and_live(
         return (), True, None
     try:
         dispatch = await rest.get_state(settings.dispatch_entity)
-    except Exception as exc:  # noqa: BLE001 - a missing entity must not crash the plan
-        log.debug("Could not read %s (%s)", settings.dispatch_entity, exc)
+    except Exception:  # noqa: BLE001 - a missing entity must not crash the plan
+        log.debug("Dispatch evidence read failed")
         return (), False, None
     if report_times is not None:
         report_times["live_dispatch"] = dispatch.last_reported
@@ -687,8 +721,8 @@ async def _read_evidence_entity(
         return None
     try:
         state = await rest.get_state(entity_id)
-    except Exception as exc:  # noqa: BLE001 - corroboration must never block planning
-        log.debug("Could not read %s (%s)", entity_id, exc)
+    except Exception:  # noqa: BLE001 - corroboration must never block planning
+        log.debug("Corroborating evidence read failed")
         return None
     if str(state.state).strip().lower() in ("unavailable", "unknown"):
         return None
@@ -820,8 +854,8 @@ async def read_ev_status(
         return None, True
     try:
         state = await rest.get_state(settings.ev_status_entity)
-    except Exception as exc:  # noqa: BLE001 - EV evidence must not stop reconciliation
-        log.debug("Could not read %s (%s)", settings.ev_status_entity, exc)
+    except Exception:  # noqa: BLE001 - EV evidence must not stop reconciliation
+        log.debug("EV status evidence read failed")
         return None, False
     if str(state.state).strip().lower() in ("unavailable", "unknown"):
         return None, False
@@ -852,6 +886,8 @@ async def gather_inputs(
     soc: SocMeasurement | None = None,
     source: SolarSource,
     sessions: SessionReadings | None = None,
+    evidence_options: Evidence | None = None,
+    retired: bool | None = None,
 ) -> tuple[PlannerInputs, PlannerConfig, LoadForecast]:
     """Read live HA state and build (inputs, config, load forecast).
 
@@ -870,6 +906,9 @@ async def gather_inputs(
     :class:`SessionCache` (#692). Omitted by callers that gather HA state only
     (the agent's state view): no session is claimed and its evidence is
     untrusted, rather than reading Octopus outside a plan.
+
+    ``evidence_options`` selects only the dispatch evidence entities on a
+    retired site. Without a valid snapshot there, no entity proves a purchase.
     """
 
     session_readings = sessions if sessions is not None else SessionReadings()
@@ -905,6 +944,8 @@ async def gather_inputs(
             log.warning("Could not read Axle event: %s", exc)
             flexibility_event_trusted = False
 
+    retired = retirement_status(settings) is not None if retired is None else retired
+    dispatch_settings = evidence_settings(settings, evidence_options, retired=retired)
     report_times: dict[str, datetime | None] = {}
     dispatches: tuple[DispatchSlot, ...]
     live_dispatch: bool | None = None
@@ -921,18 +962,22 @@ async def gather_inputs(
             log.warning("Could not read Octopus planned dispatches (%s)", exc)
             dispatches = ()
             dispatches_trusted = False
-        if settings.dispatch_entity:
+        if dispatch_settings.dispatch_entity:
             _ha_dispatches, _ha_trusted, live_dispatch = await read_dispatches_and_live(
-                settings, rest, report_times=report_times
+                dispatch_settings, rest, report_times=report_times
             )
+    elif retired and not dispatch_settings.dispatch_entity:
+        # No integration dispatch source is unknown, never a trusted clearance.
+        dispatches, dispatches_trusted = (), False
+        log.warning("Dispatch entity unavailable; holds untrusted")
     else:
         dispatches, dispatches_trusted, live_dispatch = await read_dispatches_and_live(
-            settings, rest, report_times=report_times
+            dispatch_settings, rest, report_times=report_times
         )
         if not dispatches_trusted:
-            log.warning("Dispatch entity %s unreadable; holds untrusted", settings.dispatch_entity)
+            log.warning("Dispatch entity unreadable; holds untrusted")
     evidence_read = await read_dispatch_evidence(
-        settings, rest, dispatches, live_dispatch=live_dispatch, report_times=report_times
+        dispatch_settings, rest, dispatches, live_dispatch=live_dispatch, report_times=report_times
     )
     # #420: a dispatch picture whose source has not reported within its
     # validated age is untrusted hold evidence — a cached HA state is not a
@@ -954,8 +999,8 @@ async def gather_inputs(
             "Dispatch evidence not fresh (%s); holds untrusted",
             dispatch_freshness.validity,
         )
-    if settings.ev_status_entity and not evidence_read.ev_status_trusted:
-        log.warning("EV status entity %s unreadable", settings.ev_status_entity)
+    if dispatch_settings.ev_status_entity and not evidence_read.ev_status_trusted:
+        log.warning("EV status entity unreadable")
     ev_status = evidence_read.ev_status
     ev_status_value = (
         str(ev_status.state).strip().lower()
@@ -1086,16 +1131,12 @@ async def gather_inputs(
         if dispatches_trusted else ()
     )
     for dropped in dropped_dispatches:
-        plug_value = (
-            " ".join(evidence_read.evidence.plug_value.split())
-            if evidence_read.evidence.plug_value
-            else ""
-        )
+        plug_value = (evidence_read.evidence.plug_value or "").strip().lower()
         log.info(
             "Dropped contradicted dispatch %s to %s (EV plug: %s)",
             dropped.start.isoformat(),
             dropped.end.isoformat(),
-            plug_value or "unreadable",
+            "EV Disconnected" if plug_value == "ev disconnected" else "not confirmed",
         )
     drain = 0.0
 

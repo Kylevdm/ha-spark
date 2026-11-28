@@ -100,7 +100,7 @@ import httpx
 import uvicorn
 
 from ha_spark.agent.auth import resolve_token
-from ha_spark.api.contract import IntegrationLink, dispatch_handover
+from ha_spark.api.contract import IntegrationLink, dispatch_handover, snapshot_evidence
 from ha_spark.api.native_apply import NativeApply, NativeApplyArgs, build_intents, snapshot_soc
 from ha_spark.api.server import (
     AGENT_PORT,
@@ -179,6 +179,7 @@ from ha_spark.energy.sources import (
     NATIVE_MAX_AGE,
     SessionCache,
     ev_hold_status_from_read,
+    evidence_settings,
     parse_time,
     read_dispatch_evidence,
     read_dispatches_and_live,
@@ -517,10 +518,12 @@ async def run_once(
     context = execution or execution_context()
     # Ownership comes from the durable retirement marker only, never a snapshot.
     native = retirement_status(settings) is not None
+    evidence_options = None
     if native:
-        soc = (snapshot_soc(native_link, datetime.now(UTC), settings)
-               if native_link is not None else SocMeasurement(SocStatus.UNAVAILABLE,
-                                                              datetime.now(UTC)))
+        observed_at = datetime.now(UTC)
+        soc = (snapshot_soc(native_link, observed_at, settings) if native_link is not None
+               else SocMeasurement(SocStatus.UNAVAILABLE, observed_at))
+        evidence_options = snapshot_evidence(native_link, observed_at)
     generation = context.planned_generation.get()
     if generation is None:
         generation = context.config_generation
@@ -534,6 +537,7 @@ async def run_once(
                 session_cache if session_cache is not None else context.session_cache
             ),
             dispatch_handover=native and dispatch_handover(native_link),
+            evidence_options=evidence_options, retired=native,
         )
         plan, inputs, load_source = run.plan, run.inputs, run.load_source
         log.info(
@@ -2089,7 +2093,7 @@ async def _run_paired(
     warn_deprecated_notify_target(settings)
     state = AppState(settings=settings, options_path=OPTIONS_PATH, executor=channel,
                      settings_service=service)
-    channel.link_view = state.integration_link_view
+    channel.link_view = lambda: state.integration_link_view(for_socket=True)
     server = _ingress_server(state) if discovery is None else _ingress_server(state, discovery)
     authority = AuthorityStore(settings)
     try:
@@ -2408,7 +2412,11 @@ async def _run_paired(
                         async with HomeAssistantRest(
                             settings.ha_rest_url, settings.auth_token, timeout=settings.ha_timeout
                         ) as rest:
-                            drawing = await read_ev_hold_status(settings, rest)
+                            dispatch_settings = evidence_settings(
+                                settings, snapshot_evidence(state.integration_link, now),
+                                retired=True,
+                            ) if native else settings
+                            drawing = await read_ev_hold_status(dispatch_settings, rest)
                         # This read only schedules a plan; the plan gathers its own proof.
                         if drawing is True:
                             log.info("EV draw detected during a dispatch hold; replanning")

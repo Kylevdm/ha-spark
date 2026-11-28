@@ -152,8 +152,13 @@ class EvidenceSource(FrozenModel):
         return self
 
 
+EVIDENCE_SOURCES = ("ev_status", "battery_direction", "ev_plug", "ev_power",
+                    "live_dispatch", "adjusted_rate", "dispatch_grid_power")
+_V7_EVIDENCE_FIELDS = {"dispatch_grid_invert", "ev_liveness_entity", "dispatch_liveness_entity"}
+
+
 class Evidence(FrozenModel):
-    """Native protection sources; these are not used by the legacy protection path."""
+    """Native protection sources, also used by the add-on for purchase proof from v7."""
 
     ev_status: EvidenceSource
     battery_direction: EvidenceSource
@@ -162,6 +167,9 @@ class Evidence(FrozenModel):
     live_dispatch: EvidenceSource | None = None
     adjusted_rate: EvidenceSource | None = None
     dispatch_grid_power: EvidenceSource | None = None
+    dispatch_grid_invert: bool | None = Field(default=None, strict=True)
+    ev_liveness_entity: EntityId | None = None
+    dispatch_liveness_entity: EntityId | None = None
 
     @model_validator(mode="after")
     def validate_entity_sources(self) -> Self:
@@ -376,8 +384,13 @@ def parse_snapshot_v4(raw: dict[str, object], topology: Topology | None) -> Snap
     evidence, evidence_reason = None, None
     if raw.get("evidence") is not None:
         try:
-            evidence = Evidence.model_validate(raw["evidence"])
-        except ValidationError:
+            parsed_evidence = Evidence.model_validate(raw["evidence"])
+            version = raw.get("api_version")
+            if ((not isinstance(version, int) or version < 7)
+                    and parsed_evidence.model_fields_set & _V7_EVIDENCE_FIELDS):
+                raise ValueError
+            evidence = parsed_evidence
+        except (ValidationError, ValueError):
             evidence_reason = "invalid_evidence"
     writers: tuple[Writer, ...] = ()
     writers_reason = None

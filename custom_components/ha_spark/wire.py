@@ -22,7 +22,7 @@ from math import isfinite
 from typing import Final, Literal, cast
 from uuid import UUID
 
-API_VERSION: Final = 6
+API_VERSION: Final = 7
 # Display codes the add-on sends at this api_version (its planner, SoC check and fallback).
 PLAN_MODELS: Final = frozenset({"daily", "slots"})
 PLAN_STRATEGIES: Final = frozenset({"deficit", "fill"})
@@ -33,7 +33,7 @@ SOC_STATUSES: Final = frozenset({
 FALLBACK_CAUSES: Final = frozenset({"soc_integrity"})
 
 # Every `api_version` this integration can send and accept replies to.
-SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3, 4, 5, 6})
+SUPPORTED_API_VERSIONS: Final = frozenset({1, 2, 3, 4, 5, 6, 7})
 
 
 class MalformedSummary(ValueError):

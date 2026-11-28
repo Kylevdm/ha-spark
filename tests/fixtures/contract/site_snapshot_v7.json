@@ -1,0 +1,25 @@
+{
+  "api_version": 7,
+  "release_version": "0.43.2",
+  "site_id": "6f1c2b3a-9d84-4e57-a1c0-2f3e4d5c6b7a",
+  "sent_at": "2026-10-24T11:59:58+00:00",
+  "solar_forecast": null,
+  "topology": {
+    "configured": false
+  },
+  "major_loads": [],
+  "authority_owner": "addon",
+  "dispatch_handover": false,
+  "evidence": {
+    "ev_status": {"entity_id": "sensor.ev", "max_age_s": 60},
+    "battery_direction": {"source": "native", "max_age_s": 300},
+    "ev_plug": {"entity_id": "sensor.ev_plug", "max_age_s": 61},
+    "ev_power": {"entity_id": "sensor.ev_power", "max_age_s": 62},
+    "live_dispatch": {"entity_id": "binary_sensor.dispatch", "max_age_s": 63},
+    "adjusted_rate": {"entity_id": "sensor.rate", "max_age_s": 64},
+    "dispatch_grid_power": {"entity_id": "sensor.grid_power", "max_age_s": 65},
+    "dispatch_grid_invert": true,
+    "ev_liveness_entity": "sensor.ev_live",
+    "dispatch_liveness_entity": "sensor.dispatch_live"
+  }
+}
