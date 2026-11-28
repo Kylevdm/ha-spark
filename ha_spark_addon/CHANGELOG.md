@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.43.2
+
+- **Short smart-charge dispatches now charge the battery (#795).** With dispatch purchase handover on, a purchase needs the car drawing, but the half-hour plan ran before the charger started, so a 30-minute dispatch was never bought and longer ones lost their first half-hour. During a held dispatch the add-on now checks the charger each minute and re-plans once in that half-hour when the car starts drawing.
+
 ## 0.43.1
 
 - **V2L needed notices and faster charging on short nights (#776).** When the battery is forecast to come up more than 1 kWh short, ha-spark notifies you (through `notify_service`) in the three hours before the overnight charge and again in the two hours after it, with the estimated shortfall and when to plug in. On those nights a native site charges at up to the bank's limit, delivering what is still needed within half an hour rather than spreading it over the window. The planner no longer plans on energy from the car: `v2l_budget_kwh` and `v2l_preferred_rate_kw` are retired (a saved value is ignored with a warning), and the Axle top-up request is no longer capped by a budget. Session tallies and the unplug and recharge reminders stay.
