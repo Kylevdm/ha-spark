@@ -46,6 +46,10 @@ class NativeHolds:
         self.lock = asyncio.Lock()
         self.backoff: dict[str, tuple[int, datetime]] = {}
         self.notices: dict[str, tuple[datetime, bool]] = {}
+        # Memory only (ADR-0016): the latest corroborated add-on window end per
+        # inverter. While it runs, the entity's empty list cannot release the
+        # dispatch hold; a restart forgets it and the entity decides again.
+        self.addon_backed: dict[str, datetime] = {}
 
     def topology(self) -> Topology | None:
         topology = validate_topology(self.coordinator.entry.options.get("topology"))
@@ -253,6 +257,18 @@ class NativeHolds:
                     success = False
             return success
 
+    def _clear_blocked(self, inverter: Inverter, now: datetime, evidence: EvidenceRead) -> bool:
+        """Whether add-on evidence stops the entity's empty list from releasing."""
+        ends = [w.end for w in evidence.corroborated if w.start <= now < w.end]
+        if ends:
+            self.addon_backed[inverter.id] = max(
+                [*ends, self.addon_backed.get(inverter.id, ends[0])])
+        backed = self.addon_backed.get(inverter.id)
+        if backed is not None and now >= backed:
+            del self.addon_backed[inverter.id]
+            backed = None
+        return evidence.addon_clear_blocked or backed is not None
+
     async def _reconcile(self, inverter: Inverter, expected: AuthorityState, now: datetime,
                          evidence: EvidenceRead) -> bool:
         # Read each pass from one shared evidence observation, not one per inverter.
@@ -261,19 +277,25 @@ class NativeHolds:
         if state is None:
             return False
         records = tuple(h for h in state.holds if h.device == hold_device(inverter))
+        dispatch_end = max((w.end for w in evidence.dispatches if w.start <= now < w.end),
+                           default=None)
+        clear_blocked = self._clear_blocked(inverter, now, evidence)
         updated: list[HoldRecord] = []
         for h in records:
             h = h.model_copy(update={"remap_notified": False})
             if h.cause == "ev":
                 h = advance_ev(h, evidence.charging, evidence.ev_report)
-            elif evidence.dispatch_trusted:
-                ends = [w.end for w in evidence.dispatches if w.start <= now < w.end]
-                h = h.model_copy(update={"pending_release": not bool(ends),
-                                         "trusted_end": max(ends) if ends else h.trusted_end})
+            elif dispatch_end is not None:
+                # Add-on evidence can extend the deadline, never shorten it.
+                end = dispatch_end
+                if clear_blocked and h.trusted_end is not None:
+                    end = max(end, h.trusted_end)
+                h = h.model_copy(update={"pending_release": False, "trusted_end": end})
             else:
                 # Unknown evidence re-arms an unfinished release until the last trusted end.
-                h = h.model_copy(update={"pending_release": h.trusted_end is not None
-                                         and now >= h.trusted_end})
+                h = h.model_copy(update={"pending_release": (
+                    evidence.dispatch_trusted and not clear_blocked) or (
+                    h.trusted_end is not None and now >= h.trusted_end)})
             # A sibling vouches for liveness, not for this hold's own status:
             # a quiet own report still raises the degraded notice (#679).
             fresh = (evidence.charging is not None and not evidence.ev_via_sibling
@@ -298,12 +320,11 @@ class NativeHolds:
             if state is None:
                 return False
             records = tuple(h for h in state.holds if h.device == hold_device(inverter))
-        ends = [w.end for w in evidence.dispatches if w.start <= now < w.end]
         ev_wanted = evidence.charging is True and not evidence.overnight
         active = any(h.owned and not h.pending_release and (
             h.confirmed or h.cause == "dispatch" and h.trusted_end is not None
             and now < h.trusted_end) for h in records)
-        wanted = ev_wanted or bool(ends) or active
+        wanted = ev_wanted or dispatch_end is not None or active
         if wanted:
             self.backoff.pop(inverter.id, None)
             mismatch = False
@@ -329,12 +350,9 @@ class NativeHolds:
                     if ev_wanted and "ev" not in requests:
                         requests["ev"] = HoldRecord(cause="ev", started_at=now,
                                                      device=hold_device(inverter))
-                    if ends:
-                        old = requests.get("dispatch")
-                        requests["dispatch"] = (old.model_copy(update={"trusted_end": max(ends),
-                                                                         "pending_release": False})
-                            if old else HoldRecord(cause="dispatch", started_at=now,
-                                trusted_end=max(ends), device=hold_device(inverter)))
+                    if dispatch_end is not None and "dispatch" not in requests:
+                        requests["dispatch"] = HoldRecord(cause="dispatch", started_at=now,
+                            trusted_end=dispatch_end, device=hold_device(inverter))
                 if handover is not None:
                     checked_at = max(now, dt_util.utcnow())
                     if native_handover.live(c, inverter, handover, checked_at,
@@ -406,12 +424,14 @@ class NativeHolds:
             success = True
             for inverter in c.native.inverters.values():
                 records = [h for h in state.holds if h.device == hold_device(inverter)]
+                clear_blocked = self._clear_blocked(inverter, now, evidence)
                 if removal and any(
                     (evidence.charging is not False or evidence.ev_via_sibling)
                     if h.cause == "ev" else
-                    not (h.trusted_end is not None and now >= h.trusted_end or
-                         evidence.dispatch_trusted and not any(
-                             w.start <= now < w.end for w in evidence.dispatches))
+                    (bool(evidence.corroborated) or not (
+                        h.trusted_end is not None and now >= h.trusted_end or
+                        evidence.dispatch_trusted and not clear_blocked and not any(
+                            w.start <= now < w.end for w in evidence.dispatches)))
                     for h in records
                 ):
                     success = False

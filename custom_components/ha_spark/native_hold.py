@@ -181,6 +181,17 @@ def dispatch_kept(window: "DispatchWindow", now: datetime, *, live: bool | None 
                 and residual is not None and residual < 3)
 
 
+def dispatch_corroborated(start: datetime, end: datetime, now: datetime, *,
+                          status: str | None, plug: str | None, car_kw: float | None) -> bool:
+    """Require positive local evidence; raw grid import has no house-load baseline."""
+    return start <= now < end and (
+        status is not None and status.strip().lower() in ("charging", "boosting", "delivering")
+        or car_kw is not None and isfinite(car_kw) and car_kw >= 1.4
+        or plug is not None and plug.strip().lower() in (
+            "ev connected", "charging", "waiting for ev")
+    )
+
+
 class DispatchWindow(Record):
     start: AwareDatetime
     end: AwareDatetime

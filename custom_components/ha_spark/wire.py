@@ -17,7 +17,7 @@ half can move a contract version alone.
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Final, Literal, cast
 from uuid import UUID
@@ -134,6 +134,14 @@ class AddonAuthority:
 
 
 @dataclass(frozen=True)
+class AddonDispatches:
+    """A bounded Kraken read; still needs liveness and local corroboration."""
+
+    fetched_at: datetime
+    windows: tuple[tuple[datetime, datetime], ...]
+
+
+@dataclass(frozen=True)
 class Summary:
     """Validated envelope and allowlisted plan/session display blocks."""
 
@@ -151,6 +159,7 @@ class Summary:
     addon_authority: AddonAuthority | None = None
     legacy_overlay: dict[str, bool] | None = None
     export_acks: tuple[str, ...] | None = None
+    addon_dispatches: AddonDispatches | None = None
 
 
 def build_snapshot(
@@ -294,7 +303,29 @@ def parse_summary(body: object) -> Summary:
         addon_authority=_addon_authority(body.get("addon_authority")) if version >= 4 else None,
         legacy_overlay=_legacy_overlay(body.get("legacy_overlay")) if version >= 4 else None,
         export_acks=_export_acks(body.get("export_acks")) if version >= 4 else None,
+        addon_dispatches=_addon_dispatches(body.get("addon_dispatches")) if version >= 7 else None,
     )
+
+
+def _addon_dispatches(value: object) -> AddonDispatches | None:
+    if not isinstance(value, dict):
+        return None
+    raw = value.get("windows")
+    if not isinstance(raw, list) or len(raw) > 16:
+        return None
+    windows: list[tuple[datetime, datetime]] = []
+    try:
+        fetched_at = _timestamp(value.get("fetched_at"))
+        for item in raw:
+            if not isinstance(item, dict):
+                return None
+            start, end = _timestamp(item.get("start")), _timestamp(item.get("end"))
+            if not timedelta(0) < end - start <= timedelta(hours=12):
+                return None
+            windows.append((start, end))
+    except MalformedSummary:
+        return None
+    return AddonDispatches(fetched_at, tuple(windows))
 
 
 def _addon_authority(value: object) -> AddonAuthority | None:
