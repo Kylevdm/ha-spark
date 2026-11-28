@@ -3,16 +3,20 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from freezegun.api import FrozenDateTimeFactory
+from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import issue_registry as ir
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
 from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker
 
 from custom_components.ha_spark.const import DOMAIN
+from custom_components.ha_spark.coordinator import SparkCoordinator
 from custom_components.ha_spark.native_hold import SOURCES
 from custom_components.ha_spark.solis_frames import Reading
 from tests_ha.fake_solis import FakeSolisDevice
 from tests_ha.test_native_holds import hass_config_dir, held_site  # noqa: F401
+from tests_ha.test_polling import URL, setup, summary
 
 
 async def test_evidence_options_stage_until_whole_document_save(
@@ -226,6 +230,122 @@ async def test_siblings_are_limited_to_their_source_groups(
         assert result[key].validity == ("fresh" if rescued else "stale")
     # Fresh liveness cannot turn a missing dispatch list into trusted-empty clearance.
     assert not c.holds.evidence.read(datetime.now(UTC)).dispatch_trusted
+
+
+async def _advance(hass: HomeAssistant, freezer: FrozenDateTimeFactory, seconds: int) -> None:
+    freezer.tick(timedelta(seconds=seconds))
+    async_fire_time_changed(hass, datetime.now(UTC))
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+
+@pytest.mark.parametrize("key", ["ev_status", "ev_plug", "ev_power", "live_dispatch",
+                                 "adjusted_rate", "dispatch_grid_power"])
+async def test_unavailable_evidence_repair_clears_on_fresh_report(
+    held_site: SparkCoordinator, freezer: FrozenDateTimeFactory, key: str,  # noqa: F811
+) -> None:
+    c = held_site
+    entry = c.entry
+    registry = ir.async_get(c.hass)
+    issue_id = f"evidence_source_unavailable_{entry.entry_id}_{key}"
+    entity_id = f"sensor.{key}"
+    c.hass.config_entries.async_update_entry(entry, options={**entry.options, "evidence": {
+        key: {"entity_id": entity_id, "max_age_s": 300}}})
+    c.hass.states.async_set(entity_id, "unavailable")
+    await _advance(c.hass, freezer, 30)
+    await _advance(c.hass, freezer, 14 * 60 + 30)
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+    await _advance(c.hass, freezer, 30)
+    issue = registry.async_get_issue(DOMAIN, issue_id)
+    assert issue is not None
+    assert issue.translation_key == "evidence_source_unavailable"
+    assert issue.translation_placeholders == {"source_key": key, "entity_id": entity_id}
+    assert issue.severity is ir.IssueSeverity.WARNING
+    assert not issue.is_fixable
+    for hold in ("ev_hold", "dispatch_hold"):
+        state = c.hass.states.get(f"binary_sensor.ha_spark_{hold}")
+        assert state is not None and state.state == "off"
+    for optional_key in SOURCES:
+        if optional_key != key:
+            assert registry.async_get_issue(
+                DOMAIN, f"evidence_source_unavailable_{entry.entry_id}_{optional_key}") is None
+
+    c.hass.states.async_set(entity_id, "off", {"planned_dispatches": []})
+    await _advance(c.hass, freezer, 30)
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+
+
+async def test_fresh_sibling_breaks_stale_evidence_streak(
+    held_site: SparkCoordinator, freezer: FrozenDateTimeFactory,  # noqa: F811
+) -> None:
+    c = held_site
+    entry = c.entry
+    registry = ir.async_get(c.hass)
+    issue_id = f"evidence_source_unavailable_{entry.entry_id}_live_dispatch"
+    c.hass.config_entries.async_update_entry(entry, options={**entry.options, "evidence": {
+        "live_dispatch": {"entity_id": "sensor.dispatch", "max_age_s": 60},
+        "dispatch_liveness_entity": "sensor.dispatch_live",
+    }})
+    c.hass.states.async_set("sensor.dispatch", "off", {"planned_dispatches": []})
+    await _advance(c.hass, freezer, 90)
+    await _advance(c.hass, freezer, 14 * 60)
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+    c.hass.states.async_set("sensor.dispatch_live", "alive")
+    await _advance(c.hass, freezer, 30)
+    await _advance(c.hass, freezer, 60)
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+    await _advance(c.hass, freezer, 15 * 60)
+    assert registry.async_get_issue(DOMAIN, issue_id) is not None
+    c.hass.states.async_set("sensor.dispatch_live", "alive")
+    await _advance(c.hass, freezer, 30)
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+
+
+async def test_evidence_repair_restart_does_not_duplicate_and_removal_clears(
+    held_site: SparkCoordinator, freezer: FrozenDateTimeFactory,  # noqa: F811
+) -> None:
+    c = held_site
+    entry = c.entry
+    registry = ir.async_get(c.hass)
+    issue_id = f"evidence_source_unavailable_{entry.entry_id}_ev_status"
+    await _advance(c.hass, freezer, 30)
+    await _advance(c.hass, freezer, 14 * 60 + 30)
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+    assert await c.hass.config_entries.async_reload(entry.entry_id)
+    await _advance(c.hass, freezer, 30)
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+    await _advance(c.hass, freezer, 15 * 60)
+    issue = registry.async_get_issue(DOMAIN, issue_id)
+    assert issue is not None
+
+    assert await c.hass.config_entries.async_reload(entry.entry_id)
+    await _advance(c.hass, freezer, 30)
+    await _advance(c.hass, freezer, 15 * 60)
+    assert registry.async_get_issue(DOMAIN, issue_id) == issue
+
+    c.hass.config_entries.async_update_entry(entry, options={**entry.options, "evidence": {}})
+    assert await c.hass.config_entries.async_reload(entry.entry_id)
+    await _advance(c.hass, freezer, 30)
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+
+
+async def test_addon_owned_site_clears_evidence_repair_and_does_not_raise_it(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, aioclient_mock: AiohttpClientMocker,
+) -> None:
+    aioclient_mock.post(URL, json=summary())
+    entry = await setup(hass)
+    hass.config_entries.async_update_entry(entry, options={**entry.options, "evidence": {
+        "ev_status": {"entity_id": "sensor.ev", "max_age_s": 300}}})
+    issue_id = f"evidence_source_unavailable_{entry.entry_id}_ev_status"
+    registry = ir.async_get(hass)
+    ir.async_create_issue(
+        hass, DOMAIN, issue_id, is_fixable=False, severity=ir.IssueSeverity.WARNING,
+        translation_key="evidence_source_unavailable",
+        translation_placeholders={"source_key": "ev_status", "entity_id": "sensor.ev"},
+    )
+    await _advance(hass, freezer, 30)
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+    await _advance(hass, freezer, 15 * 60)
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
 
 
 @pytest.fixture
