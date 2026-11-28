@@ -33,6 +33,13 @@ away against 900 to 1000 W at home). ha-spark *derives* base load from
 component energy statistics (grid ± battery ± solar ± EV) and never takes it
 from a single user-supplied sensor. (Decision: Q4, 2026-07-12.)
 
+**Base-load forecast**:
+The predicted base load for the plan horizon, which the planner uses to size
+battery charge. It is learned from derived base load and household signals in
+Home Assistant, such as who is home and the outdoor temperature. It is
+distinct from **Battery calibration**, which learns battery properties rather
+than household consumption.
+
 **Away day**:
 A local day on which the house stood empty for most of the day (at least 16
 of its 24 hours), or one an owner's dated away fact covers. Short outings
@@ -64,6 +71,14 @@ After a plan shortfall, the base-load forecast's daily total is held at
 least at the actual base load of that cycle (the 24 hours before the next
 cheap window opened), then eased back to the model over the following days.
 _Avoid_: override, boost.
+
+**Forecast trust bar**:
+The measured standard the base-load forecast must meet before the owner can
+rely on deficit sizing instead of charging to the cap every night. Over a
+trailing window there are no plan shortfalls on days where the two strategies
+would differ, and no unexplained step change in the forecast. Symmetric error
+is reported but does not decide. Like the **Readiness signal**, it is a
+recommendation to the owner, never a switch. (Decision: 2026-11-26.)
 
 **Car battery (V2L)**:
 A slow refill *source for the house battery*, not a parallel battery. Energy
