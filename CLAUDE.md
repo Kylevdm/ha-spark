@@ -139,7 +139,10 @@ security and prefer the safe default. Hard rules:
   are charge-only and have no default current, and AlphaESS never gets
   either. A hold
   starts only on fresh evidence and ends on fresh clear evidence, a
-  dispatch's last trusted end, or an explicit owner handover; `On` is written
+  dispatch's last trusted end, or an explicit owner handover (on a native
+  site an add-on Kraken window counts as dispatch evidence only with the
+  integration's own fresh positive car evidence, can only add or extend a
+  dispatch hold, and is remembered in memory only, ADR-0016); `On` is written
   only to a readable switch. Don't weaken these (`ha_spark/devices/inverters/`,
   `energy/supply_guard.py`, `energy/soc_monitor.py`, `authority.py`,
   `transitions.py`, and in the integration `authority_store.py`,

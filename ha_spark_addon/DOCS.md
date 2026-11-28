@@ -179,7 +179,12 @@ reads or an `entity` with `battery_direction_entity` and
 `ev_power_entity`, `live_dispatch_entity`, `adjusted_rate_entity` and
 `dispatch_grid_power_entity`; `dispatch_grid_invert` reverses the last source's
 sign. Set each configured source's `*_max_age_s`. Continue to Site topology
-and **Save topology** to apply the evidence draft.
+and **Save topology** to apply the evidence draft. On a site the integration
+controls, the add-on uses these same sources to prove a started dispatch is
+charging the car before it plans a dispatch purchase; its own copies of these
+settings are ignored there, and `ha-spark health` says which are in effect. A
+configured source that stays unavailable or stale for 15 minutes raises a
+repair naming it.
 
 Only fresh evidence starts holds. Optional `ev_liveness_entity` (EV status,
 plug and power) and `dispatch_liveness_entity` (live dispatch and adjusted rate)
@@ -195,7 +200,15 @@ charging window and fresh no-discharge evidence can prevent a new EV hold,
 never clear a confirmed one. Holds beat fallback and exports. Protection can
 continue without the add-on, but requires Home Assistant to remain running;
 do not assume switch persistence through a whole-Home-Assistant outage.
-Kraken-only dispatches are not available natively.
+If the Octopus dispatching entity only updates on request
+(`manually_refresh_dispatches`), the integration asks for a refresh every five
+minutes while the car is plugged in, and once after a plug or charging change.
+The add-on also sends its Octopus (Kraken) dispatch schedule to the
+integration. A Kraken window counts only while it is running and the
+integration's own fresh evidence shows the car charging, at 1.4 kW or more, or
+plugged in. It can start or extend a dispatch hold and support the dispatch
+hold handover, never end one; a hold it backs lasts to that window's end even if
+the add-on goes quiet, and a restart forgets this.
 
 ### Native notify target
 
