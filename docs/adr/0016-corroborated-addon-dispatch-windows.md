@@ -43,6 +43,13 @@ when its own evidence corroborates it.
   It never ends one: an absent, stale or empty add-on list never clears,
   shortens or releases a dispatch hold. Release keeps using only the
   integration's own trusted dispatch entity or the last trusted end.
+- **Backing, in memory (owner decision, #804 review).** The integration
+  remembers the latest corroborated window end per inverter, only for an
+  existing dispatch hold. Until that end, the entity's empty list cannot
+  release the hold, which lasts at least to that end and no longer on the
+  add-on's account. Holds the entity formed with no add-on window behind them
+  release exactly as before. Nothing is persisted: a restart forgets the
+  backing and the entity decides again.
 
 ## Consequences
 
