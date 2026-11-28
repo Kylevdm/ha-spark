@@ -79,6 +79,7 @@ async def current_plan(
     session_cache: SessionCache | None = None,
     dispatch_handover: bool = False,
     evidence_options: Evidence | None = None,
+    retired: bool | None = None,
 ) -> PlanRun:
     """Compute tonight's plan under the configured tariff provider.
 
@@ -115,7 +116,7 @@ async def current_plan(
     sessions = await (session_cache or context.session_cache or SessionCache()).poll(settings)
     inputs, cfg, forecast = await gather_inputs(
         settings, rest, soc=soc, source=source, sessions=sessions,
-        evidence_options=evidence_options,
+        evidence_options=evidence_options, retired=retired,
     )
     inputs = replace(inputs, dispatch_handover=dispatch_handover)
     schedule = build_schedule(settings, inputs, cfg)

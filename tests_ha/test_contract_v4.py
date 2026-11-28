@@ -191,6 +191,26 @@ async def test_v7_evidence_options_are_omitted_on_v6_retry(
         assert {field: value[field] for field in golden[key]} == golden[key]
 
 
+async def test_retry_sends_nothing_once_ownership_is_unverified(
+    held_site: SparkCoordinator,  # noqa: F811 - pytest fixture
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    # Ownership can stop being verified while the first attempt is out; the
+    # fallback retry must not project it as a handover request.
+    c = held_site
+
+    async def respond(_method: str, _url: Any, data: Any) -> AiohttpClientMockResponse:
+        c.ownership.verified = False
+        return AiohttpClientMockResponse("post", YarlURL(URL), status=409,
+                                        json=fixture("version_refusal_v6"))
+
+    aioclient_mock.clear_requests()
+    aioclient_mock.post(URL, side_effect=respond)
+    await c.async_refresh()
+    posts = [call[2] for call in aioclient_mock.mock_calls if call[0] == "POST"]
+    assert [body["api_version"] for body in posts] == [7]
+
+
 def test_v4_version_refusal_golden() -> None:
     parsed = wire.parse_refusal(fixture("version_refusal_v4"))
     assert parsed.supported_api_versions == frozenset({1, 2, 3, 4})

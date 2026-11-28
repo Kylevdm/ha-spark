@@ -442,10 +442,14 @@ class SparkCoordinator(CommandDispatch, ExportSupervisor, DataUpdateCoordinator[
                     except (KeyError, ValueError):
                         result = PollResult(Outcome.MALFORMED)
                     else:
-                        self._ownership_snapshot(snapshot)
-                        result = await async_poll(
-                            session, url=url, token=data["auth_token"], snapshot=snapshot,
-                        )
+                        if not self.ownership.verified:
+                            # Ownership may have changed while the first attempt was out.
+                            result = PollResult(Outcome.MALFORMED)
+                        else:
+                            self._ownership_snapshot(snapshot)
+                            result = await async_poll(
+                                session, url=url, token=data["auth_token"], snapshot=snapshot,
+                            )
                     envelope = result.envelope or envelope
                 if result.outcome is Outcome.VERSION_REFUSED:
                     result = PollResult(Outcome.VERSION_SKEW, envelope=envelope)

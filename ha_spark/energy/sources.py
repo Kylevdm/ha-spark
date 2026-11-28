@@ -618,9 +618,15 @@ def build_schedule(
     return apply_import_overlay(provider.schedule(inputs, cfg), inputs, cfg)
 
 
-def evidence_settings(settings: Settings, evidence: Evidence | None) -> Settings:
-    """Project only dispatch evidence options, never falling back on a retired site."""
-    if retirement_status(settings) is None:
+def evidence_settings(
+    settings: Settings, evidence: Evidence | None, *, retired: bool | None = None,
+) -> Settings:
+    """Project only dispatch evidence options, never falling back on a retired site.
+
+    A caller that has already established retirement passes ``retired`` so a
+    second, transiently failing marker read cannot downgrade it to legacy.
+    """
+    if not (retired if retired is not None else retirement_status(settings) is not None):
         return settings
     updates: dict[str, object] = {
         "dispatch_grid_power_invert": bool(evidence and evidence.dispatch_grid_invert),
@@ -639,6 +645,9 @@ def evidence_settings(settings: Settings, evidence: Evidence | None) -> Settings
         updates[age_option] = (
             source.max_age_s if source else Settings.model_fields[age_option].default
         )
+    # A grid reading without an explicit polarity proves nothing.
+    if evidence is None or evidence.dispatch_grid_invert is None:
+        updates["dispatch_grid_power_entity"] = ""
     return settings.model_copy(update=updates)
 
 
@@ -878,6 +887,7 @@ async def gather_inputs(
     source: SolarSource,
     sessions: SessionReadings | None = None,
     evidence_options: Evidence | None = None,
+    retired: bool | None = None,
 ) -> tuple[PlannerInputs, PlannerConfig, LoadForecast]:
     """Read live HA state and build (inputs, config, load forecast).
 
@@ -934,7 +944,8 @@ async def gather_inputs(
             log.warning("Could not read Axle event: %s", exc)
             flexibility_event_trusted = False
 
-    dispatch_settings = evidence_settings(settings, evidence_options)
+    retired = retirement_status(settings) is not None if retired is None else retired
+    dispatch_settings = evidence_settings(settings, evidence_options, retired=retired)
     report_times: dict[str, datetime | None] = {}
     dispatches: tuple[DispatchSlot, ...]
     live_dispatch: bool | None = None
@@ -955,6 +966,10 @@ async def gather_inputs(
             _ha_dispatches, _ha_trusted, live_dispatch = await read_dispatches_and_live(
                 dispatch_settings, rest, report_times=report_times
             )
+    elif retired and not dispatch_settings.dispatch_entity:
+        # No integration dispatch source is unknown, never a trusted clearance.
+        dispatches, dispatches_trusted = (), False
+        log.warning("Dispatch entity unavailable; holds untrusted")
     else:
         dispatches, dispatches_trusted, live_dispatch = await read_dispatches_and_live(
             dispatch_settings, rest, report_times=report_times

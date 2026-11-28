@@ -138,6 +138,28 @@ async def test_native_scheduler_uses_only_fresh_snapshot_purchase_sources(
     assert all(not route.called for entity, route in routes.items() if "old_" in entity)
     if case in ("missing", "invalid", "v6", "stale_link"):
         assert not any(route.called for route in routes.values())
+        # No integration dispatch source is unknown, never a trusted clearance.
+        assert result.plan_run.run.inputs.dispatches_trusted is False
+
+
+def test_established_retirement_survives_a_failed_marker_read(settings, monkeypatch):
+    monkeypatch.setattr(sources, "retirement_status", lambda _settings: None)
+    effective = sources.evidence_settings(settings, None, retired=True)
+    assert not (effective.ev_power_entity or effective.ev_status_entity
+                or effective.dispatch_entity)
+
+
+@pytest.mark.usefixtures("retired")
+@pytest.mark.parametrize("invert", ["absent", None])
+def test_grid_source_without_polarity_proves_nothing(settings, invert):
+    raw = fixture("site_snapshot_v7")["evidence"]
+    if invert == "absent":
+        del raw["dispatch_grid_invert"]
+    else:
+        raw["dispatch_grid_invert"] = None
+    effective = sources.evidence_settings(settings, Evidence.model_validate(raw))
+    assert effective.dispatch_grid_power_entity == ""
+    assert effective.ev_power_entity == "sensor.ev_power"
 
 
 @pytest.mark.usefixtures("retired")

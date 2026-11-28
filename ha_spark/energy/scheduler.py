@@ -537,7 +537,7 @@ async def run_once(
                 session_cache if session_cache is not None else context.session_cache
             ),
             dispatch_handover=native and dispatch_handover(native_link),
-            evidence_options=evidence_options,
+            evidence_options=evidence_options, retired=native,
         )
         plan, inputs, load_source = run.plan, run.inputs, run.load_source
         log.info(
@@ -2414,6 +2414,7 @@ async def _run_paired(
                         ) as rest:
                             dispatch_settings = evidence_settings(
                                 settings, snapshot_evidence(state.integration_link, now),
+                                retired=True,
                             ) if native else settings
                             drawing = await read_ev_hold_status(dispatch_settings, rest)
                         # This read only schedules a plan; the plan gathers its own proof.
