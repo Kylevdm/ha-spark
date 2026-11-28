@@ -74,11 +74,37 @@ _Avoid_: override, boost.
 
 **Forecast trust bar**:
 The measured standard the base-load forecast must meet before the owner can
-rely on deficit sizing instead of charging to the cap every night. Over a
-trailing window there are no plan shortfalls on days where the two strategies
-would differ, and no unexplained step change in the forecast. Symmetric error
-is reported but does not decide. Like the **Readiness signal**, it is a
-recommendation to the owner, never a switch. (Decision: 2026-11-26.)
+rely on deficit sizing instead of charging to the cap every night. Over the
+trailing 28 days of one evidence epoch there are at least ten occupied
+differing cycles, no shadow shortfall and no real plan shortfall among the
+differing cycles, and no unexplained step change in the forecast. A known
+failure outranks too little evidence. Symmetric error is reported, split
+between occupied and away days, but does not decide. Like the **Readiness
+signal**, it is a recommendation to the owner, never a switch. (Decision:
+2026-11-28, #791.)
+
+**Differing cycle**:
+A cheap-window cycle (one opening of the fixed cheap window to the next) in
+which fill and deficit, decided from the same frozen inputs just before the
+window opens, would buy more than 1 kWh apart. Only differing cycles test
+the trust bar; on the others the two strategies plan alike. A cycle the
+replay can't model (an export event, a planned V2L top-up, a daytime
+purchase) is *unsupported*, not differing. _Avoid_: test day.
+
+**Shadow shortfall**:
+A simulated miss: replaying a cycle half-hour by half-hour on measured base
+load and solar, the deficit decision imports more than 0.2 kWh more in
+expensive slots than the fill decision would have. It blocks the trust bar
+but is not a **Plan shortfall**: it never creates a shortfall floor, and it
+can't be dismissed. The shadow decision is evidence only and never reaches
+hardware. _Avoid_: shadow miss, virtual shortfall.
+
+**Evidence epoch**:
+The stretch of history the trust bar may judge. It starts when a base-load
+history rebuild is verified, and a new one starts on any material change to
+capacity, charge buffer, limits, min SoC or cap, or the forecast pipeline. A
+cycle counts only when its decision and its whole measurement interval fall
+inside one epoch.
 
 **Car battery (V2L)**:
 A slow refill *source for the house battery*, not a parallel battery. Energy
